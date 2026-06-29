@@ -1,38 +1,52 @@
 # AutoForge
 
-#### 介绍
-自动工坊
-Build Once, Automate Everywhere.（一次构建，处处自动化。）
+自动工坊：Build Once, Automate Everywhere.
 
-#### 软件架构
-软件架构说明
+AutoForge 是一个桌面端网页自动化工具平台。当前版本使用 Electron +
+Vite + Vue 3 + TypeScript + Tailwind CSS 搭建，重点先落地安全边界、
+插件 Manifest、受控 SDK 契约和工作流状态机。
 
+## 架构
 
-#### 安装教程
+```txt
+第三方自动化工具
+  -> 受限 Playwright-like SDK
+  -> 权限校验 / 状态机 / 日志
+  -> Electron main process
+  -> CDP / DOM 注入 / webContents
+  -> 目标网页
+```
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+第三方开发者写的是自动化脚本，不是 Electron 插件。插件不能直接访问
+Node.js、Electron、文件系统、任意 IPC 或完整 CDP session。
 
-#### 使用说明
+## 目录
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+```txt
+src/main              Electron 主进程、IPC、插件注册、工作流运行器
+src/preload           受控 preload bridge
+src/renderer/src      Vue 3 工作台界面
+src/shared            Renderer / preload / main 共享类型与 SDK 契约
+resources/plugins     示例插件 Manifest 与工具代码
+docs                  架构说明
+```
 
-#### 参与贡献
+## 开发
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+```bash
+npm install
+npm run dev
+```
 
+## 验证
 
-#### 特技
+```bash
+npm run typecheck
+npm run build
+```
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+## 打包
+
+```bash
+npm run dist
+```

@@ -1,37 +1,55 @@
 # AutoForge
 
-#### Description
-自动工坊
-Build Once, Automate Everywhere.（一次构建，处处自动化。）
+Build Once, Automate Everywhere.
 
-#### Software Architecture
-Software architecture description
+AutoForge is a desktop web automation platform built with Electron, Vite,
+Vue 3, TypeScript, and Tailwind CSS.
 
-#### Installation
+The first production scaffold focuses on security boundaries, plugin manifests,
+a restricted Playwright-like SDK contract, and a workflow state machine.
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+## Architecture
 
-#### Instructions
+```txt
+Third-party automation tool
+  -> restricted Playwright-like SDK
+  -> permission checks / workflow state / logs
+  -> Electron main process
+  -> CDP / DOM injection / webContents
+  -> target web page
+```
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+Tool authors write automation scripts, not Electron plugins. Tools do not get
+direct access to Node.js, Electron, the local file system, arbitrary IPC, or a
+full CDP session.
 
-#### Contribution
+## Directories
 
-1.  Fork the repository
-2.  Create Feat_xxx branch
-3.  Commit your code
-4.  Create Pull Request
+```txt
+src/main              Electron main process, IPC, plugin registry, workflow runner
+src/preload           typed and restricted preload bridge
+src/renderer/src      Vue 3 workbench UI
+src/shared            shared contracts and SDK types
+resources/plugins     example plugin manifest and tool code
+docs                  architecture notes
+```
 
+## Development
 
-#### Gitee Feature
+```bash
+npm install
+npm run dev
+```
 
-1.  You can use Readme\_XXX.md to support different languages, such as Readme\_en.md, Readme\_zh.md
-2.  Gitee blog [blog.gitee.com](https://blog.gitee.com)
-3.  Explore open source project [https://gitee.com/explore](https://gitee.com/explore)
-4.  The most valuable open source project [GVP](https://gitee.com/gvp)
-5.  The manual of Gitee [https://gitee.com/help](https://gitee.com/help)
-6.  The most popular members  [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+## Verification
+
+```bash
+npm run typecheck
+npm run build
+```
+
+## Packaging
+
+```bash
+npm run dist
+```
