@@ -1,4 +1,4 @@
-import { defineTool } from '../../../../src/shared/automation-sdk'
+import { defineTool } from '@auto-forge/automation-sdk'
 
 export default defineTool({
   name: 'example-login-tool',

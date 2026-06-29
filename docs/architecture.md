@@ -37,7 +37,10 @@ This scaffold includes a production-oriented local shell:
 - Vue 3 renderer workbench
 - workflow status machine with pause, resume, reset, logs, and progress
 - manifest validation and built-in example plugin
+- public `@auto-forge/automation-sdk` workspace package
 - shared SDK and contract types
 
 The real CDP engine, isolated plugin worker, marketplace, signing, and review
 service are intentionally left as next implementation milestones.
+
+See `docs/automation-sdk.md` for the third-party tool integration guide.

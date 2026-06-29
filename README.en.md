@@ -30,9 +30,12 @@ src/main              Electron main process, IPC, plugin registry, workflow runn
 src/preload           typed and restricted preload bridge
 src/renderer/src      Vue 3 workbench UI
 src/shared            shared contracts and SDK types
+packages/automation-sdk public Automation SDK package
 resources/plugins     example plugin manifest and tool code
 docs                  architecture notes
 ```
+
+Third-party tool integration guide: [docs/automation-sdk.md](docs/automation-sdk.md).
 
 ## Development
 
@@ -45,6 +48,7 @@ npm run dev
 
 ```bash
 npm run typecheck
+npm run build:sdk
 npm run build
 ```
 

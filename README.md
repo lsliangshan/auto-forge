@@ -27,9 +27,12 @@ src/main              Electron 主进程、IPC、插件注册、工作流运行�
 src/preload           受控 preload bridge
 src/renderer/src      Vue 3 工作台界面
 src/shared            Renderer / preload / main 共享类型与 SDK 契约
+packages/automation-sdk 对外 Automation SDK 包
 resources/plugins     示例插件 Manifest 与工具代码
 docs                  架构说明
 ```
+
+第三方工具接入文档见 [docs/automation-sdk.md](docs/automation-sdk.md)。
 
 ## 开发
 
@@ -42,6 +45,7 @@ npm run dev
 
 ```bash
 npm run typecheck
+npm run build:sdk
 npm run build
 ```
 

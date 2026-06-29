@@ -1,4 +1,4 @@
-import { isToolPermission, type PluginValidationResult, type ToolManifest } from '@shared/plugin'
+import { validateManifest, type PluginValidationResult, type ToolManifest } from '@shared/plugin'
 
 const builtInTools: ToolManifest[] = [
   {
@@ -30,56 +30,30 @@ export class PluginRegistry {
   }
 
   validateManifest(value: unknown): PluginValidationResult {
-    const errors: string[] = []
-    const warnings: string[] = []
-
-    if (!this.isRecord(value)) {
-      return { ok: false, errors: ['Manifest 必须是对象'], warnings }
-    }
-
-    this.requireString(value, 'name', errors)
-    this.requireString(value, 'version', errors)
-    this.requireString(value, 'entry', errors)
-    this.requireStringArray(value, 'matches', errors)
-
-    const permissions = value.permissions
-    if (!Array.isArray(permissions) || permissions.length === 0) {
-      errors.push('permissions 必须是非空数组')
-    } else {
-      for (const permission of permissions) {
-        if (typeof permission !== 'string' || !isToolPermission(permission)) {
-          errors.push(`不支持的权限：${String(permission)}`)
-        }
-      }
-    }
-
-    if (Array.isArray(value.matches) && value.matches.some((match) => match === '<all_urls>')) {
-      warnings.push('不建议第一版插件申请 <all_urls>，请尽量限制到明确域名')
-    }
-
-    return { ok: errors.length === 0, errors, warnings }
-  }
-
-  private isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
-  }
-
-  private requireString(value: Record<string, unknown>, key: string, errors: string[]): void {
-    if (typeof value[key] !== 'string' || value[key].trim() === '') {
-      errors.push(`${key} 必须是非空字符串`)
+    const result = validateManifest(value)
+    return {
+      ok: result.ok,
+      errors: result.errors.map(localizeValidationMessage),
+      warnings: result.warnings.map(localizeValidationMessage)
     }
   }
+}
 
-  private requireStringArray(value: Record<string, unknown>, key: string, errors: string[]): void {
-    if (!Array.isArray(value[key]) || value[key].length === 0) {
-      errors.push(`${key} 必须是非空字符串数组`)
-      return
-    }
-
-    for (const item of value[key]) {
-      if (typeof item !== 'string' || item.trim() === '') {
-        errors.push(`${key} 只能包含非空字符串`)
-      }
-    }
-  }
+function localizeValidationMessage(message: string): string {
+  return message
+    .replace('Manifest must be an object.', 'Manifest 必须是对象')
+    .replace('permissions must be a non-empty string array.', 'permissions 必须是非空字符串数组')
+    .replace('matches must be a non-empty string array.', 'matches 必须是非空字符串数组')
+    .replace('matches can only contain non-empty strings.', 'matches 只能包含非空字符串')
+    .replace('name must be a non-empty string.', 'name 必须是非空字符串')
+    .replace('version must be a non-empty string.', 'version 必须是非空字符串')
+    .replace('entry must be a non-empty string.', 'entry 必须是非空字符串')
+    .replace('inputs must be an object when provided.', 'inputs 必须是对象')
+    .replace('input name must be a non-empty string.', '输入项名称必须是非空字符串')
+    .replace('must be an object.', '必须是对象')
+    .replace('has unsupported type:', '包含不支持的类型：')
+    .replace('.required must be a boolean when provided.', '.required 必须是布尔值')
+    .replace('with type "select" must provide non-empty options.', '类型为 select 时必须提供非空 options')
+    .replace('Avoid <all_urls> in the first plugin version. Prefer explicit host matches.', '不建议第一版插件申请 <all_urls>，请尽量限制到明确域名')
+    .replace('Unsupported permission:', '不支持的权限：')
 }

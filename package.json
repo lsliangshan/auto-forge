@@ -6,19 +6,26 @@
   "author": "AutoForge Contributors",
   "license": "MIT",
   "type": "module",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "engines": {
     "node": ">=22.12.0"
   },
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "npm run typecheck && electron-vite build",
+    "build": "npm run typecheck && npm run build:sdk && electron-vite build",
+    "build:sdk": "npm run build -w @auto-forge/automation-sdk",
     "preview": "electron-vite preview",
     "dist": "npm run build && electron-builder",
-    "typecheck": "npm run typecheck:main && npm run typecheck:renderer",
+    "typecheck": "npm run typecheck:sdk && npm run typecheck:main && npm run typecheck:renderer",
+    "typecheck:sdk": "npm run typecheck -w @auto-forge/automation-sdk",
     "typecheck:main": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:renderer": "vue-tsc --noEmit -p tsconfig.web.json"
   },
   "dependencies": {
+    "@auto-forge/automation-sdk": "file:packages/automation-sdk",
     "@electron-toolkit/utils": "^3.0.0",
     "@lucide/vue": "^1.22.0",
     "pinia": "^2.3.0",

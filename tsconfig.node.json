@@ -12,13 +12,15 @@
     "baseUrl": ".",
     "paths": {
       "@main/*": ["src/main/*"],
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "@auto-forge/automation-sdk": ["packages/automation-sdk/src/index.ts"]
     }
   },
   "include": [
     "electron.vite.config.ts",
     "src/main/**/*.ts",
     "src/preload/**/*.ts",
-    "src/shared/**/*.ts"
+    "src/shared/**/*.ts",
+    "packages/automation-sdk/src/**/*.ts"
   ]
 }
