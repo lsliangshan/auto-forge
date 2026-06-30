@@ -1,10 +1,13 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'node:path'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
+import { BrowserWindowManager } from './browser/browser-window-manager'
+import { ensureAppDatabase } from './database/app-database'
 import { registerIpcHandlers } from './ipc'
 import { PluginRegistry } from './plugins/plugin-registry'
 import { WorkflowRunner } from './workflow/workflow-runner'
 
+const browserWindowManager = new BrowserWindowManager()
 const workflowRunner = new WorkflowRunner()
 const pluginRegistry = new PluginRegistry()
 
@@ -46,11 +49,13 @@ function createMainWindow(): BrowserWindow {
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.autoforge.desktop')
+  ensureAppDatabase(join(app.getPath('userData'), 'autoforge.sqlite'))
+
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
 
-  registerIpcHandlers({ workflowRunner, pluginRegistry })
+  registerIpcHandlers({ browserWindowManager, workflowRunner, pluginRegistry })
   createMainWindow()
 
   app.on('activate', () => {

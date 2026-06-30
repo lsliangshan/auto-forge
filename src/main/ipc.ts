@@ -1,14 +1,16 @@
 import { BrowserWindow, app, ipcMain } from 'electron'
 import { ipcChannels, type PlatformOverview } from '@shared/contracts'
+import type { BrowserWindowManager } from './browser/browser-window-manager'
 import type { PluginRegistry } from './plugins/plugin-registry'
 import type { WorkflowRunner } from './workflow/workflow-runner'
 
 type IpcDeps = {
+  browserWindowManager: BrowserWindowManager
   workflowRunner: WorkflowRunner
   pluginRegistry: PluginRegistry
 }
 
-export function registerIpcHandlers({ workflowRunner, pluginRegistry }: IpcDeps): void {
+export function registerIpcHandlers({ browserWindowManager, workflowRunner, pluginRegistry }: IpcDeps): void {
   workflowRunner.on('changed', (snapshot) => {
     for (const window of BrowserWindow.getAllWindows()) {
       window.webContents.send(ipcChannels.workflowChanged, snapshot)
@@ -49,6 +51,12 @@ export function registerIpcHandlers({ workflowRunner, pluginRegistry }: IpcDeps)
     }
   })
 
+  ipcMain.handle(ipcChannels.browserOpenWindow, () => browserWindowManager.openWindow())
+  ipcMain.handle(ipcChannels.browserLoadUrl, (event, url: string) => {
+    return browserWindowManager.loadUrl(event, url)
+  })
+  ipcMain.handle(ipcChannels.browserGoBack, (event) => browserWindowManager.goBack(event))
+  ipcMain.handle(ipcChannels.browserGetState, (event) => browserWindowManager.getState(event))
   ipcMain.handle(ipcChannels.workflowGetSnapshot, () => workflowRunner.getSnapshot())
   ipcMain.handle(ipcChannels.workflowStart, () => workflowRunner.start())
   ipcMain.handle(ipcChannels.workflowPause, () => workflowRunner.pause())

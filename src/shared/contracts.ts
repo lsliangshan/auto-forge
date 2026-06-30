@@ -22,8 +22,24 @@ export type PlatformOverview = {
 
 export type BridgeUnsubscribe = () => void
 
+export type AppView = 'workbench' | 'automationTasks'
+
+export type BrowserViewState = {
+  url: string
+  title: string
+  canGoBack: boolean
+  loading: boolean
+}
+
 export type AutoForgeBridge = {
   getOverview: () => Promise<PlatformOverview>
+  browser: {
+    openWindow: () => Promise<void>
+    loadUrl: (url: string) => Promise<BrowserViewState>
+    goBack: () => Promise<BrowserViewState>
+    getState: () => Promise<BrowserViewState>
+    onStateChanged: (callback: (state: BrowserViewState) => void) => BridgeUnsubscribe
+  }
   workflow: {
     getSnapshot: () => Promise<WorkflowSnapshot>
     start: () => Promise<WorkflowSnapshot>
@@ -40,6 +56,11 @@ export type AutoForgeBridge = {
 
 export const ipcChannels = {
   getOverview: 'platform:get-overview',
+  browserOpenWindow: 'browser:open-window',
+  browserLoadUrl: 'browser:load-url',
+  browserGoBack: 'browser:go-back',
+  browserGetState: 'browser:get-state',
+  browserStateChanged: 'browser:state-changed',
   workflowGetSnapshot: 'workflow:get-snapshot',
   workflowStart: 'workflow:start',
   workflowPause: 'workflow:pause',

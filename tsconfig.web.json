@@ -24,5 +24,8 @@
     "src/renderer/src/**/*.vue",
     "src/shared/**/*.ts",
     "packages/automation-sdk/src/**/*.ts"
+  ],
+  "exclude": [
+    "**/*.test.ts"
   ]
 }

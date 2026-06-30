@@ -22,5 +22,8 @@
     "src/preload/**/*.ts",
     "src/shared/**/*.ts",
     "packages/automation-sdk/src/**/*.ts"
+  ],
+  "exclude": [
+    "**/*.test.ts"
   ]
 }
