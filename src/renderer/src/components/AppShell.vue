@@ -36,17 +36,7 @@ defineProps<{
       </footer>
     </aside>
 
-    <section class="flex min-w-0 flex-1 flex-col">
-      <header class="flex h-16 shrink-0 items-center justify-between border-b border-forge-line bg-white px-5">
-        <div>
-          <h2 class="text-base font-semibold">自动化工具运行台</h2>
-          <p class="text-xs text-slate-500">受控 SDK、插件权限、工作流状态机</p>
-        </div>
-        <div class="rounded border border-forge-line px-3 py-1.5 text-xs text-slate-600">
-          Electron + Vite + Vue 3 + TypeScript
-        </div>
-      </header>
-
+    <section class="flex min-h-0 min-w-0 flex-1 flex-col">
       <slot />
     </section>
   </div>

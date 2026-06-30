@@ -18,6 +18,13 @@ export default defineConfig({
       alias: {
         '@shared': resolve('src/shared')
       }
+    },
+    build: {
+      rollupOptions: {
+        output: {
+          format: 'cjs'
+        }
+      }
     }
   },
   renderer: {

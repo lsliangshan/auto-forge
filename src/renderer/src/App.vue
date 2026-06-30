@@ -30,7 +30,7 @@ onUnmounted(() => {
 <template>
   <AppShell :version="appVersion">
     <template v-if="store.workflow && store.overview">
-      <main class="grid min-h-0 grid-cols-[minmax(0,1.35fr)_420px] gap-4 p-4">
+      <main class="grid min-h-0 flex-1 grid-cols-[minmax(0,1.35fr)_420px] gap-4 p-4">
         <section class="flex min-h-0 flex-col gap-4">
           <WorkflowPanel
             :snapshot="store.workflow"
