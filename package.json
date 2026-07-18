@@ -17,13 +17,14 @@
     "preview": "vite preview --config vite.renderer.config.ts",
     "postinstall": "electron-builder install-app-deps",
     "test:unit": "npm run rebuild:node --silent && vitest run",
+    "test:e2e": "npm run build && npm run rebuild:electron --silent && playwright test",
     "typecheck": "npm run typecheck:node && npm run typecheck:renderer",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:renderer": "vue-tsc --noEmit -p tsconfig.web.json",
     "rebuild:node": "npm rebuild better-sqlite3",
-    "rebuild:electron": "electron-builder install-app-deps",
+    "rebuild:electron": "electron-rebuild --force --which-module better-sqlite3",
     "verify:template": "node scripts/verify-template.mjs",
-    "dist:dir": "npm run build && electron-builder --dir"
+    "dist:dir": "npm run build && npm run rebuild:electron --silent && electron-builder --dir --config.npmRebuild=false"
   },
   "dependencies": {
     "@electron-toolkit/utils": "^3.0.0",
@@ -35,6 +36,8 @@
     "vue-router": "^4.5.0"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
+    "@playwright/test": "^1.61.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.2",
     "@vitejs/plugin-vue": "^5.2.1",

@@ -6,6 +6,8 @@ directories:
 files:
   - out/**/*
   - resources/**/*
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
 asarUnpack:
   - node_modules/better-sqlite3/**/*
 mac:
