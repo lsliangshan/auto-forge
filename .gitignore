@@ -1,9 +1,10 @@
-node_modules/
-out/
-dist/
-release/
-coverage/
+/node_modules/
+/out/
+/dist/
+/release/
+/coverage/
 .DS_Store
 *.log
+*.tsbuildinfo
 artifacts/qa/*.png
 !artifacts/qa/.gitkeep

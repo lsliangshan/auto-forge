@@ -11,15 +11,17 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "npm run rebuild:electron --silent && electron-vite dev",
     "dev:renderer": "vite --config vite.renderer.config.ts",
     "build": "electron-vite build",
     "preview": "vite preview --config vite.renderer.config.ts",
     "postinstall": "electron-builder install-app-deps",
-    "test:unit": "vitest run",
+    "test:unit": "npm run rebuild:node --silent && vitest run",
     "typecheck": "npm run typecheck:node && npm run typecheck:renderer",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:renderer": "vue-tsc --noEmit -p tsconfig.web.json",
+    "rebuild:node": "npm rebuild better-sqlite3",
+    "rebuild:electron": "electron-builder install-app-deps",
     "verify:template": "node scripts/verify-template.mjs",
     "dist:dir": "npm run build && electron-builder --dir"
   },
