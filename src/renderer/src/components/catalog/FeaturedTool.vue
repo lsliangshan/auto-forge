@@ -5,7 +5,7 @@
     </div>
     <div class="featured-copy">
       <div class="featured-heading">
-        <span class="tool-icon tool-icon--blue"><Connection /></span>
+        <span class="tool-icon tool-icon--blue"><Compass /></span>
         <div>
           <div class="title-row">
             <h2 id="featured-title">{{ tool.name }}</h2>
@@ -31,7 +31,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { ArrowRight, Connection, User } from '@element-plus/icons-vue'
+import { ArrowRight, Compass, User } from '@element-plus/icons-vue'
 import type { ToolSummary } from '../../../../shared/catalog'
 import featuredIllustration from '../../assets/featured-web-collector.png'
 

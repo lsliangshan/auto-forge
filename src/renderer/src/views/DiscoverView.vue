@@ -1,7 +1,7 @@
 <template>
   <div class="page discover-page">
     <section class="page-intro">
-      <div><span class="eyebrow">AUTOMATION MARKETPLACE</span><h1>发现自动化工具</h1><p>探索高效实用的自动化工具，提升你的工作效率。</p></div>
+      <div><h1>发现自动化工具</h1><p>探索高效实用的自动化工具，提升你的工作效率。</p></div>
       <div class="search-wrap">
         <Search />
         <input

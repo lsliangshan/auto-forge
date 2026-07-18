@@ -7,19 +7,17 @@
       <span class="download-column">下载量</span>
       <span>操作</span>
     </div>
-    <button
+    <div
       v-for="tool in tools"
       :key="tool.id"
-      type="button"
-      class="tool-row"
+      :class="['tool-row', { 'tool-row--installed': installedIds.has(tool.id) }]"
       data-testid="tool-row"
-      @click="$emit('select', tool)"
     >
       <span class="tool-name-cell">
         <span class="tool-icon" :class="`tool-icon--${toolIconColors[tool.id as keyof typeof toolIconColors] ?? 'blue'}`">
           <component :is="toolIcons[tool.id as keyof typeof toolIcons]" />
         </span>
-        <span><strong>{{ tool.name }}</strong><small>{{ tool.developer }}</small></span>
+        <span><strong>{{ tool.name }}</strong></span>
       </span>
       <span class="tool-purpose">{{ tool.description }}</span>
       <span class="platform-column platform-icons">
@@ -43,9 +41,16 @@
           :loading="installingId === tool.id"
           @click.stop="$emit('install', tool)"
         >安装</el-button>
-        <ArrowRight />
+        <button
+          class="tool-details-button"
+          type="button"
+          :aria-label="`查看${tool.name}详情`"
+          @click="$emit('select', tool)"
+        >
+          <ArrowRight />
+        </button>
       </span>
-    </button>
+    </div>
   </div>
 </template>
 

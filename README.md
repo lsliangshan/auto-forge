@@ -7,7 +7,7 @@ AutoForge 是一个基于 Electron 的桌面自动化工具发现应用。首版
 - Electron + electron-vite
 - Vue 3 + TypeScript + Vue Router + Pinia
 - Tailwind CSS + Element Plus
-- better-sqlite3
+- Node.js 内置 SQLite (`node:sqlite`)
 - Vitest + Vue Test Utils + Playwright Electron
 - electron-builder
 
@@ -35,7 +35,7 @@ npm run test:e2e
 npm run dist:dir
 ```
 
-`better-sqlite3` 同时服务于 Node 单元测试和 Electron 运行时。`test:unit` 会重建 Node ABI；`dev`、`test:e2e` 与打包流程会重建 Electron ABI。
+本地数据使用 Electron 43 / Node 24 内置的 `node:sqlite`，无需下载或重编译原生 ABI 依赖。
 
 ## 目录
 

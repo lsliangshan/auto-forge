@@ -85,7 +85,7 @@
 - Electron + electron-vite
 - Vue 3 + TypeScript + Vue Router + Pinia
 - Tailwind CSS + Element Plus
-- better-sqlite3
+- Node.js 内置 SQLite (`node:sqlite`)
 - Vitest + Vue Test Utils
 - Playwright Electron
 - electron-builder

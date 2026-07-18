@@ -6,7 +6,7 @@
     "developer": "AutoForge 团队",
     "version": "2.3.1",
     "category": "data",
-    "tags": ["智能识别", "分页采集", "数据导出"],
+    "tags": ["智能识别", "分页采集", "数据导出", "登录支持", "定时任务"],
     "platforms": ["windows", "macos", "linux"],
     "downloads": 128600,
     "featured": true,

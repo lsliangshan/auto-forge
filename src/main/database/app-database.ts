@@ -1,11 +1,11 @@
-import Database from 'better-sqlite3'
+import { DatabaseSync } from 'node:sqlite'
 import { migrations } from './migrations'
 
 export class AppDatabase {
-  private readonly database: Database.Database
+  private readonly database: DatabaseSync
 
   constructor(path: string) {
-    this.database = new Database(path)
+    this.database = new DatabaseSync(path)
   }
 
   initialize(): void {
@@ -21,12 +21,17 @@ export class AppDatabase {
       .get() as { version: number }
 
     for (const migration of migrations.filter(({ version }) => version > currentVersion.version)) {
-      this.database.transaction(() => {
+      this.database.exec('BEGIN')
+      try {
         this.database.exec(migration.sql)
         this.database
           .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
           .run(migration.version, new Date().toISOString())
-      })()
+        this.database.exec('COMMIT')
+      } catch (error) {
+        this.database.exec('ROLLBACK')
+        throw error
+      }
     }
   }
 

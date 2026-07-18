@@ -1,5 +1,5 @@
 import {
-  Connection,
+  Compass,
   Document,
   FolderOpened,
   Grid,
@@ -8,7 +8,7 @@ import {
 } from '@element-plus/icons-vue'
 
 export const toolIcons = {
-  'web-collector': Connection,
+  'web-collector': Compass,
   'file-renamer': FolderOpened,
   'sheet-filler': Grid,
   'content-publisher': Promotion,

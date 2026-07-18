@@ -6,7 +6,7 @@
 
 **Architecture:** The Vue renderer owns presentation and transient filter state. A typed preload allowlist connects it to Electron main services for SQLite-backed settings/installations and safe template export; shared contracts keep renderer and main-process payloads serializable and testable.
 
-**Tech Stack:** Electron, electron-vite, Vue 3, TypeScript, Vue Router, Pinia, Tailwind CSS, Element Plus, better-sqlite3, Vitest, Vue Test Utils, Playwright Electron, electron-builder.
+**Tech Stack:** Electron, electron-vite, Vue 3, TypeScript, Vue Router, Pinia, Tailwind CSS, Element Plus, Node.js built-in SQLite (`node:sqlite`), Vitest, Vue Test Utils, Playwright Electron, electron-builder.
 
 ## Global Constraints
 

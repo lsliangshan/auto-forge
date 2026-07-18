@@ -6,7 +6,6 @@
         <span>AutoForge</span>
       </div>
       <div class="titlebar-spacer" />
-      <button class="titlebar-action" type="button" aria-label="帮助"><QuestionFilled /></button>
     </header>
 
     <aside class="sidebar" aria-label="主导航">
@@ -33,7 +32,7 @@
 </template>
 
 <script setup lang="ts">
-import { Compass, Promotion, QuestionFilled, Setting } from '@element-plus/icons-vue'
+import { Compass, Promotion, Setting } from '@element-plus/icons-vue'
 
 const navigation = [
   { label: '发现', to: '/', icon: Compass },

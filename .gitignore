@@ -8,5 +8,8 @@
 .DS_Store
 *.log
 *.tsbuildinfo
-artifacts/qa/*.png
+artifacts/qa/*
 !artifacts/qa/.gitkeep
+!artifacts/qa/autoforge-discover.png
+!artifacts/qa/autoforge-discover-comparison.png
+!artifacts/qa/autoforge-discover-focus-comparison.png
