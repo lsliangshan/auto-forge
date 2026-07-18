@@ -1,0 +1,17 @@
+appId: com.autoforge.desktop
+productName: AutoForge
+directories:
+  buildResources: build
+  output: release
+files:
+  - out/**/*
+  - resources/**/*
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
+mac:
+  category: public.app-category.productivity
+win:
+  target: nsis
+linux:
+  target: AppImage
+  category: Utility

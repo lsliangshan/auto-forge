@@ -1,0 +1,9 @@
+node_modules/
+out/
+dist/
+release/
+coverage/
+.DS_Store
+*.log
+artifacts/qa/*.png
+!artifacts/qa/.gitkeep
