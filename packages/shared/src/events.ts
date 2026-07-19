@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { appErrorSchema } from './errors.js'
+import { capabilitySchema, capabilityScopeSchema } from './worker-protocol.js'
 
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
@@ -25,7 +26,14 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     workflowName: z.string().trim().min(1),
     args: z.unknown(),
   }).strict(),
-  z.object({ type: z.literal('approval'), executionId: identifierSchema }).strict(),
+  z.object({
+    type: z.literal('approval'),
+    executionId: identifierSchema,
+    permissionIndex: z.number().int().nonnegative(),
+    capability: capabilitySchema,
+    scope: capabilityScopeSchema,
+    scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+  }).strict(),
   z.object({ type: z.literal('workflow_execution'), executionId: identifierSchema }).strict(),
   z.object({
     type: z.literal('execution_result'),

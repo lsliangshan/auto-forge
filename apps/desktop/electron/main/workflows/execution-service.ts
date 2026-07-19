@@ -115,8 +115,6 @@ export class NodeWorkerFactory implements WorkflowWorkerFactory {
 }
 
 export interface ExecutionStartInput {
-  /** Reserved by the trusted main-process orchestrator before pre-start permission approval. */
-  executionId?: string
   workflowId: string
   workflowVersion: string
   input: unknown
@@ -128,6 +126,18 @@ export interface ExecutionStartInput {
 export interface StartedExecution {
   id: string
   finished: Promise<Execution>
+}
+
+export interface ExecutionReservation {
+  readonly executionId: string
+}
+
+interface ReservationRecord {
+  readonly handle: ExecutionReservation
+  readonly executionId: string
+  cancelled: boolean
+  started: boolean
+  starting?: Promise<StartedExecution>
 }
 
 interface PendingCapability {
@@ -205,6 +215,8 @@ function samePermission(
 
 export class ExecutionService {
   private readonly active = new Map<string, ActiveExecution>()
+  private readonly reservationHandles = new WeakMap<ExecutionReservation, ReservationRecord>()
+  private readonly reservationsById = new Map<string, ReservationRecord>()
   private readonly temporaryDirectories: TemporaryDirectoryPort
 
   constructor(private readonly dependencies: ExecutionServiceDependencies) {
@@ -214,11 +226,44 @@ export class ExecutionService {
     }
   }
 
-  async start(input: ExecutionStartInput): Promise<StartedExecution> {
-    const source = await this.dependencies.sourceResolver.resolve(input.workflowId, input.workflowVersion)
-    if (!source) throw failure('NOT_FOUND')
-    const workflow = source.workflow
-    const id = input.executionId?.trim() || randomUUID()
+  reserve(): ExecutionReservation {
+    const handle = Object.freeze({ executionId: randomUUID() })
+    const record: ReservationRecord = {
+      handle,
+      executionId: handle.executionId,
+      cancelled: false,
+      started: false,
+    }
+    this.reservationHandles.set(handle, record)
+    this.reservationsById.set(record.executionId, record)
+    return handle
+  }
+
+  async start(input: ExecutionStartInput, signal?: AbortSignal): Promise<StartedExecution> {
+    return this.startReserved(this.reserve(), input, signal)
+  }
+
+  async startReserved(
+    reservation: ExecutionReservation,
+    input: ExecutionStartInput,
+    signal?: AbortSignal,
+  ): Promise<StartedExecution> {
+    const record = this.reservationHandles.get(reservation)
+    if (!record || record.handle !== reservation || record.started) throw failure('CONFLICT')
+    if (record.cancelled || signal?.aborted) throw failure('CANCELLED')
+    record.started = true
+    const onAbort = () => { record.cancelled = true }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    record.starting = this.startReservation(record, input)
+    try {
+      return await record.starting
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  private async startReservation(record: ReservationRecord, input: ExecutionStartInput): Promise<StartedExecution> {
+    const id = record.executionId
     const inserted = this.dependencies.repositories.executions.insert({
       id,
       workflowId: input.workflowId,
@@ -229,12 +274,23 @@ export class ExecutionService {
     })
     this.emit(statusEvent(id, inserted.status))
 
+    const checkCancelled = () => {
+      if (record.cancelled) throw failure('CANCELLED')
+    }
     let directory: string | undefined
     let entryPath: string
-    let worker: WorkflowWorker
+    let worker: WorkflowWorker | undefined
+    let workflow: WorkflowDetail
     try {
-      entryPath = await this.resolveEntryPath(input, source)
+      checkCancelled()
+      const source = await this.dependencies.sourceResolver.resolve(input.workflowId, input.workflowVersion)
+      checkCancelled()
+      if (!source) throw failure('NOT_FOUND')
+      workflow = source.workflow
+      entryPath = await this.resolveEntryPath(input, source, checkCancelled)
+      checkCancelled()
       directory = await this.temporaryDirectories.create()
+      checkCancelled()
       const nonce = randomUUID()
       worker = await this.dependencies.workers.spawn({
         executionId: id,
@@ -242,8 +298,13 @@ export class ExecutionService {
         cwd: directory,
         env: workerEnvironment(nonce),
       })
+      checkCancelled()
     } catch (error) {
-      return this.failBeforeActive(id, toSafeAppError(error), directory)
+      if (worker) {
+        try { worker.kill('SIGTERM') } catch { /* A cancelled pre-active worker may already have exited. */ }
+      }
+      const safe = record.cancelled ? failure('CANCELLED') : toSafeAppError(error)
+      return this.failBeforeActive(id, safe, directory)
     }
 
     let resolveFinished: (execution: Execution) => void = () => undefined
@@ -271,6 +332,7 @@ export class ExecutionService {
       rejectFinished,
     }
     this.active.set(id, active)
+    this.reservationsById.delete(id)
     this.attach(active)
 
     try {
@@ -294,6 +356,12 @@ export class ExecutionService {
     const active = this.active.get(parsed.data.executionId)
     if (!active || active.terminal || !active.pending?.requiresApproval) throw failure('CONFLICT')
     const pending = active.pending
+    const permissionIndex = active.workflow.permissions.findIndex((permission) => samePermission(permission, pending.request))
+    if (permissionIndex < 0
+      || parsed.data.permissionIndex !== permissionIndex
+      || parsed.data.scopeHash !== scopeHash(pending.request.scope)) {
+      throw failure('CONFLICT')
+    }
 
     if (parsed.data.decision === 'deny') {
       await this.finish(active.id, 'failed', failure('PERMISSION_DENIED'))
@@ -321,6 +389,20 @@ export class ExecutionService {
   }
 
   async cancel(executionId: string): Promise<void> {
+    const reservation = this.reservationsById.get(executionId)
+    if (reservation) {
+      reservation.cancelled = true
+      if (!reservation.starting) {
+        this.reservationsById.delete(executionId)
+        return
+      }
+      const started = await reservation.starting
+      const activeAfterStart = this.active.get(executionId)
+      if (!activeAfterStart) {
+        await started.finished.catch(() => undefined)
+        return
+      }
+    }
     const active = this.active.get(executionId)
     if (!active || active.terminal) return
     try {
@@ -331,7 +413,11 @@ export class ExecutionService {
     await this.finish(executionId, 'cancelled', failure('CANCELLED'))
   }
 
-  private async resolveEntryPath(input: ExecutionStartInput, source: WorkflowExecutionSource): Promise<string> {
+  private async resolveEntryPath(
+    input: ExecutionStartInput,
+    source: WorkflowExecutionSource,
+    checkCancelled: () => void = () => undefined,
+  ): Promise<string> {
     if (source.workflow.id !== input.workflowId
       || source.workflow.version !== input.workflowVersion
       || !source.workflow.enabled
@@ -343,7 +429,9 @@ export class ExecutionService {
     }
     try {
       const root = await realpath(source.rootPath)
+      checkCancelled()
       const entry = await realpath(resolve(root, source.entryPath))
+      checkCancelled()
       if (!inside(root, entry)) throw failure('WORKFLOW_INTEGRITY_FAILED')
       return entry
     } catch {
@@ -356,13 +444,14 @@ export class ExecutionService {
     error: AppError,
     directory?: string,
   ): Promise<StartedExecution> {
+    const status = error.code === 'CANCELLED' ? 'cancelled' : 'failed'
     const terminal = this.dependencies.repositories.executions.update(executionId, {
-      status: 'failed',
+      status,
       errorCode: error.code,
       endedAt: Date.now(),
     })
     if (!terminal) throw failure('NOT_FOUND')
-    this.emit(statusEvent(executionId, 'failed', error))
+    this.emit(statusEvent(executionId, status, error))
     try {
       this.dependencies.policy.releaseExecution(executionId)
     } catch {
@@ -374,6 +463,7 @@ export class ExecutionService {
       // Pre-active capability cleanup is best effort after the terminal state is durable.
     }
     if (directory) await this.removeTemporaryDirectory(directory)
+    this.reservationsById.delete(executionId)
     return { id: executionId, finished: Promise.resolve(terminal) }
   }
 

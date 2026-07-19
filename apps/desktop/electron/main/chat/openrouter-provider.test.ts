@@ -177,4 +177,66 @@ describe('OpenRouterProvider', () => {
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).toHaveBeenCalledTimes(1)
   })
+
+  it('retries a streamed 429 error after partial text without duplicating text or usage', async () => {
+    let attempt = 0
+    const fetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"A"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.1}}\n\n',
+        'data: {"error":{"code":429,"message":"prompt must never leak","metadata":{"error_type":"rate_limit"}}}\n\n',
+      ])
+      return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"AB"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.1}}\n\n',
+        'data: [DONE]\n\n',
+      ])
+    })
+    const diagnostic = vi.fn()
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep: async () => undefined })
+
+    const result = await collect(provider.stream({ model: 'm', messages: [{ role: 'user', content: 'prompt must never leak' }] }))
+
+    expect(result.filter((event) => event.type === 'text_delta')).toEqual([
+      { type: 'text_delta', choiceIndex: 0, text: 'A' },
+      { type: 'text_delta', choiceIndex: 0, text: 'B' },
+    ])
+    expect(result.filter((event) => event.type === 'usage')).toHaveLength(1)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('prompt must never leak')
+  })
+
+  it('maps a streamed 403 error to a safe credential error without retry', async () => {
+    const diagnostic = vi.fn()
+    const fetch = vi.fn(async () => sseResponse([
+      'data: {"error":{"code":403,"message":"user content secret","metadata":{"error_type":"permission"}}}\n\n',
+    ]))
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] })))
+      .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('user content secret')
+  })
+
+  it('rejects a clean EOF without DONE or an explicit non-error finish frame', async () => {
+    const fetch = vi.fn(async () => sseResponse([
+      'data: {"choices":[{"index":0,"delta":{"content":"truncated"}}]}\n\n',
+    ]))
+    const provider = new OpenRouterProvider({ credential, fetch, sleep: async () => undefined })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] })))
+      .rejects.toMatchObject({ code: 'OPENROUTER_REQUEST_FAILED' })
+    expect(fetch).toHaveBeenCalledTimes(4)
+  })
+
+  it('never treats finish_reason error as a normal finish', async () => {
+    const fetch = vi.fn(async () => sseResponse([
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"error","error":{"code":400,"message":"bad prompt"}}]}\n\n',
+    ]))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] })))
+      .rejects.toMatchObject({ code: 'OPENROUTER_REQUEST_FAILED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
 })

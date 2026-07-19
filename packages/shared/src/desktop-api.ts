@@ -183,11 +183,15 @@ export interface ExecutionDetail extends Omit<z.infer<typeof executionDetailSche
 
 const oneTimeApprovalDecisionSchema = z.object({
   executionId: identifierSchema,
+  permissionIndex: z.number().int().nonnegative(),
+  scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
   decision: z.enum(['once', 'deny']),
 }).strict()
 
 const persistentApprovalDecisionSchema = z.object({
   executionId: identifierSchema,
+  permissionIndex: z.number().int().nonnegative(),
+  scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
   decision: z.literal('always'),
   workflowId: identifierSchema,
   workflowVersion: nonEmptyStringSchema,

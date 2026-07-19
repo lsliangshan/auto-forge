@@ -5,6 +5,7 @@ describe('cross-process contracts', () => {
   it('rejects a persistent approval without an exact workflow version', () => {
     expect(() => approvalDecisionSchema.parse({
       executionId: 'exec_1', decision: 'always', workflowId: 'browser.search.baidu',
+      permissionIndex: 0, scopeHash: 'a'.repeat(64),
       capability: 'browser.open', scope: { origins: ['https://www.baidu.com'] },
     })).toThrow()
   })
@@ -16,6 +17,7 @@ describe('cross-process contracts', () => {
   it('accepts a version-bound persistent approval', () => {
     expect(approvalDecisionSchema.parse({
       executionId: 'exec_1', decision: 'always', workflowId: 'browser.search.baidu',
+      permissionIndex: 0, scopeHash: 'a'.repeat(64),
       workflowVersion: '1.0.0', capability: 'browser.open',
       scope: { origins: ['https://www.baidu.com'] },
     })).toMatchObject({ decision: 'always', workflowVersion: '1.0.0' })

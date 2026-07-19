@@ -10,7 +10,7 @@ import {
   type WorkflowDetail,
 } from '@autoforge/shared'
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
-import type { ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
+import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
 import { retrieveWorkflows } from '../workflows/retriever.js'
 import type { AppRepositories } from '../database/repositories.js'
 import type {
@@ -39,12 +39,13 @@ export interface AgentPolicyPort {
   releaseExecution(executionId: string): void
 }
 
-export interface AgentExecutionInput extends ExecutionStartInput {
-  executionId: string
-}
-
 export interface AgentExecutionPort {
-  start(input: AgentExecutionInput): Promise<StartedExecution | { id: string; finished: Promise<{ id: string; status: string; result?: unknown; errorCode?: string }> }>
+  reserve(): ExecutionReservation
+  startReserved(
+    reservation: ExecutionReservation,
+    input: ExecutionStartInput,
+    signal?: AbortSignal,
+  ): Promise<StartedExecution | { id: string; finished: Promise<{ id: string; status: string; result?: unknown; errorCode?: string }> }>
   cancel(executionId: string): Promise<void>
 }
 
@@ -175,6 +176,7 @@ interface PendingTool {
   workflow: WorkflowDetail
   args: unknown
   executionId: string
+  reservation: ExecutionReservation
   permissionIndex: number
 }
 
@@ -308,6 +310,10 @@ export class AgentOrchestrator {
     const pending = active.pending
     const permission = pending.workflow.permissions[pending.permissionIndex]
     if (!permission) return this.finish(active, 'failed', appFailure('CONFLICT'))
+    const expectedScopeHash = scopeHash(permission.scope)
+    if (parsed.data.permissionIndex !== pending.permissionIndex || parsed.data.scopeHash !== expectedScopeHash) {
+      return this.failedResult(active.requestId, 'CONFLICT')
+    }
 
     if (parsed.data.decision === 'deny') {
       return this.finish(active, 'failed', appFailure('PERMISSION_DENIED'))
@@ -429,8 +435,9 @@ export class AgentOrchestrator {
     } catch {
       return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
     }
-    const executionId = this.id()
-    active.pending = { callId: call.id, assistantContent, workflow, args: call.arguments, executionId, permissionIndex: 0 }
+    const reservation = this.dependencies.executions.reserve()
+    const executionId = reservation.executionId
+    active.pending = { callId: call.id, assistantContent, workflow, args: call.arguments, executionId, reservation, permissionIndex: 0 }
     active.executionId = executionId
     this.activeByExecution.set(executionId, active)
     this.appendBlock(active, {
@@ -451,9 +458,20 @@ export class AgentOrchestrator {
         scope: permission.scope,
       })
       if (!evaluation.allowed) {
+        const permissionScopeHash = scopeHash(permission.scope)
         const last = active.blocks.at(-1)
-        if (last?.type !== 'approval' || last.executionId !== pending.executionId) {
-          this.appendBlock(active, { type: 'approval', executionId: pending.executionId })
+        if (last?.type !== 'approval'
+          || last.executionId !== pending.executionId
+          || last.permissionIndex !== pending.permissionIndex
+          || last.scopeHash !== permissionScopeHash) {
+          this.appendBlock(active, {
+            type: 'approval',
+            executionId: pending.executionId,
+            permissionIndex: pending.permissionIndex,
+            capability: permission.capability,
+            scope: permission.scope,
+            scopeHash: permissionScopeHash,
+          })
         }
         return { requestId: active.requestId, status: 'awaiting_approval', executionId: pending.executionId }
       }
@@ -461,13 +479,12 @@ export class AgentOrchestrator {
     }
 
     this.appendBlock(active, { type: 'workflow_execution', executionId: pending.executionId })
-    const started = await this.dependencies.executions.start({
-      executionId: pending.executionId,
+    const started = await this.dependencies.executions.startReserved(pending.reservation, {
       workflowId: pending.workflow.id,
       workflowVersion: pending.workflow.version,
       input: pending.args,
       chatRunId: active.runId,
-    })
+    }, active.controller.signal)
     if (started.id !== pending.executionId) throw appFailure('CONFLICT')
     const execution = await started.finished
     if (active.cancelled || execution.status === 'cancelled') return this.finish(active, 'cancelled', appFailure('CANCELLED'))
@@ -514,7 +531,10 @@ export class AgentOrchestrator {
   ): AgentRunResult {
     if (active.terminal) return active.terminal
     const blocks = structuredClone(active.blocks)
-    if (error && status === 'failed') blocks.push({ type: 'error', code: error.code, message: error.message })
+    const errorBlock: ChatBlock | undefined = error && status === 'failed'
+      ? { type: 'error', code: error.code, message: error.message }
+      : undefined
+    if (errorBlock) blocks.push(errorBlock)
     this.dependencies.persistence.finalize({
       runId: active.runId,
       requestId: active.requestId,
@@ -528,6 +548,7 @@ export class AgentOrchestrator {
       ...(active.costUsd === undefined ? {} : { costUsd: active.costUsd }),
       ...(error ? { errorCode: error.code } : {}),
     })
+    active.blocks = blocks
     const result: AgentRunResult = {
       requestId: active.requestId,
       status,
@@ -538,6 +559,11 @@ export class AgentOrchestrator {
     if (active.pending) {
       this.activeByExecution.delete(active.pending.executionId)
       try { this.dependencies.policy.releaseExecution(active.pending.executionId) } catch { /* terminal persistence remains authoritative */ }
+    }
+    if (errorBlock) {
+      this.safeEmit({
+        type: 'block', conversationId: active.conversationId, messageId: active.messageId, block: errorBlock,
+      })
     }
     this.safeEmit({
       type: 'status', conversationId: active.conversationId, requestId: active.requestId, status,

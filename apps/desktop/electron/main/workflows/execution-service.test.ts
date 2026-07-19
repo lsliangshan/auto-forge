@@ -9,12 +9,13 @@ import type { ApprovalDecision, ExecutionEvent, WorkerCapabilityRequest, WorkerR
 import { workerRequestSchema } from '@autoforge/shared'
 import { describe, expect, it, vi } from 'vitest'
 import type { Execution, ExecutionLog, ExecutionStep } from '../database/repositories.js'
-import { PolicyEngine } from '../permissions/policy-engine.js'
+import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
   type CapabilityPort,
   type ExecutionRepositories,
+  type WorkflowExecutionSourceResolver,
   type WorkflowWorker,
   type WorkflowWorkerFactory,
 } from './execution-service.js'
@@ -143,6 +144,7 @@ function createHarness(options: {
     entryPath: string
     integrity: 'valid' | 'failed'
   }
+  sourceResolver?: WorkflowExecutionSourceResolver
   emit?: (event: ExecutionEvent) => void
   temporaryDirectories?: {
     create(): Promise<string>
@@ -165,7 +167,7 @@ function createHarness(options: {
   }
   const dependencies = {
     repositories,
-    sourceResolver: { resolve: async () => source },
+    sourceResolver: options.sourceResolver ?? { resolve: async () => source },
     policy,
     workers: workerFactory,
     capability,
@@ -263,18 +265,50 @@ async function runActualWorker(source: string, options: ActualWorkerOptions = {}
 }
 
 describe('ExecutionService', () => {
-  it('uses a main-process reserved execution ID so pre-start approval remains bound to the worker', async () => {
+  it('uses an unforgeable reservation so pre-start approval remains bound to the worker', async () => {
     const harness = createHarness()
-    const execution = await harness.service.start({
-      executionId: 'reserved_execution_1',
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(reservation, {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: { query: 'weather' },
     })
 
-    expect(execution.id).toBe('reserved_execution_1')
-    expect(harness.workerFactory.specifications[0]?.executionId).toBe('reserved_execution_1')
+    expect(execution.id).toBe(reservation.executionId)
+    expect(harness.workerFactory.specifications[0]?.executionId).toBe(reservation.executionId)
     await harness.service.cancel(execution.id)
+
+    await expect(harness.service.startReserved({ executionId: 'forged' } as never, {
+      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('cancels and settles a reserved start blocked before active registration without spawning', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    const source = {
+      workflow, rootPath: trustedRootPath, entryPath: 'workers/workflow-runner.ts', integrity: 'valid' as const,
+    }
+    const harness = createHarness({
+      sourceResolver: { resolve: async () => { await gate; return source } },
+    })
+    const reservation = harness.service.reserve()
+    const starting = harness.service.startReserved(reservation, {
+      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+    })
+    await turn()
+    let cancelSettled = false
+    const cancelling = harness.service.cancel(reservation.executionId).then(() => { cancelSettled = true })
+    await turn()
+    expect(cancelSettled).toBe(false)
+
+    release()
+    const started = await starting
+    await cancelling
+
+    await expect(started.finished).resolves.toMatchObject({ status: 'cancelled', errorCode: 'CANCELLED' })
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(harness.repositories.records.get(reservation.executionId)?.status).toBe('cancelled')
   })
 
   it('kills a timed-out worker and stores a terminal failure', async () => {
@@ -304,7 +338,12 @@ describe('ExecutionService', () => {
     expect(harness.repositories.records.get(execution.id)?.status).toBe('awaiting_approval')
     expect(worker.requests.some((message) => message.type === 'capability_result')).toBe(false)
 
-    await harness.service.decide({ executionId: execution.id, decision: 'once' })
+    await harness.service.decide({
+      executionId: execution.id,
+      permissionIndex: 0,
+      scopeHash: scopeHash(capabilityRequest.scope),
+      decision: 'once',
+    })
     await turn()
 
     expect(harness.repositories.records.get(execution.id)?.status).toBe('running')
@@ -324,6 +363,8 @@ describe('ExecutionService', () => {
     await turn()
     const decision: ApprovalDecision = {
       executionId: execution.id,
+      permissionIndex: 0,
+      scopeHash: scopeHash(capabilityRequest.scope),
       decision: 'always',
       workflowId: workflow.id,
       workflowVersion: workflow.version,

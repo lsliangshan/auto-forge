@@ -5,6 +5,7 @@ import {
   type AgentOrchestratorDependencies,
   type ProviderStreamEvent,
 } from './agent-orchestrator.js'
+import { scopeHash } from '../permissions/policy-engine.js'
 
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
@@ -25,6 +26,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
 } {
   const records = { users: [] as unknown[], starts: [] as unknown[], decisions: [] as unknown[], events: [] as unknown[], terminal: [] as unknown[] }
   const messages = new Map<string, { blocks: unknown[] }>()
+  let reservation = 0
   return {
     records,
     provider: { stream: () => events(turns.shift() ?? []) },
@@ -36,9 +38,10 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
       releaseExecution: () => undefined,
     },
     executions: {
-      start: async (input) => {
-        records.starts.push(input)
-        return { id: input.executionId, finished: Promise.resolve({ id: input.executionId, status: 'completed', result: { title: '天气' } }) }
+      reserve: () => ({ executionId: `reserved_${++reservation}` }),
+      startReserved: async (reserved, input) => {
+        records.starts.push({ ...input, executionId: reserved.executionId })
+        return { id: reserved.executionId, finished: Promise.resolve({ id: reserved.executionId, status: 'completed', result: { title: '天气' } }) }
       },
       cancel: async () => undefined,
     },
@@ -59,6 +62,7 @@ const toolTurn: ProviderStreamEvent[] = [
   { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1', name: workflow.id, arguments: { keyword: '今日天气' } },
   { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
 ]
+const approvalIdentity = { permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope) }
 
 describe('AgentOrchestrator', () => {
   it('persists the user first and pauses before starting an approval-gated workflow', async () => {
@@ -89,7 +93,7 @@ describe('AgentOrchestrator', () => {
     const orchestrator = new AgentOrchestrator(dependencies)
     const pending = await orchestrator.run({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', model: 'model' })
 
-    const done = await orchestrator.resumeApproval({ executionId: pending.executionId!, decision: 'once' })
+    const done = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
 
     expect(done.status).toBe('completed')
     expect(dependencies.records.starts).toHaveLength(1)
@@ -102,7 +106,7 @@ describe('AgentOrchestrator', () => {
     const mismatchOrchestrator = new AgentOrchestrator(mismatchDependencies)
     const mismatchPending = await mismatchOrchestrator.run({ conversationId: 'c1', content: '搜索', model: 'm' })
     const mismatch = await mismatchOrchestrator.resumeApproval({
-      executionId: mismatchPending.executionId!, decision: 'always', workflowId: workflow.id,
+      executionId: mismatchPending.executionId!, ...approvalIdentity, decision: 'always', workflowId: workflow.id,
       workflowVersion: workflow.version, capability: 'browser.open', scope: { origins: ['https://example.com'] },
     })
     expect(mismatch).toMatchObject({ status: 'failed', error: { code: 'INVALID_INPUT' } })
@@ -112,10 +116,58 @@ describe('AgentOrchestrator', () => {
     const denyDependencies = harness([toolTurn])
     const denyOrchestrator = new AgentOrchestrator(denyDependencies)
     const denyPending = await denyOrchestrator.run({ conversationId: 'c2', content: '搜索', model: 'm' })
-    const denied = await denyOrchestrator.resumeApproval({ executionId: denyPending.executionId!, decision: 'deny' })
+    const denied = await denyOrchestrator.resumeApproval({ executionId: denyPending.executionId!, ...approvalIdentity, decision: 'deny' })
     expect(denied).toMatchObject({ status: 'failed', error: { code: 'PERMISSION_DENIED' } })
     expect(denyDependencies.records.starts).toHaveLength(0)
     expect(denyDependencies.records.terminal).toHaveLength(1)
+  })
+
+  it.each(['once', 'always'] as const)('identifies and emits each missing permission across %s then once approval', async (firstDecision) => {
+    const secondPermission = { capability: 'browser.fill' as const, scope: { origins: ['https://www.baidu.com'] } }
+    const twoPermissionWorkflow = { ...workflow, permissions: [workflow.permissions[0]!, secondPermission] }
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '完成' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [twoPermissionWorkflow]
+    dependencies.retrieve = () => [twoPermissionWorkflow]
+    dependencies.policy.evaluate = (request) => ({
+      allowed: dependencies.records.decisions.some((record) => {
+        const value = record as { capability: string; scope: unknown }
+        return value.capability === request.capability && JSON.stringify(value.scope) === JSON.stringify(request.scope)
+      }),
+      requiresApproval: true,
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const first = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+
+    const second = await orchestrator.resumeApproval(firstDecision === 'always' ? {
+      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope),
+      decision: 'always', workflowId: workflow.id, workflowVersion: workflow.version,
+      capability: workflow.permissions[0]!.capability, scope: workflow.permissions[0]!.scope,
+    } : {
+      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope), decision: 'once',
+    })
+
+    expect(second).toMatchObject({ status: 'awaiting_approval', executionId: first.executionId })
+    expect(dependencies.records.starts).toHaveLength(0)
+    const approvals = dependencies.records.events
+      .map((event) => (event as { block?: unknown }).block)
+      .filter((block): block is { type: string; permissionIndex: number; scopeHash: string; capability: string } => Boolean(block) && (block as { type?: string }).type === 'approval')
+    expect(approvals.map((block) => block.permissionIndex)).toEqual([0, 1])
+    expect(approvals.map((block) => block.capability)).toEqual(['browser.open', 'browser.fill'])
+
+    const stale = await orchestrator.resumeApproval({
+      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope), decision: 'once',
+    })
+    expect(stale).toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
+    expect(dependencies.records.starts).toHaveLength(0)
+
+    const done = await orchestrator.resumeApproval({
+      executionId: first.executionId!, permissionIndex: 1, scopeHash: scopeHash(secondPermission.scope), decision: 'once',
+    })
+    expect(done.status).toBe('completed')
+    expect(dependencies.records.starts).toHaveLength(1)
   })
 
   it('rejects unknown tools, invalid args, multiple active tools, and model-turn overflow', async () => {
@@ -152,6 +204,28 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 
+  it('atomically finalizes an error block before emitting that block and terminal status', async () => {
+    const dependencies = harness([[
+      { ...toolTurn[0]!, name: 'unknown' } as ProviderStreamEvent,
+      toolTurn[1]!,
+    ]])
+    const order: string[] = []
+    dependencies.persistence.finalize = (value) => {
+      order.push(`finalize:${JSON.stringify(value.blocks.at(-1))}`)
+      dependencies.records.terminal.push(value)
+    }
+    dependencies.emit = (event) => { order.push(`emit:${event.type}:${event.type === 'block' ? event.block.type : event.status}`) }
+
+    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', model: 'm' })
+
+    expect(result.status).toBe('failed')
+    expect(order.slice(-3)).toEqual([
+      expect.stringContaining('finalize:{"type":"error"'),
+      'emit:block:error',
+      'emit:status:failed',
+    ])
+  })
+
   it('terminalizes the durable run when workflow discovery fails before the provider starts', async () => {
     const dependencies = harness([])
     dependencies.workflows.list = async () => { throw new Error('registry unavailable') }
@@ -167,8 +241,8 @@ describe('AgentOrchestrator', () => {
     let resolveExecution!: (value: { id: string; status: string }) => void
     const dependencies = harness([toolTurn])
     dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
-    dependencies.executions.start = async (input) => ({
-      id: input.executionId,
+    dependencies.executions.startReserved = async (reserved) => ({
+      id: reserved.executionId,
       finished: new Promise((resolve) => { resolveExecution = resolve }),
     })
     let cancelled = false
@@ -189,18 +263,18 @@ describe('AgentOrchestrator', () => {
       { type: 'text_delta', choiceIndex: 0, text: '完成' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
-    dependencies.executions.start = async (input) => {
-      dependencies.records.starts.push(input)
+    dependencies.executions.startReserved = async (reserved, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reserved.executionId })
       return {
-        id: input.executionId,
+        id: reserved.executionId,
         finished: new Promise((resolve) => { finishExecution = resolve }),
       }
     }
     const orchestrator = new AgentOrchestrator(dependencies)
     const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
 
-    const first = orchestrator.resumeApproval({ executionId: pending.executionId!, decision: 'once' })
-    const second = await orchestrator.resumeApproval({ executionId: pending.executionId!, decision: 'once' })
+    const first = orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
+    const second = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
     expect(second).toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
     expect(dependencies.records.starts).toHaveLength(1)
 

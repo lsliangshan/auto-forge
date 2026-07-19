@@ -44,8 +44,15 @@ export interface OpenRouterProviderDependencies {
   fetch?: FetchPort
   sleep?: SleepPort
   random?: () => number
-  diagnostic?: (diagnostic: { operation: 'models' | 'chat'; status?: number; body?: string }) => void
+  diagnostic?: (diagnostic: { operation: 'models' | 'chat'; status?: number; code?: string | number; error_type?: string }) => void
 }
+
+const providerErrorSchema = z.object({
+  code: z.union([z.string(), z.number()]).optional(),
+  message: z.string().optional(),
+  error_type: z.string().optional(),
+  metadata: z.object({ error_type: z.string().optional() }).passthrough().optional(),
+}).passthrough()
 
 const modelResponseSchema = z.object({
   data: z.array(z.object({
@@ -74,6 +81,7 @@ const streamChunkSchema = z.object({
       }).passthrough()).optional(),
     }).passthrough().optional().default({}),
     finish_reason: z.string().nullable().optional(),
+    error: providerErrorSchema.optional(),
   }).passthrough()).optional().default([]),
   usage: z.object({
     prompt_tokens: z.number().int().nonnegative(),
@@ -81,6 +89,7 @@ const streamChunkSchema = z.object({
     total_tokens: z.number().int().nonnegative(),
     cost: z.union([z.number(), z.string()]).refine((value) => Number.isFinite(Number(value)) && Number(value) >= 0).optional(),
   }).passthrough().optional(),
+  error: providerErrorSchema.optional(),
 }).passthrough()
 
 class RetryableFailure extends Error {
@@ -123,14 +132,6 @@ function retryAfter(response: Response): number | undefined {
   return Math.max(0, Math.min(MAX_RETRY_AFTER_MS, milliseconds))
 }
 
-function safeBody(value: string, secret: string): string {
-  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return value
-    .slice(0, MAX_DIAGNOSTIC_BODY)
-    .replace(new RegExp(escaped, 'g'), '[REDACTED]')
-    .replace(/(authorization|api[_-]?key|token|cookie)\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+/gi, '$1=[REDACTED]')
-}
-
 async function boundedResponseText(response: Response): Promise<string> {
   if (!response.body) return ''
   const reader = response.body.getReader()
@@ -153,6 +154,38 @@ async function boundedResponseText(response: Response): Promise<string> {
     await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
+}
+
+type ProviderError = z.infer<typeof providerErrorSchema>
+
+function safeMetadataValue(value: unknown): string | number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.length <= 64 && /^[a-z0-9_.-]+$/i.test(value)) return value
+  return undefined
+}
+
+function providerErrorMetadata(error: ProviderError | undefined): { code?: string | number; error_type?: string } {
+  const code = safeMetadataValue(error?.code)
+  const errorTypeValue = safeMetadataValue(error?.metadata?.error_type ?? error?.error_type)
+  return {
+    ...(code === undefined ? {} : { code }),
+    ...(typeof errorTypeValue === 'string' ? { error_type: errorTypeValue } : {}),
+  }
+}
+
+function numericProviderCode(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isInteger(value)) return value
+  if (typeof value === 'string' && /^\d{3}$/.test(value)) return Number(value)
+  return undefined
+}
+
+function streamedFailure(error: ProviderError | undefined): RetryableFailure | AppError {
+  const code = numericProviderCode(error?.code)
+  const errorType = String(error?.metadata?.error_type ?? error?.error_type ?? '').toLowerCase()
+  if (code === 401 || code === 403) return failure('CREDENTIAL_INVALID')
+  if (code === 429 || (code !== undefined && code >= 500)) return new RetryableFailure()
+  if (/network|connection|timeout|upstream|unavailable/.test(errorType)) return new RetryableFailure()
+  return failure('OPENROUTER_REQUEST_FAILED')
 }
 
 function millionPrice(value: string | undefined): number | undefined {
@@ -187,8 +220,8 @@ export class OpenRouterProvider {
   }
 
   async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
-    const { response, secret } = await this.fetchModels(signal)
-    if (!response.ok) await this.throwHttpFailure('models', response, secret)
+    const { response } = await this.fetchModels(signal)
+    if (!response.ok) await this.throwHttpFailure('models', response)
     let parsed: z.infer<typeof modelResponseSchema>
     try {
       parsed = modelResponseSchema.parse(await response.json())
@@ -255,10 +288,10 @@ export class OpenRouterProvider {
           throw failure('OPENROUTER_REQUEST_FAILED')
         }
         if (response.status === 429 || response.status >= 500) {
-          await this.readDiagnostic('chat', response, secret)
+          await this.readDiagnostic('chat', response)
           throw new RetryableFailure(retryAfter(response))
         }
-        if (!response.ok) await this.throwHttpFailure('chat', response, secret)
+        if (!response.ok) await this.throwHttpFailure('chat', response)
 
         try {
           yield* this.parseStream(response, replay, request.signal)
@@ -298,7 +331,7 @@ export class OpenRouterProvider {
         continue
       }
       if (response.status !== 429 && response.status < 500) return { response, secret }
-      await this.readDiagnostic('models', response, secret)
+      await this.readDiagnostic('models', response)
       if (attempt === MAX_ATTEMPTS - 1) throw failure('OPENROUTER_REQUEST_FAILED')
       await this.retryDelay(attempt, retryAfter(response), signal)
     }
@@ -327,17 +360,26 @@ export class OpenRouterProvider {
     }
   }
 
-  private async throwHttpFailure(operation: 'models' | 'chat', response: Response, secret: string): Promise<never> {
-    await this.readDiagnostic(operation, response, secret)
+  private async throwHttpFailure(operation: 'models' | 'chat', response: Response): Promise<never> {
+    await this.readDiagnostic(operation, response)
     if (response.status === 401 || response.status === 403) throw failure('CREDENTIAL_INVALID')
     throw failure('OPENROUTER_REQUEST_FAILED')
   }
 
-  private async readDiagnostic(operation: 'models' | 'chat', response: Response, secret: string): Promise<void> {
+  private async readDiagnostic(operation: 'models' | 'chat', response: Response): Promise<void> {
+    let metadata: { code?: string | number; error_type?: string } = {}
+    try {
+      const parsed = JSON.parse(await boundedResponseText(response)) as unknown
+      const envelope = z.object({ error: providerErrorSchema.optional() }).passthrough().safeParse(parsed)
+      const direct = providerErrorSchema.safeParse(parsed)
+      metadata = providerErrorMetadata(envelope.success && envelope.data.error
+        ? envelope.data.error
+        : direct.success ? direct.data : undefined)
+    } catch {
+      // The body is deliberately drained but never forwarded to diagnostics.
+    }
     if (!this.dependencies.diagnostic) return
-    let body = ''
-    try { body = safeBody(await boundedResponseText(response), secret) } catch { /* response diagnostics are optional */ }
-    try { this.dependencies.diagnostic({ operation, status: response.status, ...(body ? { body } : {}) }) } catch { /* diagnostics are observational */ }
+    try { this.dependencies.diagnostic({ operation, status: response.status, ...metadata }) } catch { /* diagnostics are observational */ }
   }
 
   private async *parseStream(response: Response, replay: ReplayState, signal?: AbortSignal): AsyncGenerator<OpenRouterStreamEvent> {
@@ -347,6 +389,7 @@ export class OpenRouterProvider {
     const tools = new Map<string, ToolAccumulator>()
     let parserError: unknown
     let done = false
+    let explicitTerminal = false
     const parser = createParser({
       maxBufferSize: 1024 * 1024,
       onError(error) { parserError = error },
@@ -354,6 +397,11 @@ export class OpenRouterProvider {
         if (data === '[DONE]') { done = true; return }
         let chunk: z.infer<typeof streamChunkSchema>
         try { chunk = streamChunkSchema.parse(JSON.parse(data)) } catch (error) { parserError = error; return }
+        if (chunk.error) {
+          this.reportStreamDiagnostic(chunk.error)
+          parserError = streamedFailure(chunk.error)
+          return
+        }
         if (chunk.id && !replay.generations.has(chunk.id)) {
           replay.generations.add(chunk.id)
           pending.push({ type: 'generation', id: chunk.id })
@@ -383,6 +431,12 @@ export class OpenRouterProvider {
             tools.set(key, accumulated)
           }
           if (choice.finish_reason) {
+            if (choice.finish_reason === 'error' || choice.error) {
+              this.reportStreamDiagnostic(choice.error)
+              parserError = streamedFailure(choice.error)
+              return
+            }
+            if (choice.index === 0) explicitTerminal = true
             if (choice.finish_reason === 'tool_calls') {
               for (const [key, tool] of tools) {
                 const [choiceIndexValue, toolIndexValue] = key.split(':')
@@ -430,9 +484,15 @@ export class OpenRouterProvider {
       parser.reset({ consume: true })
       if (parserError) throw parserError
       while (pending.length) yield pending.shift()!
+      if (!done && !explicitTerminal) throw new RetryableFailure()
     } finally {
       if (signal?.aborted || done) await reader.cancel().catch(() => undefined)
       reader.releaseLock()
     }
+  }
+
+  private reportStreamDiagnostic(error: ProviderError | undefined): void {
+    if (!this.dependencies.diagnostic) return
+    try { this.dependencies.diagnostic({ operation: 'chat', ...providerErrorMetadata(error) }) } catch { /* diagnostics are observational */ }
   }
 }
