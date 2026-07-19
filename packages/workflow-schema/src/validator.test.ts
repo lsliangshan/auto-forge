@@ -1,6 +1,28 @@
 import { describe, expect, it } from 'vitest'
 import { validateManifest } from './validator.js'
 
+function validManifest() {
+  return {
+    id: 'com.autoforge.browser.search',
+    version: '1.2.3',
+    name: '百度搜索',
+    description: '在百度中搜索信息。',
+    author: 'AutoForge',
+    category: 'search',
+    entryPath: 'dist/index.mjs',
+    codeSha256: 'a'.repeat(64),
+    permissions: [{
+      capability: 'browser.open',
+      scope: { origins: ['https://www.baidu.com'] },
+    }],
+    activationExamples: ['使用百度搜索今日天气'],
+    activationNegativeExamples: [],
+    timeoutMs: 30_000,
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+  }
+}
+
 describe('validateManifest', () => {
   it('requires activation examples and exact browser origins', () => {
     const result = validateManifest({
@@ -70,6 +92,28 @@ describe('validateManifest', () => {
       { ...manifest, timeoutMs: 300_001 },
     ]) {
       expect(validateManifest(invalid).valid).toBe(false)
+    }
+  })
+
+  it('rejects reverse-DNS labels ending in a hyphen', () => {
+    expect(validateManifest({ ...validManifest(), id: 'com-.autoforge.browser.search' }).valid).toBe(false)
+  })
+
+  it('rejects SemVer numeric prerelease identifiers with leading zeroes', () => {
+    expect(validateManifest({ ...validManifest(), version: '1.2.3-01' }).valid).toBe(false)
+  })
+
+  it('requires browser origins to be exact HTTPS URL origins', () => {
+    for (const origin of [
+      'https://allowed.example@evil.example',
+      'https://allowed.example/path',
+      'https://allowed.example?query=value',
+      'https://allowed.example#fragment',
+    ]) {
+      expect(validateManifest({
+        ...validManifest(),
+        permissions: [{ capability: 'browser.open', scope: { origins: [origin] } }],
+      }).valid).toBe(false)
     }
   })
 })

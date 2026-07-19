@@ -6,6 +6,23 @@ import type { WorkflowManifest } from './manifest.js'
 
 const ajv = new Ajv({ allErrors: true, strict: true })
 addFormats(ajv)
+ajv.addFormat('https-origin', {
+  type: 'string',
+  validate(value: string): boolean {
+    try {
+      const url = new URL(value)
+      return url.protocol === 'https:'
+        && url.username === ''
+        && url.password === ''
+        && url.pathname === '/'
+        && url.search === ''
+        && url.hash === ''
+        && url.origin === value
+    } catch {
+      return false
+    }
+  },
+})
 const validate = ajv.compile<WorkflowManifest>(manifestSchema)
 
 export function validateManifest(value: unknown): ValidationResult {
