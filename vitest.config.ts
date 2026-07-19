@@ -1,14 +1,26 @@
-import { resolve } from 'node:path'
-import vue from '@vitejs/plugin-vue'
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
-  plugins: [vue()],
-  resolve: { alias: { '@renderer': resolve('src/renderer/src'), '@shared': resolve('src/shared') } },
   test: {
-    include: ['src/**/*.test.ts', 'packages/**/*.test.ts', 'server/**/*.test.ts'],
-    environment: 'happy-dom',
-    globals: true,
-    setupFiles: []
-  }
+    projects: [
+      'packages/*',
+      'apps/desktop/vitest.config.ts',
+      'apps/desktop/vitest.node.config.ts',
+      {
+        test: {
+          name: 'examples',
+          environment: 'node',
+          include: ['examples/**/*.test.ts'],
+        },
+      },
+      {
+        test: {
+          name: 'root',
+          environment: 'node',
+          include: ['tests/**/*.test.ts'],
+          exclude: ['tests/e2e/**'],
+        },
+      },
+    ],
+  },
 })

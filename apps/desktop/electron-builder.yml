@@ -1,0 +1,6 @@
+appId: com.autoforge.desktop
+productName: AutoForge
+directories:
+  output: dist
+files:
+  - out/**

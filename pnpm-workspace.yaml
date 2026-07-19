@@ -1,0 +1,11 @@
+packages:
+  - apps/*
+  - packages/*
+  - examples/*
+allowBuilds:
+  better-sqlite3: true
+  electron-winstaller: true
+  esbuild: true
+  playwright-chromium: true
+minimumReleaseAgeExclude:
+  - happy-dom@20.11.0

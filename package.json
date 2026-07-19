@@ -1,60 +1,27 @@
 {
   "name": "auto-forge",
   "version": "0.1.0",
-  "description": "AutoForge desktop automation tool marketplace.",
-  "main": "./out/main/index.js",
-  "author": "AutoForge Contributors",
-  "license": "MIT",
   "private": true,
   "type": "module",
-  "workspaces": [
-    "packages/*",
-    "server"
-  ],
-  "engines": {
-    "node": ">=22.12.0"
-  },
+  "packageManager": "pnpm@11.15.0",
+  "engines": { "node": ">=22.12.0 <27" },
   "scripts": {
-    "dev": "electron-vite dev",
-    "dev:renderer": "vite --config vite.renderer.config.ts",
-    "build": "electron-vite build",
-    "preview": "vite preview --config vite.renderer.config.ts",
-    "postinstall": "node scripts/install-electron.mjs && electron-builder install-app-deps",
-    "test:unit": "vitest run",
-    "test:contracts": "vitest run packages/workflow-contracts",
-    "test:server": "vitest run server",
-    "typecheck:contracts": "tsc --noEmit -p packages/workflow-contracts/tsconfig.json",
-    "typecheck:server": "tsc --noEmit -p server/tsconfig.json",
-    "test:e2e": "npm run build && playwright test",
-    "typecheck": "npm run typecheck:node && npm run typecheck:renderer && npm run typecheck:contracts && npm run typecheck:server",
-    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
-    "typecheck:renderer": "vue-tsc --noEmit -p tsconfig.web.json",
-    "dist:dir": "npm run build && electron-builder --dir"
-  },
-  "dependencies": {
-    "@electron-toolkit/utils": "^3.0.0",
-    "@element-plus/icons-vue": "^2.3.1",
-    "esbuild": "0.25.12",
-    "element-plus": "^2.9.14",
-    "pinia": "^2.3.1",
-    "vue": "^3.5.13",
-    "vue-router": "^4.5.0"
+    "lint": "eslint .",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "vitest run",
+    "build": "pnpm -r --filter \"./packages/**\" build && pnpm --filter @autoforge/desktop build",
+    "dev": "pnpm -r --filter \"./packages/**\" build && pnpm --filter @autoforge/desktop dev",
+    "test:e2e": "pnpm build && playwright test",
+    "dist:dir": "pnpm build && pnpm --filter @autoforge/desktop dist:dir"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
-    "@types/node": "^22.10.2",
-    "@vitejs/plugin-vue": "^5.2.1",
-    "@vue/test-utils": "^2.4.6",
-    "autoprefixer": "^10.4.20",
-    "electron": "^43.1.1",
-    "electron-builder": "^25.1.8",
-    "electron-vite": "^5.0.0",
-    "happy-dom": "^17.6.3",
-    "postcss": "^8.4.49",
-    "tailwindcss": "^3.4.17",
-    "typescript": "^5.7.2",
-    "vite": "^6.0.5",
-    "vitest": "^3.0.5",
-    "vue-tsc": "^2.2.0"
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.61.1",
+    "@types/node": "24.13.3",
+    "eslint": "10.7.0",
+    "eslint-plugin-vue": "10.9.2",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.64.0",
+    "vitest": "4.1.10"
   }
 }
