@@ -150,6 +150,7 @@ interface ActiveExecution {
   stepSequence: number
   finished: Promise<Execution>
   resolveFinished: (execution: Execution) => void
+  rejectFinished: (error: AppError) => void
   finishing?: Promise<void>
 }
 
@@ -244,7 +245,12 @@ export class ExecutionService {
     }
 
     let resolveFinished: (execution: Execution) => void = () => undefined
-    const finished = new Promise<Execution>((resolvePromise) => { resolveFinished = resolvePromise })
+    let rejectFinished: (error: AppError) => void = () => undefined
+    const finished = new Promise<Execution>((resolvePromise, rejectPromise) => {
+      resolveFinished = resolvePromise
+      rejectFinished = rejectPromise
+    })
+    void finished.catch(() => undefined)
     const active: ActiveExecution = {
       id,
       workflow,
@@ -260,6 +266,7 @@ export class ExecutionService {
       stepSequence: 0,
       finished,
       resolveFinished,
+      rejectFinished,
     }
     this.active.set(id, active)
     this.attach(active)
@@ -570,6 +577,7 @@ export class ExecutionService {
     active.finishing = (async () => {
       clearTimeout(active.timer)
       let updated: Execution | undefined
+      let persistenceError: AppError | undefined
       try {
         updated = this.dependencies.repositories.executions.update(executionId, {
           status,
@@ -587,6 +595,8 @@ export class ExecutionService {
             occurredAt: new Date().toISOString(),
           })
         }
+      } catch (error) {
+        persistenceError = toSafeAppError(error)
       } finally {
         try {
           this.dependencies.policy.releaseExecution(executionId)
@@ -608,6 +618,7 @@ export class ExecutionService {
         await this.removeTemporaryDirectory(active.directory)
         this.active.delete(executionId)
         if (updated) active.resolveFinished(updated)
+        else active.rejectFinished(persistenceError ?? failure('INTERNAL_ERROR'))
       }
     })()
     return active.finishing

@@ -534,6 +534,51 @@ describe('ExecutionService', () => {
     expect(worker.killed).toBe(true)
     expect(removed).toBe('/tmp/autoforge-event-test')
   })
+
+  it.each([
+    ['throws', 'INTERNAL_ERROR', true],
+    ['returns empty', 'NOT_FOUND', false],
+  ] as const)('rejects finished and completes cleanup when terminal persistence %s', async (_case, code, throws) => {
+    let closed = false
+    let removed = false
+    const harness = createHarness({
+      capability: {
+        request: async () => undefined,
+        closeExecution: async () => { closed = true },
+      },
+      temporaryDirectories: {
+        create: async () => '/tmp/autoforge-persistence-test',
+        remove: async () => { removed = true },
+      },
+    })
+    const update = harness.repositories.executions.update
+    harness.repositories.executions.update = (id, value) => {
+      if (value.status === 'completed') {
+        if (throws) throw new Error('database unavailable')
+        return undefined
+      }
+      return update(id, value)
+    }
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'result', output: { ok: true } })
+
+    const settlement = await Promise.race([
+      execution.finished.then(
+        (value) => ({ type: 'resolved' as const, value }),
+        (error: unknown) => ({ type: 'rejected' as const, error }),
+      ),
+      new Promise<{ type: 'timed-out' }>((resolvePromise) => {
+        setTimeout(() => resolvePromise({ type: 'timed-out' }), 100)
+      }),
+    ])
+
+    expect(settlement).toMatchObject({ type: 'rejected', error: { code } })
+    expect(closed).toBe(true)
+    expect(removed).toBe(true)
+    expect(worker.killed).toBe(true)
+  })
 })
 
 describe('NodeWorkerFactory', () => {
@@ -699,5 +744,40 @@ describe('NodeWorkerFactory', () => {
 
     expect(messages.map((message) => message.type)).toEqual(['ready', 'capability_request', 'result'])
     expect(messages.at(-1)).toEqual({ type: 'result', output: { resumed: true } })
+  })
+
+  it('waits for an unawaited capability call before completing', async () => {
+    let answered = false
+    let responseTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const messages = await runActualWorker(`
+        import { defineWorkflow } from '@autoforge/workflow-sdk'
+        export default defineWorkflow({
+          async run(context) {
+            context.browser.open('https://www.baidu.com')
+            return { returnedBeforeCapability: true }
+          },
+        })
+      `, {
+        onMessage: (message, worker) => {
+          if (message.type === 'capability_request') {
+            responseTimer = setTimeout(() => {
+              if (worker.killed) return
+              answered = true
+              worker.stdin!.write(`${JSON.stringify({
+                type: 'capability_result',
+                requestId: message.requestId,
+                result: null,
+              })}\n`)
+            }, 20)
+          }
+          if (message.type === 'result') expect(answered).toBe(true)
+        },
+      })
+
+      expect(messages.map((message) => message.type)).toEqual(['ready', 'capability_request', 'result'])
+    } finally {
+      if (responseTimer) clearTimeout(responseTimer)
+    }
   })
 })

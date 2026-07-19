@@ -28,6 +28,7 @@ interface RunnerState {
   started: boolean
   terminal: boolean
   pending: Map<string, PendingRequest>
+  pendingWaiters: Set<() => void>
 }
 
 function protocolError(): AppError {
@@ -156,10 +157,24 @@ async function loadWorkflow(
 function requestCapability(state: RunnerState, request: WorkerCapabilityRequest): Promise<unknown> {
   if (state.terminal) return Promise.reject(cancelledError())
   const requestId = randomUUID()
-  return new Promise((resolve, reject) => {
+  const result = new Promise((resolve, reject) => {
     state.pending.set(requestId, { resolve, reject })
     write({ type: 'capability_request', requestId, request })
   })
+  void result.catch(() => undefined)
+  return result
+}
+
+function notifyPendingDrained(state: RunnerState): void {
+  if (state.pending.size !== 0) return
+  for (const resolvePending of state.pendingWaiters) resolvePending()
+  state.pendingWaiters.clear()
+}
+
+async function waitForPending(state: RunnerState): Promise<void> {
+  while (state.pending.size !== 0) {
+    await new Promise<void>((resolvePending) => state.pendingWaiters.add(resolvePending))
+  }
 }
 
 function terminate(state: RunnerState, error: AppError): void {
@@ -167,6 +182,7 @@ function terminate(state: RunnerState, error: AppError): void {
   state.terminal = true
   for (const pending of state.pending.values()) pending.reject(error)
   state.pending.clear()
+  notifyPendingDrained(state)
   write({ type: 'error', error })
   process.stdin.pause()
 }
@@ -177,6 +193,7 @@ async function runWorkflow(state: RunnerState, message: Extract<WorkerRequest, {
     if (state.terminal) return
     write({ type: 'ready', executionId: message.executionId })
     const output = await loaded.definition.run(loaded.context, message.input)
+    await waitForPending(state)
     if (!state.terminal) {
       state.terminal = true
       write({ type: 'result', output: output ?? null })
@@ -207,6 +224,7 @@ async function handle(state: RunnerState, message: WorkerRequest): Promise<void>
   state.pending.delete(message.requestId)
   if (message.type === 'capability_result') pending.resolve(message.result)
   else pending.reject(message.error)
+  notifyPendingDrained(state)
 }
 
 function consumeJsonLines(onLine: (line: Buffer) => void, onViolation: () => void): (chunk: Buffer | string) => void {
@@ -237,7 +255,12 @@ function consumeJsonLines(onLine: (line: Buffer) => void, onViolation: () => voi
 }
 
 function startRunner(): void {
-  const state: RunnerState = { started: false, terminal: false, pending: new Map() }
+  const state: RunnerState = {
+    started: false,
+    terminal: false,
+    pending: new Map(),
+    pendingWaiters: new Set(),
+  }
   let queue = Promise.resolve()
   const violate = () => terminate(state, protocolError())
   process.stdin.on('data', consumeJsonLines((line) => {
