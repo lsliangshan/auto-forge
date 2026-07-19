@@ -10,7 +10,17 @@ export default defineConfig({
     build: {
       rollupOptions: {
         input: {
-          index: new URL('./src/main.ts', import.meta.url).pathname,
+          index: new URL('./electron/main/index.ts', import.meta.url).pathname,
+        },
+      },
+    },
+  },
+  preload: {
+    plugins: [externalizeDepsPlugin()],
+    build: {
+      rollupOptions: {
+        input: {
+          index: new URL('./electron/preload/index.ts', import.meta.url).pathname,
         },
       },
     },

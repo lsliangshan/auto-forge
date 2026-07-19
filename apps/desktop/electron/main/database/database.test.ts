@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { openAppDatabase } from './client.js'
+import { resolveMigrationDirectory } from './migrations.js'
 
 const temporaryDirectories: string[] = []
 
@@ -27,6 +28,13 @@ describe('openAppDatabase', () => {
     expect(config).toContain('extraResources:\n  - from: resources/migrations\n    to: migrations')
   })
 
+  it('resolves source migrations from the bundled main module location in development', () => {
+    const bundledMainUrl = new URL('../../../out/main/index.js', import.meta.url).href
+    expect(resolveMigrationDirectory(bundledMainUrl, '')).toBe(
+      fileURLToPath(new URL('../../../resources/migrations/', import.meta.url)),
+    )
+  })
+
   it('migrates a fresh database and interrupts abandoned executions', () => {
     const database = openTestDatabase()
 
@@ -40,6 +48,26 @@ describe('openAppDatabase', () => {
     expect(database.schemaVersion()).toBe(1)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
+  })
+
+  it('recovers every nonterminal execution and chat run without claiming success', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'recovery_conversation', title: 'Recovery' })
+    for (const status of ['queued', 'awaiting_approval', 'running']) {
+      database.executions.insert({
+        id: `execution_${status}`, status, workflowId: 'workflow', workflowVersion: '1.0.0',
+      })
+      database.chatRuns.insert({
+        id: `run_${status}`, conversationId: 'recovery_conversation', requestId: `request_${status}`,
+        model: 'model', status, startedAt: 1,
+      })
+    }
+
+    expect(database.recoverInterrupted()).toEqual({ executions: 3, chatRuns: 3 })
+    for (const status of ['queued', 'awaiting_approval', 'running']) {
+      expect(database.executions.get(`execution_${status}`)).toMatchObject({ status: 'interrupted' })
+      expect(database.chatRuns.get(`run_${status}`)).toMatchObject({ status: 'failed', errorCode: 'INTERNAL_ERROR' })
+    }
   })
 
   it('persists JSON message blocks in chronological order and cascades deletion', () => {

@@ -4,6 +4,5 @@
     "noEmit": true,
     "types": ["vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.vue"],
-  "exclude": ["src/main.ts"]
+  "include": ["src/**/*.ts", "src/**/*.vue", "electron/preload/index.d.ts"]
 }

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Capability, CapabilityScope } from '@autoforge/shared'
 import type { AppRepositories, PermissionGrant } from '../database/repositories.js'
 
-type PermissionGrantRepository = AppRepositories['permissionGrants']
+type PermissionGrantRepository = Pick<AppRepositories['permissionGrants'], 'upsert' | 'get' | 'delete'>
 
 export interface PermissionRequest {
   executionId: string

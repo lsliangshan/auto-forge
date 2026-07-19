@@ -290,6 +290,7 @@ export const ipcChannels = {
   settingsValidateOpenRouterKey: 'settings:validate-openrouter-key',
   settingsListModels: 'settings:list-models',
   settingsClearLocalData: 'settings:clear-local-data',
+  systemOpenExternal: 'system:open-external',
 } as const
 
 export type IpcChannel = (typeof ipcChannels)[keyof typeof ipcChannels]
@@ -329,6 +330,22 @@ export const listModelsRequestSchema = z.undefined()
 export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
 }).strict()
+export const openExternalRequestSchema = z.object({
+  url: z.string().superRefine((value, context) => {
+    try {
+      const parsed = new URL(value)
+      if (parsed.protocol !== 'https:'
+        || parsed.username !== ''
+        || parsed.password !== ''
+        || parsed.port !== ''
+        || parsed.href !== value) {
+        context.addIssue({ code: 'custom', message: 'A canonical default-port HTTPS URL is required' })
+      }
+    } catch {
+      context.addIssue({ code: 'custom', message: 'A canonical default-port HTTPS URL is required' })
+    }
+  }),
+}).strict()
 
 export const ipcRequestSchemas = {
   [ipcChannels.chatListConversations]: z.undefined(),
@@ -360,6 +377,44 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsValidateOpenRouterKey]: validateOpenRouterKeyRequestSchema,
   [ipcChannels.settingsListModels]: listModelsRequestSchema,
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
+  [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
+} as const
+
+const voidResponseSchema = z.void()
+const requestIdResponseSchema = z.object({ requestId: identifierSchema }).strict()
+const executionIdResponseSchema = z.object({ executionId: identifierSchema }).strict()
+
+export const ipcResponseSchemas = {
+  [ipcChannels.chatListConversations]: z.array(conversationSummarySchema),
+  [ipcChannels.chatCreateConversation]: conversationSummarySchema,
+  [ipcChannels.chatRenameConversation]: conversationSummarySchema,
+  [ipcChannels.chatDeleteConversation]: voidResponseSchema,
+  [ipcChannels.chatSend]: requestIdResponseSchema,
+  [ipcChannels.chatCancel]: voidResponseSchema,
+  [ipcChannels.workflowsList]: z.array(workflowSummarySchema),
+  [ipcChannels.workflowsGet]: workflowDetailSchema,
+  [ipcChannels.workflowsSetEnabled]: voidResponseSchema,
+  [ipcChannels.workflowsInstallProject]: workflowDetailSchema,
+  [ipcChannels.developerCreateProject]: developerProjectSchema,
+  [ipcChannels.developerRegisterProject]: developerProjectSchema.nullable(),
+  [ipcChannels.developerReadFile]: z.string(),
+  [ipcChannels.developerWriteFile]: voidResponseSchema,
+  [ipcChannels.developerValidate]: validationResultSchema,
+  [ipcChannels.developerRun]: executionIdResponseSchema,
+  [ipcChannels.executionsList]: z.array(executionSummarySchema),
+  [ipcChannels.executionsGet]: executionDetailSchema,
+  [ipcChannels.executionsDecide]: voidResponseSchema,
+  [ipcChannels.executionsCancel]: voidResponseSchema,
+  [ipcChannels.permissionsListGrants]: z.array(permissionGrantSchema),
+  [ipcChannels.permissionsRevoke]: voidResponseSchema,
+  [ipcChannels.settingsGet]: appSettingsSchema,
+  [ipcChannels.settingsUpdate]: appSettingsSchema,
+  [ipcChannels.settingsSaveOpenRouterKey]: credentialStatusSchema,
+  [ipcChannels.settingsClearOpenRouterKey]: voidResponseSchema,
+  [ipcChannels.settingsValidateOpenRouterKey]: credentialStatusSchema,
+  [ipcChannels.settingsListModels]: z.array(modelInfoSchema),
+  [ipcChannels.settingsClearLocalData]: voidResponseSchema,
+  [ipcChannels.systemOpenExternal]: voidResponseSchema,
 } as const
 
 export interface DesktopAPI {
@@ -405,5 +460,8 @@ export interface DesktopAPI {
     validateOpenRouterKey(): Promise<CredentialStatus>
     listModels(): Promise<ModelInfo[]>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
+  }
+  system: {
+    openExternal(url: string): Promise<void>
   }
 }

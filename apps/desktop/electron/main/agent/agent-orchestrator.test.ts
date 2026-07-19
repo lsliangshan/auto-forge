@@ -295,6 +295,19 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 
+  it('cancels an approval-gated agent run by its execution identity', async () => {
+    const dependencies = harness([toolTurn])
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+
+    await orchestrator.cancelExecution(pending.executionId!)
+
+    expect(dependencies.records.terminal).toEqual([
+      expect.objectContaining({ requestId: pending.requestId, status: 'cancelled' }),
+    ])
+    expect(dependencies.records.discards).toHaveLength(1)
+  })
+
   it('allows only one resume continuation for the same approval', async () => {
     let finishExecution!: (value: { id: string; status: string; result: unknown }) => void
     const dependencies = harness([toolTurn, [

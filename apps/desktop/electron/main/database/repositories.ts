@@ -187,12 +187,13 @@ export interface AppRepositories {
   executions: {
     insert(value: Pick<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'> & Partial<Omit<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'>>): Execution
     get(id: string): Execution | undefined
+    list(): Execution[]
     update(id: string, value: Partial<Omit<Execution, 'id' | 'workflowId' | 'workflowVersion' | 'createdAt'>>): Execution | undefined
     markInterrupted(): number
   }
   executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[] }
   executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[] }
-  permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; delete(id: string): void }
+  permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; list(): PermissionGrant[]; delete(id: string): void }
   appSettings: { get(key: string): AppSetting | undefined; set(key: string, value: unknown): AppSetting; delete(key: string): void }
   encryptedSecrets: EncryptedSecretsRepository
 }
@@ -348,6 +349,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return { ...value, input, createdAt } as Execution
       },
       get: (id) => { const row = one<Query>(database, `SELECT ${executionColumns} FROM executions WHERE id = @id`, { id }); return row && executionFromRow(row) },
+      list: () => many<Query>(database, `SELECT ${executionColumns} FROM executions ORDER BY created_at DESC, id`).map(executionFromRow),
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE executions SET chat_run_id = COALESCE(@chatRunId, chat_run_id), status = COALESCE(@status, status), input_json = COALESCE(@inputJson, input_json), result_json = COALESCE(@resultJson, result_json), error_code = COALESCE(@errorCode, error_code), started_at = COALESCE(@startedAt, started_at), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
           id, chatRunId: null, status: null, errorCode: null, startedAt: null, endedAt: null, ...value,
@@ -357,7 +359,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         const row = one<Query>(database, `SELECT ${executionColumns} FROM executions WHERE id = @id`, { id })
         return row && executionFromRow(row)
       },
-      markInterrupted: () => transaction(database, () => database.prepare("UPDATE executions SET status = 'interrupted', ended_at = @endedAt WHERE status IN ('pending', 'running', 'waiting_approval')").run({ endedAt: now() }).changes),
+      markInterrupted: () => transaction(database, () => database.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = @endedAt WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run({ endedAt: now() }).changes),
     },
     executionSteps: {
       insert(value) { transaction(database, () => database.prepare('INSERT INTO execution_steps (id, execution_id, sequence, name, status, percent, started_at, ended_at) VALUES (@id, @executionId, @sequence, @name, @status, @percent, @startedAt, @endedAt)').run(value)); return value },
@@ -386,6 +388,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return value
       },
       get: (workflowId, workflowVersion, capability, scopeHash) => { const row = one<Query>(database, 'SELECT id, workflow_id AS workflowId, workflow_version AS workflowVersion, capability, scope_json AS scopeJson, scope_hash AS scopeHash, created_at AS createdAt, updated_at AS updatedAt FROM permission_grants WHERE workflow_id = @workflowId AND workflow_version = @workflowVersion AND capability = @capability AND scope_hash = @scopeHash', { workflowId, workflowVersion, capability, scopeHash }); return row && permissionFromRow(row) },
+      list: () => many<Query>(database, 'SELECT id, workflow_id AS workflowId, workflow_version AS workflowVersion, capability, scope_json AS scopeJson, scope_hash AS scopeHash, created_at AS createdAt, updated_at AS updatedAt FROM permission_grants ORDER BY created_at DESC, id').map(permissionFromRow),
       delete: (id) => { transaction(database, () => database.prepare('DELETE FROM permission_grants WHERE id = @id').run({ id })) },
     },
     appSettings: {

@@ -355,6 +355,13 @@ export class AgentOrchestrator {
     if (!active.terminal) this.finish(active, 'cancelled', appFailure('CANCELLED'))
   }
 
+  async cancelExecution(executionId: string): Promise<boolean> {
+    const active = this.activeByExecution.get(executionId)
+    if (!active || active.terminal) return false
+    await this.cancel(active.requestId)
+    return true
+  }
+
   private async driveExclusive(active: ActiveAgentRun): Promise<AgentRunResult> {
     if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
     active.busy = true
