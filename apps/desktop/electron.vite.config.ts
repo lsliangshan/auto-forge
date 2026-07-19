@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 
 const root = fileURLToPath(new URL('.', import.meta.url))
 
@@ -27,7 +28,7 @@ export default defineConfig({
   },
   renderer: {
     root,
-    plugins: [vue()],
+    plugins: [vue(), tailwindcss()],
     build: {
       rollupOptions: {
         input: new URL('./index.html', import.meta.url).pathname,

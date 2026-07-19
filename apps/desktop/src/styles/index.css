@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --af-canvas: #f3f5f8;
+  --af-surface: #ffffff;
+  --af-surface-muted: #f8f9fb;
+  --af-border: #dfe3e8;
+  --af-border-strong: #c8ced6;
+  --af-graphite: #20242b;
+  --af-text: #303640;
+  --af-text-muted: #68717d;
+  --af-cobalt: #2563eb;
+  --af-cobalt-hover: #1d4ed8;
+  --af-cobalt-soft: #eaf1ff;
+  --af-warning: #b45309;
+  --af-warning-soft: #fff7ed;
+  --af-success: #15803d;
+  --af-success-soft: #ecfdf3;
+  --af-danger: #b42318;
+  --af-focus: 0 0 0 3px rgb(37 99 235 / 22%);
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { width: 100%; min-width: 860px; height: 100%; min-height: 600px; margin: 0; overflow: hidden; }
+body { color: var(--af-text); background: var(--af-canvas); }
+button, input, textarea, select { font: inherit; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: none; box-shadow: var(--af-focus); }
+
+.af-scrollbar { scrollbar-width: thin; scrollbar-color: #bcc4cf transparent; }
+.af-panel-heading { font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--af-text-muted); text-transform: uppercase; }
+.af-empty { display: grid; min-height: 240px; place-items: center; padding: 32px; color: var(--af-text-muted); text-align: center; }
+.af-error { border-left: 3px solid var(--af-danger); padding: 12px 14px; color: var(--af-danger); background: #fff5f5; }
+.af-status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--af-border-strong); }
+.af-status-dot.success { background: var(--af-success); }
+.af-status-dot.warning { background: var(--af-warning); }
+.af-status-dot.danger { background: var(--af-danger); }
+.af-truncate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}

@@ -117,6 +117,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   }
 
   register(ipcChannels.chatListConversations, () => options.services.chat.listConversations())
+  register(ipcChannels.chatListMessages, (input) => options.services.chat.listMessages(input.conversationId))
   register(ipcChannels.chatCreateConversation, () => options.services.chat.createConversation())
   register(ipcChannels.chatRenameConversation, (input) => options.services.chat.renameConversation(input.conversationId, input.title))
   register(ipcChannels.chatDeleteConversation, (input) => options.services.chat.deleteConversation(input.conversationId))
@@ -125,6 +126,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.workflowsList, (input) => options.services.workflows.list(input))
   register(ipcChannels.workflowsGet, (input) => options.services.workflows.get(input.id, input.version))
   register(ipcChannels.workflowsSetEnabled, (input) => options.services.workflows.setEnabled(input.id, input.enabled))
+  register(ipcChannels.workflowsRemove, (input) => options.services.workflows.remove(input.id, input.version))
   register(ipcChannels.workflowsInstallProject, (input) => options.services.workflows.installProject(input.projectId))
   register(ipcChannels.developerCreateProject, (input) => options.services.developer.createProject(input.name))
   register(ipcChannels.developerRegisterProject, () => options.services.developer.registerProject())

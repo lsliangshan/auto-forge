@@ -52,6 +52,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
   return {
     chat: {
       listConversations: () => invoke(ipcRenderer, ipcChannels.chatListConversations),
+      listMessages: (conversationId) => invoke(ipcRenderer, ipcChannels.chatListMessages, { conversationId }),
       createConversation: () => invoke(ipcRenderer, ipcChannels.chatCreateConversation),
       renameConversation: (conversationId, title) => invoke(ipcRenderer, ipcChannels.chatRenameConversation, { conversationId, title }),
       deleteConversation: (conversationId) => invoke(ipcRenderer, ipcChannels.chatDeleteConversation, { conversationId }),
@@ -63,6 +64,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
       list: (query) => invoke(ipcRenderer, ipcChannels.workflowsList, query),
       get: (id, version) => invoke(ipcRenderer, ipcChannels.workflowsGet, { id, ...(version ? { version } : {}) }),
       setEnabled: (id, enabled) => invoke(ipcRenderer, ipcChannels.workflowsSetEnabled, { id, enabled }),
+      remove: (id, version) => invoke(ipcRenderer, ipcChannels.workflowsRemove, { id, version }),
       installProject: (projectId) => invoke(ipcRenderer, ipcChannels.workflowsInstallProject, { projectId }),
     },
     developer: {

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import type { ChatEvent, ExecutionEvent, ExecutionStatus } from './events.js'
+import { chatBlockSchema, type ChatBlock, type ChatEvent, type ExecutionEvent, type ExecutionStatus } from './events.js'
 import {
   capabilitySchema,
   capabilityScopeSchema,
@@ -19,6 +19,17 @@ export const conversationSummarySchema = z.object({
 }).strict()
 
 export type ConversationSummary = z.infer<typeof conversationSummarySchema>
+
+export const chatMessageSchema = z.object({
+  id: identifierSchema,
+  conversationId: identifierSchema,
+  role: z.enum(['user', 'assistant']),
+  blocks: z.array(chatBlockSchema),
+  executionId: identifierSchema.optional(),
+  createdAt: timestampSchema,
+}).strict()
+
+export interface ChatMessage extends Omit<z.infer<typeof chatMessageSchema>, 'blocks'> { blocks: ChatBlock[] }
 
 export const chatSendInputSchema = z.object({
   conversationId: identifierSchema,
@@ -260,6 +271,7 @@ export type ModelInfo = z.infer<typeof modelInfoSchema>
 
 export const ipcChannels = {
   chatListConversations: 'chat:list-conversations',
+  chatListMessages: 'chat:list-messages',
   chatCreateConversation: 'chat:create-conversation',
   chatRenameConversation: 'chat:rename-conversation',
   chatDeleteConversation: 'chat:delete-conversation',
@@ -269,6 +281,7 @@ export const ipcChannels = {
   workflowsList: 'workflows:list',
   workflowsGet: 'workflows:get',
   workflowsSetEnabled: 'workflows:set-enabled',
+  workflowsRemove: 'workflows:remove',
   workflowsInstallProject: 'workflows:install-project',
   developerCreateProject: 'developer:create-project',
   developerRegisterProject: 'developer:register-project',
@@ -296,6 +309,7 @@ export const ipcChannels = {
 export type IpcChannel = (typeof ipcChannels)[keyof typeof ipcChannels]
 
 export const createConversationRequestSchema = z.undefined()
+export const listMessagesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const renameConversationRequestSchema = z.object({
   conversationId: identifierSchema,
   title: nonEmptyStringSchema,
@@ -308,6 +322,7 @@ export const workflowGetRequestSchema = z.object({
   version: nonEmptyStringSchema.optional(),
 }).strict()
 export const workflowSetEnabledRequestSchema = z.object({ id: identifierSchema, enabled: z.boolean() }).strict()
+export const workflowRemoveRequestSchema = z.object({ id: identifierSchema, version: nonEmptyStringSchema }).strict()
 export const workflowInstallProjectRequestSchema = z.object({ projectId: identifierSchema }).strict()
 export const createProjectRequestSchema = z.object({ name: nonEmptyStringSchema }).strict()
 export const registerProjectRequestSchema = z.undefined()
@@ -349,6 +364,7 @@ export const openExternalRequestSchema = z.object({
 
 export const ipcRequestSchemas = {
   [ipcChannels.chatListConversations]: z.undefined(),
+  [ipcChannels.chatListMessages]: listMessagesRequestSchema,
   [ipcChannels.chatCreateConversation]: createConversationRequestSchema,
   [ipcChannels.chatRenameConversation]: renameConversationRequestSchema,
   [ipcChannels.chatDeleteConversation]: deleteConversationRequestSchema,
@@ -357,6 +373,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.workflowsList]: workflowListRequestSchema,
   [ipcChannels.workflowsGet]: workflowGetRequestSchema,
   [ipcChannels.workflowsSetEnabled]: workflowSetEnabledRequestSchema,
+  [ipcChannels.workflowsRemove]: workflowRemoveRequestSchema,
   [ipcChannels.workflowsInstallProject]: workflowInstallProjectRequestSchema,
   [ipcChannels.developerCreateProject]: createProjectRequestSchema,
   [ipcChannels.developerRegisterProject]: registerProjectRequestSchema,
@@ -386,6 +403,7 @@ const executionIdResponseSchema = z.object({ executionId: identifierSchema }).st
 
 export const ipcResponseSchemas = {
   [ipcChannels.chatListConversations]: z.array(conversationSummarySchema),
+  [ipcChannels.chatListMessages]: z.array(chatMessageSchema),
   [ipcChannels.chatCreateConversation]: conversationSummarySchema,
   [ipcChannels.chatRenameConversation]: conversationSummarySchema,
   [ipcChannels.chatDeleteConversation]: voidResponseSchema,
@@ -394,6 +412,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.workflowsList]: z.array(workflowSummarySchema),
   [ipcChannels.workflowsGet]: workflowDetailSchema,
   [ipcChannels.workflowsSetEnabled]: voidResponseSchema,
+  [ipcChannels.workflowsRemove]: voidResponseSchema,
   [ipcChannels.workflowsInstallProject]: workflowDetailSchema,
   [ipcChannels.developerCreateProject]: developerProjectSchema,
   [ipcChannels.developerRegisterProject]: developerProjectSchema.nullable(),
@@ -420,6 +439,7 @@ export const ipcResponseSchemas = {
 export interface DesktopAPI {
   chat: {
     listConversations(): Promise<ConversationSummary[]>
+    listMessages(conversationId: string): Promise<ChatMessage[]>
     createConversation(): Promise<ConversationSummary>
     renameConversation(conversationId: string, title: string): Promise<ConversationSummary>
     deleteConversation(conversationId: string): Promise<void>
@@ -431,6 +451,7 @@ export interface DesktopAPI {
     list(query?: WorkflowQuery): Promise<WorkflowSummary[]>
     get(id: string, version?: string): Promise<WorkflowDetail>
     setEnabled(id: string, enabled: boolean): Promise<void>
+    remove(id: string, version: string): Promise<void>
     installProject(projectId: string): Promise<WorkflowDetail>
   }
   developer: {

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
+  chatBlockSchema,
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
@@ -294,6 +295,20 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         createdAt: new Date(conversation.createdAt).toISOString(),
         updatedAt: new Date(conversation.updatedAt).toISOString(),
       })),
+      listMessages: async (conversationId) => {
+        if (!database.conversations.get(conversationId)) throw failure('NOT_FOUND')
+        return database.messages.listForConversation(conversationId).map((message) => {
+          if (message.role !== 'user' && message.role !== 'assistant') throw failure('INTERNAL_ERROR')
+          return {
+            id: message.id,
+            conversationId: message.conversationId,
+            role: message.role,
+            blocks: chatBlockSchema.array().parse(message.blocks),
+            ...(message.executionId ? { executionId: message.executionId } : {}),
+            createdAt: new Date(message.createdAt).toISOString(),
+          }
+        })
+      },
       createConversation: async () => {
         const conversation = database.conversations.insert({ id: randomUUID(), title: '新会话' })
         return { ...conversation, createdAt: new Date(conversation.createdAt).toISOString(), updatedAt: new Date(conversation.updatedAt).toISOString() }
@@ -351,6 +366,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (!installed.length) throw failure('NOT_FOUND')
         for (const workflow of installed) registry.setEnabled(workflow.workflowId, workflow.version, enabled)
       },
+      remove: (id, version) => projects.removeInstalled(id, version),
       installProject: async (projectId) => {
         const installed = await projects.install(projectId)
         const workflow = await registry.get(installed.workflowId, installed.version)

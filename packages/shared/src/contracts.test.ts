@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import { approvalDecisionSchema, executionEventSchema, toSafeAppError, workerMessageSchema } from './index'
+import { approvalDecisionSchema, executionEventSchema, ipcRequestSchemas, ipcChannels, toSafeAppError, workerMessageSchema } from './index'
 
 describe('cross-process contracts', () => {
+  it('requires exact workflow identity for removal', () => {
+    expect(ipcRequestSchemas[ipcChannels.workflowsRemove].parse({ id: 'browser.search.baidu', version: '1.0.0' }))
+      .toEqual({ id: 'browser.search.baidu', version: '1.0.0' })
+    expect(() => ipcRequestSchemas[ipcChannels.workflowsRemove].parse({ id: 'browser.search.baidu' })).toThrow()
+  })
+
+  it('requires a conversation identity when reading persisted messages', () => {
+    expect(ipcRequestSchemas[ipcChannels.chatListMessages].parse({ conversationId: 'conversation_1' }))
+      .toEqual({ conversationId: 'conversation_1' })
+    expect(() => ipcRequestSchemas[ipcChannels.chatListMessages].parse({})).toThrow()
+  })
+
   it('rejects a persistent approval without an exact workflow version', () => {
     expect(() => approvalDecisionSchema.parse({
       executionId: 'exec_1', decision: 'always', workflowId: 'browser.search.baidu',

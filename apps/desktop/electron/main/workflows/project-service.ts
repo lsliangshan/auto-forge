@@ -184,6 +184,35 @@ export class WorkflowProjectService {
     return this.withInstallationLock(`${manifest.id}@${manifest.version}`, () => this.installUnlocked(projectId))
   }
 
+  async removeInstalled(workflowId: string, version: string): Promise<void> {
+    return this.withInstallationLock(`${workflowId}@${version}`, async () => {
+      const installed = this.repositories.installedWorkflows.get(workflowId, version)
+      if (!installed) throw failure('NOT_FOUND')
+      const installationRoot = resolve(this.installationRoot)
+      const destination = join(installationRoot, workflowId, version)
+      if (resolve(installed.installPath) !== destination) throw failure('WORKFLOW_INTEGRITY_FAILED')
+
+      let quarantine: string | undefined
+      if (await pathExists(destination)) {
+        const entry = await lstat(destination)
+        if (entry.isSymbolicLink() || !entry.isDirectory()) throw failure('WORKFLOW_INTEGRITY_FAILED')
+        const canonicalRoot = await realpath(installationRoot)
+        const canonicalDestination = await realpath(destination)
+        if (!inside(canonicalRoot, canonicalDestination)) throw failure('WORKFLOW_INTEGRITY_FAILED')
+        quarantine = join(dirname(destination), `.${basename(destination)}-remove-${randomUUID()}.tmp`)
+        await rename(destination, quarantine)
+      }
+
+      try {
+        this.repositories.installedWorkflows.delete(workflowId, version)
+      } catch (error) {
+        if (quarantine) await rename(quarantine, destination)
+        throw error
+      }
+      if (quarantine) await rm(quarantine, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    })
+  }
+
   private async installUnlocked(projectId: string): Promise<InstalledWorkflow> {
     const project = this.require(projectId)
     const validation = await this.validate(project.id)

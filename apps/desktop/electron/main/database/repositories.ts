@@ -182,7 +182,7 @@ export interface AppRepositories {
     ): ChatRun
   }
   workflowProjects: { insert(value: WorkflowProject): WorkflowProject; get(id: string): WorkflowProject | undefined; list(): WorkflowProject[]; update(id: string, value: Partial<Omit<WorkflowProject, 'id' | 'createdAt'>>): WorkflowProject | undefined }
-  installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void }
+  installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void; delete(workflowId: string, version: string): void }
   workflowFiles: { insert(value: WorkflowFile): WorkflowFile; list(workflowId: string, workflowVersion: string): WorkflowFile[] }
   executions: {
     insert(value: Pick<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'> & Partial<Omit<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'>>): Execution
@@ -336,6 +336,12 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       get: (workflowId, version) => { const row = one<Query>(database, `SELECT ${installedWorkflowColumns} FROM installed_workflows WHERE workflow_id = @workflowId AND version = @version`, { workflowId, version }); return row && installedWorkflowFromRow(row) },
       list: () => many<Query>(database, `SELECT ${installedWorkflowColumns} FROM installed_workflows ORDER BY name, version`).map(installedWorkflowFromRow),
       setEnabled: (workflowId, version, enabled) => { transaction(database, () => database.prepare('UPDATE installed_workflows SET enabled = @enabled, updated_at = @updatedAt WHERE workflow_id = @workflowId AND version = @version').run({ workflowId, version, enabled: Number(enabled), updatedAt: now() })) },
+      delete: (workflowId, version) => {
+        transaction(database, () => {
+          database.prepare('DELETE FROM permission_grants WHERE workflow_id = @workflowId AND workflow_version = @version').run({ workflowId, version })
+          database.prepare('DELETE FROM installed_workflows WHERE workflow_id = @workflowId AND version = @version').run({ workflowId, version })
+        })
+      },
     },
     workflowFiles: {
       insert(value) { transaction(database, () => database.prepare('INSERT INTO workflow_files (workflow_id, workflow_version, path, sha256) VALUES (@workflowId, @workflowVersion, @path, @sha256)').run(value)); return value },

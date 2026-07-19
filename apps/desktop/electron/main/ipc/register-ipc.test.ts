@@ -12,13 +12,14 @@ function services(): DesktopIpcServices {
   return {
     chat: {
       listConversations: vi.fn().mockResolvedValue([]),
+      listMessages: vi.fn().mockResolvedValue([]),
       createConversation: vi.fn(),
       renameConversation: vi.fn(),
       deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'request_1' }),
       cancel: vi.fn(),
     },
-    workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), installProject: vi.fn() },
+    workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
     developer: {
       createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
       validate: vi.fn(), run: vi.fn(),

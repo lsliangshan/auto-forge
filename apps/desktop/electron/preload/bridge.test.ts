@@ -27,6 +27,21 @@ describe('preload desktop bridge', () => {
     expect(app.api).not.toHaveProperty('ipcRenderer')
   })
 
+  it('removes an exact workflow version through its fixed channel', async () => {
+    const app = harness()
+    await app.api.workflows.remove('browser.search.baidu', '1.0.0')
+
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.workflowsRemove, {
+      id: 'browser.search.baidu', version: '1.0.0',
+    })
+  })
+
+  it('reads persisted messages through the fixed conversation channel', async () => {
+    const app = harness()
+    await app.api.chat.listMessages('conversation_1')
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.chatListMessages, { conversationId: 'conversation_1' })
+  })
+
   it('removes exactly its wrapped event listener with an idempotent unsubscribe', () => {
     const app = harness()
     const listener = vi.fn()

@@ -15,6 +15,13 @@ export default tseslint.config(
   },
   js.configs.recommended,
   ...vue.configs['flat/recommended'],
+  {
+    files: ['**/*.vue'],
+    languageOptions: {
+      globals: { KeyboardEvent: 'readonly', window: 'readonly' },
+      parserOptions: { parser: tseslint.parser },
+    },
+  },
   ...tseslint.configs.recommended.map((config) => ({
     ...config,
     files: ['**/*.{ts,tsx,mts,cts}'],

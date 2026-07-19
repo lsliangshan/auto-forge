@@ -57,6 +57,44 @@ afterEach(() => {
 })
 
 describe('WorkflowProjectService', () => {
+  it('removes an exact installed version from disk and persistence', async () => {
+    const { directory, database, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+    const installed = await projects.install(project.id)
+    database.permissionGrants.upsert({
+      id: 'grant_1', workflowId: 'browser.search.baidu', workflowVersion: '1.0.0',
+      capability: 'notification.send', scope: {}, scopeHash: 'a'.repeat(64), createdAt: 1, updatedAt: 1,
+    })
+
+    await projects.removeInstalled('browser.search.baidu', '1.0.0')
+
+    expect(existsSync(installed.installPath)).toBe(false)
+    expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeUndefined()
+    expect(database.workflowFiles.list('browser.search.baidu', '1.0.0')).toEqual([])
+    expect(database.permissionGrants.get('browser.search.baidu', '1.0.0', 'notification.send', 'a'.repeat(64))).toBeUndefined()
+  })
+
+  it('restores the quarantined install when removal persistence fails', async () => {
+    const { directory, database, installs, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+    const installed = await projects.install(project.id)
+    const failing = new WorkflowProjectService({
+      workflowProjects: database.workflowProjects,
+      installedWorkflows: { ...database.installedWorkflows, delete: () => { throw new Error('database unavailable') } },
+      workflowFiles: database.workflowFiles,
+    }, installs)
+
+    await expect(failing.removeInstalled('browser.search.baidu', '1.0.0')).rejects.toThrow('database unavailable')
+    expect(existsSync(installed.installPath)).toBe(true)
+    expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeDefined()
+  })
+
   it('rejects a file path that escapes the registered project', async () => {
     const { directory, projects } = openTestServices()
     const root = join(directory, 'project')

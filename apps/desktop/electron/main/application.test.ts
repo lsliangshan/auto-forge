@@ -15,6 +15,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)
     const openExternal = vi.fn().mockResolvedValue(undefined)
+    const chatEvents: Array<{ type: string; status?: string }> = []
     const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
@@ -33,7 +34,7 @@ describe('createApplicationRuntime', () => {
       },
       chooseProjectDirectory: async () => undefined,
       openExternal,
-      emitChat: vi.fn(),
+      emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       browserRuntime: { packaged: false },
     })
@@ -41,7 +42,14 @@ describe('createApplicationRuntime', () => {
     await runtime.recover()
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.listConversations()).toEqual([conversation])
+    expect(await runtime.services.chat.listMessages(conversation.id)).toEqual([])
     expect(await runtime.services.chat.renameConversation(conversation.id, 'Renamed')).toMatchObject({ title: 'Renamed' })
+    await runtime.services.chat.send({ conversationId: conversation.id, content: 'persist me' })
+    for (let index = 0; index < 30 && !chatEvents.some((event) => event.status === 'completed'); index += 1) await Promise.resolve()
+    expect(await runtime.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
+      expect.objectContaining({ role: 'assistant' }),
+    ]))
     expect(await runtime.services.settings.saveOpenRouterKey('sk-local')).toMatchObject({ configured: true, valid: true })
     const longNameProject = await runtime.services.developer.createProject(`${'a'.repeat(47)} b`)
     expect(longNameProject.name).toBe(`${'a'.repeat(47)} b`)
@@ -52,6 +60,31 @@ describe('createApplicationRuntime', () => {
       expect(Object.values(runtime.services[domain]).every((member) => typeof member === 'function')).toBe(true)
     }
     await runtime.close()
+
+    const restarted = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      openRouter: {
+        listModels: async () => [], validateCredential: async () => ({ valid: true }),
+        stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
+      },
+      chooseProjectDirectory: async () => undefined,
+      openExternal,
+      emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+    })
+    await restarted.recover()
+    expect(await restarted.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
+    ]))
+    await restarted.close()
   })
 
   it('rejects conversation cleanup during a streaming chat and succeeds after terminalization', async () => {
