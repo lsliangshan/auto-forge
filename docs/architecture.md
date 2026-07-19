@@ -1,27 +1,21 @@
 # AutoForge 架构
 
-## 进程边界
-
 ```text
 Vue Renderer
-  -> window.autoForge typed API
-  -> sandboxed preload allowlist
-  -> validated ipcMain handlers
-  -> catalog / installations / settings / templates services
-  -> SQLite and filesystem
+  → 主窗口 preload 具名 API
+  → ipcMain 输入校验
+  → RegistryClient / WorkflowProjectService / InstallationService
+  → SQLite、文件系统、HTTPS 中心服务
+
+工作流模块
+  → 隐藏 sandbox runner
+  → 固定 SDK RPC + executionId/sender 绑定
+  → 主进程能力检查
+  → 可见 target WebContents 的窄化 DOM 操作
 ```
 
-Renderer 不导入 Electron、Node.js 或文件系统模块。主窗口启用 `contextIsolation`、`sandbox` 和 `webSecurity`，关闭 `nodeIntegration`。Preload 只暴露具名方法，不暴露原始 `ipcRenderer`。
+Renderer 不导入 Electron、Node.js 或文件系统模块。主窗口与 runner 都启用 `contextIsolation`、`sandbox` 和 `webSecurity`，关闭 `nodeIntegration`。两个 preload 都不暴露原始 `ipcRenderer`。
 
-## 模块职责
+中心服务使用 Fastify、Prisma/PostgreSQL 与 S3 兼容存储。桌面端的 access token 只在主进程内存中，refresh token 经 Electron `safeStorage` 加密后写入 SQLite。
 
-- `catalog` 读取只读本地工具目录，并提供工具查找。
-- `installations` 校验工具 ID，将模拟安装状态写入 SQLite。
-- `settings` 管理主题与最近下载目录。
-- `templates` 将随应用发布的完整模板复制到用户选择的目录，拒绝覆盖同名目录。
-- `database` 执行顺序迁移并提供小型仓储接口。
-- `ipc` 校验跨进程输入，并将未知异常转换为安全错误。
-
-## 数据模型
-
-SQLite 包含 `schema_migrations`、`app_settings` 与 `installed_tools`。工具目录位于 `resources/catalog/tools.json`，不写入数据库；后续接远程目录时可替换 `CatalogService` 而不改页面。
+SQLite 迁移保留旧 `installed_tools`，但运行路径只使用 `workflow_projects`、`installed_workflows`、`encrypted_sessions`、`app_settings`。详细安全与状态流见 [工作流生命周期](workflow-lifecycle.md)。

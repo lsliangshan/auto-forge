@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [vue()],
   resolve: { alias: { '@renderer': resolve('src/renderer/src'), '@shared': resolve('src/shared') } },
   test: {
-    include: ['src/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'packages/**/*.test.ts', 'server/**/*.test.ts'],
     environment: 'happy-dom',
     globals: true,
     setupFiles: []

@@ -7,6 +7,10 @@
   "license": "MIT",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "packages/*",
+    "server"
+  ],
   "engines": {
     "node": ">=22.12.0"
   },
@@ -17,16 +21,20 @@
     "preview": "vite preview --config vite.renderer.config.ts",
     "postinstall": "node scripts/install-electron.mjs && electron-builder install-app-deps",
     "test:unit": "vitest run",
+    "test:contracts": "vitest run packages/workflow-contracts",
+    "test:server": "vitest run server",
+    "typecheck:contracts": "tsc --noEmit -p packages/workflow-contracts/tsconfig.json",
+    "typecheck:server": "tsc --noEmit -p server/tsconfig.json",
     "test:e2e": "npm run build && playwright test",
-    "typecheck": "npm run typecheck:node && npm run typecheck:renderer",
+    "typecheck": "npm run typecheck:node && npm run typecheck:renderer && npm run typecheck:contracts && npm run typecheck:server",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:renderer": "vue-tsc --noEmit -p tsconfig.web.json",
-    "verify:template": "node scripts/verify-template.mjs",
     "dist:dir": "npm run build && electron-builder --dir"
   },
   "dependencies": {
     "@electron-toolkit/utils": "^3.0.0",
     "@element-plus/icons-vue": "^2.3.1",
+    "esbuild": "0.25.12",
     "element-plus": "^2.9.14",
     "pinia": "^2.3.1",
     "vue": "^3.5.13",

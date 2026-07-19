@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: autoforge
+      POSTGRES_PASSWORD: autoforge
+      POSTGRES_DB: autoforge
+    ports: ["5432:5432"]
+    volumes: ["autoforge-postgres:/var/lib/postgresql/data"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U autoforge"], interval: 5s, timeout: 3s, retries: 20 }
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    environment: { MINIO_ROOT_USER: autoforge, MINIO_ROOT_PASSWORD: autoforge-secret }
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["autoforge-minio:/data"]
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-c", "until mc alias set local http://minio:9000 autoforge autoforge-secret; do sleep 1; done; mc mb --ignore-existing local/autoforge"]
+  server:
+    build: { context: ., dockerfile: server/Dockerfile }
+    env_file: [server/.env]
+    environment:
+      DATABASE_URL: postgresql://autoforge:autoforge@postgres:5432/autoforge
+      S3_ENDPOINT: http://minio:9000
+    ports: ["4310:4310"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+volumes: { autoforge-postgres: {}, autoforge-minio: {} }

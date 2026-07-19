@@ -1,7 +1,0 @@
-{
-  "id": "example-automation-tool",
-  "name": "示例自动化工具",
-  "version": "1.0.0",
-  "entry": "dist/index.js",
-  "permissions": ["web:read"]
-}

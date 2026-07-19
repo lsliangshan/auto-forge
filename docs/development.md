@@ -8,9 +8,9 @@
 
 ## 常用命令
 
-`npm run dev` 启动完整 Electron 应用；它会先将原生 SQLite 模块重建为 Electron ABI。`npm run dev:renderer` 只启动浏览器可访问的渲染端，并使用内置演示适配器。
+`npm run dev` 启动完整 Electron 应用。`npm run dev:renderer` 只启动渲染端静态界面；工作流数据和文件能力必须通过 Electron preload，项目不提供 Mock 大厅数据。
 
-`npm run test:unit` 会将 SQLite 模块重建为当前 Node ABI，再运行领域、数据库和 Vue 组件测试。`npm run test:e2e` 会构建应用、重建 Electron ABI，并启动真实 Electron 窗口验证主路径。
+`npm run test:unit` 运行契约、构建、安全安装、SQLite、服务端和 Vue 测试。`npm run test:e2e` 会构建应用并启动真实 Electron 窗口验证主路径。PostgreSQL + MinIO 集成测试需要先启动 `docker compose up --build`。
 
 ## 新增 IPC
 

@@ -1,140 +1,79 @@
 <template>
-  <div class="page discover-page">
-    <section class="page-intro">
-      <div><h1>发现自动化工具</h1><p>探索高效实用的自动化工具，提升你的工作效率。</p></div>
-      <div class="search-wrap">
-        <Search />
-        <input
-          ref="searchInput"
-          v-model="query"
-          data-testid="tool-search"
-          type="search"
-          placeholder="搜索工具、场景或开发者"
-          aria-label="搜索工具、场景或开发者"
-        />
-        <kbd>{{ shortcutLabel }} K</kbd>
-      </div>
+  <div class="page workflow-page">
+    <section class="workflow-hero">
+      <div><span class="eyebrow">WORKFLOW REGISTRY</span><h1>发现工作流</h1><p>安装经过审核和签名验证的网页自动化工作流，或开发自己的工作流。</p></div>
+      <div class="account-actions"><template v-if="session.user"><span>{{ session.user.displayName }}</span><el-button @click="logout">退出</el-button></template><el-button v-else type="primary" @click="authVisible = true">登录 / 注册</el-button></div>
     </section>
 
-    <div v-if="error" class="inline-alert" role="alert"><WarningFilled /><span>{{ error }}</span><el-button link @click="load">重新加载</el-button></div>
-    <template v-else>
-      <div v-if="loading" class="loading-stack"><el-skeleton :rows="8" animated /></div>
-      <template v-else>
-        <div class="section-heading"><h2>精选推荐</h2><span>编辑精选</span></div>
-        <FeaturedTool v-if="featuredTool" :tool="featuredTool" @select="selectedTool = $event" />
+    <el-tabs v-model="activeTab" class="workflow-tabs" @tab-change="refreshActiveTab">
+      <el-tab-pane label="工作流大厅" name="hall">
+        <section v-if="installedItems.length" class="offline-installed"><div class="section-heading"><h2>已安装工作流</h2><span>可离线运行</span></div><div class="installed-row"><button v-for="item in installedItems" :key="item.workflowId" type="button" @click="openInstalled(item.workflowId)"><Connection /><span><strong>{{ item.slug }}</strong><small>v{{ item.version }}</small></span><VideoPlay /></button></div></section>
+        <div class="workflow-toolbar"><div class="search-wrap compact"><Search /><input v-model="query" data-testid="workflow-search" placeholder="搜索名称、描述、作者或 slug" @keyup.enter="loadHall" /></div><el-select v-model="category" placeholder="全部分类" clearable @change="loadHall"><el-option v-for="item in categories" :key="item.id" :label="item.name" :value="item.slug" /></el-select><el-button @click="loadHall">刷新</el-button></div>
+        <div v-if="error" class="inline-alert"><WarningFilled /><span>{{ error }}</span><el-button link @click="loadHall">重试</el-button></div>
+        <el-skeleton v-else-if="loading" :rows="7" animated />
+        <div v-else-if="hall.items.length" class="workflow-grid">
+          <article v-for="workflow in hall.items" :key="workflow.id" class="workflow-card" data-testid="workflow-card">
+            <div class="workflow-card__top"><span class="workflow-glyph"><Connection /></span><div><h2>{{ workflow.name }}</h2><code>{{ workflow.slug }} · v{{ workflow.version }}</code></div></div>
+            <p>{{ workflow.description }}</p><div class="workflow-tags"><span>{{ workflow.category.name }}</span><span v-for="permission in workflow.permissions" :key="permission">{{ permissionLabel(permission) }}</span></div>
+            <dl><div><dt>作者</dt><dd>{{ workflow.authorName }}</dd></div><div><dt>目标域名</dt><dd>{{ workflow.targetHosts.join('、') }}</dd></div><div><dt>下载</dt><dd>{{ workflow.downloads }}</dd></div></dl>
+            <div class="hash-line" :title="workflow.codeSha256">SHA-256 {{ workflow.codeSha256.slice(0, 12) }}…</div>
+            <el-button v-if="installed.has(workflow.id)" type="success" @click="openRun(workflow)">运行</el-button><el-button v-else type="primary" :loading="busyId === workflow.id" @click="install(workflow)">安装</el-button>
+          </article>
+        </div><div v-else class="workflow-empty"><Connection /><h3>还没有已发布的工作流</h3><p>大厅只展示管理员审核通过的签名版本。</p></div>
+        <el-pagination v-if="hall.total > hall.pageSize" v-model:current-page="hall.page" :page-size="hall.pageSize" :total="hall.total" layout="prev, pager, next" @current-change="loadHall" />
+      </el-tab-pane>
 
-        <div class="catalog-toolbar">
-          <div class="category-list" aria-label="工具分类">
-            <button
-              v-for="item in categories"
-              :key="item.value"
-              type="button"
-              :class="['category-chip', { 'category-chip--active': category === item.value }]"
-              @click="category = item.value"
-            >{{ item.label }}</button>
-          </div>
-          <span class="result-count">{{ visibleTools.length }} 个工具</span>
-        </div>
+      <el-tab-pane v-if="session.user" label="我的工作流" name="mine">
+        <div class="panel-header"><div><h2>本地项目</h2><p>源码保存在本机目录中，AutoForge 负责编译、调试和提交。</p></div><div><el-button @click="openProject">打开项目</el-button><el-button type="primary" @click="createVisible = true">创建项目</el-button></div></div>
+        <el-table :data="projects" empty-text="还没有本地工作流项目">
+          <el-table-column prop="name" label="工作流" min-width="180"><template #default="{ row }"><strong>{{ row.name }}</strong><small class="block-muted">{{ row.path }}</small></template></el-table-column>
+          <el-table-column prop="version" label="版本" width="90" /><el-table-column prop="status" label="状态" width="100" />
+          <el-table-column label="Hash" width="150"><template #default="{ row }"><code>{{ row.codeSha256?.slice(0, 12) || '未构建' }}</code></template></el-table-column>
+          <el-table-column label="操作" width="360"><template #default="{ row }"><el-button link @click="buildProject(row.id)">构建</el-button><el-button link @click="watchProject(row.id)">监听</el-button><el-button link @click="editProject(row.id)">编辑器</el-button><el-button link @click="openDebug(row.id)">调试</el-button><el-button link type="primary" @click="submit(row.id)">提交审核</el-button></template></el-table-column>
+        </el-table>
+        <div class="panel-header submissions"><div><h2>审核记录</h2><p>被驳回的版本可以修复后按新 revision 再次提交。</p></div></div>
+        <el-table :data="submissions" empty-text="暂无提交记录"><el-table-column prop="workflow.name" label="工作流" /><el-table-column prop="version" label="版本" width="90" /><el-table-column prop="revision" label="Revision" width="90" /><el-table-column prop="status" label="状态" width="110" /><el-table-column prop="reviewComment" label="审核意见" /></el-table>
+      </el-tab-pane>
 
-        <ToolList
-          v-if="visibleTools.length"
-          :tools="visibleTools"
-          :installed-ids="installedIds"
-          :installing-id="installingId"
-          @select="selectedTool = $event"
-          @install="install"
-        />
-        <EmptyState v-else @clear="clearFilters" />
-      </template>
-    </template>
+      <el-tab-pane v-if="session.user?.role === 'ADMIN'" label="审核管理" name="review">
+        <div class="panel-header"><div><h2>待审核提交</h2><p>审批会重新构建源码并生成不可变签名发布包。</p></div><el-button @click="loadReview">刷新</el-button></div>
+        <el-table :data="pending" empty-text="没有待审核提交"><el-table-column prop="workflow.name" label="工作流" /><el-table-column prop="version" label="版本" width="100" /><el-table-column prop="revision" label="Revision" width="90" /><el-table-column prop="serverCodeSha256" label="服务端 Hash" min-width="190" /><el-table-column label="操作" width="290"><template #default="{ row }"><el-button link @click="showSource(row.id)">查看源码</el-button><el-button link @click="openTrial(row.id)">试运行</el-button><el-button link type="success" @click="approve(row.id)">通过</el-button><el-button link type="danger" @click="openReject(row.id)">驳回</el-button></template></el-table-column></el-table>
+        <div class="panel-header submissions"><div><h2>分类管理</h2><p>停用分类不会影响已有发布版本；被引用的分类不能删除。</p></div><el-button type="primary" @click="openCategoryCreate">新增分类</el-button></div>
+        <el-table :data="adminCategories"><el-table-column prop="name" label="名称" /><el-table-column prop="slug" label="Slug" /><el-table-column prop="sortOrder" label="排序" width="80" /><el-table-column label="状态" width="90"><template #default="{ row }">{{ row.active ? '启用' : '停用' }}</template></el-table-column><el-table-column label="操作" width="150"><template #default="{ row }"><el-button link @click="toggleCategory(row)">{{ row.active ? '停用' : '启用' }}</el-button><el-button link type="danger" @click="removeCategory(row.id)">删除</el-button></template></el-table-column></el-table>
+      </el-tab-pane>
+    </el-tabs>
 
-    <ToolDetailsDrawer
-      :tool="selectedTool"
-      :installed="Boolean(selectedTool && installedIds.has(selectedTool.id))"
-      :installing="installingId === selectedTool?.id"
-      @close="selectedTool = null"
-      @install="install"
-    />
+    <el-dialog v-model="authVisible" title="开发者账号" width="440"><el-form label-position="top"><el-form-item label="邮箱"><el-input v-model="auth.email" /></el-form-item><el-form-item v-if="registerMode" label="显示名称"><el-input v-model="auth.displayName" /></el-form-item><el-form-item label="密码（12–128 位）"><el-input v-model="auth.password" type="password" show-password /></el-form-item></el-form><template #footer><el-button link @click="registerMode = !registerMode">{{ registerMode ? '已有账号，登录' : '没有账号，注册' }}</el-button><el-button type="primary" @click="authenticate">{{ registerMode ? '注册' : '登录' }}</el-button></template></el-dialog>
+    <el-dialog v-model="createVisible" title="创建本地工作流" width="560"><el-form label-position="top"><el-form-item label="工作流名称"><el-input v-model="draft.name" /></el-form-item><el-form-item label="Slug"><el-input v-model="draft.slug" /></el-form-item><el-form-item label="描述"><el-input v-model="draft.description" type="textarea" /></el-form-item><el-form-item label="版本"><el-input v-model="draft.version" /></el-form-item><el-form-item label="分类"><el-select v-model="draft.categorySlug"><el-option v-for="item in categories" :key="item.id" :label="item.name" :value="item.slug" /></el-select></el-form-item><el-form-item label="目标域名（逗号分隔）"><el-input v-model="draft.targetHosts" placeholder="example.com, *.example.com" /></el-form-item></el-form><template #footer><el-button @click="createVisible=false">取消</el-button><el-button type="primary" @click="createProject">选择目录并创建</el-button></template></el-dialog>
+    <el-dialog v-model="runVisible" title="运行工作流" width="480"><el-input v-model="targetUrl" placeholder="https://目标网页地址" /><template #footer><el-button @click="runVisible=false">取消</el-button><el-button type="primary" @click="runSelected">打开并运行</el-button></template></el-dialog>
+    <el-dialog v-model="rejectVisible" title="驳回提交" width="480"><el-input v-model="rejectComment" type="textarea" :rows="4" placeholder="请输入具体审核意见" /><template #footer><el-button @click="rejectVisible=false">取消</el-button><el-button type="danger" @click="reject">确认驳回</el-button></template></el-dialog>
+    <el-dialog v-model="sourceVisible" title="提交源码与校验信息" width="760"><div v-if="detail" class="source-review"><dl><div><dt>客户端 Hash</dt><dd>{{ detail.clientCodeSha256 || '未提供' }}</dd></div><div><dt>服务端 Hash</dt><dd>{{ detail.serverCodeSha256 }}</dd></div><div><dt>权限</dt><dd>{{ detail.manifest.permissions.join('、') }}</dd></div><div><dt>目标域名</dt><dd>{{ detail.manifest.targetHosts.join('、') }}</dd></div></dl><pre>{{ detail.source }}</pre><h3>Revision 历史</h3><p v-for="item in detail.history" :key="item.id">r{{ item.revision }} · {{ item.status }} <span v-if="item.reviewComment">· {{ item.reviewComment }}</span></p></div></el-dialog>
+    <el-dialog v-model="categoryVisible" title="新增分类" width="440"><el-form label-position="top"><el-form-item label="名称"><el-input v-model="categoryDraft.name" /></el-form-item><el-form-item label="Slug"><el-input v-model="categoryDraft.slug" /></el-form-item><el-form-item label="排序"><el-input-number v-model="categoryDraft.sortOrder" /></el-form-item></el-form><template #footer><el-button @click="categoryVisible=false">取消</el-button><el-button type="primary" @click="createCategory">创建</el-button></template></el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Search, WarningFilled } from '@element-plus/icons-vue'
+import { onMounted, reactive, ref } from 'vue'
+import { Connection, Search, VideoPlay, WarningFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { filterTools, type ToolCategory, type ToolSummary } from '../../../shared/catalog'
+import type { CategorySummary, Page, WorkflowPermission, WorkflowSummary } from '@autoforge/workflow-contracts'
+import type { InstalledWorkflow, SessionState, SubmissionDetail, SubmissionSummary, WorkflowProject } from '../../../shared/contracts'
 import { getDesktopApi } from '../services/desktop-api'
-import FeaturedTool from '../components/catalog/FeaturedTool.vue'
-import ToolList from '../components/catalog/ToolList.vue'
-import ToolDetailsDrawer from '../components/catalog/ToolDetailsDrawer.vue'
-import EmptyState from '../components/common/EmptyState.vue'
-
-const categories: Array<{ label: string; value: ToolCategory }> = [
-  { label: '全部', value: 'all' },
-  { label: '数据采集', value: 'data' },
-  { label: '内容发布', value: 'publishing' },
-  { label: '效率工具', value: 'productivity' },
-  { label: '开发者工具', value: 'developer' }
-]
-
-const tools = ref<ToolSummary[]>([])
-const installedIds = ref(new Set<string>())
-const selectedTool = ref<ToolSummary | null>(null)
-const installingId = ref<string | null>(null)
-const loading = ref(true)
-const error = ref('')
-const query = ref('')
-const category = ref<ToolCategory>('all')
-const searchInput = ref<HTMLInputElement | null>(null)
-const shortcutLabel = navigator.platform.toLowerCase().includes('mac') ? '⌘' : 'Ctrl +'
-
-const featuredTool = computed(() => tools.value.find(({ featured }) => featured) ?? tools.value[0])
-const visibleTools = computed(() => filterTools(tools.value, query.value, category.value))
-
-async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    const api = getDesktopApi()
-    const [catalog, installed] = await Promise.all([api.listTools(), api.listInstalledToolIds()])
-    tools.value = catalog
-    installedIds.value = new Set(installed)
-  } catch {
-    error.value = '工具目录暂时无法加载。'
-  } finally {
-    loading.value = false
-  }
-}
-
-async function install(tool: ToolSummary) {
-  if (installedIds.value.has(tool.id) || installingId.value) return
-  installingId.value = tool.id
-  try {
-    await getDesktopApi().installTool({ toolId: tool.id })
-    installedIds.value = new Set([...installedIds.value, tool.id])
-    ElMessage.success(`${tool.name} 已安装`)
-  } catch {
-    ElMessage.error('安装失败，请重试。')
-  } finally {
-    installingId.value = null
-  }
-}
-
-function clearFilters() {
-  query.value = ''
-  category.value = 'all'
-}
-
-function handleShortcut(event: KeyboardEvent) {
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
-    event.preventDefault()
-    searchInput.value?.focus()
-  }
-}
-
-onMounted(() => {
-  void load()
-  window.addEventListener('keydown', handleShortcut)
-})
-onBeforeUnmount(() => window.removeEventListener('keydown', handleShortcut))
+const api = getDesktopApi(); const activeTab = ref('hall'); const loading = ref(true); const error = ref(''); const query = ref(''); const category = ref(''); const categories = ref<CategorySummary[]>([]); const hall = reactive<Page<WorkflowSummary>>({ items: [], page: 1, pageSize: 20, total: 0 }); const installed = ref(new Set<string>()); const busyId = ref('');
+const installedItems = ref<InstalledWorkflow[]>([])
+const adminCategories = ref<CategorySummary[]>([]); const sourceVisible = ref(false); const detail = ref<SubmissionDetail | null>(null); const categoryVisible = ref(false); const categoryDraft = reactive({ name: '', slug: '', sortOrder: 0 })
+const session = reactive<SessionState>({ user: null }); const authVisible = ref(false); const registerMode = ref(false); const auth = reactive({ email: '', password: '', displayName: '' }); const projects = ref<WorkflowProject[]>([]); const submissions = ref<SubmissionSummary[]>([]); const pending = ref<SubmissionSummary[]>([])
+const createVisible = ref(false); const draft = reactive({ name: '', slug: '', description: '', version: '0.1.0', categorySlug: '', targetHosts: 'localhost' }); const runVisible = ref(false); const targetUrl = ref('http://localhost:3000'); const selected = ref<WorkflowSummary | null>(null); const selectedWorkflowId = ref(''); const debugProjectId = ref(''); const trialSubmissionId = ref(''); const rejectVisible = ref(false); const rejectId = ref(''); const rejectComment = ref('')
+const permissionLabel = (value: WorkflowPermission) => ({ 'browser.navigate': '导航', 'browser.read': '读取', 'browser.interact': '交互', 'browser.download': '下载' }[value])
+async function loadHall(){ loading.value=true; error.value=''; try { installedItems.value=await api.listInstalledWorkflows(); installed.value=new Set(installedItems.value.map(i=>i.workflowId)) } catch { installedItems.value=[] } try { const [cats,page]=await Promise.all([api.listCategories(),api.listWorkflows({page:hall.page,pageSize:hall.pageSize,search:query.value,category:category.value})]); categories.value=cats; Object.assign(hall,page) } catch(e){ error.value=e instanceof Error?e.message:'工作流大厅暂时无法加载' } finally{loading.value=false} }
+async function install(w:WorkflowSummary){ if(!session.user){authVisible.value=true;return} busyId.value=w.id;try{await api.installWorkflow({workflowId:w.id,version:w.version});installed.value=new Set([...installed.value,w.id]);ElMessage.success(`${w.name} 已验证并安装`)}catch(e){ElMessage.error(e instanceof Error?e.message:'安装失败')}finally{busyId.value=''} }
+function clearRunModes(){debugProjectId.value='';trialSubmissionId.value='';selectedWorkflowId.value=''} function openRun(w:WorkflowSummary){clearRunModes();selected.value=w;selectedWorkflowId.value=w.id;runVisible.value=true} function openInstalled(id:string){clearRunModes();selected.value=null;selectedWorkflowId.value=id;runVisible.value=true} function openDebug(id:string){clearRunModes();debugProjectId.value=id;selected.value=null;runVisible.value=true} function openTrial(id:string){clearRunModes();trialSubmissionId.value=id;runVisible.value=true}
+async function runSelected(){try{const result=debugProjectId.value?await api.debugWorkflow({projectId:debugProjectId.value,targetUrl:targetUrl.value}):trialSubmissionId.value?await api.trialSubmission(trialSubmissionId.value,targetUrl.value):await api.runWorkflow({workflowId:selectedWorkflowId.value,targetUrl:targetUrl.value});runVisible.value=false;ElMessage.success(`执行已启动：${result.executionId.slice(0,8)}`)}catch(e){ElMessage.error(e instanceof Error?e.message:'运行失败')}}
+async function authenticate(){try{Object.assign(session,registerMode.value?await api.register(auth):await api.login(auth));authVisible.value=false;await refreshActiveTab();ElMessage.success('登录成功')}catch(e){ElMessage.error(e instanceof Error?e.message:'认证失败')}} async function logout(){await api.logout();session.user=null;activeTab.value='hall'}
+async function loadMine(){[projects.value,submissions.value]=await Promise.all([api.listWorkflowProjects(),api.listMySubmissions()])} async function loadReview(){[pending.value,adminCategories.value]=await Promise.all([api.listPendingSubmissions(),api.listAdminCategories()])} async function refreshActiveTab(){if(activeTab.value==='hall')await loadHall();else if(activeTab.value==='mine')await loadMine();else if(activeTab.value==='review')await loadReview()}
+async function openProject(){const p=await api.openWorkflowProject();if(p)await loadMine()} async function createProject(){try{const p=await api.createWorkflowProject({manifest:{schemaVersion:1,sdkVersion:1,slug:draft.slug,name:draft.name,description:draft.description,version:draft.version,categorySlug:draft.categorySlug,entry:'dist/index.mjs',targetHosts:draft.targetHosts.split(',').map(v=>v.trim()).filter(Boolean),permissions:['browser.navigate','browser.read','browser.interact','browser.download']}});if(p){createVisible.value=false;await loadMine()}}catch(e){ElMessage.error(e instanceof Error?e.message:'创建失败')}}
+async function buildProject(id:string){try{await api.buildWorkflowProject({projectId:id});await loadMine();ElMessage.success('构建成功')}catch(e){ElMessage.error(e instanceof Error?e.message:'构建失败')}} async function watchProject(id:string){try{await api.watchWorkflowProject({projectId:id});await loadMine();ElMessage.success('已开始监听')}catch(e){ElMessage.error(String(e))}} const editProject=(id:string)=>api.openProjectEditor({projectId:id})
+async function submit(id:string){try{await api.submitWorkflow(id);await loadMine();ElMessage.success('已提交审核')}catch(e){ElMessage.error(e instanceof Error?e.message:'提交失败')}} async function approve(id:string){try{await api.approveSubmission(id);await loadReview();ElMessage.success('已通过并发布')}catch(e){ElMessage.error(String(e))}} function openReject(id:string){rejectId.value=id;rejectComment.value='';rejectVisible.value=true} async function reject(){if(!rejectComment.value.trim()){ElMessage.warning('请填写审核意见');return}await api.rejectSubmission(rejectId.value,rejectComment.value);rejectVisible.value=false;await loadReview()}
+async function showSource(id:string){try{detail.value=await api.getSubmissionDetail(id);sourceVisible.value=true}catch(e){ElMessage.error(String(e))}} function openCategoryCreate(){Object.assign(categoryDraft,{name:'',slug:'',sortOrder:adminCategories.value.length*10});categoryVisible.value=true} async function createCategory(){try{await api.createCategory(categoryDraft);categoryVisible.value=false;await loadReview()}catch(e){ElMessage.error(String(e))}} async function toggleCategory(item:CategorySummary){await api.updateCategory(item.id,{active:!item.active});await loadReview()} async function removeCategory(id:string){try{await api.deleteCategory(id);await loadReview()}catch(e){ElMessage.error(e instanceof Error?e.message:'删除失败')}}
+onMounted(async()=>{try{Object.assign(session,await api.getSession())}finally{await loadHall()}})
 </script>
