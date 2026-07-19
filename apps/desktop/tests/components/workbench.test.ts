@@ -2,9 +2,10 @@ import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessageBox } from 'element-plus'
 import type { DesktopAPI } from '@autoforge/shared'
 import App from '../../src/App.vue'
+import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { routes } from '../../src/router/index'
 import { useExecutionStore } from '../../src/stores/execution'
 import { useChatStore } from '../../src/stores/chat'
@@ -198,6 +199,46 @@ describe('workbench', () => {
     expect(store.details.exec_2?.status).toBe('completed')
   })
 
+  it('keeps execution detail loading and errors isolated per card and never offers cancel for unknown state', async () => {
+    const api = createApi()
+    vi.mocked(api.executions.get).mockImplementation(async (id) => {
+      if (id === 'exec_failed') throw new Error('detail offline')
+      return {
+        id, workflowId: 'workflow.real', workflowVersion: '1.0.0', status: 'running',
+        createdAt: '2026-07-19T00:00:00.000Z', input: {}, steps: [], logs: [],
+      }
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const success = mount(ExecutionCard, { props: { executionId: 'exec_ok' }, global: { plugins: [pinia, ElementPlus] } })
+    const failed = mount(ExecutionCard, { props: { executionId: 'exec_failed' }, global: { plugins: [pinia, ElementPlus] } })
+
+    await vi.waitFor(() => expect(success.text()).toContain('执行中'))
+    await vi.waitFor(() => expect(failed.text()).toContain('执行详情加载失败'))
+    expect(success.text()).not.toContain('执行详情加载失败')
+    expect(failed.text()).toContain('加载失败')
+    expect(failed.text()).not.toContain('取消执行')
+  })
+
+  it('invalidates pending execution details and event history when local data resets', async () => {
+    const api = createApi()
+    let resolveDetail!: (value: Awaited<ReturnType<DesktopAPI['executions']['get']>>) => void
+    vi.mocked(api.executions.get).mockReturnValue(new Promise((resolve) => { resolveDetail = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useExecutionStore()
+    const pending = store.loadDetail('exec_late')
+    store.applyEvent({ type: 'status', executionId: 'exec_late', status: 'running', occurredAt: '2026-07-19T00:00:01.000Z' })
+    store.resetLocalData()
+    resolveDetail({
+      id: 'exec_late', workflowId: 'workflow.real', workflowVersion: '1.0.0', status: 'completed',
+      createdAt: '2026-07-19T00:00:00.000Z', input: {}, steps: [], logs: [],
+    })
+    await pending
+    expect(store.details.exec_late).toBeUndefined()
+    expect(store._eventHistory).toEqual([])
+  })
+
   it('releases the last execution bridge lease on store disposal', () => {
     const api = createApi()
     const unsubscribe = vi.fn()
@@ -263,6 +304,7 @@ describe('workbench', () => {
     await vi.waitFor(() => expect(wrapper.text()).toContain('search.real · 1.2.3'))
     expect(wrapper.text()).toContain('1.4.0')
     expect(wrapper.text()).toContain('Windows')
+    expect(wrapper.text()).toContain('https://example.com')
     await wrapper.get('.grant-row button').trigger('click')
     await vi.waitFor(() => expect(api.permissions.revoke).toHaveBeenCalledWith('grant_1'))
     expect(wrapper.text()).not.toContain('search.real · 1.2.3')
@@ -289,6 +331,40 @@ describe('workbench', () => {
     await vi.waitFor(() => expect(wrapper.findAll('.execution-row')).toHaveLength(1))
     expect(wrapper.find('.execution-row button').exists()).toBe(true)
     expect(wrapper.find('button.execution-row').exists()).toBe(false)
+  })
+
+  it('marks execution headers and cells semantically and selects a row from the keyboard', async () => {
+    const api = createApi()
+    vi.mocked(api.executions.list).mockResolvedValue([{
+      id: 'exec_1', workflowId: 'workflow.real', workflowVersion: '1.0.0', status: 'completed', createdAt: '2026-07-19T00:00:00.000Z',
+    }])
+    vi.mocked(api.executions.get).mockResolvedValue({
+      id: 'exec_1', workflowId: 'workflow.real', workflowVersion: '1.0.0', status: 'completed', createdAt: '2026-07-19T00:00:00.000Z',
+      input: { keyword: 'weather' }, output: { title: 'sunny' }, error: { code: 'SAFE_ERROR', message: 'redacted message' }, steps: [], logs: [],
+    })
+    const { wrapper } = await mountApp('/executions', api)
+    await vi.waitFor(() => expect(wrapper.findAll('[role="columnheader"]')).toHaveLength(5))
+    expect(wrapper.findAll('.execution-row [role="cell"]')).toHaveLength(5)
+    await wrapper.get('.execution-row').trigger('keydown', { key: ' ' })
+    await vi.waitFor(() => expect(api.executions.get).toHaveBeenCalledWith('exec_1'))
+    expect(wrapper.text()).toContain('weather')
+    expect(wrapper.text()).toContain('sunny')
+    expect(wrapper.text()).toContain('SAFE_ERROR')
+    expect(wrapper.text()).toContain('redacted message')
+  })
+
+  it('describes all-data cleanup as conversations and executions while retaining other local state', async () => {
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockRejectedValue('cancel')
+    const { wrapper } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('清除会话与执行记录'))
+    const button = wrapper.findAll('button').find((entry) => entry.text().includes('清除会话与执行记录'))
+    await button?.trigger('click')
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining('凭证、设置、授权和工作流将保留'),
+      '确认清理本地数据',
+      expect.any(Object),
+    )
+    confirm.mockRestore()
   })
 
   it('clears a successfully saved key from the settings input without retaining it in state', async () => {

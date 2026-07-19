@@ -27,13 +27,15 @@ function acquireExecutionEvents(api: DesktopAPI, listener: (event: ExecutionEven
 export const useExecutionStore = defineStore('execution', {
   state: () => ({
     items: [] as ExecutionSummary[], details: {} as Record<string, ExecutionDetail>, selectedId: '',
-    query: {} as ExecutionQuery, loading: false, detailLoadingById: {} as Record<string, boolean>, error: '',
-    _listVersion: 0, _detailVersions: {} as Record<string, number>, _subscribed: false,
+    query: {} as ExecutionQuery, loading: false, detailLoadingById: {} as Record<string, boolean>,
+    detailErrorsById: {} as Record<string, string>, error: '',
+    _listVersion: 0, _detailEpoch: 0, _detailVersions: {} as Record<string, number>, _subscribed: false,
     _eventSequence: 0, _eventHistory: [] as SequencedExecutionEvent[],
   }),
   getters: {
     selectedDetail(state): ExecutionDetail | undefined { return state.details[state.selectedId] },
     selectedDetailLoading(state): boolean { return Boolean(state.detailLoadingById[state.selectedId]) },
+    selectedDetailError(state): string { return state.detailErrorsById[state.selectedId] ?? '' },
   },
   actions: {
     resetLocalData() {
@@ -43,6 +45,10 @@ export const useExecutionStore = defineStore('execution', {
       this.selectedId = ''
       this.query = {}
       this.detailLoadingById = {}
+      this.detailErrorsById = {}
+      this._detailEpoch += 1
+      this._detailVersions = {}
+      this._eventHistory = []
       this.loading = false
       this.error = ''
     },
@@ -90,21 +96,27 @@ export const useExecutionStore = defineStore('execution', {
     async loadDetail(id: string) {
       this.ensureSubscription()
       const version = (this._detailVersions[id] ?? 0) + 1
+      const epoch = this._detailEpoch
       this._detailVersions[id] = version
       this.detailLoadingById[id] = true
+      delete this.detailErrorsById[id]
       const eventSequence = this._eventSequence
-      this.error = ''
       try {
         const detail = await getDesktopApi().executions.get(id)
-        if (version === this._detailVersions[id]) {
+        if (epoch === this._detailEpoch && version === this._detailVersions[id]) {
           this.details[id] = detail
           for (const entry of this._eventHistory) {
             if (entry.sequence > eventSequence && entry.event.executionId === id) this._applyEvent(entry.event)
           }
         }
-      } catch (error) { if (version === this._detailVersions[id]) this.error = displayError(error, '执行详情加载失败') }
+      } catch (error) {
+        if (epoch === this._detailEpoch && version === this._detailVersions[id]) {
+          delete this.details[id]
+          this.detailErrorsById[id] = displayError(error, '执行详情加载失败')
+        }
+      }
       finally {
-        if (version === this._detailVersions[id]) this.detailLoadingById[id] = false
+        if (epoch === this._detailEpoch && version === this._detailVersions[id]) this.detailLoadingById[id] = false
         if (!this.loading && !Object.values(this.detailLoadingById).some(Boolean)) this._eventHistory = []
       }
     },

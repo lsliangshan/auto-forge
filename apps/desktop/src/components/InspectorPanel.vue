@@ -22,11 +22,29 @@
         >
           正在加载执行详情…
         </div>
+        <div
+          v-else-if="execution.selectedDetailError"
+          class="inspector-error"
+          role="alert"
+        >
+          {{ execution.selectedDetailError }}
+        </div>
         <template v-else-if="execution.selectedDetail">
           <section><span class="af-panel-heading">状态</span><p>{{ statusLabel(execution.selectedDetail.status) }}</p></section>
           <section>
             <span class="af-panel-heading">工作流</span><p class="breakable">
               {{ execution.selectedDetail.workflowId }} · {{ execution.selectedDetail.workflowVersion }}
+            </p>
+          </section>
+          <section>
+            <span class="af-panel-heading">输入</span><pre class="data-preview">{{ formatData(execution.selectedDetail.input) }}</pre>
+          </section>
+          <section>
+            <span class="af-panel-heading">输出</span><pre class="data-preview">{{ formatData(execution.selectedDetail.output) }}</pre>
+          </section>
+          <section v-if="execution.selectedDetail.error">
+            <span class="af-panel-heading">错误</span><p class="execution-error">
+              {{ execution.selectedDetail.error.code }} · {{ execution.selectedDetail.error.message }}
             </p>
           </section>
           <section>
@@ -163,6 +181,11 @@ const inspectorTitle = computed(() => route.name === 'executions' ? '执行详�
 const isCancellable = computed(() => execution.selectedDetail && ['queued', 'awaiting_approval', 'running'].includes(execution.selectedDetail.status))
 const statusLabel = (status: string) => ({ queued: '排队中', awaiting_approval: '等待授权', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[status] ?? status
 const formatScope = (scope: { origins?: string[]; paths?: string[] }) => scope.origins?.join('、') ?? scope.paths?.join('、') ?? '无附加范围'
+const formatData = (value: unknown) => {
+  if (value === undefined) return '—'
+  try { return JSON.stringify(value, null, 2) }
+  catch { return '无法显示' }
+}
 </script>
 
 <style scoped>
@@ -176,6 +199,7 @@ const formatScope = (scope: { origins?: string[]; paths?: string[] }) => scope.o
 .inspector p { margin: 7px 0 0; font-size: 13px; line-height: 1.5; }.muted { color: var(--af-text-muted); }.breakable { overflow-wrap: anywhere; }
 .step-list { display: grid; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }.step-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .logs { max-height: 240px; margin-top: 8px; overflow: auto; color: #cfd7e3; background: #242a32; }.logs p { margin: 0; border-bottom: 1px solid #353d48; padding: 7px 8px; font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.logs b { color: #8fb4ff; }
+.data-preview { max-height: 220px; margin: 8px 0 0; padding: 8px; overflow: auto; color: var(--af-text); background: var(--af-surface-muted); font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }.execution-error, .inspector-error { color: var(--af-danger); }.inspector-error { padding: 18px 10px; font-size: 12px; }
 .permission-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.permission-list li { font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.permission-list small { display: block; margin-top: 2px; color: var(--af-text-muted); font-family: inherit; }
 .hash { font-family: ui-monospace, monospace; font-size: 10px !important; }.recent-list { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }.recent-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }.recent-list small { color: var(--af-text-muted); }
 .inspector-state { padding: 36px 10px; color: var(--af-text-muted); font-size: 13px; line-height: 1.6; text-align: center; }

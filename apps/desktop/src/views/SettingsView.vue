@@ -161,7 +161,7 @@
             plain
             @click="confirmClear('all')"
           >
-            清除全部本地数据
+            清除会话与执行记录
           </el-button>
         </div>
       </section>
@@ -182,7 +182,7 @@
             v-for="grant in settings.grants"
             :key="grant.id"
             class="grant-row"
-          ><div><strong>{{ grant.workflowId }} · {{ grant.workflowVersion }}</strong><small>{{ grant.capability }}</small></div><el-button
+          ><div><strong>{{ grant.workflowId }} · {{ grant.workflowVersion }}</strong><small>{{ grant.capability }}</small><small>{{ formatScope(grant.scope) }}</small></div><el-button
             type="danger"
             text
             :disabled="settings.saving"
@@ -238,11 +238,15 @@ async function clearCredential() {
 function saveModel(value: string) { if (value) void settings.update({ defaultModel: value }) }
 async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
   try {
-    await ElMessageBox.confirm('此操作会永久删除所选本地数据，无法撤销。', '确认清理本地数据', { type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消' })
+    const message = scope === 'all'
+      ? '此操作会永久删除本机的会话与执行记录，无法撤销。凭证、设置、授权和工作流将保留。'
+      : '此操作会永久删除所选本地数据，无法撤销。'
+    await ElMessageBox.confirm(message, '确认清理本地数据', { type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消' })
     await settings.clearLocalData(scope)
     ElMessage.success('本地数据已清理')
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
 }
+const formatScope = (scope: { origins?: string[]; paths?: string[] }) => JSON.stringify(scope)
 </script>
 
 <style scoped>

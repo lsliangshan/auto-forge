@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { build as esbuild } from 'esbuild'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
@@ -17,8 +17,26 @@ export interface WorkflowProjectServiceOptions {
   removeQuarantine?: (path: string) => Promise<void>
 }
 
-const ownedQuarantinePrefix = '.autoforge-remove-owned-'
-const ownedQuarantineMarker = '.autoforge-remove-quarantine'
+const quarantineDirectoryName = '.autoforge-quarantine'
+const removalJournalDirectoryName = '.autoforge-removals'
+const workflowIdPattern = /^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/
+const workflowVersionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+const operationIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+interface RemovalJournal {
+  schemaVersion: 1
+  operationId: string
+  workflowId: string
+  workflowVersion: string
+  quarantineName: string
+  phase: 'prepared' | 'moved'
+}
+
+interface InstallationStorage {
+  root: string
+  quarantineRoot: string
+  journalRoot: string
+}
 
 function failure(code: AppErrorCode): Error & { code: AppErrorCode } {
   return Object.assign(new Error(code), { code })
@@ -183,78 +201,61 @@ export class WorkflowProjectService {
   }
 
   async install(projectId: string): Promise<InstalledWorkflow> {
-    const project = this.require(projectId)
-    const manifest = JSON.parse(await this.readFile(project.id, 'workflow.json')) as WorkflowManifest
-    return this.withInstallationLock(`${manifest.id}@${manifest.version}`, () => this.installUnlocked(projectId))
+    return this.withInstallationLock('installation-root', async () => {
+      const storage = await this.ensureInstallationStorage()
+      await this.recoverRemovalJournalsUnlocked(storage)
+      return this.installUnlocked(projectId, storage)
+    })
   }
 
   async removeInstalled(workflowId: string, version: string): Promise<void> {
-    return this.withInstallationLock(`${workflowId}@${version}`, async () => {
+    return this.withInstallationLock('installation-root', async () => {
+      const storage = await this.ensureInstallationStorage()
+      await this.recoverRemovalJournalsUnlocked(storage)
+      this.validateWorkflowIdentity(workflowId, version)
       const installed = this.repositories.installedWorkflows.get(workflowId, version)
       if (!installed) throw failure('NOT_FOUND')
-      const installationRoot = resolve(this.installationRoot)
-      const destination = join(installationRoot, workflowId, version)
+      const destination = join(storage.root, workflowId, version)
       if (resolve(installed.installPath) !== destination) throw failure('WORKFLOW_INTEGRITY_FAILED')
+      const workflowParent = await this.requireSafeWorkflowParent(storage.root, workflowId, false)
+      await this.requireSafeDirectory(destination)
 
-      await this.cleanupOwnedQuarantines(dirname(destination))
-      let quarantine: string | undefined
-      let quarantineMarker: string | undefined
-      if (await pathExists(destination)) {
-        const entry = await lstat(destination)
-        if (entry.isSymbolicLink() || !entry.isDirectory()) throw failure('WORKFLOW_INTEGRITY_FAILED')
-        const canonicalRoot = await realpath(installationRoot)
-        const canonicalDestination = await realpath(destination)
-        if (!inside(canonicalRoot, canonicalDestination)) throw failure('WORKFLOW_INTEGRITY_FAILED')
-        quarantine = join(dirname(destination), `${ownedQuarantinePrefix}${basename(destination)}-${randomUUID()}`)
-        await rename(destination, quarantine)
-        quarantineMarker = join(quarantine, ownedQuarantineMarker)
-        try {
-          await writeFile(quarantineMarker, randomUUID(), { flag: 'wx' })
-        } catch (error) {
-          await rm(quarantineMarker, { force: true })
-          await rename(quarantine, destination)
-          throw error
-        }
+      const operationId = randomUUID()
+      const quarantine = join(storage.quarantineRoot, operationId)
+      const prepared: RemovalJournal = {
+        schemaVersion: 1, operationId, workflowId, workflowVersion: version,
+        quarantineName: operationId, phase: 'prepared',
       }
+      const moved: RemovalJournal = { ...prepared, phase: 'moved' }
+      const preparedPath = await this.writeRemovalJournal(storage, prepared)
+      await rename(destination, quarantine)
+      await Promise.all([this.syncDirectory(workflowParent), this.syncDirectory(storage.quarantineRoot)])
+      const movedPath = await this.writeRemovalJournal(storage, moved)
+      await this.removeJournal(preparedPath, storage.journalRoot)
 
       try {
         this.repositories.installedWorkflows.delete(workflowId, version)
       } catch (error) {
-        if (quarantine) {
-          if (quarantineMarker) await rm(quarantineMarker, { force: true })
+        try {
           await rename(quarantine, destination)
-        }
+          await Promise.all([this.syncDirectory(workflowParent), this.syncDirectory(storage.quarantineRoot)])
+          await this.removeJournal(movedPath, storage.journalRoot)
+        } catch { /* Preserve the journal for fail-closed recovery. */ }
         throw error
       }
-      if (quarantine) {
-        try { await this.removeOwnedQuarantine(quarantine) } catch { /* Durable removal already committed; startup retries owned cleanup. */ }
-      }
+      try {
+        await this.removeOwnedQuarantine(quarantine)
+        await this.syncDirectory(storage.quarantineRoot)
+        await this.removeJournal(movedPath, storage.journalRoot)
+      } catch { /* Durable removal already committed; startup retries the exact journal. */ }
     })
   }
 
-  async cleanupOwnedQuarantines(parentPath?: string): Promise<void> {
-    if (parentPath) {
-      let names: string[]
-      try { names = await readdir(parentPath) } catch { return }
-      await Promise.all(names.filter((name) => name.startsWith(ownedQuarantinePrefix)).map(async (name) => {
-        const quarantine = join(parentPath, name)
-        try {
-          const entry = await lstat(quarantine)
-          if (!entry.isDirectory() || entry.isSymbolicLink() || !await pathExists(join(quarantine, ownedQuarantineMarker))) return
-          await this.removeOwnedQuarantine(quarantine)
-        } catch { /* A later startup or operation retries owned cleanup. */ }
-      }))
-      return
-    }
-    let workflowIds: string[]
-    try { workflowIds = await readdir(resolve(this.installationRoot)) } catch { return }
-    await Promise.all(workflowIds.map(async (workflowId) => {
-      const parent = join(resolve(this.installationRoot), workflowId)
-      try {
-        const entry = await lstat(parent)
-        if (entry.isDirectory() && !entry.isSymbolicLink()) await this.cleanupOwnedQuarantines(parent)
-      } catch { /* Ignore untrusted or concurrently removed entries. */ }
-    }))
+  async recoverRemovalJournals(): Promise<void> {
+    return this.withInstallationLock('installation-root', async () => {
+      const storage = await this.ensureInstallationStorage()
+      await this.recoverRemovalJournalsUnlocked(storage)
+    })
   }
 
   private removeOwnedQuarantine(path: string): Promise<void> {
@@ -262,7 +263,164 @@ export class WorkflowProjectService {
       ?? rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
   }
 
-  private async installUnlocked(projectId: string): Promise<InstalledWorkflow> {
+  private async ensureInstallationStorage(): Promise<InstallationStorage> {
+    const configuredRoot = resolve(this.installationRoot)
+    await mkdir(configuredRoot, { recursive: true })
+    const root = await realpath(configuredRoot)
+    const quarantineRoot = join(root, quarantineDirectoryName)
+    const journalRoot = join(root, removalJournalDirectoryName)
+    await mkdir(quarantineRoot)
+      .catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error })
+    await mkdir(journalRoot)
+      .catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error })
+    await this.requireSafeDirectory(quarantineRoot)
+    await this.requireSafeDirectory(journalRoot)
+    return { root, quarantineRoot, journalRoot }
+  }
+
+  private validateWorkflowIdentity(workflowId: string, version: string): void {
+    if (!workflowIdPattern.test(workflowId) || !workflowVersionPattern.test(version)) throw failure('INVALID_INPUT')
+  }
+
+  private async requireSafeWorkflowParent(root: string, workflowId: string, create: boolean): Promise<string> {
+    if (!workflowIdPattern.test(workflowId)) throw failure('INVALID_INPUT')
+    const parent = join(root, workflowId)
+    try {
+      await this.requireSafeDirectory(parent)
+    } catch (error) {
+      if (!this.isMissing(error) || !create) throw error
+      await mkdir(parent)
+      await this.syncDirectory(root)
+      await this.requireSafeDirectory(parent)
+    }
+    return parent
+  }
+
+  private async requireSafeDirectory(path: string): Promise<void> {
+    const entry = await lstat(path)
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw failure('WORKFLOW_INTEGRITY_FAILED')
+  }
+
+  private async writeRemovalJournal(storage: InstallationStorage, journal: RemovalJournal): Promise<string> {
+    const finalPath = join(storage.journalRoot, `${journal.operationId}.${journal.phase}.json`)
+    const temporaryPath = join(storage.journalRoot, `.${journal.operationId}.${journal.phase}.${randomUUID()}.tmp`)
+    const handle = await open(temporaryPath, 'wx', 0o600)
+    try {
+      await handle.writeFile(`${JSON.stringify(journal)}\n`, 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    try {
+      await rename(temporaryPath, finalPath)
+      await this.syncDirectory(storage.journalRoot)
+    } catch (error) {
+      await rm(temporaryPath, { force: true })
+      throw error
+    }
+    return finalPath
+  }
+
+  private async removeJournal(path: string, journalRoot: string): Promise<void> {
+    await rm(path, { force: true })
+    await this.syncDirectory(journalRoot)
+  }
+
+  private async recoverRemovalJournalsUnlocked(storage: InstallationStorage): Promise<void> {
+    const entries = await readdir(storage.journalRoot, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.isFile() || entry.isSymbolicLink()) continue
+      const journalPath = join(storage.journalRoot, entry.name)
+      const journal = await this.readRemovalJournal(journalPath, entry.name)
+      if (!journal) continue
+      await this.recoverRemovalJournal(storage, journalPath, journal)
+    }
+  }
+
+  private async readRemovalJournal(path: string, name: string): Promise<RemovalJournal | undefined> {
+    try {
+      const entry = await lstat(path)
+      if (entry.isSymbolicLink() || !entry.isFile()) return undefined
+      const value = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+      const keys = Object.keys(value).sort().join(',')
+      const expectedKeys = 'operationId,phase,quarantineName,schemaVersion,workflowId,workflowVersion'
+      if (keys !== expectedKeys
+        || value.schemaVersion !== 1
+        || typeof value.operationId !== 'string' || !operationIdPattern.test(value.operationId)
+        || typeof value.workflowId !== 'string' || !workflowIdPattern.test(value.workflowId)
+        || typeof value.workflowVersion !== 'string' || !workflowVersionPattern.test(value.workflowVersion)
+        || value.quarantineName !== value.operationId
+        || (value.phase !== 'prepared' && value.phase !== 'moved')
+        || name !== `${value.operationId}.${value.phase}.json`) return undefined
+      return value as unknown as RemovalJournal
+    } catch {
+      return undefined
+    }
+  }
+
+  private async recoverRemovalJournal(storage: InstallationStorage, journalPath: string, journal: RemovalJournal): Promise<void> {
+    const quarantine = join(storage.quarantineRoot, journal.quarantineName)
+    let quarantineExists = false
+    try {
+      await this.requireSafeDirectory(quarantine)
+      quarantineExists = true
+    } catch (error) {
+      if (!this.isMissing(error)) return
+    }
+
+    const installed = this.repositories.installedWorkflows.get(journal.workflowId, journal.workflowVersion)
+    if (!quarantineExists) {
+      if (!installed) await this.removeJournal(journalPath, storage.journalRoot)
+      else {
+        const destination = join(storage.root, journal.workflowId, journal.workflowVersion)
+        if (resolve(installed.installPath) !== destination) return
+        try {
+          const parent = await this.requireSafeWorkflowParent(storage.root, journal.workflowId, false)
+          await this.requireSafeDirectory(join(parent, journal.workflowVersion))
+          await this.removeJournal(journalPath, storage.journalRoot)
+        } catch { /* Missing destination or unsafe parent: preserve the journal. */ }
+      }
+      return
+    }
+
+    if (!installed) {
+      try {
+        await this.removeOwnedQuarantine(quarantine)
+        await this.syncDirectory(storage.quarantineRoot)
+        await this.removeJournal(journalPath, storage.journalRoot)
+      } catch { /* Preserve committed cleanup work for a later retry. */ }
+      return
+    }
+
+    const destination = join(storage.root, journal.workflowId, journal.workflowVersion)
+    if (resolve(installed.installPath) !== destination) return
+    try {
+      const parent = await this.requireSafeWorkflowParent(storage.root, journal.workflowId, false)
+      if (await pathExists(destination)) return
+      await rename(quarantine, destination)
+      await Promise.all([this.syncDirectory(parent), this.syncDirectory(storage.quarantineRoot)])
+      await this.removeJournal(journalPath, storage.journalRoot)
+    } catch { /* Conflict or unsafe path: preserve the journal and quarantine. */ }
+  }
+
+  private async syncDirectory(path: string): Promise<void> {
+    let handle: Awaited<ReturnType<typeof open>> | undefined
+    try {
+      handle = await open(path, 'r')
+      await handle.sync()
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes(code ?? '')) throw error
+    } finally {
+      await handle?.close()
+    }
+  }
+
+  private isMissing(error: unknown): boolean {
+    return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+  }
+
+  private async installUnlocked(projectId: string, storage: InstallationStorage): Promise<InstalledWorkflow> {
     const project = this.require(projectId)
     const validation = await this.validate(project.id)
     if (!validation.valid || project.status !== 'ready') throw failure('INVALID_INPUT')
@@ -272,10 +430,10 @@ export class WorkflowProjectService {
     if (sha256(Buffer.from(entry)) !== manifest.codeSha256) throw failure('WORKFLOW_INTEGRITY_FAILED')
     if (buildFingerprint(await this.readFile(project.id, 'src/index.ts'), manifest) !== project.buildHash) throw failure('INVALID_INPUT')
 
-    const destination = join(resolve(this.installationRoot), manifest.id, manifest.version)
-    await this.cleanupOwnedQuarantines(dirname(destination))
+    this.validateWorkflowIdentity(manifest.id, manifest.version)
+    const destination = join(storage.root, manifest.id, manifest.version)
+    await this.requireSafeWorkflowParent(storage.root, manifest.id, true)
     if (this.repositories.installedWorkflows.get(manifest.id, manifest.version) || await pathExists(destination)) throw failure('CONFLICT')
-    await mkdir(dirname(destination), { recursive: true })
     const temporary = join(dirname(destination), `.${basename(destination)}-${randomUUID()}.tmp`)
     const ownershipMarker = join(destination, '.autoforge-install-owner')
     const owner = randomUUID()

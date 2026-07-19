@@ -6,11 +6,11 @@
     </div>
     <code>{{ executionId }}</code>
     <p
-      v-if="store.error"
+      v-if="detailError"
       class="execution-error"
       role="alert"
     >
-      {{ store.error }}
+      {{ detailError }}
     </p>
     <div class="execution-actions">
       <el-button
@@ -40,11 +40,13 @@ const props = defineProps<{ executionId: string }>()
 const store = useExecutionStore()
 onMounted(() => store.loadDetail(props.executionId))
 const detail = computed(() => store.details[props.executionId])
+const detailError = computed(() => store.detailErrorsById[props.executionId] ?? '')
+const detailLoading = computed(() => Boolean(store.detailLoadingById[props.executionId]))
 const statusLabel = computed(() => ({
   queued: '排队中', awaiting_approval: '等待授权', running: '执行中', completed: '已完成',
   failed: '失败', cancelled: '已取消', interrupted: '已中断',
-})[detail.value?.status ?? 'queued'])
-const cancellable = computed(() => ['queued', 'awaiting_approval', 'running'].includes(detail.value?.status ?? 'queued'))
+})[detail.value?.status ?? ''] ?? (detailLoading.value ? '正在加载' : detailError.value ? '加载失败' : '未知'))
+const cancellable = computed(() => Boolean(detail.value && ['queued', 'awaiting_approval', 'running'].includes(detail.value.status)))
 const statusTone = computed(() => detail.value?.status === 'completed' ? 'success' : detail.value?.status === 'failed' ? 'danger' : 'warning')
 </script>
 

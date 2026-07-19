@@ -506,7 +506,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     recover: async () => {
       database.recoverInterrupted()
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
-      await projects.cleanupOwnedQuarantines()
+      await projects.recoverRemovalJournals()
     },
     close: async () => {
       await Promise.allSettled([...activeRequests].map((requestId) => agent.cancel(requestId)))

@@ -38,7 +38,7 @@
         class="table-header"
         role="row"
       >
-        <span>状态</span><span>工作流</span><span>版本</span><span>创建时间</span><span>操作</span>
+        <span role="columnheader">状态</span><span role="columnheader">工作流</span><span role="columnheader">版本</span><span role="columnheader">创建时间</span><span role="columnheader">操作</span>
       </div>
       <div
         v-for="item in execution.items"
@@ -50,7 +50,7 @@
         @keydown.enter.prevent="execution.select(item.id)"
         @keydown.space.prevent="execution.select(item.id)"
       >
-        <span><i :class="['af-status-dot', tone(item.status)]" />{{ label(item.status) }}</span><span class="af-truncate">{{ item.workflowId }}</span><span>{{ item.workflowVersion }}</span><time>{{ formatTime(item.createdAt) }}</time><span><el-button
+        <span role="cell"><i :class="['af-status-dot', tone(item.status)]" />{{ label(item.status) }}</span><span role="cell" class="af-truncate">{{ item.workflowId }}</span><span role="cell">{{ item.workflowVersion }}</span><time role="cell">{{ formatTime(item.createdAt) }}</time><span role="cell"><el-button
           v-if="cancellable(item.status)"
           size="small"
           type="danger"
