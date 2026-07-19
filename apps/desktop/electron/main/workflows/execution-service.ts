@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { fork as nodeFork, type ChildProcess, type ForkOptions } from 'node:child_process'
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve, sep } from 'node:path'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import {
   approvalDecisionSchema,
@@ -25,7 +25,6 @@ import type {
   Execution,
   ExecutionLogInput,
   ExecutionStep,
-  InstalledWorkflow,
 } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 
@@ -34,17 +33,27 @@ const MAX_LINE_BYTES = 1024 * 1024
 type ExecutionRepository = Pick<AppRepositories['executions'], 'insert' | 'get' | 'update'>
 type ExecutionLogRepository = Pick<AppRepositories['executionLogs'], 'insert'>
 type ExecutionStepRepository = Pick<AppRepositories['executionSteps'], 'insert'>
-type InstalledWorkflowRepository = Pick<AppRepositories['installedWorkflows'], 'get'>
 
 export interface ExecutionRepositories {
   executions: ExecutionRepository
   executionLogs: ExecutionLogRepository
   executionSteps: ExecutionStepRepository
-  installedWorkflows: InstalledWorkflowRepository
 }
 
-export interface WorkflowRegistryPort {
-  get(workflowId: string, version: string): Promise<WorkflowDetail | undefined>
+export interface WorkflowExecutionSource {
+  workflow: WorkflowDetail
+  rootPath: string
+  entryPath: string
+  integrity: WorkflowDetail['integrity']
+}
+
+export interface WorkflowExecutionSourceResolver {
+  resolve(workflowId: string, version: string): Promise<WorkflowExecutionSource | undefined>
+}
+
+export interface TemporaryDirectoryPort {
+  create(): Promise<string>
+  remove(path: string): Promise<void>
 }
 
 export interface CapabilityContext {
@@ -109,7 +118,6 @@ export interface ExecutionStartInput {
   workflowId: string
   workflowVersion: string
   input: unknown
-  entryPath?: string
   chatRunId?: string
   timeoutMs?: number
   sensitivePaths?: readonly string[]
@@ -147,11 +155,12 @@ interface ActiveExecution {
 
 export interface ExecutionServiceDependencies {
   repositories: ExecutionRepositories
-  registry: WorkflowRegistryPort
+  sourceResolver: WorkflowExecutionSourceResolver
   policy: PolicyEngine
   workers: WorkflowWorkerFactory
   capability: CapabilityPort
   emit: (event: ExecutionEvent) => void
+  temporaryDirectories?: TemporaryDirectoryPort
 }
 
 function failure(code: AppErrorCode): AppError {
@@ -184,12 +193,6 @@ function inside(root: string, target: string): boolean {
   return target === root || target.startsWith(`${root}${sep}`)
 }
 
-function manifestEntry(installed: InstalledWorkflow): string | undefined {
-  if (!installed.manifest || typeof installed.manifest !== 'object') return undefined
-  const entryPath = (installed.manifest as { entryPath?: unknown }).entryPath
-  return typeof entryPath === 'string' && entryPath.trim() ? entryPath : undefined
-}
-
 function samePermission(
   left: { capability: Capability; scope: CapabilityScope },
   right: { capability: Capability; scope: CapabilityScope },
@@ -199,14 +202,19 @@ function samePermission(
 
 export class ExecutionService {
   private readonly active = new Map<string, ActiveExecution>()
+  private readonly temporaryDirectories: TemporaryDirectoryPort
 
-  constructor(private readonly dependencies: ExecutionServiceDependencies) {}
+  constructor(private readonly dependencies: ExecutionServiceDependencies) {
+    this.temporaryDirectories = dependencies.temporaryDirectories ?? {
+      create: () => mkdtemp(join(tmpdir(), 'autoforge-execution-')),
+      remove: (path) => rm(path, { recursive: true, force: true }),
+    }
+  }
 
   async start(input: ExecutionStartInput): Promise<StartedExecution> {
-    const workflow = await this.dependencies.registry.get(input.workflowId, input.workflowVersion)
-    if (!workflow) throw failure('NOT_FOUND')
-    if (!workflow.enabled || workflow.integrity !== 'valid') throw failure('WORKFLOW_INTEGRITY_FAILED')
-    const entryPath = await this.resolveEntryPath(input)
+    const source = await this.dependencies.sourceResolver.resolve(input.workflowId, input.workflowVersion)
+    if (!source) throw failure('NOT_FOUND')
+    const workflow = source.workflow
     const id = randomUUID()
     const inserted = this.dependencies.repositories.executions.insert({
       id,
@@ -216,12 +224,15 @@ export class ExecutionService {
       input: input.input,
       ...(input.chatRunId ? { chatRunId: input.chatRunId } : {}),
     })
-    this.dependencies.emit(statusEvent(id, inserted.status))
+    this.emit(statusEvent(id, inserted.status))
 
-    const directory = await mkdtemp(join(tmpdir(), 'autoforge-execution-'))
-    const nonce = randomUUID()
+    let directory: string | undefined
+    let entryPath: string
     let worker: WorkflowWorker
     try {
+      entryPath = await this.resolveEntryPath(input, source)
+      directory = await this.temporaryDirectories.create()
+      const nonce = randomUUID()
       worker = await this.dependencies.workers.spawn({
         executionId: id,
         nonce,
@@ -229,15 +240,7 @@ export class ExecutionService {
         env: workerEnvironment(nonce),
       })
     } catch (error) {
-      await rm(directory, { recursive: true, force: true })
-      const appError = toSafeAppError(error)
-      const terminal = this.dependencies.repositories.executions.update(id, {
-        status: 'failed',
-        errorCode: appError.code,
-        endedAt: Date.now(),
-      }) ?? inserted
-      this.dependencies.emit(statusEvent(id, 'failed', appError))
-      return { id, finished: Promise.resolve(terminal) }
+      return this.failBeforeActive(id, toSafeAppError(error), directory)
     }
 
     let resolveFinished: (execution: Execution) => void = () => undefined
@@ -319,15 +322,50 @@ export class ExecutionService {
     await this.finish(executionId, 'cancelled', failure('CANCELLED'))
   }
 
-  private async resolveEntryPath(input: ExecutionStartInput): Promise<string> {
-    if (input.entryPath) return resolve(input.entryPath)
-    const installed = this.dependencies.repositories.installedWorkflows.get(input.workflowId, input.workflowVersion)
-    const relativeEntry = installed && manifestEntry(installed)
-    if (!installed || !relativeEntry) throw failure('NOT_FOUND')
-    const root = await realpath(installed.installPath)
-    const entry = await realpath(resolve(root, relativeEntry))
-    if (!inside(root, entry)) throw failure('WORKFLOW_INTEGRITY_FAILED')
-    return entry
+  private async resolveEntryPath(input: ExecutionStartInput, source: WorkflowExecutionSource): Promise<string> {
+    if (source.workflow.id !== input.workflowId
+      || source.workflow.version !== input.workflowVersion
+      || !source.workflow.enabled
+      || source.workflow.integrity !== 'valid'
+      || source.integrity !== 'valid'
+      || !source.entryPath.trim()
+      || isAbsolute(source.entryPath)) {
+      throw failure('WORKFLOW_INTEGRITY_FAILED')
+    }
+    try {
+      const root = await realpath(source.rootPath)
+      const entry = await realpath(resolve(root, source.entryPath))
+      if (!inside(root, entry)) throw failure('WORKFLOW_INTEGRITY_FAILED')
+      return entry
+    } catch {
+      throw failure('WORKFLOW_INTEGRITY_FAILED')
+    }
+  }
+
+  private async failBeforeActive(
+    executionId: string,
+    error: AppError,
+    directory?: string,
+  ): Promise<StartedExecution> {
+    const terminal = this.dependencies.repositories.executions.update(executionId, {
+      status: 'failed',
+      errorCode: error.code,
+      endedAt: Date.now(),
+    })
+    if (!terminal) throw failure('NOT_FOUND')
+    this.emit(statusEvent(executionId, 'failed', error))
+    try {
+      this.dependencies.policy.releaseExecution(executionId)
+    } catch {
+      // Cleanup continues even if a policy implementation rejects release.
+    }
+    try {
+      await this.dependencies.capability.closeExecution(executionId)
+    } catch {
+      // Pre-active capability cleanup is best effort after the terminal state is durable.
+    }
+    if (directory) await this.removeTemporaryDirectory(directory)
+    return { id: executionId, finished: Promise.resolve(terminal) }
   }
 
   private attach(active: ActiveExecution): void {
@@ -481,7 +519,7 @@ export class ExecutionService {
       sensitivePaths: active.sensitivePaths,
     }
     const stored = this.dependencies.repositories.executionLogs.insert(log)
-    this.dependencies.emit({
+    this.emit({
       type: 'log',
       executionId: active.id,
       level: stored.level as Extract<ExecutionEvent, { type: 'log' }>['level'],
@@ -502,7 +540,7 @@ export class ExecutionService {
       startedAt: createdAt,
     }
     this.dependencies.repositories.executionSteps.insert(step)
-    this.dependencies.emit({
+    this.emit({
       type: 'step',
       executionId: active.id,
       stepId: step.id,
@@ -515,7 +553,7 @@ export class ExecutionService {
   private transition(active: ActiveExecution, status: Execution['status'], values: Partial<Execution> = {}): Execution {
     const updated = this.dependencies.repositories.executions.update(active.id, { ...values, status })
     if (!updated) throw failure('NOT_FOUND')
-    this.dependencies.emit(statusEvent(active.id, status))
+    this.emit(statusEvent(active.id, status))
     return updated
   }
 
@@ -531,44 +569,64 @@ export class ExecutionService {
     active.terminal = true
     active.finishing = (async () => {
       clearTimeout(active.timer)
-      const updated = this.dependencies.repositories.executions.update(executionId, {
-        status,
-        ...(result === undefined ? {} : { result }),
-        ...(error ? { errorCode: error.code } : {}),
-        endedAt: Date.now(),
-      })
-      if (!updated) throw failure('NOT_FOUND')
-      this.dependencies.emit(statusEvent(executionId, status, error))
-      if (status === 'completed') {
-        this.dependencies.emit({
-          type: 'result',
-          executionId,
-          summary: 'Workflow completed.',
-          occurredAt: new Date().toISOString(),
+      let updated: Execution | undefined
+      try {
+        updated = this.dependencies.repositories.executions.update(executionId, {
+          status,
+          ...(result === undefined ? {} : { result }),
+          ...(error ? { errorCode: error.code } : {}),
+          endedAt: Date.now(),
         })
-      }
-      this.dependencies.policy.releaseExecution(executionId)
-      try {
-        await this.dependencies.capability.closeExecution(executionId)
-      } catch {
-        // Capability cleanup must not prevent the execution from becoming terminal.
-      }
-      if (!active.exited) {
-        try {
-          active.worker.kill('SIGTERM')
-        } catch {
-          // The worker may have exited between the state update and termination.
+        if (!updated) throw failure('NOT_FOUND')
+        this.emit(statusEvent(executionId, status, error))
+        if (status === 'completed') {
+          this.emit({
+            type: 'result',
+            executionId,
+            summary: 'Workflow completed.',
+            occurredAt: new Date().toISOString(),
+          })
         }
+      } finally {
+        try {
+          this.dependencies.policy.releaseExecution(executionId)
+        } catch {
+          // Cleanup continues even if a policy implementation rejects release.
+        }
+        try {
+          await this.dependencies.capability.closeExecution(executionId)
+        } catch {
+          // Capability cleanup must not prevent remaining terminal cleanup.
+        }
+        if (!active.exited) {
+          try {
+            active.worker.kill('SIGTERM')
+          } catch {
+            // The worker may have exited between the state update and termination.
+          }
+        }
+        await this.removeTemporaryDirectory(active.directory)
+        this.active.delete(executionId)
+        if (updated) active.resolveFinished(updated)
       }
-      try {
-        await rm(active.directory, { recursive: true, force: true })
-      } catch {
-        // Terminal persistence and worker termination remain authoritative if temp cleanup fails.
-      }
-      this.active.delete(executionId)
-      active.resolveFinished(updated)
     })()
     return active.finishing
+  }
+
+  private emit(event: ExecutionEvent): void {
+    try {
+      this.dependencies.emit(event)
+    } catch {
+      // Renderer listeners cannot participate in execution transactions or cleanup.
+    }
+  }
+
+  private async removeTemporaryDirectory(path: string): Promise<void> {
+    try {
+      await this.temporaryDirectories.remove(path)
+    } catch {
+      // Terminal persistence and worker termination remain authoritative if temp cleanup fails.
+    }
   }
 
   private write(active: ActiveExecution, request: WorkerRequest): void {

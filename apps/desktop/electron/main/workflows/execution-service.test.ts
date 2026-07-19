@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import type { ApprovalDecision, ExecutionEvent, WorkerCapabilityRequest, WorkerRequest, WorkerResponse, WorkflowDetail } from '@autoforge/shared'
 import { workerRequestSchema } from '@autoforge/shared'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Execution, ExecutionLog, ExecutionStep } from '../database/repositories.js'
 import { PolicyEngine } from '../permissions/policy-engine.js'
 import {
@@ -96,9 +96,6 @@ function createRepositories(): ExecutionRepositories & { records: Map<string, Ex
         return value
       },
     },
-    installedWorkflows: {
-      get: () => undefined,
-    },
   }
 }
 
@@ -135,7 +132,23 @@ const capabilityRequest: WorkerCapabilityRequest = {
   arguments: { url: 'https://www.baidu.com' },
 }
 
-function createHarness(options: { timeoutMs?: number; capability?: CapabilityPort } = {}) {
+const trustedRootPath = fileURLToPath(new URL('../../', import.meta.url))
+
+function createHarness(options: {
+  timeoutMs?: number
+  capability?: CapabilityPort
+  source?: {
+    workflow: WorkflowDetail
+    rootPath: string
+    entryPath: string
+    integrity: 'valid' | 'failed'
+  }
+  emit?: (event: ExecutionEvent) => void
+  temporaryDirectories?: {
+    create(): Promise<string>
+    remove(path: string): Promise<void>
+  }
+} = {}) {
   const repositories = createRepositories()
   const workerFactory = new FakeWorkerFactory()
   const policy = new PolicyEngine(createPermissionRepository())
@@ -144,23 +157,30 @@ function createHarness(options: { timeoutMs?: number; capability?: CapabilityPor
     request: async () => ({ ok: true }),
     closeExecution: async () => undefined,
   }
-  const service = new ExecutionService({
+  const source = options.source ?? {
+    workflow,
+    rootPath: trustedRootPath,
+    entryPath: 'workers/workflow-runner.ts',
+    integrity: 'valid' as const,
+  }
+  const dependencies = {
     repositories,
-    registry: { get: async () => workflow },
+    sourceResolver: { resolve: async () => source },
     policy,
     workers: workerFactory,
     capability,
-    emit: (event) => {
+    temporaryDirectories: options.temporaryDirectories,
+    emit: options.emit ?? ((event: ExecutionEvent) => {
       expect(repositories.records.get(event.executionId)?.status).toBe(
         event.type === 'status' ? event.status : repositories.records.get(event.executionId)?.status,
       )
       events.push(event)
-    },
-  })
+    }),
+  }
+  const service = new ExecutionService(dependencies)
   const start = () => service.start({
     workflowId: workflow.id,
     workflowVersion: workflow.version,
-    entryPath: '/fixtures/workflow.js',
     input: { query: 'weather' },
     timeoutMs: options.timeoutMs,
   })
@@ -171,7 +191,16 @@ async function turn(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-async function runActualWorker(source: string): Promise<WorkerResponse[]> {
+interface ActualWorkerOptions {
+  writeInput?: (worker: ReturnType<typeof forkProcess>, startLine: string) => Promise<void> | void
+  onMessage?: (
+    message: WorkerResponse,
+    worker: ReturnType<typeof forkProcess>,
+    messages: readonly WorkerResponse[],
+  ) => void
+}
+
+async function runActualWorker(source: string, options: ActualWorkerOptions = {}): Promise<WorkerResponse[]> {
   const directory = await mkdtemp(join(tmpdir(), 'autoforge-runner-test-'))
   const entryPath = join(directory, 'workflow.mjs')
   await writeFile(entryPath, source, 'utf8')
@@ -201,20 +230,31 @@ async function runActualWorker(source: string): Promise<WorkerResponse[]> {
           if (!line) continue
           const message = JSON.parse(line) as WorkerResponse
           messages.push(message)
+          try {
+            options.onMessage?.(message, worker, messages)
+          } catch (error) {
+            clearTimeout(timer)
+            reject(error)
+            return
+          }
           if (message.type === 'result' || message.type === 'error') {
             clearTimeout(timer)
             resolvePromise(messages)
           }
         }
       })
-      worker.stdin!.write(`${JSON.stringify({
+      const startLine = `${JSON.stringify({
         type: 'start',
         executionId: 'exec_runner',
         workflowId: 'runner.test',
         workflowVersion: '1.0.0',
         entryPath,
         input: { ok: true },
-      })}\n`)
+      })}\n`
+      const write = options.writeInput
+        ? options.writeInput(worker, startLine)
+        : worker.stdin!.write(startLine)
+      void Promise.resolve(write).catch(reject)
     })
   } finally {
     worker.kill('SIGTERM')
@@ -381,6 +421,119 @@ describe('ExecutionService', () => {
       errorCode: 'WORKFLOW_INTEGRITY_FAILED',
     })
   })
+
+  it('uses only the trusted resolver entry when callers supply an arbitrary external path', async () => {
+    const harness = createHarness()
+    const execution = await harness.service.start({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+      entryPath: '/tmp/untrusted-workflow.mjs',
+    } as never)
+    const worker = harness.workerFactory.workers.get(execution.id)!
+
+    expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({
+      entryPath: join(trustedRootPath, 'workers/workflow-runner.ts'),
+    })
+    await harness.service.cancel(execution.id)
+  })
+
+  it('terminalizes an integrity-failed resolved source without starting a worker', async () => {
+    const harness = createHarness({
+      timeoutMs: 10,
+      source: {
+        workflow: { ...workflow, integrity: 'failed' },
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'failed',
+      },
+    })
+    const execution = await harness.start()
+
+    await execution.finished
+    expect(harness.repositories.records.get(execution.id)).toMatchObject({
+      status: 'failed',
+      errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+    })
+    expect(harness.workerFactory.workers.size).toBe(0)
+  })
+
+  it.each(['installed', 'development'] as const)('runs a valid %s source resolved inside its root', async (source) => {
+    const harness = createHarness({
+      source: {
+        workflow: { ...workflow, source },
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+
+    expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({
+      entryPath: join(trustedRootPath, 'workers/workflow-runner.ts'),
+    })
+    await harness.service.cancel(execution.id)
+  })
+
+  it('terminalizes a temporary-directory creation failure and runs pre-active cleanup', async () => {
+    let closedExecution = ''
+    const harness = createHarness({
+      timeoutMs: 10,
+      capability: {
+        request: async () => undefined,
+        closeExecution: async (executionId) => { closedExecution = executionId },
+      },
+      temporaryDirectories: {
+        create: async () => { throw new Error('temp unavailable') },
+        remove: async () => undefined,
+      },
+    })
+    const release = vi.spyOn(harness.policy, 'releaseExecution')
+    const execution = await harness.start()
+
+    const terminal = await execution.finished
+    expect(terminal).toMatchObject({ status: 'failed', errorCode: 'INTERNAL_ERROR' })
+    expect(harness.repositories.records.get(execution.id)?.status).toBe('failed')
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(release).toHaveBeenCalledWith(execution.id)
+    expect(closedExecution).toBe(execution.id)
+  })
+
+  it('finishes cleanup when a terminal event listener throws', async () => {
+    let closed = false
+    let removed = ''
+    const harness = createHarness({
+      capability: {
+        request: async () => undefined,
+        closeExecution: async () => { closed = true },
+      },
+      temporaryDirectories: {
+        create: async () => '/tmp/autoforge-event-test',
+        remove: async (path) => { removed = path },
+      },
+      emit: (event) => {
+        if (event.type === 'status' && event.status === 'completed') throw new Error('renderer listener failed')
+      },
+    })
+    const release = vi.spyOn(harness.policy, 'releaseExecution')
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'result', output: { ok: true } })
+
+    const terminal = await Promise.race([
+      execution.finished,
+      new Promise<'timed-out'>((resolvePromise) => setTimeout(() => resolvePromise('timed-out'), 100)),
+    ])
+    expect(terminal).not.toBe('timed-out')
+    expect(terminal).toMatchObject({ status: 'completed' })
+    expect(harness.repositories.records.get(execution.id)?.status).toBe('completed')
+    expect(release).toHaveBeenCalledWith(execution.id)
+    expect(closed).toBe(true)
+    expect(worker.killed).toBe(true)
+    expect(removed).toBe('/tmp/autoforge-event-test')
+  })
 })
 
 describe('NodeWorkerFactory', () => {
@@ -460,5 +613,91 @@ describe('NodeWorkerFactory', () => {
       type: 'error',
       error: { code: 'WORKER_PROTOCOL_INVALID', message: 'The worker protocol message is invalid.' },
     })
+  })
+
+  it('parses a start request fragmented across stdin chunks', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({ async run() { return { fragmented: true } } })
+    `, {
+      writeInput: async (worker, line) => {
+        const cuts = [1, 17, Math.floor(line.length / 2), line.length]
+        let offset = 0
+        for (const cut of cuts) {
+          worker.stdin!.write(line.slice(offset, cut))
+          offset = cut
+          await turn()
+        }
+      },
+    })
+
+    expect(messages).toEqual([
+      { type: 'ready', executionId: 'exec_runner' },
+      { type: 'result', output: { fragmented: true } },
+    ])
+  })
+
+  it('rejects an stdin line larger than one MiB before parsing', async () => {
+    const messages = await runActualWorker('export default { async run() { return null } }', {
+      writeInput: (worker) => {
+        worker.stdin!.write(Buffer.alloc(700_000, 97))
+        worker.stdin!.write(Buffer.alloc(400_000, 97))
+      },
+    })
+
+    expect(messages).toEqual([{
+      type: 'error',
+      error: { code: 'WORKER_PROTOCOL_INVALID', message: 'The worker protocol message is invalid.' },
+    }])
+  })
+
+  it('cancels a workflow paused on a capability request', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          await context.browser.open('https://www.baidu.com')
+          return { shouldNotComplete: true }
+        },
+      })
+    `, {
+      onMessage: (message, worker) => {
+        if (message.type === 'capability_request') {
+          worker.stdin!.write(`${JSON.stringify({ type: 'cancel', executionId: 'exec_runner' })}\n`)
+        }
+      },
+    })
+
+    expect(messages.map((message) => message.type)).toEqual(['ready', 'capability_request', 'error'])
+    expect(messages.at(-1)).toEqual({
+      type: 'error',
+      error: { code: 'CANCELLED', message: 'The operation was cancelled.' },
+    })
+  })
+
+  it('does not complete until a matching capability result arrives', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          await context.browser.open('https://www.baidu.com')
+          return { resumed: true }
+        },
+      })
+    `, {
+      onMessage: (message, worker, observed) => {
+        if (message.type === 'capability_request') {
+          expect(observed.some((candidate) => candidate.type === 'result')).toBe(false)
+          worker.stdin!.write(`${JSON.stringify({
+            type: 'capability_result',
+            requestId: message.requestId,
+            result: null,
+          })}\n`)
+        }
+      },
+    })
+
+    expect(messages.map((message) => message.type)).toEqual(['ready', 'capability_request', 'result'])
+    expect(messages.at(-1)).toEqual({ type: 'result', output: { resumed: true } })
   })
 })
