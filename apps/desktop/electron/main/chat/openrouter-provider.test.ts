@@ -1,0 +1,180 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  OpenRouterProvider,
+  type OpenRouterStreamEvent,
+} from './openrouter-provider.js'
+
+function sseResponse(chunks: string[], status = 200, headers?: Record<string, string>): Response {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  }), { status, headers })
+}
+
+async function collect(stream: AsyncIterable<OpenRouterStreamEvent>) {
+  const values: OpenRouterStreamEvent[] = []
+  for await (const value of stream) values.push(value)
+  return values
+}
+
+const credential = { get: vi.fn(async () => 'sk-private') }
+
+describe('OpenRouterProvider', () => {
+  it('parses arbitrary SSE boundaries, CRLF comments, usage, choices, and indexed tool fragments', async () => {
+    const payload = [
+      ': keep-alive\r\n\r\n',
+      'data: {"id":"gen_1","choices":[{"index":0,"delta":{"content":"你好","tool_calls":[{"index":0,"id":"call_1","function":{"name":"browser.search.baidu","arguments":"{\\"keyword\\":"}}]}},{"index":1,"delta":{"content":"备选"}}]}\r\n\r\n',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"今日天气\\"}"}}]},"finish_reason":"tool_calls"},{"index":1,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"cost":0.001}}\r\n\r\n',
+      'data: [DONE]\r\n\r\n',
+    ].join('')
+    const chunks = [payload.slice(0, 11), payload.slice(11, 53), payload.slice(53, 137), payload.slice(137)]
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => sseResponse(chunks)),
+    })
+
+    const events = await collect(provider.stream({ model: 'model', messages: [{ role: 'user', content: '搜索' }] }))
+
+    expect(events).toContainEqual({ type: 'generation', id: 'gen_1' })
+    expect(events).toContainEqual({ type: 'text_delta', choiceIndex: 0, text: '你好' })
+    expect(events).toContainEqual({ type: 'text_delta', choiceIndex: 1, text: '备选' })
+    expect(events).toContainEqual({
+      type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1',
+      name: 'browser.search.baidu', arguments: { keyword: '今日天气' },
+    })
+    expect(events).toContainEqual({ type: 'finish', choiceIndex: 0, reason: 'tool_calls' })
+    expect(events).toContainEqual({ type: 'finish', choiceIndex: 1, reason: 'stop' })
+    expect(events).toContainEqual({ type: 'usage', inputTokens: 7, outputTokens: 3, totalTokens: 10, costUsd: '0.001' })
+  })
+
+  it('uses fixed HTTPS endpoints and filters stable tool-capable text models', async () => {
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      void input
+      void init
+      return Response.json({ data: [
+      { id: 'z/model', name: 'Z', supported_parameters: ['tools'], architecture: { input_modalities: ['text'], output_modalities: ['text'] }, context_length: 1000, pricing: { prompt: '0.000001', completion: '0.000002' } },
+      { id: 'a/model', name: 'A', supported_parameters: ['tools'], architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+      { id: 'image/model', name: 'Image', supported_parameters: ['tools'], architecture: { input_modalities: ['image'], output_modalities: ['image'] } },
+      { id: 'no-tools', name: 'No tools', supported_parameters: [], architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+      ] })
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.listModels()).resolves.toEqual([
+      { id: 'a/model', name: 'A' },
+      { id: 'z/model', name: 'Z', contextLength: 1000, inputCostPerMillion: 1, outputCostPerMillion: 2 },
+    ])
+    expect(fetch.mock.calls[0]?.[0]).toBe('https://openrouter.ai/api/v1/models?supported_parameters=tools')
+    expect(credential.get).toHaveBeenCalledWith('openrouter_api_key')
+    expect(JSON.stringify(await provider.listModels())).not.toContain('sk-private')
+  })
+
+  it('validates credentials without returning the secret', async () => {
+    const valid = new OpenRouterProvider({ credential, fetch: vi.fn(async () => Response.json({ data: [] })) })
+    const invalid = new OpenRouterProvider({ credential, fetch: vi.fn(async () => new Response('', { status: 401 })) })
+
+    await expect(valid.validateCredential()).resolves.toEqual({ valid: true })
+    await expect(invalid.validateCredential()).resolves.toEqual({ valid: false })
+  })
+
+  it('applies the same bounded retry policy to model discovery', async () => {
+    let attempt = 0
+    const fetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) return new Response('busy', { status: 503 })
+      return Response.json({ data: [] })
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep, random: () => 0 })
+
+    await expect(provider.listModels()).resolves.toEqual([])
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(sleep).toHaveBeenCalledWith(200, undefined)
+  })
+
+  it('retries network, 429, and 5xx with fresh requests while suppressing replayed deltas', async () => {
+    let attempts = 0
+    const bodies: string[] = []
+    const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      attempts += 1
+      bodies.push(String(init?.body))
+      if (attempts === 1) return new Response('busy', { status: 429, headers: { 'retry-after': '99' } })
+      if (attempts === 2) return new Response('down', { status: 503 })
+      if (attempts === 3) {
+        const encoder = new TextEncoder()
+        let emitted = false
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (!emitted) {
+              emitted = true
+              controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"content":"A"}}]}\n\n'))
+            } else {
+              controller.error(new TypeError('socket closed'))
+            }
+          },
+        }))
+      }
+      return sseResponse(['data: {"choices":[{"index":0,"delta":{"content":"AB"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'])
+    })
+    const sleeps: number[] = []
+    const provider = new OpenRouterProvider({ credential, fetch, random: () => 0, sleep: async (ms) => { sleeps.push(ms) } })
+
+    const events = await collect(provider.stream({ model: 'model', messages: [{ role: 'user', content: 'hi' }] }))
+
+    expect(events.filter((event) => event.type === 'text_delta')).toEqual([
+      { type: 'text_delta', choiceIndex: 0, text: 'A' },
+      { type: 'text_delta', choiceIndex: 0, text: 'B' },
+    ])
+    expect(attempts).toBe(4)
+    expect(sleeps).toEqual([5_000, 400, 800])
+    expect(new Set(bodies).size).toBe(1)
+    expect(bodies.every((body) => body.includes('"stream":true'))).toBe(true)
+  })
+
+  it.each([400, 401, 403])('does not retry HTTP %s and reports only a safe error', async (status) => {
+    const diagnostic = vi.fn()
+    const fetch = vi.fn(async () => new Response(`authorization: Bearer sk-private ${'x'.repeat(3000)}`, { status }))
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] }))).rejects.toMatchObject({
+      code: status === 401 || status === 403 ? 'CREDENTIAL_INVALID' : 'OPENROUTER_REQUEST_FAILED',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('sk-private')
+    expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(1500)
+  })
+
+  it('propagates cancellation through request, response reading, and retry backoff without retrying', async () => {
+    const controller = new AbortController()
+    const fetch = vi.fn(async () => {
+      controller.abort()
+      throw new DOMException('aborted', 'AbortError')
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [], signal: controller.signal })))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('stops during retry backoff when cancellation wins the race', async () => {
+    const controller = new AbortController()
+    const fetch = vi.fn(async () => new Response('busy', { status: 503 }))
+    const sleep = vi.fn(async (_milliseconds: number, signal?: AbortSignal) => {
+      controller.abort()
+      expect(signal?.aborted).toBe(true)
+      throw new DOMException('aborted', 'AbortError')
+    })
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [], signal: controller.signal })))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).toHaveBeenCalledTimes(1)
+  })
+})

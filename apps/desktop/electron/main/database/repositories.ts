@@ -175,6 +175,11 @@ export interface AppRepositories {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
     get(id: string): ChatRun | undefined
     update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
+    finalizeWithMessage(
+      id: string,
+      messageId: string,
+      value: Pick<ChatRun, 'status' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode'>> & { blocks: unknown[] },
+    ): ChatRun
   }
   workflowProjects: { insert(value: WorkflowProject): WorkflowProject; get(id: string): WorkflowProject | undefined; list(): WorkflowProject[]; update(id: string, value: Partial<Omit<WorkflowProject, 'id' | 'createdAt'>>): WorkflowProject | undefined }
   installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void }
@@ -265,13 +270,38 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     },
     chatRuns: {
       insert(value) {
-        transaction(database, () => database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, @generationId, @inputTokens, @outputTokens, @costUsd, @errorCode, @startedAt, @endedAt)').run(value))
+        transaction(database, () => database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, @generationId, @inputTokens, @outputTokens, @costUsd, @errorCode, @startedAt, @endedAt)').run({
+          generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
+        }))
         return value
       },
       get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE chat_runs SET status = COALESCE(@status, status), generation_id = COALESCE(@generationId, generation_id), input_tokens = COALESCE(@inputTokens, input_tokens), output_tokens = COALESCE(@outputTokens, output_tokens), cost_usd = COALESCE(@costUsd, cost_usd), error_code = COALESCE(@errorCode, error_code), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({ id, ...value }))
         return one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+      },
+      finalizeWithMessage(id, messageId, value) {
+        transaction(database, () => {
+          const message = database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @messageId').run({
+            messageId,
+            blocksJson: JSON.stringify(value.blocks),
+          })
+          if (message.changes !== 1) throw new Error('Assistant message not found')
+          const run = database.prepare('UPDATE chat_runs SET status = @status, generation_id = @generationId, input_tokens = @inputTokens, output_tokens = @outputTokens, cost_usd = @costUsd, error_code = @errorCode, ended_at = @endedAt WHERE id = @id').run({
+            id,
+            status: value.status,
+            generationId: value.generationId ?? null,
+            inputTokens: value.inputTokens ?? null,
+            outputTokens: value.outputTokens ?? null,
+            costUsd: value.costUsd ?? null,
+            errorCode: value.errorCode ?? null,
+            endedAt: value.endedAt,
+          })
+          if (run.changes !== 1) throw new Error('Chat run not found')
+        })
+        const stored = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        if (!stored) throw new Error('Chat run not found')
+        return stored
       },
     },
     workflowProjects: {

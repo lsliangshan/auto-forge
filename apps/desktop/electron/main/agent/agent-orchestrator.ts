@@ -1,0 +1,556 @@
+import { randomUUID } from 'node:crypto'
+import Ajv from 'ajv'
+import {
+  approvalDecisionSchema,
+  toSafeAppError,
+  type AppError,
+  type ApprovalDecision,
+  type ChatBlock,
+  type ChatEvent,
+  type WorkflowDetail,
+} from '@autoforge/shared'
+import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
+import type { ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
+import { retrieveWorkflows } from '../workflows/retriever.js'
+import type { AppRepositories } from '../database/repositories.js'
+import type {
+  OpenRouterMessage,
+  OpenRouterStreamEvent,
+  OpenRouterStreamRequest,
+  OpenRouterTool,
+} from '../chat/openrouter-provider.js'
+
+const MAX_MODEL_TURNS = 8
+const RETRIEVAL_LIMIT = 8
+
+export type ProviderStreamEvent = OpenRouterStreamEvent
+
+export interface AgentProviderPort {
+  stream(request: OpenRouterStreamRequest): AsyncIterable<OpenRouterStreamEvent>
+}
+
+export interface AgentWorkflowPort {
+  list(options?: { developerMode?: boolean }): Promise<WorkflowDetail[]>
+}
+
+export interface AgentPolicyPort {
+  evaluate(request: PermissionRequest): { allowed: boolean; requiresApproval: boolean }
+  record(record: PermissionRecord): unknown
+  releaseExecution(executionId: string): void
+}
+
+export interface AgentExecutionInput extends ExecutionStartInput {
+  executionId: string
+}
+
+export interface AgentExecutionPort {
+  start(input: AgentExecutionInput): Promise<StartedExecution | { id: string; finished: Promise<{ id: string; status: string; result?: unknown; errorCode?: string }> }>
+  cancel(executionId: string): Promise<void>
+}
+
+export interface PersistUserInput {
+  messageId: string
+  conversationId: string
+  content: string
+  createdAt: number
+}
+
+export interface CreateRunInput {
+  runId: string
+  conversationId: string
+  requestId: string
+  model: string
+  startedAt: number
+}
+
+export interface CreateAssistantInput {
+  messageId: string
+  conversationId: string
+  createdAt: number
+}
+
+export interface FinalizeAgentRunInput {
+  runId: string
+  requestId: string
+  messageId: string
+  blocks: ChatBlock[]
+  status: 'completed' | 'failed' | 'cancelled'
+  endedAt: number
+  generationId?: string
+  inputTokens?: number
+  outputTokens?: number
+  costUsd?: string
+  errorCode?: string
+}
+
+/** The final method must commit the assistant blocks and chat-run terminal state atomically. */
+export interface AgentPersistencePort {
+  persistUser(input: PersistUserInput): void
+  createRun(input: CreateRunInput): void
+  createAssistant(input: CreateAssistantInput): void
+  updateAssistant(messageId: string, blocks: ChatBlock[]): unknown
+  finalize(input: FinalizeAgentRunInput): void
+}
+
+export function createAgentPersistence(
+  repositories: Pick<AppRepositories, 'messages' | 'chatRuns'>,
+): AgentPersistencePort {
+  return {
+    persistUser(input) {
+      repositories.messages.insert({
+        id: input.messageId,
+        conversationId: input.conversationId,
+        role: 'user',
+        blocks: [{ type: 'text', text: input.content }],
+        createdAt: input.createdAt,
+      })
+    },
+    createRun(input) {
+      repositories.chatRuns.insert({
+        id: input.runId,
+        conversationId: input.conversationId,
+        requestId: input.requestId,
+        model: input.model,
+        status: 'running',
+        startedAt: input.startedAt,
+      })
+    },
+    createAssistant(input) {
+      repositories.messages.insert({
+        id: input.messageId,
+        conversationId: input.conversationId,
+        role: 'assistant',
+        blocks: [],
+        createdAt: input.createdAt,
+      })
+    },
+    updateAssistant(messageId, blocks) {
+      return repositories.messages.update(messageId, { blocks })
+    },
+    finalize(input) {
+      repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, {
+        blocks: input.blocks,
+        status: input.status,
+        endedAt: input.endedAt,
+        ...(input.generationId === undefined ? {} : { generationId: input.generationId }),
+        ...(input.inputTokens === undefined ? {} : { inputTokens: input.inputTokens }),
+        ...(input.outputTokens === undefined ? {} : { outputTokens: input.outputTokens }),
+        ...(input.costUsd === undefined ? {} : { costUsd: input.costUsd }),
+        ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+      })
+    },
+  }
+}
+
+export interface AgentOrchestratorDependencies {
+  provider: AgentProviderPort
+  workflows: AgentWorkflowPort
+  persistence: AgentPersistencePort
+  policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
+  executions: AgentExecutionPort
+  emit: (event: ChatEvent) => void
+  retrieve?: typeof retrieveWorkflows
+  id?: () => string
+  now?: () => number
+  developerMode?: () => boolean
+}
+
+export interface AgentRunInput {
+  conversationId: string
+  content: string
+  model: string
+  requestId?: string
+}
+
+export interface AgentRunResult {
+  requestId: string
+  status: 'awaiting_approval' | 'running' | 'completed' | 'failed' | 'cancelled'
+  executionId?: string
+  error?: AppError
+}
+
+interface PendingTool {
+  callId: string
+  assistantContent: string
+  workflow: WorkflowDetail
+  args: unknown
+  executionId: string
+  permissionIndex: number
+}
+
+interface ActiveAgentRun {
+  requestId: string
+  runId: string
+  messageId: string
+  conversationId: string
+  model: string
+  blocks: ChatBlock[]
+  messages: OpenRouterMessage[]
+  tools: OpenRouterTool[]
+  workflows: Map<string, WorkflowDetail>
+  controller: AbortController
+  modelTurns: number
+  busy: boolean
+  cancelled: boolean
+  terminal?: AgentRunResult
+  pending?: PendingTool
+  executionId?: string
+  generationId?: string
+  inputTokens?: number
+  outputTokens?: number
+  costUsd?: string
+}
+
+function appFailure(code: AppError['code']): AppError {
+  return toSafeAppError({ code })
+}
+
+function asAppError(error: unknown): AppError {
+  if (typeof error === 'object' && error !== null && 'code' in error) return toSafeAppError(error)
+  return appFailure('INTERNAL_ERROR')
+}
+
+function manifestTool(workflow: WorkflowDetail): OpenRouterTool {
+  return {
+    type: 'function',
+    function: {
+      name: workflow.id,
+      description: workflow.description || workflow.name,
+      parameters: workflow.inputSchema,
+    },
+  }
+}
+
+function samePermission(
+  left: WorkflowDetail['permissions'][number],
+  right: Extract<ApprovalDecision, { decision: 'always' }>,
+): boolean {
+  return left.capability === right.capability && scopeHash(left.scope) === scopeHash(right.scope)
+}
+
+export class AgentOrchestrator {
+  private readonly activeByRequest = new Map<string, ActiveAgentRun>()
+  private readonly activeByExecution = new Map<string, ActiveAgentRun>()
+  private readonly retrieve: typeof retrieveWorkflows
+  private readonly id: () => string
+  private readonly now: () => number
+
+  constructor(private readonly dependencies: AgentOrchestratorDependencies) {
+    this.retrieve = dependencies.retrieve ?? retrieveWorkflows
+    this.id = dependencies.id ?? randomUUID
+    this.now = dependencies.now ?? Date.now
+  }
+
+  async run(input: AgentRunInput): Promise<AgentRunResult> {
+    const requestId = input.requestId ?? this.id()
+    if (this.activeByRequest.has(requestId)) return this.failedResult(requestId, 'CONFLICT')
+    const userMessageId = this.id()
+    const runId = this.id()
+    const messageId = this.id()
+    const startedAt = this.now()
+
+    // This ordering is intentional: no provider or workflow operation can precede durable user input.
+    this.dependencies.persistence.persistUser({
+      messageId: userMessageId,
+      conversationId: input.conversationId,
+      content: input.content,
+      createdAt: startedAt,
+    })
+    this.dependencies.persistence.createRun({
+      runId,
+      conversationId: input.conversationId,
+      requestId,
+      model: input.model,
+      startedAt,
+    })
+    this.dependencies.persistence.createAssistant({
+      messageId,
+      conversationId: input.conversationId,
+      createdAt: startedAt,
+    })
+
+    const active: ActiveAgentRun = {
+      requestId,
+      runId,
+      messageId,
+      conversationId: input.conversationId,
+      model: input.model,
+      blocks: [],
+      messages: [{ role: 'user', content: input.content }],
+      tools: [],
+      workflows: new Map(),
+      controller: new AbortController(),
+      modelTurns: 0,
+      busy: false,
+      cancelled: false,
+    }
+    this.activeByRequest.set(requestId, active)
+    try {
+      const candidates = this.retrieve(
+        input.content,
+        await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
+        RETRIEVAL_LIMIT,
+      )
+      active.tools = candidates.map(manifestTool)
+      active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
+    } catch (error) {
+      return this.finish(active, 'failed', asAppError(error))
+    }
+    return this.driveExclusive(active)
+  }
+
+  async resumeApproval(decision: ApprovalDecision): Promise<AgentRunResult> {
+    const parsed = approvalDecisionSchema.safeParse(decision)
+    if (!parsed.success) return this.failedResult('', 'INVALID_INPUT')
+    const active = this.activeByExecution.get(parsed.data.executionId)
+    if (!active || !active.pending || active.terminal) return this.failedResult(active?.requestId ?? '', 'CONFLICT')
+    if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
+    const pending = active.pending
+    const permission = pending.workflow.permissions[pending.permissionIndex]
+    if (!permission) return this.finish(active, 'failed', appFailure('CONFLICT'))
+
+    if (parsed.data.decision === 'deny') {
+      return this.finish(active, 'failed', appFailure('PERMISSION_DENIED'))
+    }
+    if (parsed.data.decision === 'always' && (
+      parsed.data.workflowId !== pending.workflow.id
+      || parsed.data.workflowVersion !== pending.workflow.version
+      || !samePermission(permission, parsed.data)
+    )) {
+      return this.failedResult(active.requestId, 'INVALID_INPUT')
+    }
+
+    this.dependencies.policy.record({
+      executionId: pending.executionId,
+      workflowId: pending.workflow.id,
+      workflowVersion: pending.workflow.version,
+      capability: permission.capability,
+      scope: permission.scope,
+      decision: parsed.data.decision,
+    })
+    pending.permissionIndex += 1
+    return this.driveExclusive(active)
+  }
+
+  async cancel(requestId: string): Promise<void> {
+    const active = this.activeByRequest.get(requestId)
+    if (!active || active.terminal) return
+    active.cancelled = true
+    active.controller.abort()
+    if (active.executionId) {
+      try { await this.dependencies.executions.cancel(active.executionId) } catch { /* terminal chat cancellation remains authoritative */ }
+    }
+    if (!active.terminal) this.finish(active, 'cancelled', appFailure('CANCELLED'))
+  }
+
+  private async driveExclusive(active: ActiveAgentRun): Promise<AgentRunResult> {
+    if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
+    active.busy = true
+    try {
+      return await this.drive(active)
+    } catch (error) {
+      if (active.terminal) return active.terminal
+      if (active.cancelled || active.controller.signal.aborted) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+      return this.finish(active, 'failed', asAppError(error))
+    } finally {
+      active.busy = false
+    }
+  }
+
+  private async drive(active: ActiveAgentRun): Promise<AgentRunResult> {
+    if (active.terminal) return active.terminal
+    if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+    if (active.pending) return this.continuePendingTool(active)
+
+    while (active.modelTurns < MAX_MODEL_TURNS) {
+      active.modelTurns += 1
+      const toolCalls: Array<Extract<OpenRouterStreamEvent, { type: 'tool_call' }>> = []
+      let finishReason: string | undefined
+      let assistantContent = ''
+      let turnUsage: Extract<OpenRouterStreamEvent, { type: 'usage' }> | undefined
+      for await (const event of this.dependencies.provider.stream({
+        model: active.model,
+        messages: active.messages,
+        ...(active.tools.length ? { tools: active.tools } : {}),
+        signal: active.controller.signal,
+      })) {
+        if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+        if ('choiceIndex' in event && event.choiceIndex !== 0) continue
+        switch (event.type) {
+          case 'text_delta':
+            assistantContent += event.text
+            this.appendText(active, event.text)
+            break
+          case 'tool_call':
+            toolCalls.push(event)
+            if (toolCalls.length > 1) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+            break
+          case 'finish':
+            finishReason = event.reason
+            break
+          case 'generation':
+            active.generationId = event.id
+            break
+          case 'usage':
+            turnUsage = event
+            break
+        }
+      }
+      if (turnUsage) {
+        active.inputTokens = (active.inputTokens ?? 0) + turnUsage.inputTokens
+        active.outputTokens = (active.outputTokens ?? 0) + turnUsage.outputTokens
+        if (turnUsage.costUsd !== undefined) {
+          active.costUsd = String((Number(active.costUsd ?? 0) + Number(turnUsage.costUsd)).toFixed(12)).replace(/\.?0+$/, '')
+        }
+      }
+
+      if (toolCalls.length === 1) {
+        if (finishReason !== 'tool_calls') return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+        const result = this.prepareTool(active, toolCalls[0]!, assistantContent)
+        if (result) return result
+        return this.continuePendingTool(active)
+      }
+      if (finishReason === 'stop') return this.finish(active, 'completed')
+      if (finishReason === 'tool_calls') return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    }
+    return this.finish(active, 'failed', appFailure('OPENROUTER_REQUEST_FAILED'))
+  }
+
+  private prepareTool(
+    active: ActiveAgentRun,
+    call: Extract<OpenRouterStreamEvent, { type: 'tool_call' }>,
+    assistantContent: string,
+  ): AgentRunResult | undefined {
+    const workflow = active.workflows.get(call.name)
+    if (!workflow) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    try {
+      const validate = new Ajv({ allErrors: true, strict: false }).compile(workflow.inputSchema as object)
+      if (!validate(call.arguments)) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    } catch {
+      return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    }
+    const executionId = this.id()
+    active.pending = { callId: call.id, assistantContent, workflow, args: call.arguments, executionId, permissionIndex: 0 }
+    active.executionId = executionId
+    this.activeByExecution.set(executionId, active)
+    this.appendBlock(active, {
+      type: 'workflow_proposal', workflowId: workflow.id, workflowName: workflow.name, args: call.arguments,
+    })
+    return undefined
+  }
+
+  private async continuePendingTool(active: ActiveAgentRun): Promise<AgentRunResult> {
+    const pending = active.pending!
+    while (pending.permissionIndex < pending.workflow.permissions.length) {
+      const permission = pending.workflow.permissions[pending.permissionIndex]!
+      const evaluation = this.dependencies.policy.evaluate({
+        executionId: pending.executionId,
+        workflowId: pending.workflow.id,
+        workflowVersion: pending.workflow.version,
+        capability: permission.capability,
+        scope: permission.scope,
+      })
+      if (!evaluation.allowed) {
+        const last = active.blocks.at(-1)
+        if (last?.type !== 'approval' || last.executionId !== pending.executionId) {
+          this.appendBlock(active, { type: 'approval', executionId: pending.executionId })
+        }
+        return { requestId: active.requestId, status: 'awaiting_approval', executionId: pending.executionId }
+      }
+      pending.permissionIndex += 1
+    }
+
+    this.appendBlock(active, { type: 'workflow_execution', executionId: pending.executionId })
+    const started = await this.dependencies.executions.start({
+      executionId: pending.executionId,
+      workflowId: pending.workflow.id,
+      workflowVersion: pending.workflow.version,
+      input: pending.args,
+      chatRunId: active.runId,
+    })
+    if (started.id !== pending.executionId) throw appFailure('CONFLICT')
+    const execution = await started.finished
+    if (active.cancelled || execution.status === 'cancelled') return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+    if (execution.status !== 'completed') return this.finish(active, 'failed', toSafeAppError({ code: execution.errorCode ?? 'INTERNAL_ERROR' }))
+
+    this.appendBlock(active, {
+      type: 'execution_result', executionId: pending.executionId, summary: 'Workflow completed.',
+    })
+    active.messages.push({
+      role: 'assistant', content: pending.assistantContent || null,
+      tool_calls: [{ id: pending.callId, type: 'function', function: { name: pending.workflow.id, arguments: JSON.stringify(pending.args) } }],
+    })
+    active.messages.push({
+      role: 'tool', tool_call_id: pending.callId, content: JSON.stringify(execution.result ?? null),
+    })
+    this.activeByExecution.delete(pending.executionId)
+    active.pending = undefined
+    active.executionId = undefined
+    return this.drive(active)
+  }
+
+  private appendText(active: ActiveAgentRun, text: string): void {
+    if (!text) return
+    const last = active.blocks.at(-1)
+    if (last?.type === 'text') last.text += text
+    else active.blocks.push({ type: 'text', text })
+    this.dependencies.persistence.updateAssistant(active.messageId, structuredClone(active.blocks))
+    this.safeEmit({
+      type: 'block', conversationId: active.conversationId, messageId: active.messageId,
+      block: { type: 'text', text },
+    })
+  }
+
+  private appendBlock(active: ActiveAgentRun, block: ChatBlock): void {
+    active.blocks.push(block)
+    this.dependencies.persistence.updateAssistant(active.messageId, structuredClone(active.blocks))
+    this.safeEmit({ type: 'block', conversationId: active.conversationId, messageId: active.messageId, block })
+  }
+
+  private finish(
+    active: ActiveAgentRun,
+    status: 'completed' | 'failed' | 'cancelled',
+    error?: AppError,
+  ): AgentRunResult {
+    if (active.terminal) return active.terminal
+    const blocks = structuredClone(active.blocks)
+    if (error && status === 'failed') blocks.push({ type: 'error', code: error.code, message: error.message })
+    this.dependencies.persistence.finalize({
+      runId: active.runId,
+      requestId: active.requestId,
+      messageId: active.messageId,
+      blocks,
+      status,
+      endedAt: this.now(),
+      ...(active.generationId ? { generationId: active.generationId } : {}),
+      ...(active.inputTokens === undefined ? {} : { inputTokens: active.inputTokens }),
+      ...(active.outputTokens === undefined ? {} : { outputTokens: active.outputTokens }),
+      ...(active.costUsd === undefined ? {} : { costUsd: active.costUsd }),
+      ...(error ? { errorCode: error.code } : {}),
+    })
+    const result: AgentRunResult = {
+      requestId: active.requestId,
+      status,
+      ...(error ? { error } : {}),
+    }
+    active.terminal = result
+    this.activeByRequest.delete(active.requestId)
+    if (active.pending) {
+      this.activeByExecution.delete(active.pending.executionId)
+      try { this.dependencies.policy.releaseExecution(active.pending.executionId) } catch { /* terminal persistence remains authoritative */ }
+    }
+    this.safeEmit({
+      type: 'status', conversationId: active.conversationId, requestId: active.requestId, status,
+      ...(error ? { error } : {}),
+    })
+    return result
+  }
+
+  private safeEmit(event: ChatEvent): void {
+    try { this.dependencies.emit(event) } catch { /* renderer listeners are observational */ }
+  }
+
+  private failedResult(requestId: string, code: AppError['code']): AgentRunResult {
+    return { requestId, status: 'failed', error: appFailure(code) }
+  }
+}

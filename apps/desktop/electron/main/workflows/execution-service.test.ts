@@ -263,6 +263,20 @@ async function runActualWorker(source: string, options: ActualWorkerOptions = {}
 }
 
 describe('ExecutionService', () => {
+  it('uses a main-process reserved execution ID so pre-start approval remains bound to the worker', async () => {
+    const harness = createHarness()
+    const execution = await harness.service.start({
+      executionId: 'reserved_execution_1',
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: { query: 'weather' },
+    })
+
+    expect(execution.id).toBe('reserved_execution_1')
+    expect(harness.workerFactory.specifications[0]?.executionId).toBe('reserved_execution_1')
+    await harness.service.cancel(execution.id)
+  })
+
   it('kills a timed-out worker and stores a terminal failure', async () => {
     const harness = createHarness({ timeoutMs: 20 })
     const execution = await harness.start()

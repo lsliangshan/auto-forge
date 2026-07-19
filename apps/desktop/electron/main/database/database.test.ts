@@ -67,6 +67,34 @@ describe('openAppDatabase', () => {
     expect(database.messages.listForConversation('conversation_1')).toEqual([])
   })
 
+  it('atomically commits assistant partials with the chat-run terminal state', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_terminal', title: 'Terminal' })
+    database.messages.insert({
+      id: 'assistant_terminal', conversationId: 'conversation_terminal', role: 'assistant',
+      blocks: [{ type: 'text', text: '部分' }], createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_terminal', conversationId: 'conversation_terminal', requestId: 'request_terminal',
+      model: 'model', status: 'running', startedAt: 1,
+    })
+
+    database.chatRuns.finalizeWithMessage('run_terminal', 'assistant_terminal', {
+      blocks: [{ type: 'text', text: '完整' }], status: 'completed', endedAt: 2,
+      generationId: 'generation_1', inputTokens: 3, outputTokens: 4, costUsd: '0.01',
+    })
+
+    expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
+    expect(database.chatRuns.get('run_terminal')).toMatchObject({
+      status: 'completed', endedAt: 2, generationId: 'generation_1', inputTokens: 3, outputTokens: 4, costUsd: '0.01',
+    })
+
+    expect(() => database.chatRuns.finalizeWithMessage('missing', 'assistant_terminal', {
+      blocks: [{ type: 'text', text: '不得提交' }], status: 'failed', endedAt: 3,
+    })).toThrow()
+    expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
+  })
+
   it('redacts execution log text and metadata before persistence', () => {
     const database = openTestDatabase()
     database.executions.insert({

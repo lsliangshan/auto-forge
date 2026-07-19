@@ -115,6 +115,8 @@ export class NodeWorkerFactory implements WorkflowWorkerFactory {
 }
 
 export interface ExecutionStartInput {
+  /** Reserved by the trusted main-process orchestrator before pre-start permission approval. */
+  executionId?: string
   workflowId: string
   workflowVersion: string
   input: unknown
@@ -216,7 +218,7 @@ export class ExecutionService {
     const source = await this.dependencies.sourceResolver.resolve(input.workflowId, input.workflowVersion)
     if (!source) throw failure('NOT_FOUND')
     const workflow = source.workflow
-    const id = randomUUID()
+    const id = input.executionId?.trim() || randomUUID()
     const inserted = this.dependencies.repositories.executions.insert({
       id,
       workflowId: input.workflowId,
