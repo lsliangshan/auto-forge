@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { chromium, type BrowserContext } from 'playwright-chromium'
+import { chromium, type BrowserContext, type Page } from 'playwright-chromium'
 import type { Capability, CapabilityScope } from '@autoforge/shared'
 import {
   BrowserCapabilityService,
@@ -335,6 +335,90 @@ describe('BrowserCapabilityService', () => {
       await guardedBrowser.closeExecution(approvedContext.executionId).catch(() => undefined)
     }
   })
+
+  it('retains a late popup error-page guard when its first context close fails', async () => {
+    const allowSuccessfulClose = deferred()
+    const firstCloseFailed = deferred()
+    const popupGuardAttached = deferred<Page>()
+    let closeAttempts = 0
+    let forceCloseContext: (() => Promise<void>) | undefined
+    let launchedContext: BrowserContext | undefined
+    let primaryPage: Page | undefined
+    const guardedBrowser = new BrowserCapabilityService({
+      authorization,
+      headless: process.env.CI === '1',
+      profileDirectories: profiles,
+      launcher: {
+        executablePath: () => chromium.executablePath(),
+        launchPersistentContext: async (directory, options) => {
+          const context = await chromium.launchPersistentContext(directory, options)
+          launchedContext = context
+          const createSession = context.newCDPSession.bind(context)
+          context.newCDPSession = async (page) => {
+            const session = await createSession(page)
+            if (primaryPage && page !== primaryPage && 'mainFrame' in page) {
+              const sessionRecord = session as unknown as {
+                send(method: string, params?: unknown): Promise<unknown>
+              }
+              const send = sessionRecord.send.bind(sessionRecord)
+              sessionRecord.send = async (method, params) => {
+                const result = await send(method, params)
+                if (method === 'Fetch.enable') popupGuardAttached.resolve(page)
+                return result
+              }
+            }
+            return session
+          }
+          const closeContext = context.close.bind(context)
+          forceCloseContext = closeContext
+          context.close = async () => {
+            closeAttempts += 1
+            if (closeAttempts === 1) {
+              firstCloseFailed.resolve()
+              throw new Error('context busy')
+            }
+            await allowSuccessfulClose.promise
+            await closeContext()
+          }
+          return context
+        },
+      },
+    })
+
+    try {
+      await guardedBrowser.open(approvedContext, fixtureOrigin)
+      primaryPage = launchedContext!.pages()[0]
+      const clicking = guardedBrowser.click(approvedContext, 'role=button[name="Popup inside"]')
+      void clicking.catch(() => undefined)
+      await Promise.race([
+        firstCloseFailed.promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('first close did not fail')), 2_000)),
+      ])
+      const popupPage = await Promise.race([
+        popupGuardAttached.promise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('popup guard did not attach')), 2_000)),
+      ])
+
+      await expect(popupPage.goto(`${outsideOrigin}/after-popup-close-failure`)).rejects.toThrow()
+      expect(outsideRequests).toBe(0)
+
+      const closing = guardedBrowser.closeExecution(approvedContext.executionId)
+      allowSuccessfulClose.resolve()
+      await expect(closing).resolves.toBeUndefined()
+      await expect(clicking).rejects.toMatchObject(denied())
+
+      expect(closeAttempts).toBe(2)
+      expect(guardedBrowser.activeContexts(approvedContext.executionId)).toBe(0)
+      await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      allowSuccessfulClose.resolve()
+      await Promise.race([
+        guardedBrowser.closeExecution(approvedContext.executionId).catch(() => undefined),
+        new Promise<void>((resolveCleanup) => setTimeout(resolveCleanup, 2_000)),
+      ])
+      await forceCloseContext?.().catch(() => undefined)
+    }
+  }, 15_000)
 
   it('preserves the final URL after safely resolving an allowed same-origin redirect', async () => {
     await browser.open(approvedContext, `${fixtureOrigin}/redirect-final`)

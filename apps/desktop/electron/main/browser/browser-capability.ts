@@ -719,16 +719,21 @@ export class BrowserCapabilityService implements CapabilityPort {
   ): Promise<void> {
     const session = await owner.context.newCDPSession(page)
     const guard = await this.createNavigationGuard(state, owner, session)
-    if (state.closing || page.isClosed()) {
+    if (!owner.contextOpen || page.isClosed()) {
       await guard.dispose()
       return
     }
     owner.navigationGuards.add(guard)
     page.once('close', () => {
-      if (state.closing) return
       owner.navigationGuards.delete(guard)
       void guard.dispose().catch(() => undefined)
     })
+    if (!owner.contextOpen || page.isClosed()) {
+      owner.navigationGuards.delete(guard)
+      await guard.dispose()
+      return
+    }
+    if (state.closing) await guard.cancel()
   }
 
   private async createNavigationGuard(
