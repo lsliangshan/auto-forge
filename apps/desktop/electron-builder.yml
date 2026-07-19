@@ -4,3 +4,6 @@ directories:
   output: dist
 files:
   - out/**
+extraResources:
+  - from: resources/migrations
+    to: migrations

@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { openAppDatabase } from './client.js'
 
@@ -19,6 +20,13 @@ afterEach(() => {
 })
 
 describe('openAppDatabase', () => {
+  it('packages migrations where the migration runner resolves them', () => {
+    const configPath = fileURLToPath(new URL('../../../electron-builder.yml', import.meta.url))
+    const config = readFileSync(configPath, 'utf8')
+
+    expect(config).toContain('extraResources:\n  - from: resources/migrations\n    to: migrations')
+  })
+
   it('migrates a fresh database and interrupts abandoned executions', () => {
     const database = openTestDatabase()
 
