@@ -1,20 +1,24 @@
 <template>
-  <section class="developer-placeholder">
-    <div
-      class="placeholder-grid"
-      aria-hidden="true"
-    >
-      <div class="file-column" /><div class="editor-column">
-        <span /><span /><span />
-      </div><div class="output-column" />
+  <section class="developer-workbench">
+    <div v-if="developer.loading && !developer.projects.length" class="developer-state">正在加载本地项目…</div>
+    <div v-else-if="developer.error && !developer.projects.length" class="developer-state error" role="alert">{{ developer.error }}</div>
+    <div v-else-if="!developer.projects.length" class="developer-state">
+      <span class="af-panel-heading">开发工作台</span><h2>创建或导入本地工作流项目</h2><p>项目文件始终通过受控桌面 API 读取，不会向编辑器暴露本地文件系统。</p>
     </div>
-    <div class="placeholder-copy">
-      <span class="af-panel-heading">开发工作台</span><h2>开发模式将在下一阶段实现</h2><p>Task 11 将接入 Monaco、项目文件树、实时校验、调试输入、日志与结果。当前页面不会伪造编辑器或项目数据。</p>
-    </div>
+    <CodeEditor v-else />
   </section>
 </template>
 
+<script setup lang="ts">
+import { onBeforeUnmount, onMounted } from 'vue'
+import CodeEditor from '../components/developer/CodeEditor.vue'
+import { useDeveloperStore } from '../stores/developer'
+
+const developer = useDeveloperStore()
+onMounted(() => { void developer.loadProjects() })
+onBeforeUnmount(() => { void developer.flushPendingSaves() })
+</script>
+
 <style scoped>
-.developer-placeholder { display: grid; min-height: 100%; place-items: center; padding: 32px; }.placeholder-copy { max-width: 510px; margin-top: -20px; text-align: center; }.placeholder-copy h2 { margin: 8px 0; color: var(--af-graphite); font-size: 20px; }.placeholder-copy p { color: var(--af-text-muted); font-size: 13px; line-height: 1.7; }
-.placeholder-grid { display: grid; width: min(620px, 80%); height: 220px; grid-template-columns: 120px 1fr 150px; border: 1px solid var(--af-border); opacity: .65; background: var(--af-surface); }.file-column { border-right: 1px solid var(--af-border); background: var(--af-surface-muted); }.editor-column { padding: 38px; }.editor-column span { display: block; width: 68%; height: 7px; margin-bottom: 16px; background: #dfe6ef; }.editor-column span:nth-child(2) { width: 86%; }.editor-column span:nth-child(3) { width: 48%; }.output-column { border-left: 1px solid var(--af-border); background: var(--af-surface-muted); }
+.developer-workbench { height: 100%; min-height: 480px; background: var(--af-surface); }.developer-state { display: grid; min-height: 100%; place-content: center; gap: 7px; padding: 32px; color: var(--af-text-muted); text-align: center; }.developer-state h2 { margin: 0; color: var(--af-graphite); font-size: 19px; }.developer-state p { max-width: 500px; margin: 0; font-size: 13px; line-height: 1.6; }.developer-state.error { color: var(--af-danger); }
 </style>

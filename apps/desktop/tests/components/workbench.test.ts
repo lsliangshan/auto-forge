@@ -24,7 +24,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       list: vi.fn().mockResolvedValue([]), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn(),
     },
     developer: {
-      createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
+      listProjects: vi.fn().mockResolvedValue([]), createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
       build: vi.fn(), validate: vi.fn(), run: vi.fn(),
     },
     executions: {
@@ -90,9 +90,10 @@ describe('workbench', () => {
     expect(wrapper.text()).not.toContain('百度搜索')
   })
 
-  it('renders the developer route as an honest Task 11 placeholder', async () => {
-    const { wrapper } = await mountApp('/developer')
-    expect(wrapper.text()).toContain('开发模式将在下一阶段实现')
+  it('renders the real developer empty state without inventing a project', async () => {
+    const { wrapper, api } = await mountApp('/developer')
+    await vi.waitFor(() => expect(api.developer.listProjects).toHaveBeenCalledOnce())
+    expect(wrapper.text()).toContain('创建或导入本地工作流项目')
     expect(wrapper.find('[data-testid="monaco-editor"]').exists()).toBe(false)
   })
 

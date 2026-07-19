@@ -147,9 +147,7 @@
       <div class="sidebar-toolbar">
         <span class="af-panel-heading">项目与文件</span>
       </div>
-      <div class="sidebar-state">
-        Task 11 将在此显示本地项目与文件树。
-      </div>
+      <FileTree />
     </template>
 
     <template v-else-if="route.name === 'executions'">
@@ -218,6 +216,7 @@ import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
 import { useWorkflowStore } from '../stores/workflow'
+import FileTree from './developer/FileTree.vue'
 
 const route = useRoute()
 const chat = useChatStore()

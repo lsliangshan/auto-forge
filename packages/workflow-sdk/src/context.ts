@@ -6,6 +6,14 @@ export interface BrowserCapability {
   close(): Promise<void>
 }
 
+export interface LoggerCapability {
+  debug(message: string): void
+  info(message: string): void
+  warn(message: string): void
+  error(message: string): void
+}
+
 export interface WorkflowContext {
   browser: BrowserCapability
+  logger: LoggerCapability
 }

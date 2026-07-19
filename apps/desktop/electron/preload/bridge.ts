@@ -68,6 +68,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
       installProject: (projectId) => invoke(ipcRenderer, ipcChannels.workflowsInstallProject, { projectId }),
     },
     developer: {
+      listProjects: () => invoke(ipcRenderer, ipcChannels.developerListProjects),
       createProject: (name) => invoke(ipcRenderer, ipcChannels.developerCreateProject, { name }),
       registerProject: () => invoke(ipcRenderer, ipcChannels.developerRegisterProject),
       readFile: (projectId, relativePath) => invoke(ipcRenderer, ipcChannels.developerReadFile, { projectId, relativePath }),

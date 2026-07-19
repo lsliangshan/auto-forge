@@ -21,7 +21,7 @@ function services(): DesktopIpcServices {
     },
     workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
     developer: {
-      createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
+      listProjects: vi.fn(), createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
       build: vi.fn(), validate: vi.fn(), run: vi.fn(),
     },
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },

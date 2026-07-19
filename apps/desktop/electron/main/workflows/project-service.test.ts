@@ -82,6 +82,22 @@ afterEach(() => {
 })
 
 describe('WorkflowProjectService', () => {
+  it('reports TypeScript build diagnostics during validation without writing build output', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    writeFileSync(join(root, 'src/index.ts'), "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ broken: missingName })) })\n")
+    const project = projects.register(root)
+
+    const result = await projects.validate(project.id)
+
+    expect(result.valid).toBe(false)
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'src/index.ts', severity: 'error' }),
+    ]))
+    expect(existsSync(join(root, 'dist/index.js'))).toBe(false)
+  })
+
   it('enables only the exact installed workflow version', async () => {
     const { directory, database, projects } = openTestServices()
     const root = join(directory, 'project')

@@ -24,7 +24,7 @@ function createEventApi() {
       onEvent: vi.fn((listener) => { chatListener = listener; return chatUnsubscribe }),
     },
     workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
-    developer: { createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(), build: vi.fn(), validate: vi.fn(), run: vi.fn() },
+    developer: { listProjects: vi.fn().mockResolvedValue([]), createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(), build: vi.fn(), validate: vi.fn(), run: vi.fn() },
     executions: {
       list: vi.fn(), get: vi.fn(), decide, cancel: vi.fn(),
       onEvent: vi.fn((listener) => { executionListener = listener; return executionUnsubscribe }),

@@ -768,6 +768,24 @@ describe('NodeWorkerFactory', () => {
     })
   })
 
+  it('exposes a log-only logger capability to workflows', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          context.logger.info('safe workflow progress')
+          return { logged: true }
+        },
+      })
+    `)
+
+    expect(messages).toEqual([
+      { type: 'ready', executionId: 'exec_runner' },
+      { type: 'log', level: 'info', message: 'safe workflow progress' },
+      { type: 'result', output: { logged: true } },
+    ])
+  })
+
   it.each([
     ['static', "import fs from 'node:fs'\nvoid fs"],
     ['dynamic', "await import('node:fs')"],

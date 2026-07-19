@@ -148,15 +148,38 @@ export class WorkflowProjectService {
       return result
     }
 
-    const result = validateManifest(manifest)
-    if (!result.valid) this.persist(project.id, { status: 'invalid', lastError: result.diagnostics.map((diagnostic) => diagnostic.message).join('; ') })
+    const manifestResult = validateManifest(manifest)
+    const diagnostics = [...manifestResult.diagnostics]
+    const sourcePath = await this.filePath(project.id, 'src/index.ts', false)
+    try {
+      await esbuild({
+        entryPoints: [sourcePath], bundle: true, write: false, platform: 'browser', format: 'esm',
+        target: 'es2022', external: ['@autoforge/workflow-sdk'], logLevel: 'silent',
+      })
+    } catch (error) {
+      const messages = typeof error === 'object' && error !== null && 'errors' in error
+        ? (error as { errors?: Array<{ text?: string; location?: { line?: number; column?: number } }> }).errors
+        : undefined
+      diagnostics.push(...(messages?.length ? messages : [{ text: 'TypeScript validation failed' }]).map((message) => ({
+        path: 'src/index.ts',
+        message: `${message.text ?? 'TypeScript validation failed'}${message.location?.line ? ` (${message.location.line}:${(message.location.column ?? 0) + 1})` : ''}`,
+        severity: 'error' as const,
+      })))
+    }
+    const result: ValidationResult = { valid: diagnostics.length === 0, diagnostics }
+    if (!result.valid) this.persist(project.id, { status: 'invalid', lastError: diagnostics.map((diagnostic) => diagnostic.message).join('; ') })
     return result
   }
 
   async build(projectId: string): Promise<WorkflowProject> {
     const project = this.require(projectId)
     const validation = await this.validate(project.id)
-    if (!validation.valid) throw failure('INVALID_INPUT')
+    if (!validation.valid) {
+      if (validation.diagnostics.length > 0 && validation.diagnostics.every(({ path }) => path === 'src/index.ts')) {
+        this.persist(project.id, { status: 'error', lastError: validation.diagnostics.map(({ message }) => message).join('; ') })
+      }
+      throw failure('INVALID_INPUT')
+    }
     const manifest = JSON.parse(await this.readFile(project.id, 'workflow.json')) as WorkflowManifest
     this.persist(project.id, { status: 'building' })
 

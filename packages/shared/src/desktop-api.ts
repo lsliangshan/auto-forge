@@ -291,6 +291,7 @@ export const ipcChannels = {
   workflowsRemove: 'workflows:remove',
   workflowsInstallProject: 'workflows:install-project',
   developerCreateProject: 'developer:create-project',
+  developerListProjects: 'developer:list-projects',
   developerRegisterProject: 'developer:register-project',
   developerReadFile: 'developer:read-file',
   developerWriteFile: 'developer:write-file',
@@ -334,6 +335,7 @@ export const workflowSetEnabledRequestSchema = z.object({ id: identifierSchema, 
 export const workflowRemoveRequestSchema = z.object({ id: identifierSchema, version: nonEmptyStringSchema }).strict()
 export const workflowInstallProjectRequestSchema = z.object({ projectId: identifierSchema }).strict()
 export const createProjectRequestSchema = z.object({ name: nonEmptyStringSchema }).strict()
+export const listProjectsRequestSchema = z.undefined()
 export const registerProjectRequestSchema = z.undefined()
 export const readFileRequestSchema = z.object({
   projectId: identifierSchema,
@@ -385,6 +387,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.workflowsRemove]: workflowRemoveRequestSchema,
   [ipcChannels.workflowsInstallProject]: workflowInstallProjectRequestSchema,
   [ipcChannels.developerCreateProject]: createProjectRequestSchema,
+  [ipcChannels.developerListProjects]: listProjectsRequestSchema,
   [ipcChannels.developerRegisterProject]: registerProjectRequestSchema,
   [ipcChannels.developerReadFile]: readFileRequestSchema,
   [ipcChannels.developerWriteFile]: writeFileRequestSchema,
@@ -426,6 +429,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.workflowsRemove]: voidResponseSchema,
   [ipcChannels.workflowsInstallProject]: workflowDetailSchema,
   [ipcChannels.developerCreateProject]: developerProjectSchema,
+  [ipcChannels.developerListProjects]: z.array(developerProjectSchema),
   [ipcChannels.developerRegisterProject]: developerProjectSchema.nullable(),
   [ipcChannels.developerReadFile]: z.string(),
   [ipcChannels.developerWriteFile]: voidResponseSchema,
@@ -468,6 +472,7 @@ export interface DesktopAPI {
     installProject(projectId: string): Promise<WorkflowDetail>
   }
   developer: {
+    listProjects(): Promise<DeveloperProject[]>
     createProject(name: string): Promise<DeveloperProject>
     registerProject(): Promise<DeveloperProject | null>
     readFile(projectId: string, relativePath: string): Promise<string>

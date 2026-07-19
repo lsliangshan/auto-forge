@@ -77,14 +77,21 @@ async function contextModule(
     void requestCapability(request).then(resolvePromise, (error) => rejectPromise(toSafeAppError(error)))
   }) as (...arguments_: never[]) => unknown)
   const originOf = isolateHostFunction(((value: string) => new URL(value).origin) as (...arguments_: never[]) => unknown)
+  const log = isolateHostFunction((((level: unknown, message: unknown) => {
+    if (!['debug', 'info', 'warn', 'error'].includes(String(level)) || typeof message !== 'string') throw protocolError()
+    write({ type: 'log', level: level as 'debug' | 'info' | 'warn' | 'error', message })
+  })) as (...arguments_: never[]) => unknown)
   const global = context as Record<string, unknown>
   global.__autoforgeCapabilityBridge = bridge
   global.__autoforgeOriginOf = originOf
+  global.__autoforgeLogBridge = log
   const module = new vm.SourceTextModule(`
     const bridge = globalThis.__autoforgeCapabilityBridge
     const originOf = globalThis.__autoforgeOriginOf
+    const logBridge = globalThis.__autoforgeLogBridge
     delete globalThis.__autoforgeCapabilityBridge
     delete globalThis.__autoforgeOriginOf
+    delete globalThis.__autoforgeLogBridge
     let currentOrigin
     function request(capability, scope, args) {
       return new Promise((resolve, reject) => bridge({ capability, scope, arguments: args }, resolve, reject))
@@ -114,7 +121,13 @@ async function contextModule(
         currentOrigin = undefined
       },
     })
-    export default Object.freeze({ browser })
+    const logger = Object.freeze({
+      debug(message) { logBridge('debug', message) },
+      info(message) { logBridge('info', message) },
+      warn(message) { logBridge('warn', message) },
+      error(message) { logBridge('error', message) },
+    })
+    export default Object.freeze({ browser, logger })
   `, { context, identifier: 'autoforge:workflow-context' })
   await module.link((specifier) => rejectImport(specifier))
   await module.evaluate()

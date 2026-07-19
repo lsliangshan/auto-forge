@@ -1,0 +1,90 @@
+{
+  "id": "browser.search.baidu",
+  "version": "1.0.0",
+  "name": "百度搜索",
+  "description": "在可见的受控浏览器中打开百度并搜索关键词。",
+  "author": "AutoForge",
+  "category": "browser",
+  "entryPath": "dist/index.js",
+  "codeSha256": "448e590bd5752b75e0d9a6bdcc23946762d50a8d08ad6b04482c0d0b8e083766",
+  "permissions": [
+    {
+      "capability": "browser.open",
+      "scope": {
+        "origins": [
+          "https://www.baidu.com"
+        ]
+      }
+    },
+    {
+      "capability": "browser.fill",
+      "scope": {
+        "origins": [
+          "https://www.baidu.com"
+        ]
+      }
+    },
+    {
+      "capability": "browser.click",
+      "scope": {
+        "origins": [
+          "https://www.baidu.com"
+        ]
+      }
+    },
+    {
+      "capability": "browser.url",
+      "scope": {
+        "origins": [
+          "https://www.baidu.com"
+        ]
+      }
+    }
+  ],
+  "activationExamples": [
+    "用百度搜索今日天气",
+    "百度一下 AutoForge",
+    "在百度查找上海景点"
+  ],
+  "activationNegativeExamples": [
+    "写一封邮件",
+    "读取本地文件",
+    "在其他搜索引擎搜索"
+  ],
+  "timeoutMs": 30000,
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "keyword"
+    ],
+    "properties": {
+      "keyword": {
+        "type": "string",
+        "title": "搜索关键词",
+        "minLength": 1,
+        "maxLength": 200
+      }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "success",
+      "keyword",
+      "url"
+    ],
+    "properties": {
+      "success": {
+        "type": "boolean"
+      },
+      "keyword": {
+        "type": "string"
+      },
+      "url": {
+        "type": "string"
+      }
+    }
+  }
+}

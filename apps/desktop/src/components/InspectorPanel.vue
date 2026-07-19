@@ -154,9 +154,12 @@
           </section>
         </template>
       </template>
+      <template v-else-if="route.name === 'developer'">
+        <DebugPanel />
+      </template>
       <template v-else>
         <div class="inspector-state">
-          Task 11 将在这里显示校验问题、调试日志与结果。
+          暂无可显示的检查器内容。
         </div>
       </template>
     </div>
@@ -170,6 +173,7 @@ import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
 import { useWorkflowStore } from '../stores/workflow'
+import DebugPanel from './developer/DebugPanel.vue'
 
 defineProps<{ open: boolean }>()
 defineEmits<{ close: [] }>()

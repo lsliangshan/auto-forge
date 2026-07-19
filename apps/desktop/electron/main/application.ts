@@ -20,6 +20,7 @@ import {
   type WorkflowSummary,
 } from '@autoforge/shared'
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
+import Ajv, { type AnySchema } from 'ajv'
 import { AgentOrchestrator, createAgentPersistence } from './agent/agent-orchestrator.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
 import { OpenRouterProvider, type OpenRouterStreamEvent, type OpenRouterStreamRequest } from './chat/openrouter-provider.js'
@@ -393,6 +394,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
     },
     developer: {
+      listProjects: async () => Promise.all(database.workflowProjects.list().map((project) => developerProject(project))),
       createProject: async (name) => developerProject(await projects.create(options.paths.projects, newManifest(name))),
       registerProject: async () => {
         const path = await options.chooseProjectDirectory()
@@ -407,6 +409,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         try {
           const built = await projects.build(projectId)
           const manifest = built.manifest as WorkflowManifest
+          try {
+            const validateInput = new Ajv({ allErrors: true, strict: false }).compile(manifest.inputSchema as AnySchema)
+            if (!validateInput(input)) throw failure('INVALID_INPUT')
+          } catch (error) {
+            if (typeof error === 'object' && error !== null && 'code' in error) throw error
+            throw failure('INVALID_INPUT')
+          }
           const started = await executions.start({ workflowId: manifest.id, workflowVersion: manifest.version, input })
           void started.finished.catch(() => undefined)
           return { executionId: started.id }

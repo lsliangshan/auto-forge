@@ -53,6 +53,17 @@ describe('createApplicationRuntime', () => {
     expect(await runtime.services.settings.saveOpenRouterKey('sk-local')).toMatchObject({ configured: true, valid: true })
     const longNameProject = await runtime.services.developer.createProject(`${'a'.repeat(47)} b`)
     expect(longNameProject.name).toBe(`${'a'.repeat(47)} b`)
+    expect(await runtime.services.developer.listProjects()).toEqual([
+      expect.objectContaining({ id: longNameProject.id, files: expect.arrayContaining(['src/index.ts', 'workflow.json']) }),
+    ])
+    const manifest = JSON.parse(await runtime.services.developer.readFile(longNameProject.id, 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', additionalProperties: false, required: ['keyword'],
+      properties: { keyword: { type: 'string', minLength: 1 } },
+    }
+    await runtime.services.developer.writeFile(longNameProject.id, 'workflow.json', JSON.stringify(manifest))
+    await expect(runtime.services.developer.run({ projectId: longNameProject.id, input: {} }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     await runtime.services.system.openExternal('https://example.com/')
     expect(openExternal).toHaveBeenCalledWith('https://example.com/')
 

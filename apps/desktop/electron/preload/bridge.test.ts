@@ -50,6 +50,12 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.chatListMessages, { conversationId: 'conversation_1' })
   })
 
+  it('lists local projects through a fixed developer channel', async () => {
+    const app = harness()
+    await app.api.developer.listProjects()
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.developerListProjects, undefined)
+  })
+
   it('removes exactly its wrapped event listener with an idempotent unsubscribe', () => {
     const app = harness()
     const listener = vi.fn()

@@ -129,6 +129,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.workflowsRemove, (input) => options.services.workflows.remove(input.id, input.version))
   register(ipcChannels.workflowsInstallProject, (input) => options.services.workflows.installProject(input.projectId))
   register(ipcChannels.developerCreateProject, (input) => options.services.developer.createProject(input.name))
+  register(ipcChannels.developerListProjects, () => options.services.developer.listProjects())
   register(ipcChannels.developerRegisterProject, () => options.services.developer.registerProject())
   register(ipcChannels.developerReadFile, (input) => options.services.developer.readFile(input.projectId, input.relativePath))
   register(ipcChannels.developerWriteFile, (input) => options.services.developer.writeFile(input.projectId, input.relativePath, input.content))
