@@ -33,4 +33,29 @@ describe('cross-process contracts', () => {
       message: 'Unexpected application error',
     })
   })
+
+  it('does not expose a native error message containing credentials', () => {
+    const result = toSafeAppError(new Error('Authorization: Bearer sk-secret'))
+
+    expect(result).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: 'Unexpected application error',
+    })
+    expect(JSON.stringify(result)).not.toContain('sk-secret')
+  })
+
+  it('keeps only the safe code from an error-like object with sensitive details', () => {
+    const result = toSafeAppError({
+      code: 'INVALID_INPUT',
+      message: 'Invalid request',
+      details: { apiKey: 'sk-secret', path: '/private/user/path' },
+    })
+
+    expect(result).toEqual({
+      code: 'INVALID_INPUT',
+      message: 'The request is invalid.',
+    })
+    expect(JSON.stringify(result)).not.toContain('sk-secret')
+    expect(JSON.stringify(result)).not.toContain('/private/user/path')
+  })
 })
