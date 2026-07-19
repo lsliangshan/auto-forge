@@ -105,7 +105,8 @@ interface ExecutionBrowserState {
 }
 
 interface PageNavigationGuard {
-  close(): Promise<void>
+  cancel(): Promise<void>
+  dispose(): Promise<void>
 }
 
 interface FetchRequestPausedEvent {
@@ -677,7 +678,9 @@ export class BrowserCapabilityService implements CapabilityPort {
         return
       }
     } catch {
-      // Initial popup navigation has no Frame yet, but is necessarily its new page's main frame.
+      await route.abort('blockedbyclient').catch(() => undefined)
+      this.recordNavigationViolation(state, failure('CAPABILITY_SCOPE_DENIED'))
+      return
     }
     if (frame) {
       const page = frame.page()
@@ -691,24 +694,6 @@ export class BrowserCapabilityService implements CapabilityPort {
       }
       return
     }
-    const operation = state.operation
-    if (!operation) {
-      await route.abort('blockedbyclient').catch(() => undefined)
-      this.recordNavigationViolation(state, failure('CAPABILITY_SCOPE_DENIED'))
-      return
-    }
-    try {
-      await this.authorizeOperation(state, operation, originOf(request.url()))
-    } catch (error) {
-      await route.abort('blockedbyclient').catch(() => undefined)
-      this.recordNavigationViolation(state, error)
-      return
-    }
-    if (!frame) {
-      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
-      await Promise.all([...owner.guardAttachments])
-    }
-    await route.continue()
   }
 
   private async guardFrameNavigation(
@@ -735,13 +720,14 @@ export class BrowserCapabilityService implements CapabilityPort {
     const session = await owner.context.newCDPSession(page)
     const guard = await this.createNavigationGuard(state, owner, session)
     if (state.closing || page.isClosed()) {
-      await guard.close()
+      await guard.dispose()
       return
     }
     owner.navigationGuards.add(guard)
     page.once('close', () => {
+      if (state.closing) return
       owner.navigationGuards.delete(guard)
-      void guard.close().catch(() => undefined)
+      void guard.dispose().catch(() => undefined)
     })
   }
 
@@ -750,7 +736,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     owner: OwnedBrowser,
     session: CDPSession,
   ): Promise<PageNavigationGuard> {
-    let closed = false
+    let disposed = false
     let mainFrameId = ''
     const pausedRequests = new Set<string>()
 
@@ -758,18 +744,21 @@ export class BrowserCapabilityService implements CapabilityPort {
       await session.send('Fetch.failRequest', { requestId, errorReason: 'Aborted' }).catch(() => undefined)
     }
     const guard: PageNavigationGuard = {
-      close: async () => {
-        if (closed) return
-        closed = true
+      cancel: async () => {
         await Promise.all([...pausedRequests].map(failRequest))
         pausedRequests.clear()
+      },
+      dispose: async () => {
+        if (disposed) return
+        disposed = true
+        await guard.cancel()
         await session.send('Fetch.disable').catch(() => undefined)
         await session.detach().catch(() => undefined)
       },
     }
 
     session.on('close', () => {
-      closed = true
+      disposed = true
       pausedRequests.clear()
       owner.navigationGuards.delete(guard)
     })
@@ -784,14 +773,14 @@ export class BrowserCapabilityService implements CapabilityPort {
       pausedRequests.add(event.requestId)
       const authorizePausedRequest = async (): Promise<void> => {
         const operation = state.operation
-        if (closed || !operation) {
+        if (disposed || !operation) {
           await failRequest(event.requestId)
           this.recordNavigationViolation(state, failure('CAPABILITY_SCOPE_DENIED'))
           return
         }
         try {
           await this.authorizeOperation(state, operation, originOf(event.request.url))
-          if (closed || state.closing) {
+          if (disposed || state.closing) {
             await failRequest(event.requestId)
             return
           }
@@ -817,7 +806,7 @@ export class BrowserCapabilityService implements CapabilityPort {
       })
       return guard
     } catch (error) {
-      await guard.close()
+      await guard.dispose()
       throw error
     }
   }
@@ -855,12 +844,15 @@ export class BrowserCapabilityService implements CapabilityPort {
       owner = state.owner
     }
     if (owner) {
-      await Promise.all([...owner.navigationGuards].map((guard) => guard.close()))
-      owner.navigationGuards.clear()
+      await Promise.all([...owner.navigationGuards].map((guard) => guard.cancel()))
     }
     if (owner?.contextOpen) {
       await owner.context.close()
       owner.contextOpen = false
+    }
+    if (owner) {
+      await Promise.all([...owner.navigationGuards].map((guard) => guard.dispose()))
+      owner.navigationGuards.clear()
     }
     await this.waitForIdle(state)
     if (state.profilePath) {

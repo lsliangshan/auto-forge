@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { chromium, type BrowserContext } from 'playwright-chromium'
 import type { Capability, CapabilityScope } from '@autoforge/shared'
 import {
   BrowserCapabilityService,
@@ -166,6 +167,11 @@ describe('BrowserCapabilityService', () => {
         response.end()
         return
       }
+      if (request.url === '/popup-redirect-outside') {
+        response.writeHead(302, { location: `${outsideOrigin}/popup-redirect-target` })
+        response.end()
+        return
+      }
       if (request.url === '/start') {
         response.writeHead(302, {
           location: `${fixtureOrigin}/nested/page`,
@@ -198,7 +204,7 @@ describe('BrowserCapabilityService', () => {
         <label>Keyword <input id="keyword" /></label>
         <button id="submit" onclick="history.pushState({}, '', '/result?q=' + encodeURIComponent(document.querySelector('#keyword').value))">Submit</button>
         <button id="popup" onclick="window.open('${outsideOrigin}/popup')">Popup</button>
-        <button id="popup-inside" onclick="window.open('${fixtureOrigin}/popup-inside')">Popup inside</button>
+        <button id="popup-inside" onclick="window.open('${fixtureOrigin}/popup-redirect-outside')">Popup inside</button>
         <button id="delayed" onclick="setTimeout(() => { location.href = '${outsideOrigin}/delayed' }, 30)">Delayed</button>
         <button id="delayed-history" onclick="setTimeout(() => { history.pushState({}, '', '/late-history') }, 30)">Delayed history</button>
         <button class="duplicate">One</button><button class="duplicate">Two</button>`)
@@ -273,13 +279,61 @@ describe('BrowserCapabilityService', () => {
     expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
   })
 
-  it('allows an operation-scoped same-origin popup while retaining execution ownership', async () => {
+  it('rejects a frame-less same-origin popup before its redirect can reach an unauthorized origin', async () => {
     await browser.open(approvedContext, fixtureOrigin)
 
-    await browser.click(approvedContext, 'role=button[name="Popup inside"]')
+    await expect(browser.click(approvedContext, 'role=button[name="Popup inside"]'))
+      .rejects.toMatchObject(denied())
 
     expect(outsideRequests).toBe(0)
-    expect(browser.activeContexts(approvedContext.executionId)).toBe(1)
+    expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('keeps request guards attached after context close fails until a later close succeeds', async () => {
+    const allowSuccessfulClose = deferred()
+    let closeAttempts = 0
+    let launchedContext: BrowserContext | undefined
+    const guardedBrowser = new BrowserCapabilityService({
+      authorization,
+      headless: process.env.CI === '1',
+      profileDirectories: profiles,
+      launcher: {
+        executablePath: () => chromium.executablePath(),
+        launchPersistentContext: async (directory, options) => {
+          const context = await chromium.launchPersistentContext(directory, options)
+          launchedContext = context
+          const closeContext = context.close.bind(context)
+          context.close = async () => {
+            closeAttempts += 1
+            if (closeAttempts === 1) throw new Error('context busy')
+            await allowSuccessfulClose.promise
+            await closeContext()
+          }
+          return context
+        },
+      },
+    })
+
+    try {
+      await guardedBrowser.open(approvedContext, fixtureOrigin)
+      await expect(guardedBrowser.closeExecution(approvedContext.executionId)).rejects.toThrow('context busy')
+
+      const externalNavigation = launchedContext!.pages()[0]!.goto(`${outsideOrigin}/after-close-failure`)
+      await expect(externalNavigation).rejects.toThrow()
+      expect(outsideRequests).toBe(0)
+
+      const closing = guardedBrowser.closeExecution(approvedContext.executionId)
+      allowSuccessfulClose.resolve()
+      await expect(closing).resolves.toBeUndefined()
+
+      expect(closeAttempts).toBe(2)
+      expect(guardedBrowser.activeContexts(approvedContext.executionId)).toBe(0)
+      await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      allowSuccessfulClose.resolve()
+      await guardedBrowser.closeExecution(approvedContext.executionId).catch(() => undefined)
+    }
   })
 
   it('preserves the final URL after safely resolving an allowed same-origin redirect', async () => {
