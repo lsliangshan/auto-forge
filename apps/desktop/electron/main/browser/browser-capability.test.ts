@@ -1,4 +1,4 @@
-import { createServer, type Server } from 'node:http'
+import { createServer, type Server, type ServerResponse } from 'node:http'
 import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -68,6 +68,16 @@ function deferred<T = void>(): {
   return { promise, resolve }
 }
 
+function fakeCDPSession() {
+  return {
+    send: async (method: string) => method === 'Page.getFrameTree'
+      ? { frameTree: { frame: { id: 'main-frame' } } }
+      : {},
+    on: () => undefined,
+    detach: async () => undefined,
+  }
+}
+
 function fakeLauncher(options: { close?: () => Promise<void> } = {}) {
   let currentUrl = 'about:blank'
   let contextCloseListener: (() => void) | undefined
@@ -87,6 +97,7 @@ function fakeLauncher(options: { close?: () => Promise<void> } = {}) {
       if (event === 'close') contextCloseListener = listener
     },
     route: async () => undefined,
+    newCDPSession: async () => fakeCDPSession(),
     close: async () => {
       await options.close?.()
       contextCloseListener?.()
@@ -119,6 +130,10 @@ describe('BrowserCapabilityService', () => {
   let outsideServer: Server
   let outsideOrigin: string
   let outsideRequests: number
+  let nestedAssetRequests: string[]
+  let nestedCookie: string | undefined
+  let stallResponse: ServerResponse | undefined
+  let stallStarted: ReturnType<typeof deferred>
   let testRoot: string
   let profiles: CapturedProfileDirectories
   let authorization: LoopbackAuthorization
@@ -126,6 +141,10 @@ describe('BrowserCapabilityService', () => {
 
   beforeEach(async () => {
     outsideRequests = 0
+    nestedAssetRequests = []
+    nestedCookie = undefined
+    stallResponse = undefined
+    stallStarted = deferred()
     outsideServer = createServer((_request, response) => {
       outsideRequests += 1
       response.end('outside')
@@ -145,6 +164,33 @@ describe('BrowserCapabilityService', () => {
       if (request.url === '/redirect-final') {
         response.writeHead(302, { location: `${fixtureOrigin}/final-page` })
         response.end()
+        return
+      }
+      if (request.url === '/start') {
+        response.writeHead(302, {
+          location: `${fixtureOrigin}/nested/page`,
+          'set-cookie': 'redirect-session=present; Path=/',
+        })
+        response.end()
+        return
+      }
+      if (request.url === '/nested/page') {
+        nestedCookie = request.headers.cookie
+        response.setHeader('content-type', 'text/html; charset=utf-8')
+        response.end('<!doctype html><script src="./asset.js"></script><p>Nested</p>')
+        return
+      }
+      if (request.url === '/nested/asset.js' || request.url === '/asset.js') {
+        nestedAssetRequests.push(request.url)
+        response.setHeader('content-type', 'application/javascript')
+        response.end('globalThis.__nestedAssetLoaded = true')
+        return
+      }
+      if (request.url === '/stall') {
+        stallResponse = response
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        response.write('<!doctype html><p>still loading')
+        stallStarted.resolve(undefined)
         return
       }
       response.setHeader('content-type', 'text/html; charset=utf-8')
@@ -170,6 +216,7 @@ describe('BrowserCapabilityService', () => {
   })
 
   afterEach(async () => {
+    stallResponse?.destroy()
     await browser.closeExecution(approvedContext.executionId)
     await closeServer(fixtureServer)
     await closeServer(outsideServer)
@@ -240,6 +287,34 @@ describe('BrowserCapabilityService', () => {
 
     expect(await browser.url(approvedContext)).toBe(`${fixtureOrigin}/final-page`)
     expect(browser.activeContexts(approvedContext.executionId)).toBe(1)
+  })
+
+  it('keeps Chromium redirect cookies and resolves relative assets from the final URL', async () => {
+    await browser.open(approvedContext, `${fixtureOrigin}/start`)
+
+    expect(await browser.url(approvedContext)).toBe(`${fixtureOrigin}/nested/page`)
+    expect(nestedCookie).toContain('redirect-session=present')
+    expect(nestedAssetRequests).toEqual(['/nested/asset.js'])
+  })
+
+  it('closes a stalled native navigation promptly and removes its profile', async () => {
+    const opening = browser.open(approvedContext, `${fixtureOrigin}/stall`)
+    await stallStarted.promise
+    const closing = browser.closeExecution(approvedContext.executionId)
+
+    try {
+      await expect(Promise.race([
+        closing,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('close timed out')), 1_000)),
+      ])).resolves.toBeUndefined()
+    } finally {
+      stallResponse?.destroy()
+      await opening.catch(() => undefined)
+      await closing.catch(() => undefined)
+    }
+
+    expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('blocks delayed main-frame navigation outside an active operation and cleans the execution', async () => {
@@ -459,6 +534,7 @@ describe('packaged Chromium runtime resolution', () => {
       on: () => undefined,
       once: () => undefined,
       route: async () => undefined,
+      newCDPSession: async () => fakeCDPSession(),
       close: async () => undefined,
     }
     const service = new BrowserCapabilityService({

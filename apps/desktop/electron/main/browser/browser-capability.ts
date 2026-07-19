@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   chromium,
   type BrowserContext,
+  type CDPSession,
   type Frame,
   type Locator,
   type Page,
@@ -77,8 +78,9 @@ interface OwnedBrowser {
   profilePath: string
   contextOpen: boolean
   pendingGuards: Set<Promise<void>>
-  routedFrames: WeakSet<Frame>
-  redirectedUrls: Map<string, string>
+  navigationGuards: Set<PageNavigationGuard>
+  guardAttachments: Set<Promise<void>>
+  guardAttachmentsByPage: WeakMap<Page, Promise<void>>
 }
 
 interface ActiveBrowserOperation {
@@ -98,6 +100,23 @@ interface ExecutionBrowserState {
   activeOperations: number
   idleWaiters: Set<() => void>
   closePromise?: Promise<void>
+  cancel: Promise<void>
+  cancelResolve: () => void
+}
+
+interface PageNavigationGuard {
+  close(): Promise<void>
+}
+
+interface FetchRequestPausedEvent {
+  requestId: string
+  frameId?: string
+  resourceType: string
+  request: { url: string }
+}
+
+interface PageFrameNavigatedEvent {
+  frame: { id: string; parentId?: string }
 }
 
 const roles = new Set([
@@ -313,36 +332,6 @@ async function uniqueLocator(page: Page, request: string): Promise<Locator> {
   return locator
 }
 
-interface NavigationResponse {
-  status: number
-  headers: Record<string, string>
-  body: Buffer
-}
-
-async function fetchNavigationWithoutRedirect(
-  url: string,
-  method: string,
-  headers: Record<string, string>,
-  postData: Buffer | null,
-): Promise<NavigationResponse> {
-  const body = postData
-    ? postData.buffer.slice(postData.byteOffset, postData.byteOffset + postData.byteLength) as ArrayBuffer
-    : undefined
-  const response = await fetch(url, {
-    method,
-    headers,
-    redirect: 'manual',
-    ...(!['GET', 'HEAD'].includes(method) && body
-      ? { body }
-      : {}),
-  })
-  return {
-    status: response.status,
-    headers: Object.fromEntries(response.headers.entries()),
-    body: Buffer.from(await response.arrayBuffer()),
-  }
-}
-
 export class BrowserCapabilityService implements CapabilityPort {
   private readonly authorization: BrowserAuthorizationPort
   private readonly headless: boolean
@@ -393,12 +382,13 @@ export class BrowserCapabilityService implements CapabilityPort {
   async open(context: BrowserCapabilityContext, url: string, declaredScope?: CapabilityScope): Promise<void> {
     return this.executeCapability(context, 'browser.open', declaredScope, true, true, async (state) => {
       const requestedOrigin = originOf(url)
-      await this.authorizeOperation({ context, capability: 'browser.open', declaredScope }, requestedOrigin)
+      await this.authorizeOperation(state, { context, capability: 'browser.open', declaredScope }, requestedOrigin)
       this.assertAvailable(state)
       const owner = await this.ensureOwner(state)
       this.assertAvailable(state)
       await owner.primaryPage.goto(url)
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.open', declaredScope },
         originOf(owner.primaryPage.url()),
       )
@@ -414,11 +404,13 @@ export class BrowserCapabilityService implements CapabilityPort {
     return this.executeCapability(context, 'browser.fill', declaredScope, false, false, async (state) => {
       const owner = this.owner(state)
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.fill', declaredScope },
         originOf(owner.primaryPage.url()),
       )
       await (await uniqueLocator(owner.primaryPage, locator)).fill(value)
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.fill', declaredScope },
         originOf(owner.primaryPage.url()),
       )
@@ -433,11 +425,13 @@ export class BrowserCapabilityService implements CapabilityPort {
     return this.executeCapability(context, 'browser.click', declaredScope, false, false, async (state) => {
       const owner = this.owner(state)
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.click', declaredScope },
         originOf(owner.primaryPage.url()),
       )
       await (await uniqueLocator(owner.primaryPage, locator)).click()
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.click', declaredScope },
         originOf(owner.primaryPage.url()),
       )
@@ -448,6 +442,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     return this.executeCapability(context, 'browser.url', declaredScope, false, false, async (state) => {
       const url = this.owner(state).primaryPage.url()
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.url', declaredScope },
         originOf(url),
       )
@@ -458,6 +453,7 @@ export class BrowserCapabilityService implements CapabilityPort {
   async close(context: BrowserCapabilityContext, declaredScope?: CapabilityScope): Promise<void> {
     await this.executeCapability(context, 'browser.close', declaredScope, false, false, async (state) => {
       await this.authorizeOperation(
+        state,
         { context, capability: 'browser.close', declaredScope },
         originOf(this.owner(state).primaryPage.url()),
       )
@@ -469,6 +465,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     const state = this.executions.get(executionId)
     if (!state) return
     state.closing = true
+    state.cancelResolve()
     if (state.closePromise) return state.closePromise
     const closePromise = this.cleanupExecution(state)
     state.closePromise = closePromise
@@ -538,8 +535,9 @@ export class BrowserCapabilityService implements CapabilityPort {
       profilePath,
       contextOpen: true,
       pendingGuards: new Set(),
-      routedFrames: new WeakSet(),
-      redirectedUrls: new Map(),
+      navigationGuards: new Set(),
+      guardAttachments: new Set(),
+      guardAttachmentsByPage: new WeakMap(),
     }
     state.owner = owner
     const associate = (page: Page) => this.associatePage(state, owner, page)
@@ -548,8 +546,9 @@ export class BrowserCapabilityService implements CapabilityPort {
     context.once('close', () => { owner.contextOpen = false })
     await context.route('**/*', (route, request) => this.trackGuard(
       owner,
-      this.guardMainFrameRequest(state, owner, route, request),
+      this.gateNavigationRequest(state, owner, route, request),
     ))
+    await Promise.all([...owner.guardAttachments])
     return owner
   }
 
@@ -557,11 +556,15 @@ export class BrowserCapabilityService implements CapabilityPort {
     let state = this.executions.get(executionId)
     if (!state) {
       if (!create) throw failure('NOT_FOUND')
+      let cancelResolve!: () => void
+      const cancel = new Promise<void>((resolveCancel) => { cancelResolve = resolveCancel })
       state = {
         executionId,
         closing: false,
         activeOperations: 0,
         idleWaiters: new Set(),
+        cancel,
+        cancelResolve,
       }
       this.executions.set(executionId, state)
     }
@@ -600,8 +603,6 @@ export class BrowserCapabilityService implements CapabilityPort {
     try {
       result = await action(state)
       await this.drainGuards(state.owner)
-      await this.applyRedirectedUrls(state.owner)
-      await this.drainGuards(state.owner)
       if (state.violation) throw state.violation
       this.assertAvailable(state)
     } catch (error) {
@@ -627,27 +628,38 @@ export class BrowserCapabilityService implements CapabilityPort {
     if (state.closing) throw failure('CANCELLED')
   }
 
-  private authorizeOperation(operation: ActiveBrowserOperation, origin: string): Promise<void> {
+  private authorizeOperation(
+    state: ExecutionBrowserState,
+    operation: ActiveBrowserOperation,
+    origin: string,
+  ): Promise<void> {
     if (operation.declaredScope) assertExactScope(operation.declaredScope, origin)
-    return this.authorize(operation.context, operation.capability, origin)
+    return Promise.race([
+      this.authorize(operation.context, operation.capability, origin),
+      state.cancel.then(() => Promise.reject(failure('CANCELLED'))),
+    ])
   }
 
   private associatePage(state: ExecutionBrowserState, owner: OwnedBrowser, page: Page): void {
+    if (this.pageOwners.get(page) === state.executionId) return
     owner.pages.add(page)
     this.pageOwners.set(page, state.executionId)
     page.once('close', () => owner.pages.delete(page))
     page.on('framenavigated', (frame) => {
       if (frame !== page.mainFrame() || frame.url() === 'about:blank') return
-      if (owner.routedFrames.delete(frame)) return
       const operation = state.operation
       void this.trackGuard(
         owner,
         this.guardFrameNavigation(state, operation, frame.url()),
       ).catch(() => undefined)
     })
+    const attachment = this.attachNavigationGuard(state, owner, page)
+    owner.guardAttachments.add(attachment)
+    owner.guardAttachmentsByPage.set(page, attachment)
+    void attachment.finally(() => owner.guardAttachments.delete(attachment)).catch(() => undefined)
   }
 
-  private async guardMainFrameRequest(
+  private async gateNavigationRequest(
     state: ExecutionBrowserState,
     owner: OwnedBrowser,
     route: Route,
@@ -667,6 +679,18 @@ export class BrowserCapabilityService implements CapabilityPort {
     } catch {
       // Initial popup navigation has no Frame yet, but is necessarily its new page's main frame.
     }
+    if (frame) {
+      const page = frame.page()
+      this.associatePage(state, owner, page)
+      try {
+        await owner.guardAttachmentsByPage.get(page)
+        await route.continue()
+      } catch (error) {
+        await route.abort('blockedbyclient').catch(() => undefined)
+        this.recordNavigationViolation(state, error)
+      }
+      return
+    }
     const operation = state.operation
     if (!operation) {
       await route.abort('blockedbyclient').catch(() => undefined)
@@ -674,25 +698,17 @@ export class BrowserCapabilityService implements CapabilityPort {
       return
     }
     try {
-      await this.authorizeOperation(operation, originOf(request.url()))
+      await this.authorizeOperation(state, operation, originOf(request.url()))
     } catch (error) {
       await route.abort('blockedbyclient').catch(() => undefined)
       this.recordNavigationViolation(state, error)
       return
     }
-    let navigationResponse: NavigationResponse
-    let finalUrl: string
-    try {
-      ({ response: navigationResponse, finalUrl } = await this.fetchNavigationChain(operation, request))
-    } catch (error) {
-      if (toSafeAppError(error).code !== 'CAPABILITY_SCOPE_DENIED') throw error
-      await route.abort('blockedbyclient').catch(() => undefined)
-      this.recordNavigationViolation(state, error)
-      return
+    if (!frame) {
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
+      await Promise.all([...owner.guardAttachments])
     }
-    if (finalUrl !== request.url()) owner.redirectedUrls.set(request.url(), finalUrl)
-    if (frame) owner.routedFrames.add(frame)
-    await route.fulfill(navigationResponse)
+    await route.continue()
   }
 
   private async guardFrameNavigation(
@@ -705,15 +721,111 @@ export class BrowserCapabilityService implements CapabilityPort {
       return
     }
     try {
-      await this.authorizeOperation(operation, originOf(url))
+      await this.authorizeOperation(state, operation, originOf(url))
     } catch (error) {
       this.recordNavigationViolation(state, error)
+    }
+  }
+
+  private async attachNavigationGuard(
+    state: ExecutionBrowserState,
+    owner: OwnedBrowser,
+    page: Page,
+  ): Promise<void> {
+    const session = await owner.context.newCDPSession(page)
+    const guard = await this.createNavigationGuard(state, owner, session)
+    if (state.closing || page.isClosed()) {
+      await guard.close()
+      return
+    }
+    owner.navigationGuards.add(guard)
+    page.once('close', () => {
+      owner.navigationGuards.delete(guard)
+      void guard.close().catch(() => undefined)
+    })
+  }
+
+  private async createNavigationGuard(
+    state: ExecutionBrowserState,
+    owner: OwnedBrowser,
+    session: CDPSession,
+  ): Promise<PageNavigationGuard> {
+    let closed = false
+    let mainFrameId = ''
+    const pausedRequests = new Set<string>()
+
+    const failRequest = async (requestId: string): Promise<void> => {
+      await session.send('Fetch.failRequest', { requestId, errorReason: 'Aborted' }).catch(() => undefined)
+    }
+    const guard: PageNavigationGuard = {
+      close: async () => {
+        if (closed) return
+        closed = true
+        await Promise.all([...pausedRequests].map(failRequest))
+        pausedRequests.clear()
+        await session.send('Fetch.disable').catch(() => undefined)
+        await session.detach().catch(() => undefined)
+      },
+    }
+
+    session.on('close', () => {
+      closed = true
+      pausedRequests.clear()
+      owner.navigationGuards.delete(guard)
+    })
+    session.on('Page.frameNavigated', (event: PageFrameNavigatedEvent) => {
+      if (!event.frame.parentId) mainFrameId = event.frame.id
+    })
+    session.on('Fetch.requestPaused', (event: FetchRequestPausedEvent) => {
+      if (event.resourceType !== 'Document' || event.frameId !== mainFrameId) {
+        void session.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => undefined)
+        return
+      }
+      pausedRequests.add(event.requestId)
+      const authorizePausedRequest = async (): Promise<void> => {
+        const operation = state.operation
+        if (closed || !operation) {
+          await failRequest(event.requestId)
+          this.recordNavigationViolation(state, failure('CAPABILITY_SCOPE_DENIED'))
+          return
+        }
+        try {
+          await this.authorizeOperation(state, operation, originOf(event.request.url))
+          if (closed || state.closing) {
+            await failRequest(event.requestId)
+            return
+          }
+          await session.send('Fetch.continueRequest', { requestId: event.requestId })
+        } catch (error) {
+          await failRequest(event.requestId)
+          this.recordNavigationViolation(state, error)
+        } finally {
+          pausedRequests.delete(event.requestId)
+        }
+      }
+      void this.trackGuard(owner, authorizePausedRequest()).catch(() => undefined)
+    })
+
+    try {
+      await session.send('Page.enable')
+      const frameTree = await session.send('Page.getFrameTree') as {
+        frameTree: { frame: { id: string } }
+      }
+      mainFrameId = frameTree.frameTree.frame.id
+      await session.send('Fetch.enable', {
+        patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }],
+      })
+      return guard
+    } catch (error) {
+      await guard.close()
+      throw error
     }
   }
 
   private recordNavigationViolation(state: ExecutionBrowserState, error: unknown): void {
     state.violation ??= toSafeAppError(error)
     state.closing = true
+    state.cancelResolve()
     void this.closeExecution(state.executionId).catch(() => undefined)
   }
 
@@ -731,56 +843,26 @@ export class BrowserCapabilityService implements CapabilityPort {
     }
   }
 
-  private async fetchNavigationChain(
-    operation: ActiveBrowserOperation,
-    request: Request,
-  ): Promise<{ response: NavigationResponse; finalUrl: string }> {
-    let url = request.url()
-    let method = request.method()
-    let postData = request.postDataBuffer()
-    const headers = await request.allHeaders()
-    for (const name of ['connection', 'content-length', 'host']) delete headers[name]
-
-    for (let redirectCount = 0; redirectCount <= 10; redirectCount += 1) {
-      const response = await fetchNavigationWithoutRedirect(url, method, headers, postData)
-      const location = response.headers.location
-      if (![301, 302, 303, 307, 308].includes(response.status) || !location) {
-        return { response, finalUrl: url }
-      }
-      if (redirectCount === 10) throw failure('INVALID_INPUT')
-      url = new URL(location, url).href
-      await this.authorizeOperation(operation, originOf(url))
-      if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
-        method = 'GET'
-        postData = null
-        delete headers['content-type']
-      }
-    }
-    throw failure('INVALID_INPUT')
-  }
-
-  private async applyRedirectedUrls(owner: OwnedBrowser | undefined): Promise<void> {
-    if (!owner || owner.redirectedUrls.size === 0) return
-    for (const page of owner.pages) {
-      const finalUrl = owner.redirectedUrls.get(page.url())
-      if (!finalUrl) continue
-      owner.redirectedUrls.delete(page.url())
-      await page.evaluate((url) => history.replaceState(null, '', url), finalUrl)
-    }
-  }
-
   private waitForIdle(state: ExecutionBrowserState): Promise<void> {
     if (state.activeOperations === 0) return Promise.resolve()
     return new Promise((resolveIdle) => state.idleWaiters.add(resolveIdle))
   }
 
   private async cleanupExecution(state: ExecutionBrowserState): Promise<void> {
-    await this.waitForIdle(state)
-    const owner = state.owner
+    let owner = state.owner
+    if (!owner) {
+      await this.waitForIdle(state)
+      owner = state.owner
+    }
+    if (owner) {
+      await Promise.all([...owner.navigationGuards].map((guard) => guard.close()))
+      owner.navigationGuards.clear()
+    }
     if (owner?.contextOpen) {
       await owner.context.close()
       owner.contextOpen = false
     }
+    await this.waitForIdle(state)
     if (state.profilePath) {
       await this.removeProfile(state.profilePath)
       state.profilePath = undefined
