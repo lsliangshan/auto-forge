@@ -9,6 +9,8 @@ blob-report/
 playwright/.cache/
 playwright/.local-browsers/
 browser-binaries/
+apps/desktop/resources/browser-runtime.json
+apps/desktop/resources/ms-playwright/
 *.db
 *.db-shm
 *.db-wal

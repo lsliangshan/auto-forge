@@ -10,6 +10,7 @@ export default tseslint.config(
       '**/out/**',
       '**/dist/**',
       '**/coverage/**',
+      'apps/desktop/resources/ms-playwright/**',
     ],
   },
   js.configs.recommended,

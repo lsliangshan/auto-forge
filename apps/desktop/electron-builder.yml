@@ -7,3 +7,7 @@ files:
 extraResources:
   - from: resources/migrations
     to: migrations
+  - from: resources/browser-runtime.json
+    to: browser-runtime.json
+  - from: resources/ms-playwright
+    to: ms-playwright
