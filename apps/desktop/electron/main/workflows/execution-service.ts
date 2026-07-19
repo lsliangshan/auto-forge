@@ -239,6 +239,15 @@ export class ExecutionService {
     return handle
   }
 
+  discardReservation(reservation: ExecutionReservation): boolean {
+    const record = this.reservationHandles.get(reservation)
+    if (!record || record.handle !== reservation || record.started) return false
+    record.cancelled = true
+    this.reservationHandles.delete(reservation)
+    this.reservationsById.delete(record.executionId)
+    return true
+  }
+
   async start(input: ExecutionStartInput, signal?: AbortSignal): Promise<StartedExecution> {
     return this.startReserved(this.reserve(), input, signal)
   }
@@ -250,7 +259,10 @@ export class ExecutionService {
   ): Promise<StartedExecution> {
     const record = this.reservationHandles.get(reservation)
     if (!record || record.handle !== reservation || record.started) throw failure('CONFLICT')
-    if (record.cancelled || signal?.aborted) throw failure('CANCELLED')
+    if (record.cancelled || signal?.aborted) {
+      this.discardReservation(reservation)
+      throw failure('CANCELLED')
+    }
     record.started = true
     const onAbort = () => { record.cancelled = true }
     signal?.addEventListener('abort', onAbort, { once: true })
@@ -332,6 +344,7 @@ export class ExecutionService {
       rejectFinished,
     }
     this.active.set(id, active)
+    this.reservationHandles.delete(record.handle)
     this.reservationsById.delete(id)
     this.attach(active)
 
@@ -393,7 +406,7 @@ export class ExecutionService {
     if (reservation) {
       reservation.cancelled = true
       if (!reservation.starting) {
-        this.reservationsById.delete(executionId)
+        this.discardReservation(reservation.handle)
         return
       }
       const started = await reservation.starting
@@ -463,6 +476,8 @@ export class ExecutionService {
       // Pre-active capability cleanup is best effort after the terminal state is durable.
     }
     if (directory) await this.removeTemporaryDirectory(directory)
+    const reservation = this.reservationsById.get(executionId)
+    if (reservation) this.reservationHandles.delete(reservation.handle)
     this.reservationsById.delete(executionId)
     return { id: executionId, finished: Promise.resolve(terminal) }
   }
@@ -583,7 +598,17 @@ export class ExecutionService {
     const pending: PendingCapability = { requestId, request, requiresApproval: evaluation.requiresApproval }
     active.pending = pending
     if (evaluation.requiresApproval) {
+      const permissionIndex = active.workflow.permissions.findIndex((permission) => samePermission(permission, request))
       this.transition(active, 'awaiting_approval')
+      this.emit({
+        type: 'approval_required',
+        executionId: active.id,
+        permissionIndex,
+        capability: request.capability,
+        scope: request.scope,
+        scopeHash: scopeHash(request.scope),
+        occurredAt: new Date().toISOString(),
+      })
       return
     }
     await this.dispatchCapability(active, pending)

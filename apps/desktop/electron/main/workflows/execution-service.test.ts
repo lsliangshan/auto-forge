@@ -283,6 +283,33 @@ describe('ExecutionService', () => {
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
+  it('discards only an unstarted authentic reservation and makes discard idempotent', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+
+    expect(harness.service.discardReservation(reservation)).toBe(true)
+    expect(harness.service.discardReservation(reservation)).toBe(false)
+    expect(harness.service.discardReservation({ executionId: reservation.executionId } as never)).toBe(false)
+    await expect(harness.service.startReserved(reservation, {
+      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('automatically discards a reservation when start is already aborted', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(harness.service.startReserved(reservation, {
+      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+    }, controller.signal)).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(harness.service.discardReservation(reservation)).toBe(false)
+    await expect(harness.service.startReserved(reservation, {
+      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
   it('cancels and settles a reserved start blocked before active registration without spawning', async () => {
     let release!: () => void
     const gate = new Promise<void>((resolvePromise) => { release = resolvePromise })
@@ -337,6 +364,14 @@ describe('ExecutionService', () => {
 
     expect(harness.repositories.records.get(execution.id)?.status).toBe('awaiting_approval')
     expect(worker.requests.some((message) => message.type === 'capability_result')).toBe(false)
+    const approval = harness.events.find((event) => event.type === 'approval_required')
+    expect(approval).toMatchObject({
+      type: 'approval_required', executionId: execution.id, permissionIndex: 0,
+      capability: capabilityRequest.capability, scope: capabilityRequest.scope,
+      scopeHash: scopeHash(capabilityRequest.scope),
+    })
+    expect(harness.events.findIndex((event) => event.type === 'status' && event.status === 'awaiting_approval'))
+      .toBeLessThan(harness.events.findIndex((event) => event.type === 'approval_required'))
 
     await harness.service.decide({
       executionId: execution.id,
@@ -352,6 +387,41 @@ describe('ExecutionService', () => {
     worker.respond({ type: 'result', output: { title: 'weather' } })
     await execution.finished
     expect(harness.repositories.records.get(execution.id)).toMatchObject({ status: 'completed', result: { title: 'weather' } })
+  })
+
+  it('emits exact identity for a later manifest permission and rejects an out-of-order decision', async () => {
+    const fillPermission = { capability: 'browser.fill' as const, scope: capabilityRequest.scope }
+    const twoPermissionWorkflow = { ...workflow, permissions: [workflow.permissions[0]!, fillPermission] }
+    const harness = createHarness({
+      source: {
+        workflow: twoPermissionWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request', requestId: 'request_fill',
+      request: { ...fillPermission, arguments: { locator: '#query', value: 'weather' } },
+    })
+    await turn()
+
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'approval_required', executionId: execution.id, permissionIndex: 1,
+      capability: 'browser.fill', scopeHash: scopeHash(fillPermission.scope),
+    }))
+    await expect(harness.service.decide({
+      executionId: execution.id, permissionIndex: 0, scopeHash: scopeHash(fillPermission.scope), decision: 'once',
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+    await harness.service.decide({
+      executionId: execution.id, permissionIndex: 1, scopeHash: scopeHash(fillPermission.scope), decision: 'once',
+    })
+    await turn()
+    expect(worker.requests).toContainEqual({ type: 'capability_result', requestId: 'request_fill', result: { ok: true } })
+    await harness.service.cancel(execution.id)
   })
 
   it('requires an always decision to exactly match the paused request', async () => {

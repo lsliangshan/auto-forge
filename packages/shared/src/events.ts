@@ -96,6 +96,15 @@ export const executionEventSchema = z.discriminatedUnion('type', [
     summary: z.string(),
     occurredAt: timestampSchema,
   }).strict(),
+  z.object({
+    type: z.literal('approval_required'),
+    executionId: identifierSchema,
+    permissionIndex: z.number().int().nonnegative(),
+    capability: capabilitySchema,
+    scope: capabilityScopeSchema,
+    scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+    occurredAt: timestampSchema,
+  }).strict(),
 ])
 
 export type ExecutionEvent = z.infer<typeof executionEventSchema>

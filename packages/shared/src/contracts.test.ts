@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { approvalDecisionSchema, toSafeAppError, workerMessageSchema } from './index'
+import { approvalDecisionSchema, executionEventSchema, toSafeAppError, workerMessageSchema } from './index'
 
 describe('cross-process contracts', () => {
   it('rejects a persistent approval without an exact workflow version', () => {
@@ -21,6 +21,18 @@ describe('cross-process contracts', () => {
       workflowVersion: '1.0.0', capability: 'browser.open',
       scope: { origins: ['https://www.baidu.com'] },
     })).toMatchObject({ decision: 'always', workflowVersion: '1.0.0' })
+  })
+
+  it('requires exact identity on a dynamic execution approval event', () => {
+    expect(executionEventSchema.parse({
+      type: 'approval_required',
+      executionId: 'exec_1',
+      permissionIndex: 1,
+      capability: 'browser.fill',
+      scope: { origins: ['https://www.baidu.com'] },
+      scopeHash: 'a'.repeat(64),
+      occurredAt: '2026-07-19T00:00:00.000Z',
+    })).toMatchObject({ type: 'approval_required', permissionIndex: 1 })
   })
 
   it('accepts a fixed worker response discriminator', () => {

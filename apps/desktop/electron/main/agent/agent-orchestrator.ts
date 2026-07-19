@@ -41,6 +41,7 @@ export interface AgentPolicyPort {
 
 export interface AgentExecutionPort {
   reserve(): ExecutionReservation
+  discardReservation(reservation: ExecutionReservation): boolean
   startReserved(
     reservation: ExecutionReservation,
     input: ExecutionStartInput,
@@ -177,6 +178,7 @@ interface PendingTool {
   args: unknown
   executionId: string
   reservation: ExecutionReservation
+  reservationStarted: boolean
   permissionIndex: number
 }
 
@@ -326,14 +328,18 @@ export class AgentOrchestrator {
       return this.failedResult(active.requestId, 'INVALID_INPUT')
     }
 
-    this.dependencies.policy.record({
-      executionId: pending.executionId,
-      workflowId: pending.workflow.id,
-      workflowVersion: pending.workflow.version,
-      capability: permission.capability,
-      scope: permission.scope,
-      decision: parsed.data.decision,
-    })
+    try {
+      this.dependencies.policy.record({
+        executionId: pending.executionId,
+        workflowId: pending.workflow.id,
+        workflowVersion: pending.workflow.version,
+        capability: permission.capability,
+        scope: permission.scope,
+        decision: parsed.data.decision,
+      })
+    } catch (error) {
+      return this.finish(active, 'failed', asAppError(error))
+    }
     pending.permissionIndex += 1
     return this.driveExclusive(active)
   }
@@ -418,6 +424,7 @@ export class AgentOrchestrator {
       }
       if (finishReason === 'stop') return this.finish(active, 'completed')
       if (finishReason === 'tool_calls') return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+      return this.finish(active, 'failed', appFailure('OPENROUTER_REQUEST_FAILED'))
     }
     return this.finish(active, 'failed', appFailure('OPENROUTER_REQUEST_FAILED'))
   }
@@ -437,7 +444,16 @@ export class AgentOrchestrator {
     }
     const reservation = this.dependencies.executions.reserve()
     const executionId = reservation.executionId
-    active.pending = { callId: call.id, assistantContent, workflow, args: call.arguments, executionId, reservation, permissionIndex: 0 }
+    active.pending = {
+      callId: call.id,
+      assistantContent,
+      workflow,
+      args: call.arguments,
+      executionId,
+      reservation,
+      reservationStarted: false,
+      permissionIndex: 0,
+    }
     active.executionId = executionId
     this.activeByExecution.set(executionId, active)
     this.appendBlock(active, {
@@ -479,6 +495,7 @@ export class AgentOrchestrator {
     }
 
     this.appendBlock(active, { type: 'workflow_execution', executionId: pending.executionId })
+    pending.reservationStarted = true
     const started = await this.dependencies.executions.startReserved(pending.reservation, {
       workflowId: pending.workflow.id,
       workflowVersion: pending.workflow.version,
@@ -558,6 +575,9 @@ export class AgentOrchestrator {
     this.activeByRequest.delete(active.requestId)
     if (active.pending) {
       this.activeByExecution.delete(active.pending.executionId)
+      if (!active.pending.reservationStarted) {
+        try { this.dependencies.executions.discardReservation(active.pending.reservation) } catch { /* terminal persistence remains authoritative */ }
+      }
       try { this.dependencies.policy.releaseExecution(active.pending.executionId) } catch { /* terminal persistence remains authoritative */ }
     }
     if (errorBlock) {

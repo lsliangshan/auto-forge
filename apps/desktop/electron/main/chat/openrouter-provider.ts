@@ -471,6 +471,7 @@ export class OpenRouterProvider {
     })
     const decoder = new TextDecoder()
     const reader = response.body.getReader()
+    let normalCompletion = false
     try {
       while (!done) {
         if (signal?.aborted) throw failure('CANCELLED')
@@ -485,8 +486,9 @@ export class OpenRouterProvider {
       if (parserError) throw parserError
       while (pending.length) yield pending.shift()!
       if (!done && !explicitTerminal) throw new RetryableFailure()
+      normalCompletion = true
     } finally {
-      if (signal?.aborted || done) await reader.cancel().catch(() => undefined)
+      if (!normalCompletion) await reader.cancel().catch(() => undefined)
       reader.releaseLock()
     }
   }

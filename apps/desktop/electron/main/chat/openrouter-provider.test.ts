@@ -239,4 +239,20 @@ describe('OpenRouterProvider', () => {
       .rejects.toMatchObject({ code: 'OPENROUTER_REQUEST_FAILED' })
     expect(fetch).toHaveBeenCalledTimes(1)
   })
+
+  it('cancels the response reader when an SSE error aborts parsing', async () => {
+    const encoder = new TextEncoder()
+    let readerCancelled = false
+    const fetch = vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"error":{"code":403,"message":"denied"}}\n\n'))
+      },
+      cancel() { readerCancelled = true },
+    })))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] })))
+      .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
+    expect(readerCancelled).toBe(true)
+  })
 })

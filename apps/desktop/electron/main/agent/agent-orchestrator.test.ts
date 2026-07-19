@@ -22,9 +22,9 @@ async function* events(values: ProviderStreamEvent[]) {
 }
 
 function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies & {
-  records: { users: unknown[]; starts: unknown[]; decisions: unknown[]; events: unknown[]; terminal: unknown[] }
+  records: { users: unknown[]; starts: unknown[]; decisions: unknown[]; discards: unknown[]; events: unknown[]; terminal: unknown[] }
 } {
-  const records = { users: [] as unknown[], starts: [] as unknown[], decisions: [] as unknown[], events: [] as unknown[], terminal: [] as unknown[] }
+  const records = { users: [] as unknown[], starts: [] as unknown[], decisions: [] as unknown[], discards: [] as unknown[], events: [] as unknown[], terminal: [] as unknown[] }
   const messages = new Map<string, { blocks: unknown[] }>()
   let reservation = 0
   return {
@@ -39,6 +39,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     },
     executions: {
       reserve: () => ({ executionId: `reserved_${++reservation}` }),
+      discardReservation: (reserved) => { records.discards.push(reserved); return true },
       startReserved: async (reserved, input) => {
         records.starts.push({ ...input, executionId: reserved.executionId })
         return { id: reserved.executionId, finished: Promise.resolve({ id: reserved.executionId, status: 'completed', result: { title: '天气' } }) }
@@ -120,6 +121,23 @@ describe('AgentOrchestrator', () => {
     expect(denied).toMatchObject({ status: 'failed', error: { code: 'PERMISSION_DENIED' } })
     expect(denyDependencies.records.starts).toHaveLength(0)
     expect(denyDependencies.records.terminal).toHaveLength(1)
+    expect(denyDependencies.records.discards).toHaveLength(1)
+  })
+
+  it('terminalizes and discards an unstarted reservation when policy recording throws', async () => {
+    const dependencies = harness([toolTurn])
+    dependencies.policy.record = () => { throw new Error('policy unavailable') }
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+
+    const result = await orchestrator.resumeApproval({
+      executionId: pending.executionId!, ...approvalIdentity, decision: 'once',
+    })
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } })
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.discards).toHaveLength(1)
+    expect(dependencies.records.terminal).toHaveLength(1)
   })
 
   it.each(['once', 'always'] as const)('identifies and emits each missing permission across %s then once approval', async (firstDecision) => {
@@ -170,7 +188,7 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts).toHaveLength(1)
   })
 
-  it('rejects unknown tools, invalid args, multiple active tools, and model-turn overflow', async () => {
+  it('rejects unknown tools, invalid args, and multiple active tools', async () => {
     const unknown = harness([[{ ...toolTurn[0]!, name: 'unknown' } as ProviderStreamEvent, toolTurn[1]!]])
     await expect(new AgentOrchestrator(unknown).run({ conversationId: 'c', content: 'x', model: 'm' }))
       .resolves.toMatchObject({ status: 'failed' })
@@ -183,9 +201,29 @@ describe('AgentOrchestrator', () => {
     await expect(new AgentOrchestrator(multiple).run({ conversationId: 'c', content: 'x', model: 'm' }))
       .resolves.toMatchObject({ status: 'failed' })
 
-    const overflow = harness(Array.from({ length: 9 }, () => [{ type: 'finish', choiceIndex: 0, reason: 'length' } as ProviderStreamEvent]))
-    await expect(new AgentOrchestrator(overflow).run({ conversationId: 'c', content: 'x', model: 'm' }))
-      .resolves.toMatchObject({ status: 'failed' })
+  })
+
+  it.each(['length', 'content_filter', 'unknown_finish'])('terminalizes partial text after %s without another provider round', async (reason) => {
+    const dependencies = harness([])
+    let providerCalls = 0
+    dependencies.provider.stream = () => {
+      providerCalls += 1
+      return events([
+        { type: 'text_delta', choiceIndex: 0, text: '保留部分内容' },
+        { type: 'finish', choiceIndex: 0, reason },
+        { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.01' },
+      ])
+    }
+
+    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', model: 'm' })
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'OPENROUTER_REQUEST_FAILED' } })
+    expect(providerCalls).toBe(1)
+    expect(dependencies.records.terminal).toHaveLength(1)
+    expect(dependencies.records.terminal[0]).toMatchObject({
+      status: 'failed', inputTokens: 2, outputTokens: 1, costUsd: '0.01',
+      blocks: expect.arrayContaining([expect.objectContaining({ type: 'text', text: '保留部分内容' })]),
+    })
   })
 
   it('persists partial text before emitting and terminalizes when the event sink throws', async () => {
