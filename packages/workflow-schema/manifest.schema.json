@@ -1,0 +1,148 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AutoForge workflow manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "version",
+    "name",
+    "description",
+    "author",
+    "category",
+    "entryPath",
+    "codeSha256",
+    "permissions",
+    "activationExamples",
+    "activationNegativeExamples",
+    "timeoutMs",
+    "inputSchema",
+    "outputSchema"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "author": { "type": "string", "minLength": 1 },
+    "category": { "type": "string", "minLength": 1 },
+    "entryPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "codeSha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "permissions": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/permission" }
+    },
+    "activationExamples": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "activationNegativeExamples": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+    "inputSchema": {},
+    "outputSchema": {}
+  },
+  "definitions": {
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability", "scope"],
+      "properties": {
+        "capability": {
+          "type": "string",
+          "enum": [
+            "browser.open",
+            "browser.fill",
+            "browser.click",
+            "browser.url",
+            "browser.close",
+            "network.fetch",
+            "filesystem.read",
+            "filesystem.write",
+            "clipboard.read",
+            "clipboard.write",
+            "notification.send",
+            "artifact.create"
+          ]
+        },
+        "scope": { "$ref": "#/definitions/capabilityScope" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "capability": { "type": "string", "pattern": "^browser\\." } } },
+          "then": { "properties": { "scope": { "$ref": "#/definitions/browserScope" } } }
+        },
+        {
+          "if": { "properties": { "capability": { "const": "network.fetch" } } },
+          "then": { "properties": { "scope": { "$ref": "#/definitions/browserScope" } } }
+        },
+        {
+          "if": { "properties": { "capability": { "type": "string", "pattern": "^filesystem\\." } } },
+          "then": { "properties": { "scope": { "$ref": "#/definitions/filesystemScope" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "capability": {
+                "enum": ["clipboard.read", "clipboard.write", "notification.send", "artifact.create"]
+              }
+            }
+          },
+          "then": { "properties": { "scope": { "$ref": "#/definitions/emptyScope" } } }
+        }
+      ]
+    },
+    "capabilityScope": {
+      "oneOf": [
+        { "$ref": "#/definitions/browserScope" },
+        { "$ref": "#/definitions/filesystemScope" },
+        { "$ref": "#/definitions/emptyScope" }
+      ]
+    },
+    "browserScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origins"],
+      "properties": {
+        "origins": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://[^/?#]+(?::[0-9]+)?$"
+          }
+        }
+      }
+    },
+    "filesystemScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["paths"],
+      "properties": {
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "emptyScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 0
+    }
+  }
+}
