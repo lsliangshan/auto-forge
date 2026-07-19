@@ -66,4 +66,30 @@ describe('openAppDatabase', () => {
     database.conversations.delete('conversation_1')
     expect(database.messages.listForConversation('conversation_1')).toEqual([])
   })
+
+  it('redacts execution log text and metadata before persistence', () => {
+    const database = openTestDatabase()
+    database.executions.insert({
+      id: 'execution_1',
+      status: 'running',
+      workflowId: 'workflow_1',
+      workflowVersion: '1.0.0',
+    })
+    database.executionLogs.insert({
+      id: 'log_1',
+      executionId: 'execution_1',
+      sequence: 1,
+      level: 'info',
+      message: JSON.stringify({ apiKey: 'api-secret', input: { privateValue: 'private-secret' } }),
+      metadata: { accessToken: 'token-secret', input: { privateValue: 'private-secret' } },
+      sensitivePaths: ['input.privateValue'],
+      createdAt: 1,
+    })
+
+    const stored = database.executionLogs.list('execution_1')[0]
+    expect(JSON.stringify(stored)).not.toContain('api-secret')
+    expect(JSON.stringify(stored)).not.toContain('token-secret')
+    expect(JSON.stringify(stored)).not.toContain('private-secret')
+    expect(stored.message).toContain('[REDACTED]')
+  })
 })

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -79,6 +79,43 @@ describe('WorkflowProjectService', () => {
       .rejects.toMatchObject({ code: 'PATH_OUTSIDE_PROJECT' })
   })
 
+  it('rejects a dangling final symlink instead of writing through it outside the project', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    const outside = join(directory, 'outside.txt')
+    writeProject(root)
+    const project = projects.register(root)
+    symlinkSync(outside, join(root, 'draft.ts'))
+
+    await expect(projects.write(project.id, 'draft.ts', 'outside')).rejects.toMatchObject({ code: 'PATH_OUTSIDE_PROJECT' })
+    expect(existsSync(outside)).toBe(false)
+  })
+
+  it('rejects registration when the manifest is an external symlink', () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    const outsideManifest = join(directory, 'workflow.json')
+    writeProject(root)
+    writeFileSync(outsideManifest, JSON.stringify(manifest()))
+    rmSync(join(root, 'workflow.json'))
+    symlinkSync(outsideManifest, join(root, 'workflow.json'))
+
+    expect(() => projects.register(root)).toThrow(expect.objectContaining({ code: 'PATH_OUTSIDE_PROJECT' }))
+  })
+
+  it('rejects a build when the source entry is an external symlink', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    const outsideSource = join(directory, 'index.ts')
+    writeProject(root)
+    writeFileSync(outsideSource, 'export default {}\n')
+    const project = projects.register(root)
+    rmSync(join(root, 'src/index.ts'))
+    symlinkSync(outsideSource, join(root, 'src/index.ts'))
+
+    await expect(projects.build(project.id)).rejects.toMatchObject({ code: 'PATH_OUTSIDE_PROJECT' })
+  })
+
   it('reads only UTF-8 editable files up to 2 MiB', async () => {
     const { directory, projects } = openTestServices()
     const root = join(directory, 'project')
@@ -145,6 +182,43 @@ describe('WorkflowProjectService', () => {
 
     await expect(projects.install(project.id)).rejects.toMatchObject({ code: 'CONFLICT' })
     expect(readFileSync(join(installed.installPath, 'dist/index.js'), 'utf8')).toBe(firstEntry)
+  })
+
+  it('serializes concurrent installs of the same workflow version', async () => {
+    const { directory, database, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+
+    const results = await Promise.allSettled([projects.install(project.id), projects.install(project.id)])
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter((result) => result.status === 'rejected').map((result) => (result as PromiseRejectedResult).reason))
+      .toEqual([expect.objectContaining({ code: 'CONFLICT' })])
+    expect(database.installedWorkflows.list()).toHaveLength(1)
+  })
+
+  it('removes the finalized directory when installation persistence fails', async () => {
+    const directory = temporaryDirectory()
+    const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
+    const installs = join(directory, 'installed-workflows')
+    const projects = new WorkflowProjectService({
+      workflowProjects: database.workflowProjects,
+      installedWorkflows: {
+        ...database.installedWorkflows,
+        insert: () => { throw new Error('database unavailable') },
+      },
+      workflowFiles: database.workflowFiles,
+    }, installs)
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+
+    await expect(projects.install(project.id)).rejects.toThrow('database unavailable')
+    expect(existsSync(join(installs, 'browser.search.baidu', '1.0.0'))).toBe(false)
+    expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeUndefined()
   })
 })
 

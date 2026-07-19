@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import { redact } from '../security/redaction.js'
 
 export interface Conversation {
   id: string
@@ -101,6 +102,8 @@ export interface ExecutionLog {
   createdAt: number
 }
 
+export type ExecutionLogInput = ExecutionLog & { sensitivePaths?: readonly string[] }
+
 export interface PermissionGrant {
   id: string
   workflowId: string
@@ -174,7 +177,7 @@ export interface AppRepositories {
     update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
   }
   workflowProjects: { insert(value: WorkflowProject): WorkflowProject; get(id: string): WorkflowProject | undefined; list(): WorkflowProject[]; update(id: string, value: Partial<Omit<WorkflowProject, 'id' | 'createdAt'>>): WorkflowProject | undefined }
-  installedWorkflows: { upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void }
+  installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void }
   workflowFiles: { insert(value: WorkflowFile): WorkflowFile; list(workflowId: string, workflowVersion: string): WorkflowFile[] }
   executions: {
     insert(value: Pick<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'> & Partial<Omit<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'>>): Execution
@@ -183,7 +186,7 @@ export interface AppRepositories {
     markInterrupted(): number
   }
   executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[] }
-  executionLogs: { insert(value: ExecutionLog): ExecutionLog; list(executionId: string): ExecutionLog[] }
+  executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[] }
   permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; delete(id: string): void }
   appSettings: { get(key: string): AppSetting | undefined; set(key: string, value: unknown): AppSetting; delete(key: string): void }
   encryptedSecrets: EncryptedSecretsRepository
@@ -214,6 +217,14 @@ function executionFromRow(row: Query): Execution {
 
 function permissionFromRow(row: Query): PermissionGrant {
   return { ...row, scope: parse(row.scopeJson as string) } as PermissionGrant
+}
+
+function redactLogMessage(message: string, sensitivePaths: readonly string[]): string {
+  try {
+    return JSON.stringify(redact(JSON.parse(message), sensitivePaths))
+  } catch {
+    return message.replace(/\b(authorization|cookie|(?:access|refresh)?token|api[_-]?key)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1$2[REDACTED]')
+  }
 }
 
 export function createRepositories(database: SqliteDatabase): AppRepositories {
@@ -272,6 +283,14 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       },
     },
     installedWorkflows: {
+      insert(value, files) {
+        transaction(database, () => {
+          database.prepare('INSERT INTO installed_workflows (workflow_id, version, name, description, author, category, manifest_json, install_path, enabled, integrity_status, source, installed_at, updated_at) VALUES (@workflowId, @version, @name, @description, @author, @category, @manifestJson, @installPath, @enabled, @integrityStatus, @source, @installedAt, @updatedAt)').run({ ...value, enabled: Number(value.enabled), manifestJson: JSON.stringify(value.manifest) })
+          const insertFile = database.prepare('INSERT INTO workflow_files (workflow_id, workflow_version, path, sha256) VALUES (@workflowId, @workflowVersion, @path, @sha256)')
+          for (const file of files) insertFile.run(file)
+        })
+        return value
+      },
       upsert(value) {
         transaction(database, () => database.prepare('INSERT INTO installed_workflows (workflow_id, version, name, description, author, category, manifest_json, install_path, enabled, integrity_status, source, installed_at, updated_at) VALUES (@workflowId, @version, @name, @description, @author, @category, @manifestJson, @installPath, @enabled, @integrityStatus, @source, @installedAt, @updatedAt) ON CONFLICT(workflow_id, version) DO UPDATE SET name = excluded.name, description = excluded.description, author = excluded.author, category = excluded.category, manifest_json = excluded.manifest_json, install_path = excluded.install_path, enabled = excluded.enabled, integrity_status = excluded.integrity_status, source = excluded.source, updated_at = excluded.updated_at').run({ ...value, enabled: Number(value.enabled), manifestJson: JSON.stringify(value.manifest) }))
         return value
@@ -304,7 +323,20 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       list: (executionId) => many<ExecutionStep>(database, 'SELECT id, execution_id AS executionId, sequence, name, status, percent, started_at AS startedAt, ended_at AS endedAt FROM execution_steps WHERE execution_id = @executionId ORDER BY sequence', { executionId }),
     },
     executionLogs: {
-      insert(value) { transaction(database, () => database.prepare('INSERT INTO execution_logs (id, execution_id, sequence, level, message, metadata_json, created_at) VALUES (@id, @executionId, @sequence, @level, @message, @metadataJson, @createdAt)').run({ ...value, metadataJson: value.metadata === undefined ? null : JSON.stringify(value.metadata) })); return value },
+      insert(value) {
+        const sensitivePaths = value.sensitivePaths ?? []
+        const log: ExecutionLog = {
+          id: value.id,
+          executionId: value.executionId,
+          sequence: value.sequence,
+          level: value.level,
+          message: redactLogMessage(value.message, sensitivePaths),
+          metadata: value.metadata === undefined ? undefined : redact(value.metadata, sensitivePaths),
+          createdAt: value.createdAt,
+        }
+        transaction(database, () => database.prepare('INSERT INTO execution_logs (id, execution_id, sequence, level, message, metadata_json, created_at) VALUES (@id, @executionId, @sequence, @level, @message, @metadataJson, @createdAt)').run({ ...log, metadataJson: log.metadata === undefined ? null : JSON.stringify(log.metadata) }))
+        return log
+      },
       list: (executionId) => many<Query>(database, 'SELECT id, execution_id AS executionId, sequence, level, message, metadata_json AS metadataJson, created_at AS createdAt FROM execution_logs WHERE execution_id = @executionId ORDER BY sequence', { executionId }).map((row) => ({ ...row, metadata: parse(row.metadataJson as string | null) } as ExecutionLog)),
     },
     permissionGrants: {
