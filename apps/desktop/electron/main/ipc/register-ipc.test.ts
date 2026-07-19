@@ -22,7 +22,7 @@ function services(): DesktopIpcServices {
     workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
     developer: {
       createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
-      validate: vi.fn(), run: vi.fn(),
+      build: vi.fn(), validate: vi.fn(), run: vi.fn(),
     },
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
     permissions: { listGrants: vi.fn(), revoke: vi.fn() },
@@ -30,7 +30,7 @@ function services(): DesktopIpcServices {
       get: vi.fn(), update: vi.fn(), saveOpenRouterKey: vi.fn(), clearOpenRouterKey: vi.fn(),
       validateOpenRouterKey: vi.fn(), listModels: vi.fn(), clearLocalData: vi.fn(),
     },
-    system: { openExternal: vi.fn() },
+    system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
 }
 

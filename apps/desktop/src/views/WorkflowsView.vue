@@ -15,7 +15,7 @@
           :loading="workflow.importing"
           @click="workflow.importProject"
         >
-          导入项目
+          {{ importLabel }}
         </el-button>
       </div>
     </div>
@@ -104,10 +104,13 @@
 import { Operation, Refresh, Upload } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import type { WorkflowSummary } from '@autoforge/shared'
-import { onMounted } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useWorkflowStore } from '../stores/workflow'
 
 const workflow = useWorkflowStore()
+const importLabel = computed(() => workflow.importStage
+  ? ({ registering: '选择项目…', building: '正在构建…', validating: '正在校验…', installing: '正在安装…' })[workflow.importStage]
+  : '导入项目')
 onMounted(() => { if (!workflow.items.length && !workflow.loading) void workflow.load() })
 const integrityLabel = (value: WorkflowSummary['integrity']) => ({ valid: '完整性通过', failed: '完整性失败', unchecked: '未校验' })[value]
 const integrityClass = (value: WorkflowSummary['integrity']) => value === 'valid' ? 'enabled' : value === 'failed' ? 'failed' : 'disabled'

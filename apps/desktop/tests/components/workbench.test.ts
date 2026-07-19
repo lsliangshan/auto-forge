@@ -7,6 +7,8 @@ import type { DesktopAPI } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import { routes } from '../../src/router/index'
 import { useExecutionStore } from '../../src/stores/execution'
+import { useChatStore } from '../../src/stores/chat'
+import { useSettingsStore } from '../../src/stores/settings'
 import { useWorkflowStore } from '../../src/stores/workflow'
 
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
@@ -22,7 +24,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
     },
     developer: {
       createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
-      validate: vi.fn(), run: vi.fn(),
+      build: vi.fn(), validate: vi.fn(), run: vi.fn(),
     },
     executions: {
       list: vi.fn().mockResolvedValue([]), get: vi.fn(), decide: vi.fn(), cancel: vi.fn(),
@@ -38,7 +40,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       validateOpenRouterKey: vi.fn().mockResolvedValue({ configured: false, valid: false }),
       listModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
     },
-    system: { openExternal: vi.fn() },
+    system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
   }
 }
@@ -102,14 +104,16 @@ describe('workbench', () => {
       category: 'search', enabled: false, source: 'installed' as const, integrity: 'valid' as const,
       updatedAt: '2026-07-19T00:00:00.000Z',
     }
-    store.items = [item]
+    const newer = { ...item, version: '2.0.0', enabled: false }
+    store.items = [item, newer]
 
     await store.setEnabled(item, true)
+    expect(newer.enabled).toBe(false)
     await store.remove(item)
 
-    expect(api.workflows.setEnabled).toHaveBeenCalledWith('search.real', true)
+    expect(api.workflows.setEnabled).toHaveBeenCalledWith('search.real', '1.2.3', true)
     expect(api.workflows.remove).toHaveBeenCalledWith('search.real', '1.2.3')
-    expect(store.items).toEqual([])
+    expect(store.items).toEqual([newer])
   })
 
   it('does not let an older workflow refresh overwrite a newer enable decision', async () => {
@@ -130,6 +134,21 @@ describe('workbench', () => {
     await refresh
     expect(store.items[0]?.enabled).toBe(true)
     expect(store.loading).toBe(false)
+  })
+
+  it('imports a first-time project through register, build, validate, then install', async () => {
+    const api = createApi()
+    const order: string[] = []
+    const project = { id: 'project_1', name: 'First project', rootPath: '/project', status: 'new' as const, files: ['workflow.json'], updatedAt: '2026-07-19T00:00:00.000Z' }
+    vi.mocked(api.developer.registerProject).mockImplementation(async () => { order.push('register'); return project })
+    vi.mocked(api.developer.build).mockImplementation(async () => { order.push('build'); return { ...project, status: 'ready' } })
+    vi.mocked(api.developer.validate).mockImplementation(async () => { order.push('validate'); return { valid: true, diagnostics: [] } })
+    vi.mocked(api.workflows.installProject).mockImplementation(async () => { order.push('install'); return {} as never })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useWorkflowStore()
+    await store.importProject()
+    expect(order).toEqual(['register', 'build', 'validate', 'install'])
+    expect(store.error).toBe('')
   })
 
   it('cancels the selected execution through the typed bridge', async () => {
@@ -163,6 +182,113 @@ describe('workbench', () => {
     resolveList([{ id: 'exec_live', workflowId: 'workflow.real', workflowVersion: '1.0.0', status: 'running', createdAt: '2026-07-19T00:00:00.000Z' }])
     await loading
     expect(store.items[0]?.status).toBe('completed')
+  })
+
+  it('loads concurrent execution-card details by id without changing inspector selection', async () => {
+    const api = createApi()
+    vi.mocked(api.executions.get).mockImplementation(async (id) => ({
+      id, workflowId: `workflow.${id}`, workflowVersion: '1.0.0', status: id === 'exec_1' ? 'running' : 'completed',
+      createdAt: '2026-07-19T00:00:00.000Z', input: {}, steps: [], logs: [],
+    }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useExecutionStore()
+    await Promise.all([store.loadDetail('exec_1'), store.loadDetail('exec_2')])
+    expect(store.selectedId).toBe('')
+    expect(store.details.exec_1?.status).toBe('running')
+    expect(store.details.exec_2?.status).toBe('completed')
+  })
+
+  it('releases the last execution bridge lease on store disposal', () => {
+    const api = createApi()
+    const unsubscribe = vi.fn()
+    vi.mocked(api.executions.onEvent).mockReturnValue(unsubscribe)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useExecutionStore()
+    store.ensureSubscription()
+    store.$dispose()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('invalidates an older conversation list when a create mutation succeeds', async () => {
+    const api = createApi()
+    let resolveList!: (value: Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>) => void
+    vi.mocked(api.chat.listConversations).mockReturnValue(new Promise((resolve) => { resolveList = resolve }))
+    vi.mocked(api.chat.createConversation).mockResolvedValue({ id: 'new', title: '新会话', createdAt: '2026-07-19T00:00:01.000Z', updatedAt: '2026-07-19T00:00:01.000Z' })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const loading = store.loadConversations()
+    await store.createConversation()
+    resolveList([{ id: 'old', title: '旧快照', createdAt: '2026-07-19T00:00:00.000Z', updatedAt: '2026-07-19T00:00:00.000Z' }])
+    await loading
+    expect(store.conversations.map(({ id }) => id)).toEqual(['new'])
+  })
+
+  it('serializes settings patches so older full responses cannot roll back newer fields', async () => {
+    const api = createApi()
+    const first = { theme: 'dark' as const, language: 'zh-CN' as const, dataDirectory: '/data', logDirectory: '/logs', defaultModel: 'old', showCosts: false, developerMode: false, permissionDefault: 'ask' as const }
+    const second = { ...first, defaultModel: 'new' }
+    vi.mocked(api.settings.update).mockResolvedValueOnce(first).mockResolvedValueOnce(second)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    await Promise.all([store.update({ theme: 'dark' }), store.update({ defaultModel: 'new' })])
+    expect(api.settings.update).toHaveBeenNthCalledWith(1, { theme: 'dark' })
+    expect(api.settings.update).toHaveBeenNthCalledWith(2, { defaultModel: 'new' })
+    expect(store.settings?.defaultModel).toBe('new')
+  })
+
+  it('resets visible stores after a successful all-data clear', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore(); chat.conversations = [{ id: 'c', title: '会话', createdAt: '2026-07-19T00:00:00.000Z', updatedAt: '2026-07-19T00:00:00.000Z' }]
+    const executions = useExecutionStore(); executions.items = [{ id: 'e', workflowId: 'w', workflowVersion: '1.0.0', status: 'completed', createdAt: '2026-07-19T00:00:00.000Z' }]
+    const settings = useSettingsStore()
+    await settings.clearLocalData('all')
+    expect(chat.conversations).toEqual([])
+    expect(executions.items).toEqual([])
+    expect(api.settings.clearLocalData).toHaveBeenCalledWith('all')
+    expect(api.workflows.list).toHaveBeenCalled()
+  })
+
+  it('loads app information and revokes an exact saved permission grant', async () => {
+    const api = createApi()
+    vi.mocked(api.permissions.listGrants).mockResolvedValue([{
+      id: 'grant_1', workflowId: 'search.real', workflowVersion: '1.2.3',
+      capability: 'browser.open', scope: { origins: ['https://example.com'] },
+      createdAt: '2026-07-19T00:00:00.000Z',
+    }])
+    vi.mocked(api.permissions.revoke).mockResolvedValue(undefined)
+    vi.mocked(api.system.getAppInfo).mockResolvedValue({ version: '1.4.0', platform: 'win32' })
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('search.real · 1.2.3'))
+    expect(wrapper.text()).toContain('1.4.0')
+    expect(wrapper.text()).toContain('Windows')
+    await wrapper.get('.grant-row button').trigger('click')
+    await vi.waitFor(() => expect(api.permissions.revoke).toHaveBeenCalledWith('grant_1'))
+    expect(wrapper.text()).not.toContain('search.real · 1.2.3')
+  })
+
+  it('folds the inspector when the viewport crosses below 1180 and removes the listener on unmount', async () => {
+    let change: ((event: { matches: boolean }) => void) | undefined
+    const removeEventListener = vi.fn()
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true, addEventListener: (_: string, listener: typeof change) => { change = listener }, removeEventListener })))
+    const { wrapper } = await mountApp('/chat')
+    expect(wrapper.get('[data-testid="inspector-panel"]').attributes('data-open')).toBe('true')
+    change?.({ matches: false })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('[data-testid="inspector-panel"]').attributes('data-open')).toBe('false')
+    wrapper.unmount()
+    expect(removeEventListener).toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
+
+  it('does not nest an interactive cancel button inside an execution row button', async () => {
+    const api = createApi()
+    vi.mocked(api.executions.list).mockResolvedValue([{ id: 'exec_1', workflowId: 'w', workflowVersion: '1.0.0', status: 'running', createdAt: '2026-07-19T00:00:00.000Z' }])
+    const { wrapper } = await mountApp('/executions', api)
+    await vi.waitFor(() => expect(wrapper.findAll('.execution-row')).toHaveLength(1))
+    expect(wrapper.find('.execution-row button').exists()).toBe(true)
+    expect(wrapper.find('button.execution-row').exists()).toBe(false)
   })
 
   it('clears a successfully saved key from the settings input without retaining it in state', async () => {

@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { approvalDecisionSchema, executionEventSchema, ipcRequestSchemas, ipcChannels, toSafeAppError, workerMessageSchema } from './index'
+import { approvalDecisionSchema, chatBlockSchema, executionEventSchema, ipcRequestSchemas, ipcChannels, toSafeAppError, workerMessageSchema } from './index'
 
 describe('cross-process contracts', () => {
+  it('requires exact pending workflow identity on approval blocks', () => {
+    expect(() => chatBlockSchema.parse({
+      type: 'approval', executionId: 'exec_1', permissionIndex: 0,
+      capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
+    })).toThrow()
+  })
   it('requires exact workflow identity for removal', () => {
     expect(ipcRequestSchemas[ipcChannels.workflowsRemove].parse({ id: 'browser.search.baidu', version: '1.0.0' }))
       .toEqual({ id: 'browser.search.baidu', version: '1.0.0' })

@@ -36,6 +36,14 @@ describe('preload desktop bridge', () => {
     })
   })
 
+  it('changes only an exact workflow version through its fixed channel', async () => {
+    const app = harness()
+    await app.api.workflows.setEnabled('browser.search.baidu', '2.0.0', false)
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.workflowsSetEnabled, {
+      id: 'browser.search.baidu', version: '2.0.0', enabled: false,
+    })
+  })
+
   it('reads persisted messages through the fixed conversation channel', async () => {
     const app = harness()
     await app.api.chat.listMessages('conversation_1')

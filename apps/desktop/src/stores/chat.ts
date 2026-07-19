@@ -1,22 +1,35 @@
-import { defineStore } from 'pinia'
+import { acceptHMRUpdate, defineStore } from 'pinia'
 import type { ChatBlock, ChatEvent, ChatMessage, ConversationSummary, DesktopAPI } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 
 export type UiChatBlock = ChatBlock & { id: string }
 export interface UiChatMessage { id: string; role: 'user' | 'assistant'; blocks: UiChatBlock[] }
 
-interface ChatHub { listeners: Set<(event: ChatEvent) => void> }
+interface ChatHub { listeners: Set<(event: ChatEvent) => void>; unsubscribe: () => void }
 const hubs = new WeakMap<DesktopAPI, ChatHub>()
+const storeReleases = new WeakMap<object, () => void>()
+const disposeWrapped = new WeakSet<object>()
 
-function chatHub(api: DesktopAPI): ChatHub {
+function acquireChatEvents(api: DesktopAPI, listener: (event: ChatEvent) => void): () => void {
   const existing = hubs.get(api)
-  if (existing) return existing
-  const hub: ChatHub = { listeners: new Set() }
-  api.chat.onEvent((event) => {
+  const hub: ChatHub = existing ?? { listeners: new Set(), unsubscribe: () => undefined }
+  if (!existing) {
+    hub.unsubscribe = api.chat.onEvent((event) => {
     for (const listener of hub.listeners) listener(event)
-  })
-  hubs.set(api, hub)
-  return hub
+    })
+    hubs.set(api, hub)
+  }
+  hub.listeners.add(listener)
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    hub.listeners.delete(listener)
+    if (!hub.listeners.size) {
+      hub.unsubscribe()
+      hubs.delete(api)
+    }
+  }
 }
 
 function blockIdentity(messageId: string, block: ChatBlock, index: number): string {
@@ -53,10 +66,33 @@ export const useChatStore = defineStore('chat', {
     isRunning(state): boolean { return Boolean(state.activeRequestByConversation[state.selectedConversationId]) },
   },
   actions: {
+    resetLocalData() {
+      this._loadVersion += 1
+      this._selectionVersion += 1
+      this.conversations = []
+      this.selectedConversationId = ''
+      this.messagesByConversation = {}
+      this.activeRequestByConversation = {}
+      this._terminalRequests = {}
+      this._messageVersions = {}
+      this.loading = false
+      this.error = ''
+    },
     ensureSubscriptions() {
       if (this._subscribed) return
       this._subscribed = true
-      chatHub(getDesktopApi()).listeners.add((event) => this.applyChatEvent(event))
+      const release = acquireChatEvents(getDesktopApi(), (event) => this.applyChatEvent(event))
+      storeReleases.set(this, release)
+      if (!disposeWrapped.has(this)) {
+        disposeWrapped.add(this)
+        const dispose = this.$dispose.bind(this)
+        this.$dispose = () => {
+          storeReleases.get(this)?.()
+          storeReleases.delete(this)
+          this._subscribed = false
+          dispose()
+        }
+      }
     },
     async loadConversations() {
       this.ensureSubscriptions()
@@ -84,6 +120,8 @@ export const useChatStore = defineStore('chat', {
       this.error = ''
       try {
         const conversation = await getDesktopApi().chat.createConversation()
+        this._loadVersion += 1
+        this.loading = false
         this.conversations.unshift(conversation)
         this.selectedConversationId = conversation.id
       } catch (error) { this.error = displayError(error, '创建会话失败') }
@@ -93,6 +131,8 @@ export const useChatStore = defineStore('chat', {
       if (!clean) return
       try {
         const updated = await getDesktopApi().chat.renameConversation(id, clean)
+        this._loadVersion += 1
+        this.loading = false
         const index = this.conversations.findIndex((item) => item.id === id)
         if (index >= 0) this.conversations[index] = updated
       } catch (error) { this.error = displayError(error, '重命名失败') }
@@ -100,6 +140,8 @@ export const useChatStore = defineStore('chat', {
     async deleteConversation(id: string) {
       try {
         await getDesktopApi().chat.deleteConversation(id)
+        this._loadVersion += 1
+        this.loading = false
         this.conversations = this.conversations.filter((item) => item.id !== id)
         delete this.messagesByConversation[id]
         if (this.selectedConversationId === id) {
@@ -192,3 +234,5 @@ export const useChatStore = defineStore('chat', {
     },
   },
 })
+
+if (import.meta.hot) import.meta.hot.accept(acceptHMRUpdate(useChatStore, import.meta.hot))

@@ -1,11 +1,17 @@
 import { defineStore } from 'pinia'
-import type { AppSettings, AppSettingsPatch, CredentialStatus, ModelInfo } from '@autoforge/shared'
+import type { AppInfo, AppSettings, AppSettingsPatch, CredentialStatus, ModelInfo, PermissionGrant } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
+import { useChatStore } from './chat'
+import { useExecutionStore } from './execution'
+import { useWorkflowStore } from './workflow'
+
+const updateQueues = new WeakMap<object, Promise<AppSettings | undefined>>()
 
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     settings: undefined as AppSettings | undefined, credential: undefined as CredentialStatus | undefined,
-    models: [] as ModelInfo[], loading: false, modelsLoading: false, saving: false, error: '', _loadVersion: 0, _modelVersion: 0,
+    models: [] as ModelInfo[], grants: [] as PermissionGrant[], appInfo: undefined as AppInfo | undefined,
+    loading: false, modelsLoading: false, saving: false, error: '', _loadVersion: 0, _modelVersion: 0,
   }),
   actions: {
     async load() {
@@ -13,21 +19,28 @@ export const useSettingsStore = defineStore('settings', {
       this.loading = true
       this.error = ''
       try {
-        const [settings, credential] = await Promise.all([
+        const [settings, credential, grants, appInfo] = await Promise.all([
           getDesktopApi().settings.get(), getDesktopApi().settings.validateOpenRouterKey(),
+          getDesktopApi().permissions.listGrants(), getDesktopApi().system.getAppInfo(),
         ])
         if (version !== this._loadVersion) return
         this.settings = settings
         this.credential = credential
+        this.grants = grants
+        this.appInfo = appInfo
       } catch (error) { if (version === this._loadVersion) this.error = displayError(error, '设置加载失败') }
       finally { if (version === this._loadVersion) this.loading = false }
     },
     async update(patch: AppSettingsPatch) {
       this.saving = true
       this.error = ''
-      try { this.settings = await getDesktopApi().settings.update(patch) }
+      const operation = (updateQueues.get(this) ?? Promise.resolve(undefined))
+        .then(() => getDesktopApi().settings.update(patch))
+      const settled = operation.catch(() => undefined)
+      updateQueues.set(this, settled)
+      try { this.settings = await operation }
       catch (error) { this.error = displayError(error, '设置保存失败') }
-      finally { this.saving = false }
+      finally { if (updateQueues.get(this) === settled) this.saving = false }
     },
     async saveCredential(apiKey: string) {
       this.saving = true
@@ -44,6 +57,15 @@ export const useSettingsStore = defineStore('settings', {
       } catch (error) { this.error = displayError(error, '凭证清除失败') }
       finally { this.saving = false }
     },
+    async revokeGrant(grantId: string) {
+      this.saving = true
+      this.error = ''
+      try {
+        await getDesktopApi().permissions.revoke(grantId)
+        this.grants = this.grants.filter(({ id }) => id !== grantId)
+      } catch (error) { this.error = displayError(error, '撤销授权失败') }
+      finally { this.saving = false }
+    },
     async loadModels() {
       const version = ++this._modelVersion
       this.modelsLoading = true
@@ -57,7 +79,12 @@ export const useSettingsStore = defineStore('settings', {
     async clearLocalData(scope: 'conversations' | 'executions' | 'all') {
       this.saving = true
       this.error = ''
-      try { await getDesktopApi().settings.clearLocalData(scope) }
+      try {
+        await getDesktopApi().settings.clearLocalData(scope)
+        if (scope === 'conversations' || scope === 'all') useChatStore().resetLocalData()
+        if (scope === 'executions' || scope === 'all') useExecutionStore().resetLocalData()
+        if (scope === 'all') await Promise.all([useWorkflowStore().load(), this.load()])
+      }
       catch (error) { this.error = displayError(error, '本地数据清理失败'); throw error }
       finally { this.saving = false }
     },

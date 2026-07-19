@@ -29,6 +29,8 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('approval'),
     executionId: identifierSchema,
+    workflowId: identifierSchema,
+    workflowVersion: z.string().trim().min(1),
     permissionIndex: z.number().int().nonnegative(),
     capability: capabilitySchema,
     scope: capabilityScopeSchema,

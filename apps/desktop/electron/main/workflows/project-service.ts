@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { build as esbuild } from 'esbuild'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
@@ -14,7 +14,11 @@ type ProjectRepositories = Pick<AppRepositories, 'workflowProjects' | 'installed
 
 export interface WorkflowProjectServiceOptions {
   beforeReservation?: () => void | Promise<void>
+  removeQuarantine?: (path: string) => Promise<void>
 }
+
+const ownedQuarantinePrefix = '.autoforge-remove-owned-'
+const ownedQuarantineMarker = '.autoforge-remove-quarantine'
 
 function failure(code: AppErrorCode): Error & { code: AppErrorCode } {
   return Object.assign(new Error(code), { code })
@@ -192,25 +196,70 @@ export class WorkflowProjectService {
       const destination = join(installationRoot, workflowId, version)
       if (resolve(installed.installPath) !== destination) throw failure('WORKFLOW_INTEGRITY_FAILED')
 
+      await this.cleanupOwnedQuarantines(dirname(destination))
       let quarantine: string | undefined
+      let quarantineMarker: string | undefined
       if (await pathExists(destination)) {
         const entry = await lstat(destination)
         if (entry.isSymbolicLink() || !entry.isDirectory()) throw failure('WORKFLOW_INTEGRITY_FAILED')
         const canonicalRoot = await realpath(installationRoot)
         const canonicalDestination = await realpath(destination)
         if (!inside(canonicalRoot, canonicalDestination)) throw failure('WORKFLOW_INTEGRITY_FAILED')
-        quarantine = join(dirname(destination), `.${basename(destination)}-remove-${randomUUID()}.tmp`)
+        quarantine = join(dirname(destination), `${ownedQuarantinePrefix}${basename(destination)}-${randomUUID()}`)
         await rename(destination, quarantine)
+        quarantineMarker = join(quarantine, ownedQuarantineMarker)
+        try {
+          await writeFile(quarantineMarker, randomUUID(), { flag: 'wx' })
+        } catch (error) {
+          await rm(quarantineMarker, { force: true })
+          await rename(quarantine, destination)
+          throw error
+        }
       }
 
       try {
         this.repositories.installedWorkflows.delete(workflowId, version)
       } catch (error) {
-        if (quarantine) await rename(quarantine, destination)
+        if (quarantine) {
+          if (quarantineMarker) await rm(quarantineMarker, { force: true })
+          await rename(quarantine, destination)
+        }
         throw error
       }
-      if (quarantine) await rm(quarantine, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      if (quarantine) {
+        try { await this.removeOwnedQuarantine(quarantine) } catch { /* Durable removal already committed; startup retries owned cleanup. */ }
+      }
     })
+  }
+
+  async cleanupOwnedQuarantines(parentPath?: string): Promise<void> {
+    if (parentPath) {
+      let names: string[]
+      try { names = await readdir(parentPath) } catch { return }
+      await Promise.all(names.filter((name) => name.startsWith(ownedQuarantinePrefix)).map(async (name) => {
+        const quarantine = join(parentPath, name)
+        try {
+          const entry = await lstat(quarantine)
+          if (!entry.isDirectory() || entry.isSymbolicLink() || !await pathExists(join(quarantine, ownedQuarantineMarker))) return
+          await this.removeOwnedQuarantine(quarantine)
+        } catch { /* A later startup or operation retries owned cleanup. */ }
+      }))
+      return
+    }
+    let workflowIds: string[]
+    try { workflowIds = await readdir(resolve(this.installationRoot)) } catch { return }
+    await Promise.all(workflowIds.map(async (workflowId) => {
+      const parent = join(resolve(this.installationRoot), workflowId)
+      try {
+        const entry = await lstat(parent)
+        if (entry.isDirectory() && !entry.isSymbolicLink()) await this.cleanupOwnedQuarantines(parent)
+      } catch { /* Ignore untrusted or concurrently removed entries. */ }
+    }))
+  }
+
+  private removeOwnedQuarantine(path: string): Promise<void> {
+    return this.options.removeQuarantine?.(path)
+      ?? rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
   }
 
   private async installUnlocked(projectId: string): Promise<InstalledWorkflow> {
@@ -224,6 +273,7 @@ export class WorkflowProjectService {
     if (buildFingerprint(await this.readFile(project.id, 'src/index.ts'), manifest) !== project.buildHash) throw failure('INVALID_INPUT')
 
     const destination = join(resolve(this.installationRoot), manifest.id, manifest.version)
+    await this.cleanupOwnedQuarantines(dirname(destination))
     if (this.repositories.installedWorkflows.get(manifest.id, manifest.version) || await pathExists(destination)) throw failure('CONFLICT')
     await mkdir(dirname(destination), { recursive: true })
     const temporary = join(dirname(destination), `.${basename(destination)}-${randomUUID()}.tmp`)

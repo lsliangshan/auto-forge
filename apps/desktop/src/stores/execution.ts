@@ -1,34 +1,66 @@
-import { defineStore } from 'pinia'
+import { acceptHMRUpdate, defineStore } from 'pinia'
 import type { DesktopAPI, ExecutionDetail, ExecutionEvent, ExecutionQuery, ExecutionSummary } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 
-interface ExecutionHub { listeners: Set<(event: ExecutionEvent) => void> }
+interface ExecutionHub { listeners: Set<(event: ExecutionEvent) => void>; unsubscribe: () => void }
 interface SequencedExecutionEvent { sequence: number; event: ExecutionEvent }
 const hubs = new WeakMap<DesktopAPI, ExecutionHub>()
-function executionHub(api: DesktopAPI): ExecutionHub {
+const storeReleases = new WeakMap<object, () => void>()
+const disposeWrapped = new WeakSet<object>()
+function acquireExecutionEvents(api: DesktopAPI, listener: (event: ExecutionEvent) => void): () => void {
   const existing = hubs.get(api)
-  if (existing) return existing
-  const hub: ExecutionHub = { listeners: new Set() }
-  api.executions.onEvent((event) => { for (const listener of hub.listeners) listener(event) })
-  hubs.set(api, hub)
-  return hub
+  const hub: ExecutionHub = existing ?? { listeners: new Set(), unsubscribe: () => undefined }
+  if (!existing) {
+    hub.unsubscribe = api.executions.onEvent((event) => { for (const listener of hub.listeners) listener(event) })
+    hubs.set(api, hub)
+  }
+  hub.listeners.add(listener)
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    hub.listeners.delete(listener)
+    if (!hub.listeners.size) { hub.unsubscribe(); hubs.delete(api) }
+  }
 }
 
 export const useExecutionStore = defineStore('execution', {
   state: () => ({
     items: [] as ExecutionSummary[], details: {} as Record<string, ExecutionDetail>, selectedId: '',
-    query: {} as ExecutionQuery, loading: false, detailLoading: false, error: '',
-    _listVersion: 0, _detailVersion: 0, _subscribed: false,
+    query: {} as ExecutionQuery, loading: false, detailLoadingById: {} as Record<string, boolean>, error: '',
+    _listVersion: 0, _detailVersions: {} as Record<string, number>, _subscribed: false,
     _eventSequence: 0, _eventHistory: [] as SequencedExecutionEvent[],
   }),
   getters: {
     selectedDetail(state): ExecutionDetail | undefined { return state.details[state.selectedId] },
+    selectedDetailLoading(state): boolean { return Boolean(state.detailLoadingById[state.selectedId]) },
   },
   actions: {
+    resetLocalData() {
+      this._listVersion += 1
+      this.items = []
+      this.details = {}
+      this.selectedId = ''
+      this.query = {}
+      this.detailLoadingById = {}
+      this.loading = false
+      this.error = ''
+    },
     ensureSubscription() {
       if (this._subscribed) return
       this._subscribed = true
-      executionHub(getDesktopApi()).listeners.add((event) => this.applyEvent(event))
+      const release = acquireExecutionEvents(getDesktopApi(), (event) => this.applyEvent(event))
+      storeReleases.set(this, release)
+      if (!disposeWrapped.has(this)) {
+        disposeWrapped.add(this)
+        const dispose = this.$dispose.bind(this)
+        this.$dispose = () => {
+          storeReleases.get(this)?.()
+          storeReleases.delete(this)
+          this._subscribed = false
+          dispose()
+        }
+      }
     },
     async load(query?: ExecutionQuery) {
       this.ensureSubscription()
@@ -48,28 +80,32 @@ export const useExecutionStore = defineStore('execution', {
       } catch (error) { if (version === this._listVersion) this.error = displayError(error, '执行记录加载失败') }
       finally {
         if (version === this._listVersion) this.loading = false
-        if (!this.loading && !this.detailLoading) this._eventHistory = []
+        if (!this.loading && !Object.values(this.detailLoadingById).some(Boolean)) this._eventHistory = []
       }
     },
     async select(id: string) {
-      this.ensureSubscription()
       this.selectedId = id
-      const version = ++this._detailVersion
-      this.detailLoading = true
+      await this.loadDetail(id)
+    },
+    async loadDetail(id: string) {
+      this.ensureSubscription()
+      const version = (this._detailVersions[id] ?? 0) + 1
+      this._detailVersions[id] = version
+      this.detailLoadingById[id] = true
       const eventSequence = this._eventSequence
       this.error = ''
       try {
         const detail = await getDesktopApi().executions.get(id)
-        if (version === this._detailVersion && this.selectedId === id) {
+        if (version === this._detailVersions[id]) {
           this.details[id] = detail
           for (const entry of this._eventHistory) {
             if (entry.sequence > eventSequence && entry.event.executionId === id) this._applyEvent(entry.event)
           }
         }
-      } catch (error) { if (version === this._detailVersion) this.error = displayError(error, '执行详情加载失败') }
+      } catch (error) { if (version === this._detailVersions[id]) this.error = displayError(error, '执行详情加载失败') }
       finally {
-        if (version === this._detailVersion) this.detailLoading = false
-        if (!this.loading && !this.detailLoading) this._eventHistory = []
+        if (version === this._detailVersions[id]) this.detailLoadingById[id] = false
+        if (!this.loading && !Object.values(this.detailLoadingById).some(Boolean)) this._eventHistory = []
       }
     },
     async cancel(id: string) {
@@ -78,7 +114,7 @@ export const useExecutionStore = defineStore('execution', {
     },
     applyEvent(event: ExecutionEvent) {
       this._eventSequence += 1
-      if (this.loading || this.detailLoading) this._eventHistory.push({ sequence: this._eventSequence, event })
+      if (this.loading || Object.values(this.detailLoadingById).some(Boolean)) this._eventHistory.push({ sequence: this._eventSequence, event })
       this._applyEvent(event)
     },
     _applyEvent(event: ExecutionEvent) {
@@ -101,3 +137,5 @@ export const useExecutionStore = defineStore('execution', {
     },
   },
 })
+
+if (import.meta.hot) import.meta.hot.accept(acceptHMRUpdate(useExecutionStore, import.meta.hot))

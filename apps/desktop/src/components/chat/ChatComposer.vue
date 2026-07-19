@@ -39,12 +39,13 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-defineProps<{ disabled: boolean; running: boolean }>()
+const props = defineProps<{ disabled: boolean; running: boolean }>()
 const emit = defineEmits<{ submit: [content: string]; cancel: [] }>()
 const content = ref('')
 const composing = ref(false)
 
 function submit() {
+  if (props.disabled || props.running) return
   const clean = content.value.trim()
   if (!clean) return
   emit('submit', clean)

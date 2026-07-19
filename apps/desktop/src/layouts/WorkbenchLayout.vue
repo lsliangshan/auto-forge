@@ -37,16 +37,20 @@
 
 <script setup lang="ts">
 import { Operation } from '@element-plus/icons-vue'
-import { ref, watch } from 'vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import AppRail from '../components/AppRail.vue'
 import ContextSidebar from '../components/ContextSidebar.vue'
 import InspectorPanel from '../components/InspectorPanel.vue'
 
 const route = useRoute()
-const inspectorOpen = ref(typeof window.matchMedia === 'function' && window.matchMedia('(min-width: 1180px)').matches)
+const inspectorMedia = typeof window.matchMedia === 'function' ? window.matchMedia('(min-width: 1180px)') : undefined
+const inspectorOpen = ref(Boolean(inspectorMedia?.matches))
+const handleInspectorBreakpoint = (event: { matches: boolean }) => { inspectorOpen.value = event.matches }
+inspectorMedia?.addEventListener('change', handleInspectorBreakpoint)
+onBeforeUnmount(() => inspectorMedia?.removeEventListener('change', handleInspectorBreakpoint))
 watch(() => route.name, () => {
-  inspectorOpen.value = typeof window.matchMedia === 'function' && window.matchMedia('(min-width: 1180px)').matches
+  inspectorOpen.value = Boolean(inspectorMedia?.matches)
 })
 </script>
 

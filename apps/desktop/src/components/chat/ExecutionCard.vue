@@ -17,7 +17,7 @@
         size="small"
         @click="store.select(executionId)"
       >
-        查看详情
+        在检查器中查看
       </el-button>
       <el-button
         v-if="cancellable"
@@ -38,7 +38,7 @@ import { useExecutionStore } from '../../stores/execution'
 
 const props = defineProps<{ executionId: string }>()
 const store = useExecutionStore()
-onMounted(() => store.select(props.executionId))
+onMounted(() => store.loadDetail(props.executionId))
 const detail = computed(() => store.details[props.executionId])
 const statusLabel = computed(() => ({
   queued: '排队中', awaiting_approval: '等待授权', running: '执行中', completed: '已完成',

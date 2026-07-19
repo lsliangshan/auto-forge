@@ -59,6 +59,7 @@ export interface ApplicationRuntimeOptions {
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
   browserRuntime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
+  appInfo?: { version: string; platform: 'darwin' | 'win32' }
 }
 
 function failure(code: AppError['code']): AppError {
@@ -86,6 +87,17 @@ export class MaintenanceGate {
     try {
       if (this.starts > 0 || hasActiveWork()) throw failure('CONFLICT')
       clear()
+    } finally {
+      this.maintenance = false
+    }
+  }
+
+  async runExclusive<T>(hasActiveWork: () => boolean, operation: () => Promise<T>): Promise<T> {
+    if (this.maintenance) throw failure('CONFLICT')
+    this.maintenance = true
+    try {
+      if (this.starts > 0 || hasActiveWork()) throw failure('CONFLICT')
+      return await operation()
     } finally {
       this.maintenance = false
     }
@@ -361,12 +373,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (!workflow) throw failure('NOT_FOUND')
         return workflow
       },
-      setEnabled: async (id, enabled) => {
-        const installed = database.installedWorkflows.list().filter((workflow) => workflow.workflowId === id)
-        if (!installed.length) throw failure('NOT_FOUND')
-        for (const workflow of installed) registry.setEnabled(workflow.workflowId, workflow.version, enabled)
+      setEnabled: async (id, version, enabled) => {
+        if (!database.installedWorkflows.get(id, version)) throw failure('NOT_FOUND')
+        registry.setEnabled(id, version, enabled)
       },
-      remove: (id, version) => projects.removeInstalled(id, version),
+      remove: (id, version) => maintenance.runExclusive(
+        () => activeRequests.size > 0
+          || activeExecutions.size > 0
+          || agent.hasActiveRuns()
+          || executions.hasActiveExecutions()
+          || browser.hasActiveContexts(),
+        () => projects.removeInstalled(id, version),
+      ),
       installProject: async (projectId) => {
         const installed = await projects.install(projectId)
         const workflow = await registry.get(installed.workflowId, installed.version)
@@ -382,6 +400,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       readFile: (projectId, relativePath) => projects.readFile(projectId, relativePath),
       writeFile: (projectId, relativePath, content) => projects.write(projectId, relativePath, content),
+      build: async (projectId) => developerProject(await projects.build(projectId)),
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {
         const releaseStart = maintenance.beginStart()
@@ -478,6 +497,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (!parsed.success) throw failure('INVALID_INPUT')
         await options.openExternal(parsed.data.url)
       },
+      getAppInfo: async () => options.appInfo ?? { version: '0.1.0', platform: process.platform === 'win32' ? 'win32' : 'darwin' },
     },
   }
 
@@ -486,6 +506,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     recover: async () => {
       database.recoverInterrupted()
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
+      await projects.cleanupOwnedQuarantines()
     },
     close: async () => {
       await Promise.allSettled([...activeRequests].map((requestId) => agent.cancel(requestId)))

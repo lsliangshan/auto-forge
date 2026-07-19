@@ -125,13 +125,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.chatCancel, (input) => options.services.chat.cancel(input.requestId))
   register(ipcChannels.workflowsList, (input) => options.services.workflows.list(input))
   register(ipcChannels.workflowsGet, (input) => options.services.workflows.get(input.id, input.version))
-  register(ipcChannels.workflowsSetEnabled, (input) => options.services.workflows.setEnabled(input.id, input.enabled))
+  register(ipcChannels.workflowsSetEnabled, (input) => options.services.workflows.setEnabled(input.id, input.version, input.enabled))
   register(ipcChannels.workflowsRemove, (input) => options.services.workflows.remove(input.id, input.version))
   register(ipcChannels.workflowsInstallProject, (input) => options.services.workflows.installProject(input.projectId))
   register(ipcChannels.developerCreateProject, (input) => options.services.developer.createProject(input.name))
   register(ipcChannels.developerRegisterProject, () => options.services.developer.registerProject())
   register(ipcChannels.developerReadFile, (input) => options.services.developer.readFile(input.projectId, input.relativePath))
   register(ipcChannels.developerWriteFile, (input) => options.services.developer.writeFile(input.projectId, input.relativePath, input.content))
+  register(ipcChannels.developerBuildProject, (input) => options.services.developer.build(input.projectId))
   register(ipcChannels.developerValidate, (input) => options.services.developer.validate(input.projectId))
   register(ipcChannels.developerRun, (input) => options.services.developer.run(input))
   register(ipcChannels.executionsList, (input) => options.services.executions.list(input))
@@ -148,6 +149,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsListModels, () => options.services.settings.listModels())
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
+  register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 
   const dispose = () => {
     if (disposed) return

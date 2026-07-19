@@ -33,8 +33,8 @@
       </el-button>
       <el-button
         data-testid="approve-always"
-        :disabled="busy || decided || !executionIdentity"
-        :title="executionIdentity ? '始终允许此工作流版本的相同权限' : '正在确认工作流版本'"
+        :disabled="busy || decided"
+        title="始终允许此工作流版本的相同权限"
         @click="decide('always')"
       >
         始终允许
@@ -57,8 +57,8 @@
 
 <script setup lang="ts">
 import { Lock } from '@element-plus/icons-vue'
-import type { ApprovalDecision, ChatBlock, ExecutionDetail } from '@autoforge/shared'
-import { computed, onMounted, ref } from 'vue'
+import type { ApprovalDecision, ChatBlock } from '@autoforge/shared'
+import { computed, ref } from 'vue'
 import { displayError, getDesktopApi } from '../../services/desktop-api'
 
 type ApprovalBlock = Extract<ChatBlock, { type: 'approval' }>
@@ -66,7 +66,6 @@ const props = defineProps<{ approval: ApprovalBlock }>()
 const busy = ref(false)
 const decided = ref(false)
 const error = ref('')
-const executionIdentity = ref<Pick<ExecutionDetail, 'workflowId' | 'workflowVersion'>>()
 
 const capabilityLabel = computed(() => props.approval.capability.startsWith('browser.') ? '工作流希望控制自动化浏览器' : '工作流请求受控宿主能力')
 const scopeLabel = computed(() => {
@@ -75,16 +74,8 @@ const scopeLabel = computed(() => {
   return '不包含附加范围'
 })
 
-onMounted(async () => {
-  try {
-    const detail = await getDesktopApi().executions.get(props.approval.executionId)
-    executionIdentity.value = { workflowId: detail.workflowId, workflowVersion: detail.workflowVersion }
-  } catch { /* One-time and deny decisions remain available without persistent identity. */ }
-})
-
 async function decide(decision: 'once' | 'always' | 'deny') {
   if (busy.value || decided.value) return
-  if (decision === 'always' && !executionIdentity.value) return
   busy.value = true
   error.value = ''
   const base = {
@@ -94,7 +85,8 @@ async function decide(decision: 'once' | 'always' | 'deny') {
   }
   const input: ApprovalDecision = decision === 'always'
     ? {
-        ...base, decision, ...executionIdentity.value!, capability: props.approval.capability,
+        ...base, decision, workflowId: props.approval.workflowId,
+        workflowVersion: props.approval.workflowVersion, capability: props.approval.capability,
         scope: props.approval.scope,
       }
     : { ...base, decision }

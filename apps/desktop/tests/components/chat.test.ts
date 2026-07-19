@@ -12,6 +12,8 @@ const scopeHash = 'a'.repeat(64)
 function createEventApi() {
   let chatListener: ((event: ChatEvent) => void) | undefined
   let executionListener: ((event: ExecutionEvent) => void) | undefined
+  const chatUnsubscribe = vi.fn()
+  const executionUnsubscribe = vi.fn()
   const decide = vi.fn<(input: ApprovalDecision) => Promise<void>>().mockResolvedValue(undefined)
   const api = {
     chat: {
@@ -19,19 +21,19 @@ function createEventApi() {
       listMessages: vi.fn().mockResolvedValue([]),
       renameConversation: vi.fn(), deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'req_1' }), cancel: vi.fn(),
-      onEvent: vi.fn((listener) => { chatListener = listener; return vi.fn() }),
+      onEvent: vi.fn((listener) => { chatListener = listener; return chatUnsubscribe }),
     },
     workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
-    developer: { createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(), validate: vi.fn(), run: vi.fn() },
+    developer: { createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(), build: vi.fn(), validate: vi.fn(), run: vi.fn() },
     executions: {
       list: vi.fn(), get: vi.fn(), decide, cancel: vi.fn(),
-      onEvent: vi.fn((listener) => { executionListener = listener; return vi.fn() }),
+      onEvent: vi.fn((listener) => { executionListener = listener; return executionUnsubscribe }),
     },
     permissions: { listGrants: vi.fn(), revoke: vi.fn() },
     settings: { get: vi.fn(), update: vi.fn(), saveOpenRouterKey: vi.fn(), clearOpenRouterKey: vi.fn(), validateOpenRouterKey: vi.fn(), listModels: vi.fn(), clearLocalData: vi.fn() },
-    system: { openExternal: vi.fn() },
+    system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
-  return { api, decide, emitChat: (event: ChatEvent) => chatListener?.(event), emitExecution: (event: ExecutionEvent) => executionListener?.(event) }
+  return { api, decide, chatUnsubscribe, executionUnsubscribe, emitChat: (event: ChatEvent) => chatListener?.(event), emitExecution: (event: ExecutionEvent) => executionListener?.(event) }
 }
 
 describe('chat interactions', () => {
@@ -42,7 +44,7 @@ describe('chat interactions', () => {
     const { api, decide } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(ApprovalCard, {
-      props: { approval: { executionId: 'exec_1', permissionIndex: 2, scopeHash, capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] } } },
+      props: { approval: { executionId: 'exec_1', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0', permissionIndex: 2, scopeHash, capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] } } },
       global: { plugins: [ElementPlus] },
     })
     await wrapper.get('[data-testid="approve-once"]').trigger('click')
@@ -50,6 +52,22 @@ describe('chat interactions', () => {
     expect(decide).toHaveBeenCalledTimes(1)
     expect(decide).toHaveBeenCalledWith({ executionId: 'exec_1', permissionIndex: 2, scopeHash, decision: 'once' })
     expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('submits an always grant with the exact pending workflow version without reading an execution record', async () => {
+    const { api, decide } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: { executionId: 'exec_pending', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0', permissionIndex: 0, scopeHash, capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] } } },
+      global: { plugins: [ElementPlus] },
+    })
+    await wrapper.get('[data-testid="approve-always"]').trigger('click')
+    expect(api.executions.get).not.toHaveBeenCalled()
+    expect(decide).toHaveBeenCalledWith({
+      executionId: 'exec_pending', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0',
+      permissionIndex: 0, scopeHash, decision: 'always', capability: 'browser.navigate',
+      scope: { origins: ['https://www.baidu.com'] },
+    })
   })
 
   it('subscribes once and merges streamed text deltas without duplication', () => {
@@ -116,6 +134,24 @@ describe('chat interactions', () => {
     expect(store.isRunning).toBe(false)
   })
 
+  it('releases the bridge listener on the last store disposal and does not duplicate deltas after rebuild', () => {
+    const { api, chatUnsubscribe, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const first = useChatStore()
+    first.ensureSubscriptions()
+    first.$dispose()
+    expect(chatUnsubscribe).toHaveBeenCalledTimes(1)
+
+    setActivePinia(createPinia())
+    const second = useChatStore()
+    second.ensureSubscriptions()
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'msg_1', block: { type: 'text', text: '一次' } })
+    expect(api.chat.onEvent).toHaveBeenCalledTimes(2)
+    expect(second.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ text: '一次' }),
+    ])
+  })
+
   it('trims composer input, honors IME, and uses Shift+Enter for a newline', async () => {
     const wrapper = mount(ChatComposer, { props: { disabled: false, running: false }, global: { plugins: [ElementPlus] } })
     const textarea = wrapper.get('textarea')
@@ -128,5 +164,14 @@ describe('chat interactions', () => {
     expect(wrapper.emitted('submit')).toBeUndefined()
     await textarea.trigger('keydown', { key: 'Enter' })
     expect(wrapper.emitted('submit')?.[0]).toEqual(['查询天气'])
+  })
+
+  it('keeps running input and blocks Enter submission at the submit layer', async () => {
+    const wrapper = mount(ChatComposer, { props: { disabled: false, running: true }, global: { plugins: [ElementPlus] } })
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('保留这段输入')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.emitted('submit')).toBeUndefined()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('保留这段输入')
   })
 })

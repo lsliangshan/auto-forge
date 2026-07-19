@@ -77,7 +77,10 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts).toHaveLength(0)
     expect(dependencies.records.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'block', block: expect.objectContaining({ type: 'workflow_proposal', workflowId: workflow.id }) }),
-      expect.objectContaining({ type: 'block', block: expect.objectContaining({ type: 'approval' }) }),
+      expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'approval', workflowId: workflow.id, workflowVersion: workflow.version }),
+      }),
     ]))
   })
 
@@ -174,6 +177,14 @@ describe('AgentOrchestrator', () => {
       .filter((block): block is { type: string; permissionIndex: number; scopeHash: string; capability: string } => Boolean(block) && (block as { type?: string }).type === 'approval')
     expect(approvals.map((block) => block.permissionIndex)).toEqual([0, 1])
     expect(approvals.map((block) => block.capability)).toEqual(['browser.open', 'browser.fill'])
+    if (firstDecision === 'always') {
+      expect(dependencies.records.decisions[0]).toMatchObject({
+        workflowId: workflow.id,
+        workflowVersion: workflow.version,
+        capability: workflow.permissions[0]!.capability,
+        scope: workflow.permissions[0]!.scope,
+      })
+    }
 
     const stale = await orchestrator.resumeApproval({
       executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope), decision: 'once',

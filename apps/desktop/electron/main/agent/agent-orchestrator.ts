@@ -494,6 +494,8 @@ export class AgentOrchestrator {
           this.appendBlock(active, {
             type: 'approval',
             executionId: pending.executionId,
+            workflowId: pending.workflow.id,
+            workflowVersion: pending.workflow.version,
             permissionIndex: pending.permissionIndex,
             capability: permission.capability,
             scope: permission.scope,

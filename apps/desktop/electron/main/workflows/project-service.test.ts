@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -57,6 +57,25 @@ afterEach(() => {
 })
 
 describe('WorkflowProjectService', () => {
+  it('enables only the exact installed workflow version', async () => {
+    const { directory, database, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+    await projects.install(project.id)
+    writeFileSync(join(root, 'workflow.json'), `${JSON.stringify(manifest({ version: '2.0.0' }), null, 2)}\n`)
+    projects.register(root)
+    await projects.build(project.id)
+    await projects.install(project.id)
+    const registry = new WorkflowRegistry(database, projects)
+
+    registry.setEnabled('browser.search.baidu', '1.0.0', false)
+
+    expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')?.enabled).toBe(false)
+    expect(database.installedWorkflows.get('browser.search.baidu', '2.0.0')?.enabled).toBe(true)
+  })
+
   it('removes an exact installed version from disk and persistence', async () => {
     const { directory, database, projects } = openTestServices()
     const root = join(directory, 'project')
@@ -93,6 +112,31 @@ describe('WorkflowProjectService', () => {
     await expect(failing.removeInstalled('browser.search.baidu', '1.0.0')).rejects.toThrow('database unavailable')
     expect(existsSync(installed.installPath)).toBe(true)
     expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeDefined()
+  })
+
+  it('reports committed removal as success and retries an owned quarantine later', async () => {
+    const directory = temporaryDirectory()
+    const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
+    const installs = join(directory, 'installed-workflows')
+    let failCleanup = true
+    const projects = new WorkflowProjectService(database, installs, {
+      removeQuarantine: async (path) => {
+        if (failCleanup) { failCleanup = false; throw new Error('filesystem busy') }
+        rmSync(path, { recursive: true, force: true })
+      },
+    })
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+    await projects.install(project.id)
+
+    await expect(projects.removeInstalled('browser.search.baidu', '1.0.0')).resolves.toBeUndefined()
+    expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeUndefined()
+    expect(readdirSync(join(installs, 'browser.search.baidu')).some((name) => name.startsWith('.autoforge-remove-owned-'))).toBe(true)
+
+    await projects.cleanupOwnedQuarantines()
+    expect(readdirSync(join(installs, 'browser.search.baidu'))).toEqual([])
   })
 
   it('rejects a file path that escapes the registered project', async () => {

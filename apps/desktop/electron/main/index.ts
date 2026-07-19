@@ -84,6 +84,7 @@ function initialize(): ApplicationRuntime {
       if (parsed.success) emit(ipcChannels.executionsEvent, parsed.data)
     },
     browserRuntime: { packaged: app.isPackaged, ...(app.isPackaged ? { resourcesPath: process.resourcesPath } : {}) },
+    appInfo: { version: app.getVersion(), platform: process.platform === 'win32' ? 'win32' : 'darwin' },
   })
 }
 

@@ -17,7 +17,7 @@
     <div class="inspector-content af-scrollbar">
       <template v-if="route.name === 'executions' || execution.selectedId">
         <div
-          v-if="execution.detailLoading"
+          v-if="execution.selectedDetailLoading"
           class="inspector-state"
         >
           正在加载执行详情…
@@ -102,6 +102,8 @@
         </div>
         <template v-else-if="workflow.selectedDetail">
           <section><span class="af-panel-heading">工作流</span><p>{{ workflow.selectedDetail.name }} · {{ workflow.selectedDetail.version }}</p></section>
+          <section><span class="af-panel-heading">Manifest</span><p class="breakable">{{ workflow.selectedDetail.id }}<br>{{ workflow.selectedDetail.author }} · {{ workflow.selectedDetail.category }} · {{ workflow.selectedDetail.source === 'installed' ? '已安装' : '开发中' }}</p></section>
+          <section><span class="af-panel-heading">代码 Hash</span><p class="breakable hash">{{ workflow.selectedDetail.codeSha256 ?? '未提供' }}</p></section>
           <section>
             <span class="af-panel-heading">权限</span>
             <ul
@@ -123,6 +125,7 @@
             </p>
           </section>
           <section><span class="af-panel-heading">超时限制</span><p>{{ workflow.selectedDetail.timeoutMs }} ms</p></section>
+          <section><span class="af-panel-heading">最近执行</span><ul v-if="workflow.recentExecutions[workflow.selectedKey]?.length" class="recent-list"><li v-for="item in workflow.recentExecutions[workflow.selectedKey]" :key="item.id">{{ statusLabel(item.status) }}<small>{{ new Date(item.createdAt).toLocaleString('zh-CN') }}</small></li></ul><p v-else class="muted">暂无执行记录</p></section>
         </template>
         <template v-else>
           <section><span class="af-panel-heading">工作流状态</span><p>共 {{ workflow.items.length }} 个真实本地工作流</p></section>
@@ -174,6 +177,7 @@ const formatScope = (scope: { origins?: string[]; paths?: string[] }) => scope.o
 .step-list { display: grid; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }.step-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .logs { max-height: 240px; margin-top: 8px; overflow: auto; color: #cfd7e3; background: #242a32; }.logs p { margin: 0; border-bottom: 1px solid #353d48; padding: 7px 8px; font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.logs b { color: #8fb4ff; }
 .permission-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.permission-list li { font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.permission-list small { display: block; margin-top: 2px; color: var(--af-text-muted); font-family: inherit; }
+.hash { font-family: ui-monospace, monospace; font-size: 10px !important; }.recent-list { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }.recent-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }.recent-list small { color: var(--af-text-muted); }
 .inspector-state { padding: 36px 10px; color: var(--af-text-muted); font-size: 13px; line-height: 1.6; text-align: center; }
 @media (max-width: 1179px) {
   .inspector { position: fixed; z-index: 25; top: 0; right: 0; box-shadow: -12px 0 28px rgb(25 32 44 / 16%); }

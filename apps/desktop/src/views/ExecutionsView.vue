@@ -40,12 +40,15 @@
       >
         <span>状态</span><span>工作流</span><span>版本</span><span>创建时间</span><span>操作</span>
       </div>
-      <button
+      <div
         v-for="item in execution.items"
         :key="item.id"
         :class="['execution-row', { selected: execution.selectedId === item.id }]"
         role="row"
+        tabindex="0"
         @click="execution.select(item.id)"
+        @keydown.enter.prevent="execution.select(item.id)"
+        @keydown.space.prevent="execution.select(item.id)"
       >
         <span><i :class="['af-status-dot', tone(item.status)]" />{{ label(item.status) }}</span><span class="af-truncate">{{ item.workflowId }}</span><span>{{ item.workflowVersion }}</span><time>{{ formatTime(item.createdAt) }}</time><span><el-button
           v-if="cancellable(item.status)"
@@ -54,7 +57,7 @@
           text
           @click.stop="execution.cancel(item.id)"
         >取消</el-button><em v-else>查看</em></span>
-      </button>
+      </div>
     </div>
   </section>
 </template>

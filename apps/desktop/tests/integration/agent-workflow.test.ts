@@ -194,7 +194,9 @@ describe('agent workflow integration', () => {
     expect(pending.error).toBeUndefined()
     expect(pending).toMatchObject({ status: 'awaiting_approval' })
     const result = await app.orchestrator.resumeApproval({
-      executionId: pending.executionId!, permissionIndex: 0, scopeHash: scopeHash(permission.scope), decision: 'once',
+      executionId: pending.executionId!, permissionIndex: 0, scopeHash: scopeHash(permission.scope), decision: 'always',
+      workflowId: app.workflow.id, workflowVersion: app.workflow.version,
+      capability: permission.capability, scope: permission.scope,
     })
 
     expect(app.database.executions.get(pending.executionId!)).toMatchObject({ status: 'completed' })
@@ -215,7 +217,12 @@ describe('agent workflow integration', () => {
     expect(app.database.chatRuns.get(execution!.chatRunId!)).toMatchObject({
       status: 'completed', generationId: 'generation_final', inputTokens: 4, outputTokens: 2, costUsd: '0.01',
     })
-    expect(app.database.permissionGrants.get(app.workflow.id, app.workflow.version, permission.capability, scopeHash(permission.scope))).toBeUndefined()
+    expect(app.database.permissionGrants.get(app.workflow.id, app.workflow.version, permission.capability, scopeHash(permission.scope))).toMatchObject({
+      workflowId: app.workflow.id,
+      workflowVersion: app.workflow.version,
+      capability: permission.capability,
+      scope: permission.scope,
+    })
   })
 
   it('cancels a real execution service start blocked before active registration', async () => {

@@ -16,6 +16,12 @@
           新建
         </el-button>
       </div>
+      <el-input
+        v-model="conversationSearch"
+        clearable
+        placeholder="搜索会话"
+        aria-label="搜索会话"
+      />
       <div
         v-if="chat.loading"
         class="sidebar-state"
@@ -39,10 +45,9 @@
         v-else
         class="context-list af-scrollbar"
       >
-        <li
-          v-for="conversation in chat.conversations"
-          :key="conversation.id"
-        >
+        <template v-for="group in conversationGroups" :key="group.label">
+          <li class="conversation-group">{{ group.label }}</li>
+          <li v-for="conversation in group.items" :key="conversation.id">
           <div :class="['conversation-row', { active: chat.selectedConversationId === conversation.id }]">
             <button
               class="conversation-select"
@@ -65,7 +70,8 @@
               <el-icon><Delete /></el-icon>
             </button>
           </div>
-        </li>
+          </li>
+        </template>
       </ul>
     </template>
 
@@ -80,6 +86,17 @@
         aria-label="搜索工作流"
         @keyup.enter="applyWorkflowFilters"
       />
+      <label
+        class="field-label"
+        for="workflow-category"
+      >类别</label>
+      <el-select
+        id="workflow-category"
+        v-model="workflowCategory"
+        placeholder="全部类别"
+        clearable
+        @change="applyWorkflowFilters"
+      ><el-option v-for="category in workflowCategories" :key="category" :label="category" :value="category" /></el-select>
       <label
         class="field-label"
         for="workflow-source"
@@ -145,6 +162,12 @@
         placeholder="工作流或执行 ID"
         aria-label="搜索执行记录"
       />
+      <el-input
+        v-model="executionWorkflowId"
+        clearable
+        placeholder="精确工作流 ID"
+        aria-label="筛选工作流 ID"
+      />
       <label
         class="field-label"
         for="execution-status"
@@ -162,6 +185,8 @@
           :value="item.value"
         />
       </el-select>
+      <label class="field-label">开始时间</label><input v-model="executionFrom" class="native-filter" type="datetime-local">
+      <label class="field-label">结束时间</label><input v-model="executionTo" class="native-filter" type="datetime-local">
       <el-button
         :icon="Search"
         @click="applyExecutionFilters"
@@ -177,7 +202,9 @@
       <a href="#credential">OpenRouter 凭证</a>
       <a href="#model">默认模型</a>
       <a href="#appearance">外观与行为</a>
+      <a href="#permissions">已保存授权</a>
       <a href="#data">本地数据</a>
+      <a href="#about">关于 AutoForge</a>
     </template>
   </aside>
 </template>
@@ -186,7 +213,7 @@
 import { ChatDotRound, Delete, Edit, Plus, Search } from '@element-plus/icons-vue'
 import type { ExecutionStatus } from '@autoforge/shared'
 import { ElMessageBox } from 'element-plus'
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
@@ -196,10 +223,27 @@ const route = useRoute()
 const chat = useChatStore()
 const workflow = useWorkflowStore()
 const execution = useExecutionStore()
+const conversationSearch = ref('')
+const conversationGroups = computed(() => {
+  const search = conversationSearch.value.trim().toLocaleLowerCase()
+  const filtered = chat.conversations.filter(({ title }) => !search || title.toLocaleLowerCase().includes(search))
+  const today = new Date().toDateString()
+  const groups = new Map<string, typeof filtered>()
+  for (const item of filtered) {
+    const label = new Date(item.updatedAt).toDateString() === today ? '今天' : '更早'
+    groups.set(label, [...(groups.get(label) ?? []), item])
+  }
+  return [...groups].map(([label, items]) => ({ label, items }))
+})
 const workflowSearch = ref('')
 const workflowSource = ref<'installed' | 'development' | ''>('')
 const workflowEnabled = ref<'true' | 'false' | ''>('')
+const workflowCategory = ref('')
+const workflowCategories = computed(() => [...new Set(workflow.items.map(({ category }) => category))].sort())
 const executionSearch = ref('')
+const executionWorkflowId = ref('')
+const executionFrom = ref('')
+const executionTo = ref('')
 const executionStatus = ref<ExecutionStatus | ''>('')
 const executionStatuses: { label: string; value: ExecutionStatus }[] = [
   { label: '排队中', value: 'queued' }, { label: '等待授权', value: 'awaiting_approval' },
@@ -211,6 +255,7 @@ function applyWorkflowFilters() {
   void workflow.load({
     ...(workflowSearch.value.trim() ? { search: workflowSearch.value.trim() } : {}),
     ...(workflowSource.value ? { source: workflowSource.value } : {}),
+    ...(workflowCategory.value ? { category: workflowCategory.value } : {}),
     ...(workflowEnabled.value ? { enabled: workflowEnabled.value === 'true' } : {}),
   })
 }
@@ -218,6 +263,9 @@ function applyExecutionFilters() {
   void execution.load({
     ...(executionSearch.value.trim() ? { search: executionSearch.value.trim() } : {}),
     ...(executionStatus.value ? { status: executionStatus.value } : {}),
+    ...(executionWorkflowId.value.trim() ? { workflowId: executionWorkflowId.value.trim() } : {}),
+    ...(executionFrom.value ? { from: new Date(executionFrom.value).toISOString() } : {}),
+    ...(executionTo.value ? { to: new Date(executionTo.value).toISOString() } : {}),
   })
 }
 async function renameConversation(id: string, title: string) {
@@ -248,6 +296,7 @@ onMounted(() => {
 .sidebar-toolbar { display: flex; min-height: 28px; align-items: center; justify-content: space-between; }
 .context-list { min-height: 0; margin: 0 -4px; padding: 0 4px; overflow: auto; list-style: none; }
 .context-list li + li { margin-top: 2px; }
+.conversation-group { padding: 9px 7px 3px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .conversation-row { display: grid; grid-template-columns: minmax(0, 1fr) 26px 26px; align-items: center; border-radius: 5px; }
 .conversation-row:hover { background: #edf0f4; }.conversation-row.active { color: #174ea6; background: var(--af-cobalt-soft); }
 .conversation-select { display: flex; min-width: 0; align-items: center; gap: 8px; border: 0; padding: 9px 8px; color: inherit; background: transparent; cursor: pointer; text-align: left; }
@@ -256,6 +305,7 @@ onMounted(() => {
 .sidebar-state { margin-top: 20px; color: var(--af-text-muted); font-size: 12px; line-height: 1.6; text-align: center; }
 .sidebar-state small { color: #8a939f; }.sidebar-error { color: var(--af-danger); font-size: 12px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 11px; font-weight: 650; }
+.native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: white; font-size: 11px; }
 a { border-radius: 5px; padding: 8px 9px; color: var(--af-text); font-size: 13px; text-decoration: none; }
 a:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 </style>

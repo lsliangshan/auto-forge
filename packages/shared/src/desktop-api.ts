@@ -87,6 +87,7 @@ export const workflowSummarySchema = z.object({
 export type WorkflowSummary = z.infer<typeof workflowSummarySchema>
 
 export const workflowDetailSchema = workflowSummarySchema.extend({
+  codeSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   permissions: z.array(workflowPermissionSchema),
   activationExamples: z.array(nonEmptyStringSchema),
   activationNegativeExamples: z.array(nonEmptyStringSchema),
@@ -269,6 +270,12 @@ export const modelInfoSchema = z.object({
 
 export type ModelInfo = z.infer<typeof modelInfoSchema>
 
+export const appInfoSchema = z.object({
+  version: nonEmptyStringSchema,
+  platform: z.enum(['darwin', 'win32']),
+}).strict()
+export type AppInfo = z.infer<typeof appInfoSchema>
+
 export const ipcChannels = {
   chatListConversations: 'chat:list-conversations',
   chatListMessages: 'chat:list-messages',
@@ -287,6 +294,7 @@ export const ipcChannels = {
   developerRegisterProject: 'developer:register-project',
   developerReadFile: 'developer:read-file',
   developerWriteFile: 'developer:write-file',
+  developerBuildProject: 'developer:build-project',
   developerValidate: 'developer:validate',
   developerRun: 'developer:run',
   executionsList: 'executions:list',
@@ -304,6 +312,7 @@ export const ipcChannels = {
   settingsListModels: 'settings:list-models',
   settingsClearLocalData: 'settings:clear-local-data',
   systemOpenExternal: 'system:open-external',
+  systemGetAppInfo: 'system:get-app-info',
 } as const
 
 export type IpcChannel = (typeof ipcChannels)[keyof typeof ipcChannels]
@@ -321,7 +330,7 @@ export const workflowGetRequestSchema = z.object({
   id: identifierSchema,
   version: nonEmptyStringSchema.optional(),
 }).strict()
-export const workflowSetEnabledRequestSchema = z.object({ id: identifierSchema, enabled: z.boolean() }).strict()
+export const workflowSetEnabledRequestSchema = z.object({ id: identifierSchema, version: nonEmptyStringSchema, enabled: z.boolean() }).strict()
 export const workflowRemoveRequestSchema = z.object({ id: identifierSchema, version: nonEmptyStringSchema }).strict()
 export const workflowInstallProjectRequestSchema = z.object({ projectId: identifierSchema }).strict()
 export const createProjectRequestSchema = z.object({ name: nonEmptyStringSchema }).strict()
@@ -379,6 +388,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.developerRegisterProject]: registerProjectRequestSchema,
   [ipcChannels.developerReadFile]: readFileRequestSchema,
   [ipcChannels.developerWriteFile]: writeFileRequestSchema,
+  [ipcChannels.developerBuildProject]: validateProjectRequestSchema,
   [ipcChannels.developerValidate]: validateProjectRequestSchema,
   [ipcChannels.developerRun]: developerRunInputSchema,
   [ipcChannels.executionsList]: executionListRequestSchema,
@@ -395,6 +405,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsListModels]: listModelsRequestSchema,
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
+  [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
 
 const voidResponseSchema = z.void()
@@ -418,6 +429,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.developerRegisterProject]: developerProjectSchema.nullable(),
   [ipcChannels.developerReadFile]: z.string(),
   [ipcChannels.developerWriteFile]: voidResponseSchema,
+  [ipcChannels.developerBuildProject]: developerProjectSchema,
   [ipcChannels.developerValidate]: validationResultSchema,
   [ipcChannels.developerRun]: executionIdResponseSchema,
   [ipcChannels.executionsList]: z.array(executionSummarySchema),
@@ -434,6 +446,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsListModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
+  [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
 
 export interface DesktopAPI {
@@ -450,7 +463,7 @@ export interface DesktopAPI {
   workflows: {
     list(query?: WorkflowQuery): Promise<WorkflowSummary[]>
     get(id: string, version?: string): Promise<WorkflowDetail>
-    setEnabled(id: string, enabled: boolean): Promise<void>
+    setEnabled(id: string, version: string, enabled: boolean): Promise<void>
     remove(id: string, version: string): Promise<void>
     installProject(projectId: string): Promise<WorkflowDetail>
   }
@@ -459,6 +472,7 @@ export interface DesktopAPI {
     registerProject(): Promise<DeveloperProject | null>
     readFile(projectId: string, relativePath: string): Promise<string>
     writeFile(projectId: string, relativePath: string, content: string): Promise<void>
+    build(projectId: string): Promise<DeveloperProject>
     validate(projectId: string): Promise<ValidationResult>
     run(input: DeveloperRunInput): Promise<{ executionId: string }>
   }
@@ -484,5 +498,6 @@ export interface DesktopAPI {
   }
   system: {
     openExternal(url: string): Promise<void>
+    getAppInfo(): Promise<AppInfo>
   }
 }

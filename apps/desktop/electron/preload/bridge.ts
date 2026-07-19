@@ -63,7 +63,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
     workflows: {
       list: (query) => invoke(ipcRenderer, ipcChannels.workflowsList, query),
       get: (id, version) => invoke(ipcRenderer, ipcChannels.workflowsGet, { id, ...(version ? { version } : {}) }),
-      setEnabled: (id, enabled) => invoke(ipcRenderer, ipcChannels.workflowsSetEnabled, { id, enabled }),
+      setEnabled: (id, version, enabled) => invoke(ipcRenderer, ipcChannels.workflowsSetEnabled, { id, version, enabled }),
       remove: (id, version) => invoke(ipcRenderer, ipcChannels.workflowsRemove, { id, version }),
       installProject: (projectId) => invoke(ipcRenderer, ipcChannels.workflowsInstallProject, { projectId }),
     },
@@ -72,6 +72,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
       registerProject: () => invoke(ipcRenderer, ipcChannels.developerRegisterProject),
       readFile: (projectId, relativePath) => invoke(ipcRenderer, ipcChannels.developerReadFile, { projectId, relativePath }),
       writeFile: (projectId, relativePath, content) => invoke(ipcRenderer, ipcChannels.developerWriteFile, { projectId, relativePath, content }),
+      build: (projectId) => invoke(ipcRenderer, ipcChannels.developerBuildProject, { projectId }),
       validate: (projectId) => invoke(ipcRenderer, ipcChannels.developerValidate, { projectId }),
       run: (input) => invoke(ipcRenderer, ipcChannels.developerRun, input),
     },
@@ -97,6 +98,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
     },
     system: {
       openExternal: (url) => invoke(ipcRenderer, ipcChannels.systemOpenExternal, { url }),
+      getAppInfo: () => invoke(ipcRenderer, ipcChannels.systemGetAppInfo),
     },
   }
 }

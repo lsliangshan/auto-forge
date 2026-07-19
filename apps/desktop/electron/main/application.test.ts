@@ -122,6 +122,8 @@ describe('createApplicationRuntime', () => {
 
     await expect(runtime.services.settings.clearLocalData('conversations'))
       .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.services.workflows.remove('workflow.active', '1.0.0'))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
     expect(await runtime.services.chat.listConversations()).toHaveLength(1)
 
     finishStream()
@@ -154,5 +156,16 @@ describe('createApplicationRuntime', () => {
       clear()
     })
     expect(clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a removal-style exclusive operation atomic against a new start', async () => {
+    const gate = new MaintenanceGate()
+    let finish!: () => void
+    const operation = gate.runExclusive(() => false, () => new Promise<void>((resolve) => { finish = resolve }))
+    expect(() => gate.beginStart()).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    finish()
+    await operation
+    const release = gate.beginStart()
+    release()
   })
 })

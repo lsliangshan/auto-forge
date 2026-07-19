@@ -165,6 +165,38 @@
           </el-button>
         </div>
       </section>
+      <section
+        id="permissions"
+        class="settings-section"
+      >
+        <header><div><h2>已保存授权</h2><p>始终允许的权限按工作流精确版本保存。</p></div></header>
+        <div
+          v-if="!settings.grants.length"
+          class="field-message"
+        >暂无已保存授权。</div>
+        <div
+          v-else
+          class="grant-list"
+        >
+          <div
+            v-for="grant in settings.grants"
+            :key="grant.id"
+            class="grant-row"
+          ><div><strong>{{ grant.workflowId }} · {{ grant.workflowVersion }}</strong><small>{{ grant.capability }}</small></div><el-button
+            type="danger"
+            text
+            :disabled="settings.saving"
+            @click="settings.revokeGrant(grant.id)"
+          >撤销</el-button></div>
+        </div>
+      </section>
+      <section
+        id="about"
+        class="settings-section"
+      >
+        <header><div><h2>关于 AutoForge</h2><p>本地优先的 AI 工作流桌面应用。</p></div></header>
+        <dl class="app-info"><dt>版本</dt><dd>{{ settings.appInfo?.version ?? '—' }}</dd><dt>平台</dt><dd>{{ settings.appInfo?.platform === 'darwin' ? 'macOS' : settings.appInfo?.platform === 'win32' ? 'Windows' : '—' }}</dd></dl>
+      </section>
     </template>
   </section>
 </template>
@@ -219,4 +251,5 @@ async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
 .settings-form { display: grid; gap: 8px; padding-top: 14px; }.settings-form > label, .settings-grid > label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.settings-form small, .field-message { margin: 0; color: var(--af-text-muted); font-size: 11px; }.settings-form > .el-button { justify-self: start; }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding-top: 15px; }.settings-grid label:not(.switch-row) { display: grid; gap: 7px; }.switch-row { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 0; }.model-id { float: right; margin-left: 18px; color: var(--af-text-muted); }
 .danger-zone { border-color: #efc6c2; }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+.grant-list { margin-top: 12px; }.grant-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 10px 0; }.grant-row div { display: grid; gap: 3px; }.grant-row strong { font-size: 12px; }.grant-row small { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 11px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }
 </style>

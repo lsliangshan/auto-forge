@@ -24,6 +24,12 @@
       </div>
     </div>
     <template v-else>
+      <div class="chat-controls">
+        <span>本次会话模型</span>
+        <el-select v-model="selectedModel" filterable placeholder="使用默认模型" :loading="settings.modelsLoading" clearable>
+          <el-option v-for="model in settings.models" :key="model.id" :label="model.name" :value="model.id" />
+        </el-select>
+      </div>
       <div
         class="messages af-scrollbar"
         aria-live="polite"
@@ -59,7 +65,7 @@
       <ChatComposer
         :disabled="false"
         :running="chat.isRunning"
-        @submit="chat.send($event, settings.settings?.defaultModel)"
+        @submit="chat.send($event, selectedModel || settings.settings?.defaultModel)"
         @cancel="chat.cancelCurrent"
       />
     </template>
@@ -68,7 +74,7 @@
 
 <script setup lang="ts">
 import { ChatDotRound, Loading } from '@element-plus/icons-vue'
-import { onMounted } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import ChatComposer from '../components/chat/ChatComposer.vue'
 import MessageBlock from '../components/chat/MessageBlock.vue'
 import { useChatStore } from '../stores/chat'
@@ -76,15 +82,20 @@ import { useSettingsStore } from '../stores/settings'
 
 const chat = useChatStore()
 const settings = useSettingsStore()
-onMounted(() => {
+const selectedModel = ref('')
+watch(() => settings.settings?.defaultModel, (value) => { if (!selectedModel.value) selectedModel.value = value ?? '' }, { immediate: true })
+onMounted(async () => {
   chat.ensureSubscriptions()
   if (!chat.conversations.length && !chat.loading) void chat.loadConversations()
+  if (!settings.settings && !settings.loading) await settings.load()
+  if (settings.credential?.configured && !settings.models.length) void settings.loadModels()
 })
 </script>
 
 <style scoped>
 .chat-view { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--af-surface); }
 .messages { flex: 1; overflow: auto; padding: 18px clamp(20px, 5vw, 72px); }
+.chat-controls { display: flex; min-height: 44px; align-items: center; justify-content: flex-end; gap: 8px; border-bottom: 1px solid var(--af-border); padding: 6px 16px; background: var(--af-surface-muted); }.chat-controls span { color: var(--af-text-muted); font-size: 11px; }.chat-controls .el-select { width: min(300px, 45%); }
 .message { display: grid; grid-template-columns: 74px minmax(0, 760px); gap: 12px; max-width: 920px; margin: 0 auto; padding: 16px 0; border-bottom: 1px solid var(--af-border); }
 .message-role { padding-top: 2px; color: var(--af-text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }.message.user .message-role { color: var(--af-cobalt); }
 .message-body { min-width: 0; font-size: 14px; }
