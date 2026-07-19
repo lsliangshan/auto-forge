@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -53,9 +53,12 @@ describe('createApplicationRuntime', () => {
     expect(await runtime.services.settings.saveOpenRouterKey('sk-local')).toMatchObject({ configured: true, valid: true })
     const longNameProject = await runtime.services.developer.createProject(`${'a'.repeat(47)} b`)
     expect(longNameProject.name).toBe(`${'a'.repeat(47)} b`)
+    await mkdir(join(longNameProject.rootPath, 'node_modules/private-package'), { recursive: true })
+    await writeFile(join(longNameProject.rootPath, 'node_modules/private-package/index.js'), 'generated dependency')
     expect(await runtime.services.developer.listProjects()).toEqual([
       expect.objectContaining({ id: longNameProject.id, files: expect.arrayContaining(['src/index.ts', 'workflow.json']) }),
     ])
+    expect((await runtime.services.developer.listProjects())[0]?.files.some((file) => file.startsWith('node_modules/'))).toBe(false)
     const manifest = JSON.parse(await runtime.services.developer.readFile(longNameProject.id, 'workflow.json')) as Record<string, unknown>
     manifest.inputSchema = {
       type: 'object', additionalProperties: false, required: ['keyword'],

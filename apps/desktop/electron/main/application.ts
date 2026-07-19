@@ -125,9 +125,11 @@ function summary(workflow: WorkflowDetail): WorkflowSummary {
 }
 
 function projectFiles(root: string): Promise<string[]> {
+  const ignoredDirectories = new Set(['.git', 'node_modules'])
   const visit = async (directory: string, prefix = ''): Promise<string[]> => {
     const entries = await readdir(directory, { withFileTypes: true })
-    const files = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()).map(async (entry) => {
+    const files = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
+      && !(entry.isDirectory() && ignoredDirectories.has(entry.name))).map(async (entry) => {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name
       return entry.isDirectory() ? visit(join(directory, entry.name), relative) : [relative]
     }))
