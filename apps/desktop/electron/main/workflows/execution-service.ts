@@ -226,6 +226,10 @@ export class ExecutionService {
     }
   }
 
+  hasActiveExecutions(): boolean {
+    return this.active.size > 0 || this.reservationsById.size > 0
+  }
+
   reserve(): ExecutionReservation {
     const handle = Object.freeze({ executionId: randomUUID() })
     const record: ReservationRecord = {

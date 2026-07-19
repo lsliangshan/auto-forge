@@ -365,6 +365,10 @@ export class BrowserCapabilityService implements CapabilityPort {
     return this.executions.get(executionId)?.owner?.contextOpen ? 1 : 0
   }
 
+  hasActiveContexts(): boolean {
+    return this.executions.size > 0
+  }
+
   async request(context: BrowserCapabilityContext, request: WorkerCapabilityRequest): Promise<unknown> {
     switch (request.capability) {
       case 'browser.open':

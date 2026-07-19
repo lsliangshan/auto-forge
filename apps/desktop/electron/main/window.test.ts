@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import { readFile } from 'node:fs/promises'
+import { pathToFileURL } from 'node:url'
 import { createSecureWindow, type BrowserWindowConstructor } from './window.js'
 
 class FakeBrowserWindow {
@@ -56,6 +58,42 @@ describe('createSecureWindow', () => {
     expect(webviewEvent.preventDefault).toHaveBeenCalled()
     expect(created.openHandler?.({ url: 'https://example.com/' })).toEqual({ action: 'deny' })
     expect(created.loadFile).toHaveBeenCalledWith('/app/renderer/index.html')
+  })
+
+  it('accepts only hash changes on the exact production file URL', async () => {
+    const filePath = '/app/renderer/index.html'
+    await createSecureWindow({
+      BrowserWindow: FakeBrowserWindow as unknown as BrowserWindowConstructor,
+      session: { setPermissionRequestHandler: vi.fn() },
+      preloadPath: '/app/preload.js',
+      rendererTarget: { kind: 'production', filePath },
+    })
+    const navigate = FakeBrowserWindow.last!.webContentsListeners.get('will-navigate')!
+    const trusted = pathToFileURL(filePath).href
+    const allowed = { preventDefault: vi.fn() }
+    navigate(allowed, `${trusted}#/chat`)
+    expect(allowed.preventDefault).not.toHaveBeenCalled()
+    const encodedHash = { preventDefault: vi.fn() }
+    navigate(encodedHash, `${trusted}#/%2Fdeveloper`)
+    expect(encodedHash.preventDefault).not.toHaveBeenCalled()
+
+    for (const url of [
+      `file://attacker${new URL(trusted).pathname}`,
+      `file://user:secret@attacker${new URL(trusted).pathname}`,
+      `file://%61ttacker${new URL(trusted).pathname}`,
+      `file:\\attacker${new URL(trusted).pathname}`,
+      `${trusted}?authority=attacker`,
+    ]) {
+      const blocked = { preventDefault: vi.fn() }
+      navigate(blocked, url)
+      expect(blocked.preventDefault).toHaveBeenCalled()
+    }
+  })
+
+  it('keeps OpenRouter network access out of the renderer CSP', async () => {
+    const html = await readFile(new URL('../../index.html', import.meta.url), 'utf8')
+    expect(html).toContain("connect-src 'self'")
+    expect(html).not.toContain('connect-src \'self\' https://openrouter.ai')
   })
 
   it('allows main to register the fixed bridge before renderer code loads', async () => {

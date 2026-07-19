@@ -1,5 +1,4 @@
-import { pathToFileURL } from 'node:url'
-import type { RendererTarget } from './ipc/register-ipc.js'
+import { isTrustedRendererUrl, type RendererTarget } from './renderer-trust.js'
 
 interface NavigationEventPort { preventDefault(): void }
 interface WebContentsPort {
@@ -34,21 +33,6 @@ export interface SecureWindowOptions {
   beforeLoad?(window: BrowserWindowPort): void | Promise<void>
 }
 
-function trustedNavigation(url: string, target: RendererTarget): boolean {
-  try {
-    const parsed = new URL(url)
-    if (target.kind === 'development') return parsed.origin === target.origin
-    const expected = pathToFileURL(target.filePath)
-    return parsed.protocol === 'file:'
-      && parsed.pathname === expected.pathname
-      && parsed.search === ''
-      && parsed.username === ''
-      && parsed.password === ''
-  } catch {
-    return false
-  }
-}
-
 export async function createSecureWindow(options: SecureWindowOptions): Promise<BrowserWindowPort> {
   options.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
   options.session.setPermissionCheckHandler?.(() => false)
@@ -72,7 +56,7 @@ export async function createSecureWindow(options: SecureWindowOptions): Promise<
   })
 
   const guardNavigation = (event: NavigationEventPort, url: string) => {
-    if (!trustedNavigation(url, options.rendererTarget)) event.preventDefault()
+    if (!isTrustedRendererUrl(url, options.rendererTarget)) event.preventDefault()
   }
   window.webContents.on('will-navigate', guardNavigation)
   window.webContents.on('will-redirect', guardNavigation)

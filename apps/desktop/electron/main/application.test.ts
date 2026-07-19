@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApplicationRuntime } from './application.js'
+import { createApplicationRuntime, MaintenanceGate } from './application.js'
 
 const directories: string[] = []
 
@@ -52,5 +52,74 @@ describe('createApplicationRuntime', () => {
       expect(Object.values(runtime.services[domain]).every((member) => typeof member === 'function')).toBe(true)
     }
     await runtime.close()
+  })
+
+  it('rejects conversation cleanup during a streaming chat and succeeds after terminalization', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
+    directories.push(root)
+    let finishStream!: () => void
+    const streamFinished = new Promise<void>((resolve) => { finishStream = resolve })
+    const chatEvents: Array<{ type: string; status?: string }> = []
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      openRouter: {
+        listModels: async () => [], validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          await streamFinished
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      },
+      chooseProjectDirectory: async () => undefined,
+      openExternal: async () => undefined,
+      emitChat: (event) => { chatEvents.push(event) },
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send({ conversationId: conversation.id, content: 'hello' })
+
+    await expect(runtime.services.settings.clearLocalData('conversations'))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(await runtime.services.chat.listConversations()).toHaveLength(1)
+
+    finishStream()
+    for (let index = 0; index < 20 && !chatEvents.some((event) => event.status === 'completed'); index += 1) {
+      await Promise.resolve()
+    }
+    await runtime.services.settings.clearLocalData('conversations')
+    expect(await runtime.services.chat.listConversations()).toEqual([])
+    await runtime.close()
+  })
+
+  it('atomically excludes maintenance from starts and active execution or browser work', () => {
+    const gate = new MaintenanceGate()
+    const releaseStart = gate.beginStart()
+    const clear = vi.fn()
+    expect(() => gate.clearLocalData(() => false, clear)).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    expect(clear).not.toHaveBeenCalled()
+    releaseStart()
+
+    let executionActive = true
+    let browserActive = true
+    expect(() => gate.clearLocalData(() => executionActive || browserActive, clear))
+      .toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    expect(clear).not.toHaveBeenCalled()
+
+    executionActive = false
+    browserActive = false
+    gate.clearLocalData(() => false, () => {
+      expect(() => gate.beginStart()).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+      clear()
+    })
+    expect(clear).toHaveBeenCalledTimes(1)
   })
 })

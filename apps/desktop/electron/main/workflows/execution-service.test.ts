@@ -268,6 +268,7 @@ describe('ExecutionService', () => {
   it('uses an unforgeable reservation so pre-start approval remains bound to the worker', async () => {
     const harness = createHarness()
     const reservation = harness.service.reserve()
+    expect(harness.service.hasActiveExecutions()).toBe(true)
     const execution = await harness.service.startReserved(reservation, {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
@@ -277,6 +278,7 @@ describe('ExecutionService', () => {
     expect(execution.id).toBe(reservation.executionId)
     expect(harness.workerFactory.specifications[0]?.executionId).toBe(reservation.executionId)
     await harness.service.cancel(execution.id)
+    expect(harness.service.hasActiveExecutions()).toBe(false)
 
     await expect(harness.service.startReserved({ executionId: 'forged' } as never, {
       workflowId: workflow.id, workflowVersion: workflow.version, input: {},
@@ -286,8 +288,10 @@ describe('ExecutionService', () => {
   it('discards only an unstarted authentic reservation and makes discard idempotent', async () => {
     const harness = createHarness()
     const reservation = harness.service.reserve()
+    expect(harness.service.hasActiveExecutions()).toBe(true)
 
     expect(harness.service.discardReservation(reservation)).toBe(true)
+    expect(harness.service.hasActiveExecutions()).toBe(false)
     expect(harness.service.discardReservation(reservation)).toBe(false)
     expect(harness.service.discardReservation({ executionId: reservation.executionId } as never)).toBe(false)
     await expect(harness.service.startReserved(reservation, {

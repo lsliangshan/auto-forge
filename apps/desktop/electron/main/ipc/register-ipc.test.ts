@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ipcChannels } from '@autoforge/shared'
+import { pathToFileURL } from 'node:url'
 import {
   registerDesktopIpc,
   type DesktopIpcServices,
@@ -32,7 +33,10 @@ function services(): DesktopIpcServices {
   }
 }
 
-function harness(senderUrl = 'http://127.0.0.1:5173/chat') {
+function harness(
+  senderUrl = 'http://127.0.0.1:5173/chat',
+  rendererTarget: import('./register-ipc.js').RendererTarget = { kind: 'development', origin: 'http://127.0.0.1:5173' },
+) {
   const handlers = new Map<string, (event: IpcInvokeEvent, input?: unknown) => Promise<unknown>>()
   const removed: string[] = []
   const ipcMain: IpcMainPort = {
@@ -47,11 +51,12 @@ function harness(senderUrl = 'http://127.0.0.1:5173/chat') {
     ipcMain,
     services: dependencies,
     getMainWindow: () => mainWindow,
-    rendererTarget: { kind: 'development', origin: 'http://127.0.0.1:5173' },
+    rendererTarget,
   })
   const event = { sender: webContents, senderFrame: mainFrame }
   return {
     dependencies, handlers, removed, dispose,
+    setSenderUrl: (url: string) => { mainFrame.url = url },
     invoke: (channel: string, input?: unknown) => handlers.get(channel)!(event, input),
     invokeFrom: (url: string, channel: string, input?: unknown) => {
       const frame = { url }
@@ -73,6 +78,27 @@ describe('registerDesktopIpc', () => {
     await expect(app.invokeFrom('https://attacker.invalid/', ipcChannels.settingsGet))
       .rejects.toMatchObject({ code: 'UNTRUSTED_SENDER' })
     expect(app.dependencies.settings.get).not.toHaveBeenCalled()
+  })
+
+  it('rejects a production file sender with an injected authority while allowing route hashes', async () => {
+    const filePath = '/app/renderer/index.html'
+    const trusted = pathToFileURL(filePath).href
+    const app = harness(trusted, { kind: 'production', filePath })
+
+    app.setSenderUrl(`${trusted}#/settings`)
+    await expect(app.invoke(ipcChannels.chatListConversations)).resolves.toEqual([])
+
+    for (const url of [
+      `file://attacker${new URL(trusted).pathname}`,
+      `file://user:secret@attacker${new URL(trusted).pathname}`,
+      `file://%61ttacker${new URL(trusted).pathname}`,
+      `file:\\attacker${new URL(trusted).pathname}`,
+      `${trusted}?host=attacker`,
+    ]) {
+      app.setSenderUrl(url)
+      await expect(app.invoke(ipcChannels.chatListConversations))
+        .rejects.toMatchObject({ code: 'UNTRUSTED_SENDER' })
+    }
   })
 
   it('rejects subframes and a different webContents identity', async () => {

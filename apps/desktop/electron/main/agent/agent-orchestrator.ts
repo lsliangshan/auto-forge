@@ -362,6 +362,10 @@ export class AgentOrchestrator {
     return true
   }
 
+  hasActiveRuns(): boolean {
+    return this.activeByRequest.size > 0
+  }
+
   private async driveExclusive(active: ActiveAgentRun): Promise<AgentRunResult> {
     if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
     active.busy = true

@@ -481,6 +481,7 @@ describe('BrowserCapabilityService', () => {
     await browser.open(approvedContext, fixtureOrigin)
     await browser.open(second, fixtureOrigin)
 
+    expect(browser.hasActiveContexts()).toBe(true)
     expect(browser.activeContexts(approvedContext.executionId)).toBe(1)
     expect(browser.activeContexts(second.executionId)).toBe(1)
     await browser.closeExecution(approvedContext.executionId)
@@ -489,6 +490,7 @@ describe('BrowserCapabilityService', () => {
     expect(browser.activeContexts(second.executionId)).toBe(1)
     await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
     await browser.closeExecution(second.executionId)
+    expect(browser.hasActiveContexts()).toBe(false)
   })
 
   it('implements the Task 6 capability port and rejects a caller scope that differs from the page origin', async () => {

@@ -64,6 +64,33 @@ function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
 }
 
+export class MaintenanceGate {
+  private maintenance = false
+  private starts = 0
+
+  beginStart(): () => void {
+    if (this.maintenance) throw failure('CONFLICT')
+    this.starts += 1
+    let active = true
+    return () => {
+      if (!active) return
+      active = false
+      this.starts -= 1
+    }
+  }
+
+  clearLocalData(hasActiveWork: () => boolean, clear: () => void): void {
+    if (this.maintenance) throw failure('CONFLICT')
+    this.maintenance = true
+    try {
+      if (this.starts > 0 || hasActiveWork()) throw failure('CONFLICT')
+      clear()
+    } finally {
+      this.maintenance = false
+    }
+  }
+}
+
 function iso(timestamp: number | undefined): string | undefined {
   return timestamp === undefined ? undefined : new Date(timestamp).toISOString()
 }
@@ -150,6 +177,7 @@ function executionSummary(execution: Execution): ExecutionSummary {
 
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
+  const maintenance = new MaintenanceGate()
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -280,16 +308,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         database.conversations.delete(conversationId)
       },
       send: async (input) => {
-        if (!database.conversations.get(input.conversationId)) throw failure('NOT_FOUND')
-        const requestId = randomUUID()
-        activeRequests.add(requestId)
-        void agent.run({
-          conversationId: input.conversationId,
-          content: input.content,
-          model: input.model ?? settings.get().defaultModel,
-          requestId,
-        }).catch(() => activeRequests.delete(requestId))
-        return { requestId }
+        const releaseStart = maintenance.beginStart()
+        try {
+          if (!database.conversations.get(input.conversationId)) throw failure('NOT_FOUND')
+          const requestId = randomUUID()
+          activeRequests.add(requestId)
+          void agent.run({
+            conversationId: input.conversationId,
+            content: input.content,
+            model: input.model ?? settings.get().defaultModel,
+            requestId,
+          }).catch(() => activeRequests.delete(requestId))
+          return { requestId }
+        } finally {
+          releaseStart()
+        }
       },
       cancel: (requestId) => agent.cancel(requestId),
     },
@@ -335,11 +368,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       writeFile: (projectId, relativePath, content) => projects.write(projectId, relativePath, content),
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {
-        const built = await projects.build(projectId)
-        const manifest = built.manifest as WorkflowManifest
-        const started = await executions.start({ workflowId: manifest.id, workflowVersion: manifest.version, input })
-        void started.finished.catch(() => undefined)
-        return { executionId: started.id }
+        const releaseStart = maintenance.beginStart()
+        try {
+          const built = await projects.build(projectId)
+          const manifest = built.manifest as WorkflowManifest
+          const started = await executions.start({ workflowId: manifest.id, workflowVersion: manifest.version, input })
+          void started.finished.catch(() => undefined)
+          return { executionId: started.id }
+        } finally {
+          releaseStart()
+        }
       },
     },
     executions: {
@@ -407,7 +445,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       clearOpenRouterKey: async () => { secretStore.delete('openrouter_api_key') },
       validateOpenRouterKey: credentialStatus,
       listModels: () => provider.listModels(),
-      clearLocalData: async (scope) => { database.clearLocalData(scope) },
+      clearLocalData: async (scope) => {
+        maintenance.clearLocalData(
+          () => activeRequests.size > 0
+            || activeExecutions.size > 0
+            || agent.hasActiveRuns()
+            || executions.hasActiveExecutions()
+            || browser.hasActiveContexts(),
+          () => database.clearLocalData(scope),
+        )
+      },
     },
     system: {
       openExternal: async (url) => {

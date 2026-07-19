@@ -7,7 +7,9 @@ import {
   type DesktopAPI,
 } from '@autoforge/shared'
 import type { z } from 'zod'
-import { pathToFileURL } from 'node:url'
+import { isTrustedRendererUrl, type RendererTarget } from '../renderer-trust.js'
+
+export type { RendererTarget } from '../renderer-trust.js'
 
 export interface IpcMainPort {
   handle(channel: string, handler: (event: IpcInvokeEvent, input?: unknown) => Promise<unknown>): void
@@ -27,10 +29,6 @@ export interface IpcInvokeEvent {
   sender: WebContentsPort
   senderFrame: WebFramePort | null
 }
-
-export type RendererTarget =
-  | { kind: 'development'; origin: string }
-  | { kind: 'production'; filePath: string }
 
 export interface DesktopIpcServices {
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
@@ -65,36 +63,6 @@ function fail(code: AppError['code']): never {
   throw new SafeIpcError(toSafeAppError({ code }))
 }
 
-function normalizeDevelopmentOrigin(origin: string): string {
-  const parsed = new URL(origin)
-  if (!['http:', 'https:'].includes(parsed.protocol)
-    || !['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
-    || parsed.username !== ''
-    || parsed.password !== ''
-    || parsed.pathname !== '/'
-    || parsed.search !== ''
-    || parsed.hash !== ''
-    || parsed.origin !== origin) {
-    throw new Error('Invalid trusted development renderer origin')
-  }
-  return parsed.origin
-}
-
-function isTrustedFrameUrl(url: string, target: RendererTarget): boolean {
-  try {
-    const parsed = new URL(url)
-    if (target.kind === 'development') return parsed.origin === normalizeDevelopmentOrigin(target.origin)
-    const expected = pathToFileURL(target.filePath)
-    return parsed.protocol === 'file:'
-      && parsed.pathname === expected.pathname
-      && parsed.search === ''
-      && parsed.username === ''
-      && parsed.password === ''
-  } catch {
-    return false
-  }
-}
-
 function assertTrustedSender(event: IpcInvokeEvent, options: RegisterDesktopIpcOptions): void {
   const window = options.getMainWindow()
   if (!window
@@ -103,7 +71,7 @@ function assertTrustedSender(event: IpcInvokeEvent, options: RegisterDesktopIpcO
     || event.sender !== window.webContents
     || !event.senderFrame
     || event.senderFrame !== window.webContents.mainFrame
-    || !isTrustedFrameUrl(event.senderFrame.url, options.rendererTarget)) {
+    || !isTrustedRendererUrl(event.senderFrame.url, options.rendererTarget)) {
     fail('UNTRUSTED_SENDER')
   }
 }
