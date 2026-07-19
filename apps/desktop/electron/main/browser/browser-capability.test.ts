@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http'
-import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -59,6 +59,45 @@ class CapturedProfileDirectories implements BrowserProfileDirectories {
   }
 }
 
+function deferred<T = void>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((complete) => { resolve = complete })
+  return { promise, resolve }
+}
+
+function fakeLauncher(options: { close?: () => Promise<void> } = {}) {
+  let currentUrl = 'about:blank'
+  let contextCloseListener: (() => void) | undefined
+  const page = {
+    goto: async (url: string) => { currentUrl = url },
+    url: () => currentUrl,
+    isClosed: () => false,
+    once: () => undefined,
+    on: () => undefined,
+    mainFrame: () => ({ url: () => currentUrl }),
+  }
+  const context = {
+    pages: () => [page],
+    newPage: async () => page,
+    on: () => undefined,
+    once: (event: string, listener: () => void) => {
+      if (event === 'close') contextCloseListener = listener
+    },
+    route: async () => undefined,
+    close: async () => {
+      await options.close?.()
+      contextCloseListener?.()
+    },
+  }
+  return {
+    executablePath: () => process.execPath,
+    launchPersistentContext: async () => context as never,
+  }
+}
+
 async function listen(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once('error', reject)
@@ -77,15 +116,34 @@ async function closeServer(server: Server): Promise<void> {
 describe('BrowserCapabilityService', () => {
   let fixtureServer: Server
   let fixtureOrigin: string
+  let outsideServer: Server
+  let outsideOrigin: string
+  let outsideRequests: number
   let testRoot: string
   let profiles: CapturedProfileDirectories
   let authorization: LoopbackAuthorization
   let browser: BrowserCapabilityService
 
   beforeEach(async () => {
+    outsideRequests = 0
+    outsideServer = createServer((_request, response) => {
+      outsideRequests += 1
+      response.end('outside')
+    })
+    outsideOrigin = `http://127.0.0.1:${await listen(outsideServer)}`
     fixtureServer = createServer((request, response) => {
       if (request.url === '/redirect-outside') {
-        response.writeHead(302, { location: `http://localhost:${new URL(fixtureOrigin).port}/` })
+        response.writeHead(302, { location: `${outsideOrigin}/redirect-target` })
+        response.end()
+        return
+      }
+      if (request.url === '/redirect-same-origin') {
+        response.writeHead(302, { location: `${fixtureOrigin}/redirect-outside` })
+        response.end()
+        return
+      }
+      if (request.url === '/redirect-final') {
+        response.writeHead(302, { location: `${fixtureOrigin}/final-page` })
         response.end()
         return
       }
@@ -93,6 +151,10 @@ describe('BrowserCapabilityService', () => {
       response.end(`<!doctype html>
         <label>Keyword <input id="keyword" /></label>
         <button id="submit" onclick="history.pushState({}, '', '/result?q=' + encodeURIComponent(document.querySelector('#keyword').value))">Submit</button>
+        <button id="popup" onclick="window.open('${outsideOrigin}/popup')">Popup</button>
+        <button id="popup-inside" onclick="window.open('${fixtureOrigin}/popup-inside')">Popup inside</button>
+        <button id="delayed" onclick="setTimeout(() => { location.href = '${outsideOrigin}/delayed' }, 30)">Delayed</button>
+        <button id="delayed-history" onclick="setTimeout(() => { history.pushState({}, '', '/late-history') }, 30)">Delayed history</button>
         <button class="duplicate">One</button><button class="duplicate">Two</button>`)
     })
     const port = await listen(fixtureServer)
@@ -110,6 +172,7 @@ describe('BrowserCapabilityService', () => {
   afterEach(async () => {
     await browser.closeExecution(approvedContext.executionId)
     await closeServer(fixtureServer)
+    await closeServer(outsideServer)
     await rm(testRoot, { recursive: true, force: true })
   })
 
@@ -127,17 +190,12 @@ describe('BrowserCapabilityService', () => {
     expect(await browser.url(approvedContext)).toBe(`${fixtureOrigin}/result?q=AutoForge`)
     await expect(browser.click(approvedContext, 'css=.duplicate')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     await expect(browser.click(approvedContext, 'text=Submit')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
-    expect(authorization.calls.map(({ capability }) => capability)).toEqual([
-      'browser.open',
-      'browser.open',
-      'browser.fill',
-      'browser.fill',
-      'browser.click',
-      'browser.click',
-      'browser.url',
-      'browser.click',
-      'browser.click',
-    ])
+    expect(new Set(authorization.calls.map(({ capability }) => capability))).toEqual(new Set([
+      'browser.open', 'browser.fill', 'browser.click', 'browser.url',
+    ]))
+    expect(authorization.calls.every(({ scope }) => (
+      'origins' in scope && scope.origins[0] === fixtureOrigin
+    ))).toBe(true)
   })
 
   it('rejects a redirect whose final page has an ungranted origin and removes its profile', async () => {
@@ -145,6 +203,63 @@ describe('BrowserCapabilityService', () => {
       .rejects.toMatchObject(denied())
 
     expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
+    expect(outsideRequests).toBe(0)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('blocks an unauthorized popup before its main-frame request is sent and cleans the execution', async () => {
+    await browser.open(approvedContext, fixtureOrigin)
+
+    await expect(browser.click(approvedContext, 'role=button[name="Popup"]'))
+      .rejects.toMatchObject(denied())
+
+    expect(outsideRequests).toBe(0)
+    expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('guards every hop before an allowed same-origin redirect can reach an unauthorized origin', async () => {
+    await expect(browser.open(approvedContext, `${fixtureOrigin}/redirect-same-origin`))
+      .rejects.toMatchObject(denied())
+
+    expect(outsideRequests).toBe(0)
+    expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
+  })
+
+  it('allows an operation-scoped same-origin popup while retaining execution ownership', async () => {
+    await browser.open(approvedContext, fixtureOrigin)
+
+    await browser.click(approvedContext, 'role=button[name="Popup inside"]')
+
+    expect(outsideRequests).toBe(0)
+    expect(browser.activeContexts(approvedContext.executionId)).toBe(1)
+  })
+
+  it('preserves the final URL after safely resolving an allowed same-origin redirect', async () => {
+    await browser.open(approvedContext, `${fixtureOrigin}/redirect-final`)
+
+    expect(await browser.url(approvedContext)).toBe(`${fixtureOrigin}/final-page`)
+    expect(browser.activeContexts(approvedContext.executionId)).toBe(1)
+  })
+
+  it('blocks delayed main-frame navigation outside an active operation and cleans the execution', async () => {
+    await browser.open(approvedContext, fixtureOrigin)
+    await browser.click(approvedContext, 'role=button[name="Delayed"]')
+
+    await expect.poll(() => browser.activeContexts(approvedContext.executionId), { timeout: 2_000 })
+      .toBe(0)
+    expect(outsideRequests).toBe(0)
+    await browser.closeExecution(approvedContext.executionId)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('closes the execution for delayed script-only navigation outside an active operation', async () => {
+    await browser.open(approvedContext, fixtureOrigin)
+    await browser.click(approvedContext, 'role=button[name="Delayed history"]')
+
+    await expect.poll(() => browser.activeContexts(approvedContext.executionId), { timeout: 2_000 })
+      .toBe(0)
+    await browser.closeExecution(approvedContext.executionId)
     await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -204,6 +319,92 @@ describe('production browser authorization', () => {
   })
 })
 
+describe('browser execution lifecycle', () => {
+  it('registers an in-flight open before authorization so concurrent close prevents a late launch', async () => {
+    const authorizationStarted = deferred()
+    const releaseAuthorization = deferred()
+    let launches = 0
+    const launcher = {
+      executablePath: () => process.execPath,
+      launchPersistentContext: async () => {
+        launches += 1
+        throw new Error('late launch')
+      },
+    }
+    const service = new BrowserCapabilityService({
+      authorization: {
+        authorize: async () => {
+          authorizationStarted.resolve()
+          await releaseAuthorization.promise
+        },
+      },
+      launcher,
+    })
+
+    const opening = service.open(approvedContext, 'https://example.com')
+    await authorizationStarted.promise
+    const closing = service.closeExecution(approvedContext.executionId)
+    releaseAuthorization.resolve()
+
+    await expect(opening).rejects.toMatchObject({ code: 'CANCELLED' })
+    await expect(closing).resolves.toBeUndefined()
+    expect(launches).toBe(0)
+    expect(service.activeContexts(approvedContext.executionId)).toBe(0)
+  })
+
+  it('retries a transient profile deletion before releasing cleanup ownership', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-cleanup-test-'))
+    let removalAttempts = 0
+    const profiles = new CapturedProfileDirectories(root)
+    const service = new BrowserCapabilityService({
+      authorization: { authorize: () => undefined },
+      launcher: fakeLauncher(),
+      profileDirectories: {
+        create: () => profiles.create(),
+        remove: async (path) => {
+          removalAttempts += 1
+          if (removalAttempts === 1) throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+          await profiles.remove(path)
+        },
+      },
+    })
+    await service.open(approvedContext, 'https://example.com')
+
+    await expect(service.closeExecution(approvedContext.executionId)).resolves.toBeUndefined()
+
+    expect(removalAttempts).toBe(2)
+    expect(service.activeContexts(approvedContext.executionId)).toBe(0)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('keeps failed context cleanup retryable until a later close succeeds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-cleanup-test-'))
+    const profiles = new CapturedProfileDirectories(root)
+    let closeAttempts = 0
+    const service = new BrowserCapabilityService({
+      authorization: { authorize: () => undefined },
+      launcher: fakeLauncher({
+        close: async () => {
+          closeAttempts += 1
+          if (closeAttempts === 1) throw new Error('context busy')
+        },
+      }),
+      profileDirectories: profiles,
+    })
+    await service.open(approvedContext, 'https://example.com')
+
+    await expect(service.closeExecution(approvedContext.executionId)).rejects.toThrow('context busy')
+    expect(service.activeContexts(approvedContext.executionId)).toBe(1)
+    await expect(service.closeExecution(approvedContext.executionId)).resolves.toBeUndefined()
+
+    expect(closeAttempts).toBe(2)
+    expect(service.activeContexts(approvedContext.executionId)).toBe(0)
+    await expect(stat(profiles.created[0]!)).rejects.toMatchObject({ code: 'ENOENT' })
+    await rm(root, { recursive: true, force: true })
+  })
+})
+
 describe('packaged Chromium runtime resolution', () => {
   it('resolves an existing manifest-relative executable under resourcesPath', async () => {
     const resourcesPath = await mkdtemp(join(tmpdir(), 'autoforge-runtime-test-'))
@@ -249,12 +450,15 @@ describe('packaged Chromium runtime resolution', () => {
       url: () => currentUrl,
       isClosed: () => false,
       once: () => undefined,
+      on: () => undefined,
+      mainFrame: () => ({ url: () => currentUrl }),
     }
     const context = {
       pages: () => [page],
       newPage: async () => page,
       on: () => undefined,
       once: () => undefined,
+      route: async () => undefined,
       close: async () => undefined,
     }
     const service = new BrowserCapabilityService({
@@ -274,6 +478,7 @@ describe('packaged Chromium runtime resolution', () => {
     expect(launchOptions).toEqual({
       headless: false,
       executablePath: await import('node:fs/promises').then(({ realpath }) => realpath(executablePath)),
+      serviceWorkers: 'block',
     })
     await service.closeExecution(approvedContext.executionId)
     await rm(resourcesPath, { recursive: true, force: true })
@@ -304,8 +509,32 @@ describe('browser runtime staging', () => {
     await expect(readFile(join(resourcesDirectory, result.executablePath), 'utf8')).resolves.toBe('browser')
     expect((await lstat(join(resourcesDirectory, 'ms-playwright', 'chromium-1228', 'chrome-linux', 'chrome-link')))
       .isSymbolicLink()).toBe(true)
+    await expect(readlink(join(
+      resourcesDirectory,
+      'ms-playwright',
+      'chromium-1228',
+      'chrome-linux',
+      'chrome-link',
+    ))).resolves.toBe('chrome')
     await expect(readFile(join(resourcesDirectory, 'browser-runtime.json'), 'utf8'))
       .resolves.toBe(`${JSON.stringify(result, null, 2)}\n`)
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('rejects a staged symlink whose target escapes the Chromium archive', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-stage-test-'))
+    const archive = join(root, 'cache', 'chromium-1228')
+    const executablePath = join(archive, 'chrome-linux', 'chrome')
+    await mkdir(join(archive, 'chrome-linux'), { recursive: true })
+    await writeFile(executablePath, 'browser')
+    await writeFile(join(root, 'cache', 'outside'), 'outside')
+    await symlink('../../outside', join(archive, 'chrome-linux', 'escape'))
+
+    await expect(stageBrowser({
+      executablePath,
+      resourcesDirectory: join(root, 'resources'),
+    })).rejects.toThrow('outside the staged Chromium archive')
+
     await rm(root, { recursive: true, force: true })
   })
 })

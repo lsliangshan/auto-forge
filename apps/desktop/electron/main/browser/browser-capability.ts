@@ -1,7 +1,15 @@
 import { lstat, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { chromium, type BrowserContext, type Locator, type Page } from 'playwright-chromium'
+import {
+  chromium,
+  type BrowserContext,
+  type Frame,
+  type Locator,
+  type Page,
+  type Request,
+  type Route,
+} from 'playwright-chromium'
 import {
   toSafeAppError,
   type AppError,
@@ -39,7 +47,7 @@ interface BrowserLauncher {
   executablePath(): string
   launchPersistentContext(
     userDataDirectory: string,
-    options: { headless: boolean; executablePath: string },
+    options: { headless: boolean; executablePath: string; serviceWorkers: 'block' },
   ): Promise<BrowserContext>
 }
 
@@ -67,6 +75,29 @@ interface OwnedBrowser {
   primaryPage: Page
   pages: Set<Page>
   profilePath: string
+  contextOpen: boolean
+  pendingGuards: Set<Promise<void>>
+  routedFrames: WeakSet<Frame>
+  redirectedUrls: Map<string, string>
+}
+
+interface ActiveBrowserOperation {
+  context: BrowserCapabilityContext
+  capability: BrowserCapability
+  declaredScope?: CapabilityScope
+}
+
+interface ExecutionBrowserState {
+  executionId: string
+  owner?: OwnedBrowser
+  profilePath?: string
+  creation?: Promise<OwnedBrowser>
+  operation?: ActiveBrowserOperation
+  violation?: AppError
+  closing: boolean
+  activeOperations: number
+  idleWaiters: Set<() => void>
+  closePromise?: Promise<void>
 }
 
 const roles = new Set([
@@ -282,14 +313,43 @@ async function uniqueLocator(page: Page, request: string): Promise<Locator> {
   return locator
 }
 
+interface NavigationResponse {
+  status: number
+  headers: Record<string, string>
+  body: Buffer
+}
+
+async function fetchNavigationWithoutRedirect(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  postData: Buffer | null,
+): Promise<NavigationResponse> {
+  const body = postData
+    ? postData.buffer.slice(postData.byteOffset, postData.byteOffset + postData.byteLength) as ArrayBuffer
+    : undefined
+  const response = await fetch(url, {
+    method,
+    headers,
+    redirect: 'manual',
+    ...(!['GET', 'HEAD'].includes(method) && body
+      ? { body }
+      : {}),
+  })
+  return {
+    status: response.status,
+    headers: Object.fromEntries(response.headers.entries()),
+    body: Buffer.from(await response.arrayBuffer()),
+  }
+}
+
 export class BrowserCapabilityService implements CapabilityPort {
   private readonly authorization: BrowserAuthorizationPort
   private readonly headless: boolean
   private readonly launcher: BrowserLauncher
   private readonly profiles: BrowserProfileDirectories
   private readonly runtime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
-  private readonly owners = new Map<string, OwnedBrowser>()
-  private readonly creating = new Map<string, Promise<OwnedBrowser>>()
+  private readonly executions = new Map<string, ExecutionBrowserState>()
   private readonly pageOwners = new WeakMap<Page, string>()
 
   constructor(options: BrowserCapabilityServiceOptions) {
@@ -301,13 +361,18 @@ export class BrowserCapabilityService implements CapabilityPort {
     }
     this.profiles = options.profileDirectories ?? {
       create: () => mkdtemp(join(tmpdir(), 'autoforge-browser-')),
-      remove: (path) => rm(path, { recursive: true, force: true }),
+      remove: (path) => rm(path, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 100,
+      }),
     }
     this.runtime = options.runtime ?? { packaged: false }
   }
 
   activeContexts(executionId: string): number {
-    return this.owners.has(executionId) ? 1 : 0
+    return this.executions.get(executionId)?.owner?.contextOpen ? 1 : 0
   }
 
   async request(context: BrowserCapabilityContext, request: WorkerCapabilityRequest): Promise<unknown> {
@@ -326,20 +391,18 @@ export class BrowserCapabilityService implements CapabilityPort {
   }
 
   async open(context: BrowserCapabilityContext, url: string, declaredScope?: CapabilityScope): Promise<void> {
-    const requestedOrigin = originOf(url)
-    if (declaredScope) assertExactScope(declaredScope, requestedOrigin)
-    await this.authorize(context, 'browser.open', requestedOrigin)
-    let owner: OwnedBrowser | undefined
-    try {
-      owner = await this.ensureOwner(context.executionId)
+    return this.executeCapability(context, 'browser.open', declaredScope, true, true, async (state) => {
+      const requestedOrigin = originOf(url)
+      await this.authorizeOperation({ context, capability: 'browser.open', declaredScope }, requestedOrigin)
+      this.assertAvailable(state)
+      const owner = await this.ensureOwner(state)
+      this.assertAvailable(state)
       await owner.primaryPage.goto(url)
-      const finalOrigin = originOf(owner.primaryPage.url())
-      if (declaredScope) assertExactScope(declaredScope, finalOrigin)
-      await this.authorize(context, 'browser.open', finalOrigin)
-    } catch (error) {
-      if (owner) await this.closeExecution(context.executionId)
-      throw error
-    }
+      await this.authorizeOperation(
+        { context, capability: 'browser.open', declaredScope },
+        originOf(owner.primaryPage.url()),
+      )
+    })
   }
 
   async fill(
@@ -348,14 +411,18 @@ export class BrowserCapabilityService implements CapabilityPort {
     value: string,
     declaredScope?: CapabilityScope,
   ): Promise<void> {
-    const owner = this.owner(context.executionId)
-    const origin = originOf(owner.primaryPage.url())
-    if (declaredScope) assertExactScope(declaredScope, origin)
-    await this.authorize(context, 'browser.fill', origin)
-    await (await uniqueLocator(owner.primaryPage, locator)).fill(value)
-    const finalOrigin = originOf(owner.primaryPage.url())
-    if (declaredScope) assertExactScope(declaredScope, finalOrigin)
-    await this.authorize(context, 'browser.fill', finalOrigin)
+    return this.executeCapability(context, 'browser.fill', declaredScope, false, false, async (state) => {
+      const owner = this.owner(state)
+      await this.authorizeOperation(
+        { context, capability: 'browser.fill', declaredScope },
+        originOf(owner.primaryPage.url()),
+      )
+      await (await uniqueLocator(owner.primaryPage, locator)).fill(value)
+      await this.authorizeOperation(
+        { context, capability: 'browser.fill', declaredScope },
+        originOf(owner.primaryPage.url()),
+      )
+    })
   }
 
   async click(
@@ -363,55 +430,59 @@ export class BrowserCapabilityService implements CapabilityPort {
     locator: string,
     declaredScope?: CapabilityScope,
   ): Promise<void> {
-    const owner = this.owner(context.executionId)
-    const origin = originOf(owner.primaryPage.url())
-    if (declaredScope) assertExactScope(declaredScope, origin)
-    await this.authorize(context, 'browser.click', origin)
-    await (await uniqueLocator(owner.primaryPage, locator)).click()
-    const finalOrigin = originOf(owner.primaryPage.url())
-    if (declaredScope) assertExactScope(declaredScope, finalOrigin)
-    await this.authorize(context, 'browser.click', finalOrigin)
+    return this.executeCapability(context, 'browser.click', declaredScope, false, false, async (state) => {
+      const owner = this.owner(state)
+      await this.authorizeOperation(
+        { context, capability: 'browser.click', declaredScope },
+        originOf(owner.primaryPage.url()),
+      )
+      await (await uniqueLocator(owner.primaryPage, locator)).click()
+      await this.authorizeOperation(
+        { context, capability: 'browser.click', declaredScope },
+        originOf(owner.primaryPage.url()),
+      )
+    })
   }
 
   async url(context: BrowserCapabilityContext, declaredScope?: CapabilityScope): Promise<string> {
-    const owner = this.owner(context.executionId)
-    const url = owner.primaryPage.url()
-    const origin = originOf(url)
-    if (declaredScope) assertExactScope(declaredScope, origin)
-    await this.authorize(context, 'browser.url', origin)
-    return url
+    return this.executeCapability(context, 'browser.url', declaredScope, false, false, async (state) => {
+      const url = this.owner(state).primaryPage.url()
+      await this.authorizeOperation(
+        { context, capability: 'browser.url', declaredScope },
+        originOf(url),
+      )
+      return url
+    })
   }
 
   async close(context: BrowserCapabilityContext, declaredScope?: CapabilityScope): Promise<void> {
-    const owner = this.owner(context.executionId)
-    const origin = originOf(owner.primaryPage.url())
-    if (declaredScope) assertExactScope(declaredScope, origin)
-    await this.authorize(context, 'browser.close', origin)
+    await this.executeCapability(context, 'browser.close', declaredScope, false, false, async (state) => {
+      await this.authorizeOperation(
+        { context, capability: 'browser.close', declaredScope },
+        originOf(this.owner(state).primaryPage.url()),
+      )
+    })
     await this.closeExecution(context.executionId)
   }
 
   async closeExecution(executionId: string): Promise<void> {
-    const pending = this.creating.get(executionId)
-    if (pending) {
-      try {
-        await pending
-      } catch {
-        return
-      }
-    }
-    const owner = this.owners.get(executionId)
-    if (!owner) return
-    this.owners.delete(executionId)
+    const state = this.executions.get(executionId)
+    if (!state) return
+    state.closing = true
+    if (state.closePromise) return state.closePromise
+    const closePromise = this.cleanupExecution(state)
+    state.closePromise = closePromise
     try {
-      await owner.context.close()
-    } finally {
-      await this.profiles.remove(owner.profilePath)
+      await closePromise
+    } catch (error) {
+      if (state.closePromise === closePromise) state.closePromise = undefined
+      throw error
     }
   }
 
-  private owner(executionId: string): OwnedBrowser {
-    const owner = this.owners.get(executionId)
-    if (!owner || owner.primaryPage.isClosed()) throw failure('NOT_FOUND')
+  private owner(state: ExecutionBrowserState): OwnedBrowser {
+    const owner = state.owner
+    if (!owner?.contextOpen || owner.primaryPage.isClosed()) throw failure('NOT_FOUND')
     return owner
   }
 
@@ -423,48 +494,315 @@ export class BrowserCapabilityService implements CapabilityPort {
     return Promise.resolve(this.authorization.authorize(context, { capability, scope: browserScope(origin) }))
   }
 
-  private ensureOwner(executionId: string): Promise<OwnedBrowser> {
-    const owner = this.owners.get(executionId)
+  private ensureOwner(state: ExecutionBrowserState): Promise<OwnedBrowser> {
+    const owner = state.owner
     if (owner) return Promise.resolve(owner)
-    const pending = this.creating.get(executionId)
+    const pending = state.creation
     if (pending) return pending
-    const creation = this.createOwner(executionId)
-    this.creating.set(executionId, creation)
-    void creation.finally(() => this.creating.delete(executionId)).catch(() => undefined)
+    const creation = this.createOwner(state)
+    state.creation = creation
+    void creation.finally(() => {
+      if (state.creation === creation) state.creation = undefined
+    }).catch(() => undefined)
     return creation
   }
 
-  private async createOwner(executionId: string): Promise<OwnedBrowser> {
+  private async createOwner(state: ExecutionBrowserState): Promise<OwnedBrowser> {
     const executablePath = await resolveBrowserExecutablePath(this.runtime.packaged
       ? this.runtime
       : { ...this.runtime, developmentExecutablePath: this.launcher.executablePath() })
     const profilePath = await this.profiles.create()
-    let context: BrowserContext | undefined
+    state.profilePath = profilePath
+    let context: BrowserContext
     try {
       context = await this.launcher.launchPersistentContext(profilePath, {
         headless: this.headless,
         executablePath,
+        serviceWorkers: 'block',
       })
-      const primaryPage = context.pages()[0] ?? await context.newPage()
-      const owner: OwnedBrowser = { context, primaryPage, pages: new Set(), profilePath }
-      const associate = (page: Page) => {
-        owner.pages.add(page)
-        this.pageOwners.set(page, executionId)
-        page.once('close', () => owner.pages.delete(page))
-      }
-      for (const page of context.pages()) associate(page)
-      context.on('page', associate)
-      context.once('close', () => {
-        if (this.owners.get(executionId) !== owner) return
-        this.owners.delete(executionId)
-        void this.profiles.remove(profilePath).catch(() => undefined)
-      })
-      this.owners.set(executionId, owner)
-      return owner
     } catch (error) {
-      if (context) await context.close().catch(() => undefined)
-      await this.profiles.remove(profilePath).catch(() => undefined)
+      try {
+        await this.removeProfile(profilePath)
+        state.profilePath = undefined
+      } catch {
+        // Keep the profile path in execution state so closeExecution can retry cleanup.
+      }
       throw error
     }
+
+    const primaryPage = context.pages()[0] ?? await context.newPage()
+    const owner: OwnedBrowser = {
+      context,
+      primaryPage,
+      pages: new Set(),
+      profilePath,
+      contextOpen: true,
+      pendingGuards: new Set(),
+      routedFrames: new WeakSet(),
+      redirectedUrls: new Map(),
+    }
+    state.owner = owner
+    const associate = (page: Page) => this.associatePage(state, owner, page)
+    for (const page of context.pages()) associate(page)
+    context.on('page', associate)
+    context.once('close', () => { owner.contextOpen = false })
+    await context.route('**/*', (route, request) => this.trackGuard(
+      owner,
+      this.guardMainFrameRequest(state, owner, route, request),
+    ))
+    return owner
+  }
+
+  private beginOperation(executionId: string, create: boolean): ExecutionBrowserState {
+    let state = this.executions.get(executionId)
+    if (!state) {
+      if (!create) throw failure('NOT_FOUND')
+      state = {
+        executionId,
+        closing: false,
+        activeOperations: 0,
+        idleWaiters: new Set(),
+      }
+      this.executions.set(executionId, state)
+    }
+    this.assertAvailable(state)
+    if (state.operation) throw failure('CONFLICT')
+    state.activeOperations += 1
+    return state
+  }
+
+  private endOperation(state: ExecutionBrowserState): void {
+    state.activeOperations -= 1
+    if (state.activeOperations === 0) {
+      for (const resolveIdle of state.idleWaiters) resolveIdle()
+      state.idleWaiters.clear()
+      if (!state.closing && !state.owner && !state.profilePath && !state.creation) {
+        this.executions.delete(state.executionId)
+      }
+    }
+  }
+
+  private async executeCapability<T>(
+    context: BrowserCapabilityContext,
+    capability: BrowserCapability,
+    declaredScope: CapabilityScope | undefined,
+    create: boolean,
+    closeOnFailure: boolean,
+    action: (state: ExecutionBrowserState) => Promise<T>,
+  ): Promise<T> {
+    const state = this.beginOperation(context.executionId, create)
+    const operation: ActiveBrowserOperation = { context, capability, ...(declaredScope ? { declaredScope } : {}) }
+    state.operation = operation
+    state.violation = undefined
+    let result!: T
+    let problem: unknown
+    let failed = false
+    try {
+      result = await action(state)
+      await this.drainGuards(state.owner)
+      await this.applyRedirectedUrls(state.owner)
+      await this.drainGuards(state.owner)
+      if (state.violation) throw state.violation
+      this.assertAvailable(state)
+    } catch (error) {
+      failed = true
+      problem = state.violation ?? error
+    } finally {
+      if (state.operation === operation) state.operation = undefined
+      this.endOperation(state)
+    }
+
+    if (failed && (closeOnFailure || state.closing || state.violation)) {
+      try {
+        await this.closeExecution(state.executionId)
+      } catch {
+        // Preserve the capability failure; retained cleanup state remains retryable.
+      }
+    }
+    if (failed) throw problem
+    return result
+  }
+
+  private assertAvailable(state: ExecutionBrowserState): void {
+    if (state.closing) throw failure('CANCELLED')
+  }
+
+  private authorizeOperation(operation: ActiveBrowserOperation, origin: string): Promise<void> {
+    if (operation.declaredScope) assertExactScope(operation.declaredScope, origin)
+    return this.authorize(operation.context, operation.capability, origin)
+  }
+
+  private associatePage(state: ExecutionBrowserState, owner: OwnedBrowser, page: Page): void {
+    owner.pages.add(page)
+    this.pageOwners.set(page, state.executionId)
+    page.once('close', () => owner.pages.delete(page))
+    page.on('framenavigated', (frame) => {
+      if (frame !== page.mainFrame() || frame.url() === 'about:blank') return
+      if (owner.routedFrames.delete(frame)) return
+      const operation = state.operation
+      void this.trackGuard(
+        owner,
+        this.guardFrameNavigation(state, operation, frame.url()),
+      ).catch(() => undefined)
+    })
+  }
+
+  private async guardMainFrameRequest(
+    state: ExecutionBrowserState,
+    owner: OwnedBrowser,
+    route: Route,
+    request: Request,
+  ): Promise<void> {
+    if (!request.isNavigationRequest()) {
+      await route.continue()
+      return
+    }
+    let frame: Frame | undefined
+    try {
+      frame = request.frame()
+      if (frame !== frame.page().mainFrame()) {
+        await route.continue()
+        return
+      }
+    } catch {
+      // Initial popup navigation has no Frame yet, but is necessarily its new page's main frame.
+    }
+    const operation = state.operation
+    if (!operation) {
+      await route.abort('blockedbyclient').catch(() => undefined)
+      this.recordNavigationViolation(state, failure('CAPABILITY_SCOPE_DENIED'))
+      return
+    }
+    try {
+      await this.authorizeOperation(operation, originOf(request.url()))
+    } catch (error) {
+      await route.abort('blockedbyclient').catch(() => undefined)
+      this.recordNavigationViolation(state, error)
+      return
+    }
+    let navigationResponse: NavigationResponse
+    let finalUrl: string
+    try {
+      ({ response: navigationResponse, finalUrl } = await this.fetchNavigationChain(operation, request))
+    } catch (error) {
+      if (toSafeAppError(error).code !== 'CAPABILITY_SCOPE_DENIED') throw error
+      await route.abort('blockedbyclient').catch(() => undefined)
+      this.recordNavigationViolation(state, error)
+      return
+    }
+    if (finalUrl !== request.url()) owner.redirectedUrls.set(request.url(), finalUrl)
+    if (frame) owner.routedFrames.add(frame)
+    await route.fulfill(navigationResponse)
+  }
+
+  private async guardFrameNavigation(
+    state: ExecutionBrowserState,
+    operation: ActiveBrowserOperation | undefined,
+    url: string,
+  ): Promise<void> {
+    if (!operation) {
+      this.recordNavigationViolation(state, failure('CAPABILITY_SCOPE_DENIED'))
+      return
+    }
+    try {
+      await this.authorizeOperation(operation, originOf(url))
+    } catch (error) {
+      this.recordNavigationViolation(state, error)
+    }
+  }
+
+  private recordNavigationViolation(state: ExecutionBrowserState, error: unknown): void {
+    state.violation ??= toSafeAppError(error)
+    state.closing = true
+    void this.closeExecution(state.executionId).catch(() => undefined)
+  }
+
+  private trackGuard(owner: OwnedBrowser, guard: Promise<void>): Promise<void> {
+    owner.pendingGuards.add(guard)
+    void guard.finally(() => owner.pendingGuards.delete(guard)).catch(() => undefined)
+    return guard
+  }
+
+  private async drainGuards(owner: OwnedBrowser | undefined): Promise<void> {
+    if (!owner) return
+    await new Promise<void>((resolveTurn) => setImmediate(resolveTurn))
+    while (owner.pendingGuards.size > 0) {
+      await Promise.allSettled([...owner.pendingGuards])
+    }
+  }
+
+  private async fetchNavigationChain(
+    operation: ActiveBrowserOperation,
+    request: Request,
+  ): Promise<{ response: NavigationResponse; finalUrl: string }> {
+    let url = request.url()
+    let method = request.method()
+    let postData = request.postDataBuffer()
+    const headers = await request.allHeaders()
+    for (const name of ['connection', 'content-length', 'host']) delete headers[name]
+
+    for (let redirectCount = 0; redirectCount <= 10; redirectCount += 1) {
+      const response = await fetchNavigationWithoutRedirect(url, method, headers, postData)
+      const location = response.headers.location
+      if (![301, 302, 303, 307, 308].includes(response.status) || !location) {
+        return { response, finalUrl: url }
+      }
+      if (redirectCount === 10) throw failure('INVALID_INPUT')
+      url = new URL(location, url).href
+      await this.authorizeOperation(operation, originOf(url))
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+        method = 'GET'
+        postData = null
+        delete headers['content-type']
+      }
+    }
+    throw failure('INVALID_INPUT')
+  }
+
+  private async applyRedirectedUrls(owner: OwnedBrowser | undefined): Promise<void> {
+    if (!owner || owner.redirectedUrls.size === 0) return
+    for (const page of owner.pages) {
+      const finalUrl = owner.redirectedUrls.get(page.url())
+      if (!finalUrl) continue
+      owner.redirectedUrls.delete(page.url())
+      await page.evaluate((url) => history.replaceState(null, '', url), finalUrl)
+    }
+  }
+
+  private waitForIdle(state: ExecutionBrowserState): Promise<void> {
+    if (state.activeOperations === 0) return Promise.resolve()
+    return new Promise((resolveIdle) => state.idleWaiters.add(resolveIdle))
+  }
+
+  private async cleanupExecution(state: ExecutionBrowserState): Promise<void> {
+    await this.waitForIdle(state)
+    const owner = state.owner
+    if (owner?.contextOpen) {
+      await owner.context.close()
+      owner.contextOpen = false
+    }
+    if (state.profilePath) {
+      await this.removeProfile(state.profilePath)
+      state.profilePath = undefined
+    }
+    owner?.pages.clear()
+    state.owner = undefined
+    if (this.executions.get(state.executionId) === state) this.executions.delete(state.executionId)
+  }
+
+  private async removeProfile(path: string): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await this.profiles.remove(path)
+        return
+      } catch (error) {
+        lastError = error
+        if (attempt < 2) {
+          await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 50 * (attempt + 1)))
+        }
+      }
+    }
+    throw lastError
   }
 }

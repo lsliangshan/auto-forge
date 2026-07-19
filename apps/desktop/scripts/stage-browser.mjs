@@ -1,5 +1,5 @@
-import { cp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, relative, resolve } from 'node:path'
+import { cp, lstat, mkdir, readdir, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { chromium } from 'playwright-chromium'
@@ -24,6 +24,36 @@ function portableRelativePath(from, to) {
   return value
 }
 
+function isWithin(root, candidate) {
+  const path = relative(root, candidate)
+  return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path))
+}
+
+async function validateStagedSymlinks(
+  archiveRoot,
+  directory = archiveRoot,
+  canonicalArchiveRoot,
+) {
+  const canonicalRoot = canonicalArchiveRoot ?? await realpath(archiveRoot)
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name)
+    const metadata = await lstat(path)
+    if (metadata.isSymbolicLink()) {
+      const target = await readlink(path)
+      const lexicalTarget = resolve(dirname(path), target)
+      if (isAbsolute(target) || !isWithin(archiveRoot, lexicalTarget)) {
+        throw new Error(`Symlink points outside the staged Chromium archive: ${path}`)
+      }
+      const canonicalTarget = await realpath(path)
+      if (!isWithin(canonicalRoot, canonicalTarget)) {
+        throw new Error(`Symlink resolves outside the staged Chromium archive: ${path}`)
+      }
+      continue
+    }
+    if (metadata.isDirectory()) await validateStagedSymlinks(archiveRoot, path, canonicalRoot)
+  }
+}
+
 export async function stageBrowser(options = {}) {
   const executablePath = options.executablePath ?? chromium.executablePath()
   const resourcesDirectory = resolve(options.resourcesDirectory
@@ -46,7 +76,8 @@ export async function stageBrowser(options = {}) {
   await mkdir(resourcesDirectory, { recursive: true })
   await rm(stagingRoot, { recursive: true, force: true })
   await mkdir(stagingRoot, { recursive: true })
-  await cp(sourceArchive, stagedArchive, { recursive: true })
+  await cp(sourceArchive, stagedArchive, { recursive: true, verbatimSymlinks: true })
+  await validateStagedSymlinks(stagedArchive)
 
   const stagedExecutable = join(stagedArchive, ...executableWithinArchive.split('/'))
   if (!(await stat(stagedExecutable)).isFile()) {
