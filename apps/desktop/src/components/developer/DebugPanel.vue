@@ -16,15 +16,15 @@
         <label v-for="field in objectFields" :key="field.name" class="debug-field">
           <span>{{ field.title }}<em v-if="field.required">必填</em></span>
           <select v-if="field.enumValues" :data-testid="`debug-field-${field.name}`" :required="field.required" @change="setPrimitive(field, ($event.target as HTMLSelectElement).value)">
-            <option value="">请选择</option><option v-for="value in field.enumValues" :key="String(value)" :value="String(value)">{{ value }}</option>
+            <option value="">请选择</option><option v-for="(value, index) in field.enumValues" :key="index" :value="String(index)">{{ enumLabel(value) }}</option>
           </select>
           <input v-else-if="field.kind === 'boolean'" :data-testid="`debug-field-${field.name}`" type="checkbox" :required="field.required" @change="setField(field.name, ($event.target as HTMLInputElement).checked)">
           <input v-else-if="field.kind === 'string'" :data-testid="`debug-field-${field.name}`" type="text" :required="field.required" @input="setField(field.name, ($event.target as HTMLInputElement).value)">
           <input v-else-if="field.kind === 'number' || field.kind === 'integer'" :data-testid="`debug-field-${field.name}`" type="number" :step="field.kind === 'integer' ? '1' : 'any'" :required="field.required" @input="setNumber(field.name, ($event.target as HTMLInputElement).value, field.kind === 'integer')">
-          <span v-else :data-testid="`debug-field-${field.name}-json`" class="json-field"><small>复杂 Schema，请输入 JSON</small><textarea :value="complexDrafts[field.name] ?? ''" @input="setComplex(field.name, ($event.target as HTMLTextAreaElement).value)" /></span>
+          <span v-else :data-testid="`debug-field-${field.name}-json`" class="json-field"><small>复杂 Schema，请输入 JSON</small><textarea :value="complexDrafts[field.name] ?? ''" @input="setComplex(field, ($event.target as HTMLTextAreaElement).value)" /><small v-if="draftErrors[field.name]" class="draft-error" role="alert">{{ draftErrors[field.name] }}</small></span>
         </label>
       </template>
-      <label v-else class="debug-field"><span>输入 JSON</span><textarea data-testid="debug-root-json" :value="rootDraft" @input="setRoot(($event.target as HTMLTextAreaElement).value)" /></label>
+      <label v-else class="debug-field"><span>输入 JSON</span><textarea data-testid="debug-root-json" :value="rootDraft" @input="setRoot(($event.target as HTMLTextAreaElement).value)" /><small v-if="draftErrors.$root" class="draft-error" role="alert">{{ draftErrors.$root }}</small></label>
     </section>
 
     <section v-if="manifest">
@@ -62,6 +62,7 @@ type JsonSchema = { type?: string; title?: string; enum?: unknown[]; properties?
 interface Field { name: string; title: string; kind: string; required: boolean; enumValues?: unknown[] }
 const developer = useDeveloperStore()
 const complexDrafts = reactive<Record<string, string>>({})
+const draftErrors = reactive<Record<string, string>>({})
 const rootDraft = ref('{}')
 const manifest = computed(() => developer.currentManifest)
 const inputSchema = computed(() => manifest.value?.inputSchema as JsonSchema | undefined)
@@ -77,8 +78,9 @@ const active = computed(() => ['starting', 'queued', 'awaiting_approval', 'runni
 const statusLabel = computed(() => ({ idle: '未运行', starting: '启动中', queued: '排队中', awaiting_approval: '等待授权', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[developer.debugStatus])
 
 function setPrimitive(field: Field, value: string) {
-  const matching = field.enumValues?.find((candidate) => String(candidate) === value)
-  setField(field.name, matching ?? value)
+  if (!value) { delete inputObject()[field.name]; return }
+  const matching = field.enumValues?.[Number(value)]
+  if (matching !== undefined) setField(field.name, matching)
 }
 function inputObject(): Record<string, unknown> {
   if (!developer.debugInput || typeof developer.debugInput !== 'object' || Array.isArray(developer.debugInput)) developer.debugInput = {}
@@ -92,16 +94,55 @@ function setNumber(name: string, value: string, integer: boolean) {
   const parsed = Number(value)
   if (Number.isFinite(parsed) && (!integer || Number.isInteger(parsed))) setField(name, parsed)
 }
-function setComplex(name: string, value: string) {
-  complexDrafts[name] = value
-  try { setField(name, JSON.parse(value) as unknown) } catch { delete inputObject()[name] }
+function syncDraftValidity() {
+  const errors = Object.values(draftErrors).filter(Boolean)
+  developer.setDebugDraftValidity(errors.length === 0, errors[0] ?? '')
+}
+function setDraftError(name: string, error = '') {
+  if (error) draftErrors[name] = error
+  else delete draftErrors[name]
+  syncDraftValidity()
+}
+function setComplex(field: Field, value: string) {
+  complexDrafts[field.name] = value
+  if (!value.trim()) {
+    if (field.required) setDraftError(field.name, `${field.title} 请输入有效 JSON`)
+    else { delete inputObject()[field.name]; setDraftError(field.name) }
+    return
+  }
+  try {
+    setField(field.name, JSON.parse(value) as unknown)
+    setDraftError(field.name)
+  } catch { setDraftError(field.name, `${field.title} 请输入有效 JSON`) }
 }
 function setRoot(value: string) {
   rootDraft.value = value
   try {
     const parsed = JSON.parse(value) as unknown
     developer.debugInput = parsed
-  } catch { developer.debugInput = {} }
+    setDraftError('$root')
+  } catch { setDraftError('$root', '请输入有效 JSON') }
+}
+function enumLabel(value: unknown) {
+  if (typeof value === 'string') return `${JSON.stringify(value)} (string)`
+  return `${String(value)} (${typeof value})`
+}
+function initializeDrafts() {
+  Object.keys(complexDrafts).forEach((key) => delete complexDrafts[key])
+  Object.keys(draftErrors).forEach((key) => delete draftErrors[key])
+  developer.debugInput = {}
+  rootDraft.value = '{}'
+  if (objectFields.value.length) {
+    for (const field of objectFields.value) {
+      if (field.kind === 'boolean' && field.required) setField(field.name, false)
+      if (!['string', 'number', 'integer', 'boolean'].includes(field.kind) && field.required) {
+        const value = field.kind === 'array' ? [] : {}
+        complexDrafts[field.name] = JSON.stringify(value, null, 2)
+        setField(field.name, value)
+      }
+    }
+  }
+  syncDraftValidity()
 }
 function formatScope(scope: CapabilityScope) { return 'origins' in scope ? scope.origins.join('、') : 'paths' in scope ? scope.paths.join('、') : '无附加范围' }
 function eventLine(event: ExecutionEvent) {
@@ -111,7 +152,7 @@ function eventLine(event: ExecutionEvent) {
   if (event.type === 'approval_required') return `[授权] ${event.capability}`
   return `[状态] ${event.status}`
 }
-watch(() => developer.selectedProjectId, () => { Object.keys(complexDrafts).forEach((key) => delete complexDrafts[key]); rootDraft.value = '{}' })
+watch(inputSchema, initializeDrafts, { immediate: true, deep: true })
 </script>
 
 <style scoped>
@@ -119,6 +160,7 @@ watch(() => developer.selectedProjectId, () => { Object.keys(complexDrafts).forE
 .debug-actions { display: flex; gap: 6px; }.debug-actions .el-button { margin: 0; }.valid { margin: 0; color: var(--af-success); font-size: 12px; }.invalid { margin: 0; color: var(--af-danger); font-size: 12px; }.muted { margin: 0; color: var(--af-text-muted); font-size: 12px; }
 .diagnostics, .permissions { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 11px; }.diagnostics li { color: var(--af-danger); overflow-wrap: anywhere; }.permissions li { display: grid; gap: 2px; }.permissions small { color: var(--af-text-muted); overflow-wrap: anywhere; }
 .debug-field { display: grid; gap: 4px; font-size: 11px; }.debug-field > span:first-child { display: flex; justify-content: space-between; font-weight: 600; }.debug-field em { color: var(--af-danger); font-size: 9px; font-style: normal; }.debug-field input:not([type='checkbox']), .debug-field select, .debug-field textarea { width: 100%; border: 1px solid var(--af-border); border-radius: 4px; padding: 6px; color: var(--af-text); background: var(--af-surface); font: inherit; }.debug-field textarea { min-height: 64px; resize: vertical; font-family: ui-monospace, monospace; }.json-field { display: grid !important; gap: 4px; }.json-field small { color: var(--af-text-muted); font-weight: 400; }
+.draft-error { color: var(--af-danger) !important; }
 .run-heading { display: flex; justify-content: space-between; }.run-heading small { color: var(--af-text-muted); }.approval { display: grid; gap: 7px; border: 1px solid var(--af-warning); border-radius: 5px; padding: 8px; font-size: 11px; }.approval div { display: flex; flex-wrap: wrap; gap: 4px; }.approval .el-button { margin: 0; }
 .debug-log { max-height: 180px; overflow: auto; color: #dbe4ef; background: #242a32; }.debug-log p { margin: 0; border-bottom: 1px solid #353d48; padding: 6px; font-family: ui-monospace, monospace; font-size: 10px; overflow-wrap: anywhere; }.debug-panel pre { max-height: 180px; margin: 0; overflow: auto; padding: 8px; background: var(--af-surface-muted); font-size: 10px; white-space: pre-wrap; }
 .debug-steps { display: grid; gap: 4px; margin: 0; padding-left: 18px; font-size: 11px; }

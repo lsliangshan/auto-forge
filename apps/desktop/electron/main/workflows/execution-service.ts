@@ -48,7 +48,16 @@ export interface WorkflowExecutionSource {
 }
 
 export interface WorkflowExecutionSourceResolver {
-  resolve(workflowId: string, version: string): Promise<WorkflowExecutionSource | undefined>
+  resolve(
+    workflowId: string,
+    version: string,
+    selector?: WorkflowExecutionSourceSelector,
+  ): Promise<WorkflowExecutionSource | undefined>
+}
+
+export interface WorkflowExecutionSourceSelector {
+  readonly kind: 'development-project'
+  readonly projectId: string
 }
 
 export interface TemporaryDirectoryPort {
@@ -121,6 +130,8 @@ export interface ExecutionStartInput {
   chatRunId?: string
   timeoutMs?: number
   sensitivePaths?: readonly string[]
+  /** Main-process-only selector. The application resolver accepts only selectors it created. */
+  sourceSelector?: WorkflowExecutionSourceSelector
 }
 
 export interface StartedExecution {
@@ -299,7 +310,11 @@ export class ExecutionService {
     let workflow: WorkflowDetail
     try {
       checkCancelled()
-      const source = await this.dependencies.sourceResolver.resolve(input.workflowId, input.workflowVersion)
+      const source = await this.dependencies.sourceResolver.resolve(
+        input.workflowId,
+        input.workflowVersion,
+        input.sourceSelector,
+      )
       checkCancelled()
       if (!source) throw failure('NOT_FOUND')
       workflow = source.workflow

@@ -30,7 +30,12 @@ import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
-import { ExecutionService, NodeWorkerFactory, type WorkflowExecutionSourceResolver } from './workflows/execution-service.js'
+import {
+  ExecutionService,
+  NodeWorkerFactory,
+  type WorkflowExecutionSourceResolver,
+  type WorkflowExecutionSourceSelector,
+} from './workflows/execution-service.js'
 import { WorkflowProjectService } from './workflows/project-service.js'
 import { WorkflowRegistry } from './workflows/registry.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
@@ -208,6 +213,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const provider = options.openRouter ?? new OpenRouterProvider({ credential: secretStore })
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
+  const developmentSourceSelectors = new WeakMap<WorkflowExecutionSourceSelector, string>()
+  const selectDevelopmentProject = (projectId: string): WorkflowExecutionSourceSelector => {
+    const selector = Object.freeze({ kind: 'development-project' as const, projectId })
+    developmentSourceSelectors.set(selector, projectId)
+    return selector
+  }
   const policy = new PolicyEngine(database.permissionGrants)
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
@@ -218,7 +229,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
   })
   const sourceResolver: WorkflowExecutionSourceResolver = {
-    async resolve(id, version) {
+    async resolve(id, version, selector) {
+      if (selector) {
+        const projectId = developmentSourceSelectors.get(selector)
+        if (!projectId || selector.kind !== 'development-project' || selector.projectId !== projectId) return undefined
+        const project = database.workflowProjects.get(projectId)
+        const workflow = await registry.getDevelopmentProject(projectId)
+        if (!project || !workflow) return undefined
+        const manifest = JSON.parse(await projects.read(projectId, 'workflow.json')) as WorkflowManifest
+        if (manifest.id !== id || manifest.version !== version) return undefined
+        return {
+          workflow,
+          rootPath: project.rootPath,
+          entryPath: String(manifest.entryPath),
+          integrity: workflow.integrity,
+        }
+      }
       const installed = database.installedWorkflows.get(id, version)
       if (installed) {
         const integrity = await registry.verifyIntegrity(id, version)
@@ -230,8 +256,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       for (const project of database.workflowProjects.list()) {
         const manifest = project.manifest as Partial<WorkflowManifest> | undefined
         if (project.status !== 'ready' || manifest?.id !== id || manifest.version !== version) continue
-        const workflow = await registry.get(id, version, { developerMode: true })
-        if (workflow?.source === 'development') {
+        const workflow = await registry.getDevelopmentProject(project.id)
+        if (workflow) {
           return { workflow, rootPath: project.rootPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
         }
       }
@@ -418,7 +444,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             if (typeof error === 'object' && error !== null && 'code' in error) throw error
             throw failure('INVALID_INPUT')
           }
-          const started = await executions.start({ workflowId: manifest.id, workflowVersion: manifest.version, input })
+          const started = await executions.start({
+            workflowId: manifest.id,
+            workflowVersion: manifest.version,
+            input,
+            sourceSelector: selectDevelopmentProject(projectId),
+          })
           void started.finished.catch(() => undefined)
           return { executionId: started.id }
         } finally {

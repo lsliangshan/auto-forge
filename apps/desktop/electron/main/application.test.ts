@@ -182,4 +182,52 @@ describe('createApplicationRuntime', () => {
     const release = gate.beginStart()
     release()
   })
+
+  it('runs the exact development project even when an installed workflow has the same identity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(import.meta.dirname, '../workers/workflow-runner.ts'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      openRouter: {
+        listModels: async () => [], validateCredential: async () => ({ valid: true }),
+        stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
+      },
+      chooseProjectDirectory: async () => undefined,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+    })
+    const installedProject = await runtime.services.developer.createProject('Installed Debug Source')
+    const selectedProject = await runtime.services.developer.createProject('Selected Debug Source')
+    for (const [projectId, marker] of [[installedProject.id, 'installed'], [selectedProject.id, 'selected']] as const) {
+      const manifest = JSON.parse(await runtime.services.developer.readFile(projectId, 'workflow.json')) as Record<string, unknown>
+      Object.assign(manifest, { id: 'debug.same-identity', version: '1.0.0', permissions: [] })
+      await runtime.services.developer.writeFile(projectId, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+      await runtime.services.developer.writeFile(projectId, 'src/index.ts', [
+        "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+        `export default defineWorkflow({ async run() { return { marker: '${marker}' } } })`,
+      ].join('\n'))
+    }
+    await runtime.services.developer.build(installedProject.id)
+    await runtime.services.workflows.installProject(installedProject.id)
+
+    const { executionId } = await runtime.services.developer.run({ projectId: selectedProject.id, input: {} })
+    let execution = await runtime.services.executions.get(executionId)
+    for (let attempt = 0; attempt < 100 && !['completed', 'failed', 'cancelled'].includes(execution.status); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      execution = await runtime.services.executions.get(executionId)
+    }
+
+    expect(execution.status).toBe('completed')
+    expect(execution.output).toEqual({ marker: 'selected' })
+    await runtime.close()
+  })
 })

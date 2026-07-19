@@ -55,6 +55,10 @@ function parseManifest(value: string): WorkflowManifest | undefined {
   }
 }
 
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted'])
 
 export const useDeveloperStore = defineStore('developer', {
@@ -69,7 +73,11 @@ export const useDeveloperStore = defineStore('developer', {
     loading: false,
     error: '',
     _projectVersions: {} as Record<string, number>,
+    _selectionGeneration: 0,
+    _runToken: 0,
     debugInput: {} as unknown,
+    debugDraftValid: true,
+    debugDraftError: '',
     debugEvents: [] as ExecutionEvent[],
     debugDetail: undefined as ExecutionDetail | undefined,
     debugExecutionId: '',
@@ -155,10 +163,14 @@ export const useDeveloperStore = defineStore('developer', {
     async selectProject(projectId: string) {
       const project = this.projects.find(({ id }) => id === projectId)
       if (!project) return
+      this._selectionGeneration += 1
+      this._runToken += 1
       this.selectedProjectId = projectId
       this.diagnostics = []
       this.validationValid = true
       this.debugInput = {}
+      this.debugDraftValid = true
+      this.debugDraftError = ''
       this.resetDebug()
       const preferred = project.files.includes('src/index.ts') ? 'src/index.ts' : project.files[0]
       this.selectedPath = ''
@@ -282,11 +294,12 @@ export const useDeveloperStore = defineStore('developer', {
         await this.validateProject()
       } catch (error) { this.error = displayError(error, '项目构建失败') }
     },
-    async _refreshBuiltManifest(projectId: string) {
+    async _refreshBuiltManifest(projectId: string, shouldApply: () => boolean = () => true) {
       const key = bufferKey(projectId, 'workflow.json')
       const buffer = this.files[key]
-      if (!buffer) return
+      if (!buffer) return false
       const content = await getDesktopApi().developer.readFile(projectId, 'workflow.json')
+      if (!shouldApply()) return false
       buffer.content = content
       buffer.version += 1
       buffer.loaded = true
@@ -294,17 +307,34 @@ export const useDeveloperStore = defineStore('developer', {
       buffer.saveState = 'saved'
       this._projectVersions[projectId] = (this._projectVersions[projectId] ?? 0) + 1
       this.manifests[projectId] = parseManifest(content)
+      return true
+    },
+    setDebugDraftValidity(valid: boolean, error = '') {
+      this.debugDraftValid = valid
+      this.debugDraftError = valid ? '' : error
     },
     ensureExecutionSubscription() { this._ensureLifecycle() },
     async runDebug() {
       const projectId = this.selectedProjectId
-      const manifest = this.currentManifest
-      if (!projectId || !manifest || ['starting', 'queued', 'awaiting_approval', 'running'].includes(this.debugStatus)) return
+      if (!projectId || !this.currentManifest || ['starting', 'queued', 'awaiting_approval', 'running'].includes(this.debugStatus)) return
       this._ensureLifecycle()
       this.debugError = ''
+      if (!this.debugDraftValid) {
+        this.debugError = this.debugDraftError || '调试输入 JSON 无效。'
+        return
+      }
+      let manifest: WorkflowManifest
+      let input: unknown
+      try {
+        manifest = cloneJson(this.currentManifest)
+        input = cloneJson(this.debugInput)
+      } catch {
+        this.debugError = '调试输入必须是有效 JSON。'
+        return
+      }
       try {
         const validate = new Ajv({ allErrors: true, strict: false }).compile(manifest.inputSchema as AnySchema)
-        if (!validate(this.debugInput)) {
+        if (!validate(input)) {
           this.debugError = `调试输入无效：${validate.errors?.map(({ instancePath, message }) => `${instancePath || '/'} ${message ?? ''}`).join('；')}`
           return
         }
@@ -313,30 +343,43 @@ export const useDeveloperStore = defineStore('developer', {
         return
       }
       this.resetDebug()
+      const selectionGeneration = this._selectionGeneration
+      const runToken = ++this._runToken
+      const isCurrent = () => this.selectedProjectId === projectId
+        && this._selectionGeneration === selectionGeneration
+        && this._runToken === runToken
       this.debugStatus = 'starting'
       const state = runtime(this)
       state.pendingEvents = []
       try {
         await this.flushPendingSaves()
+        if (!isCurrent()) return
         if (Object.values(this.files).some((file) => file.projectId === projectId && ['dirty', 'saving', 'error'].includes(file.saveState))) {
           this.debugStatus = 'failed'
           this.debugError = '存在未保存文件，请修复保存问题后重试。'
           return
         }
         const built = await getDesktopApi().developer.build(projectId)
+        if (!isCurrent()) return
         this._upsertProject(built)
-        await this._refreshBuiltManifest(projectId)
+        if (!await this._refreshBuiltManifest(projectId, isCurrent) || !isCurrent()) return
         const validation = await getDesktopApi().developer.validate(projectId)
+        if (!isCurrent()) return
         this._applyValidation(validation)
         if (!validation.valid) { this.debugStatus = 'idle'; this.debugError = '项目校验未通过。'; return }
-        const { executionId } = await getDesktopApi().developer.run({ projectId, input: this.debugInput })
+        const { executionId } = await getDesktopApi().developer.run({ projectId, input })
+        if (!isCurrent()) {
+          try { await getDesktopApi().executions.cancel(executionId) } catch { /* A stale execution may already be terminal. */ }
+          return
+        }
         this.debugExecutionId = executionId
         this.debugStatus = 'queued'
         for (const event of state.pendingEvents) if (event.executionId === executionId) this._applyExecutionEvent(event)
       } catch (error) {
+        if (!isCurrent()) return
         this.debugStatus = 'failed'
         this.debugError = displayError(error, '调试运行失败')
-      } finally { state.pendingEvents = [] }
+      } finally { if (isCurrent()) state.pendingEvents = [] }
     },
     resetDebug() {
       this.debugEvents = []

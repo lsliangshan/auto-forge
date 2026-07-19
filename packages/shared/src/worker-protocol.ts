@@ -35,7 +35,7 @@ export const capabilityScopeSchema = z.union([
 
 export type CapabilityScope = z.infer<typeof capabilityScopeSchema>
 
-const capabilityRequestSchema = z.discriminatedUnion('capability', [
+export const workerCapabilityRequestSchema = z.discriminatedUnion('capability', [
   z.object({
     capability: z.literal('browser.open'),
     scope: browserScopeSchema,
@@ -63,7 +63,7 @@ const capabilityRequestSchema = z.discriminatedUnion('capability', [
   }).strict(),
 ])
 
-export type WorkerCapabilityRequest = z.infer<typeof capabilityRequestSchema>
+export type WorkerCapabilityRequest = z.infer<typeof workerCapabilityRequestSchema>
 
 export const workerRequestSchema = z.discriminatedUnion('type', [
   z.object({
@@ -104,7 +104,7 @@ export const workerResponseSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('capability_request'),
     requestId: identifierSchema,
-    request: capabilityRequestSchema,
+    request: workerCapabilityRequestSchema,
   }).strict(),
   z.object({ type: z.literal('result'), output: z.unknown() }).strict(),
   z.object({ type: z.literal('error'), error: appErrorSchema }).strict(),

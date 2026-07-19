@@ -786,6 +786,73 @@ describe('NodeWorkerFactory', () => {
     ])
   })
 
+  it('keeps logger validation errors inside the guest realm without exposing host constructors', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          const observations = []
+          for (const message of [
+            { get toJSON() { throw new Error('guest getter') } },
+            'x'.repeat(1024 * 1024),
+          ]) {
+            try { context.logger.info(message) }
+            catch (error) {
+              let escaped = false
+              try { escaped = Boolean(error.constructor.constructor('return process')()) } catch {}
+              observations.push({ code: typeof error.code === 'string' ? error.code : null, escaped })
+            }
+          }
+          return { observations, processType: typeof process }
+        },
+      })
+    `)
+
+    expect(messages.at(-1)).toEqual({
+      type: 'result',
+      output: {
+        observations: [{ code: null, escaped: false }, { code: 'WORKER_PROTOCOL_INVALID', escaped: false }],
+        processType: 'undefined',
+      },
+    })
+  })
+
+  it('returns capability denials as guest errors that cannot reach host constructors', async () => {
+    const messages = await runActualWorker(`
+      import { defineWorkflow } from '@autoforge/workflow-sdk'
+      export default defineWorkflow({
+        async run(context) {
+          try { await context.browser.open('https://www.baidu.com') }
+          catch (error) {
+            let escaped = false
+            try { escaped = Boolean(error.constructor.constructor('return process')()) } catch {}
+            let imported = false
+            try { await import('node:fs'); imported = true } catch {}
+            return { code: error.code, message: error.message, escaped, imported, processType: typeof process }
+          }
+          return { unexpected: true }
+        },
+      })
+    `, {
+      onMessage: (message, worker) => {
+        if (message.type === 'capability_request') {
+          worker.stdin!.write(`${JSON.stringify({
+            type: 'capability_error', requestId: message.requestId,
+            error: { code: 'PERMISSION_DENIED', message: 'The operation is not permitted.' },
+          })}\n`)
+        }
+      },
+    })
+
+    expect(messages.at(-1)).toEqual({
+      type: 'result',
+      output: {
+        code: 'PERMISSION_DENIED', message: 'The requested permission was denied.',
+        escaped: false, imported: false, processType: 'undefined',
+      },
+    })
+  })
+
   it.each([
     ['static', "import fs from 'node:fs'\nvoid fs"],
     ['dynamic', "await import('node:fs')"],

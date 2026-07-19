@@ -56,10 +56,24 @@ const monacoHarness = vi.hoisted(() => {
   }
 })
 
+const workerHarness = vi.hoisted(() => {
+  const instances: Array<{ kind: string; terminate: ReturnType<typeof vi.fn> }> = []
+  const constructorFor = (kind: string) => class {
+    kind = kind
+    terminate = vi.fn()
+    constructor() { instances.push(this) }
+  }
+  return { instances, constructorFor }
+})
+
 vi.mock('monaco-editor/esm/vs/editor/editor.api.js', () => monacoHarness.api)
 vi.mock('monaco-editor/esm/vs/language/json/monaco.contribution.js', () => ({}))
 vi.mock('monaco-editor/esm/vs/language/css/monaco.contribution.js', () => ({}))
 vi.mock('monaco-editor/esm/vs/language/typescript/monaco.contribution.js', () => ({}))
+vi.mock('monaco-editor/esm/vs/editor/editor.worker?worker', () => ({ default: workerHarness.constructorFor('editor') }))
+vi.mock('monaco-editor/esm/vs/language/json/json.worker?worker', () => ({ default: workerHarness.constructorFor('json') }))
+vi.mock('monaco-editor/esm/vs/language/css/css.worker?worker', () => ({ default: workerHarness.constructorFor('css') }))
+vi.mock('monaco-editor/esm/vs/language/typescript/ts.worker?worker', () => ({ default: workerHarness.constructorFor('typescript') }))
 
 const project: DeveloperProject = {
   id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new',
@@ -159,6 +173,27 @@ describe('developer workbench', () => {
     expect([...monacoHarness.models.values()].every((model) => model.disposed)).toBe(true)
   })
 
+  it('keeps renderer-scoped language workers alive across editor remounts', async () => {
+    const { api } = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('src/index.ts')
+    const environment = globalThis.MonacoEnvironment as { getWorker(moduleId: string, label: string): Worker }
+    const first = environment.getWorker('', 'typescript') as unknown as { terminate: ReturnType<typeof vi.fn> }
+
+    const firstEditor = mount(CodeEditor)
+    await firstEditor.vm.$nextTick()
+    firstEditor.unmount()
+    expect(first.terminate).not.toHaveBeenCalled()
+
+    const secondEditor = mount(CodeEditor)
+    await secondEditor.vm.$nextTick()
+    expect(environment.getWorker('', 'typescript')).toBe(first)
+    expect(workerHarness.instances.filter(({ kind }) => kind === 'typescript')).toHaveLength(1)
+    secondEditor.unmount()
+  })
+
   it('does not let an older save or validation overwrite newer edits', async () => {
     const { api, raw } = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -202,6 +237,70 @@ describe('developer workbench', () => {
     expect(wrapper.get('[data-testid="debug-field-filters-json"]').text()).toContain('JSON')
     expect(wrapper.text()).toContain('browser.open')
     expect(wrapper.text()).not.toContain('filesystem.read')
+  })
+
+  it('keeps invalid complex JSON as a visible draft and blocks execution', async () => {
+    const { api, raw } = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="debug-field-filters-json"] textarea').setValue('{ invalid')
+    expect(wrapper.text()).toContain('请输入有效 JSON')
+    expect(store.debugDraftValid).toBe(false)
+    await store.runDebug()
+    expect(raw.developer.build).not.toHaveBeenCalled()
+    expect(raw.developer.run).not.toHaveBeenCalled()
+  })
+
+  it('blocks invalid root JSON without replacing the last valid input', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = { type: 'object' }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+    const rootInput = wrapper.get('[data-testid="debug-root-json"]')
+
+    await rootInput.setValue('{')
+    expect(store.debugInput).toEqual({})
+    await store.runDebug()
+    expect(raw.developer.build).not.toHaveBeenCalled()
+    await rootInput.setValue('{"query":"ok"}')
+    expect(store.debugDraftValid).toBe(true)
+    await store.runDebug()
+    expect(raw.developer.run).toHaveBeenCalledWith({ projectId: 'project_1', input: { query: 'ok' } })
+  })
+
+  it('initializes required booleans and preserves enum values with distinct JSON types', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object', required: ['exact'],
+      properties: { exact: { type: 'boolean' }, choice: { enum: [1, '1'] } },
+    }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    expect(store.debugInput).toMatchObject({ exact: false })
+    const select = wrapper.get('[data-testid="debug-field-choice"]')
+    expect(select.text()).toContain('1 (number)')
+    expect(select.text()).toContain('"1" (string)')
+    await select.setValue('0')
+    expect((store.debugInput as Record<string, unknown>).choice).toBe(1)
+    await select.setValue('1')
+    expect((store.debugInput as Record<string, unknown>).choice).toBe('1')
   })
 
   it('isolates execution events, handles approvals, and cancels only the active debug run', async () => {
@@ -273,5 +372,51 @@ describe('developer workbench', () => {
 
     expect(store.currentManifest?.codeSha256).toBe('c'.repeat(64))
     expect(raw.developer.writeFile).not.toHaveBeenCalledWith('project_1', 'workflow.json', expect.stringContaining('"codeSha256":"aaaaaaaa'))
+  })
+
+  it('does not apply an old project build after selection changes', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    let resolveBuild!: (value: DeveloperProject) => void
+    raw.developer.build.mockReturnValueOnce(new Promise((resolve) => { resolveBuild = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    store.debugInput = { keyword: 'captured' }
+    const run = store.runDebug()
+    await Promise.resolve()
+    await store.selectProject(second.id)
+    resolveBuild({ ...project, status: 'ready', name: 'stale build' })
+    await run
+
+    expect(store.selectedProjectId).toBe(second.id)
+    expect(store.projects.find(({ id }) => id === project.id)?.name).toBe(project.name)
+    expect(raw.developer.validate).not.toHaveBeenCalled()
+    expect(raw.developer.run).not.toHaveBeenCalled()
+    expect(store.debugStatus).toBe('idle')
+  })
+
+  it('cancels an execution returned after its debug run becomes stale and uses an input snapshot', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    let resolveRun!: (value: { executionId: string }) => void
+    raw.developer.run.mockReturnValueOnce(new Promise((resolve) => { resolveRun = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    store.debugInput = { keyword: 'captured', nested: { value: 'captured' } }
+    const run = store.runDebug()
+    await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalled())
+    ;(store.debugInput as { nested: { value: string } }).nested.value = 'mutated'
+    await store.selectProject(second.id)
+    resolveRun({ executionId: 'exec_late' })
+    await run
+
+    expect(raw.developer.run).toHaveBeenCalledWith({ projectId: project.id, input: { keyword: 'captured', nested: { value: 'captured' } } })
+    expect(raw.executions.cancel).toHaveBeenCalledWith('exec_late')
+    expect(store.debugExecutionId).toBe('')
+    expect(store.debugStatus).toBe('idle')
   })
 })

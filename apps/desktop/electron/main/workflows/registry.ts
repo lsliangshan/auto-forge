@@ -52,38 +52,43 @@ export class WorkflowRegistry {
     const installed = this.repositories.installedWorkflows.list().map(toDetail).filter((workflow): workflow is WorkflowDetail => workflow !== undefined)
     if (!options.developerMode) return installed
 
-    const development: Array<WorkflowDetail | undefined> = await Promise.all(this.repositories.workflowProjects.list().map(async (project): Promise<WorkflowDetail | undefined> => {
-      if (project.status !== 'ready' || !project.buildHash) return undefined
-      try {
-        const manifest = JSON.parse(await this.projects.read(project.id, 'workflow.json')) as WorkflowManifest
-        if (!validateManifest(manifest).valid) return undefined
-        const source = await this.projects.read(project.id, 'src/index.ts')
-        const entry = await this.projects.read(project.id, manifest.entryPath)
-        if (buildFingerprint(source, manifest) !== project.buildHash || sha256(Buffer.from(entry)) !== manifest.codeSha256) return undefined
-        return {
-          id: manifest.id,
-          version: manifest.version,
-          name: manifest.name,
-          description: manifest.description,
-          author: manifest.author,
-          category: manifest.category,
-          enabled: true,
-          source: 'development' as const,
-          integrity: 'valid' as const,
-          updatedAt: timestamp(project.updatedAt),
-          codeSha256: manifest.codeSha256,
-          permissions: manifest.permissions,
-          activationExamples: manifest.activationExamples,
-          activationNegativeExamples: manifest.activationNegativeExamples,
-          timeoutMs: manifest.timeoutMs,
-          inputSchema: manifest.inputSchema,
-          outputSchema: manifest.outputSchema,
-        } satisfies WorkflowDetail
-      } catch {
-        return undefined
-      }
-    }))
+    const development = await Promise.all(
+      this.repositories.workflowProjects.list().map((project) => this.getDevelopmentProject(project.id)),
+    )
     return [...installed, ...development.filter((workflow): workflow is WorkflowDetail => workflow !== undefined)]
+  }
+
+  async getDevelopmentProject(projectId: string): Promise<WorkflowDetail | undefined> {
+    const project = this.repositories.workflowProjects.get(projectId)
+    if (!project || project.status !== 'ready' || !project.buildHash) return undefined
+    try {
+      const manifest = JSON.parse(await this.projects.read(project.id, 'workflow.json')) as WorkflowManifest
+      if (!validateManifest(manifest).valid) return undefined
+      const source = await this.projects.read(project.id, 'src/index.ts')
+      const entry = await this.projects.read(project.id, manifest.entryPath)
+      if (buildFingerprint(source, manifest) !== project.buildHash || sha256(Buffer.from(entry)) !== manifest.codeSha256) return undefined
+      return {
+        id: manifest.id,
+        version: manifest.version,
+        name: manifest.name,
+        description: manifest.description,
+        author: manifest.author,
+        category: manifest.category,
+        enabled: true,
+        source: 'development',
+        integrity: 'valid',
+        updatedAt: timestamp(project.updatedAt),
+        codeSha256: manifest.codeSha256,
+        permissions: manifest.permissions,
+        activationExamples: manifest.activationExamples,
+        activationNegativeExamples: manifest.activationNegativeExamples,
+        timeoutMs: manifest.timeoutMs,
+        inputSchema: manifest.inputSchema,
+        outputSchema: manifest.outputSchema,
+      }
+    } catch {
+      return undefined
+    }
   }
 
   async get(workflowId: string, version: string, options: { developerMode?: boolean } = {}): Promise<WorkflowDetail | undefined> {

@@ -26,15 +26,20 @@ import CssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker'
 import TypeScriptWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
 import { useDeveloperStore } from '../../stores/developer'
 
-const workers = new Set<globalThis.Worker>()
-let editorLeases = 0
+const workers = new Map<string, globalThis.Worker>()
 
 function createWorker(label: string): globalThis.Worker {
-  const worker = label === 'json' ? new JsonWorker()
-    : ['css', 'scss', 'less'].includes(label) ? new CssWorker()
-      : ['typescript', 'javascript'].includes(label) ? new TypeScriptWorker()
+  const kind = label === 'json' ? 'json'
+    : ['css', 'scss', 'less'].includes(label) ? 'css'
+      : ['typescript', 'javascript'].includes(label) ? 'typescript'
+        : 'editor'
+  const existing = workers.get(kind)
+  if (existing) return existing
+  const worker = kind === 'json' ? new JsonWorker()
+    : kind === 'css' ? new CssWorker()
+      : kind === 'typescript' ? new TypeScriptWorker()
         : new EditorWorker()
-  workers.add(worker)
+  workers.set(kind, worker)
   return worker
 }
 
@@ -132,7 +137,6 @@ watch(() => developer.currentContent, (content) => {
 watch(() => developer.diagnostics, applyMarkers, { deep: true })
 
 onMounted(() => {
-  editorLeases += 1
   void activateModel()
 })
 onBeforeUnmount(() => {
@@ -141,11 +145,6 @@ onBeforeUnmount(() => {
   editor?.dispose()
   for (const model of ownedModels) model.dispose()
   ownedModels.clear()
-  editorLeases -= 1
-  if (editorLeases === 0) {
-    for (const worker of workers) worker.terminate()
-    workers.clear()
-  }
 })
 </script>
 

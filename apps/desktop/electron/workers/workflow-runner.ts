@@ -5,6 +5,7 @@ import {
   toSafeAppError,
   workerRequestSchema,
   workerResponseSchema,
+  workerCapabilityRequestSchema,
   type AppError,
   type WorkerCapabilityRequest,
   type WorkerRequest,
@@ -15,7 +16,7 @@ const MAX_LINE_BYTES = 1024 * 1024
 const SDK_SPECIFIER = '@autoforge/workflow-sdk'
 
 interface WorkflowDefinition {
-  run(context: unknown, input: unknown): Promise<unknown> | unknown
+  invoke(inputJson: string): Promise<string> | string
 }
 
 interface PendingRequest {
@@ -55,6 +56,23 @@ function isolateHostFunction<T extends (...arguments_: never[]) => unknown>(call
   return Object.freeze(callback)
 }
 
+function errorEnvelope(error: unknown): string {
+  try {
+    const safe = toSafeAppError(error)
+    return JSON.stringify({ ok: false, error: { code: safe.code, message: safe.message } })
+  } catch {
+    return '{"ok":false,"error":{"code":"INTERNAL_ERROR","message":"Unexpected application error"}}'
+  }
+}
+
+function successEnvelope(value: unknown = null): string {
+  try {
+    return JSON.stringify({ ok: true, value: value ?? null })
+  } catch (error) {
+    return errorEnvelope(error)
+  }
+}
+
 async function sdkModule(context: vm.Context): Promise<vm.SourceTextModule> {
   const module = new vm.SourceTextModule(
     'export function defineWorkflow(definition) { return Object.freeze(definition) }',
@@ -69,17 +87,52 @@ async function contextModule(
   context: vm.Context,
   requestCapability: (request: WorkerCapabilityRequest) => Promise<unknown>,
 ): Promise<vm.SourceTextModule> {
-  const bridge = isolateHostFunction(((
-    request: WorkerCapabilityRequest,
-    resolvePromise: (value: unknown) => void,
-    rejectPromise: (error: AppError) => void,
-  ) => {
-    void requestCapability(request).then(resolvePromise, (error) => rejectPromise(toSafeAppError(error)))
-  }) as (...arguments_: never[]) => unknown)
-  const originOf = isolateHostFunction(((value: string) => new URL(value).origin) as (...arguments_: never[]) => unknown)
-  const log = isolateHostFunction((((level: unknown, message: unknown) => {
-    if (!['debug', 'info', 'warn', 'error'].includes(String(level)) || typeof message !== 'string') throw protocolError()
-    write({ type: 'log', level: level as 'debug' | 'info' | 'warn' | 'error', message })
+  const guest = { settle: undefined as ((envelopeJson: string) => unknown) | undefined }
+  const settle = (envelopeJson: string) => {
+    try { guest.settle?.(envelopeJson) } catch { /* Guest settlement is observational to the host bridge. */ }
+  }
+  const bridge = isolateHostFunction((((requestJson: unknown): string => {
+    try {
+      if (typeof requestJson !== 'string') return errorEnvelope(protocolError())
+      const parsed = JSON.parse(requestJson) as unknown
+      if (!parsed || typeof parsed !== 'object') return errorEnvelope(protocolError())
+      const id = Reflect.get(parsed, 'id')
+      const capability = Reflect.get(parsed, 'request')
+      if (typeof id !== 'string' || id.length === 0) return errorEnvelope(protocolError())
+      const result = workerCapabilityRequestSchema.safeParse(capability)
+      if (!result.success) return errorEnvelope(protocolError())
+      void requestCapability(result.data).then(
+        (value) => settle(JSON.stringify({ id, envelope: successEnvelope(value) })),
+        (error) => settle(JSON.stringify({ id, envelope: errorEnvelope(error) })),
+      )
+      return successEnvelope()
+    } catch (error) {
+      return errorEnvelope(error)
+    }
+  })) as (...arguments_: never[]) => unknown)
+  const originOf = isolateHostFunction((((valueJson: unknown): string => {
+    try {
+      if (typeof valueJson !== 'string') return errorEnvelope(protocolError())
+      const value = JSON.parse(valueJson) as unknown
+      if (typeof value !== 'string') return errorEnvelope(protocolError())
+      return successEnvelope(new URL(value).origin)
+    } catch (error) {
+      return errorEnvelope(error)
+    }
+  })) as (...arguments_: never[]) => unknown)
+  const log = isolateHostFunction((((requestJson: unknown): string => {
+    try {
+      if (typeof requestJson !== 'string') return errorEnvelope(protocolError())
+      const parsed = JSON.parse(requestJson) as unknown
+      if (!parsed || typeof parsed !== 'object') return errorEnvelope(protocolError())
+      const level = Reflect.get(parsed, 'level')
+      const message = Reflect.get(parsed, 'message')
+      if (typeof level !== 'string' || !['debug', 'info', 'warn', 'error'].includes(level) || typeof message !== 'string') return errorEnvelope(protocolError())
+      write({ type: 'log', level: level as 'debug' | 'info' | 'warn' | 'error', message })
+      return successEnvelope()
+    } catch (error) {
+      return errorEnvelope(error)
+    }
   })) as (...arguments_: never[]) => unknown)
   const global = context as Record<string, unknown>
   global.__autoforgeCapabilityBridge = bridge
@@ -92,15 +145,48 @@ async function contextModule(
     delete globalThis.__autoforgeCapabilityBridge
     delete globalThis.__autoforgeOriginOf
     delete globalThis.__autoforgeLogBridge
-    let currentOrigin
-    function request(capability, scope, args) {
-      return new Promise((resolve, reject) => bridge({ capability, scope, arguments: args }, resolve, reject))
+    const pending = new Map()
+    let requestSequence = 0
+    function guestError(value) {
+      const error = new Error(value && typeof value.message === 'string' ? value.message : 'The worker protocol message is invalid.')
+      error.code = value && typeof value.code === 'string' ? value.code : 'WORKER_PROTOCOL_INVALID'
+      return error
     }
+    function decode(envelopeJson) {
+      let envelope
+      try { envelope = JSON.parse(envelopeJson) } catch { throw guestError(null) }
+      if (!envelope || typeof envelope !== 'object' || typeof envelope.ok !== 'boolean') throw guestError(null)
+      if (!envelope.ok) throw guestError(envelope.error)
+      return envelope.value
+    }
+    export function settle(settlementJson) {
+      let settlement
+      try { settlement = JSON.parse(settlementJson) } catch { return }
+      if (!settlement || typeof settlement.id !== 'string' || typeof settlement.envelope !== 'string') return
+      const waiter = pending.get(settlement.id)
+      if (!waiter) return
+      pending.delete(settlement.id)
+      try { waiter.resolve(decode(settlement.envelope)) } catch (error) { waiter.reject(error) }
+    }
+    function request(capability, scope, args) {
+      let requestJson
+      try { requestJson = JSON.stringify({ id: String(++requestSequence), request: { capability, scope, arguments: args } }) }
+      catch (error) { return Promise.reject(error) }
+      return new Promise((resolve, reject) => {
+        const id = String(requestSequence)
+        pending.set(id, { resolve, reject })
+        try { decode(bridge(requestJson)) }
+        catch (error) { pending.delete(id); reject(error) }
+      })
+    }
+    function origin(value) { return decode(originOf(JSON.stringify(value))) }
+    function emitLog(level, message) { decode(logBridge(JSON.stringify({ level, message }))) }
+    let currentOrigin
     const browser = Object.freeze({
       async open(url) {
-        const origin = originOf(url)
-        await request('browser.open', { origins: [origin] }, { url })
-        currentOrigin = origin
+        const nextOrigin = origin(url)
+        await request('browser.open', { origins: [nextOrigin] }, { url })
+        currentOrigin = nextOrigin
       },
       fill(locator, value) {
         if (!currentOrigin) throw new Error('A page must be opened first')
@@ -122,22 +208,23 @@ async function contextModule(
       },
     })
     const logger = Object.freeze({
-      debug(message) { logBridge('debug', message) },
-      info(message) { logBridge('info', message) },
-      warn(message) { logBridge('warn', message) },
-      error(message) { logBridge('error', message) },
+      debug(message) { emitLog('debug', message) },
+      info(message) { emitLog('info', message) },
+      warn(message) { emitLog('warn', message) },
+      error(message) { emitLog('error', message) },
     })
     export default Object.freeze({ browser, logger })
   `, { context, identifier: 'autoforge:workflow-context' })
   await module.link((specifier) => rejectImport(specifier))
   await module.evaluate()
+  guest.settle = Reflect.get(module.namespace, 'settle') as (envelopeJson: string) => unknown
   return module
 }
 
 async function loadWorkflow(
   entryPath: string,
   requestCapability: (request: WorkerCapabilityRequest) => Promise<unknown>,
-): Promise<{ definition: WorkflowDefinition; context: unknown }> {
+): Promise<WorkflowDefinition> {
   if (typeof vm.SourceTextModule !== 'function') throw protocolError()
   const canonicalEntry = await realpath(entryPath)
   const source = await readFile(canonicalEntry, 'utf8')
@@ -160,11 +247,39 @@ async function loadWorkflow(
     return sdk
   })
   await entry.evaluate()
-  const definition = Reflect.get(entry.namespace, 'default') as unknown
-  if (!definition || typeof definition !== 'object' || typeof (definition as WorkflowDefinition).run !== 'function') {
-    throw protocolError()
-  }
-  return { definition: definition as WorkflowDefinition, context: Reflect.get(capabilities.namespace, 'default') }
+  const wrapper = new vm.SourceTextModule(`
+    import definition from 'autoforge:workflow-entry'
+    import workflowContext from 'autoforge:workflow-context'
+    function serializeError(error) {
+      let code = 'INTERNAL_ERROR'
+      let message = 'Unexpected application error'
+      try { if (error && typeof error.code === 'string') code = error.code } catch {}
+      try { if (error && typeof error.message === 'string') message = error.message } catch {}
+      try { return JSON.stringify({ ok: false, error: { code, message } }) }
+      catch { return '{"ok":false,"error":{"code":"INTERNAL_ERROR","message":"Unexpected application error"}}' }
+    }
+    export async function invoke(inputJson) {
+      try {
+        if (!definition || typeof definition !== 'object' || typeof definition.run !== 'function') {
+          const error = new Error('The worker protocol message is invalid.')
+          error.code = 'WORKER_PROTOCOL_INVALID'
+          throw error
+        }
+        const input = JSON.parse(inputJson)
+        const output = await definition.run(workflowContext, input)
+        return JSON.stringify({ ok: true, value: output === undefined ? null : output })
+      } catch (error) { return serializeError(error) }
+    }
+  `, { context, identifier: 'autoforge:workflow-invoker' })
+  await wrapper.link(async (specifier) => {
+    if (specifier === 'autoforge:workflow-entry') return entry
+    if (specifier === 'autoforge:workflow-context') return capabilities
+    return rejectImport(specifier)
+  })
+  await wrapper.evaluate()
+  const invoke = Reflect.get(wrapper.namespace, 'invoke') as unknown
+  if (typeof invoke !== 'function') throw protocolError()
+  return { invoke: invoke as WorkflowDefinition['invoke'] }
 }
 
 function requestCapability(state: RunnerState, request: WorkerCapabilityRequest): Promise<unknown> {
@@ -205,7 +320,13 @@ async function runWorkflow(state: RunnerState, message: Extract<WorkerRequest, {
     const loaded = await loadWorkflow(message.entryPath, (request) => requestCapability(state, request))
     if (state.terminal) return
     write({ type: 'ready', executionId: message.executionId })
-    const output = await loaded.definition.run(loaded.context, message.input)
+    const inputJson = JSON.stringify(message.input ?? null)
+    const outputJson = await loaded.invoke(inputJson)
+    if (typeof outputJson !== 'string') throw protocolError()
+    const envelope = JSON.parse(outputJson) as unknown
+    if (!envelope || typeof envelope !== 'object' || typeof Reflect.get(envelope, 'ok') !== 'boolean') throw protocolError()
+    if (!Reflect.get(envelope, 'ok')) throw Reflect.get(envelope, 'error')
+    const output = Reflect.get(envelope, 'value')
     await waitForPending(state)
     if (!state.terminal) {
       state.terminal = true
