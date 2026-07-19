@@ -12,6 +12,10 @@ const textDecoder = new TextDecoder('utf-8', { fatal: true })
 
 type ProjectRepositories = Pick<AppRepositories, 'workflowProjects' | 'installedWorkflows' | 'workflowFiles'>
 
+export interface WorkflowProjectServiceOptions {
+  beforeReservation?: () => void | Promise<void>
+}
+
 function failure(code: AppErrorCode): Error & { code: AppErrorCode } {
   return Object.assign(new Error(code), { code })
 }
@@ -43,6 +47,7 @@ export class WorkflowProjectService {
   constructor(
     private readonly repositories: ProjectRepositories,
     private readonly installationRoot: string,
+    private readonly options: WorkflowProjectServiceOptions = {},
   ) {}
 
   async create(parentPath: string, manifest: WorkflowManifest): Promise<WorkflowProject> {
@@ -193,15 +198,21 @@ export class WorkflowProjectService {
     if (this.repositories.installedWorkflows.get(manifest.id, manifest.version) || await pathExists(destination)) throw failure('CONFLICT')
     await mkdir(dirname(destination), { recursive: true })
     const temporary = join(dirname(destination), `.${basename(destination)}-${randomUUID()}.tmp`)
-    let finalized = false
+    const ownershipMarker = join(destination, '.autoforge-install-owner')
+    const owner = randomUUID()
+    let reserved = false
 
     try {
       await mkdir(join(temporary, dirname(manifest.entryPath)), { recursive: true })
       await writeFile(join(temporary, 'workflow.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
       await copyFile(sourceEntry, join(temporary, manifest.entryPath))
-      if (await pathExists(destination)) throw failure('CONFLICT')
-      await rename(temporary, destination)
-      finalized = true
+      await this.options.beforeReservation?.()
+      await mkdir(destination)
+      reserved = true
+      await writeFile(ownershipMarker, owner, { flag: 'wx' })
+      await rename(join(temporary, 'workflow.json'), join(destination, 'workflow.json'))
+      await rename(join(temporary, dirname(manifest.entryPath)), join(destination, dirname(manifest.entryPath)))
+      await rm(temporary, { recursive: true, force: true })
 
       const now = Date.now()
       const installed: InstalledWorkflow = {
@@ -225,7 +236,7 @@ export class WorkflowProjectService {
       ])
     } catch (error) {
       await rm(temporary, { recursive: true, force: true })
-      if (finalized) await rm(destination, { recursive: true, force: true })
+      if (reserved) await this.removeOwnedDestination(destination, ownershipMarker, owner)
       if (error instanceof Error && ('code' in error) && ['EEXIST', 'ENOTEMPTY', 'SQLITE_CONSTRAINT_PRIMARYKEY', 'SQLITE_CONSTRAINT_UNIQUE'].includes(String(error.code))) throw failure('CONFLICT')
       throw error
     }
@@ -320,6 +331,14 @@ export class WorkflowProjectService {
     } finally {
       release()
       if (this.installationLocks.get(key) === current) this.installationLocks.delete(key)
+    }
+  }
+
+  private async removeOwnedDestination(destination: string, ownershipMarker: string, owner: string): Promise<void> {
+    try {
+      if (await readFile(ownershipMarker, 'utf8') === owner) await rm(destination, { recursive: true, force: true })
+    } catch {
+      // A missing or replaced marker means this attempt no longer owns the destination.
     }
   }
 

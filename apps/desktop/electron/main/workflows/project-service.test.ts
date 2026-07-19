@@ -220,6 +220,49 @@ describe('WorkflowProjectService', () => {
     expect(existsSync(join(installs, 'browser.search.baidu', '1.0.0'))).toBe(false)
     expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeUndefined()
   })
+
+  it('rejects an empty destination created after staging without overwriting it', async () => {
+    const directory = temporaryDirectory()
+    const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
+    const installs = join(directory, 'installed-workflows')
+    const destination = join(installs, 'browser.search.baidu', '1.0.0')
+    const projects = new WorkflowProjectService(database, installs, {
+      beforeReservation: () => { mkdirSync(destination, { recursive: true }) },
+    })
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+
+    await expect(projects.install(project.id)).rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(existsSync(destination)).toBe(true)
+    expect(database.installedWorkflows.get('browser.search.baidu', '1.0.0')).toBeUndefined()
+  })
+
+  it('does not remove a destination whose ownership marker changed before persistence fails', async () => {
+    const directory = temporaryDirectory()
+    const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
+    const installs = join(directory, 'installed-workflows')
+    const destination = join(installs, 'browser.search.baidu', '1.0.0')
+    const projects = new WorkflowProjectService({
+      workflowProjects: database.workflowProjects,
+      installedWorkflows: {
+        ...database.installedWorkflows,
+        insert: () => {
+          writeFileSync(join(destination, '.autoforge-install-owner'), 'other-owner')
+          throw new Error('database unavailable')
+        },
+      },
+      workflowFiles: database.workflowFiles,
+    }, installs)
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+
+    await expect(projects.install(project.id)).rejects.toThrow('database unavailable')
+    expect(readFileSync(join(destination, '.autoforge-install-owner'), 'utf8')).toBe('other-owner')
+  })
 })
 
 describe('WorkflowRegistry', () => {

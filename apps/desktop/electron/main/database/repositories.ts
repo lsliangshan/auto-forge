@@ -223,7 +223,12 @@ function redactLogMessage(message: string, sensitivePaths: readonly string[]): s
   try {
     return JSON.stringify(redact(JSON.parse(message), sensitivePaths))
   } catch {
-    return message.replace(/\b(authorization|cookie|(?:access|refresh)?token|api[_-]?key)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1$2[REDACTED]')
+    const sensitiveKeys = sensitivePaths
+      .map((path) => path.split('.').at(-1))
+      .filter((key): key is string => Boolean(key))
+      .map((key) => key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    const keys = ['authorization', 'cookie', 'x-api-key', 'api[_-]?key', '(?:access|refresh)?token', ...sensitiveKeys].join('|')
+    return message.replace(new RegExp(`\\b(${keys})\\b\\s*([:=])\\s*(?:Bearer\\s+)?(?:"[^"]*"|'[^']*'|[^\\s,;]+)`, 'gi'), '$1$2[REDACTED]')
   }
 }
 

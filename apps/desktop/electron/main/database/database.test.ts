@@ -92,4 +92,26 @@ describe('openAppDatabase', () => {
     expect(JSON.stringify(stored)).not.toContain('private-secret')
     expect(stored.message).toContain('[REDACTED]')
   })
+
+  it('redacts complete plain-text secret values before persistence and return', () => {
+    const database = openTestDatabase()
+    database.executions.insert({ id: 'execution_2', status: 'running', workflowId: 'workflow_1', workflowVersion: '1.0.0' })
+    const message = 'Authorization: Bearer sk-secret; X-API-Key: api-secret; token=token-secret; password=password-secret'
+    const returned = database.executionLogs.insert({
+      id: 'log_2',
+      executionId: 'execution_2',
+      sequence: 1,
+      level: 'info',
+      message,
+      sensitivePaths: ['credentials.password'],
+      createdAt: 1,
+    })
+    const stored = database.executionLogs.list('execution_2')[0]
+
+    for (const secret of ['sk-secret', 'api-secret', 'token-secret', 'password-secret']) {
+      expect(returned.message).not.toContain(secret)
+      expect(stored.message).not.toContain(secret)
+    }
+    expect(stored.message).toContain('[REDACTED]')
+  })
 })
