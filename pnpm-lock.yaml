@@ -136,7 +136,11 @@ importers:
         specifier: 3.3.7
         version: 3.3.7(typescript@6.0.3)
 
-  packages/shared: {}
+  packages/shared:
+    dependencies:
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
 
   packages/workflow-schema: {}
 
