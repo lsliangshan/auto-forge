@@ -5,6 +5,7 @@
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
+    "predev": "install-electron && electron-rebuild -f -w better-sqlite3",
     "dev": "electron-vite dev",
     "build": "electron-vite build && tsup electron/workers/workflow-runner.ts --format cjs --platform node --out-dir out/workers --clean false",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
@@ -32,6 +33,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@electron/rebuild": "4.2.0",
     "@tailwindcss/vite": "4.3.3",
     "@types/better-sqlite3": "7.6.13",
     "@vitejs/plugin-vue": "6.0.8",

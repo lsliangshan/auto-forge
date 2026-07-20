@@ -7,6 +7,7 @@
   "engines": { "node": ">=22.12.0 <27" },
   "scripts": {
     "lint": "eslint .",
+    "pretest": "node apps/desktop/scripts/prepare-native-node.mjs",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "vitest run",
     "build": "pnpm -r --filter \"./packages/**\" build && pnpm --filter @autoforge/desktop build",
