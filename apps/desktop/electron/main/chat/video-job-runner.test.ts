@@ -995,6 +995,54 @@ describe('VideoJobRunner', () => {
     expect(harness.database.mediaAssets.get(submittedOutputAssetId)).toBeUndefined()
   })
 
+  it('cancels response bodies rejected before streaming for invalid length and non-success status', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const invalidLength = createHarness()
+    vi.mocked(invalidLength.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    let invalidLengthCancelled = false
+    vi.mocked(invalidLength.provider.downloadVideo!).mockResolvedValue(new Response(
+      new ReadableStream<Uint8Array>({
+        cancel() {
+          invalidLengthCancelled = true
+        },
+      }),
+      { headers: { 'content-type': 'video/mp4', 'content-length': 'invalid' } },
+    ))
+    const invalidLengthRunner = new VideoJobRunner(invalidLength.dependencies)
+    await invalidLengthRunner.submit(submitInput)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(invalidLengthCancelled).toBe(true)
+    expect(invalidLength.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_DOWNLOAD_FAILED',
+    })
+
+    const unsuccessful = createHarness()
+    vi.mocked(unsuccessful.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    let unsuccessfulCancelled = false
+    vi.mocked(unsuccessful.provider.downloadVideo!).mockResolvedValue(new Response(
+      new ReadableStream<Uint8Array>({
+        cancel() {
+          unsuccessfulCancelled = true
+        },
+      }),
+      { status: 502, headers: { 'content-type': 'video/mp4' } },
+    ))
+    const unsuccessfulRunner = new VideoJobRunner(unsuccessful.dependencies)
+    await unsuccessfulRunner.submit(submitInput)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(unsuccessfulCancelled).toBe(true)
+    expect(unsuccessful.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_DOWNLOAD_FAILED',
+    })
+  })
+
   it('normalizes a parameterized mixed-case video Content-Type before persistence', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -1292,6 +1340,63 @@ describe('video job persistence boundaries', () => {
     }
     expect(database.mediaGenerationJobs.listActive().map((job) => job.id))
       .toEqual(['valid_active'])
+  })
+
+  it('does not roll back interrupted recovery when an associated message has malformed blocks JSON', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-corrupt-recovery-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'conversation_corrupt_recovery', title: 'Corrupt' })
+    database.messages.insert({
+      id: 'assistant_corrupt_recovery',
+      conversationId: 'conversation_corrupt_recovery',
+      role: 'assistant',
+      blocks: [{
+        type: 'media_generation',
+        blockId: 'block_corrupt_recovery',
+        jobId: 'request_corrupt_recovery',
+        kind: 'video',
+        status: 'pending',
+      }],
+      createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_corrupt_recovery',
+      conversationId: 'conversation_corrupt_recovery',
+      requestId: 'request_corrupt_recovery',
+      model: route.model,
+      status: 'running',
+      startedAt: 1,
+    })
+    database.mediaGenerationJobs.insert({
+      id: 'request_corrupt_recovery',
+      conversationId: 'conversation_corrupt_recovery',
+      assistantMessageId: 'assistant_corrupt_recovery',
+      provider: 'openrouter',
+      model: route.model,
+      kind: 'video',
+      providerJobId: 'provider_corrupt_recovery',
+      status: 'pending',
+      parameters: {},
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const fault = new Database(path)
+    fault.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run('{not valid json', 'assistant_corrupt_recovery')
+    fault.close()
+
+    expect(() => database.recoverInterrupted()).not.toThrow()
+    expect(database.mediaGenerationJobs.get('request_corrupt_recovery')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(database.chatRuns.get('run_corrupt_recovery')).toMatchObject({
+      status: 'failed',
+      errorCode: 'INTERNAL_ERROR',
+    })
+    expect(database.mediaGenerationJobs.listActive()).toEqual([])
   })
 
   it('rolls back the entire submitted turn when the video job insert fails', () => {

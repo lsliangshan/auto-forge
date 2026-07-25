@@ -880,7 +880,12 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           let failed = 0
           const activeStatuses = new Set(['pending', 'in_progress', 'downloading', 'paused'])
           for (const row of many<Query>(database, 'SELECT id, blocks_json AS blocksJson FROM messages')) {
-            const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+            let blocks: ChatBlock[]
+            try {
+              blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+            } catch {
+              continue
+            }
             let changed = false
             for (const block of blocks) {
               if (block.type !== 'media_generation' || !activeStatuses.has(block.status)) continue

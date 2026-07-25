@@ -658,10 +658,18 @@ export class VideoJobRunner {
       const provider = this.provider(modelProviderIdSchema.parse(job.provider))
       if (!provider.downloadVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
       const response = await provider.downloadVideo(job.providerJobId, signal)
-      const length = contentLength(response)
-      if (length !== undefined && length > MEDIA_LIMITS.generatedBytes) {
+      let length: number | undefined
+      try {
+        if (!response.ok || !response.body) {
+          throw toSafeAppError({ code: 'MEDIA_DOWNLOAD_FAILED' })
+        }
+        length = contentLength(response)
+        if (length !== undefined && length > MEDIA_LIMITS.generatedBytes) {
+          throw toSafeAppError({ code: 'MEDIA_SIZE_LIMIT_EXCEEDED' })
+        }
+      } catch (error) {
         await response.body?.cancel().catch(() => undefined)
-        throw toSafeAppError({ code: 'MEDIA_SIZE_LIMIT_EXCEEDED' })
+        throw error
       }
       const declaredMimeType = response.headers.get('content-type')
         ?.split(';', 1)[0]
