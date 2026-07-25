@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
+import type { Dirent, Stats } from 'node:fs'
 import {
+  type FileHandle,
   lstat,
   mkdir,
   open,
@@ -8,7 +10,7 @@ import {
   rename,
   rm,
 } from 'node:fs/promises'
-import { basename, isAbsolute, join, posix, resolve, sep } from 'node:path'
+import { basename, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import {
   appErrorCodeSchema,
   toSafeAppError,
@@ -33,6 +35,7 @@ const MAX_SNIFF_BYTES = 64 * 1024
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const SAFE_EXTENSIONS = new Set(['png', 'jpg', 'webp', 'gif', 'avif', 'svg', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'mp4', 'webm', 'mov'])
 const MAX_ENCODED_GENERATED_BYTES = Math.ceil(MEDIA_LIMITS.generatedBytes / 3) * 4
+const BASE64_BATCH_CHARACTERS = 64 * 1024
 
 export interface MediaImportPathsInput {
   conversationId: string
@@ -90,7 +93,7 @@ export interface GeneratedStreamInput extends GeneratedWriterInput {
 export interface MediaAssetService {
   importPaths(input: MediaImportPathsInput): Promise<MediaAsset[]>
   importClipboardImage(input: MediaImportBytesInput): Promise<MediaAsset[]>
-  removeDraft(assetId: string): Promise<void>
+  removeDraft(assetId: string, conversationId?: string): Promise<void>
   resolveReadyAsset(assetId: string, conversationId?: string): Promise<ResolvedMediaAsset>
   modelInput(conversationId: string, assetIds: string[]): Promise<ModelMediaInput[]>
   createGeneratedWriter(input: GeneratedWriterInput): Promise<GeneratedAssetWriter>
@@ -117,6 +120,17 @@ export interface CreateMediaAssetServiceOptions {
   mediaRoot: string
   id?: () => string
   now?: () => number
+  filesystem?: Partial<MediaAssetFileSystem>
+}
+
+export interface MediaAssetFileSystem {
+  lstat(path: string): Promise<Stats>
+  mkdir(path: string, options: { recursive: true }): Promise<string | undefined>
+  open(path: string, flags: string, mode?: number): Promise<FileHandle>
+  readdir(path: string, options: { withFileTypes: true }): Promise<Dirent[]>
+  realpath(path: string): Promise<string>
+  rename(source: string, destination: string): Promise<void>
+  rm(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void>
 }
 
 interface StagedMedia {
@@ -202,6 +216,10 @@ function sameFile(left: StableFile, right: StableFile): boolean {
   )
 }
 
+function sameNode(left: StableFile, right: StableFile): boolean {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
 async function writeAll(handle: Awaited<ReturnType<typeof open>>, bytes: Uint8Array): Promise<void> {
   let offset = 0
   while (offset < bytes.byteLength) {
@@ -227,6 +245,16 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
   const configuredRoot = resolve(options.mediaRoot)
   const createId = options.id ?? randomUUID
   const now = options.now ?? Date.now
+  const filesystem: MediaAssetFileSystem = {
+    lstat,
+    mkdir,
+    open,
+    readdir,
+    realpath,
+    rename,
+    rm,
+    ...options.filesystem,
+  }
   let rootPromise: Promise<string> | undefined
 
   const controlledId = () => {
@@ -237,8 +265,8 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
 
   const mediaRoot = async () => {
     rootPromise ??= (async () => {
-      await mkdir(configuredRoot, { recursive: true })
-      return realpath(configuredRoot)
+      await filesystem.mkdir(configuredRoot, { recursive: true })
+      return filesystem.realpath(configuredRoot)
     })()
     return rootPromise
   }
@@ -247,19 +275,27 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     assertIdentifier(conversationId)
     const root = await mediaRoot()
     const conversationPath = join(root, conversationId)
-    await mkdir(conversationPath, { recursive: true })
-    if (await realpath(conversationPath) !== conversationPath) throw failure('MEDIA_IMPORT_FAILED')
+    await filesystem.mkdir(conversationPath, { recursive: true })
+    if (await filesystem.realpath(conversationPath) !== conversationPath) throw failure('MEDIA_IMPORT_FAILED')
     const stagingPath = join(conversationPath, '.staging')
-    await mkdir(stagingPath, { recursive: true })
-    if (await realpath(stagingPath) !== stagingPath) throw failure('MEDIA_IMPORT_FAILED')
+    await filesystem.mkdir(stagingPath, { recursive: true })
+    if (await filesystem.realpath(stagingPath) !== stagingPath) throw failure('MEDIA_IMPORT_FAILED')
     return { root, conversationPath, stagingPath }
   }
 
   const newStage = async (conversationId: string) => {
     const directories = await conversationDirectories(conversationId)
     const path = join(directories.stagingPath, `${randomUUID()}.part`)
-    const handle = await open(path, 'wx', 0o600)
+    const handle = await filesystem.open(path, 'wx', 0o600)
     return { ...directories, path, handle }
+  }
+
+  const mappedNewStage = async (conversationId: string, fallback: AppErrorCode) => {
+    try {
+      return await newStage(conversationId)
+    } catch (error) {
+      throw mappedFailure(error, fallback)
+    }
   }
 
   const existingRequestBytes = (conversationId: string, assetIds: readonly string[]) => {
@@ -309,14 +345,157 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     return absolutePath
   }
 
-  const removeRecordAndFiles = async (record: MediaAssetRecord) => {
-    try {
-      if (record.relativePath) {
-        const path = await safeAssetPath(record)
-        await rm(path, { force: true })
+  const missing = (error: unknown) => (
+    typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && (error as { code?: unknown }).code === 'ENOENT'
+  )
+
+  const verifyManagedDirectory = async (path: string): Promise<StableFile> => {
+    const root = await mediaRoot()
+    const relativePath = relative(root, path)
+    if (relativePath.startsWith(`..${sep}`) || relativePath === '..' || isAbsolute(relativePath)) {
+      throw failure('MEDIA_IMPORT_FAILED')
+    }
+    const metadata = await filesystem.lstat(path)
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw failure('MEDIA_IMPORT_FAILED')
+    if (await filesystem.realpath(path) !== path) throw failure('MEDIA_IMPORT_FAILED')
+    return snapshot(metadata)
+  }
+
+  const verifyManagedAncestors = async (path: string): Promise<Array<{ path: string; identity: StableFile }>> => {
+    const root = await mediaRoot()
+    const relativePath = relative(root, path)
+    if (
+      !relativePath
+      || relativePath.startsWith(`..${sep}`)
+      || relativePath === '..'
+      || isAbsolute(relativePath)
+    ) throw failure('MEDIA_IMPORT_FAILED')
+    const segments = relativePath.split(sep)
+    const quarantine = segments[0] === '.quarantine' && segments.length === 2
+    const conversationFile = (
+      ID_PATTERN.test(segments[0]!)
+      && (segments.length === 2 || (segments.length === 3 && segments[1] === '.staging'))
+    )
+    if (!quarantine && !conversationFile) throw failure('MEDIA_IMPORT_FAILED')
+    const directories = [root]
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      directories.push(join(root, ...segments.slice(0, index + 1)))
+    }
+    const verified: Array<{ path: string; identity: StableFile }> = []
+    for (const directory of directories) {
+      verified.push({ path: directory, identity: await verifyManagedDirectory(directory) })
+    }
+    return verified
+  }
+
+  const reverifyAncestors = async (ancestors: Array<{ path: string; identity: StableFile }>) => {
+    for (const ancestor of ancestors) {
+      if (!sameNode(ancestor.identity, await verifyManagedDirectory(ancestor.path))) {
+        throw failure('MEDIA_IMPORT_FAILED')
       }
-    } finally {
+    }
+  }
+
+  const verifyManagedFile = async (path: string, expected?: StableFile): Promise<StableFile> => {
+    await verifyManagedAncestors(path)
+    const metadata = await filesystem.lstat(path)
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('MEDIA_IMPORT_FAILED')
+    if (await filesystem.realpath(path) !== path) throw failure('MEDIA_IMPORT_FAILED')
+    const identity = snapshot(metadata)
+    if (expected && !sameFile(expected, identity)) throw failure('MEDIA_IMPORT_FAILED')
+    return identity
+  }
+
+  const restoreQuarantinedSubstitute = async (quarantinePath: string, originalPath: string) => {
+    try {
+      await filesystem.rename(quarantinePath, originalPath)
+    } catch {
+      // The quarantined file is retained rather than deleted if restoration cannot be proven safe.
+    }
+  }
+
+  const quarantineAndDelete = async (path: string, expected?: StableFile): Promise<void> => {
+    const originalAncestors = await verifyManagedAncestors(path)
+    const originalIdentity = await verifyManagedFile(path, expected)
+    const root = await mediaRoot()
+    const quarantineDirectory = join(root, '.quarantine')
+    await filesystem.mkdir(quarantineDirectory, { recursive: true })
+    const quarantineParentIdentity = await verifyManagedDirectory(quarantineDirectory)
+    const quarantinePath = join(quarantineDirectory, `${randomUUID()}.delete`)
+    try {
+      await filesystem.lstat(quarantinePath)
+      throw failure('MEDIA_IMPORT_FAILED')
+    } catch (error) {
+      if (!missing(error)) throw error
+    }
+
+    await filesystem.rename(path, quarantinePath)
+    let quarantinedIdentity: StableFile
+    try {
+      quarantinedIdentity = await verifyManagedFile(quarantinePath)
+    } catch (error) {
+      await restoreQuarantinedSubstitute(quarantinePath, path)
+      throw error
+    }
+    if (!sameNode(originalIdentity, quarantinedIdentity) || originalIdentity.size !== quarantinedIdentity.size) {
+      await restoreQuarantinedSubstitute(quarantinePath, path)
+      throw failure('MEDIA_IMPORT_FAILED')
+    }
+    try {
+      await filesystem.lstat(path)
+      throw failure('MEDIA_IMPORT_FAILED')
+    } catch (error) {
+      if (!missing(error)) throw error
+    }
+    try {
+      await reverifyAncestors(originalAncestors)
+      if (!sameNode(quarantineParentIdentity, await verifyManagedDirectory(quarantineDirectory))) {
+        throw failure('MEDIA_IMPORT_FAILED')
+      }
+      if (!sameFile(quarantinedIdentity, await verifyManagedFile(quarantinePath))) {
+        throw failure('MEDIA_IMPORT_FAILED')
+      }
+    } catch (error) {
+      throw mappedFailure(error, 'MEDIA_IMPORT_FAILED')
+    }
+
+    await filesystem.rm(quarantinePath, { force: true })
+    try {
+      await filesystem.lstat(quarantinePath)
+      throw failure('MEDIA_IMPORT_FAILED')
+    } catch (error) {
+      if (!missing(error)) throw error
+    }
+    if (!sameNode(quarantineParentIdentity, await verifyManagedDirectory(quarantineDirectory))) {
+      throw failure('MEDIA_IMPORT_FAILED')
+    }
+  }
+
+  const cleanupManagedFile = async (path: string) => {
+    try {
+      await quarantineAndDelete(path)
+    } catch {
+      // Cleanup fails closed. Unverified paths are never passed to a destructive operation.
+    }
+  }
+
+  const removeRecordAndFiles = async (record: MediaAssetRecord) => {
+    if (record.relativePath) {
+      const path = await safeAssetPath(record)
+      await quarantineAndDelete(path)
+    }
+    try {
       database.mediaAssets.delete(record.id)
+    } catch (error) {
+      try {
+        database.mediaAssets.update(record.id, { status: 'failed', updatedAt: now() })
+      } catch {
+        // The original persistence error remains authoritative.
+      }
+      throw error
     }
   }
 
@@ -353,7 +532,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     try {
       database.mediaAssets.insert(record)
       inserted = true
-      await rename(staged.path, destination)
+      await filesystem.rename(staged.path, destination)
       renamed = true
       const ready = database.mediaAssets.update(id, { status: 'ready', updatedAt: now() })
       if (!ready || ready.status !== 'ready') throw new Error('Media asset did not become ready')
@@ -361,13 +540,18 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     } catch (error) {
       if (inserted) {
         try {
+          database.mediaAssets.update(id, { status: 'failed', updatedAt: now() })
+        } catch {
+          // Deletion is still attempted; a successful failed-state update prevents a ready orphan.
+        }
+        try {
           database.mediaAssets.delete(id)
         } catch {
           // Cleanup continues with the file; no ready result is returned.
         }
       }
-      await rm(staged.path, { force: true }).catch(() => undefined)
-      if (renamed) await rm(destination, { force: true }).catch(() => undefined)
+      await cleanupManagedFile(staged.path)
+      if (renamed) await cleanupManagedFile(destination)
       throw mappedFailure(error, fallback)
     }
   }
@@ -381,7 +565,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     if (bytes.byteLength > maximum) throw failure('MEDIA_SIZE_LIMIT_EXCEEDED')
     const detected = detectMediaType(bytes)
     if (!detected) throw failure('MEDIA_TYPE_UNSUPPORTED')
-    const stage = await newStage(conversationId)
+    const stage = await mappedNewStage(conversationId, fallback)
     try {
       await writeAll(stage.handle, bytes)
       await stage.handle.sync()
@@ -394,7 +578,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       }
     } catch (error) {
       await stage.handle.close().catch(() => undefined)
-      await rm(stage.path, { force: true }).catch(() => undefined)
+      await cleanupManagedFile(stage.path)
       throw mappedFailure(error, fallback)
     }
   }
@@ -408,13 +592,13 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     let stageHandle: Awaited<ReturnType<typeof open>> | undefined
     let stagePath: string | undefined
     try {
-      const initialPathStat = await lstat(sourcePath)
+      const initialPathStat = await filesystem.lstat(sourcePath)
       if (initialPathStat.isSymbolicLink() || !initialPathStat.isFile()) throw failure('MEDIA_IMPORT_FAILED')
       const initial = snapshot(initialPathStat)
-      const initialRealPath = await realpath(sourcePath)
-      sourceHandle = await open(sourcePath, 'r')
+      const initialRealPath = await filesystem.realpath(sourcePath)
+      sourceHandle = await filesystem.open(sourcePath, 'r')
       const opened = snapshot(await sourceHandle.stat())
-      if (!sameFile(initial, opened) || await realpath(sourcePath) !== initialRealPath) {
+      if (!sameFile(initial, opened) || await filesystem.realpath(sourcePath) !== initialRealPath) {
         throw failure('MEDIA_IMPORT_FAILED')
       }
       const prefix = await readPrefix(sourceHandle, opened.size)
@@ -441,12 +625,12 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       }
       if (byteSize !== opened.size) throw failure('MEDIA_IMPORT_FAILED')
       const afterHandle = snapshot(await sourceHandle.stat())
-      const afterPath = await lstat(sourcePath)
+      const afterPath = await filesystem.lstat(sourcePath)
       if (
         afterPath.isSymbolicLink()
         || !sameFile(opened, afterHandle)
         || !sameFile(afterHandle, snapshot(afterPath))
-        || await realpath(sourcePath) !== initialRealPath
+        || await filesystem.realpath(sourcePath) !== initialRealPath
       ) throw failure('MEDIA_IMPORT_FAILED')
       await stageHandle.sync()
       await stageHandle.close()
@@ -462,13 +646,13 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     } catch (error) {
       await sourceHandle?.close().catch(() => undefined)
       await stageHandle?.close().catch(() => undefined)
-      if (stagePath) await rm(stagePath, { force: true }).catch(() => undefined)
+      if (stagePath) await cleanupManagedFile(stagePath)
       throw mappedFailure(error, 'MEDIA_IMPORT_FAILED')
     }
   }
 
   const stageGeneratedStream = async (input: GeneratedStreamInput): Promise<StagedMedia> => {
-    const stage = await newStage(input.conversationId)
+    const stage = await mappedNewStage(input.conversationId, 'MEDIA_GENERATION_FAILED')
     const hash = createHash('sha256')
     let byteSize = 0
     const prefixParts: Buffer[] = []
@@ -499,7 +683,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       return { path: stage.path, byteSize, sha256: hash.digest('hex'), detected }
     } catch (error) {
       await stage.handle.close().catch(() => undefined)
-      await rm(stage.path, { force: true }).catch(() => undefined)
+      await cleanupManagedFile(stage.path)
       throw mappedFailure(error, 'MEDIA_GENERATION_FAILED')
     }
   }
@@ -514,12 +698,12 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     const absolutePath = await safeAssetPath(record)
     let handle: Awaited<ReturnType<typeof open>> | undefined
     try {
-      const pathStat = await lstat(absolutePath)
+      const pathStat = await filesystem.lstat(absolutePath)
       if (pathStat.isSymbolicLink() || !pathStat.isFile()) throw failure('MEDIA_ASSET_UNAVAILABLE')
       const before = snapshot(pathStat)
-      const canonical = await realpath(absolutePath)
+      const canonical = await filesystem.realpath(absolutePath)
       if (canonical !== absolutePath) throw failure('MEDIA_ASSET_UNAVAILABLE')
-      handle = await open(absolutePath, 'r')
+      handle = await filesystem.open(absolutePath, 'r')
       const opened = snapshot(await handle.stat())
       if (!sameFile(before, opened) || opened.size !== record.byteSize) throw failure('MEDIA_ASSET_UNAVAILABLE')
       const hash = createHash('sha256')
@@ -542,14 +726,14 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
         }
       }
       const after = snapshot(await handle.stat())
-      const afterPath = await lstat(absolutePath)
+      const afterPath = await filesystem.lstat(absolutePath)
       if (
         byteSize !== record.byteSize
         || hash.digest('hex') !== record.sha256
         || !sameFile(opened, after)
         || afterPath.isSymbolicLink()
         || !sameFile(after, snapshot(afterPath))
-        || await realpath(absolutePath) !== canonical
+        || await filesystem.realpath(absolutePath) !== canonical
       ) throw failure('MEDIA_ASSET_UNAVAILABLE')
       const detected = detectMediaType(Buffer.concat(prefixParts, prefixBytes))
       if (!detected || detected.kind !== record.kind || detected.mimeType !== record.mimeType) {
@@ -574,7 +758,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       const existingBytes = existingRequestBytes(input.conversationId, input.existingAssetIds)
       let preflightBytes = existingBytes
       for (const path of input.paths) {
-        const metadata = await lstat(path).catch((error: unknown) => { throw mappedFailure(error, 'MEDIA_IMPORT_FAILED') })
+        const metadata = await filesystem.lstat(path).catch((error: unknown) => { throw mappedFailure(error, 'MEDIA_IMPORT_FAILED') })
         if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('MEDIA_IMPORT_FAILED')
         preflightBytes += metadata.size
         if (preflightBytes > MEDIA_LIMITS.requestBytes) throw failure('MEDIA_SIZE_LIMIT_EXCEEDED')
@@ -610,21 +794,43 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       }
       const staged = await stageBytes(input.conversationId, input.bytes, MEDIA_LIMITS.imageBytes, 'MEDIA_IMPORT_FAILED')
       if (staged.detected.kind !== 'image' || staged.detected.mimeType !== input.mimeType) {
-        await rm(staged.path, { force: true }).catch(() => undefined)
+        await cleanupManagedFile(staged.path)
         throw failure('MEDIA_MIME_MISMATCH')
       }
       return [await commitStage(input, 'upload', staged, 'MEDIA_IMPORT_FAILED')]
     },
 
-    async removeDraft(assetId) {
+    async removeDraft(assetId, conversationId) {
       assertIdentifier(assetId)
+      if (conversationId !== undefined) assertIdentifier(conversationId)
       const record = database.mediaAssets.get(assetId)
       if (!record) return
+      if (conversationId !== undefined && record.conversationId !== conversationId) {
+        throw failure('MEDIA_ASSET_UNAVAILABLE')
+      }
       if (record.messageId) throw failure('CONFLICT')
+      let path: string | undefined
+      let fileDeleted = false
       try {
-        database.mediaAssets.update(assetId, { status: 'deleting', updatedAt: now() })
-        await removeRecordAndFiles(record)
+        path = await safeAssetPath(record)
+        const identity = await verifyManagedFile(path)
+        const deleting = database.mediaAssets.update(assetId, { status: 'deleting', updatedAt: now() })
+        if (!deleting || deleting.messageId) throw failure('CONFLICT')
+        await quarantineAndDelete(path, identity)
+        fileDeleted = true
+        database.mediaAssets.delete(assetId)
       } catch (error) {
+        const current = database.mediaAssets.get(assetId)
+        if (current?.status === 'deleting') {
+          try {
+            database.mediaAssets.update(assetId, {
+              status: fileDeleted ? 'failed' : 'ready',
+              updatedAt: now(),
+            })
+          } catch {
+            // A failed restore remains non-ready rather than authorizing an unsafe delete.
+          }
+        }
         throw mappedFailure(error, 'MEDIA_IMPORT_FAILED')
       }
     },
@@ -684,9 +890,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       assertIdentifier(input.messageId)
       if (!input.model.trim() || !input.name.trim()) throw failure('INVALID_INPUT')
       const declaredMimeType = (input as GeneratedWriterInput & { declaredMimeType?: string }).declaredMimeType
-      const stage = await newStage(input.conversationId).catch((error: unknown) => {
-        throw mappedFailure(error, 'MEDIA_GENERATION_FAILED')
-      })
+      const stage = await mappedNewStage(input.conversationId, 'MEDIA_GENERATION_FAILED')
       const hash = createHash('sha256')
       let byteSize = 0
       let encodedCharacters = 0
@@ -697,7 +901,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
 
       const cleanup = async () => {
         await stage.handle.close().catch(() => undefined)
-        await rm(stage.path, { force: true }).catch(() => undefined)
+        await cleanupManagedFile(stage.path)
       }
 
       const writeDecoded = async (encoded: string) => {
@@ -714,6 +918,12 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
         await writeAll(stage.handle, bytes)
       }
 
+      const writeDecodedBatches = async (encoded: string) => {
+        for (let offset = 0; offset < encoded.length; offset += BASE64_BATCH_CHARACTERS) {
+          await writeDecoded(encoded.slice(offset, offset + BASE64_BATCH_CHARACTERS))
+        }
+      }
+
       const append = async (chunk: string) => {
         if (state !== 'open') throw failure('MEDIA_GENERATION_FAILED')
         if (!chunk) return
@@ -722,19 +932,26 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
           throw failure(encodedCharacters > MAX_ENCODED_GENERATED_BYTES ? 'MEDIA_SIZE_LIMIT_EXCEEDED' : 'MEDIA_GENERATION_FAILED')
         }
         if (sawPadding) throw failure('MEDIA_GENERATION_FAILED')
-        pending += chunk
-        while (pending.length >= 4) {
-          const quartet = pending.slice(0, 4)
-          pending = pending.slice(4)
-          if (/^[A-Za-z0-9+/]{4}$/.test(quartet)) {
-            await writeDecoded(quartet)
-            continue
-          }
-          if (!/^(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$/.test(quartet) || pending.length > 0) {
+        const combined = pending + chunk
+        const completeLength = combined.length - (combined.length % 4)
+        const complete = combined.slice(0, completeLength)
+        pending = combined.slice(completeLength)
+        const paddingIndex = complete.indexOf('=')
+        if (paddingIndex >= 0) {
+          const finalQuartetOffset = complete.length - 4
+          const finalQuartet = complete.slice(finalQuartetOffset)
+          if (
+            pending.length > 0
+            || paddingIndex < finalQuartetOffset
+            || !/^(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$/.test(finalQuartet)
+          ) {
             throw failure('MEDIA_GENERATION_FAILED')
           }
+          await writeDecodedBatches(complete.slice(0, finalQuartetOffset))
           sawPadding = true
-          await writeDecoded(quartet)
+          await writeDecoded(finalQuartet)
+        } else {
+          await writeDecodedBatches(complete)
         }
       }
 
@@ -759,7 +976,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
             if (pending.length > 0) await writeDecoded(pending)
             await stage.handle.sync()
             await stage.handle.close()
-            const handle = await open(stage.path, 'r')
+            const handle = await filesystem.open(stage.path, 'r')
             const prefix = await readPrefix(handle, byteSize)
             await handle.close()
             const detected = detectMediaType(prefix)
@@ -814,25 +1031,35 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     async cleanupDrafts(olderThan) {
       if (!Number.isFinite(olderThan) || olderThan < 0) throw failure('INVALID_INPUT')
       for (const record of database.mediaAssets.listUnclaimedBefore(olderThan)) {
-        await service.removeDraft(record.id)
+        try {
+          await service.removeDraft(record.id)
+        } catch {
+          // Cleanup is per-entry: unsafe or raced drafts remain for later recovery.
+        }
       }
       const root = await mediaRoot()
-      const conversations = await readdir(root, { withFileTypes: true })
+      const conversations = await filesystem.readdir(root, { withFileTypes: true })
       for (const conversation of conversations) {
         if (!conversation.isDirectory() || !ID_PATTERN.test(conversation.name)) continue
-        const stagingPath = join(root, conversation.name, '.staging')
-        let stagingStat
         try {
-          stagingStat = await lstat(stagingPath)
+          const conversationPath = join(root, conversation.name)
+          await verifyManagedDirectory(conversationPath)
+          const stagingPath = join(conversationPath, '.staging')
+          await verifyManagedDirectory(stagingPath)
+          for (const entry of await filesystem.readdir(stagingPath, { withFileTypes: true })) {
+            if (!entry.isFile()) continue
+            const path = join(stagingPath, entry.name)
+            try {
+              const metadata = await filesystem.lstat(path)
+              if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.mtimeMs >= olderThan) continue
+              await quarantineAndDelete(path, snapshot(metadata))
+            } catch {
+              // One unsafe or raced orphan must not authorize deletion or block other entries.
+            }
+          }
         } catch {
+          // A swapped or symlinked managed ancestor is skipped without following it.
           continue
-        }
-        if (stagingStat.isSymbolicLink() || !stagingStat.isDirectory()) continue
-        for (const entry of await readdir(stagingPath, { withFileTypes: true })) {
-          if (!entry.isFile()) continue
-          const path = join(stagingPath, entry.name)
-          const metadata = await lstat(path)
-          if (!metadata.isSymbolicLink() && metadata.mtimeMs < olderThan) await rm(path, { force: true })
         }
       }
     },
