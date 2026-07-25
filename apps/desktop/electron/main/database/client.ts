@@ -15,7 +15,17 @@ export function openAppDatabase(path: string) {
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
     const executions = sqlite.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run(endedAt).changes
-    const chatRuns = sqlite.prepare("UPDATE chat_runs SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')").run(endedAt).changes
+    const chatRuns = sqlite.prepare(`
+      UPDATE chat_runs
+      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = ?
+      WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM media_generation_jobs
+          WHERE media_generation_jobs.id = chat_runs.request_id
+            AND media_generation_jobs.status IN ('pending', 'in_progress', 'downloading', 'paused')
+        )
+    `).run(endedAt).changes
     repositories.messages.failInterruptedMediaGenerations()
     return { executions, chatRuns }
   })()

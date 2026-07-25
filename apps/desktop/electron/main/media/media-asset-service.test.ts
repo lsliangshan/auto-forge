@@ -565,6 +565,45 @@ describe('MediaAssetService generated outputs', () => {
     })
   })
 
+  it('commits a caller-bound generated asset ID without overwriting an existing recovery asset', async () => {
+    const service = createMediaAssetService({ database, mediaRoot })
+    async function* stream() {
+      yield mp4
+    }
+
+    await expect(service.commitGeneratedStream({
+      assetId: 'video_recovery_asset',
+      conversationId: 'conversation_1',
+      messageId: 'message_video',
+      kind: 'video',
+      provider: 'openrouter',
+      model: 'video-model',
+      name: 'generated-video.mp4',
+      stream: stream(),
+      declaredMimeType: 'video/mp4',
+    })).resolves.toMatchObject({
+      id: 'video_recovery_asset',
+      kind: 'video',
+      mimeType: 'video/mp4',
+    })
+
+    await expect(service.commitGeneratedStream({
+      assetId: 'video_recovery_asset',
+      conversationId: 'conversation_1',
+      messageId: 'other_message',
+      kind: 'video',
+      provider: 'openrouter',
+      model: 'other-model',
+      name: 'replacement.mp4',
+      stream: stream(),
+    })).rejects.toMatchObject({ code: 'MEDIA_GENERATION_FAILED' })
+    expect(database.mediaAssets.get('video_recovery_asset')).toMatchObject({
+      model: 'video-model',
+      status: 'ready',
+    })
+    expect(await stagingEntries()).toEqual([])
+  })
+
   it('enforces generated encoded and streamed limits before expanding an oversized chunk', async () => {
     const service = createMediaAssetService({ database, mediaRoot })
     const encodedCeiling = Math.ceil(MEDIA_LIMITS.generatedBytes / 3) * 4

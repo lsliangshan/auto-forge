@@ -65,6 +65,7 @@ export interface ModelMediaInput {
 }
 
 export interface GeneratedWriterInput {
+  assetId?: string
   conversationId: string
   messageId: string
   kind: 'image' | 'audio' | 'video'
@@ -617,7 +618,9 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     staged: StagedMedia,
     fallback: AppErrorCode,
   ): Promise<MediaAsset> => {
-    const id = controlledId()
+    const id = 'assetId' in input && input.assetId !== undefined
+      ? (assertIdentifier(input.assetId), input.assetId)
+      : controlledId()
     const relativePath = posix.join(input.conversationId, `${id}.${staged.detected.extension}`)
     const root = await mediaRoot()
     const destination = resolve(root, ...relativePath.split('/'))
