@@ -152,6 +152,19 @@ const videoCapabilityModelSchema = z.object({
   supported_aspect_ratios: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
 }).passthrough()
 
+const modelContentPartSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('text'),
+    text: z.string(),
+  }).strict(),
+  z.object({
+    type: z.literal('media'),
+    kind: z.enum(['image', 'audio', 'video']),
+    mimeType: z.string().min(1),
+    dataBase64: z.string(),
+  }).strict(),
+])
+
 const streamChunkSchema = z.object({
   id: z.string().optional(),
   choices: z.array(z.object({
@@ -578,9 +591,20 @@ function assertSupportedRequest(request: ModelStreamRequest, config: OpenAiCompa
     throw failure('MODEL_MODALITY_UNSUPPORTED')
   }
   for (const message of request.messages) {
-    if (typeof message.content === 'string' || message.content === null) continue
-    for (const part of message.content) {
-      if (part.type !== 'media') continue
+    if (message.role === 'assistant') {
+      if (typeof message.content !== 'string' && message.content !== null) throw failure('INVALID_INPUT')
+      continue
+    }
+    if (message.role === 'tool') {
+      if (typeof message.content !== 'string') throw failure('INVALID_INPUT')
+      continue
+    }
+    if (typeof message.content === 'string') continue
+    if (!Array.isArray(message.content)) throw failure('INVALID_INPUT')
+    const parsed = modelContentPartSchema.array().safeParse(message.content)
+    if (!parsed.success) throw failure('INVALID_INPUT')
+    for (const part of parsed.data) {
+      if (part.type === 'text') continue
       if (!config.supportsMediaInput) throw failure('MODEL_MODALITY_UNSUPPORTED')
       const compatible = part.kind === 'image'
         ? IMAGE_MIME_TYPES.has(part.mimeType)
@@ -593,17 +617,29 @@ function assertSupportedRequest(request: ModelStreamRequest, config: OpenAiCompa
 }
 
 function wireContentPart(part: ModelContentPart): unknown {
-  if (part.type === 'text') return part
-  if (part.kind === 'image') {
-    return { type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
-  }
-  if (part.kind === 'audio') {
-    return {
-      type: 'input_audio',
-      input_audio: { data: part.dataBase64, format: AUDIO_FORMAT_BY_MIME.get(part.mimeType)! },
+  switch (part.type) {
+    case 'text':
+      return part
+    case 'media':
+      switch (part.kind) {
+        case 'image':
+          if (!IMAGE_MIME_TYPES.has(part.mimeType)) throw failure('MODEL_MODALITY_UNSUPPORTED')
+          return { type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
+        case 'audio': {
+          const format = AUDIO_FORMAT_BY_MIME.get(part.mimeType)
+          if (!format) throw failure('MODEL_MODALITY_UNSUPPORTED')
+          return {
+            type: 'input_audio',
+            input_audio: { data: part.dataBase64, format },
+          }
+        }
+        case 'video':
+          if (!VIDEO_MIME_TYPES.has(part.mimeType)) throw failure('MODEL_MODALITY_UNSUPPORTED')
+          return { type: 'video_url', video_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
+      }
+      throw failure('INVALID_INPUT')
     }
-  }
-  return { type: 'video_url', video_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
+  throw failure('INVALID_INPUT')
 }
 
 function wireMessages(messages: ModelMessage[]): unknown[] {
@@ -721,7 +757,12 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         } catch (error) {
           if (isAbort(error, request.signal)) throw failure('CANCELLED')
           if (error instanceof TypeError) throw new RetryableFailure(undefined, error)
-          throw error
+          if (error instanceof RetryableFailure) throw error
+          if (typeof error === 'object' && error !== null && 'code' in error) {
+            const safe = toSafeAppError(error)
+            if (safe.code !== 'INTERNAL_ERROR' || error.code === 'INTERNAL_ERROR') throw safe
+          }
+          throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         }
       } catch (error) {
         if (!(error instanceof RetryableFailure) || attempt === MAX_ATTEMPTS - 1) {

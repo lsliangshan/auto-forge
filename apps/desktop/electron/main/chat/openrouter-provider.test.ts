@@ -24,6 +24,15 @@ async function collect(stream: AsyncIterable<OpenRouterStreamEvent>) {
   return values
 }
 
+async function rejection(stream: AsyncIterable<OpenRouterStreamEvent>): Promise<unknown> {
+  try {
+    await collect(stream)
+    return new Error('Expected stream rejection')
+  } catch (error) {
+    return error
+  }
+}
+
 const credential = { get: vi.fn(async () => 'sk-private') }
 
 describe('OpenRouterProvider', () => {
@@ -212,6 +221,31 @@ describe('OpenRouterProvider', () => {
   })
 
   it.each([
+    ['non-array structured content', { type: 'text', text: 'not wrapped in an array' }],
+    ['an unknown part type', [{ type: 'bogus', kind: 'image', mimeType: 'image/png', dataBase64: 'AQID' }]],
+    ['an unknown media kind', [{ type: 'media', kind: 'document', mimeType: 'video/mp4', dataBase64: 'AQID' }]],
+    ['a text part without text', [{ type: 'text' }]],
+    ['a media part without MIME', [{ type: 'media', kind: 'image', dataBase64: 'AQID' }]],
+    ['a media part without data', [{ type: 'media', kind: 'image', mimeType: 'image/png' }]],
+  ])('rejects %s before reading credentials or fetching', async (_description, content) => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const fetch = vi.fn(async () => sseResponse([]))
+    const provider = new OpenRouterProvider({ credential: localCredential, fetch })
+
+    const error = await rejection(provider.stream({
+      model: 'media-model',
+      messages: [{ role: 'user', content } as never],
+    }))
+
+    expect(error).toMatchObject({
+      code: 'INVALID_INPUT',
+      message: 'The request is invalid.',
+    })
+    expect(localCredential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
     ['audio/mpeg', 'mp3'],
     ['audio/wav', 'wav'],
     ['audio/ogg', 'ogg'],
@@ -312,6 +346,105 @@ describe('OpenRouterProvider', () => {
       { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AQI=' },
       { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AwQ=' },
     ])
+  })
+
+  it.each([
+    [
+      'invalid JSON',
+      'RAW_JSON_SECRET',
+      'data: {"choices":[RAW_JSON_SECRET\n\n',
+    ],
+    [
+      'schema-invalid audio',
+      'RAW_AUDIO_SECRET',
+      'data: {"choices":[{"index":0,"delta":{"audio":{"data":42,"transcript":"RAW_AUDIO_SECRET"}}}]}\n\n',
+    ],
+    [
+      'an incomplete tool fragment',
+      'RAW_TOOL_SECRET',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"RAW_TOOL_SECRET","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    ],
+  ])('maps %s to a fixed safe error and cancels the reader', async (_description, marker, payload) => {
+    const encoder = new TextEncoder()
+    let readerCancelled = false
+    const fetch = vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(payload))
+      },
+      cancel() { readerCancelled = true },
+    })))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    const error = await rejection(provider.stream({ model: 'm', messages: [] }))
+
+    expect(error).toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+    expect(JSON.stringify(error)).not.toContain(marker)
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(readerCancelled).toBe(true)
+  })
+
+  it.each([
+    [
+      'text',
+      'data: {"choices":[{"index":0,"delta":{"content":"SAFE"}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"content":"RAW_TEXT_DIVERGENCE"}}]}\n\n',
+      'RAW_TEXT_DIVERGENCE',
+    ],
+    [
+      'audio',
+      'data: {"choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"audio":{"data":"UkFXX0FVRElPX0RJVkVSR0VOQ0U="}}}]}\n\n',
+      'RAW_AUDIO_DIVERGENCE',
+    ],
+  ])('maps divergent %s replay to a fixed safe error and cancels the replay reader', async (
+    _kind,
+    firstPayload,
+    divergentPayload,
+    marker,
+  ) => {
+    const encoder = new TextEncoder()
+    let attempt = 0
+    let replayReaderCancelled = false
+    const fetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) {
+        let emitted = false
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (!emitted) {
+              emitted = true
+              controller.enqueue(encoder.encode(firstPayload))
+            } else {
+              controller.error(new TypeError('socket closed'))
+            }
+          },
+        }))
+      }
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(divergentPayload))
+        },
+        cancel() { replayReaderCancelled = true },
+      }))
+    })
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch,
+      sleep: async () => undefined,
+    })
+
+    const error = await rejection(provider.stream({ model: 'm', messages: [] }))
+
+    expect(error).toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+    expect(JSON.stringify(error)).not.toContain(marker)
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(replayReaderCancelled).toBe(true)
   })
 
   it('merges stable capability metadata by exact model ID without dropping media-only models', async () => {
