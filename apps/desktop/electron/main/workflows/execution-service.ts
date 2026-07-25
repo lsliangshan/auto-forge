@@ -445,6 +445,22 @@ export class ExecutionService {
     await this.finish(executionId, 'cancelled', failure('CANCELLED'))
   }
 
+  async shutdown(): Promise<void> {
+    const executionIds = new Set([
+      ...this.reservationsById.keys(),
+      ...this.active.keys(),
+    ])
+    await Promise.allSettled([...executionIds].map(async (executionId) => {
+      await this.cancel(executionId)
+      const active = this.active.get(executionId)
+      if (active?.finishing) await active.finishing
+      else if (active) await active.finished.catch(() => undefined)
+    }))
+    await Promise.allSettled([...this.active.values()].map((active) => (
+      active.finishing ?? active.finished.then(() => undefined, () => undefined)
+    )))
+  }
+
   private async resolveEntryPath(
     input: ExecutionStartInput,
     source: WorkflowExecutionSource,

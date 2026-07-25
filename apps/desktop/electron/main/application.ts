@@ -80,6 +80,7 @@ export interface ApplicationRuntimeOptions {
   emitExecution(event: ExecutionEvent): void
   browserRuntime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
+  removeExecutionTemporaryDirectory?(path: string): Promise<void>
 }
 
 function failure(code: AppError['code']): AppError {
@@ -95,38 +96,57 @@ const defaultGenerationPreferences = conversationGenerationPreferencesSchema.par
 export class MaintenanceGate {
   private maintenance = false
   private starts = 0
+  private stopped = false
+  private readonly drainWaiters = new Set<() => void>()
+
+  private resolveDrainWaiters(): void {
+    if (this.starts !== 0 || this.maintenance) return
+    for (const resolve of this.drainWaiters) resolve()
+    this.drainWaiters.clear()
+  }
 
   beginStart(): () => void {
-    if (this.maintenance) throw failure('CONFLICT')
+    if (this.maintenance || this.stopped) throw failure('CONFLICT')
     this.starts += 1
     let active = true
     return () => {
       if (!active) return
       active = false
       this.starts -= 1
+      this.resolveDrainWaiters()
     }
   }
 
   clearLocalData(hasActiveWork: () => boolean, clear: () => void): void {
-    if (this.maintenance) throw failure('CONFLICT')
+    if (this.maintenance || this.stopped) throw failure('CONFLICT')
     this.maintenance = true
     try {
       if (this.starts > 0 || hasActiveWork()) throw failure('CONFLICT')
       clear()
     } finally {
       this.maintenance = false
+      this.resolveDrainWaiters()
     }
   }
 
   async runExclusive<T>(hasActiveWork: () => boolean, operation: () => Promise<T>): Promise<T> {
-    if (this.maintenance) throw failure('CONFLICT')
+    if (this.maintenance || this.stopped) throw failure('CONFLICT')
     this.maintenance = true
     try {
       if (this.starts > 0 || hasActiveWork()) throw failure('CONFLICT')
       return await operation()
     } finally {
       this.maintenance = false
+      this.resolveDrainWaiters()
     }
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stopped = true
+    if (this.starts === 0 && !this.maintenance) return
+    await new Promise<void>((resolve) => {
+      this.drainWaiters.add(resolve)
+    })
   }
 }
 
@@ -333,7 +353,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     emit: emitExecution,
     temporaryDirectories: {
       create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-execution-')) },
-      remove: (path) => rm(path, { recursive: true, force: true }),
+      remove: options.removeExecutionTemporaryDirectory
+        ?? ((path) => rm(path, { recursive: true, force: true })),
     },
   })
   const emitChat = (event: ChatEvent) => {
@@ -814,16 +835,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     close: async () => {
       acceptingWork = false
+      const admittedStarts = maintenance.stopAndDrain()
       await videoJobs.stop()
+      await admittedStarts
       await Promise.allSettled([...activeRequests].flatMap((requestId) => [
         agent.cancel(requestId),
         mediaGeneration.cancel(requestId),
       ]))
       await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
-      await Promise.allSettled([...activeExecutions].map(async (executionId) => {
-        await executions.cancel(executionId)
-        await browser.closeExecution(executionId)
-      }))
+      await executions.shutdown()
       database.close()
     },
   }

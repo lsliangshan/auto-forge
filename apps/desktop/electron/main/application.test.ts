@@ -772,9 +772,13 @@ describe('createApplicationRuntime', () => {
 
     await expect(runtime.services.chat.deleteConversation(conversation.id))
       .rejects.toMatchObject({ code: 'CONFLICT' })
+    let closed = false
+    const closing = runtime.close().then(() => { closed = true })
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    expect(closed).toBe(false)
     finishValidation({ valid: true })
     await sending
-    await runtime.close()
+    await closing
   })
 
   it('uses the video runner for pause/resume and stops polling timers before database close', async () => {
@@ -1304,9 +1308,31 @@ describe('createApplicationRuntime', () => {
     release()
   })
 
+  it('drains an in-progress exclusive operation before shutdown admission closes', async () => {
+    const gate = new MaintenanceGate()
+    let finish!: () => void
+    const operation = gate.runExclusive(
+      () => false,
+      () => new Promise<void>((resolve) => { finish = resolve }),
+    )
+    let drained = false
+    const draining = gate.stopAndDrain().then(() => { drained = true })
+    await Promise.resolve()
+    expect(drained).toBe(false)
+
+    finish()
+    await operation
+    await draining
+    expect(() => gate.beginStart()).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+  })
+
   it('runs the exact development project even when an installed workflow has the same identity', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)
+    let markCleanupStarted!: () => void
+    let finishCleanup!: () => void
+    const cleanupStarted = new Promise<void>((resolve) => { markCleanupStarted = resolve })
+    const cleanupFinished = new Promise<void>((resolve) => { finishCleanup = resolve })
     const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
@@ -1329,6 +1355,11 @@ describe('createApplicationRuntime', () => {
       revealPath: () => undefined,
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+      removeExecutionTemporaryDirectory: async (path: string) => {
+        markCleanupStarted()
+        await cleanupFinished
+        await rm(path, { recursive: true, force: true })
+      },
     })
     const installedProject = await runtime.services.developer.createProject('Installed Debug Source')
     const selectedProject = await runtime.services.developer.createProject('Selected Debug Source')
@@ -1353,6 +1384,12 @@ describe('createApplicationRuntime', () => {
 
     expect(execution.status).toBe('completed')
     expect(execution.output).toEqual({ marker: 'selected' })
-    await runtime.close()
+    await cleanupStarted
+    let closed = false
+    const closing = runtime.close().then(() => { closed = true })
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    expect(closed).toBe(false)
+    finishCleanup()
+    await closing
   })
 })
