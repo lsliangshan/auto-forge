@@ -894,9 +894,17 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
                 `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`,
                 { id: block.jobId },
               )
-              const association = jobRow
-                ? resumableVideoAssociation(database, mediaGenerationJobFromRow(jobRow))
-                : undefined
+              let association: ResumableVideoAssociation | undefined
+              if (jobRow) {
+                try {
+                  association = resumableVideoAssociation(
+                    database,
+                    mediaGenerationJobFromRow(jobRow),
+                  )
+                } catch {
+                  association = undefined
+                }
+              }
               if (
                 association
                 && association.messageId === row.id
@@ -1024,22 +1032,29 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
              WHERE status IN ('pending', 'in_progress', 'downloading', 'paused')
              ORDER BY id`,
           )
+          const failJob = database.prepare(`
+            UPDATE media_generation_jobs
+            SET status = 'failed',
+                next_poll_at = NULL,
+                error_code = 'MEDIA_GENERATION_FAILED',
+                updated_at = @endedAt,
+                ended_at = @endedAt
+            WHERE id = @id
+              AND status IN ('pending', 'in_progress', 'downloading', 'paused')
+          `)
           for (const row of rows) {
-            const job = mediaGenerationJobFromRow(row)
+            let job: MediaGenerationJob
+            try {
+              job = mediaGenerationJobFromRow(row)
+            } catch {
+              failJob.run({ id: row.id as string, endedAt })
+              continue
+            }
             if (resumableVideoAssociation(database, job)) {
               preservedRequestIds.push(job.id)
               continue
             }
-            database.prepare(`
-              UPDATE media_generation_jobs
-              SET status = 'failed',
-                  next_poll_at = NULL,
-                  error_code = 'MEDIA_GENERATION_FAILED',
-                  updated_at = @endedAt,
-                  ended_at = @endedAt
-              WHERE id = @id
-                AND status IN ('pending', 'in_progress', 'downloading', 'paused')
-            `).run({ id: job.id, endedAt })
+            failJob.run({ id: job.id, endedAt })
           }
           return preservedRequestIds
         })

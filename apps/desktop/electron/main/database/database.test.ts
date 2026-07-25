@@ -622,6 +622,115 @@ describe('openAppDatabase', () => {
     ])
   })
 
+  it('isolates malformed video parameters during interrupted recovery', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-corrupt-parameters-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'conversation_parameters_recovery', title: 'Recovery' })
+    const insertVideo = (
+      id: string,
+      status: 'pending' | 'paused',
+    ) => {
+      database.messages.insert({
+        id: `assistant_${id}`,
+        conversationId: 'conversation_parameters_recovery',
+        role: 'assistant',
+        blocks: [{
+          type: 'media_generation',
+          blockId: `block_${id}`,
+          jobId: id,
+          kind: 'video',
+          status,
+        }],
+        createdAt: 1,
+      })
+      database.chatRuns.insert({
+        id: `run_${id}`,
+        conversationId: 'conversation_parameters_recovery',
+        requestId: id,
+        model: 'video-model',
+        status: 'running',
+        startedAt: 1,
+      })
+      database.mediaGenerationJobs.insert({
+        id,
+        conversationId: 'conversation_parameters_recovery',
+        assistantMessageId: `assistant_${id}`,
+        provider: 'openrouter',
+        model: 'video-model',
+        kind: 'video',
+        providerJobId: `provider_${id}`,
+        status,
+        parameters: {},
+        createdAt: 1,
+        updatedAt: 1,
+      })
+    }
+    insertVideo('request_bad_parameters', 'pending')
+    insertVideo('request_valid_active', 'pending')
+    insertVideo('request_valid_paused', 'paused')
+    database.executions.insert({
+      id: 'execution_parameters_recovery',
+      status: 'running',
+      workflowId: 'workflow',
+      workflowVersion: '1.0.0',
+    })
+    database.chatRuns.insert({
+      id: 'run_unrelated_parameters_recovery',
+      conversationId: 'conversation_parameters_recovery',
+      requestId: 'request_unrelated_parameters_recovery',
+      model: 'text-model',
+      status: 'streaming',
+      startedAt: 1,
+    })
+    const fault = new Database(path)
+    fault.prepare('UPDATE media_generation_jobs SET parameters_json = ? WHERE id = ?')
+      .run('{not valid json', 'request_bad_parameters')
+    fault.close()
+
+    let recovery: { executions: number; chatRuns: number } | undefined
+    expect(() => {
+      recovery = database.recoverInterrupted()
+    }).not.toThrow()
+    expect(recovery).toEqual({ executions: 1, chatRuns: 2 })
+
+    const inspection = new Database(path)
+    expect(inspection.prepare(`
+      SELECT status, error_code AS errorCode
+      FROM media_generation_jobs
+      WHERE id = ?
+    `).get('request_bad_parameters')).toEqual({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    inspection.close()
+    expect(() => database.mediaGenerationJobs.get('request_bad_parameters')).toThrow()
+    expect(database.chatRuns.get('run_request_bad_parameters')).toMatchObject({
+      status: 'failed',
+      errorCode: 'INTERNAL_ERROR',
+    })
+    expect(database.messages.get('assistant_request_bad_parameters')?.blocks).toEqual([{
+      type: 'media_generation',
+      blockId: 'block_request_bad_parameters',
+      jobId: 'request_bad_parameters',
+      kind: 'video',
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    }])
+    expect(database.mediaGenerationJobs.get('request_valid_active')?.status).toBe('pending')
+    expect(database.mediaGenerationJobs.get('request_valid_paused')?.status).toBe('paused')
+    expect(database.mediaGenerationJobs.listActive().map((job) => job.id))
+      .toEqual(['request_valid_active'])
+    expect(database.chatRuns.get('run_request_valid_active')?.status).toBe('running')
+    expect(database.chatRuns.get('run_request_valid_paused')?.status).toBe('running')
+    expect(database.executions.get('execution_parameters_recovery')?.status).toBe('interrupted')
+    expect(database.chatRuns.get('run_unrelated_parameters_recovery')).toMatchObject({
+      status: 'failed',
+      errorCode: 'INTERNAL_ERROR',
+    })
+  })
+
   it('atomically commits assistant partials with the chat-run terminal state', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_terminal', title: 'Terminal' })
