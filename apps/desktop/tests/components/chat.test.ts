@@ -332,6 +332,27 @@ describe('chat interactions', () => {
     },
   )
 
+  it('keeps video downloading indeterminate without offering an upstream tracking pause', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_video_download',
+          type: 'media_generation',
+          blockId: 'block_video_download',
+          jobId: 'job_video_download',
+          kind: 'video',
+          status: 'downloading',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="generation-progress"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('%')
+    expect(wrapper.find('[data-testid="pause-video-job"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('上游任务可能继续执行并产生费用')
+  })
+
   it('warns before pausing video tracking and resumes a persisted paused job', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

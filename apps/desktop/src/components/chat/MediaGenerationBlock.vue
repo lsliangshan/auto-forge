@@ -33,13 +33,13 @@
 
     <template v-if="block.kind === 'video'">
       <p
-        v-if="active"
+        v-if="trackable"
         class="af-media-generation-warning"
       >
         暂停只会停止本地跟踪，上游任务可能继续执行并产生费用。
       </p>
       <button
-        v-if="active"
+        v-if="trackable"
         type="button"
         class="af-secondary-button"
         data-testid="pause-video-job"
@@ -85,6 +85,9 @@ const active = computed(() => (
   props.block.status === 'pending'
   || props.block.status === 'in_progress'
   || props.block.status === 'downloading'
+))
+const trackable = computed(() => (
+  props.block.status === 'pending' || props.block.status === 'in_progress'
 ))
 const kindLabel = computed(() => ({
   image: '图片',
