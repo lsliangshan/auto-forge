@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { isProxy } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -14,6 +14,8 @@ import type {
 } from '@autoforge/shared'
 import ApprovalCard from '../../src/components/chat/ApprovalCard.vue'
 import ChatComposer from '../../src/components/chat/ChatComposer.vue'
+import MessageBlock from '../../src/components/chat/MessageBlock.vue'
+import { displayError } from '../../src/services/desktop-api'
 import { useChatStore } from '../../src/stores/chat'
 
 const scopeHash = 'a'.repeat(64)
@@ -106,6 +108,332 @@ function createEventApi() {
 describe('chat interactions', () => {
   beforeEach(() => setActivePinia(createPinia()))
   afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+
+  it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_image',
+          type: 'media',
+          blockId: 'block_image',
+          assetId: 'asset_1',
+          kind: 'image',
+          purpose: 'output',
+          name: 'result.png',
+          mimeType: 'image/png',
+          byteSize: 2048,
+          width: 1024,
+          height: 768,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('img').attributes('src')).toBe('autoforge-media://asset/asset_1')
+    expect(wrapper.get('img').attributes('alt')).toBe('result.png')
+    expect(wrapper.text()).toContain('PNG')
+    expect(wrapper.text()).toContain('2 KB')
+    expect(wrapper.text()).toContain('1024 × 768')
+    expect(wrapper.html()).not.toContain('/Users/')
+    expect(wrapper.html()).not.toContain('base64')
+    expect(wrapper.html()).not.toContain('https://')
+  })
+
+  it('refuses to put a non-canonical asset identifier into a media source', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_image',
+          type: 'media',
+          blockId: 'block_image',
+          assetId: '/Users/private/photo.png',
+          kind: 'image',
+          purpose: 'output',
+          name: 'photo.png',
+          mimeType: 'image/png',
+          byteSize: 2048,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('img').exists()).toBe(false)
+    expect(wrapper.html()).not.toContain('/Users/')
+  })
+
+  it('uses native audio and video controls with safe protocol sources and useful metadata', () => {
+    const audio = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_audio',
+          type: 'media',
+          blockId: 'block_audio',
+          assetId: 'asset_audio',
+          kind: 'audio',
+          purpose: 'output',
+          name: 'voice.mp3',
+          mimeType: 'audio/mpeg',
+          byteSize: 1_536,
+          durationMs: 65_000,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    expect(audio.get('audio').attributes()).toMatchObject({
+      controls: '',
+      src: 'autoforge-media://asset/asset_audio',
+    })
+    expect(audio.text()).toContain('MP3')
+    expect(audio.text()).toContain('1:05')
+    expect(audio.text()).toContain('1.5 KB')
+
+    const video = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_video',
+          type: 'media',
+          blockId: 'block_video',
+          assetId: 'asset_video',
+          kind: 'video',
+          purpose: 'output',
+          name: 'clip.mp4',
+          mimeType: 'video/mp4',
+          byteSize: 2_000_000,
+          width: 1280,
+          height: 720,
+          durationMs: 5_000,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    expect(video.get('video').attributes()).toMatchObject({
+      controls: '',
+      preload: 'metadata',
+      src: 'autoforge-media://asset/asset_video',
+    })
+    expect(video.text()).toContain('MP4')
+    expect(video.text()).toContain('0:05')
+    expect(video.text()).toContain('1280 × 720')
+  })
+
+  it('never embeds SVG media and keeps save and reveal actions available', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_svg',
+          type: 'media',
+          blockId: 'block_svg',
+          assetId: 'asset_svg',
+          kind: 'image',
+          purpose: 'output',
+          name: 'diagram.svg',
+          mimeType: 'image/svg+xml',
+          byteSize: 512,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('img').exists()).toBe(false)
+    expect(wrapper.find('audio').exists()).toBe(false)
+    expect(wrapper.find('video').exists()).toBe(false)
+    expect(wrapper.text()).toContain('diagram.svg')
+    await wrapper.get('[data-testid="save-media-copy"]').trigger('click')
+    await wrapper.get('[data-testid="reveal-media"]').trigger('click')
+    expect(api.media.saveCopy).toHaveBeenCalledWith('asset_svg')
+    expect(api.media.reveal).toHaveBeenCalledWith('asset_svg')
+  })
+
+  it('submits a media action only once while its first request is pending', async () => {
+    const { api } = createEventApi()
+    let resolveSave!: () => void
+    vi.mocked(api.media.saveCopy).mockImplementation(() => new Promise<void>((resolve) => {
+      resolveSave = resolve
+    }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_image',
+          type: 'media',
+          blockId: 'block_image',
+          assetId: 'asset_image',
+          kind: 'image',
+          purpose: 'output',
+          name: 'result.png',
+          mimeType: 'image/png',
+          byteSize: 2048,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const button = wrapper.get('[data-testid="save-media-copy"]').element
+    button.dispatchEvent(new MouseEvent('click'))
+    button.dispatchEvent(new MouseEvent('click'))
+    expect(api.media.saveCopy).toHaveBeenCalledTimes(1)
+    resolveSave()
+    await flushPromises()
+  })
+
+  it('shows safe action failures inside only the affected media block', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.media.saveCopy).mockRejectedValue({
+      code: 'MEDIA_ASSET_UNAVAILABLE',
+      message: 'private path and provider response',
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_audio',
+          type: 'media',
+          blockId: 'block_audio',
+          assetId: 'asset_audio',
+          kind: 'audio',
+          purpose: 'output',
+          name: 'voice.mp3',
+          mimeType: 'audio/mpeg',
+          byteSize: 1024,
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('[data-testid="save-media-copy"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('媒体文件不可用或已损坏')
+    expect(wrapper.html()).not.toContain('private path')
+    expect(wrapper.find('audio').exists()).toBe(true)
+  })
+
+  it.each(['pending', 'in_progress', 'downloading'] as const)(
+    'renders %s generation as truthful indeterminate progress without a fabricated percentage',
+    (status) => {
+      const wrapper = mount(MessageBlock, {
+        props: {
+          block: {
+            id: `message_1:block_${status}`,
+            type: 'media_generation',
+            blockId: `block_${status}`,
+            jobId: `job_${status}`,
+            kind: 'image',
+            status,
+          },
+        },
+        global: { plugins: [ElementPlus] },
+      })
+
+      expect(wrapper.get('[data-testid="generation-progress"]').exists()).toBe(true)
+      expect(wrapper.text()).not.toContain('%')
+      expect(wrapper.find('[data-testid="retry-media-generation"]').exists()).toBe(false)
+    },
+  )
+
+  it('warns before pausing video tracking and resumes a persisted paused job', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const active = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_video',
+          type: 'media_generation',
+          blockId: 'block_video',
+          jobId: 'job_video',
+          kind: 'video',
+          status: 'in_progress',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    expect(active.text()).toContain('暂停只会停止本地跟踪，上游任务可能继续执行并产生费用。')
+    await active.get('[data-testid="pause-video-job"]').trigger('click')
+    expect(active.get('[data-testid="pause-video-job"]').text()).toContain('暂停跟踪')
+    expect(api.media.pauseVideoJob).toHaveBeenCalledWith('job_video')
+
+    const paused = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_video',
+          type: 'media_generation',
+          blockId: 'block_video',
+          jobId: 'job_video',
+          kind: 'video',
+          status: 'paused',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    await paused.get('[data-testid="resume-video-job"]').trigger('click')
+    expect(paused.get('[data-testid="resume-video-job"]').text()).toContain('继续跟踪')
+    expect(api.media.resumeVideoJob).toHaveBeenCalledWith('job_video')
+  })
+
+  it('localizes video action failures without exposing provider details', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.media.resumeVideoJob).mockRejectedValue({
+      code: 'MEDIA_DOWNLOAD_FAILED',
+      message: 'https://provider.example/private-output',
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_video',
+          type: 'media_generation',
+          blockId: 'block_video',
+          jobId: 'job_video',
+          kind: 'video',
+          status: 'paused',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('[data-testid="resume-video-job"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('媒体下载失败')
+    expect(wrapper.html()).not.toContain('provider.example')
+  })
+
+  it('renders a failed generation as an isolated safe block without inventing an unreconstructable retry', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:block_failed',
+          type: 'media_generation',
+          blockId: 'block_failed',
+          jobId: 'job_failed',
+          kind: 'audio',
+          status: 'failed',
+          errorCode: 'MEDIA_GENERATION_FAILED',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[role="alert"]').text()).toContain('媒体生成失败')
+    expect(wrapper.find('[data-testid="retry-media-generation"]').exists()).toBe(false)
+    expect(wrapper.classes()).toContain('message-block')
+  })
+
+  it.each([
+    ['MEDIA_TYPE_UNSUPPORTED', '不支持此媒体格式'],
+    ['MEDIA_ATTACHMENT_LIMIT_EXCEEDED', '每条消息最多添加 5 个附件'],
+    ['MEDIA_SIZE_LIMIT_EXCEEDED', '媒体文件大小超出限制'],
+    ['MEDIA_MIME_MISMATCH', '文件内容与格式不匹配'],
+    ['MEDIA_IMPORT_FAILED', '媒体文件导入失败'],
+    ['MEDIA_ASSET_UNAVAILABLE', '媒体文件不可用或已损坏'],
+    ['MEDIA_STORAGE_FULL', '本地磁盘空间不足'],
+    ['MODEL_MODALITY_UNSUPPORTED', '当前模型不支持所选输入或输出类型'],
+    ['MEDIA_GENERATION_FAILED', '媒体生成失败'],
+    ['MEDIA_DOWNLOAD_FAILED', '媒体下载失败'],
+    ['MEDIA_GENERATION_TIMEOUT', '视频生成超时'],
+  ] as const)('maps %s to its safe localized message', (code, message) => {
+    expect(displayError({ code, message: 'unsafe provider details' })).toBe(message)
+  })
 
   it('submits the complete current identity for an exact once approval and disables duplicates', async () => {
     const { api, decide } = createEventApi()

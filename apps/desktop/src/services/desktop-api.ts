@@ -29,6 +29,17 @@ const messages: Partial<Record<AppError['code'], string>> = {
   MODEL_PROVIDER_ACCESS_DENIED: '供应商拒绝了该模型请求，请检查模型权限、内容策略或 Guardrail 设置',
   MODEL_PROVIDER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
   OPENROUTER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
+  MEDIA_TYPE_UNSUPPORTED: '不支持此媒体格式',
+  MEDIA_ATTACHMENT_LIMIT_EXCEEDED: '每条消息最多添加 5 个附件',
+  MEDIA_SIZE_LIMIT_EXCEEDED: '媒体文件大小超出限制',
+  MEDIA_MIME_MISMATCH: '文件内容与格式不匹配',
+  MEDIA_IMPORT_FAILED: '媒体文件导入失败',
+  MEDIA_ASSET_UNAVAILABLE: '媒体文件不可用或已损坏',
+  MEDIA_STORAGE_FULL: '本地磁盘空间不足',
+  MODEL_MODALITY_UNSUPPORTED: '当前模型不支持所选输入或输出类型',
+  MEDIA_GENERATION_FAILED: '媒体生成失败',
+  MEDIA_DOWNLOAD_FAILED: '媒体下载失败',
+  MEDIA_GENERATION_TIMEOUT: '视频生成超时',
   INTERNAL_ERROR: '操作失败，请稍后重试',
 }
 

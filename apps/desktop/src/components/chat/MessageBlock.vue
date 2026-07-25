@@ -41,6 +41,14 @@
     >
       <strong>处理失败</strong><p>{{ block.message }}</p>
     </section>
+    <MediaBlock
+      v-else-if="block.type === 'media'"
+      :block="block"
+    />
+    <MediaGenerationBlock
+      v-else-if="block.type === 'media_generation'"
+      :block="block"
+    />
   </div>
 </template>
 
@@ -49,6 +57,8 @@ import { Loading } from '@element-plus/icons-vue'
 import type { UiChatBlock } from '../../stores/chat'
 import ApprovalCard from './ApprovalCard.vue'
 import ExecutionCard from './ExecutionCard.vue'
+import MediaBlock from './MediaBlock.vue'
+import MediaGenerationBlock from './MediaGenerationBlock.vue'
 
 defineProps<{ block: UiChatBlock }>()
 </script>
