@@ -604,6 +604,10 @@ describe('openAppDatabase', () => {
         { type: 'media_generation', blockId: 'block_video', jobId: 'job_video_recovery', kind: 'video', status: 'in_progress' },
       ],
     })
+    database.chatRuns.insert({
+      id: 'run_video_recovery', conversationId: 'conversation_recovery_media',
+      requestId: 'job_video_recovery', model: 'video-model', status: 'running', startedAt: 1,
+    })
     database.mediaGenerationJobs.insert({
       id: 'job_video_recovery', conversationId: 'conversation_recovery_media', assistantMessageId: 'message_recovery_media',
       provider: 'openrouter', model: 'video-model', kind: 'video', providerJobId: 'provider_video_recovery',

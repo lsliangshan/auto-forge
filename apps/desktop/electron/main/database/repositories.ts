@@ -196,6 +196,10 @@ export interface VideoGenerationTurnInput {
   job: MediaGenerationJob
 }
 
+export type VideoGenerationTurnPreflightInput = Omit<VideoGenerationTurnInput, 'job'> & {
+  job: Omit<MediaGenerationJob, 'providerJobId'>
+}
+
 export interface VideoGenerationTransitionPatch {
   status: MediaGenerationJobStatus
   parameters?: unknown
@@ -323,8 +327,10 @@ export interface AppRepositories {
   mediaAssets: { insert(value: MediaAssetRecord): MediaAssetRecord; get(id: string): MediaAssetRecord | undefined; listForConversation(conversationId: string): MediaAssetRecord[]; listUnclaimedBefore(timestamp: number): MediaAssetRecord[]; update(id: string, patch: MediaAssetPatch): MediaAssetRecord | undefined; delete(id: string): void }
   mediaGenerationJobs: {
     insert(value: MediaGenerationJob): MediaGenerationJob
+    preflightTurn(value: VideoGenerationTurnPreflightInput): void
     insertTurn(value: VideoGenerationTurnInput): MediaGenerationJob
     get(id: string): MediaGenerationJob | undefined
+    reconcileInterrupted(endedAt: number): string[]
     listResumable(now: number): MediaGenerationJob[]
     listActive(): MediaGenerationJob[]
     update(id: string, patch: MediaGenerationJobPatch): MediaGenerationJob | undefined
@@ -526,11 +532,11 @@ function assertUniqueFinalMediaBlocks(blocks: readonly ChatBlock[]): void {
   }
 }
 
-function insertMessageWithAssets(
+function validateMessageWithAssets(
   database: SqliteDatabase,
   value: MessageInput,
   assetIds: readonly string[],
-): Message {
+): ChatBlock[] {
   const blocks = chatBlockSchema.array().parse(value.blocks)
   const blockAssetIds = blocks
     .filter((block) => block.type === 'media')
@@ -558,6 +564,15 @@ function insertMessageWithAssets(
     if (!block || block.type !== 'media') throw new Error('Media block is missing')
     assertMediaBlockMetadata(block, asset)
   }
+  return blocks
+}
+
+function insertMessageWithAssets(
+  database: SqliteDatabase,
+  value: MessageInput,
+  assetIds: readonly string[],
+): Message {
+  const blocks = validateMessageWithAssets(database, value, assetIds)
   database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
     ...value,
     blocksJson: JSON.stringify(blocks),
@@ -572,6 +587,65 @@ function insertMessageWithAssets(
     }).changes !== 1) throw new Error('Media asset could not be claimed')
   }
   return { ...value, blocks }
+}
+
+function validateVideoGenerationTurn(
+  database: SqliteDatabase,
+  value: VideoGenerationTurnPreflightInput,
+  providerJobId?: string,
+): ChatBlock[] {
+  const { userMessage, userAssetIds, assistantMessage, run, job } = value
+  const assistantBlocks = chatBlockSchema.array().parse(assistantMessage.blocks)
+  const block = assistantBlocks[0]
+  for (const id of [
+    userMessage.id,
+    assistantMessage.id,
+    run.id,
+    run.requestId,
+    job.id,
+    job.assistantMessageId,
+  ]) identifierSchema.parse(id)
+  identifierSchema.parse(job.provider)
+  identifierSchema.parse(job.model)
+  if (providerJobId !== undefined) identifierSchema.parse(providerJobId)
+  if (
+    userMessage.role !== 'user'
+    || assistantMessage.role !== 'assistant'
+    || userMessage.id === assistantMessage.id
+    || userMessage.conversationId !== job.conversationId
+    || assistantMessage.conversationId !== job.conversationId
+    || run.conversationId !== job.conversationId
+    || run.requestId !== job.id
+    || run.model !== job.model
+    || run.status !== 'running'
+    || job.assistantMessageId !== assistantMessage.id
+    || job.kind !== 'video'
+    || (job.status !== 'pending' && job.status !== 'in_progress')
+    || assistantBlocks.length !== 1
+    || block?.type !== 'media_generation'
+    || block.jobId !== job.id
+    || block.kind !== 'video'
+    || block.status !== job.status
+    || block.errorCode !== undefined
+  ) throw new Error('Video generation turn identity does not match')
+
+  if (!one(database, 'SELECT id FROM conversations WHERE id = @id', {
+    id: job.conversationId,
+  })) throw new Error('Video generation conversation not found')
+  if (one(database, 'SELECT id FROM messages WHERE id IN (@userMessageId, @assistantMessageId) LIMIT 1', {
+    userMessageId: userMessage.id,
+    assistantMessageId: assistantMessage.id,
+  })) throw new Error('Video generation message ID already exists')
+  if (one(database, 'SELECT id FROM chat_runs WHERE id = @id OR request_id = @requestId LIMIT 1', {
+    id: run.id,
+    requestId: run.requestId,
+  })) throw new Error('Video generation run identity already exists')
+  if (one(database, 'SELECT id FROM media_generation_jobs WHERE id = @id', {
+    id: job.id,
+  })) throw new Error('Video generation job already exists')
+
+  validateMessageWithAssets(database, userMessage, userAssetIds)
+  return assistantBlocks
 }
 
 function activeVideoBlock(
@@ -646,6 +720,55 @@ function videoRun(database: SqliteDatabase, job: MediaGenerationJob): ChatRun {
     || run.status !== 'running'
   ) throw new Error('Video chat run is not active')
   return run
+}
+
+interface ResumableVideoAssociation {
+  messageId: string
+  blockId: string
+}
+
+function resumableVideoAssociation(
+  database: SqliteDatabase,
+  job: MediaGenerationJob,
+): ResumableVideoAssociation | undefined {
+  if (
+    job.kind !== 'video'
+    || !['pending', 'in_progress', 'downloading', 'paused'].includes(job.status)
+  ) return undefined
+  const run = one<ChatRun>(
+    database,
+    `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`,
+    { requestId: job.id },
+  )
+  if (
+    !run
+    || run.conversationId !== job.conversationId
+    || run.model !== job.model
+    || run.status !== 'running'
+  ) return undefined
+  const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, {
+    id: job.assistantMessageId,
+  })
+  if (!row || row.role !== 'assistant' || row.conversationId !== job.conversationId) {
+    return undefined
+  }
+  try {
+    const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+    const matches = blocks.filter((block) => (
+      block.type === 'media_generation' && block.jobId === job.id
+    ))
+    const block = matches[0]
+    if (
+      matches.length !== 1
+      || !block
+      || block.type !== 'media_generation'
+      || block.kind !== 'video'
+      || block.status !== job.status
+    ) return undefined
+    return { messageId: job.assistantMessageId, blockId: block.blockId }
+  } catch {
+    return undefined
+  }
 }
 
 function projectFromRow(row: Query): WorkflowProject {
@@ -755,14 +878,25 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       failInterruptedMediaGenerations() {
         return transaction(database, () => {
           let failed = 0
-          const activeStatuses = new Set(['pending', 'in_progress', 'downloading'])
+          const activeStatuses = new Set(['pending', 'in_progress', 'downloading', 'paused'])
           for (const row of many<Query>(database, 'SELECT id, blocks_json AS blocksJson FROM messages')) {
             const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
             let changed = false
             for (const block of blocks) {
               if (block.type !== 'media_generation' || !activeStatuses.has(block.status)) continue
-              const job = one<{ status: MediaGenerationJobStatus }>(database, 'SELECT status FROM media_generation_jobs WHERE id = @id', { id: block.jobId })
-              if (job && activeStatuses.has(job.status)) continue
+              const jobRow = one<Query>(
+                database,
+                `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`,
+                { id: block.jobId },
+              )
+              const association = jobRow
+                ? resumableVideoAssociation(database, mediaGenerationJobFromRow(jobRow))
+                : undefined
+              if (
+                association
+                && association.messageId === row.id
+                && association.blockId === block.blockId
+              ) continue
               block.status = 'failed'
               block.errorCode = 'MEDIA_GENERATION_FAILED'
               failed += 1
@@ -843,35 +977,19 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         if (!stored) throw new Error('Media generation job was not persisted')
         return stored
       },
+      preflightTurn(value) {
+        transaction(database, () => {
+          validateVideoGenerationTurn(database, value)
+        })
+      },
       insertTurn(value) {
         const { userMessage, userAssetIds, assistantMessage, run, job } = value
-        const assistantBlocks = chatBlockSchema.array().parse(assistantMessage.blocks)
-        const block = assistantBlocks[0]
-        identifierSchema.parse(job.id)
-        identifierSchema.parse(job.providerJobId)
-        identifierSchema.parse(job.provider)
-        identifierSchema.parse(job.model)
-        if (
-          userMessage.role !== 'user'
-          || assistantMessage.role !== 'assistant'
-          || userMessage.conversationId !== job.conversationId
-          || assistantMessage.conversationId !== job.conversationId
-          || run.conversationId !== job.conversationId
-          || run.requestId !== job.id
-          || run.model !== job.model
-          || run.status !== 'running'
-          || job.assistantMessageId !== assistantMessage.id
-          || job.kind !== 'video'
-          || (job.status !== 'pending' && job.status !== 'in_progress')
-          || assistantBlocks.length !== 1
-          || block?.type !== 'media_generation'
-          || block.jobId !== job.id
-          || block.kind !== 'video'
-          || block.status !== job.status
-          || block.errorCode !== undefined
-        ) throw new Error('Video generation turn identity does not match')
-
         transaction(database, () => {
+          const assistantBlocks = validateVideoGenerationTurn(
+            database,
+            value,
+            job.providerJobId,
+          )
           insertMessageWithAssets(database, userMessage, userAssetIds)
           database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
           database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
@@ -891,6 +1009,36 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return stored
       },
       get: (id) => { const row = one<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`, { id }); return row && mediaGenerationJobFromRow(row) },
+      reconcileInterrupted(endedAt) {
+        return transaction(database, () => {
+          const preservedRequestIds: string[] = []
+          const rows = many<Query>(
+            database,
+            `SELECT ${mediaGenerationJobColumns}
+             FROM media_generation_jobs
+             WHERE status IN ('pending', 'in_progress', 'downloading', 'paused')
+             ORDER BY id`,
+          )
+          for (const row of rows) {
+            const job = mediaGenerationJobFromRow(row)
+            if (resumableVideoAssociation(database, job)) {
+              preservedRequestIds.push(job.id)
+              continue
+            }
+            database.prepare(`
+              UPDATE media_generation_jobs
+              SET status = 'failed',
+                  next_poll_at = NULL,
+                  error_code = 'MEDIA_GENERATION_FAILED',
+                  updated_at = @endedAt,
+                  ended_at = @endedAt
+              WHERE id = @id
+                AND status IN ('pending', 'in_progress', 'downloading', 'paused')
+            `).run({ id: job.id, endedAt })
+          }
+          return preservedRequestIds
+        })
+      },
       listResumable: (now) => many<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE status IN ('pending', 'in_progress', 'downloading') AND (next_poll_at IS NULL OR next_poll_at <= @now) ORDER BY next_poll_at, id`, { now }).map(mediaGenerationJobFromRow),
       listActive: () => many<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE status IN ('pending', 'in_progress', 'downloading') ORDER BY next_poll_at, id`).map(mediaGenerationJobFromRow),
       update(id, patch) {

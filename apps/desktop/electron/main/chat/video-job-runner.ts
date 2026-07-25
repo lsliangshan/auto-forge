@@ -13,6 +13,7 @@ import type {
   AppRepositories,
   MediaGenerationJob,
   MediaGenerationJobStatus,
+  VideoGenerationTurnPreflightInput,
   VideoGenerationTransition,
 } from '../database/repositories.js'
 import {
@@ -172,9 +173,11 @@ function contentLength(response: Response): number | undefined {
 async function* responseBody(
   response: Response,
   signal: AbortSignal,
+  expectedLength?: number,
 ): AsyncGenerator<Uint8Array> {
   if (!response.ok || !response.body) throw toSafeAppError({ code: 'MEDIA_DOWNLOAD_FAILED' })
   const reader = response.body.getReader()
+  let received = 0
   try {
     while (true) {
       if (signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
@@ -188,7 +191,20 @@ async function* responseBody(
           signal.removeEventListener('abort', onAbort)
         })
       })
-      if (chunk.done) return
+      if (chunk.done) {
+        if (expectedLength !== undefined && received !== expectedLength) {
+          throw toSafeAppError({ code: 'MEDIA_DOWNLOAD_FAILED' })
+        }
+        return
+      }
+      const nextReceived = received + chunk.value.byteLength
+      if (nextReceived > MEDIA_LIMITS.generatedBytes) {
+        throw toSafeAppError({ code: 'MEDIA_SIZE_LIMIT_EXCEEDED' })
+      }
+      if (expectedLength !== undefined && nextReceived > expectedLength) {
+        throw toSafeAppError({ code: 'MEDIA_DOWNLOAD_FAILED' })
+      }
+      received = nextReceived
       yield chunk.value
     }
   } finally {
@@ -205,6 +221,7 @@ export class VideoJobRunner {
   private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly controllers = new Map<string, AbortController>()
   private readonly work = new Map<string, Promise<void>>()
+  private readonly submissions = new Set<Promise<SubmittedVideoJob>>()
   private stopped = false
 
   constructor(private readonly dependencies: VideoJobRunnerDependencies) {
@@ -217,6 +234,16 @@ export class VideoJobRunner {
   }
 
   async submit(input: SubmitVideoInput): Promise<SubmittedVideoJob> {
+    const operation = this.submitInternal(input)
+    this.submissions.add(operation)
+    try {
+      return await operation
+    } finally {
+      this.submissions.delete(operation)
+    }
+  }
+
+  private async submitInternal(input: SubmitVideoInput): Promise<SubmittedVideoJob> {
     this.assertSubmit(input)
     if (
       this.stopped
@@ -227,15 +254,71 @@ export class VideoJobRunner {
       throw toSafeAppError({ code: 'NOT_FOUND' })
     }
 
-    const controller = new AbortController()
-    this.controllers.set(input.requestId, controller)
+    let controller: AbortController | undefined
     try {
+      const preparedAt = this.now()
+      const userMessageId = this.id()
+      const runId = this.id()
+      const assistantMessageId = this.id()
+      const blockId = this.id()
+      const preparedBlock: Extract<ChatBlock, { type: 'media_generation' }> = {
+        type: 'media_generation',
+        blockId,
+        jobId: input.requestId,
+        kind: 'video',
+        status: 'pending',
+      }
+      const preparedTurn = {
+        userMessage: {
+          id: userMessageId,
+          conversationId: input.conversationId,
+          role: 'user',
+          blocks: input.userBlocks,
+          createdAt: preparedAt,
+        },
+        userAssetIds: input.assetIds,
+        assistantMessage: {
+          id: assistantMessageId,
+          conversationId: input.conversationId,
+          role: 'assistant',
+          blocks: [preparedBlock],
+          createdAt: preparedAt,
+        },
+        run: {
+          id: runId,
+          conversationId: input.conversationId,
+          requestId: input.requestId,
+          model: input.route.model,
+          status: 'running',
+          startedAt: preparedAt,
+        },
+        job: {
+          id: input.requestId,
+          conversationId: input.conversationId,
+          assistantMessageId,
+          provider: input.route.provider,
+          model: input.route.model,
+          kind: 'video',
+          status: 'pending',
+          parameters: persistedParameters(input.route.generation.video),
+          pollAttempts: 0,
+          createdAt: preparedAt,
+          updatedAt: preparedAt,
+        },
+      } satisfies VideoGenerationTurnPreflightInput
+      this.dependencies.database.mediaGenerationJobs.preflightTurn(preparedTurn)
+
+      controller = new AbortController()
+      this.controllers.set(input.requestId, controller)
       const provider = this.provider(input.route.provider)
       if (!provider.submitVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
       const inputs = await this.dependencies.media.modelInput(
         input.conversationId,
         input.assetIds,
       )
+      if (this.stopped || controller.signal.aborted) {
+        throw toSafeAppError({ code: 'CANCELLED' })
+      }
       if (
         inputs.length !== input.assetIds.length
         || inputs.some((asset, index) => (
@@ -250,7 +333,8 @@ export class VideoJobRunner {
         signal: controller.signal,
       })
       if (
-        controller.signal.aborted
+        this.stopped
+        || controller.signal.aborted
         || !PROVIDER_JOB_ID_PATTERN.test(submitted.providerJobId)
         || (submitted.status !== 'pending' && submitted.status !== 'in_progress')
       ) {
@@ -260,53 +344,30 @@ export class VideoJobRunner {
       }
 
       const createdAt = this.now()
-      const userMessageId = this.id()
-      const runId = this.id()
-      const assistantMessageId = this.id()
-      const blockId = this.id()
       const block: Extract<ChatBlock, { type: 'media_generation' }> = {
-        type: 'media_generation',
-        blockId,
-        jobId: input.requestId,
-        kind: 'video',
+        ...preparedBlock,
         status: submitted.status,
       }
       const job = this.dependencies.database.mediaGenerationJobs.insertTurn({
         userMessage: {
-          id: userMessageId,
-          conversationId: input.conversationId,
-          role: 'user',
-          blocks: input.userBlocks,
+          ...preparedTurn.userMessage,
           createdAt,
         },
-        userAssetIds: input.assetIds,
+        userAssetIds: preparedTurn.userAssetIds,
         assistantMessage: {
-          id: assistantMessageId,
-          conversationId: input.conversationId,
-          role: 'assistant',
+          ...preparedTurn.assistantMessage,
           blocks: [block],
           createdAt,
         },
         run: {
-          id: runId,
-          conversationId: input.conversationId,
-          requestId: input.requestId,
-          model: input.route.model,
-          status: 'running',
+          ...preparedTurn.run,
           startedAt: createdAt,
         },
         job: {
-          id: input.requestId,
-          conversationId: input.conversationId,
-          assistantMessageId,
-          provider: input.route.provider,
-          model: input.route.model,
-          kind: 'video',
+          ...preparedTurn.job,
           providerJobId: submitted.providerJobId,
           status: submitted.status,
-          parameters: persistedParameters(input.route.generation.video),
           nextPollAt: createdAt + pollDelay(1),
-          pollAttempts: 0,
           createdAt,
           updatedAt: createdAt,
         },
@@ -332,7 +393,9 @@ export class VideoJobRunner {
     } catch (error) {
       throw mappedFailure(error)
     } finally {
-      this.controllers.delete(input.requestId)
+      if (controller && this.controllers.get(input.requestId) === controller) {
+        this.controllers.delete(input.requestId)
+      }
     }
   }
 
@@ -391,7 +454,10 @@ export class VideoJobRunner {
     for (const jobId of [...this.timers.keys()]) this.clearTimer(jobId)
     for (const jobId of [...this.deadlineTimers.keys()]) this.clearDeadlineTimer(jobId)
     for (const controller of this.controllers.values()) controller.abort()
-    await Promise.allSettled([...this.work.values()])
+    await Promise.allSettled([
+      ...this.work.values(),
+      ...this.submissions,
+    ])
   }
 
   private assertSubmit(input: SubmitVideoInput): void {
@@ -600,6 +666,7 @@ export class VideoJobRunner {
       const declaredMimeType = response.headers.get('content-type')
         ?.split(';', 1)[0]
         ?.trim()
+        .toLowerCase()
       asset = await this.dependencies.media.commitGeneratedStream({
         assetId,
         conversationId: job.conversationId,
@@ -608,7 +675,7 @@ export class VideoJobRunner {
         provider: modelProviderIdSchema.parse(job.provider),
         model: job.model,
         name: 'generated-video.mp4',
-        stream: responseBody(response, signal),
+        stream: responseBody(response, signal, length),
         ...(declaredMimeType ? { declaredMimeType } : {}),
       })
     }

@@ -278,6 +278,181 @@ describe('VideoJobRunner', () => {
     expect(harness.database.messages.get('user_message_1')?.blocks).toEqual(userBlocks)
   })
 
+  it('rejects already-claimed reference assets before making a paid provider submission', async () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    harness.database.mediaAssets.insert({
+      id: 'claimed_reference',
+      conversationId: submitInput.conversationId,
+      source: 'upload',
+      kind: 'image',
+      mimeType: 'image/png',
+      originalName: 'claimed.png',
+      relativePath: `${submitInput.conversationId}/claimed_reference.png`,
+      byteSize: 12,
+      sha256: 'a'.repeat(64),
+      status: 'ready',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const referenceBlock: Extract<ChatBlock, { type: 'media' }> = {
+      type: 'media',
+      blockId: 'claimed_reference_block',
+      assetId: 'claimed_reference',
+      kind: 'image',
+      purpose: 'input',
+      name: 'claimed.png',
+      mimeType: 'image/png',
+      byteSize: 12,
+    }
+    harness.database.messages.insertWithAssets({
+      id: 'existing_user_message',
+      conversationId: submitInput.conversationId,
+      role: 'user',
+      blocks: [referenceBlock],
+      createdAt: 1,
+    }, ['claimed_reference'])
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit({
+      ...submitInput,
+      userBlocks: [referenceBlock],
+      assetIds: ['claimed_reference'],
+      route: {
+        ...route,
+        assets: [{
+          id: 'claimed_reference',
+          kind: 'image',
+          mimeType: 'image/png',
+          name: 'claimed.png',
+          byteSize: 12,
+          conversationId: submitInput.conversationId,
+          absolutePath: '/managed/claimed.png',
+          relativePath: `${submitInput.conversationId}/claimed_reference.png`,
+          inlineSafe: true,
+        }],
+      },
+    })).rejects.toMatchObject({ code: 'MEDIA_GENERATION_FAILED' })
+
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.provider.submitVideo).not.toHaveBeenCalled()
+    expect(harness.events).toEqual([])
+  })
+
+  it('rejects malformed and metadata-mismatched user blocks before provider submission', async () => {
+    vi.useFakeTimers()
+    const malformed = createHarness()
+    const malformedRunner = new VideoJobRunner(malformed.dependencies)
+
+    await expect(malformedRunner.submit({
+      ...submitInput,
+      userBlocks: [{ type: 'text', text: 42 }] as unknown as ChatBlock[],
+    })).rejects.toMatchObject({ code: 'MEDIA_GENERATION_FAILED' })
+    expect(malformed.provider.submitVideo).not.toHaveBeenCalled()
+
+    const mismatched = createHarness()
+    mismatched.database.mediaAssets.insert({
+      id: 'mismatched_reference',
+      conversationId: submitInput.conversationId,
+      source: 'upload',
+      kind: 'image',
+      mimeType: 'image/png',
+      originalName: 'mismatched.png',
+      relativePath: `${submitInput.conversationId}/mismatched_reference.png`,
+      byteSize: 12,
+      sha256: 'a'.repeat(64),
+      status: 'ready',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const mismatchedRunner = new VideoJobRunner(mismatched.dependencies)
+
+    await expect(mismatchedRunner.submit({
+      ...submitInput,
+      userBlocks: [{
+        type: 'media',
+        blockId: 'mismatched_reference_block',
+        assetId: 'mismatched_reference',
+        kind: 'image',
+        purpose: 'input',
+        name: 'mismatched.png',
+        mimeType: 'image/png',
+        byteSize: 13,
+      }],
+      assetIds: ['mismatched_reference'],
+      route: {
+        ...route,
+        assets: [{
+          id: 'mismatched_reference',
+          kind: 'image',
+          mimeType: 'image/png',
+          name: 'mismatched.png',
+          byteSize: 12,
+          conversationId: submitInput.conversationId,
+          absolutePath: '/managed/mismatched.png',
+          relativePath: `${submitInput.conversationId}/mismatched_reference.png`,
+          inlineSafe: true,
+        }],
+      },
+    })).rejects.toMatchObject({ code: 'MEDIA_GENERATION_FAILED' })
+    expect(mismatched.provider.submitVideo).not.toHaveBeenCalled()
+  })
+
+  it('rejects duplicate request IDs before making a paid provider submission', async () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    harness.database.chatRuns.insert({
+      id: 'existing_run',
+      conversationId: submitInput.conversationId,
+      requestId: submitInput.requestId,
+      model: route.model,
+      status: 'running',
+      startedAt: 1,
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).rejects.toMatchObject({
+      code: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.provider.submitVideo).not.toHaveBeenCalled()
+    expect(harness.events).toEqual([])
+  })
+
+  it('rejects generated message and run ID collisions before provider submission', async () => {
+    vi.useFakeTimers()
+    const messageCollision = createHarness()
+    messageCollision.database.messages.insert({
+      id: 'user_message_1',
+      conversationId: submitInput.conversationId,
+      role: 'user',
+      blocks: [{ type: 'text', text: 'existing' }],
+      createdAt: 1,
+    })
+    const messageRunner = new VideoJobRunner(messageCollision.dependencies)
+
+    await expect(messageRunner.submit(submitInput)).rejects.toMatchObject({
+      code: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(messageCollision.provider.submitVideo).not.toHaveBeenCalled()
+
+    const runCollision = createHarness()
+    runCollision.database.chatRuns.insert({
+      id: 'run_video_1',
+      conversationId: submitInput.conversationId,
+      requestId: 'existing_request',
+      model: route.model,
+      status: 'running',
+      startedAt: 1,
+    })
+    const runRunner = new VideoJobRunner(runCollision.dependencies)
+
+    await expect(runRunner.submit(submitInput)).rejects.toMatchObject({
+      code: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(runCollision.provider.submitVideo).not.toHaveBeenCalled()
+  })
+
   it('uses the exact polling schedule and atomically completes the durable block, job, asset, and run', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(10_000)
@@ -743,6 +918,174 @@ describe('VideoJobRunner', () => {
     expect(harness.database.mediaAssets.get(submittedOutputAssetId)).toBeUndefined()
   })
 
+  it('fails truncated and overlong response bodies against an exact Content-Length', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const mp4 = new Uint8Array([
+      0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70,
+      0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0,
+      0x69, 0x73, 0x6f, 0x6d, 0x6d, 0x70, 0x34, 0x31,
+    ])
+    const truncated = createHarness()
+    vi.mocked(truncated.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    vi.mocked(truncated.provider.downloadVideo!).mockResolvedValue(new Response(
+      mp4,
+      { headers: { 'content-type': 'video/mp4', 'content-length': '25' } },
+    ))
+    const truncatedRunner = new VideoJobRunner(truncated.dependencies)
+    await truncatedRunner.submit(submitInput)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(truncated.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_DOWNLOAD_FAILED',
+    })
+    expect(truncated.database.mediaAssets.get(submittedOutputAssetId)).toBeUndefined()
+
+    const overlong = createHarness()
+    vi.mocked(overlong.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    vi.mocked(overlong.provider.downloadVideo!).mockResolvedValue(new Response(
+      new Uint8Array([...mp4, 0]),
+      { headers: { 'content-type': 'video/mp4', 'content-length': '24' } },
+    ))
+    const overlongRunner = new VideoJobRunner(overlong.dependencies)
+    await overlongRunner.submit(submitInput)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(overlong.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_DOWNLOAD_FAILED',
+    })
+    expect(overlong.database.mediaAssets.get(submittedOutputAssetId)).toBeUndefined()
+  })
+
+  it('enforces the generated byte limit while streaming and cancels the oversized body', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    const chunk = new Uint8Array(1024 * 1024)
+    let chunks = 0
+    let cancelled = false
+    vi.mocked(harness.provider.downloadVideo!).mockResolvedValue(new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(chunk)
+          chunks += 1
+          if (chunks === 502) controller.close()
+        },
+        cancel() {
+          cancelled = true
+        },
+      }),
+      { headers: { 'content-type': 'video/mp4' } },
+    ))
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_SIZE_LIMIT_EXCEEDED',
+    })
+    expect(cancelled).toBe(true)
+    expect(harness.database.mediaAssets.get(submittedOutputAssetId)).toBeUndefined()
+  })
+
+  it('normalizes a parameterized mixed-case video Content-Type before persistence', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    vi.mocked(harness.provider.downloadVideo!).mockResolvedValue(new Response(
+      new Uint8Array([
+        0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70,
+        0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0,
+        0x69, 0x73, 0x6f, 0x6d, 0x6d, 0x70, 0x34, 0x31,
+      ]),
+      { headers: { 'content-type': ' Video/MP4; charset=binary ' } },
+    ))
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(vi.mocked(harness.media.commitGeneratedStream).mock.calls[0]?.[0])
+      .toMatchObject({ declaredMimeType: 'video/mp4' })
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')?.status)
+      .toBe('completed')
+  })
+
+  it('waits for abort-ignoring model input cleanup without provider calls or local writes', async () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    let releaseModelInput!: () => void
+    vi.mocked(harness.media.modelInput).mockImplementation(async () => (
+      new Promise((resolve) => {
+        releaseModelInput = () => resolve([])
+      })
+    ))
+    const runner = new VideoJobRunner(harness.dependencies)
+    const submission = runner.submit(submitInput).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await Promise.resolve()
+
+    let stopped = false
+    const stopping = runner.stop().then(() => { stopped = true })
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+    releaseModelInput()
+    expect(await submission).toMatchObject({ code: 'CANCELLED' })
+    await stopping
+
+    expect(harness.provider.submitVideo).not.toHaveBeenCalled()
+    expect(harness.database.messages.listForConversation(submitInput.conversationId)).toEqual([])
+    expect(harness.database.mediaGenerationJobs.listActive()).toEqual([])
+    expect(harness.events).toEqual([])
+  })
+
+  it('waits for an abort-ignoring provider submission without local writes or events', async () => {
+    vi.useFakeTimers()
+    const harness = createHarness()
+    let releaseProvider!: () => void
+    vi.mocked(harness.provider.submitVideo!).mockImplementation(async () => (
+      new Promise((resolve) => {
+        releaseProvider = () => resolve({
+          providerJobId: 'provider_job_late',
+          status: 'pending',
+        })
+      })
+    ))
+    const runner = new VideoJobRunner(harness.dependencies)
+    const submission = runner.submit(submitInput).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    let stopped = false
+    const stopping = runner.stop().then(() => { stopped = true })
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+    releaseProvider()
+    expect(await submission).toMatchObject({ code: 'CANCELLED' })
+    await stopping
+
+    expect(harness.database.messages.listForConversation(submitInput.conversationId)).toEqual([])
+    expect(harness.database.mediaGenerationJobs.listActive()).toEqual([])
+    expect(harness.events).toEqual([])
+  })
+
   it('does not delete or claim an unrelated asset that collides with the deterministic recovery ID', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -841,6 +1184,114 @@ describe('video job persistence boundaries', () => {
     database.recoverInterrupted()
 
     expect(database.chatRuns.get('run_recovery')?.status).toBe('running')
+  })
+
+  it('fails corrupted resumable associations while preserving exact active and paused pairs', () => {
+    const database = createDatabase()
+    database.conversations.insert({ id: 'conversation_other', title: 'Other' })
+    const addJob = (input: {
+      id: string
+      status?: 'pending' | 'paused'
+      runConversationId?: string
+      runModel?: string
+      messageRole?: string
+      jobAssistantMessageId?: string
+      blockStatus?: 'pending' | 'in_progress' | 'paused'
+      blockKind?: 'image' | 'video'
+    }) => {
+      const status = input.status ?? 'pending'
+      const messageId = `assistant_${input.id}`
+      const jobAssistantMessageId = input.jobAssistantMessageId ?? messageId
+      database.messages.insert({
+        id: messageId,
+        conversationId: submitInput.conversationId,
+        role: input.messageRole ?? 'assistant',
+        blocks: [{
+          type: 'media_generation',
+          blockId: `block_${input.id}`,
+          jobId: input.id,
+          kind: input.blockKind ?? 'video',
+          status: input.blockStatus ?? status,
+        }],
+        createdAt: 1,
+      })
+      if (jobAssistantMessageId !== messageId) {
+        database.messages.insert({
+          id: jobAssistantMessageId,
+          conversationId: submitInput.conversationId,
+          role: 'assistant',
+          blocks: [{ type: 'text', text: 'wrong assistant' }],
+          createdAt: 1,
+        })
+      }
+      database.chatRuns.insert({
+        id: `run_${input.id}`,
+        conversationId: input.runConversationId ?? submitInput.conversationId,
+        requestId: input.id,
+        model: input.runModel ?? route.model,
+        status: 'running',
+        startedAt: 1,
+      })
+      database.mediaGenerationJobs.insert({
+        id: input.id,
+        conversationId: submitInput.conversationId,
+        assistantMessageId: jobAssistantMessageId,
+        provider: 'openrouter',
+        model: route.model,
+        kind: 'video',
+        providerJobId: `provider_${input.id}`,
+        status,
+        parameters: {},
+        createdAt: 1,
+        updatedAt: 1,
+      })
+    }
+
+    addJob({ id: 'valid_active' })
+    addJob({ id: 'valid_paused', status: 'paused' })
+    addJob({ id: 'wrong_conversation', runConversationId: 'conversation_other' })
+    addJob({ id: 'wrong_model', runModel: 'other-model' })
+    addJob({ id: 'wrong_message', jobAssistantMessageId: 'assistant_decoy' })
+    addJob({ id: 'wrong_role', messageRole: 'user' })
+    addJob({ id: 'wrong_block_status', blockStatus: 'in_progress' })
+    addJob({ id: 'wrong_block_kind', blockKind: 'image' })
+
+    database.recoverInterrupted()
+
+    expect(database.chatRuns.get('run_valid_active')?.status).toBe('running')
+    expect(database.chatRuns.get('run_valid_paused')?.status).toBe('running')
+    expect(database.messages.get('assistant_valid_active')?.blocks).toEqual([
+      expect.objectContaining({ status: 'pending' }),
+    ])
+    expect(database.messages.get('assistant_valid_paused')?.blocks).toEqual([
+      expect.objectContaining({ status: 'paused' }),
+    ])
+    const invalidIds = [
+      'wrong_conversation',
+      'wrong_model',
+      'wrong_message',
+      'wrong_role',
+      'wrong_block_status',
+      'wrong_block_kind',
+    ]
+    for (const id of invalidIds) {
+      expect(database.mediaGenerationJobs.get(id)).toMatchObject({
+        status: 'failed',
+        errorCode: 'MEDIA_GENERATION_FAILED',
+      })
+      expect(database.chatRuns.get(`run_${id}`)).toMatchObject({
+        status: 'failed',
+        errorCode: 'INTERNAL_ERROR',
+      })
+      expect(database.messages.get(`assistant_${id}`)?.blocks).toEqual([
+        expect.objectContaining({
+          status: 'failed',
+          errorCode: 'MEDIA_GENERATION_FAILED',
+        }),
+      ])
+    }
+    expect(database.mediaGenerationJobs.listActive().map((job) => job.id))
+      .toEqual(['valid_active'])
   })
 
   it('rolls back the entire submitted turn when the video job insert fails', () => {

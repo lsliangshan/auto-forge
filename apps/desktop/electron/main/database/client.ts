@@ -15,17 +15,25 @@ export function openAppDatabase(path: string) {
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
     const executions = sqlite.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run(endedAt).changes
-    const chatRuns = sqlite.prepare(`
-      UPDATE chat_runs
-      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = ?
+    const preservedRequestIds = new Set(
+      repositories.mediaGenerationJobs.reconcileInterrupted(endedAt),
+    )
+    let chatRuns = 0
+    const interruptedRuns = sqlite.prepare(`
+      SELECT id, request_id AS requestId
+      FROM chat_runs
       WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
-        AND NOT EXISTS (
-          SELECT 1
-          FROM media_generation_jobs
-          WHERE media_generation_jobs.id = chat_runs.request_id
-            AND media_generation_jobs.status IN ('pending', 'in_progress', 'downloading', 'paused')
-        )
-    `).run(endedAt).changes
+    `).all() as Array<{ id: string; requestId: string }>
+    const failRun = sqlite.prepare(`
+      UPDATE chat_runs
+      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
+      WHERE id = @id
+        AND status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `)
+    for (const run of interruptedRuns) {
+      if (preservedRequestIds.has(run.requestId)) continue
+      chatRuns += failRun.run({ id: run.id, endedAt }).changes
+    }
     repositories.messages.failInterruptedMediaGenerations()
     return { executions, chatRuns }
   })()
