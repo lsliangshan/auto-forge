@@ -428,6 +428,101 @@ describe('MediaLifecycle', () => {
     expect(existsSync(join(mediaRoot, '.quarantine', 'orphan.delete'))).toBe(false)
   })
 
+  it.each([
+    ['after committing deleting metadata before the initial rename', 'transition'],
+    ['after rollback renamed bytes before restoring metadata', 'rollback'],
+  ])('recovers canonical bytes %s', async (_scenario, suffix) => {
+    const { database, mediaRoot } = setup()
+    const conversationId = `conversation_crash_${suffix}`
+    const assetId = `asset_crash_${suffix}`
+    const relativePath = `${conversationId}/${assetId}.png`
+    insertConversation(database, conversationId)
+    insertAsset(database, {
+      id: assetId,
+      conversationId,
+      relativePath: `.quarantine/${assetId}.delete`,
+      status: 'deleting',
+      createdAt: NOW,
+    })
+    writeAsset(mediaRoot, conversationId, `${assetId}.png`, assetId)
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toBeUndefined()
+    expect(existsSync(join(mediaRoot, relativePath))).toBe(false)
+    expect(existsSync(join(mediaRoot, '.quarantine', `${assetId}.delete`))).toBe(false)
+
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toBeUndefined()
+    expect(existsSync(join(mediaRoot, relativePath))).toBe(false)
+  })
+
+  it('retains a non-ready row when its exact canonical candidate is a symlink', async () => {
+    const { database, mediaRoot } = setup()
+    const conversationId = 'conversation_crash_symlink'
+    const assetId = 'asset_crash_symlink'
+    insertConversation(database, conversationId)
+    insertAsset(database, {
+      id: assetId,
+      conversationId,
+      relativePath: `.quarantine/${assetId}.delete`,
+      status: 'deleting',
+      createdAt: NOW,
+    })
+    const outside = mkdtempSync(join(tmpdir(), 'autoforge-media-crash-outside-'))
+    temporaryDirectories.push(outside)
+    const victim = join(outside, 'victim.png')
+    writeFileSync(victim, 'outside')
+    mkdirSync(join(mediaRoot, conversationId), { recursive: true })
+    const canonical = join(mediaRoot, conversationId, `${assetId}.png`)
+    await symlink(victim, canonical)
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toMatchObject({
+      status: 'deleting',
+      relativePath: `.quarantine/${assetId}.delete`,
+    })
+    expect((await lstat(canonical)).isSymbolicLink()).toBe(true)
+    expect(await readFile(victim, 'utf8')).toBe('outside')
+  })
+
+  it('removes a Task 4 non-ready row when neither tombstone nor canonical bytes exist', async () => {
+    const { database, mediaRoot } = setup()
+    const conversationId = 'conversation_task4_missing'
+    const assetId = 'asset_task4_missing'
+    insertConversation(database, conversationId)
+    insertAsset(database, {
+      id: assetId,
+      conversationId,
+      relativePath: `.quarantine/${assetId}.delete`,
+      status: 'failed',
+      createdAt: NOW,
+    })
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toBeUndefined()
+  })
+
   it('preserves paused video generation jobs during recovery', async () => {
     const { database, mediaRoot } = setup()
     insertConversation(database, 'conversation_video')

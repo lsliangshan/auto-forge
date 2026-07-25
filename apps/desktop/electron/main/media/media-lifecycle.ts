@@ -18,6 +18,11 @@ import type {
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const DAY = 24 * 60 * 60 * 1_000
+const MANAGED_EXTENSIONS = [
+  'png', 'jpg', 'webp', 'gif', 'avif', 'svg',
+  'mp3', 'wav', 'ogg', 'flac', 'm4a',
+  'mp4', 'webm', 'mov',
+] as const
 
 interface ConversationRepository {
   get(id: string): Conversation | undefined
@@ -68,6 +73,11 @@ interface QuarantinedConversation {
   source: string
   quarantine: string
 }
+
+type CanonicalCandidate =
+  | { state: 'absent' }
+  | { state: 'unsafe' }
+  | { state: 'file'; path: string; identity: FileIdentity }
 
 const nodeFileSystem: MediaLifecycleFileSystem = {
   lstat,
@@ -454,13 +464,7 @@ export class MediaLifecycle {
     for (const asset of this.database.mediaAssets.listForConversation(conversationId)) {
       const tombstone = this.tombstonePath(asset)
       if (asset.status !== 'ready' && tombstone) {
-        if (await this.tryPurge(tombstone)) {
-          try {
-            this.database.mediaAssets.delete(asset.id)
-          } catch {
-            // The non-ready row is safe to retry on the next startup.
-          }
-        }
+        await this.recoverNonReadyTombstoneAsset(asset, tombstone)
         continue
       }
       if (asset.status !== 'ready') continue
@@ -481,6 +485,67 @@ export class MediaLifecycle {
           // Keep recovery per-entry; the database remains authoritative on retry.
         }
       }
+    }
+  }
+
+  private async recoverNonReadyTombstoneAsset(
+    asset: MediaAssetRecord,
+    tombstone: string,
+  ): Promise<void> {
+    if (await this.metadata(tombstone)) {
+      if (!await this.tryPurge(tombstone)) return
+    } else {
+      const candidate = await this.findCanonicalCandidate(asset)
+      if (candidate.state === 'unsafe') return
+      if (
+        candidate.state === 'file'
+        && !await this.moveCanonicalBackToTombstone(
+          candidate.path,
+          candidate.identity,
+          tombstone,
+        )
+      ) return
+      if (candidate.state === 'file' && !await this.tryPurge(tombstone)) return
+    }
+
+    if (await this.metadata(tombstone)) return
+    if ((await this.findCanonicalCandidate(asset)).state !== 'absent') return
+    try {
+      this.database.mediaAssets.delete(asset.id)
+    } catch {
+      // No managed bytes remain; a retained non-ready row is safe to retry.
+    }
+  }
+
+  private async findCanonicalCandidate(asset: MediaAssetRecord): Promise<CanonicalCandidate> {
+    if (!ID_PATTERN.test(asset.id) || !ID_PATTERN.test(asset.conversationId)) {
+      return { state: 'unsafe' }
+    }
+    const directory = join(this.mediaRoot, asset.conversationId)
+    const directoryMetadata = await this.metadata(directory)
+    if (!directoryMetadata) return { state: 'absent' }
+    if (directoryMetadata.isSymbolicLink() || !directoryMetadata.isDirectory()) {
+      return { state: 'unsafe' }
+    }
+    try {
+      const directoryIdentity = await this.verifyDirectory(directory)
+      const expectedNames = new Set(
+        MANAGED_EXTENSIONS.map((extension) => `${asset.id}.${extension}`),
+      )
+      const matches = (await this.filesystem.readdir(directory, { withFileTypes: true }))
+        .filter((entry) => expectedNames.has(entry.name))
+      if (matches.length === 0) return { state: 'absent' }
+      if (
+        matches.length !== 1
+        || matches[0]!.isSymbolicLink()
+        || !matches[0]!.isFile()
+      ) return { state: 'unsafe' }
+      const path = join(directory, matches[0]!.name)
+      const identity = await this.verifyFile(path)
+      await this.verifyDirectory(directory, directoryIdentity)
+      return { state: 'file', path, identity }
+    } catch {
+      return { state: 'unsafe' }
     }
   }
 
