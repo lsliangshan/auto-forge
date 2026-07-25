@@ -18,6 +18,30 @@ function sseResponse(chunks: string[], status = 200, headers?: Record<string, st
   }), { status, headers })
 }
 
+function abortingSlowJsonResponse(
+  abort: AbortController,
+  value: unknown,
+): { response: Response; wasCancelled(): boolean } {
+  const encoder = new TextEncoder()
+  let cancelled = false
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(JSON.stringify(value)))
+    },
+    pull(controller) {
+      abort.abort()
+      return new Promise<void>((resolve) => {
+        setTimeout(() => {
+          try { controller.close() } catch { /* the signal-aware reader already cancelled */ }
+          resolve()
+        }, 5)
+      })
+    },
+    cancel() { cancelled = true },
+  }, { highWaterMark: 0 }))
+  return { response, wasCancelled: () => cancelled }
+}
+
 async function collect(stream: AsyncIterable<OpenRouterStreamEvent>) {
   const values: OpenRouterStreamEvent[] = []
   for await (const value of stream) values.push(value)
@@ -397,6 +421,29 @@ describe('OpenRouterProvider', () => {
     expect(fetch).toHaveBeenCalledTimes(attempts)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it('treats an extra-key diagnostic envelope as malformed while keeping safe HTTP mapping', async () => {
+    const diagnostic = vi.fn()
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({
+        error: {
+          code: 'RAW_NESTED_CODE',
+          message: 'RAW_NESTED_MESSAGE',
+          error_type: 'RAW_NESTED_TYPE',
+        },
+        unexpected: true,
+      }, { status: 403 })),
+      diagnostic,
+    })
+
+    await expect(provider.downloadVideo('job_1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_ACCESS_DENIED',
+      message: 'The model provider denied access.',
+    })
+    expect(diagnostic).toHaveBeenCalledWith({ operation: 'video', status: 403 })
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_NESTED')
   })
 
   it('rejects a non-2xx video download after draining only bounded diagnostics', async () => {
@@ -1187,6 +1234,36 @@ describe('OpenRouterProvider', () => {
     await expect(valid.validateCredential()).resolves.toEqual({ valid: true })
     await expect(invalid.validateCredential()).resolves.toEqual({ valid: false })
     await expect(forbidden.validateCredential()).rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
+  })
+
+  it('cancels a slow general catalog body before optional discovery starts', async () => {
+    const controller = new AbortController()
+    const slow = abortingSlowJsonResponse(controller, { data: [] })
+    const fetch = vi.fn(async () => (
+      fetch.mock.calls.length === 1 ? slow.response : Response.json({ data: [] })
+    ))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.listModels(controller.signal)).rejects.toMatchObject({
+      code: 'CANCELLED',
+      message: 'The operation was cancelled.',
+    })
+    expect(slow.wasCancelled()).toBe(true)
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels a slow credential-validation body instead of returning valid', async () => {
+    const controller = new AbortController()
+    const slow = abortingSlowJsonResponse(controller, { data: [] })
+    const fetch = vi.fn(async () => slow.response)
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.validateCredential(controller.signal)).rejects.toMatchObject({
+      code: 'CANCELLED',
+      message: 'The operation was cancelled.',
+    })
+    expect(slow.wasCancelled()).toBe(true)
+    expect(fetch).toHaveBeenCalledTimes(1)
   })
 
   it('applies the same bounded retry policy to model discovery', async () => {

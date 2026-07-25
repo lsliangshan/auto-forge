@@ -322,6 +322,7 @@ async function boundedResponseJson(
   maximumBytes = MAX_MODEL_CATALOG_BODY,
   signal?: AbortSignal,
 ): Promise<unknown> {
+  if (signal?.aborted) throw failure('CANCELLED')
   const declaredLength = response.headers.get('content-length')
   if (declaredLength && Number(declaredLength) > maximumBytes) {
     throw new Error('Model provider response exceeded the size limit')
@@ -341,6 +342,7 @@ async function boundedResponseJson(
       output += decoder.decode(chunk.value, { stream: true })
     }
     output += decoder.decode()
+    if (signal?.aborted) throw failure('CANCELLED')
     return JSON.parse(output) as unknown
   } finally {
     await reader.cancel().catch(() => undefined)
@@ -734,15 +736,24 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     if (!response.ok) await this.throwHttpFailure('models', response, signal)
     let general: ModelInfo[]
     try {
-      general = this.config.parseModels(await boundedResponseJson(response))
-    } catch {
+      general = this.config.parseModels(await boundedResponseJson(
+        response,
+        MAX_MODEL_CATALOG_BODY,
+        signal,
+      ))
+    } catch (error) {
+      if (isAbort(error, signal)) throw failure('CANCELLED')
       throw failure('MODEL_PROVIDER_REQUEST_FAILED')
     }
     if (!this.config.optionalModelCatalogs?.length) return general
     const results = await Promise.allSettled(this.config.optionalModelCatalogs.map(async (catalog) => {
       const { response: optionalResponse } = await this.fetchModels(signal, catalog.endpoint)
       if (!optionalResponse.ok) await this.throwHttpFailure('models', optionalResponse, signal)
-      return catalog.parse(await boundedResponseJson(optionalResponse))
+      return catalog.parse(await boundedResponseJson(
+        optionalResponse,
+        MAX_MODEL_CATALOG_BODY,
+        signal,
+      ))
     }))
     if (signal?.aborted) throw failure('CANCELLED')
     const optional = results.flatMap((result) => {
@@ -758,7 +769,11 @@ export class OpenAiCompatibleProvider implements ModelProvider {
       const { response } = await this.fetchModels(signal)
       if (response.status === 401) return { valid: false }
       if (!response.ok) await this.throwHttpFailure('models', response, signal)
-      this.config.parseModels(await boundedResponseJson(response))
+      this.config.parseModels(await boundedResponseJson(
+        response,
+        MAX_MODEL_CATALOG_BODY,
+        signal,
+      ))
       return { valid: true }
     } catch (error) {
       if (isAbort(error, signal)) throw failure('CANCELLED')
@@ -966,7 +981,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     let metadata: { code?: string | number; error_type?: string } = {}
     try {
       const parsed = JSON.parse(await boundedResponseText(response, signal)) as unknown
-      const envelope = z.object({ error: providerErrorSchema.optional() }).passthrough().safeParse(parsed)
+      const envelope = z.object({ error: providerErrorSchema.optional() }).strict().safeParse(parsed)
       const direct = providerErrorSchema.safeParse(parsed)
       metadata = providerErrorMetadata(envelope.success && envelope.data.error
         ? envelope.data.error
