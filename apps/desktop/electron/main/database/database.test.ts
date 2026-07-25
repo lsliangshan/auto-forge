@@ -548,7 +548,7 @@ describe('openAppDatabase', () => {
       model: 'model', status: 'running', startedAt: 1,
     })
 
-    database.chatRuns.finalizeWithMessage('run_terminal', 'assistant_terminal', {
+    database.chatRuns.finalizeWithMessage('run_terminal', 'assistant_terminal', 'request_terminal', {
       blocks: [{ type: 'text', text: '完整' }], status: 'completed', endedAt: 2,
       generationId: 'generation_1', inputTokens: 3, outputTokens: 4, costUsd: '0.01',
     })
@@ -558,7 +558,7 @@ describe('openAppDatabase', () => {
       status: 'completed', endedAt: 2, generationId: 'generation_1', inputTokens: 3, outputTokens: 4, costUsd: '0.01',
     })
 
-    expect(() => database.chatRuns.finalizeWithMessage('missing', 'assistant_terminal', {
+    expect(() => database.chatRuns.finalizeWithMessage('missing', 'assistant_terminal', 'request_terminal', {
       blocks: [{ type: 'text', text: '不得提交' }], status: 'failed', endedAt: 3,
     })).toThrow()
     expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
@@ -592,6 +592,8 @@ describe('openAppDatabase', () => {
     const asset = {
       ...readyAsset('asset_media_terminal', 'conversation_media_terminal'),
       source: 'generated' as const,
+      provider: 'openrouter',
+      model: 'image-model',
     }
     database.mediaAssets.insert(asset)
     const finalBlocks = [
@@ -602,6 +604,7 @@ describe('openAppDatabase', () => {
     database.chatRuns.finalizeWithMessage(
       'run_media_terminal',
       'assistant_media_terminal',
+      'request_media_terminal',
       {
         blocks: finalBlocks,
         status: 'completed',
@@ -656,6 +659,8 @@ describe('openAppDatabase', () => {
     const asset = {
       ...readyAsset('asset_media_rollback', 'conversation_media_rollback'),
       source: 'generated' as const,
+      provider: 'openrouter',
+      model: 'image-model',
     }
     database.mediaAssets.insert(asset)
     const faultInjector = new Database(path)
@@ -672,6 +677,7 @@ describe('openAppDatabase', () => {
     expect(() => database.chatRuns.finalizeWithMessage(
       'run_media_rollback',
       'assistant_media_rollback',
+      'request_media_rollback',
       {
         blocks: [mediaBlockForAsset(asset, 'block_media_rollback', 'output')],
         status: 'completed',
@@ -683,6 +689,220 @@ describe('openAppDatabase', () => {
     expect(database.mediaAssets.get(asset.id)?.messageId).toBeUndefined()
     expect(database.chatRuns.get('run_media_rollback')?.status).toBe('running')
   })
+
+  it.each([
+    ['run request mismatch', {
+      requestId: 'request_wrong',
+      pendingJobId: 'request_identity',
+      pendingStatus: 'in_progress',
+      assetModel: 'image-model',
+    }],
+    ['generation job mismatch', {
+      requestId: 'request_identity',
+      pendingJobId: 'request_wrong',
+      pendingStatus: 'in_progress',
+      assetModel: 'image-model',
+    }],
+    ['generated asset model mismatch', {
+      requestId: 'request_identity',
+      pendingJobId: 'request_identity',
+      pendingStatus: 'in_progress',
+      assetModel: 'other-model',
+    }],
+    ['already failed generation', {
+      requestId: 'request_identity',
+      pendingJobId: 'request_identity',
+      pendingStatus: 'failed',
+      assetModel: 'image-model',
+    }],
+  ] as const)('rejects media finalization with %s', (_description, variant) => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_identity', title: 'Identity' })
+    const pending = {
+      type: 'media_generation' as const,
+      blockId: 'block_identity',
+      jobId: variant.pendingJobId,
+      kind: 'image' as const,
+      status: variant.pendingStatus,
+      ...(variant.pendingStatus === 'failed' ? { errorCode: 'CANCELLED' as const } : {}),
+    }
+    database.messages.insert({
+      id: 'assistant_identity',
+      conversationId: 'conversation_identity',
+      role: 'assistant',
+      blocks: [pending],
+      createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_identity',
+      conversationId: 'conversation_identity',
+      requestId: 'request_identity',
+      model: 'image-model',
+      status: 'running',
+      startedAt: 1,
+    })
+    const asset = {
+      ...readyAsset('asset_identity', 'conversation_identity'),
+      source: 'generated' as const,
+      provider: 'openrouter',
+      model: variant.assetModel,
+    }
+    database.mediaAssets.insert(asset)
+
+    expect(() => database.chatRuns.finalizeWithMessage(
+      'run_identity',
+      'assistant_identity',
+      variant.requestId,
+      {
+        blocks: [mediaBlockForAsset(asset, 'block_identity', 'output')],
+        status: 'completed',
+        endedAt: 2,
+      },
+    )).toThrow()
+
+    expect(database.messages.get('assistant_identity')?.blocks).toEqual([pending])
+    expect(database.mediaAssets.get(asset.id)?.messageId).toBeUndefined()
+    expect(database.chatRuns.get('run_identity')?.status).toBe('running')
+  })
+
+  it.each(['failed', 'cancelled'] as const)(
+    'rejects a media generation terminal with a mismatched job ID when the run is %s',
+    (runStatus) => {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_failed_identity', title: 'Failed identity' })
+      const pending = {
+        type: 'media_generation' as const,
+        blockId: 'block_failed_identity',
+        jobId: 'request_failed_identity',
+        kind: 'audio' as const,
+        status: 'in_progress' as const,
+      }
+      database.messages.insert({
+        id: 'assistant_failed_identity',
+        conversationId: 'conversation_failed_identity',
+        role: 'assistant',
+        blocks: [pending],
+        createdAt: 1,
+      })
+      database.chatRuns.insert({
+        id: 'run_failed_identity',
+        conversationId: 'conversation_failed_identity',
+        requestId: 'request_failed_identity',
+        model: 'audio-model',
+        status: 'running',
+        startedAt: 1,
+      })
+
+      expect(() => database.chatRuns.finalizeWithMessage(
+        'run_failed_identity',
+        'assistant_failed_identity',
+        'request_failed_identity',
+        {
+          blocks: [{
+            ...pending,
+            jobId: 'request_wrong',
+            status: 'failed',
+            errorCode: 'MEDIA_GENERATION_FAILED',
+          }],
+          status: runStatus,
+          endedAt: 2,
+          errorCode: 'MEDIA_GENERATION_FAILED',
+        },
+      )).toThrow()
+
+      expect(database.messages.get('assistant_failed_identity')?.blocks).toEqual([pending])
+      expect(database.chatRuns.get('run_failed_identity')?.status).toBe('running')
+    },
+  )
+
+  it('keeps non-media workflow terminal persistence compatible', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_workflow_terminal', title: 'Workflow terminal' })
+    database.messages.insert({
+      id: 'assistant_workflow_terminal',
+      conversationId: 'conversation_workflow_terminal',
+      role: 'assistant',
+      blocks: [{
+        type: 'workflow_proposal',
+        workflowId: 'workflow_1',
+        workflowName: 'Workflow',
+        args: {},
+      }],
+      createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_workflow_terminal',
+      conversationId: 'conversation_workflow_terminal',
+      requestId: 'request_workflow_terminal',
+      model: 'text-model',
+      status: 'running',
+      startedAt: 1,
+    })
+    const blocks = [
+      { type: 'text' as const, text: 'Ready' },
+      {
+        type: 'workflow_proposal' as const,
+        workflowId: 'workflow_1',
+        workflowName: 'Workflow',
+        args: { value: 1 },
+      },
+    ]
+
+    database.chatRuns.finalizeWithMessage(
+      'run_workflow_terminal',
+      'assistant_workflow_terminal',
+      'request_workflow_terminal',
+      { blocks, status: 'completed', endedAt: 2 },
+    )
+
+    expect(database.messages.get('assistant_workflow_terminal')?.blocks).toEqual(blocks)
+    expect(database.chatRuns.get('run_workflow_terminal')).toMatchObject({
+      status: 'completed',
+      endedAt: 2,
+    })
+  })
+
+  it.each(['completed', 'failed', 'cancelled'] as const)(
+    'rejects rewriting an already terminal %s chat run',
+    (terminalStatus) => {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_terminal_rewrite', title: 'Terminal rewrite' })
+      database.messages.insert({
+        id: 'assistant_terminal_rewrite',
+        conversationId: 'conversation_terminal_rewrite',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: 'original terminal' }],
+        createdAt: 1,
+      })
+      database.chatRuns.insert({
+        id: 'run_terminal_rewrite',
+        conversationId: 'conversation_terminal_rewrite',
+        requestId: 'request_terminal_rewrite',
+        model: 'text-model',
+        status: terminalStatus,
+        startedAt: 1,
+        endedAt: 2,
+      })
+
+      expect(() => database.chatRuns.finalizeWithMessage(
+        'run_terminal_rewrite',
+        'assistant_terminal_rewrite',
+        'request_terminal_rewrite',
+        {
+          blocks: [{ type: 'text', text: 'late rewrite' }],
+          status: 'completed',
+          endedAt: 3,
+        },
+      )).toThrow()
+
+      expect(database.messages.get('assistant_terminal_rewrite')?.blocks)
+        .toEqual([{ type: 'text', text: 'original terminal' }])
+      expect(database.chatRuns.get('run_terminal_rewrite')).toMatchObject({
+        status: terminalStatus,
+        endedAt: 2,
+      })
+    },
+  )
 
   it('redacts execution log text and metadata before persistence', () => {
     const database = openTestDatabase()

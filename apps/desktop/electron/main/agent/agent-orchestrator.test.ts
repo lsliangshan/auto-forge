@@ -200,6 +200,27 @@ describe('AgentOrchestrator', () => {
     })
     persistence.replaceAssistantBlock('assistant_1', 'block_1', pending)
     expect(replaceBlock).toHaveBeenCalledWith('assistant_1', 'block_1', pending)
+
+    const finalizeWithMessage = vi.fn()
+    const terminalPersistence = createAgentPersistence({
+      messages: { insert, insertWithAssets, replaceBlock },
+      chatRuns: { finalizeWithMessage },
+    } as never)
+    terminalPersistence.finalize({
+      runId: 'run_1',
+      requestId: 'request_1',
+      messageId: 'assistant_1',
+      blocks: [pending],
+      status: 'failed',
+      endedAt: 12,
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(finalizeWithMessage).toHaveBeenCalledWith(
+      'run_1',
+      'assistant_1',
+      'request_1',
+      expect.objectContaining({ status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' }),
+    )
   })
 
   it('skips workflow listing and retrieval when tools are disabled', async () => {

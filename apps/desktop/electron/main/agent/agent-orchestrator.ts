@@ -142,7 +142,7 @@ export function createAgentPersistence(
       return repositories.messages.replaceBlock(messageId, blockId, block)
     },
     finalize(input) {
-      repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, {
+      repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, input.requestId, {
         blocks: input.blocks,
         status: input.status,
         endedAt: input.endedAt,

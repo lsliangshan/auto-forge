@@ -291,6 +291,7 @@ export interface AppRepositories {
     finalizeWithMessage(
       id: string,
       messageId: string,
+      requestId: string,
       value: Pick<ChatRun, 'status' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode'>> & { blocks: unknown[] },
     ): ChatRun
   }
@@ -401,6 +402,7 @@ function claimReplacementMedia(
   conversationId: string,
   previous: ChatBlock,
   replacement: Extract<ChatBlock, { type: 'media' }>,
+  identity?: { requestId: string; model: string },
 ): void {
   if (
     !('blockId' in previous)
@@ -414,6 +416,10 @@ function claimReplacementMedia(
     )
     || replacement.purpose !== 'output'
   ) throw new Error('Media output must replace its matching generation block')
+  if (identity && previous.type === 'media_generation' && (
+    previous.jobId !== identity.requestId
+    || !['pending', 'in_progress', 'downloading'].includes(previous.status)
+  )) throw new Error('Media generation identity is not active')
 
   const row = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, {
     id: replacement.assetId,
@@ -423,6 +429,7 @@ function claimReplacementMedia(
   if (
     asset.conversationId !== conversationId
     || asset.source !== 'generated'
+    || (identity !== undefined && asset.model !== identity.model)
     || asset.status !== 'ready'
     || (asset.messageId !== undefined && asset.messageId !== messageId)
   ) throw new Error('Media asset cannot be claimed')
@@ -709,7 +716,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         }))
         return one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
       },
-      finalizeWithMessage(id, messageId, value) {
+      finalizeWithMessage(id, messageId, requestId, value) {
         const blocks = chatBlockSchema.array().parse(value.blocks)
         assertUniqueFinalMediaBlocks(blocks)
         return transaction(database, () => {
@@ -718,10 +725,38 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           })
           if (!messageRow || messageRow.role !== 'assistant') throw new Error('Assistant message not found')
           const runRow = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
-          if (!runRow || runRow.conversationId !== messageRow.conversationId) {
+          if (
+            !runRow
+            || runRow.conversationId !== messageRow.conversationId
+            || runRow.requestId !== requestId
+            || runRow.status !== 'running'
+          ) {
             throw new Error('Chat run does not belong to the assistant conversation')
           }
           const previousBlocks = chatBlockSchema.array().parse(parse(messageRow.blocksJson as string))
+          for (const previous of previousBlocks) {
+            if (previous.type !== 'media_generation') continue
+            const replacement = blocks.find((candidate) => (
+              'blockId' in candidate && candidate.blockId === previous.blockId
+            ))
+            if (
+              !replacement
+              || previous.jobId !== requestId
+              || !['pending', 'in_progress', 'downloading'].includes(previous.status)
+            ) throw new Error('Media generation identity is not active')
+            if (replacement.type === 'media_generation') {
+              if (
+                replacement.jobId !== requestId
+                || replacement.kind !== previous.kind
+                || replacement.status !== 'failed'
+                || !['failed', 'cancelled'].includes(value.status)
+              ) throw new Error('Media generation failure does not match its request')
+            } else if (replacement.type === 'media') {
+              if (value.status !== 'completed') throw new Error('Media output requires a completed run')
+            } else {
+              throw new Error('Media generation block requires a terminal replacement')
+            }
+          }
           for (const block of blocks) {
             if (block.type !== 'media') continue
             const previous = previousBlocks.find((candidate) => (
@@ -734,6 +769,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               messageRow.conversationId as string,
               previous,
               block,
+              { requestId, model: runRow.model },
             )
           }
           const message = database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @messageId').run({
