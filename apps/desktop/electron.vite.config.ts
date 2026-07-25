@@ -17,11 +17,15 @@ export default defineConfig({
     },
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
     build: {
+      externalizeDeps: false,
       rollupOptions: {
         input: {
           index: new URL('./electron/preload/index.ts', import.meta.url).pathname,
+        },
+        output: {
+          format: 'cjs',
+          entryFileNames: '[name].cjs',
         },
       },
     },

@@ -57,6 +57,7 @@ describe('OpenRouterProvider', () => {
       return Response.json({ data: [
       { id: 'z/model', name: 'Z', supported_parameters: ['tools'], architecture: { input_modalities: ['text'], output_modalities: ['text'] }, context_length: 1000, pricing: { prompt: '0.000001', completion: '0.000002' } },
       { id: 'a/model', name: 'A', supported_parameters: ['tools'], architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
+      { id: 'unknown-context/model', name: 'Unknown context', supported_parameters: ['tools'], architecture: { input_modalities: ['text'], output_modalities: ['text'] }, context_length: 0 },
       { id: 'image/model', name: 'Image', supported_parameters: ['tools'], architecture: { input_modalities: ['image'], output_modalities: ['image'] } },
       { id: 'no-tools', name: 'No tools', supported_parameters: [], architecture: { input_modalities: ['text'], output_modalities: ['text'] } },
       ] })
@@ -65,6 +66,7 @@ describe('OpenRouterProvider', () => {
 
     await expect(provider.listModels()).resolves.toEqual([
       { id: 'a/model', name: 'A' },
+      { id: 'unknown-context/model', name: 'Unknown context' },
       { id: 'z/model', name: 'Z', contextLength: 1000, inputCostPerMillion: 1, outputCostPerMillion: 2 },
     ])
     expect(fetch.mock.calls[0]?.[0]).toBe('https://openrouter.ai/api/v1/models?supported_parameters=tools')

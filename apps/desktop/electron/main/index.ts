@@ -93,7 +93,7 @@ async function createMainWindow(application: ApplicationRuntime): Promise<void> 
   const created = await createSecureWindow({
     BrowserWindow,
     session: session.defaultSession,
-    preloadPath: fileURLToPath(new URL('../preload/index.mjs', import.meta.url)),
+    preloadPath: fileURLToPath(new URL('../preload/index.cjs', import.meta.url)),
     rendererTarget: target,
     beforeLoad: (window) => {
       mainWindow = window as BrowserWindow

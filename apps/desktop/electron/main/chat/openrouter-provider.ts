@@ -63,7 +63,7 @@ const modelResponseSchema = z.object({
       input_modalities: z.array(z.string()).optional(),
       output_modalities: z.array(z.string()).optional(),
     }).passthrough().optional(),
-    context_length: z.number().int().positive().optional(),
+    context_length: z.number().int().nonnegative().optional(),
     pricing: z.object({ prompt: z.string().optional(), completion: z.string().optional() }).passthrough().optional(),
   }).passthrough()),
 }).passthrough()
@@ -238,7 +238,9 @@ export class OpenRouterProvider {
         return {
           id: model.id,
           name: model.name,
-          ...(model.context_length === undefined ? {} : { contextLength: model.context_length }),
+          ...(model.context_length === undefined || model.context_length === 0
+            ? {}
+            : { contextLength: model.context_length }),
           ...(inputCostPerMillion === undefined ? {} : { inputCostPerMillion }),
           ...(outputCostPerMillion === undefined ? {} : { outputCostPerMillion }),
         }
