@@ -124,6 +124,53 @@ describe('SettingsService', () => {
     })
   })
 
+  it('preserves OpenRouter audio while discarding blank, malformed, and unknown slots', () => {
+    const repository = settingsRepository({
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat', image: 'not-supported' },
+        openrouter: {
+          text: 'text-model',
+          image: '   ',
+          audio: 'audio-model',
+          video: 42,
+          custom: 'not-supported',
+        },
+      },
+    })
+    const service = new SettingsService(repository, defaults)
+
+    expect(service.get().defaultModels).toEqual({
+      deepseek: { text: 'deepseek-chat' },
+      openrouter: { text: 'text-model', audio: 'audio-model' },
+    })
+  })
+
+  it('persists every nested OpenRouter output default through an update round-trip', () => {
+    const service = new SettingsService(settingsRepository(), defaults)
+
+    service.update({
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-pro' },
+        openrouter: {
+          text: 'text-model',
+          image: 'image-model',
+          audio: 'audio-model',
+          video: 'video-model',
+        },
+      },
+    })
+
+    expect(service.get().defaultModels).toEqual({
+      deepseek: { text: 'deepseek-v4-pro' },
+      openrouter: {
+        text: 'text-model',
+        image: 'image-model',
+        audio: 'audio-model',
+        video: 'video-model',
+      },
+    })
+  })
+
   it('updates one provider default without changing the other', () => {
     const service = new SettingsService(settingsRepository(), defaults)
 

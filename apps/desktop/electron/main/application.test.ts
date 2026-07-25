@@ -71,6 +71,21 @@ describe('createApplicationRuntime', () => {
       model: 'deepseek-v4-flash',
     }))
 
+    const currentSettings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        ...currentSettings.defaultModels,
+        openrouter: { text: 'openrouter/text-default' },
+      },
+    })
+    const openRouterConversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send({ conversationId: openRouterConversation.id, content: 'hello from OpenRouter' })
+    await vi.waitFor(() => expect(openrouter.stream).toHaveBeenCalled())
+    expect(openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'openrouter/text-default',
+    }))
+
     await runtime.services.settings.clearProviderApiKey('deepseek')
     await expect(runtime.services.settings.validateProviderCredential('deepseek'))
       .resolves.toMatchObject({ provider: 'deepseek', configured: false, validation: 'unchecked' })
