@@ -3,6 +3,10 @@ import {
   OpenRouterProvider,
   type OpenRouterStreamEvent,
 } from './openrouter-provider.js'
+import {
+  parseOpenRouterImageModels,
+  parseOpenRouterVideoModels,
+} from './model-provider.js'
 
 function sseResponse(chunks: string[], status = 200, headers?: Record<string, string>): Response {
   const encoder = new TextEncoder()
@@ -23,6 +27,104 @@ async function collect(stream: AsyncIterable<OpenRouterStreamEvent>) {
 const credential = { get: vi.fn(async () => 'sk-private') }
 
 describe('OpenRouterProvider', () => {
+  it.each([
+    ['range zero', { type: 'range', min: 0, max: 0 }, 1],
+    ['range one', { type: 'range', min: 1, max: 1 }, 1],
+    ['range ten', { type: 'range', min: 1, max: 10 }, 10],
+    ['range above global maximum', { type: 'range', min: 1, max: 11 }, 10],
+    ['range unsafe maximum', { type: 'range', min: 1, max: Number.MAX_SAFE_INTEGER + 1 }, 1],
+    ['range reversed', { type: 'range', min: 10, max: 1 }, 1],
+    ['enum zero', { type: 'enum', values: [0] }, 1],
+    ['enum one', { type: 'enum', values: [1] }, 1],
+    ['enum ten', { type: 'enum', values: [10] }, 10],
+    ['enum above global maximum', { type: 'enum', values: [11] }, 1],
+    ['enum unsafe value', { type: 'enum', values: [Number.MAX_SAFE_INTEGER + 1] }, 1],
+  ] as const)('bounds image count for %s', (_case, descriptor, expected) => {
+    const [model] = parseOpenRouterImageModels({ data: [{
+      id: 'image/model',
+      name: 'Image model',
+      supported_parameters: { n: descriptor },
+    }] })
+
+    expect(model?.generation.image?.maxCount).toBe(expected)
+  })
+
+  it('merges duplicate dedicated image IDs independently of record order', () => {
+    const first = {
+      id: 'duplicate/image',
+      name: 'Same image model',
+      architecture: { input_modalities: ['text'], output_modalities: ['image'] },
+      supported_parameters: {
+        resolution: { type: 'enum', values: ['2K'] },
+        aspect_ratio: { type: 'enum', values: ['16:9'] },
+        output_format: { type: 'enum', values: ['png'] },
+        n: { type: 'range', min: 1, max: 2 },
+      },
+    }
+    const second = {
+      id: 'duplicate/image',
+      name: 'Same image model',
+      architecture: { input_modalities: ['image'], output_modalities: ['image'] },
+      supported_parameters: {
+        resolution: { type: 'enum', values: ['1K'] },
+        aspect_ratio: { type: 'enum', values: ['1:1'] },
+        output_format: { type: 'enum', values: ['jpeg'] },
+        n: { type: 'range', min: 1, max: 4 },
+      },
+    }
+    const expected = [{
+      id: 'duplicate/image',
+      name: 'Same image model',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['image'],
+      supportsTools: false,
+      generation: {
+        image: {
+          resolutions: ['1K', '2K'],
+          aspectRatios: ['16:9', '1:1'],
+          formats: ['jpeg', 'png'],
+          maxCount: 4,
+        },
+      },
+    }]
+
+    expect(parseOpenRouterImageModels({ data: [first, second] })).toEqual(expected)
+    expect(parseOpenRouterImageModels({ data: [second, first] })).toEqual(expected)
+  })
+
+  it('merges duplicate dedicated video IDs independently of record order', () => {
+    const first = {
+      id: 'duplicate/video',
+      name: 'Same video model',
+      supported_resolutions: ['1080p'],
+      supported_aspect_ratios: ['16:9'],
+    }
+    const second = {
+      id: 'duplicate/video',
+      name: 'Same video model',
+      supported_resolutions: ['720p'],
+      supported_aspect_ratios: ['9:16'],
+    }
+    const expected = [{
+      id: 'duplicate/video',
+      name: 'Same video model',
+      inputModalities: [],
+      outputModalities: ['video'],
+      supportsTools: false,
+      generation: {
+        video: {
+          resolutions: ['1080p', '720p'],
+          aspectRatios: ['16:9', '9:16'],
+          durations: [],
+          supportsAudio: false,
+        },
+      },
+    }]
+
+    expect(parseOpenRouterVideoModels({ data: [first, second] })).toEqual(expected)
+    expect(parseOpenRouterVideoModels({ data: [second, first] })).toEqual(expected)
+  })
+
   it('parses arbitrary SSE boundaries, CRLF comments, usage, choices, and indexed tool fragments', async () => {
     const payload = [
       ': keep-alive\r\n\r\n',
@@ -78,6 +180,14 @@ describe('OpenRouterProvider', () => {
               output_format: { type: 'enum', values: ['webp'] },
             },
           },
+          {
+            id: 'shared/model ',
+            name: 'Whitespace variant must not merge',
+            architecture: { output_modalities: ['image'] },
+            supported_parameters: {
+              resolution: { type: 'enum', values: ['whitespace-only'] },
+            },
+          },
           { id: 'dedicated-only/image', name: 'Not authoritative', architecture: { output_modalities: ['image'] }, supported_parameters: {} },
           { id: '__proto__', name: 'Prototype key', architecture: { output_modalities: ['image'] }, supported_parameters: {} },
         ] })
@@ -128,6 +238,12 @@ describe('OpenRouterProvider', () => {
           architecture: { input_modalities: ['audio'], output_modalities: ['audio'] },
         },
         {
+          id: ' shared/model',
+          name: 'Whitespace variant must not deduplicate',
+          supported_parameters: [],
+          architecture: { input_modalities: ['video'], output_modalities: ['video'] },
+        },
+        {
           id: 'video/no-options',
           name: 'Video without options',
           supported_parameters: [],
@@ -173,8 +289,8 @@ describe('OpenRouterProvider', () => {
           video: {
             resolutions: ['1080p', '720p'],
             aspectRatios: ['16:9', '9:16'],
-            durations: [5, 10],
-            supportsAudio: true,
+            durations: [],
+            supportsAudio: false,
           },
         },
       },

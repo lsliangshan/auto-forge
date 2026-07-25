@@ -28,6 +28,8 @@ describe('DeepSeekProvider', () => {
         data: [
           { id: 'deepseek-v4-pro', object: 'model', owned_by: 'deepseek' },
           { id: 'deepseek-v4-flash', object: 'model', owned_by: 'deepseek' },
+          { id: ' deepseek-v4-flash', object: 'model', owned_by: 'deepseek' },
+          { id: 'deepseek-v4-pro ', object: 'model', owned_by: 'deepseek' },
         ],
       })
     })
@@ -54,6 +56,21 @@ describe('DeepSeekProvider', () => {
     expect(fetch.mock.calls[0]?.[0]).toBe('https://api.deepseek.com/models')
     expect(credential.get).toHaveBeenCalledWith('deepseek_api_key')
     expect(JSON.stringify(await provider.listModels())).not.toContain('sk-deepseek-private')
+  })
+
+  it('rejects non-canonical model IDs instead of trimming them', async () => {
+    const provider = new DeepSeekProvider({
+      credential: { get: vi.fn(async () => 'sk-deepseek-private') },
+      fetch: vi.fn(async () => Response.json({
+        object: 'list',
+        data: [
+          { id: ' deepseek-leading', object: 'model' },
+          { id: 'deepseek-trailing ', object: 'model' },
+        ],
+      })),
+    })
+
+    await expect(provider.listModels()).resolves.toEqual([])
   })
 
   it('uses DeepSeek chat and parses text, tools, nullable usage, and final usage', async () => {

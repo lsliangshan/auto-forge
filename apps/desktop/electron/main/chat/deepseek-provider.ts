@@ -16,7 +16,10 @@ const deepSeekModelsSchema = z.object({
 }).passthrough()
 
 const deepSeekModelSchema = z.object({
-  id: z.string().trim().min(1).max(MAX_MODEL_ID_LENGTH),
+  id: z.string()
+    .min(1)
+    .max(MAX_MODEL_ID_LENGTH)
+    .refine((value) => value === value.trim()),
   object: z.literal('model').optional(),
   owned_by: z.string().max(256).optional(),
 }).passthrough()

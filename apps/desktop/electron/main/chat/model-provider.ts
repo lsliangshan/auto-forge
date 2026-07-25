@@ -13,6 +13,7 @@ const MAX_CAPABILITY_VALUES = 64
 const MAX_MODEL_ID_LENGTH = 256
 const MAX_MODEL_NAME_LENGTH = 512
 const MAX_CAPABILITY_VALUE_LENGTH = 128
+const MAX_IMAGE_COUNT = 10
 
 export type ModelMessage =
   | { role: 'system' | 'user'; content: string }
@@ -82,7 +83,10 @@ const modelResponseSchema = z.object({
   data: z.array(z.unknown()).max(MAX_MODELS),
 }).passthrough()
 
-const boundedModelIdSchema = z.string().trim().min(1).max(MAX_MODEL_ID_LENGTH)
+const boundedModelIdSchema = z.string()
+  .min(1)
+  .max(MAX_MODEL_ID_LENGTH)
+  .refine((value) => value === value.trim())
 const boundedModelNameSchema = z.string().trim().min(1).max(MAX_MODEL_NAME_LENGTH)
 const boundedCapabilityValueSchema = z.string().trim().min(1).max(MAX_CAPABILITY_VALUE_LENGTH)
 const modelModalitySchema = z.enum(['text', 'image', 'audio', 'video'])
@@ -137,8 +141,6 @@ const videoCapabilityModelSchema = z.object({
   name: boundedModelNameSchema,
   supported_resolutions: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
   supported_aspect_ratios: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
-  supported_durations: z.array(z.number().int().positive().max(3_600)).max(MAX_CAPABILITY_VALUES).optional(),
-  allowed_passthrough_parameters: z.array(boundedCapabilityValueSchema).max(MAX_MODEL_PARAMETERS).optional(),
 }).passthrough()
 
 const streamChunkSchema = z.object({
@@ -391,14 +393,14 @@ function maxImageCount(value: unknown): number {
     && Number.isSafeInteger(parsed.data.max)
     && parsed.data.min > 0
     && parsed.data.max >= parsed.data.min
-    && parsed.data.max <= 100
-  ) return parsed.data.max
+    && parsed.data.min <= MAX_IMAGE_COUNT
+  ) return Math.min(parsed.data.max, MAX_IMAGE_COUNT)
   if (parsed.data.type !== 'enum') return 1
   const values = parsed.data.values.flatMap((candidate) => (
     typeof candidate === 'number'
     && Number.isSafeInteger(candidate)
     && candidate > 0
-    && candidate <= 100
+    && candidate <= MAX_IMAGE_COUNT
       ? [candidate]
       : []
   ))
@@ -410,14 +412,14 @@ export function parseOpenRouterImageModels(value: unknown): ModelInfo[] {
   const byId = new Map<string, ModelInfo>()
   for (const entry of parsed.data) {
     const result = imageCapabilityModelSchema.safeParse(entry)
-    if (!result.success || byId.has(result.data.id)) continue
+    if (!result.success) continue
     const model = result.data
     const inputModalities = sortedModalities(model.architecture?.input_modalities)
     const outputModalities = mergeModalities(
       sortedModalities(model.architecture?.output_modalities),
       ['image'],
     )
-    byId.set(model.id, {
+    const candidate: ModelInfo = {
       id: model.id,
       name: model.name,
       inputModalities,
@@ -431,18 +433,30 @@ export function parseOpenRouterImageModels(value: unknown): ModelInfo[] {
           maxCount: maxImageCount(model.supported_parameters?.n),
         },
       },
+    }
+    const existing = byId.get(model.id)
+    if (!existing) {
+      byId.set(model.id, candidate)
+      continue
+    }
+    const existingImage = existing.generation.image!
+    const candidateImage = candidate.generation.image!
+    byId.set(model.id, {
+      ...existing,
+      name: compareStrings(existing.name, candidate.name) <= 0 ? existing.name : candidate.name,
+      inputModalities: mergeModalities(existing.inputModalities, candidate.inputModalities),
+      outputModalities: mergeModalities(existing.outputModalities, candidate.outputModalities),
+      generation: {
+        image: {
+          resolutions: sortedUniqueStrings([...existingImage.resolutions, ...candidateImage.resolutions]),
+          aspectRatios: sortedUniqueStrings([...existingImage.aspectRatios, ...candidateImage.aspectRatios]),
+          formats: sortedUniqueStrings([...existingImage.formats, ...candidateImage.formats]),
+          maxCount: Math.min(MAX_IMAGE_COUNT, Math.max(existingImage.maxCount, candidateImage.maxCount)),
+        },
+      },
     })
   }
   return [...byId.values()].sort((left, right) => compareStrings(left.id, right.id))
-}
-
-function sortedPositiveIntegers(values: unknown[] | undefined): number[] {
-  const valid = values?.flatMap((value) => (
-    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 3_600
-      ? [value]
-      : []
-  )) ?? []
-  return [...new Set(valid)].sort((left, right) => left - right)
 }
 
 export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
@@ -450,9 +464,9 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
   const byId = new Map<string, ModelInfo>()
   for (const entry of parsed.data) {
     const result = videoCapabilityModelSchema.safeParse(entry)
-    if (!result.success || byId.has(result.data.id)) continue
+    if (!result.success) continue
     const model = result.data
-    byId.set(model.id, {
+    const candidate: ModelInfo = {
       id: model.id,
       name: model.name,
       inputModalities: [],
@@ -462,8 +476,27 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
         video: {
           resolutions: sortedUniqueStrings(model.supported_resolutions),
           aspectRatios: sortedUniqueStrings(model.supported_aspect_ratios),
-          durations: sortedPositiveIntegers(model.supported_durations),
-          supportsAudio: model.allowed_passthrough_parameters?.includes('generate_audio') === true,
+          durations: [],
+          supportsAudio: false,
+        },
+      },
+    }
+    const existing = byId.get(model.id)
+    if (!existing) {
+      byId.set(model.id, candidate)
+      continue
+    }
+    const existingVideo = existing.generation.video!
+    const candidateVideo = candidate.generation.video!
+    byId.set(model.id, {
+      ...existing,
+      name: compareStrings(existing.name, candidate.name) <= 0 ? existing.name : candidate.name,
+      generation: {
+        video: {
+          resolutions: sortedUniqueStrings([...existingVideo.resolutions, ...candidateVideo.resolutions]),
+          aspectRatios: sortedUniqueStrings([...existingVideo.aspectRatios, ...candidateVideo.aspectRatios]),
+          durations: [],
+          supportsAudio: false,
         },
       },
     })
