@@ -580,6 +580,10 @@ export class MediaLifecycle {
   private async removeUnclaimedAsset(asset: MediaAssetRecord): Promise<void> {
     const existingTombstone = this.tombstonePath(asset)
     if (existingTombstone) {
+      if (asset.status !== 'ready') {
+        await this.recoverNonReadyTombstoneAsset(asset, existingTombstone)
+        return
+      }
       if (await this.tryPurge(existingTombstone)) {
         try {
           this.database.mediaAssets.delete(asset.id)

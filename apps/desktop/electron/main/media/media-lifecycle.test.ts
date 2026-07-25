@@ -463,7 +463,7 @@ describe('MediaLifecycle', () => {
     expect(existsSync(join(mediaRoot, relativePath))).toBe(false)
   })
 
-  it('retains a non-ready row when its exact canonical candidate is a symlink', async () => {
+  it('retains an old non-ready row when its exact canonical candidate is a symlink', async () => {
     const { database, mediaRoot } = setup()
     const conversationId = 'conversation_crash_symlink'
     const assetId = 'asset_crash_symlink'
@@ -473,7 +473,7 @@ describe('MediaLifecycle', () => {
       conversationId,
       relativePath: `.quarantine/${assetId}.delete`,
       status: 'deleting',
-      createdAt: NOW,
+      createdAt: NOW - DAY - 1,
     })
     const outside = mkdtempSync(join(tmpdir(), 'autoforge-media-crash-outside-'))
     temporaryDirectories.push(outside)
@@ -499,7 +499,40 @@ describe('MediaLifecycle', () => {
     expect(await readFile(victim, 'utf8')).toBe('outside')
   })
 
-  it('removes a Task 4 non-ready row when neither tombstone nor canonical bytes exist', async () => {
+  it('retains an old non-ready row when multiple exact canonical candidates exist', async () => {
+    const { database, mediaRoot } = setup()
+    const conversationId = 'conversation_crash_collision'
+    const assetId = 'asset_crash_collision'
+    insertConversation(database, conversationId)
+    insertAsset(database, {
+      id: assetId,
+      conversationId,
+      relativePath: `.quarantine/${assetId}.delete`,
+      status: 'deleting',
+      createdAt: NOW - DAY - 1,
+    })
+    writeAsset(mediaRoot, conversationId, `${assetId}.png`, 'png')
+    writeAsset(mediaRoot, conversationId, `${assetId}.jpg`, 'jpg')
+    const png = join(mediaRoot, conversationId, `${assetId}.png`)
+    const jpg = join(mediaRoot, conversationId, `${assetId}.jpg`)
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toMatchObject({
+      status: 'deleting',
+      relativePath: `.quarantine/${assetId}.delete`,
+    })
+    expect(await readFile(png, 'utf8')).toBe('png')
+    expect(await readFile(jpg, 'utf8')).toBe('jpg')
+  })
+
+  it('removes an old Task 4 non-ready row when neither tombstone nor canonical bytes exist', async () => {
     const { database, mediaRoot } = setup()
     const conversationId = 'conversation_task4_missing'
     const assetId = 'asset_task4_missing'
@@ -509,7 +542,7 @@ describe('MediaLifecycle', () => {
       conversationId,
       relativePath: `.quarantine/${assetId}.delete`,
       status: 'failed',
-      createdAt: NOW,
+      createdAt: NOW - DAY - 1,
     })
     const lifecycle = new MediaLifecycle({
       database: databasePort(database),
