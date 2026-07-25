@@ -79,6 +79,12 @@ export interface CreateAssistantInput {
   createdAt: number
 }
 
+export interface StartMediaGenerationInput {
+  user: PersistUserInput
+  run: CreateRunInput
+  assistant: CreateAssistantInput
+}
+
 export interface FinalizeAgentRunInput {
   runId: string
   requestId: string
@@ -98,6 +104,7 @@ export interface AgentPersistencePort {
   persistUser(input: PersistUserInput): void
   createRun(input: CreateRunInput): void
   createAssistant(input: CreateAssistantInput): void
+  startMediaGeneration(input: StartMediaGenerationInput): void
   updateAssistant(messageId: string, blocks: ChatBlock[]): unknown
   replaceAssistantBlock(messageId: string, blockId: string, block: ChatBlock): unknown
   finalize(input: FinalizeAgentRunInput): void
@@ -133,6 +140,33 @@ export function createAgentPersistence(
         role: 'assistant',
         blocks: input.initialBlocks,
         createdAt: input.createdAt,
+      })
+    },
+    startMediaGeneration(input) {
+      repositories.chatRuns.startMediaGeneration({
+        userMessage: {
+          id: input.user.messageId,
+          conversationId: input.user.conversationId,
+          role: 'user',
+          blocks: input.user.blocks,
+          createdAt: input.user.createdAt,
+        },
+        userAssetIds: input.user.assetIds,
+        run: {
+          id: input.run.runId,
+          conversationId: input.run.conversationId,
+          requestId: input.run.requestId,
+          model: input.run.model,
+          status: 'running',
+          startedAt: input.run.startedAt,
+        },
+        assistantMessage: {
+          id: input.assistant.messageId,
+          conversationId: input.assistant.conversationId,
+          role: 'assistant',
+          blocks: input.assistant.initialBlocks,
+          createdAt: input.assistant.createdAt,
+        },
       })
     },
     updateAssistant(messageId, blocks) {

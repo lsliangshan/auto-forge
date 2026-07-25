@@ -89,6 +89,7 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     persistUser: vi.fn(() => { calls.push('persistUser') }),
     createRun: vi.fn(() => { calls.push('createRun') }),
     createAssistant: vi.fn(() => { calls.push('createAssistant') }),
+    startMediaGeneration: vi.fn(() => { calls.push('startMediaGeneration') }),
     updateAssistant: vi.fn(),
     replaceAssistantBlock: vi.fn((messageId, blockId, block) => {
       calls.push('replaceAssistantBlock')
@@ -179,22 +180,32 @@ describe('MediaGenerationOrchestrator', () => {
     const result = await orchestrator.runImage({ ...input, route: imageRoute })
 
     expect(result).toEqual({ requestId: 'request_1', status: 'completed' })
-    expect(harness.persistence.persistUser).toHaveBeenCalledWith(expect.objectContaining({
-      conversationId: 'conversation_1',
-      blocks: input.userBlocks,
-      assetIds: [],
-    }))
-    expect(harness.persistence.createAssistant).toHaveBeenCalledWith(expect.objectContaining({
-      initialBlocks: [{
-        type: 'media_generation',
-        blockId: 'generation_block',
-        jobId: 'request_1',
-        kind: 'image',
-        status: 'in_progress',
-      }],
-    }))
-    expect(harness.calls.indexOf('persistUser')).toBeLessThan(harness.calls.indexOf('generateImage'))
-    expect(harness.calls.indexOf('createAssistant')).toBeLessThan(harness.calls.indexOf('generateImage'))
+    expect(harness.persistence.startMediaGeneration).toHaveBeenCalledWith({
+      user: expect.objectContaining({
+        conversationId: 'conversation_1',
+        blocks: input.userBlocks,
+        assetIds: [],
+      }),
+      run: expect.objectContaining({
+        requestId: 'request_1',
+        model: 'image-model',
+      }),
+      assistant: expect.objectContaining({
+        initialBlocks: [{
+          type: 'media_generation',
+          blockId: 'generation_block',
+          jobId: 'request_1',
+          kind: 'image',
+          status: 'in_progress',
+        }],
+      }),
+    })
+    expect(harness.calls.indexOf('startMediaGeneration')).toBeLessThan(
+      harness.calls.indexOf('generateImage'),
+    )
+    expect(harness.persistence.persistUser).not.toHaveBeenCalled()
+    expect(harness.persistence.createRun).not.toHaveBeenCalled()
+    expect(harness.persistence.createAssistant).not.toHaveBeenCalled()
     expect(harness.calls.indexOf('commitGeneratedBase64')).toBeLessThan(harness.calls.indexOf('finalize'))
     expect(harness.persistence.replaceAssistantBlock).not.toHaveBeenCalled()
     expect(harness.finalizations).toEqual([
@@ -491,6 +502,151 @@ describe('MediaGenerationOrchestrator', () => {
 })
 
 describe('MediaGenerationOrchestrator persistence integration', () => {
+  it.each([
+    {
+      failure: 'chat run',
+      ids: ['user_atomic_run', 'run_atomic_conflict', 'assistant_atomic_run', 'block_atomic_run'],
+      arrange(database: ReturnType<typeof openAppDatabase>) {
+        database.chatRuns.insert({
+          id: 'run_atomic_conflict',
+          conversationId: 'conversation_atomic',
+          requestId: 'request_existing',
+          model: 'image-model',
+          status: 'completed',
+          startedAt: 1,
+          endedAt: 2,
+        })
+      },
+      userMessageId: 'user_atomic_run',
+      runId: 'run_atomic_conflict',
+      assistantMessageId: 'assistant_atomic_run',
+      kind: 'image' as const,
+    },
+    {
+      failure: 'assistant message',
+      ids: ['user_atomic_assistant', 'run_atomic_assistant', 'assistant_atomic_conflict', 'block_atomic_assistant'],
+      arrange(database: ReturnType<typeof openAppDatabase>) {
+        database.messages.insert({
+          id: 'assistant_atomic_conflict',
+          conversationId: 'conversation_atomic',
+          role: 'assistant',
+          blocks: [],
+          createdAt: 1,
+        })
+      },
+      userMessageId: 'user_atomic_assistant',
+      runId: 'run_atomic_assistant',
+      assistantMessageId: 'assistant_atomic_conflict',
+      kind: 'audio' as const,
+    },
+  ])('rolls back the entire $kind start and emits a terminal failure when the $failure insert violates a database constraint', async ({
+    ids,
+    arrange,
+    userMessageId,
+    runId,
+    assistantMessageId,
+    kind,
+  }) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-media-start-'))
+    const database = openAppDatabase(join(root, 'database.sqlite'))
+    const events: ChatEvent[] = []
+    const provider = {
+      stream: vi.fn<ModelProvider['stream']>(),
+      generateImage: vi.fn<NonNullable<ModelProvider['generateImage']>>(),
+    }
+    const asset = {
+      id: 'asset_atomic',
+      conversationId: 'conversation_atomic',
+      source: 'upload' as const,
+      kind: 'image' as const,
+      mimeType: 'image/png',
+      originalName: 'atomic.png',
+      relativePath: 'conversation_atomic/asset_atomic.png',
+      byteSize: 12,
+      sha256: 'a'.repeat(64),
+      status: 'ready' as const,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    try {
+      database.conversations.insert({ id: 'conversation_atomic', title: 'Atomic start' })
+      database.mediaAssets.insert(asset)
+      arrange(database)
+      const harness = createHarness({
+        providers: { get: () => provider },
+        persistence: createAgentPersistence(database),
+        emit: (event) => { events.push(event) },
+        id: () => ids.shift() ?? 'unexpected_id',
+      })
+      const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+      const run = kind === 'image'
+        ? orchestrator.runImage.bind(orchestrator)
+        : orchestrator.runAudio.bind(orchestrator)
+      const result = await run({
+        requestId: 'request_atomic',
+        conversationId: 'conversation_atomic',
+        prompt: 'paint atomically',
+        userBlocks: [
+          { type: 'text', text: 'paint atomically' },
+          {
+            type: 'media',
+            blockId: 'block_asset_atomic',
+            assetId: asset.id,
+            kind: asset.kind,
+            purpose: 'input',
+            name: asset.originalName,
+            mimeType: asset.mimeType,
+            byteSize: asset.byteSize,
+          },
+        ],
+        assetIds: [asset.id],
+        route: {
+          ...(kind === 'image' ? imageRoute : audioRoute),
+          assets: [{
+            id: asset.id,
+            kind: asset.kind,
+            mimeType: asset.mimeType,
+            name: asset.originalName,
+            byteSize: asset.byteSize,
+            conversationId: asset.conversationId,
+            absolutePath: join(root, asset.relativePath),
+            relativePath: asset.relativePath,
+            inlineSafe: true,
+          }],
+        },
+      })
+
+      expect(database.messages.get(userMessageId)).toBeUndefined()
+      if (runId === 'run_atomic_conflict') {
+        expect(database.chatRuns.get(runId)?.requestId).toBe('request_existing')
+      } else {
+        expect(database.chatRuns.get(runId)).toBeUndefined()
+      }
+      if (assistantMessageId !== 'assistant_atomic_conflict') {
+        expect(database.messages.get(assistantMessageId)).toBeUndefined()
+      }
+      expect(database.mediaAssets.get(asset.id)?.messageId).toBeUndefined()
+      expect(provider.generateImage).not.toHaveBeenCalled()
+      expect(provider.stream).not.toHaveBeenCalled()
+      expect(orchestrator.hasActiveRuns()).toBe(false)
+      expect(result).toEqual({
+        requestId: 'request_atomic',
+        status: 'failed',
+        error: expect.objectContaining({ code: 'MEDIA_GENERATION_FAILED' }),
+      })
+      expect(events).toEqual([{
+        type: 'status',
+        conversationId: 'conversation_atomic',
+        requestId: 'request_atomic',
+        status: 'failed',
+        error: expect.objectContaining({ code: 'MEDIA_GENERATION_FAILED' }),
+      }])
+    } finally {
+      database.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('persists independently padded audio deltas, transcript, usage, and ownership atomically', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-audio-orchestrator-'))
     const database = openAppDatabase(join(root, 'database.sqlite'))

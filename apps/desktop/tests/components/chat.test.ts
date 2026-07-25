@@ -792,6 +792,38 @@ describe('chat interactions', () => {
     expect(store.isRunning).toBe(false)
   })
 
+  it('does not resurrect a media request that failed before send returned', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveSend!: (value: { requestId: string }) => void
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((resolve) => { resolveSend = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+    store.ensureSubscriptions()
+
+    const sending = store.send({
+      content: '生成图片',
+      assetIds: [],
+      outputType: 'image',
+      generation: generationPreferences().generation,
+    })
+    emitChat({
+      type: 'status',
+      conversationId: 'conv_1',
+      requestId: 'req_media_start_failed',
+      status: 'failed',
+      error: {
+        code: 'MEDIA_GENERATION_FAILED',
+        message: 'The media generation failed.',
+      },
+    })
+    resolveSend({ requestId: 'req_media_start_failed' })
+    await sending
+
+    expect(store.isRunning).toBe(false)
+    expect(store.error).toBe('媒体生成失败')
+  })
+
   it('maps asynchronous provider failures to actionable localized chat errors', () => {
     const { api, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

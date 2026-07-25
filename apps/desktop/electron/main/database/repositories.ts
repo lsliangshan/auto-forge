@@ -196,6 +196,8 @@ export interface VideoGenerationTurnInput {
   job: MediaGenerationJob
 }
 
+export type MediaGenerationTurnInput = Omit<VideoGenerationTurnInput, 'job'>
+
 export type VideoGenerationTurnPreflightInput = Omit<VideoGenerationTurnInput, 'job'> & {
   job: Omit<MediaGenerationJob, 'providerJobId'>
 }
@@ -353,6 +355,7 @@ export interface AppRepositories {
   }
   chatRuns: {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
+    startMediaGeneration(value: MediaGenerationTurnInput): void
     get(id: string): ChatRun | undefined
     update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
     finalizeWithMessage(
@@ -645,6 +648,39 @@ function validateVideoGenerationTurn(
   })) throw new Error('Video generation job already exists')
 
   validateMessageWithAssets(database, userMessage, userAssetIds)
+  return assistantBlocks
+}
+
+function validateMediaGenerationTurn(
+  database: SqliteDatabase,
+  value: MediaGenerationTurnInput,
+): ChatBlock[] {
+  const { userMessage, assistantMessage, run } = value
+  const assistantBlocks = chatBlockSchema.array().parse(assistantMessage.blocks)
+  const block = assistantBlocks[0]
+  for (const id of [
+    userMessage.id,
+    assistantMessage.id,
+    run.id,
+    run.requestId,
+  ]) identifierSchema.parse(id)
+  if (
+    userMessage.role !== 'user'
+    || assistantMessage.role !== 'assistant'
+    || userMessage.id === assistantMessage.id
+    || userMessage.conversationId !== assistantMessage.conversationId
+    || run.conversationId !== assistantMessage.conversationId
+    || run.status !== 'running'
+    || assistantBlocks.length !== 1
+    || block?.type !== 'media_generation'
+    || block.jobId !== run.requestId
+    || (block.kind !== 'image' && block.kind !== 'audio')
+    || block.status !== 'in_progress'
+    || block.errorCode !== undefined
+  ) throw new Error('Media generation turn identity does not match')
+  if (!one(database, 'SELECT id FROM conversations WHERE id = @id', {
+    id: run.conversationId,
+  })) throw new Error('Media generation conversation not found')
   return assistantBlocks
 }
 
@@ -1225,6 +1261,19 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
         }))
         return value
+      },
+      startMediaGeneration(value) {
+        const { userMessage, userAssetIds, assistantMessage, run } = value
+        transaction(database, () => {
+          const assistantBlocks = validateMediaGenerationTurn(database, value)
+          insertMessageWithAssets(database, userMessage, userAssetIds)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
+            ...assistantMessage,
+            blocksJson: JSON.stringify(assistantBlocks),
+            executionId: assistantMessage.executionId ?? null,
+          })
+        })
       },
       get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),
       update(id, value) {

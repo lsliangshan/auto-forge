@@ -162,7 +162,21 @@ export class MediaGenerationOrchestrator {
         ? await this.generateImage(input, persisted, active)
         : await this.generateAudio(input, persisted, active)
     } catch (error) {
-      if (!persisted) throw error
+      if (!persisted) {
+        const failure = safeError(error, active.controller.signal)
+        this.safeEmit({
+          type: 'status',
+          conversationId: input.conversationId,
+          requestId: input.requestId,
+          status: 'failed',
+          error: failure,
+        })
+        return {
+          requestId: input.requestId,
+          status: 'failed',
+          error: failure,
+        }
+      }
       try {
         return await this.fail(input, persisted, active, error)
       } catch (terminalError) {
@@ -190,25 +204,27 @@ export class MediaGenerationOrchestrator {
       status: 'in_progress',
     }
 
-    this.dependencies.persistence.persistUser({
-      messageId: userMessageId,
-      conversationId: input.conversationId,
-      blocks: input.userBlocks,
-      assetIds: input.assetIds,
-      createdAt: startedAt,
-    })
-    this.dependencies.persistence.createRun({
-      runId,
-      conversationId: input.conversationId,
-      requestId: input.requestId,
-      model: input.route.model,
-      startedAt,
-    })
-    this.dependencies.persistence.createAssistant({
-      messageId,
-      conversationId: input.conversationId,
-      initialBlocks: [pending],
-      createdAt: startedAt,
+    this.dependencies.persistence.startMediaGeneration({
+      user: {
+        messageId: userMessageId,
+        conversationId: input.conversationId,
+        blocks: input.userBlocks,
+        assetIds: input.assetIds,
+        createdAt: startedAt,
+      },
+      run: {
+        runId,
+        conversationId: input.conversationId,
+        requestId: input.requestId,
+        model: input.route.model,
+        startedAt,
+      },
+      assistant: {
+        messageId,
+        conversationId: input.conversationId,
+        initialBlocks: [pending],
+        createdAt: startedAt,
+      },
     })
     return { runId, messageId, blockId, pending }
   }

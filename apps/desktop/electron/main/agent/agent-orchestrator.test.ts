@@ -62,6 +62,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
       persistUser(value) { records.users.push(value) },
       createRun() {},
       createAssistant(value) { messages.set(value.messageId, { blocks: value.initialBlocks }) },
+      startMediaGeneration() {},
       updateAssistant(messageId, blocks) { messages.set(messageId, { blocks }); return { blocks } },
       replaceAssistantBlock(messageId, blockId, block) {
         const current = messages.get(messageId)?.blocks ?? []
