@@ -327,21 +327,103 @@ describe('openAppDatabase', () => {
     })).toThrow()
   })
 
-  it('claims a ready output media asset when replacing a generation block', () => {
+  it.each(['pending', 'in_progress', 'downloading'] as const)(
+    'claims a ready output media asset when replacing an active %s generation block',
+    (status) => {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_output', title: 'Output' })
+      database.messages.insert({
+        id: 'message_output', conversationId: 'conversation_output', role: 'assistant', createdAt: 1,
+        blocks: [{ type: 'media_generation', blockId: 'block_output', jobId: 'job_output', kind: 'image', status }],
+      })
+      database.mediaAssets.insert({ ...readyAsset('asset_output', 'conversation_output'), source: 'generated' })
+
+      database.messages.replaceBlock('message_output', 'block_output', {
+        type: 'media', blockId: 'block_output', assetId: 'asset_output', kind: 'image', purpose: 'output',
+        name: 'asset_output.png', mimeType: 'image/png', byteSize: 12,
+      })
+
+      expect(database.mediaAssets.get('asset_output')?.messageId).toBe('message_output')
+    },
+  )
+
+  it.each(['failed', 'paused'] as const)(
+    'rejects output media that arrives after a generation block is %s',
+    (status) => {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_late_output', title: 'Late output' })
+      const generation = {
+        type: 'media_generation' as const,
+        blockId: 'block_late_output',
+        jobId: 'job_late_output',
+        kind: 'image' as const,
+        status,
+        ...(status === 'failed' ? { errorCode: 'CANCELLED' as const } : {}),
+      }
+      database.messages.insert({
+        id: 'message_late_output',
+        conversationId: 'conversation_late_output',
+        role: 'assistant',
+        createdAt: 1,
+        blocks: [generation],
+      })
+      database.mediaAssets.insert({
+        ...readyAsset('asset_late_output', 'conversation_late_output'),
+        source: 'generated',
+      })
+
+      expect(() => database.messages.replaceBlock('message_late_output', 'block_late_output', {
+        type: 'media',
+        blockId: 'block_late_output',
+        assetId: 'asset_late_output',
+        kind: 'image',
+        purpose: 'output',
+        name: 'asset_late_output.png',
+        mimeType: 'image/png',
+        byteSize: 12,
+      })).toThrow()
+
+      expect(database.messages.get('message_late_output')?.blocks).toEqual([generation])
+      expect(database.mediaAssets.get('asset_late_output')?.messageId).toBeUndefined()
+    },
+  )
+
+  it('keeps replacing an output media block with the same claimed asset idempotent', () => {
     const database = openTestDatabase()
-    database.conversations.insert({ id: 'conversation_output', title: 'Output' })
+    database.conversations.insert({ id: 'conversation_output_retry', title: 'Output retry' })
+    const output = {
+      type: 'media' as const,
+      blockId: 'block_output_retry',
+      assetId: 'asset_output_retry',
+      kind: 'image' as const,
+      purpose: 'output' as const,
+      name: 'asset_output_retry.png',
+      mimeType: 'image/png',
+      byteSize: 12,
+    }
     database.messages.insert({
-      id: 'message_output', conversationId: 'conversation_output', role: 'assistant', createdAt: 1,
-      blocks: [{ type: 'media_generation', blockId: 'block_output', jobId: 'job_output', kind: 'image', status: 'in_progress' }],
+      id: 'message_output_retry',
+      conversationId: 'conversation_output_retry',
+      role: 'assistant',
+      createdAt: 1,
+      blocks: [{
+        type: 'media_generation',
+        blockId: 'block_output_retry',
+        jobId: 'job_output_retry',
+        kind: 'image',
+        status: 'in_progress',
+      }],
     })
-    database.mediaAssets.insert({ ...readyAsset('asset_output', 'conversation_output'), source: 'generated' })
-
-    database.messages.replaceBlock('message_output', 'block_output', {
-      type: 'media', blockId: 'block_output', assetId: 'asset_output', kind: 'image', purpose: 'output',
-      name: 'asset_output.png', mimeType: 'image/png', byteSize: 12,
+    database.mediaAssets.insert({
+      ...readyAsset('asset_output_retry', 'conversation_output_retry'),
+      source: 'generated',
     })
+    database.messages.replaceBlock('message_output_retry', 'block_output_retry', output)
 
-    expect(database.mediaAssets.get('asset_output')?.messageId).toBe('message_output')
+    database.messages.replaceBlock('message_output_retry', 'block_output_retry', output)
+
+    expect(database.messages.get('message_output_retry')?.blocks).toEqual([output])
+    expect(database.mediaAssets.get('asset_output_retry')?.messageId).toBe('message_output_retry')
   })
 
   it.each([
@@ -802,11 +884,11 @@ describe('openAppDatabase', () => {
             ...pending,
             jobId: 'request_wrong',
             status: 'failed',
-            errorCode: 'MEDIA_GENERATION_FAILED',
+            errorCode: runStatus === 'cancelled' ? 'CANCELLED' : 'MEDIA_GENERATION_FAILED',
           }],
           status: runStatus,
           endedAt: 2,
-          errorCode: 'MEDIA_GENERATION_FAILED',
+          errorCode: runStatus === 'cancelled' ? 'CANCELLED' : 'MEDIA_GENERATION_FAILED',
         },
       )).toThrow()
 
@@ -814,6 +896,152 @@ describe('openAppDatabase', () => {
       expect(database.chatRuns.get('run_failed_identity')?.status).toBe('running')
     },
   )
+
+  it.each([
+    ['failed run and failure block differ', 'failed', 'MEDIA_DOWNLOAD_FAILED', 'MEDIA_GENERATION_FAILED'],
+    ['cancelled run does not carry CANCELLED', 'cancelled', 'CANCELLED', 'MEDIA_GENERATION_FAILED'],
+    ['cancelled block does not carry CANCELLED', 'cancelled', 'MEDIA_GENERATION_FAILED', 'CANCELLED'],
+  ] as const)(
+    'rejects media terminal error codes when %s',
+    (_description, runStatus, blockErrorCode, runErrorCode) => {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_terminal_error', title: 'Terminal error' })
+      const pending = {
+        type: 'media_generation' as const,
+        blockId: 'block_terminal_error',
+        jobId: 'request_terminal_error',
+        kind: 'audio' as const,
+        status: 'in_progress' as const,
+      }
+      database.messages.insert({
+        id: 'assistant_terminal_error',
+        conversationId: 'conversation_terminal_error',
+        role: 'assistant',
+        blocks: [pending],
+        createdAt: 1,
+      })
+      database.chatRuns.insert({
+        id: 'run_terminal_error',
+        conversationId: 'conversation_terminal_error',
+        requestId: 'request_terminal_error',
+        model: 'audio-model',
+        status: 'running',
+        startedAt: 1,
+      })
+
+      expect(() => database.chatRuns.finalizeWithMessage(
+        'run_terminal_error',
+        'assistant_terminal_error',
+        'request_terminal_error',
+        {
+          blocks: [{
+            ...pending,
+            status: 'failed',
+            errorCode: blockErrorCode,
+          }],
+          status: runStatus,
+          endedAt: 2,
+          errorCode: runErrorCode,
+        },
+      )).toThrow()
+
+      expect(database.messages.get('assistant_terminal_error')?.blocks).toEqual([pending])
+      expect(database.chatRuns.get('run_terminal_error')?.status).toBe('running')
+    },
+  )
+
+  it.each([
+    ['failed', 'MEDIA_DOWNLOAD_FAILED'],
+    ['cancelled', 'CANCELLED'],
+  ] as const)(
+    'accepts a request-bound media %s terminal with a matching safe error code',
+    (runStatus, errorCode) => {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_terminal_error_match', title: 'Matching terminal error' })
+      const pending = {
+        type: 'media_generation' as const,
+        blockId: 'block_terminal_error_match',
+        jobId: 'request_terminal_error_match',
+        kind: 'audio' as const,
+        status: 'in_progress' as const,
+      }
+      database.messages.insert({
+        id: 'assistant_terminal_error_match',
+        conversationId: 'conversation_terminal_error_match',
+        role: 'assistant',
+        blocks: [pending],
+        createdAt: 1,
+      })
+      database.chatRuns.insert({
+        id: 'run_terminal_error_match',
+        conversationId: 'conversation_terminal_error_match',
+        requestId: 'request_terminal_error_match',
+        model: 'audio-model',
+        status: 'running',
+        startedAt: 1,
+      })
+      const terminal = {
+        ...pending,
+        status: 'failed' as const,
+        errorCode,
+      }
+
+      database.chatRuns.finalizeWithMessage(
+        'run_terminal_error_match',
+        'assistant_terminal_error_match',
+        'request_terminal_error_match',
+        {
+          blocks: [terminal],
+          status: runStatus,
+          endedAt: 2,
+          errorCode,
+        },
+      )
+
+      expect(database.messages.get('assistant_terminal_error_match')?.blocks).toEqual([terminal])
+      expect(database.chatRuns.get('run_terminal_error_match')).toMatchObject({
+        status: runStatus,
+        errorCode,
+        endedAt: 2,
+      })
+    },
+  )
+
+  it('rejects a completed terminal carrying an error code', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_completed_error', title: 'Completed error' })
+    database.messages.insert({
+      id: 'assistant_completed_error',
+      conversationId: 'conversation_completed_error',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: 'partial' }],
+      createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_completed_error',
+      conversationId: 'conversation_completed_error',
+      requestId: 'request_completed_error',
+      model: 'text-model',
+      status: 'running',
+      startedAt: 1,
+    })
+
+    expect(() => database.chatRuns.finalizeWithMessage(
+      'run_completed_error',
+      'assistant_completed_error',
+      'request_completed_error',
+      {
+        blocks: [{ type: 'text', text: 'complete' }],
+        status: 'completed',
+        endedAt: 2,
+        errorCode: 'INTERNAL_ERROR',
+      },
+    )).toThrow()
+
+    expect(database.messages.get('assistant_completed_error')?.blocks)
+      .toEqual([{ type: 'text', text: 'partial' }])
+    expect(database.chatRuns.get('run_completed_error')?.status).toBe('running')
+  })
 
   it('keeps non-media workflow terminal persistence compatible', () => {
     const database = openTestDatabase()

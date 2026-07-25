@@ -416,10 +416,15 @@ function claimReplacementMedia(
     )
     || replacement.purpose !== 'output'
   ) throw new Error('Media output must replace its matching generation block')
-  if (identity && previous.type === 'media_generation' && (
-    previous.jobId !== identity.requestId
-    || !['pending', 'in_progress', 'downloading'].includes(previous.status)
-  )) throw new Error('Media generation identity is not active')
+  if (
+    previous.type === 'media_generation'
+    && !['pending', 'in_progress', 'downloading'].includes(previous.status)
+  ) throw new Error('Media generation is not active')
+  if (
+    identity
+    && previous.type === 'media_generation'
+    && previous.jobId !== identity.requestId
+  ) throw new Error('Media generation identity does not match')
 
   const row = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, {
     id: replacement.assetId,
@@ -733,6 +738,9 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           ) {
             throw new Error('Chat run does not belong to the assistant conversation')
           }
+          if (value.status === 'completed' && value.errorCode !== undefined) {
+            throw new Error('Completed chat run cannot carry an error')
+          }
           const previousBlocks = chatBlockSchema.array().parse(parse(messageRow.blocksJson as string))
           for (const previous of previousBlocks) {
             if (previous.type !== 'media_generation') continue
@@ -745,11 +753,22 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               || !['pending', 'in_progress', 'downloading'].includes(previous.status)
             ) throw new Error('Media generation identity is not active')
             if (replacement.type === 'media_generation') {
+              const matchingFailure = (
+                replacement.errorCode !== undefined
+                && replacement.errorCode === value.errorCode
+                && (
+                  value.status === 'failed'
+                  || (
+                    value.status === 'cancelled'
+                    && value.errorCode === 'CANCELLED'
+                  )
+                )
+              )
               if (
                 replacement.jobId !== requestId
                 || replacement.kind !== previous.kind
                 || replacement.status !== 'failed'
-                || !['failed', 'cancelled'].includes(value.status)
+                || !matchingFailure
               ) throw new Error('Media generation failure does not match its request')
             } else if (replacement.type === 'media') {
               if (value.status !== 'completed') throw new Error('Media output requires a completed run')
