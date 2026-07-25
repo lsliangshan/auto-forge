@@ -7,6 +7,7 @@ import {
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
+  type ChatBlock,
   type ChatEvent,
   type DeveloperProject,
   type ExecutionDetail,
@@ -28,12 +29,18 @@ import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import type { ModelProvider } from './chat/model-provider.js'
 import { credentialKeyForProvider, ModelProviderRegistry } from './chat/model-provider-registry.js'
 import { OpenRouterProvider } from './chat/openrouter-provider.js'
+import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
+import { resolveChatRoute } from './chat/multimodal-router.js'
+import type { ModelContentPart } from './chat/model-provider.js'
+import { VideoJobRunner } from './chat/video-job-runner.js'
 import { openAppDatabase } from './database/client.js'
 import type { Execution, WorkflowProject } from './database/repositories.js'
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { createMediaAssetService } from './media/media-asset-service.js'
+import { MediaLifecycle } from './media/media-lifecycle.js'
+import { SafeMediaDownloader } from './media/safe-download.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import {
   ExecutionService,
@@ -234,6 +241,23 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
   const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
+  const mediaLifecycle = new MediaLifecycle({
+    database,
+    mediaRoot: join(options.paths.data, 'media'),
+  })
+  const modelCatalog = new Map<ModelProviderId, Promise<Awaited<ReturnType<ModelProvider['listModels']>>>>()
+  const getModelCatalog = (provider: ModelProviderId) => {
+    let catalog = modelCatalog.get(provider)
+    if (!catalog) {
+      catalog = providerRegistry.get(provider).listModels()
+        .catch((error) => {
+          modelCatalog.delete(provider)
+          throw error
+        })
+      modelCatalog.set(provider, catalog)
+    }
+    return catalog
+  }
   const developmentSourceSelectors = new WeakMap<WorkflowExecutionSourceSelector, string>()
   const selectDevelopmentProject = (projectId: string): WorkflowExecutionSourceSelector => {
     const selector = Object.freeze({ kind: 'development-project' as const, projectId })
@@ -288,6 +312,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
 
   const activeExecutions = new Set<string>()
   const activeRequests = new Set<string>()
+  const activeChatWork = new Map<string, {
+    conversationId: string
+    promise: Promise<void>
+  }>()
+  let acceptingWork = true
   const emitExecution = (event: ExecutionEvent) => {
     if (event.type === 'status') {
       if (['queued', 'awaiting_approval', 'running'].includes(event.status)) activeExecutions.add(event.executionId)
@@ -331,6 +360,50 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
   })
+  const persistence = createAgentPersistence(database)
+  const mediaGeneration = new MediaGenerationOrchestrator({
+    providers: providerRegistry,
+    persistence,
+    media,
+    downloader: new SafeMediaDownloader(),
+    emit: emitChat,
+  })
+  const videoJobs = new VideoJobRunner({
+    database,
+    providers: providerRegistry,
+    media,
+    emit: emitChat,
+  })
+
+  const requireValidCredential = async (provider: ModelProviderId): Promise<void> => {
+    if (database.encryptedSecrets.raw(credentialKeyForProvider(provider)) === undefined) {
+      throw failure('CREDENTIAL_UNAVAILABLE')
+    }
+    const result = await providerRegistry.get(provider).validateCredential()
+    if (!result.valid) throw failure('CREDENTIAL_INVALID')
+  }
+
+  const resolvedInput = async (conversationId: string, assetIds: string[]) => {
+    const assets = await Promise.all(assetIds.map((assetId) => (
+      media.resolveReadyAsset(assetId, conversationId)
+    )))
+    const userBlocks: ChatBlock[] = [
+      ...assets.map((asset): Extract<ChatBlock, { type: 'media' }> => ({
+        type: 'media',
+        blockId: randomUUID(),
+        assetId: asset.id,
+        kind: asset.kind,
+        purpose: 'input',
+        name: asset.name,
+        mimeType: asset.mimeType,
+        byteSize: asset.byteSize,
+        ...(asset.width === undefined ? {} : { width: asset.width }),
+        ...(asset.height === undefined ? {} : { height: asset.height }),
+        ...(asset.durationMs === undefined ? {} : { durationMs: asset.durationMs }),
+      })),
+    ]
+    return { assets, userBlocks }
+  }
 
   const credentialStatus = async (provider: ModelProviderId): Promise<ProviderCredentialStatus> => {
     const configured = database.encryptedSecrets.raw(credentialKeyForProvider(provider)) !== undefined
@@ -388,36 +461,127 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (!conversation) throw failure('NOT_FOUND')
         return { ...conversation, createdAt: new Date(conversation.createdAt).toISOString(), updatedAt: new Date(conversation.updatedAt).toISOString() }
       },
-      deleteConversation: async (conversationId) => {
-        if (!database.conversations.get(conversationId)) throw failure('NOT_FOUND')
-        database.conversations.delete(conversationId)
-      },
+      deleteConversation: (conversationId) => maintenance.runExclusive(
+        () => [...activeChatWork.values()].some((work) => work.conversationId === conversationId)
+          || database.mediaGenerationJobs.listActive()
+            .some((job) => job.conversationId === conversationId),
+        async () => {
+          if (!database.conversations.get(conversationId)) throw failure('NOT_FOUND')
+          await mediaLifecycle.deleteConversation(conversationId)
+        },
+      ),
       send: async (input) => {
         const releaseStart = maintenance.beginStart()
         try {
+          if (!acceptingWork) throw failure('CONFLICT')
           if (!database.conversations.get(input.conversationId)) throw failure('NOT_FOUND')
           const snapshot = settings.get()
-          const model = input.model ?? snapshot.defaultModels[snapshot.activeProvider].text
-          if (!model) throw failure('INVALID_INPUT')
-          const requestId = randomUUID()
-          activeRequests.add(requestId)
-          void agent.run({
-            conversationId: input.conversationId,
-            content: input.content,
-            userBlocks: [{ type: 'text', text: input.content }],
-            modelContent: input.content,
-            assetIds: [],
-            allowTools: true,
+          const preferences = conversationGenerationPreferencesSchema.parse(
+            database.conversations.get(input.conversationId)?.generationPreferences
+              ?? defaultGenerationPreferences,
+          )
+          const requestedOutput = input.outputType === 'auto'
+            ? preferences.outputType
+            : input.outputType
+          if (
+            snapshot.activeProvider === 'deepseek'
+            && (input.assetIds.length > 0
+              || (requestedOutput !== 'auto' && requestedOutput !== 'text'))
+          ) throw failure('MODEL_MODALITY_UNSUPPORTED')
+          await requireValidCredential(snapshot.activeProvider)
+          const resolved = await resolvedInput(input.conversationId, input.assetIds)
+          const route = resolveChatRoute({
             provider: snapshot.activeProvider,
-            model,
+            ...(input.model === undefined ? {} : { requestedModel: input.model }),
+            requestedOutput: input.outputType,
+            requestedGeneration: input.generation,
+            defaults: snapshot.defaultModels,
+            conversationPreferences: preferences,
+            models: await getModelCatalog(snapshot.activeProvider),
+            assets: resolved.assets,
+          })
+          if ('selectionRequired' in route || 'modelRequired' in route) {
+            throw failure('INVALID_INPUT')
+          }
+          const requestId = randomUUID()
+          const userBlocks: ChatBlock[] = [
+            ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
+            ...resolved.userBlocks,
+          ]
+          const generationInput = {
             requestId,
-          }).catch(() => activeRequests.delete(requestId))
+            conversationId: input.conversationId,
+            prompt: input.content,
+            userBlocks,
+            assetIds: input.assetIds,
+            route,
+          }
+          if (route.outputType === 'text') {
+            const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
+            const modelContent: string | ModelContentPart[] = modelInputs.length === 0
+              ? input.content
+              : [
+                  { type: 'text', text: input.content },
+                  ...modelInputs.map(({ kind, mimeType, dataBase64 }) => ({
+                    type: 'media' as const,
+                    kind,
+                    mimeType,
+                    dataBase64,
+                  })),
+                ]
+            activeRequests.add(requestId)
+            const promise = Promise.resolve().then(async () => {
+              await agent.run({
+                conversationId: input.conversationId,
+                content: input.content,
+                userBlocks,
+                modelContent,
+                assetIds: input.assetIds,
+                allowTools: route.supportsTools,
+                provider: route.provider,
+                model: route.model,
+                requestId,
+              })
+            }).catch(() => undefined).finally(() => {
+              activeRequests.delete(requestId)
+              activeChatWork.delete(requestId)
+            })
+            activeChatWork.set(requestId, { conversationId: input.conversationId, promise })
+          } else if (route.outputType === 'image') {
+            activeRequests.add(requestId)
+            const promise = Promise.resolve().then(async () => {
+              await mediaGeneration.runImage(generationInput)
+            }).catch(() => undefined).finally(() => {
+              activeRequests.delete(requestId)
+              activeChatWork.delete(requestId)
+            })
+            activeChatWork.set(requestId, { conversationId: input.conversationId, promise })
+          } else if (route.outputType === 'audio') {
+            activeRequests.add(requestId)
+            const promise = Promise.resolve().then(async () => {
+              await mediaGeneration.runAudio(generationInput)
+            }).catch(() => undefined).finally(() => {
+              activeRequests.delete(requestId)
+              activeChatWork.delete(requestId)
+            })
+            activeChatWork.set(requestId, { conversationId: input.conversationId, promise })
+          } else {
+            await videoJobs.submit({
+              ...generationInput,
+              route: { ...route, outputType: 'video' },
+            })
+          }
           return { requestId }
         } finally {
           releaseStart()
         }
       },
-      cancel: (requestId) => agent.cancel(requestId),
+      cancel: async (requestId) => {
+        await Promise.allSettled([
+          agent.cancel(requestId),
+          mediaGeneration.cancel(requestId),
+        ])
+      },
       getGenerationPreferences: async (conversationId) => {
         const conversation = database.conversations.get(conversationId)
         if (!conversation) throw failure('NOT_FOUND')
@@ -426,7 +590,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
       updateGenerationPreferences: async (conversationId, preferences) => {
-        const conversation = database.conversations.updateGenerationPreferences(conversationId, preferences)
+        const normalized = conversationGenerationPreferencesSchema.safeParse(preferences)
+        if (!normalized.success) throw failure('INVALID_INPUT')
+        const conversation = database.conversations.updateGenerationPreferences(conversationId, normalized.data)
         if (!conversation?.generationPreferences) throw failure('NOT_FOUND')
         return conversationGenerationPreferencesSchema.parse(conversation.generationPreferences)
       },
@@ -453,18 +619,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const asset = await media.resolveReadyAsset(assetId)
         options.revealPath(asset.absolutePath)
       },
-      pauseVideoJob: async (jobId) => {
-        const job = database.mediaGenerationJobs.get(jobId)
-        if (!job) throw failure('NOT_FOUND')
-        if (!['pending', 'in_progress', 'downloading'].includes(job.status)) throw failure('CONFLICT')
-        database.mediaGenerationJobs.update(jobId, { status: 'paused' })
-      },
-      resumeVideoJob: async (jobId) => {
-        const job = database.mediaGenerationJobs.get(jobId)
-        if (!job) throw failure('NOT_FOUND')
-        if (job.status !== 'paused') throw failure('CONFLICT')
-        database.mediaGenerationJobs.update(jobId, { status: 'pending' })
-      },
+      pauseVideoJob: (jobId) => videoJobs.pause(jobId),
+      resumeVideoJob: (jobId) => videoJobs.resume(jobId),
     },
     workflows: {
       list: async (query?: WorkflowQuery) => {
@@ -604,19 +760,33 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       update: async (patch) => settings.update(patch),
       saveProviderApiKey: async (provider, apiKey) => {
         await secretStore.set(credentialKeyForProvider(provider), apiKey)
+        modelCatalog.delete(provider)
         return { provider, configured: true, validation: 'unchecked' as const }
       },
-      clearProviderApiKey: async (provider) => { secretStore.delete(credentialKeyForProvider(provider)) },
+      clearProviderApiKey: async (provider) => {
+        secretStore.delete(credentialKeyForProvider(provider))
+        modelCatalog.delete(provider)
+      },
       validateProviderCredential: credentialStatus,
-      listProviderModels: (provider) => providerRegistry.get(provider).listModels(),
+      listProviderModels: (provider) => getModelCatalog(provider),
       clearLocalData: async (scope) => {
-        maintenance.clearLocalData(
+        await maintenance.runExclusive(
           () => activeRequests.size > 0
+            || activeChatWork.size > 0
             || activeExecutions.size > 0
             || agent.hasActiveRuns()
+            || mediaGeneration.hasActiveRuns()
+            || database.mediaGenerationJobs.listActive().length > 0
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
-          () => database.clearLocalData(scope),
+          async () => {
+            if (scope === 'conversations' || scope === 'all') {
+              await mediaLifecycle.clearConversations()
+            }
+            if (scope === 'executions' || scope === 'all') {
+              database.clearLocalData('executions')
+            }
+          },
         )
       },
     },
@@ -636,12 +806,20 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       resolveReadyAsset: media.resolveReadyAsset,
     },
     recover: async () => {
+      await mediaLifecycle.recover()
       database.recoverInterrupted()
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
       await projects.recoverRemovalJournals()
+      await videoJobs.recover()
     },
     close: async () => {
-      await Promise.allSettled([...activeRequests].map((requestId) => agent.cancel(requestId)))
+      acceptingWork = false
+      await videoJobs.stop()
+      await Promise.allSettled([...activeRequests].flatMap((requestId) => [
+        agent.cancel(requestId),
+        mediaGeneration.cancel(requestId),
+      ]))
+      await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
       await Promise.allSettled([...activeExecutions].map(async (executionId) => {
         await executions.cancel(executionId)
         await browser.closeExecution(executionId)
