@@ -20,6 +20,10 @@ export function openAppDatabase(path: string) {
     return { executions, chatRuns }
   })()
 
+  const clearConversations = () => sqlite.transaction(() => {
+    sqlite.prepare('DELETE FROM conversations').run()
+  })()
+
   const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => sqlite.transaction(() => {
     if (scope === 'executions' || scope === 'all') sqlite.prepare('DELETE FROM executions').run()
     if (scope === 'conversations' || scope === 'all') sqlite.prepare('DELETE FROM conversations').run()
@@ -31,6 +35,7 @@ export function openAppDatabase(path: string) {
     schemaVersion: () => (sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null }).version ?? 0,
     markInterruptedExecutions: () => repositories.executions.markInterrupted(),
     recoverInterrupted,
+    clearConversations,
     clearLocalData,
     ...repositories,
   }
