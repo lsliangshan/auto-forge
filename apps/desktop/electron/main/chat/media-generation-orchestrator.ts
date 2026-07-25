@@ -264,6 +264,7 @@ export class MediaGenerationOrchestrator {
     url: string,
     signal: AbortSignal,
   ): Promise<MediaAsset> {
+    if (signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
     const stream = new PassThrough()
     const abort = () => stream.destroy(new Error('cancelled'))
     signal.addEventListener('abort', abort, { once: true })
@@ -309,6 +310,7 @@ export class MediaGenerationOrchestrator {
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
     )
+    if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
     const writer = await this.dependencies.media.createGeneratedWriter({
       conversationId: input.conversationId,
       messageId: persisted.messageId,
