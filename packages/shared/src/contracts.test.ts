@@ -4,6 +4,8 @@ import {
   appSettingsSchema,
   approvalDecisionSchema,
   chatBlockSchema,
+  chatEventSchema,
+  chatSendInputSchema,
   executionEventSchema,
   ipcRequestSchemas,
   ipcChannels,
@@ -21,8 +23,8 @@ describe('cross-process contracts', () => {
       logDirectory: '/logs',
       activeProvider: 'deepseek',
       defaultModels: {
-        deepseek: 'deepseek-v4-flash',
-        openrouter: 'openai/gpt-4.1-mini',
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
       },
       showCosts: true,
       developerMode: false,
@@ -31,6 +33,88 @@ describe('cross-process contracts', () => {
 
     expect(settings.activeProvider).toBe('deepseek')
     expect(() => appSettingsSchema.parse({ ...settings, activeProvider: 'custom' })).toThrow()
+  })
+
+  it('accepts strict persisted media blocks without paths or encoded bytes', () => {
+    expect(chatBlockSchema.parse({
+      type: 'media',
+      blockId: 'block_1',
+      assetId: 'asset_1',
+      kind: 'image',
+      purpose: 'input',
+      name: 'photo.png',
+      mimeType: 'image/png',
+      byteSize: 12,
+    })).toMatchObject({ assetId: 'asset_1', purpose: 'input' })
+
+    expect(() => chatBlockSchema.parse({
+      type: 'media',
+      blockId: 'block_1',
+      assetId: 'asset_1',
+      kind: 'image',
+      purpose: 'input',
+      name: 'photo.png',
+      mimeType: 'image/png',
+      byteSize: 12,
+      path: '/private/photo.png',
+    })).toThrow()
+  })
+
+  it('replaces only the matching media block through a strict block update event', () => {
+    expect(chatEventSchema.parse({
+      type: 'block_update',
+      conversationId: 'conversation_1',
+      messageId: 'message_1',
+      blockId: 'block_1',
+      block: {
+        type: 'media_generation',
+        blockId: 'block_1',
+        jobId: 'job_1',
+        kind: 'video',
+        status: 'in_progress',
+      },
+    })).toMatchObject({ type: 'block_update', blockId: 'block_1' })
+
+    expect(() => chatEventSchema.parse({
+      type: 'block_update',
+      conversationId: 'conversation_1',
+      messageId: 'message_1',
+      blockId: 'block_1',
+      block: {
+        type: 'media_generation',
+        blockId: 'block_2',
+        jobId: 'job_1',
+        kind: 'video',
+        status: 'in_progress',
+      },
+    })).toThrow()
+  })
+
+  it('allows attachment-only understanding but rejects empty or encoded sends', () => {
+    expect(chatSendInputSchema.parse({
+      conversationId: 'conversation_1',
+      content: '',
+      assetIds: ['asset_1'],
+      outputType: 'auto',
+      generation: { image: { count: 1 }, audio: {}, video: {} },
+    })).toMatchObject({ assetIds: ['asset_1'], outputType: 'auto' })
+
+    expect(() => chatSendInputSchema.parse({
+      conversationId: 'conversation_1',
+      content: '',
+      assetIds: [],
+      outputType: 'text',
+      generation: { image: { count: 1 }, audio: {}, video: {} },
+    })).toThrow()
+
+    expect(() => chatSendInputSchema.parse({
+      conversationId: 'conversation_1',
+      content: 'describe this image',
+      assetIds: ['asset_1'],
+      outputType: 'auto',
+      generation: { image: { count: 1 }, audio: {}, video: {} },
+      base64: 'c2VjcmV0',
+    })).toThrow()
   })
 
   it('requires provider-scoped credential status without exposing a key', () => {
