@@ -142,7 +142,7 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
 
     await expect(collect(provider.stream({ model: 'm', messages: [] }))).rejects.toMatchObject({
-      code: status === 401 || status === 403 ? 'CREDENTIAL_INVALID' : 'OPENROUTER_REQUEST_FAILED',
+      code: status === 401 || status === 403 ? 'CREDENTIAL_INVALID' : 'MODEL_PROVIDER_REQUEST_FAILED',
     })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('sk-private')
@@ -227,7 +227,7 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch, sleep: async () => undefined })
 
     await expect(collect(provider.stream({ model: 'm', messages: [] })))
-      .rejects.toMatchObject({ code: 'OPENROUTER_REQUEST_FAILED' })
+      .rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
     expect(fetch).toHaveBeenCalledTimes(4)
   })
 
@@ -238,7 +238,7 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch })
 
     await expect(collect(provider.stream({ model: 'm', messages: [] })))
-      .rejects.toMatchObject({ code: 'OPENROUTER_REQUEST_FAILED' })
+      .rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
     expect(fetch).toHaveBeenCalledTimes(1)
   })
 

@@ -27,7 +27,7 @@
       <div class="chat-controls">
         <span>本次会话模型</span>
         <el-select v-model="selectedModel" filterable placeholder="使用默认模型" :loading="settings.modelsLoading" clearable>
-          <el-option v-for="model in settings.models" :key="model.id" :label="model.name" :value="model.id" />
+          <el-option v-for="model in settings.modelOptions" :key="model.id" :label="model.name" :value="model.id" />
         </el-select>
       </div>
       <div
@@ -65,7 +65,7 @@
       <ChatComposer
         :disabled="false"
         :running="chat.isRunning"
-        @submit="chat.send($event, selectedModel || settings.settings?.defaultModel)"
+        @submit="chat.send($event, selectedModel || settings.defaultModel)"
         @cancel="chat.cancelCurrent"
       />
     </template>
@@ -83,12 +83,15 @@ import { useSettingsStore } from '../stores/settings'
 const chat = useChatStore()
 const settings = useSettingsStore()
 const selectedModel = ref('')
-watch(() => settings.settings?.defaultModel, (value) => { if (!selectedModel.value) selectedModel.value = value ?? '' }, { immediate: true })
+watch(
+  [() => settings.activeProvider, () => settings.defaultModel],
+  ([, defaultModel]) => { selectedModel.value = defaultModel },
+  { immediate: true },
+)
 onMounted(async () => {
   chat.ensureSubscriptions()
   if (!chat.conversations.length && !chat.loading) void chat.loadConversations()
   if (!settings.settings && !settings.loading) await settings.load()
-  if (settings.credential?.configured && !settings.models.length) void settings.loadModels()
 })
 </script>
 

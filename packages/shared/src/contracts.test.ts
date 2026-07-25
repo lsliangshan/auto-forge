@@ -1,7 +1,62 @@
 import { describe, expect, it } from 'vitest'
-import { approvalDecisionSchema, chatBlockSchema, executionEventSchema, ipcRequestSchemas, ipcChannels, toSafeAppError, workerMessageSchema } from './index'
+import {
+  appErrorCodeSchema,
+  appSettingsSchema,
+  approvalDecisionSchema,
+  chatBlockSchema,
+  executionEventSchema,
+  ipcRequestSchemas,
+  ipcChannels,
+  providerCredentialStatusSchema,
+  toSafeAppError,
+  workerMessageSchema,
+} from './index'
 
 describe('cross-process contracts', () => {
+  it('accepts only fixed model providers with independent defaults', () => {
+    const settings = appSettingsSchema.parse({
+      theme: 'system',
+      language: 'zh-CN',
+      dataDirectory: '/data',
+      logDirectory: '/logs',
+      activeProvider: 'deepseek',
+      defaultModels: {
+        deepseek: 'deepseek-v4-flash',
+        openrouter: 'openai/gpt-4.1-mini',
+      },
+      showCosts: true,
+      developerMode: false,
+      permissionDefault: 'ask',
+    })
+
+    expect(settings.activeProvider).toBe('deepseek')
+    expect(() => appSettingsSchema.parse({ ...settings, activeProvider: 'custom' })).toThrow()
+  })
+
+  it('requires provider-scoped credential status without exposing a key', () => {
+    const status = providerCredentialStatusSchema.parse({
+      provider: 'deepseek',
+      configured: true,
+      validation: 'valid',
+    })
+
+    expect(status).toEqual({
+      provider: 'deepseek',
+      configured: true,
+      validation: 'valid',
+    })
+    expect(status).not.toHaveProperty('apiKey')
+  })
+
+  it('declares provider-aware settings channels and a neutral provider error', () => {
+    expect(ipcChannels.settingsSaveProviderApiKey).toBe('settings:save-provider-api-key')
+    expect(ipcChannels.settingsClearProviderApiKey).toBe('settings:clear-provider-api-key')
+    expect(ipcChannels.settingsValidateProviderCredential).toBe('settings:validate-provider-credential')
+    expect(ipcChannels.settingsListProviderModels).toBe('settings:list-provider-models')
+    expect(appErrorCodeSchema.parse('MODEL_PROVIDER_REQUEST_FAILED')).toBe('MODEL_PROVIDER_REQUEST_FAILED')
+    expect(appErrorCodeSchema.parse('OPENROUTER_REQUEST_FAILED')).toBe('OPENROUTER_REQUEST_FAILED')
+  })
+
   it('requires exact pending workflow identity on approval blocks', () => {
     expect(() => chatBlockSchema.parse({
       type: 'approval', executionId: 'exec_1', permissionIndex: 0,

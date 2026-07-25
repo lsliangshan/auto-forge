@@ -30,7 +30,10 @@ function createEventApi() {
       onEvent: vi.fn((listener) => { executionListener = listener; return executionUnsubscribe }),
     },
     permissions: { listGrants: vi.fn(), revoke: vi.fn() },
-    settings: { get: vi.fn(), update: vi.fn(), saveOpenRouterKey: vi.fn(), clearOpenRouterKey: vi.fn(), validateOpenRouterKey: vi.fn(), listModels: vi.fn(), clearLocalData: vi.fn() },
+    settings: {
+      get: vi.fn(), update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(),
+      validateProviderCredential: vi.fn(), listProviderModels: vi.fn(), clearLocalData: vi.fn(),
+    },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
   return { api, decide, chatUnsubscribe, executionUnsubscribe, emitChat: (event: ChatEvent) => chatListener?.(event), emitExecution: (event: ExecutionEvent) => executionListener?.(event) }
@@ -132,6 +135,23 @@ describe('chat interactions', () => {
     await sending
 
     expect(store.isRunning).toBe(false)
+  })
+
+  it('maps asynchronous provider failures to actionable localized chat errors', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'status',
+      conversationId: 'conv_1',
+      requestId: 'req_failed',
+      status: 'failed',
+      error: { code: 'CREDENTIAL_UNAVAILABLE', message: 'The credential is unavailable.' },
+    })
+
+    expect(store.error).toBe('当前供应商尚未配置 API Key，或系统安全存储暂时不可用')
   })
 
   it('releases the bridge listener on the last store disposal and does not duplicate deltas after rebuild', () => {

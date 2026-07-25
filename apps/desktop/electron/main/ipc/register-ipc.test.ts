@@ -27,8 +27,12 @@ function services(): DesktopIpcServices {
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
     permissions: { listGrants: vi.fn(), revoke: vi.fn() },
     settings: {
-      get: vi.fn(), update: vi.fn(), saveOpenRouterKey: vi.fn(), clearOpenRouterKey: vi.fn(),
-      validateOpenRouterKey: vi.fn(), listModels: vi.fn(), clearLocalData: vi.fn(),
+      get: vi.fn(), update: vi.fn(),
+      saveProviderApiKey: vi.fn(async (provider) => ({ provider, configured: true, validation: 'valid' as const })),
+      clearProviderApiKey: vi.fn(),
+      validateProviderCredential: vi.fn(async (provider) => ({ provider, configured: false, validation: 'unchecked' as const })),
+      listProviderModels: vi.fn(async () => []),
+      clearLocalData: vi.fn(),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
@@ -72,6 +76,22 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.chat.send).not.toHaveBeenCalled()
+  })
+
+  it('validates and forwards an explicit fixed provider for credential operations', async () => {
+    const app = harness()
+    await app.invoke(ipcChannels.settingsSaveProviderApiKey, {
+      provider: 'deepseek',
+      apiKey: 'sk-deepseek',
+    })
+
+    expect(app.dependencies.settings.saveProviderApiKey)
+      .toHaveBeenCalledWith('deepseek', 'sk-deepseek')
+
+    await expect(app.invoke(ipcChannels.settingsListProviderModels, {
+      provider: 'custom',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(app.dependencies.settings.listProviderModels).not.toHaveBeenCalled()
   })
 
   it('rejects a request from an untrusted sender frame', async () => {

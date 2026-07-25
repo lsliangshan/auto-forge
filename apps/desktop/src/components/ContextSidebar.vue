@@ -197,7 +197,7 @@
       <div class="sidebar-toolbar">
         <span class="af-panel-heading">设置</span>
       </div>
-      <a href="#credential">OpenRouter 凭证</a>
+      <a href="#provider">大模型供应商</a>
       <a href="#model">默认模型</a>
       <a href="#appearance">外观与行为</a>
       <a href="#permissions">已保存授权</a>

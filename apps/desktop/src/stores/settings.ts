@@ -1,5 +1,13 @@
 import { defineStore } from 'pinia'
-import type { AppInfo, AppSettings, AppSettingsPatch, CredentialStatus, ModelInfo, PermissionGrant } from '@autoforge/shared'
+import type {
+  AppInfo,
+  AppSettings,
+  AppSettingsPatch,
+  ModelInfo,
+  ModelProviderId,
+  PermissionGrant,
+  ProviderCredentialStatus,
+} from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
 import { useExecutionStore } from './execution'
@@ -9,53 +17,141 @@ const updateQueues = new WeakMap<object, Promise<AppSettings | undefined>>()
 
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
-    settings: undefined as AppSettings | undefined, credential: undefined as CredentialStatus | undefined,
-    models: [] as ModelInfo[], grants: [] as PermissionGrant[], appInfo: undefined as AppInfo | undefined,
-    loading: false, modelsLoading: false, saving: false, error: '', _loadVersion: 0, _modelVersion: 0,
+    settings: undefined as AppSettings | undefined,
+    credentials: {
+      deepseek: undefined,
+      openrouter: undefined,
+    } as Record<ModelProviderId, ProviderCredentialStatus | undefined>,
+    providerModels: {
+      deepseek: [],
+      openrouter: [],
+    } as Record<ModelProviderId, ModelInfo[]>,
+    grants: [] as PermissionGrant[],
+    appInfo: undefined as AppInfo | undefined,
+    loading: false,
+    modelsLoading: false,
+    saving: false,
+    error: '',
+    _loadVersion: 0,
+    _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
+    _modelVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
   }),
+  getters: {
+    activeProvider: (state): ModelProviderId => state.settings?.activeProvider ?? 'deepseek',
+    credential(): ProviderCredentialStatus | undefined {
+      return this.credentials[this.activeProvider]
+    },
+    models(): ModelInfo[] {
+      return this.providerModels[this.activeProvider]
+    },
+    defaultModel(): string {
+      return this.settings?.defaultModels[this.activeProvider] ?? ''
+    },
+    modelOptions(): ModelInfo[] {
+      const saved = this.defaultModel
+      if (!saved || this.models.some(({ id }) => id === saved)) return this.models
+      return [{ id: saved, name: `${saved}（已保存模型）` }, ...this.models]
+    },
+  },
   actions: {
     async load() {
       const version = ++this._loadVersion
       this.loading = true
       this.error = ''
       try {
-        const [settings, credential, grants, appInfo] = await Promise.all([
-          getDesktopApi().settings.get(), getDesktopApi().settings.validateOpenRouterKey(),
-          getDesktopApi().permissions.listGrants(), getDesktopApi().system.getAppInfo(),
+        const [settings, grants, appInfo] = await Promise.all([
+          getDesktopApi().settings.get(),
+          getDesktopApi().permissions.listGrants(),
+          getDesktopApi().system.getAppInfo(),
         ])
         if (version !== this._loadVersion) return
         this.settings = settings
-        this.credential = credential
         this.grants = grants
         this.appInfo = appInfo
-      } catch (error) { if (version === this._loadVersion) this.error = displayError(error, '设置加载失败') }
-      finally { if (version === this._loadVersion) this.loading = false }
+        const credential = await this.validateCredential(settings.activeProvider)
+        if (version !== this._loadVersion) return
+        if (credential?.configured) await this.loadModels(settings.activeProvider)
+        else this.providerModels[settings.activeProvider] = []
+      } catch (error) {
+        if (version === this._loadVersion) this.error = displayError(error, '设置加载失败')
+      } finally {
+        if (version === this._loadVersion) this.loading = false
+      }
     },
-    async update(patch: AppSettingsPatch) {
+    async update(patch: AppSettingsPatch): Promise<AppSettings | undefined> {
       this.saving = true
       this.error = ''
       const operation = (updateQueues.get(this) ?? Promise.resolve(undefined))
         .then(() => getDesktopApi().settings.update(patch))
       const settled = operation.catch(() => undefined)
       updateQueues.set(this, settled)
-      try { this.settings = await operation }
-      catch (error) { this.error = displayError(error, '设置保存失败') }
-      finally { if (updateQueues.get(this) === settled) this.saving = false }
+      try {
+        this.settings = await operation
+        return this.settings
+      } catch (error) {
+        this.error = displayError(error, '设置保存失败')
+        return undefined
+      } finally {
+        if (updateQueues.get(this) === settled) this.saving = false
+      }
+    },
+    async switchProvider(provider: ModelProviderId) {
+      if (provider === this.activeProvider) return
+      const updated = await this.update({ activeProvider: provider })
+      if (!updated || updated.activeProvider !== provider) return
+      this.modelsLoading = false
+      const credential = await this.validateCredential(provider)
+      if (credential?.configured) await this.loadModels(provider)
+      else this.providerModels[provider] = []
     },
     async saveCredential(apiKey: string) {
+      const provider = this.activeProvider
+      const version = ++this._credentialVersions[provider]
       this.saving = true
       this.error = ''
-      try { this.credential = await getDesktopApi().settings.saveOpenRouterKey(apiKey.trim()) }
-      catch (error) { this.error = displayError(error, '凭证保存失败'); throw error }
-      finally { this.saving = false }
+      try {
+        const status = await getDesktopApi().settings.saveProviderApiKey(provider, apiKey.trim())
+        if (version === this._credentialVersions[provider]) this.credentials[provider] = status
+      } catch (error) {
+        if (version === this._credentialVersions[provider] && provider === this.activeProvider) {
+          this.error = displayError(error, '凭证保存失败')
+        }
+        throw error
+      } finally {
+        this.saving = false
+      }
     },
     async clearCredential() {
+      const provider = this.activeProvider
+      ++this._credentialVersions[provider]
+      ++this._modelVersions[provider]
       this.saving = true
+      this.error = ''
       try {
-        await getDesktopApi().settings.clearOpenRouterKey()
-        this.credential = { configured: false, valid: false }
-      } catch (error) { this.error = displayError(error, '凭证清除失败') }
-      finally { this.saving = false }
+        await getDesktopApi().settings.clearProviderApiKey(provider)
+        this.credentials[provider] = { provider, configured: false, validation: 'unchecked' }
+        this.providerModels[provider] = []
+        if (provider === this.activeProvider) this.modelsLoading = false
+      } catch (error) {
+        if (provider === this.activeProvider) this.error = displayError(error, '凭证清除失败')
+      } finally {
+        this.saving = false
+      }
+    },
+    async validateCredential(provider?: ModelProviderId) {
+      const target = provider ?? this.activeProvider
+      const version = ++this._credentialVersions[target]
+      try {
+        const status = await getDesktopApi().settings.validateProviderCredential(target)
+        if (version !== this._credentialVersions[target]) return undefined
+        this.credentials[target] = status
+        return status
+      } catch (error) {
+        if (version === this._credentialVersions[target] && target === this.activeProvider) {
+          this.error = displayError(error, '凭证验证失败')
+        }
+        return undefined
+      }
     },
     async revokeGrant(grantId: string) {
       this.saving = true
@@ -63,18 +159,34 @@ export const useSettingsStore = defineStore('settings', {
       try {
         await getDesktopApi().permissions.revoke(grantId)
         this.grants = this.grants.filter(({ id }) => id !== grantId)
-      } catch (error) { this.error = displayError(error, '撤销授权失败') }
-      finally { this.saving = false }
+      } catch (error) {
+        this.error = displayError(error, '撤销授权失败')
+      } finally {
+        this.saving = false
+      }
     },
-    async loadModels() {
-      const version = ++this._modelVersion
-      this.modelsLoading = true
+    async loadModels(provider?: ModelProviderId) {
+      const target = provider ?? this.activeProvider
+      const version = ++this._modelVersions[target]
+      this.modelsLoading = target === this.activeProvider
       this.error = ''
       try {
-        const models = await getDesktopApi().settings.listModels()
-        if (version === this._modelVersion) this.models = models
-      } catch (error) { if (version === this._modelVersion) this.error = displayError(error, '模型列表加载失败') }
-      finally { if (version === this._modelVersion) this.modelsLoading = false }
+        const models = await getDesktopApi().settings.listProviderModels(target)
+        if (version === this._modelVersions[target]) this.providerModels[target] = models
+      } catch (error) {
+        if (version === this._modelVersions[target] && target === this.activeProvider) {
+          this.error = displayError(error, '模型列表加载失败')
+        }
+      } finally {
+        if (version === this._modelVersions[target] && target === this.activeProvider) this.modelsLoading = false
+      }
+    },
+    async saveDefaultModel(model: string) {
+      if (!this.settings || !model) return
+      const provider = this.activeProvider
+      await this.update({
+        defaultModels: { ...this.settings.defaultModels, [provider]: model },
+      })
     },
     async clearLocalData(scope: 'conversations' | 'executions' | 'all') {
       this.saving = true
@@ -84,9 +196,12 @@ export const useSettingsStore = defineStore('settings', {
         if (scope === 'conversations' || scope === 'all') useChatStore().resetLocalData()
         if (scope === 'executions' || scope === 'all') useExecutionStore().resetLocalData()
         if (scope === 'all') await Promise.all([useWorkflowStore().load(), this.load()])
+      } catch (error) {
+        this.error = displayError(error, '本地数据清理失败')
+        throw error
+      } finally {
+        this.saving = false
       }
-      catch (error) { this.error = displayError(error, '本地数据清理失败'); throw error }
-      finally { this.saving = false }
     },
   },
 })

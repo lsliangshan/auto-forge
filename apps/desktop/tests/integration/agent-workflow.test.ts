@@ -150,7 +150,7 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
   })
   const registry = new WorkflowRegistry(database, {} as never)
   const orchestrator = new AgentOrchestrator({
-    provider,
+    providers: { get: () => provider },
     workflows: registry,
     persistence: createAgentPersistence(database),
     policy,
@@ -186,7 +186,8 @@ describe('agent workflow integration', () => {
     expect(listed[0]).toMatchObject({ enabled: true, integrity: 'valid', activationExamples: ['使用百度搜索今日天气'] })
     expect(retrieveWorkflows('使用百度搜索今日天气', listed, 8).map((item) => item.id)).toEqual([app.workflow.id])
     const pending = await app.orchestrator.run({
-      conversationId: 'conversation_1', content: '使用百度搜索今日天气', model: 'local-test-model', requestId: 'request_1',
+      conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
+      model: 'local-test-model', requestId: 'request_1',
     })
     expect(app.database.messages.listForConversation('conversation_1').find((message) => message.role === 'assistant')?.blocks).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'workflow_proposal' }),
@@ -248,7 +249,8 @@ describe('agent workflow integration', () => {
     })
     appDirectory = app.directory
     const pending = await app.orchestrator.run({
-      conversationId: 'conversation_1', content: '使用百度搜索今日天气', model: 'local-test-model', requestId: 'cancel_request',
+      conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
+      model: 'local-test-model', requestId: 'cancel_request',
     })
     const resuming = app.orchestrator.resumeApproval({
       executionId: pending.executionId!, permissionIndex: 0, scopeHash: scopeHash(permission.scope), decision: 'once',

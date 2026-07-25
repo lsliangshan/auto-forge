@@ -27,6 +27,22 @@ describe('preload desktop bridge', () => {
     expect(app.api).not.toHaveProperty('ipcRenderer')
   })
 
+  it('uses provider-aware credential channels without exposing generic transport', async () => {
+    const app = harness()
+    await app.api.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
+    await app.api.settings.listProviderModels('openrouter')
+
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(
+      ipcChannels.settingsSaveProviderApiKey,
+      { provider: 'deepseek', apiKey: 'sk-deepseek' },
+    )
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(
+      ipcChannels.settingsListProviderModels,
+      { provider: 'openrouter' },
+    )
+    expect(app.api).not.toHaveProperty('invoke')
+  })
+
   it('removes an exact workflow version through its fixed channel', async () => {
     const app = harness()
     await app.api.workflows.remove('browser.search.baidu', '1.0.0')

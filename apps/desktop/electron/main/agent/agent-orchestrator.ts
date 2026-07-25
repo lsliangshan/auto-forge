@@ -7,6 +7,7 @@ import {
   type ApprovalDecision,
   type ChatBlock,
   type ChatEvent,
+  type ModelProviderId,
   type WorkflowDetail,
 } from '@autoforge/shared'
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
@@ -14,19 +15,23 @@ import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from
 import { retrieveWorkflows } from '../workflows/retriever.js'
 import type { AppRepositories } from '../database/repositories.js'
 import type {
-  OpenRouterMessage,
-  OpenRouterStreamEvent,
-  OpenRouterStreamRequest,
-  OpenRouterTool,
-} from '../chat/openrouter-provider.js'
+  ModelMessage,
+  ModelStreamEvent,
+  ModelStreamRequest,
+  ModelTool,
+} from '../chat/model-provider.js'
 
 const MAX_MODEL_TURNS = 8
 const RETRIEVAL_LIMIT = 8
 
-export type ProviderStreamEvent = OpenRouterStreamEvent
+export type ProviderStreamEvent = ModelStreamEvent
 
 export interface AgentProviderPort {
-  stream(request: OpenRouterStreamRequest): AsyncIterable<OpenRouterStreamEvent>
+  stream(request: ModelStreamRequest): AsyncIterable<ModelStreamEvent>
+}
+
+export interface AgentProviderRegistryPort {
+  get(provider: ModelProviderId): AgentProviderPort
 }
 
 export interface AgentWorkflowPort {
@@ -145,7 +150,7 @@ export function createAgentPersistence(
 }
 
 export interface AgentOrchestratorDependencies {
-  provider: AgentProviderPort
+  providers: AgentProviderRegistryPort
   workflows: AgentWorkflowPort
   persistence: AgentPersistencePort
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
@@ -160,6 +165,7 @@ export interface AgentOrchestratorDependencies {
 export interface AgentRunInput {
   conversationId: string
   content: string
+  provider: ModelProviderId
   model: string
   requestId?: string
 }
@@ -187,10 +193,11 @@ interface ActiveAgentRun {
   runId: string
   messageId: string
   conversationId: string
+  provider: AgentProviderPort
   model: string
   blocks: ChatBlock[]
-  messages: OpenRouterMessage[]
-  tools: OpenRouterTool[]
+  messages: ModelMessage[]
+  tools: ModelTool[]
   workflows: Map<string, WorkflowDetail>
   controller: AbortController
   modelTurns: number
@@ -214,7 +221,7 @@ function asAppError(error: unknown): AppError {
   return appFailure('INTERNAL_ERROR')
 }
 
-function manifestTool(workflow: WorkflowDetail): OpenRouterTool {
+function manifestTool(workflow: WorkflowDetail): ModelTool {
   return {
     type: 'function',
     function: {
@@ -272,12 +279,14 @@ export class AgentOrchestrator {
       conversationId: input.conversationId,
       createdAt: startedAt,
     })
+    const provider = this.dependencies.providers.get(input.provider)
 
     const active: ActiveAgentRun = {
       requestId,
       runId,
       messageId,
       conversationId: input.conversationId,
+      provider,
       model: input.model,
       blocks: [],
       messages: [{ role: 'user', content: input.content }],
@@ -387,11 +396,11 @@ export class AgentOrchestrator {
 
     while (active.modelTurns < MAX_MODEL_TURNS) {
       active.modelTurns += 1
-      const toolCalls: Array<Extract<OpenRouterStreamEvent, { type: 'tool_call' }>> = []
+      const toolCalls: Array<Extract<ModelStreamEvent, { type: 'tool_call' }>> = []
       let finishReason: string | undefined
       let assistantContent = ''
-      let turnUsage: Extract<OpenRouterStreamEvent, { type: 'usage' }> | undefined
-      for await (const event of this.dependencies.provider.stream({
+      let turnUsage: Extract<ModelStreamEvent, { type: 'usage' }> | undefined
+      for await (const event of active.provider.stream({
         model: active.model,
         messages: active.messages,
         ...(active.tools.length ? { tools: active.tools } : {}),
@@ -435,14 +444,14 @@ export class AgentOrchestrator {
       }
       if (finishReason === 'stop') return this.finish(active, 'completed')
       if (finishReason === 'tool_calls') return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-      return this.finish(active, 'failed', appFailure('OPENROUTER_REQUEST_FAILED'))
+      return this.finish(active, 'failed', appFailure('MODEL_PROVIDER_REQUEST_FAILED'))
     }
-    return this.finish(active, 'failed', appFailure('OPENROUTER_REQUEST_FAILED'))
+    return this.finish(active, 'failed', appFailure('MODEL_PROVIDER_REQUEST_FAILED'))
   }
 
   private prepareTool(
     active: ActiveAgentRun,
-    call: Extract<OpenRouterStreamEvent, { type: 'tool_call' }>,
+    call: Extract<ModelStreamEvent, { type: 'tool_call' }>,
     assistantContent: string,
   ): AgentRunResult | undefined {
     const workflow = active.workflows.get(call.name)

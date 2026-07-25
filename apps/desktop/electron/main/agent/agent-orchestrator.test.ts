@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
-import type { WorkflowDetail } from '@autoforge/shared'
+import { describe, expect, it, vi } from 'vitest'
+import type { ModelProviderId, WorkflowDetail } from '@autoforge/shared'
 import {
   AgentOrchestrator,
   type AgentOrchestratorDependencies,
+  type AgentProviderPort,
   type ProviderStreamEvent,
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
@@ -23,13 +24,22 @@ async function* events(values: ProviderStreamEvent[]) {
 
 function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies & {
   records: { users: unknown[]; starts: unknown[]; decisions: unknown[]; discards: unknown[]; events: unknown[]; terminal: unknown[] }
+  providerInstances: Record<ModelProviderId, AgentProviderPort>
+  registry: { get: ReturnType<typeof vi.fn> }
 } {
   const records = { users: [] as unknown[], starts: [] as unknown[], decisions: [] as unknown[], discards: [] as unknown[], events: [] as unknown[], terminal: [] as unknown[] }
   const messages = new Map<string, { blocks: unknown[] }>()
   let reservation = 0
+  const providerInstances = {
+    openrouter: { stream: vi.fn(() => events(turns.shift() ?? [])) },
+    deepseek: { stream: vi.fn(() => events(turns.shift() ?? [])) },
+  }
+  const registry = { get: vi.fn((provider: ModelProviderId) => providerInstances[provider]) }
   return {
     records,
-    provider: { stream: () => events(turns.shift() ?? []) },
+    providers: registry,
+    providerInstances,
+    registry,
     workflows: { list: async () => [workflow] },
     retrieve: () => [workflow],
     policy: {
@@ -70,7 +80,7 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([toolTurn])
     const orchestrator = new AgentOrchestrator(dependencies)
 
-    const result = await orchestrator.run({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', model: 'model' })
+    const result = await orchestrator.run({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model' })
 
     expect(result.status).toBe('awaiting_approval')
     expect(dependencies.records.users).toHaveLength(1)
@@ -90,12 +100,12 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     const providerInputs: unknown[] = []
-    dependencies.provider.stream = (input) => { providerInputs.push(input); return events((providerInputs.length === 1 ? toolTurn : [
+    dependencies.providerInstances.openrouter.stream = vi.fn((input) => { providerInputs.push(input); return events((providerInputs.length === 1 ? toolTurn : [
       { type: 'text_delta', choiceIndex: 0, text: '搜索结果：天气晴' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ])) }
+    ])) })
     const orchestrator = new AgentOrchestrator(dependencies)
-    const pending = await orchestrator.run({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', model: 'model' })
+    const pending = await orchestrator.run({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model' })
 
     const done = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
 
@@ -105,10 +115,36 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal.at(-1)).toMatchObject({ status: 'completed' })
   })
 
+  it('resolves a provider once and reuses it after a tool continuation', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const original = dependencies.providerInstances.deepseek
+    const replacement: AgentProviderPort = { stream: vi.fn(() => events([])) }
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const pending = await orchestrator.run({
+      conversationId: 'c',
+      content: '搜索',
+      provider: 'deepseek',
+      model: 'deepseek-v4-pro',
+    })
+    dependencies.providerInstances.deepseek = replacement
+    await orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      ...approvalIdentity,
+      decision: 'once',
+    })
+
+    expect(original.stream).toHaveBeenCalledTimes(2)
+    expect(replacement.stream).not.toHaveBeenCalled()
+    expect(dependencies.registry.get).toHaveBeenCalledTimes(1)
+  })
+
   it('binds always approval to the exact manifest permission and deny never starts execution', async () => {
     const mismatchDependencies = harness([toolTurn])
     const mismatchOrchestrator = new AgentOrchestrator(mismatchDependencies)
-    const mismatchPending = await mismatchOrchestrator.run({ conversationId: 'c1', content: '搜索', model: 'm' })
+    const mismatchPending = await mismatchOrchestrator.run({ conversationId: 'c1', content: '搜索', provider: 'openrouter', model: 'm' })
     const mismatch = await mismatchOrchestrator.resumeApproval({
       executionId: mismatchPending.executionId!, ...approvalIdentity, decision: 'always', workflowId: workflow.id,
       workflowVersion: workflow.version, capability: 'browser.open', scope: { origins: ['https://example.com'] },
@@ -119,7 +155,7 @@ describe('AgentOrchestrator', () => {
 
     const denyDependencies = harness([toolTurn])
     const denyOrchestrator = new AgentOrchestrator(denyDependencies)
-    const denyPending = await denyOrchestrator.run({ conversationId: 'c2', content: '搜索', model: 'm' })
+    const denyPending = await denyOrchestrator.run({ conversationId: 'c2', content: '搜索', provider: 'openrouter', model: 'm' })
     const denied = await denyOrchestrator.resumeApproval({ executionId: denyPending.executionId!, ...approvalIdentity, decision: 'deny' })
     expect(denied).toMatchObject({ status: 'failed', error: { code: 'PERMISSION_DENIED' } })
     expect(denyDependencies.records.starts).toHaveLength(0)
@@ -131,7 +167,7 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([toolTurn])
     dependencies.policy.record = () => { throw new Error('policy unavailable') }
     const orchestrator = new AgentOrchestrator(dependencies)
-    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' })
 
     const result = await orchestrator.resumeApproval({
       executionId: pending.executionId!, ...approvalIdentity, decision: 'once',
@@ -160,7 +196,7 @@ describe('AgentOrchestrator', () => {
       requiresApproval: true,
     })
     const orchestrator = new AgentOrchestrator(dependencies)
-    const first = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+    const first = await orchestrator.run({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' })
 
     const second = await orchestrator.resumeApproval(firstDecision === 'always' ? {
       executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope),
@@ -201,15 +237,15 @@ describe('AgentOrchestrator', () => {
 
   it('rejects unknown tools, invalid args, and multiple active tools', async () => {
     const unknown = harness([[{ ...toolTurn[0]!, name: 'unknown' } as ProviderStreamEvent, toolTurn[1]!]])
-    await expect(new AgentOrchestrator(unknown).run({ conversationId: 'c', content: 'x', model: 'm' }))
+    await expect(new AgentOrchestrator(unknown).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' }))
       .resolves.toMatchObject({ status: 'failed' })
 
     const invalid = harness([[{ ...toolTurn[0]!, arguments: {} } as ProviderStreamEvent, toolTurn[1]!]])
-    await expect(new AgentOrchestrator(invalid).run({ conversationId: 'c', content: 'x', model: 'm' }))
+    await expect(new AgentOrchestrator(invalid).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' }))
       .resolves.toMatchObject({ status: 'failed' })
 
     const multiple = harness([[toolTurn[0]!, { ...toolTurn[0]!, id: 'call_2', index: 1 } as ProviderStreamEvent, toolTurn[1]!]])
-    await expect(new AgentOrchestrator(multiple).run({ conversationId: 'c', content: 'x', model: 'm' }))
+    await expect(new AgentOrchestrator(multiple).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' }))
       .resolves.toMatchObject({ status: 'failed' })
 
   })
@@ -217,18 +253,18 @@ describe('AgentOrchestrator', () => {
   it.each(['length', 'content_filter', 'unknown_finish'])('terminalizes partial text after %s without another provider round', async (reason) => {
     const dependencies = harness([])
     let providerCalls = 0
-    dependencies.provider.stream = () => {
+    dependencies.providerInstances.openrouter.stream = vi.fn(() => {
       providerCalls += 1
       return events([
         { type: 'text_delta', choiceIndex: 0, text: '保留部分内容' },
         { type: 'finish', choiceIndex: 0, reason },
         { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.01' },
       ])
-    }
+    })
 
-    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', model: 'm' })
+    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' })
 
-    expect(result).toMatchObject({ status: 'failed', error: { code: 'OPENROUTER_REQUEST_FAILED' } })
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'MODEL_PROVIDER_REQUEST_FAILED' } })
     expect(providerCalls).toBe(1)
     expect(dependencies.records.terminal).toHaveLength(1)
     expect(dependencies.records.terminal[0]).toMatchObject({
@@ -246,7 +282,7 @@ describe('AgentOrchestrator', () => {
     dependencies.persistence.updateAssistant = (_id, blocks) => { order.push(`persist:${JSON.stringify(blocks)}`); return { blocks } }
     dependencies.emit = () => { order.push('emit'); throw new Error('renderer closed') }
 
-    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', model: 'm' })
+    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' })
 
     expect(result.status).toBe('completed')
     expect(order[0]).toContain('persist')
@@ -265,7 +301,7 @@ describe('AgentOrchestrator', () => {
     }
     dependencies.emit = (event) => { order.push(`emit:${event.type}:${event.type === 'block' ? event.block.type : event.status}`) }
 
-    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', model: 'm' })
+    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' })
 
     expect(result.status).toBe('failed')
     expect(order.slice(-3)).toEqual([
@@ -279,7 +315,7 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([])
     dependencies.workflows.list = async () => { throw new Error('registry unavailable') }
 
-    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', model: 'm' })
+    const result = await new AgentOrchestrator(dependencies).run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm' })
 
     expect(result).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } })
     expect(dependencies.records.users).toHaveLength(1)
@@ -297,7 +333,7 @@ describe('AgentOrchestrator', () => {
     let cancelled = false
     dependencies.executions.cancel = async () => { cancelled = true; resolveExecution({ id: 'x', status: 'cancelled' }) }
     const orchestrator = new AgentOrchestrator(dependencies)
-    const running = orchestrator.run({ conversationId: 'c', content: 'x', model: 'm', requestId: 'request_1' })
+    const running = orchestrator.run({ conversationId: 'c', content: 'x', provider: 'openrouter', model: 'm', requestId: 'request_1' })
     for (let index = 0; index < 20 && dependencies.records.starts.length === 0; index += 1) await Promise.resolve()
 
     await orchestrator.cancel('request_1')
@@ -309,7 +345,7 @@ describe('AgentOrchestrator', () => {
   it('cancels an approval-gated agent run by its execution identity', async () => {
     const dependencies = harness([toolTurn])
     const orchestrator = new AgentOrchestrator(dependencies)
-    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' })
 
     await orchestrator.cancelExecution(pending.executionId!)
 
@@ -333,7 +369,7 @@ describe('AgentOrchestrator', () => {
       }
     }
     const orchestrator = new AgentOrchestrator(dependencies)
-    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', model: 'm' })
+    const pending = await orchestrator.run({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' })
 
     const first = orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
     const second = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })

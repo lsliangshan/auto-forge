@@ -234,12 +234,22 @@ export const permissionGrantSchema = z.object({
 
 export type PermissionGrant = z.infer<typeof permissionGrantSchema>
 
+export const modelProviderIdSchema = z.enum(['deepseek', 'openrouter'])
+export type ModelProviderId = z.infer<typeof modelProviderIdSchema>
+
+export const providerDefaultModelsSchema = z.object({
+  deepseek: nonEmptyStringSchema,
+  openrouter: nonEmptyStringSchema,
+}).strict()
+export type ProviderDefaultModels = z.infer<typeof providerDefaultModelsSchema>
+
 export const appSettingsSchema = z.object({
   theme: z.enum(['light', 'dark', 'system']),
   language: z.enum(['zh-CN', 'en-US']),
   dataDirectory: nonEmptyStringSchema,
   logDirectory: nonEmptyStringSchema,
-  defaultModel: z.string(),
+  activeProvider: modelProviderIdSchema,
+  defaultModels: providerDefaultModelsSchema,
   showCosts: z.boolean(),
   developerMode: z.boolean(),
   permissionDefault: z.literal('ask'),
@@ -251,14 +261,15 @@ export const appSettingsPatchSchema = appSettingsSchema.partial().strict()
 
 export type AppSettingsPatch = z.infer<typeof appSettingsPatchSchema>
 
-export const credentialStatusSchema = z.object({
+export const providerCredentialStatusSchema = z.object({
+  provider: modelProviderIdSchema,
   configured: z.boolean(),
-  valid: z.boolean(),
+  validation: z.enum(['unchecked', 'valid', 'invalid', 'unavailable']),
   message: z.string().optional(),
   checkedAt: timestampSchema.optional(),
 }).strict()
 
-export type CredentialStatus = z.infer<typeof credentialStatusSchema>
+export type ProviderCredentialStatus = z.infer<typeof providerCredentialStatusSchema>
 
 export const modelInfoSchema = z.object({
   id: nonEmptyStringSchema,
@@ -307,10 +318,10 @@ export const ipcChannels = {
   permissionsRevoke: 'permissions:revoke',
   settingsGet: 'settings:get',
   settingsUpdate: 'settings:update',
-  settingsSaveOpenRouterKey: 'settings:save-openrouter-key',
-  settingsClearOpenRouterKey: 'settings:clear-openrouter-key',
-  settingsValidateOpenRouterKey: 'settings:validate-openrouter-key',
-  settingsListModels: 'settings:list-models',
+  settingsSaveProviderApiKey: 'settings:save-provider-api-key',
+  settingsClearProviderApiKey: 'settings:clear-provider-api-key',
+  settingsValidateProviderCredential: 'settings:validate-provider-credential',
+  settingsListProviderModels: 'settings:list-provider-models',
   settingsClearLocalData: 'settings:clear-local-data',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
@@ -349,10 +360,8 @@ export const cancelExecutionRequestSchema = z.object({ executionId: identifierSc
 export const revokePermissionRequestSchema = z.object({ grantId: identifierSchema }).strict()
 export const settingsGetRequestSchema = z.undefined()
 export const settingsUpdateRequestSchema = appSettingsPatchSchema
-export const saveOpenRouterKeyRequestSchema = z.object({ apiKey: nonEmptyStringSchema }).strict()
-export const clearOpenRouterKeyRequestSchema = z.undefined()
-export const validateOpenRouterKeyRequestSchema = z.undefined()
-export const listModelsRequestSchema = z.undefined()
+export const providerRequestSchema = z.object({ provider: modelProviderIdSchema }).strict()
+export const saveProviderApiKeyRequestSchema = providerRequestSchema.extend({ apiKey: nonEmptyStringSchema }).strict()
 export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
 }).strict()
@@ -402,10 +411,10 @@ export const ipcRequestSchemas = {
   [ipcChannels.permissionsRevoke]: revokePermissionRequestSchema,
   [ipcChannels.settingsGet]: settingsGetRequestSchema,
   [ipcChannels.settingsUpdate]: settingsUpdateRequestSchema,
-  [ipcChannels.settingsSaveOpenRouterKey]: saveOpenRouterKeyRequestSchema,
-  [ipcChannels.settingsClearOpenRouterKey]: clearOpenRouterKeyRequestSchema,
-  [ipcChannels.settingsValidateOpenRouterKey]: validateOpenRouterKeyRequestSchema,
-  [ipcChannels.settingsListModels]: listModelsRequestSchema,
+  [ipcChannels.settingsSaveProviderApiKey]: saveProviderApiKeyRequestSchema,
+  [ipcChannels.settingsClearProviderApiKey]: providerRequestSchema,
+  [ipcChannels.settingsValidateProviderCredential]: providerRequestSchema,
+  [ipcChannels.settingsListProviderModels]: providerRequestSchema,
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
@@ -444,10 +453,10 @@ export const ipcResponseSchemas = {
   [ipcChannels.permissionsRevoke]: voidResponseSchema,
   [ipcChannels.settingsGet]: appSettingsSchema,
   [ipcChannels.settingsUpdate]: appSettingsSchema,
-  [ipcChannels.settingsSaveOpenRouterKey]: credentialStatusSchema,
-  [ipcChannels.settingsClearOpenRouterKey]: voidResponseSchema,
-  [ipcChannels.settingsValidateOpenRouterKey]: credentialStatusSchema,
-  [ipcChannels.settingsListModels]: z.array(modelInfoSchema),
+  [ipcChannels.settingsSaveProviderApiKey]: providerCredentialStatusSchema,
+  [ipcChannels.settingsClearProviderApiKey]: voidResponseSchema,
+  [ipcChannels.settingsValidateProviderCredential]: providerCredentialStatusSchema,
+  [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
@@ -495,10 +504,10 @@ export interface DesktopAPI {
   settings: {
     get(): Promise<AppSettings>
     update(patch: AppSettingsPatch): Promise<AppSettings>
-    saveOpenRouterKey(apiKey: string): Promise<CredentialStatus>
-    clearOpenRouterKey(): Promise<void>
-    validateOpenRouterKey(): Promise<CredentialStatus>
-    listModels(): Promise<ModelInfo[]>
+    saveProviderApiKey(provider: ModelProviderId, apiKey: string): Promise<ProviderCredentialStatus>
+    clearProviderApiKey(provider: ModelProviderId): Promise<void>
+    validateProviderCredential(provider: ModelProviderId): Promise<ProviderCredentialStatus>
+    listProviderModels(provider: ModelProviderId): Promise<ModelInfo[]>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
   }
   system: {

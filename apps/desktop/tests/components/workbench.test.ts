@@ -2,7 +2,7 @@ import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import ElementPlus, { ElMessageBox } from 'element-plus'
+import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
 import type { DesktopAPI } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
@@ -35,11 +35,15 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
     settings: {
       get: vi.fn().mockResolvedValue({
         theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
-        defaultModel: '', showCosts: false, developerMode: false, permissionDefault: 'ask',
+        activeProvider: 'deepseek', defaultModels: {
+          openrouter: 'openai/gpt-4.1-mini', deepseek: 'deepseek-v4-flash',
+        }, showCosts: false, developerMode: false, permissionDefault: 'ask',
       }),
-      update: vi.fn(), saveOpenRouterKey: vi.fn(), clearOpenRouterKey: vi.fn(),
-      validateOpenRouterKey: vi.fn().mockResolvedValue({ configured: false, valid: false }),
-      listModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
+      update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(),
+      validateProviderCredential: vi.fn().mockImplementation(async (provider) => ({
+        provider, configured: false, validation: 'unchecked',
+      })),
+      listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
@@ -267,15 +271,177 @@ describe('workbench', () => {
 
   it('serializes settings patches so older full responses cannot roll back newer fields', async () => {
     const api = createApi()
-    const first = { theme: 'dark' as const, language: 'zh-CN' as const, dataDirectory: '/data', logDirectory: '/logs', defaultModel: 'old', showCosts: false, developerMode: false, permissionDefault: 'ask' as const }
-    const second = { ...first, defaultModel: 'new' }
+    const first = {
+      theme: 'dark' as const, language: 'zh-CN' as const, dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter' as const, defaultModels: { openrouter: 'old', deepseek: 'deepseek-v4-flash' },
+      showCosts: false, developerMode: false, permissionDefault: 'ask' as const,
+    }
+    const second = { ...first, defaultModels: { ...first.defaultModels, openrouter: 'new' } }
     vi.mocked(api.settings.update).mockResolvedValueOnce(first).mockResolvedValueOnce(second)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useSettingsStore()
-    await Promise.all([store.update({ theme: 'dark' }), store.update({ defaultModel: 'new' })])
+    await Promise.all([
+      store.update({ theme: 'dark' }),
+      store.update({ defaultModels: { openrouter: 'new', deepseek: 'deepseek-v4-flash' } }),
+    ])
     expect(api.settings.update).toHaveBeenNthCalledWith(1, { theme: 'dark' })
-    expect(api.settings.update).toHaveBeenNthCalledWith(2, { defaultModel: 'new' })
-    expect(store.settings?.defaultModel).toBe('new')
+    expect(api.settings.update).toHaveBeenNthCalledWith(2, {
+      defaultModels: { openrouter: 'new', deepseek: 'deepseek-v4-flash' },
+    })
+    expect(store.settings?.defaultModels.openrouter).toBe('new')
+  })
+
+  it('uses DeepSeek while persisted settings are not loaded', () => {
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: createApi() })
+    const store = useSettingsStore()
+
+    expect(store.activeProvider).toBe('deepseek')
+  })
+
+  it('switches provider state, credentials, and models without reusing the previous provider data', async () => {
+    const api = createApi()
+    const openrouterSettings = { ...await api.settings.get(), activeProvider: 'openrouter' as const }
+    const deepseekSettings = { ...openrouterSettings, activeProvider: 'deepseek' as const }
+    vi.mocked(api.settings.get).mockResolvedValue(openrouterSettings)
+    vi.mocked(api.settings.update).mockResolvedValue(deepseekSettings)
+    vi.mocked(api.settings.validateProviderCredential).mockImplementation(async (provider) => ({
+      provider, configured: true, validation: 'valid',
+    }))
+    vi.mocked(api.settings.listProviderModels).mockImplementation(async (provider) => (
+      provider === 'openrouter'
+        ? [{ id: 'openrouter/model', name: 'OpenRouter model' }]
+        : [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' }]
+    ))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+
+    await store.load()
+    expect(store.models.map(({ id }) => id)).toEqual(['openrouter/model'])
+    await store.switchProvider('deepseek')
+
+    expect(api.settings.update).toHaveBeenCalledWith({ activeProvider: 'deepseek' })
+    expect(api.settings.validateProviderCredential).toHaveBeenLastCalledWith('deepseek')
+    expect(api.settings.listProviderModels).toHaveBeenLastCalledWith('deepseek')
+    expect(store.credential?.provider).toBe('deepseek')
+    expect(store.models.map(({ id }) => id)).toEqual(['deepseek-v4-flash'])
+  })
+
+  it('keeps the saved provider default selectable when it is absent from the fetched catalog', () => {
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: createApi() })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'deepseek', defaultModels: {
+        openrouter: 'openrouter/model', deepseek: 'deepseek-legacy',
+      }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+    store.providerModels.deepseek = [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' }]
+
+    expect(store.modelOptions).toEqual([
+      { id: 'deepseek-legacy', name: 'deepseek-legacy（已保存模型）' },
+      { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    ])
+  })
+
+  it('stops showing the previous provider model load after switching to an unconfigured provider', async () => {
+    const api = createApi()
+    let resolveOpenRouterModels!: (models: Awaited<ReturnType<DesktopAPI['settings']['listProviderModels']>>) => void
+    vi.mocked(api.settings.listProviderModels).mockReturnValue(
+      new Promise((resolve) => { resolveOpenRouterModels = resolve }),
+    )
+    vi.mocked(api.settings.update).mockResolvedValue({
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'deepseek', defaultModels: {
+        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+      }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+    })
+    vi.mocked(api.settings.validateProviderCredential).mockResolvedValue({
+      provider: 'deepseek', configured: false, validation: 'unchecked',
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter', defaultModels: {
+        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+      }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+
+    const oldLoad = store.loadModels('openrouter')
+    await vi.waitFor(() => expect(store.modelsLoading).toBe(true))
+    await store.switchProvider('deepseek')
+
+    expect(store.modelsLoading).toBe(false)
+    resolveOpenRouterModels([])
+    await oldLoad
+    expect(store.modelsLoading).toBe(false)
+  })
+
+  it('does not restore cleared credentials or models from older provider responses', async () => {
+    const api = createApi()
+    let resolveValidation!: (status: Awaited<ReturnType<DesktopAPI['settings']['validateProviderCredential']>>) => void
+    let resolveModels!: (models: Awaited<ReturnType<DesktopAPI['settings']['listProviderModels']>>) => void
+    vi.mocked(api.settings.validateProviderCredential).mockReturnValue(
+      new Promise((resolve) => { resolveValidation = resolve }),
+    )
+    vi.mocked(api.settings.listProviderModels).mockReturnValue(
+      new Promise((resolve) => { resolveModels = resolve }),
+    )
+    vi.mocked(api.settings.clearProviderApiKey).mockResolvedValue(undefined)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter', defaultModels: {
+        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+      }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+    store.credentials.openrouter = { provider: 'openrouter', configured: true, validation: 'valid' }
+
+    const validation = store.validateCredential('openrouter')
+    const models = store.loadModels('openrouter')
+    await store.clearCredential()
+    resolveValidation({ provider: 'openrouter', configured: true, validation: 'valid' })
+    resolveModels([{ id: 'stale/model', name: 'Stale model' }])
+    await Promise.all([validation, models])
+
+    expect(store.credentials.openrouter).toEqual({
+      provider: 'openrouter', configured: false, validation: 'unchecked',
+    })
+    expect(store.providerModels.openrouter).toEqual([])
+  })
+
+  it('does not show an inactive provider failure after switching providers', async () => {
+    const api = createApi()
+    let rejectOpenRouterModels!: (error: Error) => void
+    vi.mocked(api.settings.listProviderModels).mockReturnValue(
+      new Promise((_, reject) => { rejectOpenRouterModels = reject }),
+    )
+    vi.mocked(api.settings.update).mockResolvedValue({
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'deepseek', defaultModels: {
+        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+      }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+    })
+    vi.mocked(api.settings.validateProviderCredential).mockResolvedValue({
+      provider: 'deepseek', configured: false, validation: 'unchecked',
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter', defaultModels: {
+        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+      }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+
+    const oldLoad = store.loadModels('openrouter')
+    await store.switchProvider('deepseek')
+    rejectOpenRouterModels(new Error('old provider failed'))
+    await oldLoad
+
+    expect(store.activeProvider).toBe('deepseek')
+    expect(store.error).toBe('')
   })
 
   it('resets visible stores after a successful all-data clear', async () => {
@@ -370,14 +536,99 @@ describe('workbench', () => {
 
   it('clears a successfully saved key from the settings input without retaining it in state', async () => {
     const api = createApi()
-    vi.mocked(api.settings.saveOpenRouterKey).mockResolvedValue({ configured: true, valid: true })
+    const success = vi.spyOn(ElMessage, 'success')
+    vi.mocked(api.settings.validateProviderCredential)
+      .mockResolvedValueOnce({
+        provider: 'deepseek', configured: false, validation: 'unchecked',
+      })
+      .mockReturnValueOnce(new Promise(() => undefined))
+    vi.mocked(api.settings.saveProviderApiKey).mockResolvedValue({
+      provider: 'deepseek', configured: true, validation: 'unchecked',
+    })
     const { wrapper, pinia } = await mountApp('/settings', api)
-    await vi.waitFor(() => expect(api.settings.get).toHaveBeenCalled())
-    const input = wrapper.get('#openrouter-key')
+    await vi.waitFor(() => expect(wrapper.find('#provider-api-key').exists()).toBe(true))
+    const input = wrapper.get('#provider-api-key')
     await input.setValue('sk-sensitive-value')
     await wrapper.get('[data-testid="save-api-key"]').trigger('click')
-    await vi.waitFor(() => expect(api.settings.saveOpenRouterKey).toHaveBeenCalledWith('sk-sensitive-value'))
+    await vi.waitFor(() => expect(api.settings.saveProviderApiKey)
+      .toHaveBeenCalledWith('deepseek', 'sk-sensitive-value'))
+    await vi.waitFor(() => expect(api.settings.validateProviderCredential).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已设置 API Key · 尚未验证'))
+    expect(success).toHaveBeenCalledWith('API Key 已保存到本地数据库')
     await vi.waitFor(() => expect((input.element as HTMLInputElement).value).toBe(''))
     expect(JSON.stringify(pinia.state.value)).not.toContain('sk-sensitive-value')
+    success.mockRestore()
+  })
+
+  it('loads models for the saved provider after validation even if the active provider changes', async () => {
+    const api = createApi()
+    let resolveValidation!: (
+      status: Awaited<ReturnType<DesktopAPI['settings']['validateProviderCredential']>>,
+    ) => void
+    vi.mocked(api.settings.validateProviderCredential)
+      .mockResolvedValueOnce({
+        provider: 'deepseek', configured: false, validation: 'unchecked',
+      })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveValidation = resolve }))
+    vi.mocked(api.settings.saveProviderApiKey).mockResolvedValue({
+      provider: 'deepseek', configured: true, validation: 'unchecked',
+    })
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('未设置 API Key'))
+    const store = useSettingsStore()
+    const loadModels = vi.spyOn(store, 'loadModels')
+
+    await wrapper.get('#provider-api-key').setValue('sk-deepseek')
+    await wrapper.get('[data-testid="save-api-key"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.validateProviderCredential).toHaveBeenCalledTimes(2))
+    if (store.settings) store.settings.activeProvider = 'openrouter'
+    resolveValidation({ provider: 'deepseek', configured: true, validation: 'valid' })
+
+    await vi.waitFor(() => expect(loadModels).toHaveBeenCalledWith('deepseek'))
+  })
+
+  it('does not load provider models when the saved API Key fails validation', async () => {
+    const api = createApi()
+    let resolveValidation!: (
+      status: Awaited<ReturnType<DesktopAPI['settings']['validateProviderCredential']>>,
+    ) => void
+    vi.mocked(api.settings.validateProviderCredential)
+      .mockResolvedValueOnce({
+        provider: 'deepseek', configured: false, validation: 'unchecked',
+      })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveValidation = resolve }))
+    vi.mocked(api.settings.saveProviderApiKey).mockResolvedValue({
+      provider: 'deepseek', configured: true, validation: 'unchecked',
+    })
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('未设置 API Key'))
+    const store = useSettingsStore()
+    const loadModels = vi.spyOn(store, 'loadModels')
+
+    await wrapper.get('#provider-api-key').setValue('invalid-key')
+    await wrapper.get('[data-testid="save-api-key"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.validateProviderCredential).toHaveBeenCalledTimes(2))
+    resolveValidation({ provider: 'deepseek', configured: true, validation: 'invalid' })
+
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已设置 API Key · 验证失败'))
+    expect(loadModels).not.toHaveBeenCalled()
+  })
+
+  it('separates locally saved API Key state from provider validation state', async () => {
+    const labels = [
+      [{ provider: 'deepseek', configured: false, validation: 'unchecked' }, '未设置 API Key'],
+      [{ provider: 'deepseek', configured: true, validation: 'valid' }, '已设置 API Key · 已验证'],
+      [{ provider: 'deepseek', configured: true, validation: 'invalid' }, '已设置 API Key · 验证失败'],
+      [{ provider: 'deepseek', configured: true, validation: 'unavailable' }, '已设置 API Key · 暂时无法验证'],
+      [{ provider: 'deepseek', configured: true, validation: 'unchecked' }, '已设置 API Key · 尚未验证'],
+    ] as const
+
+    for (const [credential, label] of labels) {
+      const api = createApi()
+      vi.mocked(api.settings.validateProviderCredential).mockResolvedValue(credential)
+      const { wrapper } = await mountApp('/settings', api)
+      await vi.waitFor(() => expect(wrapper.text()).toContain(label))
+      wrapper.unmount()
+    }
   })
 })

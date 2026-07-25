@@ -7,14 +7,14 @@ import {
   toSafeAppError,
   type AppError,
   type ChatEvent,
-  type CredentialStatus,
   type DeveloperProject,
   type ExecutionDetail,
   type ExecutionEvent,
   type ExecutionQuery,
   type ExecutionSummary,
-  type ModelInfo,
+  type ModelProviderId,
   type PermissionGrant,
+  type ProviderCredentialStatus,
   type WorkflowDetail,
   type WorkflowQuery,
   type WorkflowSummary,
@@ -23,7 +23,10 @@ import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import Ajv, { type AnySchema } from 'ajv'
 import { AgentOrchestrator, createAgentPersistence } from './agent/agent-orchestrator.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
-import { OpenRouterProvider, type OpenRouterStreamEvent, type OpenRouterStreamRequest } from './chat/openrouter-provider.js'
+import { DeepSeekProvider } from './chat/deepseek-provider.js'
+import type { ModelProvider } from './chat/model-provider.js'
+import { credentialKeyForProvider, ModelProviderRegistry } from './chat/model-provider-registry.js'
+import { OpenRouterProvider } from './chat/openrouter-provider.js'
 import { openAppDatabase } from './database/client.js'
 import type { Execution, WorkflowProject } from './database/repositories.js'
 import { PolicyEngine } from './permissions/policy-engine.js'
@@ -50,16 +53,14 @@ export interface ApplicationPaths {
   temporary: string
 }
 
-export interface ApplicationOpenRouterPort {
-  listModels(signal?: AbortSignal): Promise<ModelInfo[]>
-  validateCredential(signal?: AbortSignal): Promise<{ valid: boolean }>
-  stream(request: OpenRouterStreamRequest): AsyncIterable<OpenRouterStreamEvent>
-}
+export type ApplicationModelProviderPort = ModelProvider
+export type ApplicationOpenRouterPort = ApplicationModelProviderPort
 
 export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
   openRouter?: ApplicationOpenRouterPort
+  modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
   chooseProjectDirectory(): Promise<string | undefined>
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
@@ -205,12 +206,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     language: 'zh-CN',
     dataDirectory: options.paths.data,
     logDirectory: options.paths.logs,
-    defaultModel: 'openai/gpt-4.1-mini',
+    activeProvider: 'deepseek',
+    defaultModels: {
+      openrouter: 'openai/gpt-4.1-mini',
+      deepseek: 'deepseek-v4-flash',
+    },
     showCosts: true,
     developerMode: false,
     permissionDefault: 'ask',
   })
-  const provider = options.openRouter ?? new OpenRouterProvider({ credential: secretStore })
+  const providerRegistry = new ModelProviderRegistry({
+    openrouter: options.modelProviders?.openrouter ?? options.openRouter ?? new OpenRouterProvider({ credential: secretStore }),
+    deepseek: options.modelProviders?.deepseek ?? new DeepSeekProvider({ credential: secretStore }),
+  })
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
   const developmentSourceSelectors = new WeakMap<WorkflowExecutionSourceSelector, string>()
@@ -302,7 +310,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
   }
   const agent = new AgentOrchestrator({
-    provider,
+    providers: providerRegistry,
     workflows: registry,
     persistence: createAgentPersistence(database),
     policy,
@@ -311,20 +319,26 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     developerMode: () => settings.get().developerMode,
   })
 
-  const credentialStatus = async (): Promise<CredentialStatus> => {
-    const configured = Boolean(await secretStore.get('openrouter_api_key'))
-    if (!configured) return { configured: false, valid: false, message: 'OpenRouter API key is not configured.' }
+  const credentialStatus = async (provider: ModelProviderId): Promise<ProviderCredentialStatus> => {
+    const configured = database.encryptedSecrets.raw(credentialKeyForProvider(provider)) !== undefined
+    if (!configured) return { provider, configured: false, validation: 'unchecked' }
     try {
-      const result = await provider.validateCredential()
+      const result = await providerRegistry.get(provider).validateCredential()
       return {
+        provider,
         configured: true,
-        valid: result.valid,
-        ...(result.valid ? {} : { message: 'OpenRouter rejected the credential.' }),
+        validation: result.valid ? 'valid' : 'invalid',
         checkedAt: new Date().toISOString(),
       }
     } catch (error) {
       const safe = toSafeAppError(error)
-      return { configured: true, valid: false, message: safe.message, checkedAt: new Date().toISOString() }
+      return {
+        provider,
+        configured: true,
+        validation: safe.code === 'CREDENTIAL_INVALID' ? 'invalid' : 'unavailable',
+        message: safe.message,
+        checkedAt: new Date().toISOString(),
+      }
     }
   }
 
@@ -368,11 +382,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         try {
           if (!database.conversations.get(input.conversationId)) throw failure('NOT_FOUND')
           const requestId = randomUUID()
+          const snapshot = settings.get()
           activeRequests.add(requestId)
           void agent.run({
             conversationId: input.conversationId,
             content: input.content,
-            model: input.model ?? settings.get().defaultModel,
+            provider: snapshot.activeProvider,
+            model: input.model ?? snapshot.defaultModels[snapshot.activeProvider],
             requestId,
           }).catch(() => activeRequests.delete(requestId))
           return { requestId }
@@ -518,10 +534,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     settings: {
       get: async () => settings.get(),
       update: async (patch) => settings.update(patch),
-      saveOpenRouterKey: async (apiKey) => { await secretStore.set('openrouter_api_key', apiKey); return credentialStatus() },
-      clearOpenRouterKey: async () => { secretStore.delete('openrouter_api_key') },
-      validateOpenRouterKey: credentialStatus,
-      listModels: () => provider.listModels(),
+      saveProviderApiKey: async (provider, apiKey) => {
+        await secretStore.set(credentialKeyForProvider(provider), apiKey)
+        return { provider, configured: true, validation: 'unchecked' as const }
+      },
+      clearProviderApiKey: async (provider) => { secretStore.delete(credentialKeyForProvider(provider)) },
+      validateProviderCredential: credentialStatus,
+      listProviderModels: (provider) => providerRegistry.get(provider).listModels(),
       clearLocalData: async (scope) => {
         maintenance.clearLocalData(
           () => activeRequests.size > 0

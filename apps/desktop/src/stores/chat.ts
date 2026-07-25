@@ -213,7 +213,7 @@ export const useChatStore = defineStore('chat', {
           const terminalRequestIds = Object.keys(this._terminalRequests)
           if (terminalRequestIds.length > 100) delete this._terminalRequests[terminalRequestIds[0]!]
         }
-        if (event.status === 'failed' && event.error) this.error = event.error.message
+        if (event.status === 'failed' && event.error) this.error = displayError(event.error, '消息发送失败')
         return
       }
       this._messageVersions[event.conversationId] = (this._messageVersions[event.conversationId] ?? 0) + 1

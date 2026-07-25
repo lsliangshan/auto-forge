@@ -16,6 +16,7 @@ export const appErrorCodeSchema = z.enum([
   'CREDENTIAL_UNAVAILABLE',
   'CREDENTIAL_INVALID',
   'OPENROUTER_REQUEST_FAILED',
+  'MODEL_PROVIDER_REQUEST_FAILED',
 ])
 
 export type AppErrorCode = z.infer<typeof appErrorCodeSchema>
@@ -43,6 +44,7 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   CREDENTIAL_UNAVAILABLE: 'The credential is unavailable.',
   CREDENTIAL_INVALID: 'The credential is invalid.',
   OPENROUTER_REQUEST_FAILED: 'The OpenRouter request failed.',
+  MODEL_PROVIDER_REQUEST_FAILED: 'The model provider request failed.',
 }
 
 export function toSafeAppError(error: unknown): AppError {

@@ -91,10 +91,10 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
     settings: {
       get: () => invoke(ipcRenderer, ipcChannels.settingsGet),
       update: (patch) => invoke(ipcRenderer, ipcChannels.settingsUpdate, patch),
-      saveOpenRouterKey: (apiKey) => invoke(ipcRenderer, ipcChannels.settingsSaveOpenRouterKey, { apiKey }),
-      clearOpenRouterKey: () => invoke(ipcRenderer, ipcChannels.settingsClearOpenRouterKey),
-      validateOpenRouterKey: () => invoke(ipcRenderer, ipcChannels.settingsValidateOpenRouterKey),
-      listModels: () => invoke(ipcRenderer, ipcChannels.settingsListModels),
+      saveProviderApiKey: (provider, apiKey) => invoke(ipcRenderer, ipcChannels.settingsSaveProviderApiKey, { provider, apiKey }),
+      clearProviderApiKey: (provider) => invoke(ipcRenderer, ipcChannels.settingsClearProviderApiKey, { provider }),
+      validateProviderCredential: (provider) => invoke(ipcRenderer, ipcChannels.settingsValidateProviderCredential, { provider }),
+      listProviderModels: (provider) => invoke(ipcRenderer, ipcChannels.settingsListProviderModels, { provider }),
       clearLocalData: (scope) => invoke(ipcRenderer, ipcChannels.settingsClearLocalData, { scope }),
     },
     system: {

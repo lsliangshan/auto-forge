@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
+import { openAppDatabase } from './database/client.js'
+import { SecretStore } from './security/secret-store.js'
 
 const directories: string[] = []
 
@@ -11,6 +13,179 @@ afterEach(async () => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('stores provider credentials separately and routes new chats to the active provider default', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
+    directories.push(root)
+    const openrouter = {
+      listModels: vi.fn(async () => [{ id: 'openrouter/model', name: 'OpenRouter model' }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const deepseek = {
+      listModels: vi.fn(async () => [{ id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      modelProviders: { openrouter, deepseek },
+      chooseProjectDirectory: async () => undefined,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(),
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    })
+
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({
+      activeProvider: 'deepseek',
+    })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
+    await runtime.services.settings.update({ activeProvider: 'deepseek' })
+    await expect(runtime.services.settings.listProviderModels('deepseek')).resolves.toEqual([
+      { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' },
+    ])
+
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send({ conversationId: conversation.id, content: 'hello' })
+    await vi.waitFor(() => expect(deepseek.stream).toHaveBeenCalled())
+    expect(openrouter.stream).not.toHaveBeenCalled()
+    expect(deepseek.stream).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'deepseek-v4-flash',
+    }))
+
+    await runtime.services.settings.clearProviderApiKey('deepseek')
+    await expect(runtime.services.settings.validateProviderCredential('deepseek'))
+      .resolves.toMatchObject({ provider: 'deepseek', configured: false, validation: 'unchecked' })
+    await expect(runtime.services.settings.validateProviderCredential('openrouter'))
+      .resolves.toMatchObject({ provider: 'openrouter', configured: true, validation: 'valid' })
+    await runtime.close()
+  })
+
+  it('persists both provider credentials in the local database across a restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
+    directories.push(root)
+    const openrouter = {
+      listModels: vi.fn(async () => []),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const deepseek = {
+      listModels: vi.fn(async () => []),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const options: Parameters<typeof createApplicationRuntime>[0] = {
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(`encrypted:${value}`),
+        decrypt: async (value) => ({
+          value: value.toString().replace(/^encrypted:/, ''),
+          shouldReEncrypt: false,
+        }),
+      },
+      modelProviders: { openrouter, deepseek },
+      chooseProjectDirectory: async () => undefined,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(),
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    }
+    const runtime = createApplicationRuntime(options)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
+    await runtime.close()
+
+    const database = openAppDatabase(options.paths.database)
+    const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
+    await expect(secretStore.get('openrouter_api_key')).resolves.toBe('sk-openrouter')
+    await expect(secretStore.get('deepseek_api_key')).resolves.toBe('sk-deepseek')
+    database.close()
+
+    const restarted = createApplicationRuntime(options)
+    await expect(restarted.services.settings.validateProviderCredential('openrouter'))
+      .resolves.toMatchObject({ provider: 'openrouter', configured: true, validation: 'valid' })
+    await expect(restarted.services.settings.validateProviderCredential('deepseek'))
+      .resolves.toMatchObject({ provider: 'deepseek', configured: true, validation: 'valid' })
+    await restarted.close()
+  })
+
+  it('reports local credential persistence without waiting for online validation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
+    directories.push(root)
+    const validation = new Promise<{ valid: boolean }>(() => undefined)
+    const deepseek = {
+      listModels: vi.fn(async () => []),
+      validateCredential: vi.fn(() => validation),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(`encrypted:${value}`),
+        decrypt: async (value) => ({
+          value: value.toString().replace(/^encrypted:/, ''),
+          shouldReEncrypt: false,
+        }),
+      },
+      modelProviders: {
+        deepseek,
+        openrouter: {
+          listModels: vi.fn(async () => []),
+          validateCredential: vi.fn(async () => ({ valid: true })),
+          stream: vi.fn(async function* () {
+            yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+          }),
+        },
+      },
+      chooseProjectDirectory: async () => undefined,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(),
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    })
+    let status: Awaited<ReturnType<typeof runtime.services.settings.saveProviderApiKey>> | undefined
+    void runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
+      .then((value) => { status = value })
+
+    await vi.waitFor(() => expect(status).toEqual({
+      provider: 'deepseek',
+      configured: true,
+      validation: 'unchecked',
+    }))
+    expect(deepseek.validateCredential).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
   it('composes real persistence-backed DesktopAPI services and recovers before use', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)
@@ -40,6 +215,7 @@ describe('createApplicationRuntime', () => {
     })
 
     await runtime.recover()
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.listConversations()).toEqual([conversation])
     expect(await runtime.services.chat.listMessages(conversation.id)).toEqual([])
@@ -50,7 +226,8 @@ describe('createApplicationRuntime', () => {
       expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
       expect.objectContaining({ role: 'assistant' }),
     ]))
-    expect(await runtime.services.settings.saveOpenRouterKey('sk-local')).toMatchObject({ configured: true, valid: true })
+    expect(await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-local'))
+      .toMatchObject({ provider: 'openrouter', configured: true, validation: 'unchecked' })
     const longNameProject = await runtime.services.developer.createProject(`${'a'.repeat(47)} b`)
     expect(longNameProject.name).toBe(`${'a'.repeat(47)} b`)
     await mkdir(join(longNameProject.rootPath, 'node_modules/private-package'), { recursive: true })
@@ -131,6 +308,7 @@ describe('createApplicationRuntime', () => {
       emitExecution: vi.fn(),
       browserRuntime: { packaged: false },
     })
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
     const conversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.send({ conversationId: conversation.id, content: 'hello' })
 

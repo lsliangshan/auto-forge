@@ -15,25 +15,42 @@
     </div>
     <template v-else>
       <section
-        id="credential"
+        id="provider"
         class="settings-section"
       >
         <header>
-          <div><h2>OpenRouter 凭证</h2><p>密钥由系统安全存储加密，本页面只显示状态。</p></div><span :class="['credential-status', credentialTone]"><i
+          <div><h2>大模型供应商</h2><p>不同供应商的密钥独立加密保存，本页面只显示当前供应商的状态。</p></div><span :class="['credential-status', credentialTone]"><i
             class="af-status-dot"
             :class="credentialTone"
           />{{ credentialLabel }}</span>
         </header>
         <div class="settings-form">
-          <label for="openrouter-key">替换 API Key</label>
+          <label for="model-provider">供应商</label>
+          <el-select
+            id="model-provider"
+            v-model="selectedProvider"
+            data-testid="provider-select"
+            :disabled="settings.saving"
+            @change="changeProvider"
+          >
+            <el-option
+              label="DeepSeek"
+              value="deepseek"
+            />
+            <el-option
+              label="OpenRouter"
+              value="openrouter"
+            />
+          </el-select>
+          <label for="provider-api-key">替换 API Key</label>
           <div class="inline-control">
             <el-input
-              id="openrouter-key"
+              id="provider-api-key"
               v-model="apiKey"
               type="password"
               show-password
               autocomplete="new-password"
-              placeholder="输入新的 OpenRouter API Key"
+              :placeholder="`输入新的 ${providerLabel} API Key`"
             /><el-button
               type="primary"
               :disabled="!apiKey.trim()"
@@ -62,9 +79,10 @@
         class="settings-section"
       >
         <header>
-          <div><h2>默认模型</h2><p>模型列表直接来自 OpenRouter。</p></div><el-button
+          <div><h2>默认模型</h2><p>模型列表来自当前选择的 {{ providerLabel }}。</p></div><el-button
             :icon="Refresh"
             :loading="settings.modelsLoading"
+            :disabled="!settings.credential?.configured"
             @click="settings.loadModels"
           >
             刷新模型
@@ -82,7 +100,7 @@
             @change="saveModel"
           >
             <el-option
-              v-for="model in settings.models"
+              v-for="model in settings.modelOptions"
               :key="model.id"
               :label="model.name"
               :value="model.id"
@@ -203,39 +221,59 @@
 
 <script setup lang="ts">
 import { Refresh } from '@element-plus/icons-vue'
+import type { ModelProviderId } from '@autoforge/shared'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
 
 const settings = useSettingsStore()
 const apiKey = ref('')
+const selectedProvider = ref<ModelProviderId>('deepseek')
 const selectedModel = ref('')
-const credentialLabel = computed(() => !settings.credential?.configured ? '未配置' : settings.credential.valid ? '已配置并验证' : '已配置，验证失败')
-const credentialTone = computed(() => settings.credential?.valid ? 'success' : settings.credential?.configured ? 'warning' : '')
-watch(() => settings.settings?.defaultModel, (value) => { selectedModel.value = value ?? '' }, { immediate: true })
+const providerLabel = computed(() => settings.activeProvider === 'deepseek' ? 'DeepSeek' : 'OpenRouter')
+const credentialLabel = computed(() => {
+  const credential = settings.credential
+  if (!credential?.configured) return '未设置 API Key'
+  if (credential.validation === 'valid') return '已设置 API Key · 已验证'
+  if (credential.validation === 'invalid') return '已设置 API Key · 验证失败'
+  if (credential.validation === 'unavailable') return '已设置 API Key · 暂时无法验证'
+  return '已设置 API Key · 尚未验证'
+})
+const credentialTone = computed(() => settings.credential?.validation === 'valid'
+  ? 'success'
+  : settings.credential?.configured ? 'warning' : '')
+watch(() => settings.activeProvider, (value) => { selectedProvider.value = value }, { immediate: true })
+watch(() => settings.defaultModel, (value) => { selectedModel.value = value }, { immediate: true })
 
 onMounted(async () => {
   if (!settings.settings && !settings.loading) await settings.load()
-  if (settings.credential?.configured && !settings.models.length) void settings.loadModels()
 })
+async function changeProvider(provider: ModelProviderId) {
+  const previous = settings.activeProvider
+  await settings.switchProvider(provider)
+  if (settings.activeProvider === provider) apiKey.value = ''
+  else selectedProvider.value = previous
+}
 async function saveApiKey() {
   const key = apiKey.value.trim()
   if (!key) return
+  const provider = settings.activeProvider
   try {
     await settings.saveCredential(key)
     apiKey.value = ''
-    ElMessage.success('凭证已安全保存')
-    void settings.loadModels()
+    ElMessage.success('API Key 已保存到本地数据库')
+    void settings.validateCredential(provider).then((credential) => {
+      if (credential?.validation === 'valid') void settings.loadModels(provider)
+    })
   } catch { /* Store renders the safe error. */ }
 }
 async function clearCredential() {
   try {
-    await ElMessageBox.confirm('清除后将无法继续调用 OpenRouter，确认清除？', '清除凭证', { type: 'warning', confirmButtonText: '确认清除', cancelButtonText: '取消' })
+    await ElMessageBox.confirm(`清除后将无法继续调用 ${providerLabel.value}，确认清除？`, '清除凭证', { type: 'warning', confirmButtonText: '确认清除', cancelButtonText: '取消' })
     await settings.clearCredential()
-    settings.models = []
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
 }
-function saveModel(value: string) { if (value) void settings.update({ defaultModel: value }) }
+function saveModel(value: string) { if (value) void settings.saveDefaultModel(value) }
 async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
   try {
     const message = scope === 'all'
