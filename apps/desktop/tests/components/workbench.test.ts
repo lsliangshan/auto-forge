@@ -466,6 +466,42 @@ describe('workbench', () => {
     ])
   })
 
+  it('does not synthesize a saved model whose catalog entry advertises a different output', () => {
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: createApi() })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { image: 'catalog/incompatible' },
+      },
+      showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+    store.providerModels.openrouter = [modelInfo('catalog/incompatible', ['text'])]
+
+    expect(store.modelOptionsFor('image')).toEqual([])
+  })
+
+  it('does not synthesize a saved media model whose catalog entry lacks generation metadata', () => {
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: createApi() })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { audio: 'catalog/no-generation' },
+      },
+      showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+    const catalogModel = modelInfo('catalog/no-generation', ['audio'])
+    catalogModel.generation = {}
+    store.providerModels.openrouter = [catalogModel]
+
+    expect(store.modelOptionsFor('audio')).toEqual([])
+  })
+
   it('uses DeepSeek while persisted settings are not loaded', () => {
     Object.defineProperty(window, 'autoForge', { configurable: true, value: createApi() })
     const store = useSettingsStore()

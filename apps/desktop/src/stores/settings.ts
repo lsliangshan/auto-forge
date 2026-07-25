@@ -86,7 +86,7 @@ export const useSettingsStore = defineStore('settings', {
       return (output) => {
         const models = this.models.filter((model) => supportsOutput(model, output))
         const saved = this.defaultModelFor(output)
-        if (!saved || models.some(({ id }) => id === saved)) return models
+        if (!saved || this.models.some(({ id }) => id === saved)) return models
         return [savedModelOption(saved, output), ...models]
       }
     },
