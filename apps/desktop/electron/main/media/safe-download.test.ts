@@ -161,6 +161,10 @@ class DeferredSink extends Writable {
   readonly chunks: Buffer[] = []
   private releaseWrite?: (error?: Error | null) => void
 
+  constructor() {
+    super({ autoDestroy: false })
+  }
+
   override _write(
     chunk: Buffer,
     _encoding: BufferEncoding,
@@ -810,6 +814,47 @@ describe('SafeMediaDownloader failure lifecycle', () => {
     expect(network.calls).toHaveLength(0)
     expect(timers.pending.size).toBe(0)
   })
+
+  it.each(['total timeout', 'response abort'] as const)(
+    'retains a destination error guard until a deferred write settles after %s',
+    async (failurePoint) => {
+      const { downloader, network, timers } = setup()
+      const sink = new DeferredSink()
+      const baselineErrorListeners = sink.listenerCount('error')
+      const baselineCloseListeners = sink.listenerCount('close')
+      const promise = downloader.download(
+        'https://provider.example/result.png',
+        sink,
+        { maxBytes: 10, totalTimeoutMs: 33 },
+      )
+      await waitFor(() => network.calls.length === 1)
+      network.connect(0)
+      const response = network.respond(0, 200)
+      response.emit('data', Buffer.from('pending'))
+
+      if (failurePoint === 'total timeout') timers.fire(33)
+      else response.emit('aborted', new Error('response aborted'))
+
+      // Failure remains prompt and does not wait for the caller-owned sink.
+      await expectSafeFailure(promise)
+      expect(timers.pending.size).toBe(0)
+      expect(network.calls[0]!.request.destroyed).toBe(true)
+      expect(response.destroyed).toBe(true)
+      expect(sink.listenerCount('error')).toBe(baselineErrorListeners + 1)
+      expect(sink.listenerCount('close')).toBe(baselineCloseListeners)
+      expect(sink.writableEnded).toBe(false)
+      expect(sink.destroyed).toBe(false)
+
+      sink.release(new Error('late deferred destination failure'))
+      await new Promise<void>((resolve) => setImmediate(resolve))
+
+      expect(sink.listenerCount('error')).toBe(baselineErrorListeners)
+      expect(sink.listenerCount('close')).toBe(baselineCloseListeners)
+      expect(timers.pending.size).toBe(0)
+      expect(sink.writableEnded).toBe(false)
+      expect(sink.destroyed).toBe(false)
+    },
+  )
 
   it.each(['request error', 'response error', 'response aborted'] as const)(
     'sanitizes %s without leaking the URL, host, or underlying message',

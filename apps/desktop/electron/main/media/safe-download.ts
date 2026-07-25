@@ -529,9 +529,30 @@ export class SafeMediaDownloader {
       let waitingForDrain = false
       let byteSize = 0
       let pendingWrites = 0
+      let destinationWriteGuardInstalled = false
+      let writeCallbackErrorObserved = false
+      let writeErrorEventObserved = false
       let declaredContentLength: number | undefined
       let responseContentType: string | undefined
 
+      const releaseDestinationWriteGuardIfSettled = () => {
+        if (
+          !destinationWriteGuardInstalled
+          || pendingWrites !== 0
+          || (writeCallbackErrorObserved && !writeErrorEventObserved)
+        ) return
+        destination.removeListener('error', onPendingDestinationError)
+        destinationWriteGuardInstalled = false
+        writeCallbackErrorObserved = false
+        writeErrorEventObserved = false
+      }
+      const retainDestinationWriteGuard = () => {
+        if (destinationWriteGuardInstalled) return
+        destinationWriteGuardInstalled = true
+        writeCallbackErrorObserved = false
+        writeErrorEventObserved = false
+        destination.on('error', onPendingDestinationError)
+      }
       const clearConnectTimer = () => {
         if (connectTimer !== undefined) this.dependencies.clearTimer(connectTimer)
         connectTimer = undefined
@@ -555,6 +576,7 @@ export class SafeMediaDownloader {
           response.removeListener('close', onResponseClose)
         }
         destination.removeListener('drain', onDrain)
+        releaseDestinationWriteGuardIfSettled()
         context.abortCurrent = undefined
       }
       const cancelOwnedStreams = () => {
@@ -573,6 +595,11 @@ export class SafeMediaDownloader {
         settled = true
         cleanup()
         resolve(result)
+      }
+      function onPendingDestinationError(): void {
+        writeErrorEventObserved = true
+        fail()
+        releaseDestinationWriteGuardIfSettled()
       }
       const cancelResponse = () => {
         if (response && !response.destroyed) response.destroy()
@@ -634,13 +661,17 @@ export class SafeMediaDownloader {
         }
         byteSize += bytes.byteLength
         pendingWrites += 1
+        retainDestinationWriteGuard()
         try {
           const accepted = destination.write(bytes, (error?: Error | null) => {
-            if (settled) return
             pendingWrites -= 1
-            // Node Writable emits the same asynchronous write error. Keep the
-            // destination error listener installed until that event arrives.
-            if (!error) completeBody()
+            if (error) {
+              writeCallbackErrorObserved = true
+              fail()
+            } else if (!settled) {
+              completeBody()
+            }
+            releaseDestinationWriteGuardIfSettled()
           })
           if (accepted === false) {
             waitingForDrain = true
@@ -650,6 +681,7 @@ export class SafeMediaDownloader {
         } catch {
           pendingWrites -= 1
           fail()
+          releaseDestinationWriteGuardIfSettled()
         }
       }
       const onEnd = () => {
