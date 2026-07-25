@@ -628,6 +628,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
 
   return {
     services,
+    mediaAssets: {
+      resolveReadyAsset: media.resolveReadyAsset,
+    },
     recover: async () => {
       database.recoverInterrupted()
       await removeInterruptedRuntimeDirectories(options.paths.temporary)

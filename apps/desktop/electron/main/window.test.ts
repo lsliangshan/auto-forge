@@ -1,11 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { createSecureWindow, type BrowserWindowConstructor } from './window.js'
+import {
+  createSecureWindow,
+  installMediaProtocolRequestGuard,
+  type BrowserWindowConstructor,
+} from './window.js'
 
 class FakeBrowserWindow {
   static last: FakeBrowserWindow | undefined
   readonly webContents = {
+    id: 7,
+    isDestroyed: vi.fn(() => false),
     on: vi.fn((name: string, listener: (...args: unknown[]) => void) => { this.webContentsListeners.set(name, listener) }),
     setWindowOpenHandler: vi.fn((listener: (details: { url: string }) => unknown) => { this.openHandler = listener }),
   }
@@ -109,5 +115,54 @@ describe('createSecureWindow', () => {
       beforeLoad: async () => { order.push('register') },
     })
     expect(order).toEqual(['register', 'load'])
+  })
+
+  it('allows only the live main window to request autoforge media', () => {
+    let listener: ((details: { webContentsId?: number }, callback: (result: { cancel: boolean }) => void) => void) | undefined
+    const session = {
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: {
+        onBeforeRequest: vi.fn((_filter, callback) => { listener = callback }),
+      },
+    }
+    let main: { isDestroyed(): boolean; webContents: { id: number; isDestroyed(): boolean } } | null = {
+      isDestroyed: () => false,
+      webContents: { id: 7, isDestroyed: () => false },
+    }
+
+    installMediaProtocolRequestGuard(session, () => main)
+    const decide = (webContentsId?: number) => {
+      const callback = vi.fn()
+      listener!({ webContentsId }, callback)
+      return callback.mock.calls[0]![0]
+    }
+
+    expect(session.webRequest.onBeforeRequest).toHaveBeenCalledWith(
+      { urls: ['autoforge-media://*/*'] }, expect.any(Function),
+    )
+    expect(decide(7)).toEqual({ cancel: false })
+    expect(decide(8)).toEqual({ cancel: true })
+    main = { isDestroyed: () => true, webContents: { id: 7, isDestroyed: () => false } }
+    expect(decide(7)).toEqual({ cancel: true })
+    main = null
+    expect(decide(7)).toEqual({ cancel: true })
+  })
+
+  it('updates a shared session guard without registering duplicate listeners', () => {
+    let listener: ((details: { webContentsId?: number }, callback: (result: { cancel: boolean }) => void) => void) | undefined
+    const session = {
+      setPermissionRequestHandler: vi.fn(),
+      webRequest: { onBeforeRequest: vi.fn((_filter, callback) => { listener = callback }) },
+    }
+    const destroyed = { isDestroyed: () => true, webContents: { id: 7, isDestroyed: () => false } }
+    const replacement = { isDestroyed: () => false, webContents: { id: 9, isDestroyed: () => false } }
+
+    installMediaProtocolRequestGuard(session, () => destroyed)
+    installMediaProtocolRequestGuard(session, () => replacement)
+    const callback = vi.fn()
+    listener!({ webContentsId: 9 }, callback)
+
+    expect(session.webRequest.onBeforeRequest).toHaveBeenCalledTimes(1)
+    expect(callback).toHaveBeenCalledWith({ cancel: false })
   })
 })
