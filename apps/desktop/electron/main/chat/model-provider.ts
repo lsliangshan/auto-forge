@@ -5,6 +5,14 @@ import { toSafeAppError, type AppError, type ModelInfo } from '@autoforge/shared
 const MAX_ATTEMPTS = 4
 const MAX_RETRY_AFTER_MS = 5_000
 const MAX_DIAGNOSTIC_BODY = 1_024
+const MAX_MODEL_CATALOG_BODY = 4 * 1024 * 1024
+const MAX_MODELS = 5_000
+const MAX_MODEL_PARAMETERS = 256
+const MAX_MODALITIES = 16
+const MAX_CAPABILITY_VALUES = 64
+const MAX_MODEL_ID_LENGTH = 256
+const MAX_MODEL_NAME_LENGTH = 512
+const MAX_CAPABILITY_VALUE_LENGTH = 128
 
 export type ModelMessage =
   | { role: 'system' | 'user'; content: string }
@@ -47,6 +55,11 @@ export interface OpenAiCompatibleProviderConfig {
   chatEndpoint: string
   modelsEndpoint: string
   parseModels(value: unknown): ModelInfo[]
+  optionalModelCatalogs?: ReadonlyArray<{
+    endpoint: string
+    parse(value: unknown): ModelInfo[]
+  }>
+  mergeModels?(general: ModelInfo[], optional: ModelInfo[][]): ModelInfo[]
   includeUsageStreamOption: boolean
 }
 
@@ -66,17 +79,66 @@ const providerErrorSchema = z.object({
 }).passthrough()
 
 const modelResponseSchema = z.object({
-  data: z.array(z.object({
-    id: z.string().min(1),
-    name: z.string().min(1),
-    supported_parameters: z.array(z.string()).optional(),
-    architecture: z.object({
-      input_modalities: z.array(z.string()).optional(),
-      output_modalities: z.array(z.string()).optional(),
-    }).passthrough().optional(),
-    context_length: z.number().int().nonnegative().optional(),
-    pricing: z.object({ prompt: z.string().optional(), completion: z.string().optional() }).passthrough().optional(),
-  }).passthrough()),
+  data: z.array(z.unknown()).max(MAX_MODELS),
+}).passthrough()
+
+const boundedModelIdSchema = z.string().trim().min(1).max(MAX_MODEL_ID_LENGTH)
+const boundedModelNameSchema = z.string().trim().min(1).max(MAX_MODEL_NAME_LENGTH)
+const boundedCapabilityValueSchema = z.string().trim().min(1).max(MAX_CAPABILITY_VALUE_LENGTH)
+const modelModalitySchema = z.enum(['text', 'image', 'audio', 'video'])
+const capabilityDescriptorSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('enum'),
+    values: z.array(z.union([
+      boundedCapabilityValueSchema,
+      z.number().safe(),
+      z.boolean(),
+    ])).max(MAX_CAPABILITY_VALUES),
+  }).passthrough(),
+  z.object({
+    type: z.literal('range'),
+    min: z.number().safe(),
+    max: z.number().safe(),
+  }).passthrough(),
+  z.object({ type: z.literal('boolean') }).passthrough(),
+])
+const generalModelSchema = z.object({
+  id: boundedModelIdSchema,
+  name: boundedModelNameSchema,
+  supported_parameters: z.array(boundedCapabilityValueSchema).max(MAX_MODEL_PARAMETERS).optional(),
+  architecture: z.object({
+    input_modalities: z.array(z.unknown()).max(MAX_MODALITIES).optional(),
+    output_modalities: z.array(z.unknown()).max(MAX_MODALITIES).optional(),
+  }).passthrough().optional(),
+  context_length: z.number().int().nonnegative().safe().optional(),
+  pricing: z.object({
+    prompt: z.string().max(64).optional(),
+    completion: z.string().max(64).optional(),
+  }).passthrough().optional(),
+}).passthrough()
+
+const imageCapabilityModelSchema = z.object({
+  id: boundedModelIdSchema,
+  name: boundedModelNameSchema,
+  architecture: z.object({
+    input_modalities: z.array(z.unknown()).max(MAX_MODALITIES).optional(),
+    output_modalities: z.array(z.unknown()).max(MAX_MODALITIES).optional(),
+  }).passthrough().optional(),
+  supported_parameters: z.object({
+    resolution: z.unknown().optional(),
+    aspect_ratio: z.unknown().optional(),
+    output_format: z.unknown().optional(),
+    n: z.unknown().optional(),
+  }).passthrough().optional(),
+}).passthrough()
+
+const videoCapabilityModelSchema = z.object({
+  id: boundedModelIdSchema,
+  name: boundedModelNameSchema,
+  supported_resolutions: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
+  supported_aspect_ratios: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
+  supported_durations: z.array(z.number().int().positive().max(3_600)).max(MAX_CAPABILITY_VALUES).optional(),
+  allowed_passthrough_parameters: z.array(boundedCapabilityValueSchema).max(MAX_MODEL_PARAMETERS).optional(),
 }).passthrough()
 
 const streamChunkSchema = z.object({
@@ -167,6 +229,32 @@ async function boundedResponseText(response: Response): Promise<string> {
   }
 }
 
+async function boundedResponseJson(response: Response): Promise<unknown> {
+  const declaredLength = response.headers.get('content-length')
+  if (declaredLength && Number(declaredLength) > MAX_MODEL_CATALOG_BODY) {
+    throw new Error('Model catalog response exceeded the size limit')
+  }
+  if (!response.body) throw new Error('Model catalog response had no body')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let total = 0
+  let output = ''
+  try {
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      total += chunk.value.byteLength
+      if (total > MAX_MODEL_CATALOG_BODY) throw new Error('Model catalog response exceeded the size limit')
+      output += decoder.decode(chunk.value, { stream: true })
+    }
+    output += decoder.decode()
+    return JSON.parse(output) as unknown
+  } finally {
+    await reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+  }
+}
+
 type ProviderError = z.infer<typeof providerErrorSchema>
 
 function safeMetadataValue(value: unknown): string | number | undefined {
@@ -206,26 +294,201 @@ function millionPrice(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed * 1_000_000 : undefined
 }
 
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function sortedUniqueStrings(values: unknown[] | undefined): string[] {
+  const valid = values?.flatMap((value) => {
+    const parsed = boundedCapabilityValueSchema.safeParse(value)
+    return parsed.success ? [parsed.data] : []
+  }) ?? []
+  return [...new Set(valid)].sort(compareStrings)
+}
+
+function sortedModalities(values: unknown[] | undefined): Array<'text' | 'image' | 'audio' | 'video'> {
+  const order = ['text', 'image', 'audio', 'video'] as const
+  const included = new Set(values?.flatMap((value) => {
+    const parsed = modelModalitySchema.safeParse(value)
+    return parsed.success ? [parsed.data] : []
+  }) ?? [])
+  return order.filter((modality) => included.has(modality))
+}
+
+function mergeModalities(
+  ...values: Array<ReadonlyArray<'text' | 'image' | 'audio' | 'video'>>
+): Array<'text' | 'image' | 'audio' | 'video'> {
+  return sortedModalities(values.flat())
+}
+
+function generationForOutputs(outputModalities: ModelInfo['outputModalities']): ModelInfo['generation'] {
+  return {
+    ...(outputModalities.includes('image')
+      ? { image: { resolutions: [], aspectRatios: [], formats: [], maxCount: 1 } }
+      : {}),
+    ...(outputModalities.includes('audio')
+      ? { audio: { voices: [], formats: [] } }
+      : {}),
+    ...(outputModalities.includes('video')
+      ? { video: { resolutions: [], aspectRatios: [], durations: [], supportsAudio: false } }
+      : {}),
+  }
+}
+
 export function parseOpenRouterModels(value: unknown): ModelInfo[] {
   const parsed = modelResponseSchema.parse(value)
-  return parsed.data
-    .filter((model) => model.supported_parameters?.includes('tools') === true
-      && model.architecture?.input_modalities?.includes('text') === true
-      && model.architecture.output_modalities?.includes('text') === true)
-    .map((model) => {
-      const inputCostPerMillion = millionPrice(model.pricing?.prompt)
-      const outputCostPerMillion = millionPrice(model.pricing?.completion)
-      return {
-        id: model.id,
-        name: model.name,
-        ...(model.context_length === undefined || model.context_length === 0
-          ? {}
-          : { contextLength: model.context_length }),
-        ...(inputCostPerMillion === undefined ? {} : { inputCostPerMillion }),
-        ...(outputCostPerMillion === undefined ? {} : { outputCostPerMillion }),
-      }
+  const byId = new Map<string, ModelInfo>()
+  for (const entry of parsed.data) {
+    const result = generalModelSchema.safeParse(entry)
+    if (!result.success) continue
+    const model = result.data
+    const inputModalities = sortedModalities(model.architecture?.input_modalities)
+    const outputModalities = sortedModalities(model.architecture?.output_modalities)
+    const existing = byId.get(model.id)
+    if (existing) {
+      const mergedOutputs = mergeModalities(existing.outputModalities, outputModalities)
+      byId.set(model.id, {
+        ...existing,
+        inputModalities: mergeModalities(existing.inputModalities, inputModalities),
+        outputModalities: mergedOutputs,
+        supportsTools: existing.supportsTools || model.supported_parameters?.includes('tools') === true,
+        generation: generationForOutputs(mergedOutputs),
+      })
+      continue
+    }
+    const inputCostPerMillion = millionPrice(model.pricing?.prompt)
+    const outputCostPerMillion = millionPrice(model.pricing?.completion)
+    byId.set(model.id, {
+      id: model.id,
+      name: model.name,
+      ...(model.context_length === undefined || model.context_length === 0
+        ? {}
+        : { contextLength: model.context_length }),
+      ...(inputCostPerMillion === undefined ? {} : { inputCostPerMillion }),
+      ...(outputCostPerMillion === undefined ? {} : { outputCostPerMillion }),
+      inputModalities,
+      outputModalities,
+      supportsTools: model.supported_parameters?.includes('tools') === true,
+      generation: generationForOutputs(outputModalities),
     })
-    .sort((left, right) => left.id.localeCompare(right.id))
+  }
+  return [...byId.values()].sort((left, right) => compareStrings(left.id, right.id))
+}
+
+function enumDescriptorValues(value: unknown): string[] {
+  const parsed = capabilityDescriptorSchema.safeParse(value)
+  return parsed.success && parsed.data.type === 'enum'
+    ? sortedUniqueStrings(parsed.data.values)
+    : []
+}
+
+function maxImageCount(value: unknown): number {
+  const parsed = capabilityDescriptorSchema.safeParse(value)
+  if (!parsed.success) return 1
+  if (
+    parsed.data.type === 'range'
+    && Number.isSafeInteger(parsed.data.min)
+    && Number.isSafeInteger(parsed.data.max)
+    && parsed.data.min > 0
+    && parsed.data.max >= parsed.data.min
+    && parsed.data.max <= 100
+  ) return parsed.data.max
+  if (parsed.data.type !== 'enum') return 1
+  const values = parsed.data.values.flatMap((candidate) => (
+    typeof candidate === 'number'
+    && Number.isSafeInteger(candidate)
+    && candidate > 0
+    && candidate <= 100
+      ? [candidate]
+      : []
+  ))
+  return values.length ? Math.max(...values) : 1
+}
+
+export function parseOpenRouterImageModels(value: unknown): ModelInfo[] {
+  const parsed = modelResponseSchema.parse(value)
+  const byId = new Map<string, ModelInfo>()
+  for (const entry of parsed.data) {
+    const result = imageCapabilityModelSchema.safeParse(entry)
+    if (!result.success || byId.has(result.data.id)) continue
+    const model = result.data
+    const inputModalities = sortedModalities(model.architecture?.input_modalities)
+    const outputModalities = mergeModalities(
+      sortedModalities(model.architecture?.output_modalities),
+      ['image'],
+    )
+    byId.set(model.id, {
+      id: model.id,
+      name: model.name,
+      inputModalities,
+      outputModalities,
+      supportsTools: false,
+      generation: {
+        image: {
+          resolutions: enumDescriptorValues(model.supported_parameters?.resolution),
+          aspectRatios: enumDescriptorValues(model.supported_parameters?.aspect_ratio),
+          formats: enumDescriptorValues(model.supported_parameters?.output_format),
+          maxCount: maxImageCount(model.supported_parameters?.n),
+        },
+      },
+    })
+  }
+  return [...byId.values()].sort((left, right) => compareStrings(left.id, right.id))
+}
+
+function sortedPositiveIntegers(values: unknown[] | undefined): number[] {
+  const valid = values?.flatMap((value) => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 3_600
+      ? [value]
+      : []
+  )) ?? []
+  return [...new Set(valid)].sort((left, right) => left - right)
+}
+
+export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
+  const parsed = modelResponseSchema.parse(value)
+  const byId = new Map<string, ModelInfo>()
+  for (const entry of parsed.data) {
+    const result = videoCapabilityModelSchema.safeParse(entry)
+    if (!result.success || byId.has(result.data.id)) continue
+    const model = result.data
+    byId.set(model.id, {
+      id: model.id,
+      name: model.name,
+      inputModalities: [],
+      outputModalities: ['video'],
+      supportsTools: false,
+      generation: {
+        video: {
+          resolutions: sortedUniqueStrings(model.supported_resolutions),
+          aspectRatios: sortedUniqueStrings(model.supported_aspect_ratios),
+          durations: sortedPositiveIntegers(model.supported_durations),
+          supportsAudio: model.allowed_passthrough_parameters?.includes('generate_audio') === true,
+        },
+      },
+    })
+  }
+  return [...byId.values()].sort((left, right) => compareStrings(left.id, right.id))
+}
+
+export function mergeOpenRouterModels(general: ModelInfo[], optional: ModelInfo[][]): ModelInfo[] {
+  const byId = new Map(general.map((model) => [model.id, model]))
+  for (const catalog of optional) {
+    for (const dedicated of catalog) {
+      const base = byId.get(dedicated.id)
+      if (!base) continue
+      byId.set(base.id, {
+        ...base,
+        inputModalities: mergeModalities(base.inputModalities, dedicated.inputModalities),
+        outputModalities: mergeModalities(base.outputModalities, dedicated.outputModalities),
+        generation: {
+          ...base.generation,
+          ...dedicated.generation,
+        },
+      })
+    }
+  }
+  return [...byId.values()].sort((left, right) => compareStrings(left.id, right.id))
 }
 
 interface ToolAccumulator {
@@ -259,11 +522,25 @@ export class OpenAiCompatibleProvider implements ModelProvider {
   async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     const { response } = await this.fetchModels(signal)
     if (!response.ok) await this.throwHttpFailure('models', response)
+    let general: ModelInfo[]
     try {
-      return this.config.parseModels(await response.json())
+      general = this.config.parseModels(await boundedResponseJson(response))
     } catch {
       throw failure('MODEL_PROVIDER_REQUEST_FAILED')
     }
+    if (!this.config.optionalModelCatalogs?.length) return general
+    const results = await Promise.allSettled(this.config.optionalModelCatalogs.map(async (catalog) => {
+      const { response: optionalResponse } = await this.fetchModels(signal, catalog.endpoint)
+      if (!optionalResponse.ok) await this.throwHttpFailure('models', optionalResponse)
+      return catalog.parse(await boundedResponseJson(optionalResponse))
+    }))
+    if (signal?.aborted) throw failure('CANCELLED')
+    const optional = results.flatMap((result) => {
+      if (result.status === 'fulfilled') return [result.value]
+      this.reportModelDiscoveryFailure()
+      return []
+    })
+    return this.config.mergeModels?.(general, optional) ?? general
   }
 
   async validateCredential(signal?: AbortSignal): Promise<{ valid: boolean }> {
@@ -271,7 +548,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
       const { response } = await this.fetchModels(signal)
       if (response.status === 401) return { valid: false }
       if (!response.ok) await this.throwHttpFailure('models', response)
-      this.config.parseModels(await response.json())
+      this.config.parseModels(await boundedResponseJson(response))
       return { valid: true }
     } catch (error) {
       if (isAbort(error, signal)) throw failure('CANCELLED')
@@ -338,12 +615,15 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     }
   }
 
-  private async fetchModels(signal?: AbortSignal): Promise<{ response: Response; secret: string }> {
+  private async fetchModels(
+    signal?: AbortSignal,
+    endpoint = this.config.modelsEndpoint,
+  ): Promise<{ response: Response; secret: string }> {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const secret = await this.secret()
       let response: Response
       try {
-        response = await this.fetch(this.config.modelsEndpoint, { headers: { authorization: `Bearer ${secret}` }, signal })
+        response = await this.fetch(endpoint, { headers: { authorization: `Bearer ${secret}` }, signal })
       } catch (error) {
         if (isAbort(error, signal)) throw failure('CANCELLED')
         if (!(error instanceof TypeError) || attempt === MAX_ATTEMPTS - 1) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
@@ -401,6 +681,11 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     }
     if (!this.dependencies.diagnostic) return
     try { this.dependencies.diagnostic({ operation, status: response.status, ...metadata }) } catch { /* diagnostics are observational */ }
+  }
+
+  private reportModelDiscoveryFailure(): void {
+    if (!this.dependencies.diagnostic) return
+    try { this.dependencies.diagnostic({ operation: 'models' }) } catch { /* diagnostics are observational */ }
   }
 
   private async *parseStream(response: Response, replay: ReplayState, signal?: AbortSignal): AsyncGenerator<ModelStreamEvent> {

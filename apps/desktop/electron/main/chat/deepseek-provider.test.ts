@@ -34,8 +34,22 @@ describe('DeepSeekProvider', () => {
     const provider = new DeepSeekProvider({ credential, fetch })
 
     await expect(provider.listModels()).resolves.toEqual([
-      { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' },
-      { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro' },
+      {
+        id: 'deepseek-v4-flash',
+        name: 'deepseek-v4-flash',
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsTools: true,
+        generation: {},
+      },
+      {
+        id: 'deepseek-v4-pro',
+        name: 'deepseek-v4-pro',
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsTools: true,
+        generation: {},
+      },
     ])
     expect(fetch.mock.calls[0]?.[0]).toBe('https://api.deepseek.com/models')
     expect(credential.get).toHaveBeenCalledWith('deepseek_api_key')

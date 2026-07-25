@@ -1,6 +1,9 @@
 import {
+  mergeOpenRouterModels,
   OpenAiCompatibleProvider,
+  parseOpenRouterImageModels,
   parseOpenRouterModels,
+  parseOpenRouterVideoModels,
   type ModelMessage,
   type ModelStreamEvent,
   type ModelStreamRequest,
@@ -9,7 +12,9 @@ import {
 } from './model-provider.js'
 
 const CHAT_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
-const MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/models?supported_parameters=tools'
+const MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/models'
+const IMAGE_MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/images/models'
+const VIDEO_MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/videos/models'
 
 export type OpenRouterMessage = ModelMessage
 export type OpenRouterTool = ModelTool
@@ -30,6 +35,11 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       chatEndpoint: CHAT_ENDPOINT,
       modelsEndpoint: MODELS_ENDPOINT,
       parseModels: parseOpenRouterModels,
+      optionalModelCatalogs: [
+        { endpoint: IMAGE_MODELS_ENDPOINT, parse: parseOpenRouterImageModels },
+        { endpoint: VIDEO_MODELS_ENDPOINT, parse: parseOpenRouterVideoModels },
+      ],
+      mergeModels: mergeOpenRouterModels,
       includeUsageStreamOption: true,
     }, {
       ...dependencies,
