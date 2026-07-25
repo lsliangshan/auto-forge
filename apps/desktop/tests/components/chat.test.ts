@@ -141,6 +141,7 @@ describe('chat interactions', () => {
     const { api, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
     store.ensureSubscriptions()
     store.ensureSubscriptions()
     expect(api.chat.onEvent).toHaveBeenCalledTimes(1)
@@ -210,6 +211,7 @@ describe('chat interactions', () => {
     const { api, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
     store.ensureSubscriptions()
 
     emitChat({
@@ -227,6 +229,7 @@ describe('chat interactions', () => {
     const { api, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
     store.ensureSubscriptions()
 
     emitChat({
@@ -259,7 +262,16 @@ describe('chat interactions', () => {
   })
 
   it('trims composer input, honors IME, and uses Shift+Enter for a newline', async () => {
-    const wrapper = mount(ChatComposer, { props: { disabled: false, running: false }, global: { plugins: [ElementPlus] } })
+    useChatStore().selectedConversationId = 'conversation_1'
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
     const textarea = wrapper.get('textarea')
     await textarea.setValue('  查询天气  ')
     await textarea.trigger('compositionstart')
@@ -269,12 +281,13 @@ describe('chat interactions', () => {
     await textarea.trigger('keydown', { key: 'Enter', shiftKey: true })
     expect(wrapper.emitted('submit')).toBeUndefined()
     await textarea.trigger('keydown', { key: 'Enter' })
-    expect(wrapper.emitted('submit')?.[0]).toEqual([{
+    expect(wrapper.emitted('submit')?.[0]?.[0]).toEqual({
       content: '查询天气',
       assetIds: [],
       outputType: 'auto',
       generation: generationPreferences().generation,
-    }])
+      model: 'text/model',
+    })
   })
 
   it('keeps running input and blocks Enter submission at the submit layer', async () => {
@@ -397,18 +410,22 @@ describe('chat interactions', () => {
     await wrapper.get('[data-testid="chat-composer"]').trigger('drop', {
       dataTransfer: { files: [droppedFile] },
     })
-    expect(api.media.importDroppedFiles).toHaveBeenCalledWith({
-      conversationId: 'conversation_1',
-      existingAssetIds: ['picked'],
-    }, [droppedFile])
+    await vi.waitFor(() => {
+      expect(api.media.importDroppedFiles).toHaveBeenCalledWith({
+        conversationId: 'conversation_1',
+        existingAssetIds: ['picked'],
+      }, [droppedFile])
+    })
 
     const getAsFile = vi.fn()
     await wrapper.get('textarea').trigger('paste', {
       clipboardData: { items: [{ type: 'image/png', getAsFile }] },
     })
-    expect(api.media.importClipboardImage).toHaveBeenCalledWith({
-      conversationId: 'conversation_1',
-      existingAssetIds: ['picked', 'dropped'],
+    await vi.waitFor(() => {
+      expect(api.media.importClipboardImage).toHaveBeenCalledWith({
+        conversationId: 'conversation_1',
+        existingAssetIds: ['picked', 'dropped'],
+      })
     })
     expect(getAsFile).not.toHaveBeenCalled()
     expect(store.drafts.map(({ id }) => id)).toEqual(['picked', 'dropped', 'pasted'])
@@ -433,9 +450,11 @@ describe('chat interactions', () => {
     expect(api.media.pickFiles).toHaveBeenCalledTimes(1)
 
     await wrapper.get('[data-testid="remove-draft-1"]').trigger('click')
-    expect(api.media.removeDraft).toHaveBeenCalledWith({
-      conversationId: 'conversation_1',
-      assetId: '1',
+    await vi.waitFor(() => {
+      expect(api.media.removeDraft).toHaveBeenCalledWith({
+        conversationId: 'conversation_1',
+        assetId: '1',
+      })
     })
     expect(store.drafts.map(({ id }) => id)).toEqual(['2', '3', '4', '5'])
   })
@@ -517,18 +536,23 @@ describe('chat interactions', () => {
       models: { text: 'text/model' },
     })
     const wrapper = mount(ChatComposer, {
-      props: { disabled: false, running: false, models: [modelInfo('text/model', ['text'])], defaultModel: '' },
+      props: {
+        disabled: false,
+        running: false,
+        models: [modelInfo('text/model', ['text']), modelInfo('image/model', ['image'])],
+        defaultModel: '',
+      },
       global: { plugins: [ElementPlus] },
     })
 
     await wrapper.get('form').trigger('submit')
-    expect(wrapper.emitted('submit')?.[0]).toEqual([{
+    expect(wrapper.emitted('submit')?.[0]?.[0]).toEqual({
       content: '',
       assetIds: ['asset_1'],
       outputType: 'text',
       generation: generationPreferences().generation,
       model: 'text/model',
-    }])
+    })
 
     await wrapper.get('[data-testid="output-type"]').setValue('image')
     await vi.waitFor(() => expect(store.preferences.outputType).toBe('image'))
@@ -567,5 +591,352 @@ describe('chat interactions', () => {
     expect(isProxy(sent)).toBe(false)
     expect(isProxy(sent?.generation)).toBe(false)
     expect(isProxy(sent?.generation.video)).toBe(false)
+  })
+
+  it('serializes imports so concurrent fifth and sixth attachments use current admission state', async () => {
+    const { api } = createEventApi()
+    let resolvePick!: (assets: MediaAsset[]) => void
+    vi.mocked(api.media.pickFiles).mockReturnValue(new Promise((resolve) => { resolvePick = resolve }))
+    vi.mocked(api.media.importClipboardImage).mockResolvedValue([mediaAsset('6')])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = ['1', '2', '3', '4'].map((id) => mediaAsset(id))
+
+    const fifth = store.pickDraftFiles()
+    const sixth = store.importClipboardDraft()
+    await vi.waitFor(() => expect(api.media.pickFiles).toHaveBeenCalledWith({
+      conversationId: 'conversation_1',
+      existingAssetIds: ['1', '2', '3', '4'],
+    }))
+    expect(api.media.importClipboardImage).not.toHaveBeenCalled()
+
+    resolvePick([mediaAsset('5')])
+    await Promise.all([fifth, sixth])
+
+    expect(store.drafts.map(({ id }) => id)).toEqual(['1', '2', '3', '4', '5'])
+    expect(api.media.importClipboardImage).not.toHaveBeenCalled()
+  })
+
+  it('rolls back every unexpected overflow asset returned by Main instead of hiding orphans', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.media.pickFiles).mockResolvedValue([mediaAsset('5'), mediaAsset('6')])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = ['1', '2', '3', '4'].map((id) => mediaAsset(id))
+
+    await store.pickDraftFiles()
+
+    expect(api.media.removeDraft).toHaveBeenCalledWith({
+      conversationId: 'conversation_1',
+      assetId: '5',
+    })
+    expect(api.media.removeDraft).toHaveBeenCalledWith({
+      conversationId: 'conversation_1',
+      assetId: '6',
+    })
+    expect(store.drafts.map(({ id }) => id)).toEqual(['1', '2', '3', '4'])
+    expect(store.error).toContain('已拒绝本次导入')
+  })
+
+  it('keeps late import, remove, send, and status failures out of the newly selected conversation', async () => {
+    const { api, emitChat } = createEventApi()
+    let rejectPick!: (error: Error) => void
+    let rejectRemove!: (error: Error) => void
+    let rejectSend!: (error: Error) => void
+    vi.mocked(api.media.pickFiles).mockReturnValue(new Promise((_resolve, reject) => { rejectPick = reject }))
+    vi.mocked(api.media.removeDraft).mockReturnValue(new Promise((_resolve, reject) => { rejectRemove = reject }))
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((_resolve, reject) => { rejectSend = reject }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = [mediaAsset('asset_1')]
+    store.ensureSubscriptions()
+
+    const importing = store.pickDraftFiles()
+    await vi.waitFor(() => expect(api.media.pickFiles).toHaveBeenCalled())
+    store.selectedConversationId = 'conversation_2'
+    rejectPick(new Error('late import'))
+    await importing
+    expect(store.error).toBe('')
+
+    store.selectedConversationId = 'conversation_1'
+    const removing = store.removeDraft('asset_1')
+    await vi.waitFor(() => expect(api.media.removeDraft).toHaveBeenCalled())
+    store.selectedConversationId = 'conversation_2'
+    rejectRemove(new Error('late remove'))
+    await removing
+    expect(store.error).toBe('')
+
+    store.selectedConversationId = 'conversation_1'
+    const sending = store.send({
+      content: '保留',
+      assetIds: ['asset_1'],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+      model: 'text/model',
+    })
+    await vi.waitFor(() => expect(api.chat.send).toHaveBeenCalled())
+    store.selectedConversationId = 'conversation_2'
+    rejectSend(new Error('late send'))
+    await sending
+    expect(store.error).toBe('')
+
+    emitChat({
+      type: 'status',
+      conversationId: 'conversation_1',
+      requestId: 'late_status',
+      status: 'failed',
+      error: { code: 'MODEL_PROVIDER_REQUEST_FAILED', message: 'late' },
+    })
+    expect(store.error).toBe('')
+  })
+
+  it('keeps composer text and drafts until Main accepts, and rolls back only the rejected optimistic message', async () => {
+    const { api } = createEventApi()
+    let rejectFirst!: (error: Error) => void
+    vi.mocked(api.chat.send).mockReturnValueOnce(new Promise((_resolve, reject) => { rejectFirst = reject }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = [mediaAsset('asset_1')]
+    store.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'text',
+      models: { text: 'text/model' },
+    })
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+        onSubmit: async (input, acknowledge) => { acknowledge(await store.send(input)) },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    const textarea = wrapper.get('textarea')
+
+    await textarea.setValue('不能丢失')
+    await wrapper.get('form').trigger('submit')
+    await vi.waitFor(() => expect(api.chat.send).toHaveBeenCalledTimes(1))
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('不能丢失')
+    expect(store.messagesByConversation.conversation_1).toHaveLength(1)
+
+    rejectFirst(new Error('rejected'))
+    await vi.waitFor(() => expect(store.messagesByConversation.conversation_1).toEqual([]))
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('不能丢失')
+    expect(store.drafts.map(({ id }) => id)).toEqual(['asset_1'])
+
+    vi.mocked(api.chat.send).mockResolvedValueOnce({ requestId: 'accepted' })
+    await wrapper.get('form').trigger('submit')
+    await vi.waitFor(() => expect(api.chat.send).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect((textarea.element as HTMLTextAreaElement).value).toBe(''))
+    expect(store.drafts).toEqual([])
+  })
+
+  it('keeps pending send acknowledgement isolated to its captured conversation', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_a'
+    store.preferencesByConversation.conversation_a = generationPreferences({ outputType: 'text' })
+    store.preferencesByConversation.conversation_b = generationPreferences({ outputType: 'text' })
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('textarea').setValue('会话 A')
+    await wrapper.get('form').trigger('submit')
+    const acknowledgeA = wrapper.emitted('submit')?.[0]?.[1] as ((accepted: boolean) => void)
+
+    store.selectedConversationId = 'conversation_b'
+    await wrapper.get('textarea').setValue('会话 B')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('form').trigger('submit')
+    expect(wrapper.emitted('submit')).toHaveLength(2)
+
+    acknowledgeA(true)
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('会话 B')
+  })
+
+  it('disables unsupported outputs and cannot send without a compatible model', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'image' })
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [modelInfo('deepseek/text', ['text'])],
+        defaultModel: 'deepseek/text',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('textarea').setValue('生成图片')
+    expect(wrapper.get('[data-testid="output-type"] option[value="image"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('form').trigger('submit')
+    expect(wrapper.emitted('submit')).toBeUndefined()
+  })
+
+  it('normalizes stale values on output and model changes but preserves unpublished empty capability lists', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'text',
+      generation: {
+        ...generationPreferences().generation,
+        image: { count: 1, resolution: '4K', aspectRatio: '9:16', format: 'jpg' },
+      },
+    })
+    const unrestricted = modelInfo('image/unrestricted', ['image'])
+    unrestricted.generation.image = { resolutions: [], aspectRatios: [], formats: [], maxCount: 1 }
+    const otherDefault = modelInfo('image/other-default', ['image'])
+    otherDefault.generation.image = {
+      resolutions: ['2K'],
+      aspectRatios: ['1:1'],
+      formats: ['webp'],
+      maxCount: 1,
+    }
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [
+          modelInfo('text/model', ['text']),
+          otherDefault,
+          modelInfo('image/restricted', ['image']),
+          unrestricted,
+        ],
+        defaultModel: 'text/model',
+        defaultModels: { text: 'text/model', image: 'image/restricted' },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('[data-testid="output-type"]').setValue('image')
+    await vi.waitFor(() => expect(store.preferences.outputType).toBe('image'))
+    expect(store.preferences.generation.image).toEqual({
+      count: 1,
+      resolution: '1K',
+      aspectRatio: 'auto',
+      format: 'png',
+    })
+
+    store.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'image',
+      models: { image: 'image/restricted' },
+      generation: {
+        ...generationPreferences().generation,
+        image: { count: 1, resolution: '4K', aspectRatio: '9:16', format: 'jpg' },
+      },
+    })
+    await wrapper.get('[data-testid="model-select"]').setValue('image/unrestricted')
+    await vi.waitFor(() => expect(store.preferences.models.image).toBe('image/unrestricted'))
+    expect(store.preferences.generation.image).toEqual({
+      count: 1,
+      resolution: '4K',
+      aspectRatio: '9:16',
+      format: 'jpg',
+    })
+  })
+
+  it('appends a full stable replacement when block update wins the message loading race', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveMessages!: (messages: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
+    vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const loading = store.selectConversation('conversation_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conversation_1'))
+
+    emitChat({
+      type: 'block_update',
+      conversationId: 'conversation_1',
+      messageId: 'assistant_1',
+      blockId: 'media_1',
+      block: {
+        type: 'media',
+        blockId: 'media_1',
+        assetId: 'asset_1',
+        kind: 'image',
+        purpose: 'output',
+        name: 'done.png',
+        mimeType: 'image/png',
+        byteSize: 100,
+      },
+    })
+    resolveMessages([{
+      id: 'assistant_1',
+      conversationId: 'conversation_1',
+      role: 'assistant',
+      blocks: [{
+        type: 'media_generation',
+        blockId: 'media_1',
+        jobId: 'job_1',
+        kind: 'image',
+        status: 'pending',
+      }],
+      createdAt: '2026-07-25T00:00:00.000Z',
+    }])
+    await loading
+
+    expect(store.messagesByConversation.conversation_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({
+        id: 'assistant_1:media_1',
+        type: 'media',
+        blockId: 'media_1',
+        assetId: 'asset_1',
+      }),
+    ])
+  })
+
+  it('blocks running media mutations and generation options while retaining textarea input', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = [mediaAsset('asset_1')]
+    store.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'video',
+      models: { video: 'video/model' },
+    })
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: true,
+        models: [modelInfo('video/model', ['video'])],
+        defaultModel: 'video/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    const droppedFile = new File(['image'], 'new.png', { type: 'image/png' })
+
+    await wrapper.get('[data-testid="attach-media"]').trigger('click')
+    await wrapper.get('[data-testid="chat-composer"]').trigger('drop', { dataTransfer: { files: [droppedFile] } })
+    await wrapper.get('textarea').trigger('paste', { clipboardData: { items: [{ type: 'image/png' }] } })
+    await wrapper.get('[data-testid="remove-draft-asset_1"]').trigger('click')
+    await wrapper.get('[data-testid="video-duration"]').setValue('10')
+    await wrapper.get('textarea').setValue('继续编辑')
+
+    expect(api.media.pickFiles).not.toHaveBeenCalled()
+    expect(api.media.importDroppedFiles).not.toHaveBeenCalled()
+    expect(api.media.importClipboardImage).not.toHaveBeenCalled()
+    expect(api.media.removeDraft).not.toHaveBeenCalled()
+    expect(api.chat.updateGenerationPreferences).not.toHaveBeenCalled()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('继续编辑')
   })
 })

@@ -61,7 +61,8 @@
         :running="chat.isRunning"
         :models="settings.models"
         :default-model="defaultModel"
-        @submit="chat.send($event)"
+        :default-models="defaultModels"
+        @submit="submit"
         @cancel="chat.cancelCurrent"
       />
     </template>
@@ -70,14 +71,22 @@
 
 <script setup lang="ts">
 import { ChatDotRound, Loading } from '@element-plus/icons-vue'
+import type { ChatSendInput, OutputType } from '@autoforge/shared'
 import { computed, onMounted } from 'vue'
 import ChatComposer from '../components/chat/ChatComposer.vue'
 import MessageBlock from '../components/chat/MessageBlock.vue'
-import { useChatStore } from '../stores/chat'
+import { useChatStore, type ChatSendAcknowledgement } from '../stores/chat'
 import { useSettingsStore } from '../stores/settings'
 
 const chat = useChatStore()
 const settings = useSettingsStore()
+type ConcreteOutput = Exclude<OutputType, 'auto'>
+const defaultModels = computed<Partial<Record<ConcreteOutput, string>>>(() => {
+  const defaults = settings.settings?.defaultModels
+  if (!defaults) return {}
+  if (settings.activeProvider === 'deepseek') return { text: defaults.deepseek.text }
+  return { ...defaults.openrouter }
+})
 const defaultModel = computed(() => {
   const defaults = settings.settings?.defaultModels
   if (!defaults) return ''
@@ -90,6 +99,12 @@ const defaultModel = computed(() => {
     ?? defaults.openrouter.video
     ?? ''
 })
+async function submit(
+  input: Omit<ChatSendInput, 'conversationId'>,
+  acknowledge: ChatSendAcknowledgement,
+) {
+  acknowledge(await chat.send(input))
+}
 onMounted(async () => {
   chat.ensureSubscriptions()
   if (!chat.conversations.length && !chat.loading) void chat.loadConversations()

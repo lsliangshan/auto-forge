@@ -14,12 +14,15 @@ import { displayError, getDesktopApi } from '../services/desktop-api'
 
 export type UiChatBlock = ChatBlock & { id: string }
 export interface UiChatMessage { id: string; role: 'user' | 'assistant'; blocks: UiChatBlock[] }
+export type ChatSendAcknowledgement = (accepted: boolean) => void
 
 interface ChatHub { listeners: Set<(event: ChatEvent) => void>; unsubscribe: () => void }
 const hubs = new WeakMap<DesktopAPI, ChatHub>()
 const storeReleases = new WeakMap<object, () => void>()
 const disposeWrapped = new WeakSet<object>()
 const preferenceQueues = new WeakMap<object, Map<string, Promise<void>>>()
+const mediaQueues = new WeakMap<object, Map<string, Promise<void>>>()
+let localMessageSequence = 0
 
 function defaultGenerationPreferences(): ConversationGenerationPreferences {
   return {
@@ -307,91 +310,147 @@ export const useChatStore = defineStore('chat', {
         if (queues.get(conversationId) === settled) queues.delete(conversationId)
       }
     },
-    async pickDraftFiles() {
-      const conversationId = this.selectedConversationId
-      const existing = this.draftsByConversation[conversationId] ?? []
-      if (!conversationId || existing.length >= 5) {
-        if (conversationId) this.error = '每条消息最多添加 5 个附件'
+    async queueMediaOperation(conversationId: string, operation: () => Promise<void>) {
+      let queues = mediaQueues.get(this)
+      if (!queues) {
+        queues = new Map()
+        mediaQueues.set(this, queues)
+      }
+      const previous = queues.get(conversationId) ?? Promise.resolve()
+      const queued = previous.catch(() => undefined).then(operation)
+      const settled = queued.catch(() => undefined)
+      queues.set(conversationId, settled)
+      try {
+        await queued
+      } finally {
+        if (queues.get(conversationId) === settled) queues.delete(conversationId)
+      }
+    },
+    reportConversationError(conversationId: string, epoch: number, message: string) {
+      if (epoch === this._stateEpoch && conversationId === this.selectedConversationId) {
+        this.error = message
+      }
+    },
+    async acceptImportedDrafts(
+      conversationId: string,
+      epoch: number,
+      assets: MediaAsset[],
+    ) {
+      const current = this.draftsByConversation[conversationId] ?? []
+      const currentIds = new Set(current.map(({ id }) => id))
+      const imported = assets.filter(({ id }, index) =>
+        !currentIds.has(id) && assets.findIndex((asset) => asset.id === id) === index)
+      if (epoch !== this._stateEpoch) {
+        await Promise.allSettled(imported.map(({ id }) =>
+          getDesktopApi().media.removeDraft({ conversationId, assetId: id })))
         return
       }
-      try {
-        const assets = await getDesktopApi().media.pickFiles({
-          conversationId,
-          existingAssetIds: existing.map(({ id }) => id),
-        })
-        this.addDrafts(conversationId, assets)
-      } catch (error) {
-        this.error = displayError(error, '附件导入失败')
+      if (current.length + imported.length <= 5) {
+        this.draftsByConversation[conversationId] = [...current, ...imported]
+        return
       }
+      const cleanup = await Promise.allSettled(imported.map(({ id }) =>
+        getDesktopApi().media.removeDraft({ conversationId, assetId: id })))
+      const visibleCleanupFailures = imported.filter((_, index) => cleanup[index]?.status === 'rejected')
+      if (visibleCleanupFailures.length) {
+        this.draftsByConversation[conversationId] = [...current, ...visibleCleanupFailures]
+      }
+      this.reportConversationError(conversationId, epoch, '附件导入结果超过 5 个，已拒绝本次导入')
+    },
+    async pickDraftFiles() {
+      const conversationId = this.selectedConversationId
+      const epoch = this._stateEpoch
+      if (!conversationId) return
+      await this.queueMediaOperation(conversationId, async () => {
+        if (epoch !== this._stateEpoch) return
+        const existing = this.draftsByConversation[conversationId] ?? []
+        if (existing.length >= 5) {
+          this.reportConversationError(conversationId, epoch, '每条消息最多添加 5 个附件')
+          return
+        }
+        try {
+          const assets = await getDesktopApi().media.pickFiles({
+            conversationId,
+            existingAssetIds: existing.map(({ id }) => id),
+          })
+          await this.acceptImportedDrafts(conversationId, epoch, assets)
+        } catch (error) {
+          this.reportConversationError(conversationId, epoch, displayError(error, '附件导入失败'))
+        }
+      })
     },
     async importDroppedDrafts(files: readonly File[]) {
       const conversationId = this.selectedConversationId
-      const existing = this.draftsByConversation[conversationId] ?? []
+      const epoch = this._stateEpoch
       if (!conversationId || files.length === 0) return
-      if (existing.length + files.length > 5) {
-        this.error = '每条消息最多添加 5 个附件'
-        return
-      }
-      try {
-        const assets = await getDesktopApi().media.importDroppedFiles({
-          conversationId,
-          existingAssetIds: existing.map(({ id }) => id),
-        }, files)
-        this.addDrafts(conversationId, assets)
-      } catch (error) {
-        this.error = displayError(error, '附件导入失败')
-      }
+      await this.queueMediaOperation(conversationId, async () => {
+        if (epoch !== this._stateEpoch) return
+        const existing = this.draftsByConversation[conversationId] ?? []
+        if (existing.length + files.length > 5) {
+          this.reportConversationError(conversationId, epoch, '每条消息最多添加 5 个附件')
+          return
+        }
+        try {
+          const assets = await getDesktopApi().media.importDroppedFiles({
+            conversationId,
+            existingAssetIds: existing.map(({ id }) => id),
+          }, files)
+          await this.acceptImportedDrafts(conversationId, epoch, assets)
+        } catch (error) {
+          this.reportConversationError(conversationId, epoch, displayError(error, '附件导入失败'))
+        }
+      })
     },
     async importClipboardDraft() {
       const conversationId = this.selectedConversationId
-      const existing = this.draftsByConversation[conversationId] ?? []
-      if (!conversationId || existing.length >= 5) {
-        if (conversationId) this.error = '每条消息最多添加 5 个附件'
-        return
-      }
-      try {
-        const assets = await getDesktopApi().media.importClipboardImage({
-          conversationId,
-          existingAssetIds: existing.map(({ id }) => id),
-        })
-        this.addDrafts(conversationId, assets)
-      } catch (error) {
-        this.error = displayError(error, '剪贴板图片导入失败')
-      }
-    },
-    addDrafts(conversationId: string, assets: MediaAsset[]) {
-      const existing = this.draftsByConversation[conversationId] ?? []
-      const ids = new Set(existing.map(({ id }) => id))
-      const merged = [...existing]
-      for (const asset of assets) {
-        if (!ids.has(asset.id) && merged.length < 5) {
-          merged.push(asset)
-          ids.add(asset.id)
+      const epoch = this._stateEpoch
+      if (!conversationId) return
+      await this.queueMediaOperation(conversationId, async () => {
+        if (epoch !== this._stateEpoch) return
+        const existing = this.draftsByConversation[conversationId] ?? []
+        if (existing.length >= 5) {
+          this.reportConversationError(conversationId, epoch, '每条消息最多添加 5 个附件')
+          return
         }
-      }
-      this.draftsByConversation[conversationId] = merged
+        try {
+          const assets = await getDesktopApi().media.importClipboardImage({
+            conversationId,
+            existingAssetIds: existing.map(({ id }) => id),
+          })
+          await this.acceptImportedDrafts(conversationId, epoch, assets)
+        } catch (error) {
+          this.reportConversationError(conversationId, epoch, displayError(error, '剪贴板图片导入失败'))
+        }
+      })
     },
     async removeDraft(assetId: string) {
       const conversationId = this.selectedConversationId
+      const epoch = this._stateEpoch
       if (!conversationId) return
-      try {
-        await getDesktopApi().media.removeDraft({ conversationId, assetId })
-        this.draftsByConversation[conversationId] = (this.draftsByConversation[conversationId] ?? [])
-          .filter(({ id }) => id !== assetId)
-      } catch (error) {
-        this.error = displayError(error, '附件移除失败')
-      }
+      await this.queueMediaOperation(conversationId, async () => {
+        if (epoch !== this._stateEpoch) return
+        try {
+          await getDesktopApi().media.removeDraft({ conversationId, assetId })
+          if (epoch === this._stateEpoch) {
+            this.draftsByConversation[conversationId] = (this.draftsByConversation[conversationId] ?? [])
+              .filter(({ id }) => id !== assetId)
+          }
+        } catch (error) {
+          this.reportConversationError(conversationId, epoch, displayError(error, '附件移除失败'))
+        }
+      })
     },
-    async send(input: Omit<ChatSendInput, 'conversationId'>) {
+    async send(input: Omit<ChatSendInput, 'conversationId'>): Promise<boolean> {
       const clean = input.content.trim()
       if ((!clean && input.assetIds.length === 0)
         || (!clean && input.outputType !== 'text')
         || !this.selectedConversationId
-        || this.isRunning) return
+        || this.isRunning) return false
       const conversationId = this.selectedConversationId
+      const epoch = this._stateEpoch
       const drafts = this.draftsByConversation[conversationId] ?? []
       const draftById = new Map(drafts.map((asset) => [asset.id, asset]))
-      const localId = `local-${Date.now()}`
+      const localId = `local-${Date.now()}-${++localMessageSequence}`
       const blocks: UiChatBlock[] = []
       if (clean) blocks.push({ id: `${localId}:text:0`, type: 'text', text: clean })
       for (const assetId of input.assetIds) {
@@ -436,7 +495,14 @@ export const useChatStore = defineStore('chat', {
           .filter(({ id }) => !sentIds.has(id))
         if (this._terminalRequests[result.requestId]) delete this._terminalRequests[result.requestId]
         else this.activeRequestByConversation[conversationId] = result.requestId
-      } catch (error) { this.error = displayError(error, '消息发送失败') }
+        return true
+      } catch (error) {
+        this.messagesByConversation[conversationId] = (this.messagesByConversation[conversationId] ?? [])
+          .filter(({ id }) => id !== localId)
+        this._messageVersions[conversationId] = (this._messageVersions[conversationId] ?? 0) + 1
+        this.reportConversationError(conversationId, epoch, displayError(error, '消息发送失败'))
+        return false
+      }
     },
     async cancelCurrent() {
       const conversationId = this.selectedConversationId
@@ -456,7 +522,11 @@ export const useChatStore = defineStore('chat', {
           const terminalRequestIds = Object.keys(this._terminalRequests)
           if (terminalRequestIds.length > 100) delete this._terminalRequests[terminalRequestIds[0]!]
         }
-        if (event.status === 'failed' && event.error) this.error = displayError(event.error, '消息发送失败')
+        if (event.status === 'failed'
+          && event.error
+          && event.conversationId === this.selectedConversationId) {
+          this.error = displayError(event.error, '消息发送失败')
+        }
         return
       }
       this._messageVersions[event.conversationId] = (this._messageVersions[event.conversationId] ?? 0) + 1
@@ -474,6 +544,11 @@ export const useChatStore = defineStore('chat', {
             ...event.block,
             id: `${event.messageId}:${event.blockId}`,
           }
+        } else {
+          message.blocks.push({
+            ...event.block,
+            id: `${event.messageId}:${event.blockId}`,
+          })
         }
         return
       }
