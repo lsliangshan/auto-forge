@@ -15,6 +15,7 @@ export const appErrorCodeSchema = z.enum([
   'WORKER_TIMEOUT',
   'CREDENTIAL_UNAVAILABLE',
   'CREDENTIAL_INVALID',
+  'MODEL_PROVIDER_ACCESS_DENIED',
   'OPENROUTER_REQUEST_FAILED',
   'MODEL_PROVIDER_REQUEST_FAILED',
 ])
@@ -43,6 +44,7 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   WORKER_TIMEOUT: 'The worker timed out.',
   CREDENTIAL_UNAVAILABLE: 'The credential is unavailable.',
   CREDENTIAL_INVALID: 'The credential is invalid.',
+  MODEL_PROVIDER_ACCESS_DENIED: 'The model provider denied access.',
   OPENROUTER_REQUEST_FAILED: 'The OpenRouter request failed.',
   MODEL_PROVIDER_REQUEST_FAILED: 'The model provider request failed.',
 }

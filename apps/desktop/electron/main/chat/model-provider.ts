@@ -193,7 +193,8 @@ function numericProviderCode(value: unknown): number | undefined {
 function streamedFailure(error: ProviderError | undefined): RetryableFailure | AppError {
   const code = numericProviderCode(error?.code)
   const errorType = String(error?.metadata?.error_type ?? error?.error_type ?? '').toLowerCase()
-  if (code === 401 || code === 403) return failure('CREDENTIAL_INVALID')
+  if (code === 401) return failure('CREDENTIAL_INVALID')
+  if (code === 403) return failure('MODEL_PROVIDER_ACCESS_DENIED')
   if (code === 429 || (code !== undefined && code >= 500)) return new RetryableFailure()
   if (/network|connection|timeout|upstream|unavailable/.test(errorType)) return new RetryableFailure()
   return failure('MODEL_PROVIDER_REQUEST_FAILED')
@@ -268,8 +269,8 @@ export class OpenAiCompatibleProvider implements ModelProvider {
   async validateCredential(signal?: AbortSignal): Promise<{ valid: boolean }> {
     try {
       const { response } = await this.fetchModels(signal)
-      if (response.status === 401 || response.status === 403) return { valid: false }
-      if (!response.ok) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+      if (response.status === 401) return { valid: false }
+      if (!response.ok) await this.throwHttpFailure('models', response)
       this.config.parseModels(await response.json())
       return { valid: true }
     } catch (error) {
@@ -381,7 +382,8 @@ export class OpenAiCompatibleProvider implements ModelProvider {
 
   private async throwHttpFailure(operation: 'models' | 'chat', response: Response): Promise<never> {
     await this.readDiagnostic(operation, response)
-    if (response.status === 401 || response.status === 403) throw failure('CREDENTIAL_INVALID')
+    if (response.status === 401) throw failure('CREDENTIAL_INVALID')
+    if (response.status === 403) throw failure('MODEL_PROVIDER_ACCESS_DENIED')
     throw failure('MODEL_PROVIDER_REQUEST_FAILED')
   }
 

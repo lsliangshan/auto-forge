@@ -264,7 +264,7 @@ export type AppSettingsPatch = z.infer<typeof appSettingsPatchSchema>
 export const providerCredentialStatusSchema = z.object({
   provider: modelProviderIdSchema,
   configured: z.boolean(),
-  validation: z.enum(['unchecked', 'valid', 'invalid', 'unavailable']),
+  validation: z.enum(['unchecked', 'valid', 'invalid', 'denied', 'unavailable']),
   message: z.string().optional(),
   checkedAt: timestampSchema.optional(),
 }).strict()

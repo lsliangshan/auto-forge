@@ -72,6 +72,12 @@ describe('createApplicationRuntime', () => {
       .resolves.toMatchObject({ provider: 'deepseek', configured: false, validation: 'unchecked' })
     await expect(runtime.services.settings.validateProviderCredential('openrouter'))
       .resolves.toMatchObject({ provider: 'openrouter', configured: true, validation: 'valid' })
+    openrouter.validateCredential.mockRejectedValueOnce({
+      code: 'MODEL_PROVIDER_ACCESS_DENIED',
+      message: 'The model provider denied access.',
+    })
+    await expect(runtime.services.settings.validateProviderCredential('openrouter'))
+      .resolves.toMatchObject({ provider: 'openrouter', configured: true, validation: 'denied' })
     await runtime.close()
   })
 

@@ -46,6 +46,11 @@ describe('cross-process contracts', () => {
       validation: 'valid',
     })
     expect(status).not.toHaveProperty('apiKey')
+    expect(providerCredentialStatusSchema.parse({
+      provider: 'openrouter',
+      configured: true,
+      validation: 'denied',
+    }).validation).toBe('denied')
   })
 
   it('declares provider-aware settings channels and a neutral provider error', () => {
@@ -53,6 +58,7 @@ describe('cross-process contracts', () => {
     expect(ipcChannels.settingsClearProviderApiKey).toBe('settings:clear-provider-api-key')
     expect(ipcChannels.settingsValidateProviderCredential).toBe('settings:validate-provider-credential')
     expect(ipcChannels.settingsListProviderModels).toBe('settings:list-provider-models')
+    expect(appErrorCodeSchema.parse('MODEL_PROVIDER_ACCESS_DENIED')).toBe('MODEL_PROVIDER_ACCESS_DENIED')
     expect(appErrorCodeSchema.parse('MODEL_PROVIDER_REQUEST_FAILED')).toBe('MODEL_PROVIDER_REQUEST_FAILED')
     expect(appErrorCodeSchema.parse('OPENROUTER_REQUEST_FAILED')).toBe('OPENROUTER_REQUEST_FAILED')
   })

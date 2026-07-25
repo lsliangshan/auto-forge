@@ -26,6 +26,7 @@ const messages: Partial<Record<AppError['code'], string>> = {
   UNTRUSTED_SENDER: '当前页面无法访问桌面服务',
   CREDENTIAL_UNAVAILABLE: '当前供应商尚未配置 API Key，或系统安全存储暂时不可用',
   CREDENTIAL_INVALID: '当前供应商的 API Key 无效',
+  MODEL_PROVIDER_ACCESS_DENIED: '供应商拒绝了该模型请求，请检查模型权限、内容策略或 Guardrail 设置',
   MODEL_PROVIDER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
   OPENROUTER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
   INTERNAL_ERROR: '操作失败，请稍后重试',

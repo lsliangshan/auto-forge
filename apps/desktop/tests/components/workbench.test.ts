@@ -619,6 +619,7 @@ describe('workbench', () => {
       [{ provider: 'deepseek', configured: false, validation: 'unchecked' }, '未设置 API Key'],
       [{ provider: 'deepseek', configured: true, validation: 'valid' }, '已设置 API Key · 已验证'],
       [{ provider: 'deepseek', configured: true, validation: 'invalid' }, '已设置 API Key · 验证失败'],
+      [{ provider: 'deepseek', configured: true, validation: 'denied' }, '已设置 API Key · 访问受限'],
       [{ provider: 'deepseek', configured: true, validation: 'unavailable' }, '已设置 API Key · 暂时无法验证'],
       [{ provider: 'deepseek', configured: true, validation: 'unchecked' }, '已设置 API Key · 尚未验证'],
     ] as const
@@ -628,6 +629,9 @@ describe('workbench', () => {
       vi.mocked(api.settings.validateProviderCredential).mockResolvedValue(credential)
       const { wrapper } = await mountApp('/settings', api)
       await vi.waitFor(() => expect(wrapper.text()).toContain(label))
+      if (credential.validation === 'denied') {
+        expect(wrapper.text()).toContain('请检查模型权限、内容策略或 Guardrail 设置')
+      }
       wrapper.unmount()
     }
   })

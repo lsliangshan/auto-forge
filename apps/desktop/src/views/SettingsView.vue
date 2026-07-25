@@ -62,6 +62,12 @@
             </el-button>
           </div>
           <small>保存成功后输入框会立即清空；应用不会读取或回显已保存的密钥。</small>
+          <p
+            v-if="settings.credential?.validation === 'denied'"
+            class="field-message"
+          >
+            供应商拒绝了凭证验证请求，请检查模型权限、内容策略或 Guardrail 设置。
+          </p>
           <el-button
             v-if="settings.credential?.configured"
             type="danger"
@@ -236,6 +242,7 @@ const credentialLabel = computed(() => {
   if (!credential?.configured) return '未设置 API Key'
   if (credential.validation === 'valid') return '已设置 API Key · 已验证'
   if (credential.validation === 'invalid') return '已设置 API Key · 验证失败'
+  if (credential.validation === 'denied') return '已设置 API Key · 访问受限'
   if (credential.validation === 'unavailable') return '已设置 API Key · 暂时无法验证'
   return '已设置 API Key · 尚未验证'
 })

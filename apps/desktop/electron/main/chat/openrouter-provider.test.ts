@@ -77,9 +77,11 @@ describe('OpenRouterProvider', () => {
   it('validates credentials without returning the secret', async () => {
     const valid = new OpenRouterProvider({ credential, fetch: vi.fn(async () => Response.json({ data: [] })) })
     const invalid = new OpenRouterProvider({ credential, fetch: vi.fn(async () => new Response('', { status: 401 })) })
+    const forbidden = new OpenRouterProvider({ credential, fetch: vi.fn(async () => new Response('', { status: 403 })) })
 
     await expect(valid.validateCredential()).resolves.toEqual({ valid: true })
     await expect(invalid.validateCredential()).resolves.toEqual({ valid: false })
+    await expect(forbidden.validateCredential()).rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
   })
 
   it('applies the same bounded retry policy to model discovery', async () => {
@@ -142,7 +144,9 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
 
     await expect(collect(provider.stream({ model: 'm', messages: [] }))).rejects.toMatchObject({
-      code: status === 401 || status === 403 ? 'CREDENTIAL_INVALID' : 'MODEL_PROVIDER_REQUEST_FAILED',
+      code: status === 401
+        ? 'CREDENTIAL_INVALID'
+        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_REQUEST_FAILED',
     })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('sk-private')
@@ -207,7 +211,7 @@ describe('OpenRouterProvider', () => {
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('prompt must never leak')
   })
 
-  it('maps a streamed 403 error to a safe credential error without retry', async () => {
+  it('maps a streamed 403 error to access denied without claiming the credential is invalid', async () => {
     const diagnostic = vi.fn()
     const fetch = vi.fn(async () => sseResponse([
       'data: {"error":{"code":403,"message":"user content secret","metadata":{"error_type":"permission"}}}\n\n',
@@ -215,7 +219,7 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
 
     await expect(collect(provider.stream({ model: 'm', messages: [] })))
-      .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
+      .rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('user content secret')
   })
@@ -254,7 +258,7 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch })
 
     await expect(collect(provider.stream({ model: 'm', messages: [] })))
-      .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
+      .rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
     expect(readerCancelled).toBe(true)
   })
 })

@@ -154,6 +154,23 @@ describe('chat interactions', () => {
     expect(store.error).toBe('当前供应商尚未配置 API Key，或系统安全存储暂时不可用')
   })
 
+  it('reports provider access denial without claiming the API Key is invalid', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'status',
+      conversationId: 'conv_1',
+      requestId: 'req_denied',
+      status: 'failed',
+      error: { code: 'MODEL_PROVIDER_ACCESS_DENIED', message: 'The model provider denied access.' },
+    })
+
+    expect(store.error).toBe('供应商拒绝了该模型请求，请检查模型权限、内容策略或 Guardrail 设置')
+  })
+
   it('releases the bridge listener on the last store disposal and does not duplicate deltas after rebuild', () => {
     const { api, chatUnsubscribe, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

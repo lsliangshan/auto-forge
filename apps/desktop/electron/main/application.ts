@@ -335,7 +335,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       return {
         provider,
         configured: true,
-        validation: safe.code === 'CREDENTIAL_INVALID' ? 'invalid' : 'unavailable',
+        validation: safe.code === 'CREDENTIAL_INVALID'
+          ? 'invalid'
+          : safe.code === 'MODEL_PROVIDER_ACCESS_DENIED' ? 'denied' : 'unavailable',
         message: safe.message,
         checkedAt: new Date().toISOString(),
       }
