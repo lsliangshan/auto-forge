@@ -1,9 +1,16 @@
 import type Database from 'better-sqlite3'
+import {
+  chatBlockSchema,
+  conversationGenerationPreferencesSchema,
+  type ConversationGenerationPreferences,
+  type MediaKind,
+} from '@autoforge/shared'
 import { redact } from '../security/redaction.js'
 
 export interface Conversation {
   id: string
   title: string
+  generationPreferences?: ConversationGenerationPreferences
   createdAt: number
   updatedAt: number
 }
@@ -127,6 +134,56 @@ export interface EncryptedSecret {
   updatedAt: number
 }
 
+export type MediaAssetSource = 'upload' | 'generated'
+export type MediaAssetStatus = 'staging' | 'ready' | 'failed' | 'deleting'
+
+export interface MediaAssetRecord {
+  id: string
+  conversationId: string
+  messageId?: string
+  source: MediaAssetSource
+  kind: MediaKind
+  mimeType?: string
+  originalName: string
+  relativePath?: string
+  byteSize?: number
+  width?: number
+  height?: number
+  durationMs?: number
+  sha256?: string
+  provider?: string
+  model?: string
+  status: MediaAssetStatus
+  createdAt: number
+  updatedAt: number
+}
+
+export type MediaAssetPatch = Partial<Omit<MediaAssetRecord, 'id' | 'conversationId' | 'messageId' | 'createdAt'>>
+
+export type MediaGenerationJobStatus = 'pending' | 'in_progress' | 'downloading' | 'paused' | 'completed' | 'failed'
+
+export interface MediaGenerationJob {
+  id: string
+  conversationId: string
+  assistantMessageId: string
+  provider: string
+  model: string
+  kind: 'video'
+  providerJobId: string
+  status: MediaGenerationJobStatus
+  parameters: unknown
+  nextPollAt?: number
+  pollAttempts?: number
+  errorCode?: string
+  assetId?: string
+  createdAt: number
+  updatedAt: number
+  endedAt?: number
+}
+
+export type MediaGenerationJobPatch = Partial<Omit<MediaGenerationJob, 'id' | 'conversationId' | 'assistantMessageId' | 'provider' | 'model' | 'kind' | 'providerJobId' | 'createdAt'>>
+export type MessageInput = Omit<Message, 'executionId'> & { executionId?: string }
+
 type Query = Record<string, unknown>
 type SqliteDatabase = Database.Database
 
@@ -163,14 +220,20 @@ export interface AppRepositories {
     get(id: string): Conversation | undefined
     list(): Conversation[]
     update(id: string, value: Partial<Pick<Conversation, 'title' | 'updatedAt'>>): Conversation | undefined
+    updateGenerationPreferences(id: string, preferences: ConversationGenerationPreferences): Conversation | undefined
     delete(id: string): void
   }
   messages: {
-    insert(value: Omit<Message, 'executionId'> & { executionId?: string }): Message
+    insert(value: MessageInput): Message
+    insertWithAssets(value: MessageInput, assetIds: string[]): Message
     get(id: string): Message | undefined
     listForConversation(conversationId: string): Message[]
     update(id: string, value: Partial<Pick<Message, 'blocks' | 'executionId'>>): Message | undefined
+    replaceBlock(messageId: string, blockId: string, replacement: unknown): Message
+    failInterruptedMediaGenerations(): number
   }
+  mediaAssets: { insert(value: MediaAssetRecord): MediaAssetRecord; get(id: string): MediaAssetRecord | undefined; listForConversation(conversationId: string): MediaAssetRecord[]; listUnclaimedBefore(timestamp: number): MediaAssetRecord[]; update(id: string, patch: MediaAssetPatch): MediaAssetRecord | undefined; delete(id: string): void }
+  mediaGenerationJobs: { insert(value: MediaGenerationJob): MediaGenerationJob; get(id: string): MediaGenerationJob | undefined; listResumable(now: number): MediaGenerationJob[]; update(id: string, patch: MediaGenerationJobPatch): MediaGenerationJob | undefined }
   chatRuns: {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
     get(id: string): ChatRun | undefined
@@ -198,8 +261,10 @@ export interface AppRepositories {
   encryptedSecrets: EncryptedSecretsRepository
 }
 
-const conversationColumns = 'id, title, created_at AS createdAt, updated_at AS updatedAt'
+const conversationColumns = 'id, title, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
 const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, execution_id AS executionId, created_at AS createdAt'
+const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
+const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
 const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt'
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
@@ -207,6 +272,65 @@ const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS wor
 
 function messageFromRow(row: Query): Message {
   return { ...row, blocks: parse(row.blocksJson as string) as unknown[] } as Message
+}
+
+function conversationFromRow(row: Query): Conversation {
+  const preferences = parse(row.generationPreferencesJson as string | null)
+  return {
+    id: row.id as string,
+    title: row.title as string,
+    ...(preferences === undefined ? {} : { generationPreferences: conversationGenerationPreferencesSchema.parse(preferences) }),
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+  }
+}
+
+function optional<T>(value: unknown): T | undefined {
+  return value === null || value === undefined ? undefined : value as T
+}
+
+function mediaAssetFromRow(row: Query): MediaAssetRecord {
+  return {
+    id: row.id as string,
+    conversationId: row.conversationId as string,
+    messageId: optional<string>(row.messageId),
+    source: row.source as MediaAssetSource,
+    kind: row.kind as MediaKind,
+    mimeType: optional<string>(row.mimeType),
+    originalName: row.originalName as string,
+    relativePath: optional<string>(row.relativePath),
+    byteSize: optional<number>(row.byteSize),
+    width: optional<number>(row.width),
+    height: optional<number>(row.height),
+    durationMs: optional<number>(row.durationMs),
+    sha256: optional<string>(row.sha256),
+    provider: optional<string>(row.provider),
+    model: optional<string>(row.model),
+    status: row.status as MediaAssetStatus,
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+  }
+}
+
+function mediaGenerationJobFromRow(row: Query): MediaGenerationJob {
+  return {
+    id: row.id as string,
+    conversationId: row.conversationId as string,
+    assistantMessageId: row.assistantMessageId as string,
+    provider: row.provider as string,
+    model: row.model as string,
+    kind: row.kind as 'video',
+    providerJobId: row.providerJobId as string,
+    status: row.status as MediaGenerationJobStatus,
+    parameters: parse(row.parametersJson as string),
+    nextPollAt: optional<number>(row.nextPollAt),
+    pollAttempts: row.pollAttempts as number,
+    errorCode: optional<string>(row.errorCode),
+    assetId: optional<string>(row.assetId),
+    createdAt: row.createdAt as number,
+    updatedAt: row.updatedAt as number,
+    endedAt: optional<number>(row.endedAt),
+  }
 }
 
 function projectFromRow(row: Query): WorkflowProject {
@@ -247,12 +371,23 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => database.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (@id, @title, @createdAt, @updatedAt)').run({ ...value, createdAt, updatedAt }))
         return { id: value.id, title: value.title, createdAt, updatedAt }
       },
-      get: (id) => one<Conversation>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id }),
-      list: () => many<Conversation>(database, `SELECT ${conversationColumns} FROM conversations ORDER BY updated_at DESC, id`),
+      get: (id) => { const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id }); return row && conversationFromRow(row) },
+      list: () => many<Query>(database, `SELECT ${conversationColumns} FROM conversations ORDER BY updated_at DESC, id`).map(conversationFromRow),
       update(id, value) {
         const updatedAt = value.updatedAt ?? now()
         transaction(database, () => database.prepare('UPDATE conversations SET title = COALESCE(@title, title), updated_at = @updatedAt WHERE id = @id').run({ id, title: value.title ?? null, updatedAt }))
-        return one<Conversation>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id })
+        const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id })
+        return row && conversationFromRow(row)
+      },
+      updateGenerationPreferences(id, preferences) {
+        const validated = conversationGenerationPreferencesSchema.parse(preferences)
+        transaction(database, () => database.prepare('UPDATE conversations SET generation_preferences_json = @generationPreferencesJson, updated_at = @updatedAt WHERE id = @id').run({
+          id,
+          generationPreferencesJson: JSON.stringify(validated),
+          updatedAt: now(),
+        }))
+        const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id })
+        return row && conversationFromRow(row)
       },
       delete: (id) => { transaction(database, () => database.prepare('DELETE FROM conversations WHERE id = @id').run({ id })) },
     },
@@ -261,12 +396,131 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({ ...value, blocksJson: JSON.stringify(value.blocks), executionId: value.executionId ?? null }))
         return value
       },
+      insertWithAssets(value, assetIds) {
+        const blocks = chatBlockSchema.array().parse(value.blocks)
+        transaction(database, () => {
+          if (new Set(assetIds).size !== assetIds.length) throw new Error('Duplicate media assets are not allowed')
+          for (const assetId of assetIds) {
+            const asset = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, { id: assetId })
+            if (!asset) throw new Error('Media asset not found')
+            const stored = mediaAssetFromRow(asset)
+            if (stored.conversationId !== value.conversationId || stored.status !== 'ready' || stored.messageId !== undefined) {
+              throw new Error('Media asset cannot be claimed')
+            }
+          }
+          database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
+            ...value,
+            blocksJson: JSON.stringify(blocks),
+            executionId: value.executionId ?? null,
+          })
+          const claim = database.prepare('UPDATE media_assets SET message_id = @messageId, updated_at = @updatedAt WHERE id = @assetId AND message_id IS NULL AND status = \'ready\'')
+          for (const assetId of assetIds) {
+            if (claim.run({ messageId: value.id, assetId, updatedAt: now() }).changes !== 1) throw new Error('Media asset could not be claimed')
+          }
+        })
+        const stored = this.get(value.id)
+        if (!stored) throw new Error('Message was not persisted')
+        return stored
+      },
       get: (id) => { const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id }); return row && messageFromRow(row) },
       listForConversation: (conversationId) => many<Query>(database, `SELECT ${messageColumns} FROM messages WHERE conversation_id = @conversationId ORDER BY created_at, id`, { conversationId }).map(messageFromRow),
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE messages SET blocks_json = COALESCE(@blocksJson, blocks_json), execution_id = COALESCE(@executionId, execution_id) WHERE id = @id').run({ id, blocksJson: value.blocks === undefined ? null : JSON.stringify(value.blocks), executionId: value.executionId ?? null }))
         const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id })
         return row && messageFromRow(row)
+      },
+      replaceBlock(messageId, blockId, replacement) {
+        const parsedReplacement = chatBlockSchema.parse(replacement)
+        if (!('blockId' in parsedReplacement) || parsedReplacement.blockId !== blockId) {
+          throw new Error('Replacement block identity must match the updated block')
+        }
+        transaction(database, () => {
+          const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id: messageId })
+          if (!row) throw new Error('Message not found')
+          const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+          const index = blocks.findIndex((block) => 'blockId' in block && block.blockId === blockId)
+          if (index === -1) throw new Error('Message block not found')
+          blocks[index] = parsedReplacement
+          database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: messageId, blocksJson: JSON.stringify(blocks) })
+        })
+        const stored = this.get(messageId)
+        if (!stored) throw new Error('Message not found')
+        return stored
+      },
+      failInterruptedMediaGenerations() {
+        return transaction(database, () => {
+          let failed = 0
+          const activeStatuses = new Set(['pending', 'in_progress', 'downloading'])
+          for (const row of many<Query>(database, 'SELECT id, blocks_json AS blocksJson FROM messages')) {
+            const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+            let changed = false
+            for (const block of blocks) {
+              if (block.type !== 'media_generation' || !activeStatuses.has(block.status)) continue
+              const job = one<{ status: MediaGenerationJobStatus }>(database, 'SELECT status FROM media_generation_jobs WHERE id = @id', { id: block.jobId })
+              if (job && activeStatuses.has(job.status)) continue
+              block.status = 'failed'
+              block.errorCode = 'MEDIA_GENERATION_FAILED'
+              failed += 1
+              changed = true
+            }
+            if (changed) database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+          }
+          return failed
+        })
+      },
+    },
+    mediaAssets: {
+      insert(value) {
+        transaction(database, () => database.prepare('INSERT INTO media_assets (id, conversation_id, message_id, source, kind, mime_type, original_name, relative_path, byte_size, width, height, duration_ms, sha256, provider, model, status, created_at, updated_at) VALUES (@id, @conversationId, @messageId, @source, @kind, @mimeType, @originalName, @relativePath, @byteSize, @width, @height, @durationMs, @sha256, @provider, @model, @status, @createdAt, @updatedAt)').run({
+          ...value,
+          messageId: value.messageId ?? null,
+          mimeType: value.mimeType ?? null,
+          relativePath: value.relativePath ?? null,
+          byteSize: value.byteSize ?? null,
+          width: value.width ?? null,
+          height: value.height ?? null,
+          durationMs: value.durationMs ?? null,
+          sha256: value.sha256 ?? null,
+          provider: value.provider ?? null,
+          model: value.model ?? null,
+        }))
+        const stored = this.get(value.id)
+        if (!stored) throw new Error('Media asset was not persisted')
+        return stored
+      },
+      get: (id) => { const row = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, { id }); return row && mediaAssetFromRow(row) },
+      listForConversation: (conversationId) => many<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE conversation_id = @conversationId ORDER BY created_at, id`, { conversationId }).map(mediaAssetFromRow),
+      listUnclaimedBefore: (timestamp) => many<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE message_id IS NULL AND created_at < @timestamp ORDER BY created_at, id`, { timestamp }).map(mediaAssetFromRow),
+      update(id, patch) {
+        transaction(database, () => database.prepare('UPDATE media_assets SET source = COALESCE(@source, source), kind = COALESCE(@kind, kind), mime_type = COALESCE(@mimeType, mime_type), original_name = COALESCE(@originalName, original_name), relative_path = COALESCE(@relativePath, relative_path), byte_size = COALESCE(@byteSize, byte_size), width = COALESCE(@width, width), height = COALESCE(@height, height), duration_ms = COALESCE(@durationMs, duration_ms), sha256 = COALESCE(@sha256, sha256), provider = COALESCE(@provider, provider), model = COALESCE(@model, model), status = COALESCE(@status, status), updated_at = @updatedAt WHERE id = @id').run({
+          id, ...patch, source: patch.source ?? null, kind: patch.kind ?? null, mimeType: patch.mimeType ?? null, originalName: patch.originalName ?? null, relativePath: patch.relativePath ?? null, byteSize: patch.byteSize ?? null, width: patch.width ?? null, height: patch.height ?? null, durationMs: patch.durationMs ?? null, sha256: patch.sha256 ?? null, provider: patch.provider ?? null, model: patch.model ?? null, status: patch.status ?? null, updatedAt: patch.updatedAt ?? now(),
+        }))
+        return this.get(id)
+      },
+      delete: (id) => { transaction(database, () => database.prepare('DELETE FROM media_assets WHERE id = @id').run({ id })) },
+    },
+    mediaGenerationJobs: {
+      insert(value) {
+        transaction(database, () => database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, @nextPollAt, @pollAttempts, @errorCode, @assetId, @createdAt, @updatedAt, @endedAt)').run({
+          ...value,
+          parametersJson: JSON.stringify(value.parameters),
+          nextPollAt: value.nextPollAt ?? null,
+          pollAttempts: value.pollAttempts ?? 0,
+          errorCode: value.errorCode ?? null,
+          assetId: value.assetId ?? null,
+          endedAt: value.endedAt ?? null,
+        }))
+        const stored = this.get(value.id)
+        if (!stored) throw new Error('Media generation job was not persisted')
+        return stored
+      },
+      get: (id) => { const row = one<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`, { id }); return row && mediaGenerationJobFromRow(row) },
+      listResumable: (now) => many<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE status IN ('pending', 'in_progress', 'downloading') AND (next_poll_at IS NULL OR next_poll_at <= @now) ORDER BY next_poll_at, id`, { now }).map(mediaGenerationJobFromRow),
+      update(id, patch) {
+        transaction(database, () => database.prepare('UPDATE media_generation_jobs SET status = COALESCE(@status, status), parameters_json = COALESCE(@parametersJson, parameters_json), next_poll_at = COALESCE(@nextPollAt, next_poll_at), poll_attempts = COALESCE(@pollAttempts, poll_attempts), error_code = COALESCE(@errorCode, error_code), asset_id = COALESCE(@assetId, asset_id), updated_at = @updatedAt, ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
+          id, ...patch, status: patch.status ?? null, parametersJson: patch.parameters === undefined ? null : JSON.stringify(patch.parameters), nextPollAt: patch.nextPollAt ?? null, pollAttempts: patch.pollAttempts ?? null, errorCode: patch.errorCode ?? null, assetId: patch.assetId ?? null, endedAt: patch.endedAt ?? null, updatedAt: patch.updatedAt ?? now(),
+        }))
+        return this.get(id)
       },
     },
     chatRuns: {

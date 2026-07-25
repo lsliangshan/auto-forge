@@ -16,6 +16,7 @@ export function openAppDatabase(path: string) {
     const endedAt = Date.now()
     const executions = sqlite.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run(endedAt).changes
     const chatRuns = sqlite.prepare("UPDATE chat_runs SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')").run(endedAt).changes
+    repositories.messages.failInterruptedMediaGenerations()
     return { executions, chatRuns }
   })()
 

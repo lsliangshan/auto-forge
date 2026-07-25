@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
 
@@ -12,6 +13,52 @@ function openTestDatabase() {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-'))
   temporaryDirectories.push(directory)
   return openAppDatabase(join(directory, 'autoforge.sqlite'))
+}
+
+const defaultConversationGenerationPreferences: ConversationGenerationPreferences = {
+  outputType: 'auto',
+  models: {},
+  generation: {
+    image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+    audio: { format: 'mp3' },
+    video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+  },
+}
+
+function readyAsset(id: string, conversationId: string) {
+  return {
+    id,
+    conversationId,
+    source: 'upload' as const,
+    kind: 'image' as const,
+    mimeType: 'image/png',
+    originalName: `${id}.png`,
+    relativePath: `${conversationId}/${id}.png`,
+    byteSize: 12,
+    sha256: 'a'.repeat(64),
+    status: 'ready' as const,
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}
+
+function mediaMessage(id: string, conversationId: string, assetId: string) {
+  return {
+    id,
+    conversationId,
+    role: 'user',
+    blocks: [{
+      type: 'media' as const,
+      blockId: `${id}_block`,
+      assetId,
+      kind: 'image' as const,
+      purpose: 'input' as const,
+      name: `${assetId}.png`,
+      mimeType: 'image/png',
+      byteSize: 12,
+    }],
+    createdAt: 1,
+  }
 }
 
 afterEach(() => {
@@ -45,7 +92,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(1)
+    expect(database.schemaVersion()).toBe(2)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -93,6 +140,149 @@ describe('openAppDatabase', () => {
 
     database.conversations.delete('conversation_1')
     expect(database.messages.listForConversation('conversation_1')).toEqual([])
+  })
+
+  it('persists media ownership and generation preferences with the Task 1 schema', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_media', title: 'Media' })
+    database.mediaAssets.insert(readyAsset('asset_media', 'conversation_media'))
+
+    database.messages.insertWithAssets(
+      mediaMessage('message_media', 'conversation_media', 'asset_media'),
+      ['asset_media'],
+    )
+    const updated = database.conversations.updateGenerationPreferences(
+      'conversation_media',
+      defaultConversationGenerationPreferences,
+    )
+
+    expect(database.mediaAssets.get('asset_media')?.messageId).toBe('message_media')
+    expect(updated?.generationPreferences).toEqual(defaultConversationGenerationPreferences)
+    expect(database.conversations.get('conversation_media')?.generationPreferences).toEqual(defaultConversationGenerationPreferences)
+  })
+
+  it.each([
+    ['a cross-conversation asset', (database: ReturnType<typeof openTestDatabase>) => {
+      database.conversations.insert({ id: 'conversation_other', title: 'Other' })
+      database.mediaAssets.insert(readyAsset('asset_other', 'conversation_other'))
+      return 'asset_other'
+    }],
+    ['an already claimed asset', (database: ReturnType<typeof openTestDatabase>) => {
+      database.mediaAssets.insert(readyAsset('asset_claimed', 'conversation_claims'))
+      database.messages.insertWithAssets(
+        mediaMessage('message_claimed', 'conversation_claims', 'asset_claimed'),
+        ['asset_claimed'],
+      )
+      return 'asset_claimed'
+    }],
+    ['an asset that is not ready', (database: ReturnType<typeof openTestDatabase>) => {
+      database.mediaAssets.insert({ ...readyAsset('asset_staging', 'conversation_claims'), status: 'staging' })
+      return 'asset_staging'
+    }],
+  ])('rolls back a message when it claims %s', (_description, setup) => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_claims', title: 'Claims' })
+    const assetId = setup(database)
+
+    expect(() => database.messages.insertWithAssets(
+      mediaMessage(`message_${assetId}`, 'conversation_claims', assetId),
+      [assetId],
+    )).toThrow()
+
+    expect(database.messages.get(`message_${assetId}`)).toBeUndefined()
+    expect(database.mediaAssets.get(assetId)?.messageId).not.toBe(`message_${assetId}`)
+  })
+
+  it('cascades media assets and generation jobs when deleting a conversation', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_cascade', title: 'Cascade' })
+    database.messages.insert({
+      id: 'message_cascade', conversationId: 'conversation_cascade', role: 'assistant',
+      blocks: [{ type: 'media_generation', blockId: 'block_cascade', jobId: 'job_cascade', kind: 'video', status: 'pending' }], createdAt: 1,
+    })
+    database.mediaAssets.insert(readyAsset('asset_cascade', 'conversation_cascade'))
+    database.mediaGenerationJobs.insert({
+      id: 'job_cascade', conversationId: 'conversation_cascade', assistantMessageId: 'message_cascade',
+      provider: 'openrouter', model: 'video-model', kind: 'video', providerJobId: 'provider_job_cascade',
+      status: 'pending', parameters: { prompt: 'cascade' }, createdAt: 1, updatedAt: 1,
+    })
+
+    database.conversations.delete('conversation_cascade')
+
+    expect(database.mediaAssets.get('asset_cascade')).toBeUndefined()
+    expect(database.mediaGenerationJobs.get('job_cascade')).toBeUndefined()
+  })
+
+  it('lists only due resumable video generation job statuses', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_jobs', title: 'Jobs' })
+    database.messages.insert({ id: 'message_jobs', conversationId: 'conversation_jobs', role: 'assistant', blocks: [], createdAt: 1 })
+    for (const status of ['pending', 'in_progress', 'downloading', 'paused', 'completed', 'failed'] as const) {
+      database.mediaGenerationJobs.insert({
+        id: `job_${status}`, conversationId: 'conversation_jobs', assistantMessageId: 'message_jobs',
+        provider: 'openrouter', model: 'video-model', kind: 'video', providerJobId: `provider_${status}`,
+        status, parameters: {}, nextPollAt: 10, createdAt: 1, updatedAt: 1,
+      })
+    }
+    database.mediaGenerationJobs.insert({
+      id: 'job_later', conversationId: 'conversation_jobs', assistantMessageId: 'message_jobs',
+      provider: 'openrouter', model: 'video-model', kind: 'video', providerJobId: 'provider_later',
+      status: 'pending', parameters: {}, nextPollAt: 11, createdAt: 1, updatedAt: 1,
+    })
+
+    expect(database.mediaGenerationJobs.listResumable(10).map((job) => job.id))
+      .toEqual(['job_downloading', 'job_in_progress', 'job_pending'])
+  })
+
+  it('replaces a media generation block in place only with a valid matching block', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_blocks', title: 'Blocks' })
+    database.messages.insert({
+      id: 'message_blocks', conversationId: 'conversation_blocks', role: 'assistant', createdAt: 1,
+      blocks: [{ type: 'media_generation', blockId: 'block_video', jobId: 'job_video', kind: 'video', status: 'downloading' }],
+    })
+
+    database.messages.replaceBlock('message_blocks', 'block_video', {
+      type: 'media', blockId: 'block_video', assetId: 'asset_video', kind: 'video', purpose: 'output',
+      name: 'video.mp4', mimeType: 'video/mp4', byteSize: 12,
+    })
+
+    expect(database.messages.get('message_blocks')?.blocks).toEqual([{
+      type: 'media', blockId: 'block_video', assetId: 'asset_video', kind: 'video', purpose: 'output',
+      name: 'video.mp4', mimeType: 'video/mp4', byteSize: 12,
+    }])
+    expect(() => database.messages.replaceBlock('message_blocks', 'block_video', {
+      type: 'media', blockId: 'different_block', assetId: 'asset_video', kind: 'video', purpose: 'output',
+      name: 'video.mp4', mimeType: 'video/mp4', byteSize: 12,
+    })).toThrow()
+    expect(() => database.messages.replaceBlock('message_blocks', 'block_video', {
+      type: 'media', blockId: 'block_video', assetId: 'asset_video', kind: 'video', purpose: 'output',
+      name: '', mimeType: 'video/mp4', byteSize: 12,
+    })).toThrow()
+  })
+
+  it('fails interrupted non-video media generations while preserving resumable video jobs', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_recovery_media', title: 'Recovery media' })
+    database.messages.insert({
+      id: 'message_recovery_media', conversationId: 'conversation_recovery_media', role: 'assistant', createdAt: 1,
+      blocks: [
+        { type: 'media_generation', blockId: 'block_lost', jobId: 'image_request_lost', kind: 'image', status: 'in_progress' },
+        { type: 'media_generation', blockId: 'block_video', jobId: 'job_video_recovery', kind: 'video', status: 'in_progress' },
+      ],
+    })
+    database.mediaGenerationJobs.insert({
+      id: 'job_video_recovery', conversationId: 'conversation_recovery_media', assistantMessageId: 'message_recovery_media',
+      provider: 'openrouter', model: 'video-model', kind: 'video', providerJobId: 'provider_video_recovery',
+      status: 'in_progress', parameters: {}, createdAt: 1, updatedAt: 1,
+    })
+
+    database.recoverInterrupted()
+
+    expect(database.messages.get('message_recovery_media')?.blocks).toEqual([
+      { type: 'media_generation', blockId: 'block_lost', jobId: 'image_request_lost', kind: 'image', status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' },
+      { type: 'media_generation', blockId: 'block_video', jobId: 'job_video_recovery', kind: 'video', status: 'in_progress' },
+    ])
   })
 
   it('atomically commits assistant partials with the chat-run terminal state', () => {
