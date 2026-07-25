@@ -631,6 +631,7 @@ export class MediaLifecycle {
     } catch {
       restored = false
     }
+
     try {
       this.database.mediaAssets.update(asset.id, {
         status: restored ? asset.status : 'failed',
@@ -638,8 +639,186 @@ export class MediaLifecycle {
         updatedAt: this.now(),
       })
     } catch {
-      // The deleting state is already non-ready and retains tombstone metadata.
+      // The durable result is resolved by the authoritative reread below.
     }
+
+    let authoritative: MediaAssetRecord | undefined
+    try {
+      authoritative = this.database.mediaAssets.get(asset.id)
+    } catch {
+      authoritative = undefined
+    }
+    if (restored && this.matchesOriginalAsset(authoritative, asset)) return
+
+    if (restored && !await this.moveCanonicalBackToTombstone(
+      originalPath,
+      originalIdentity,
+      tombstone,
+    )) {
+      await this.reconcileCanonicalNonReady(asset, originalPath)
+      return
+    }
+
+    await this.reconcileTombstoneAuthority(
+      asset,
+      originalIdentity,
+      originalPath,
+      tombstone,
+      tombstoneRelativePath,
+      authoritative,
+    )
+  }
+
+  private matchesOriginalAsset(
+    authoritative: MediaAssetRecord | undefined,
+    original: MediaAssetRecord,
+  ): boolean {
+    return Boolean(
+      authoritative
+      && authoritative.conversationId === original.conversationId
+      && authoritative.messageId === original.messageId
+      && authoritative.status === original.status
+      && authoritative.relativePath === original.relativePath,
+    )
+  }
+
+  private matchesTombstoneAsset(
+    authoritative: MediaAssetRecord | undefined,
+    asset: MediaAssetRecord,
+    tombstoneRelativePath: string,
+  ): boolean {
+    return Boolean(
+      authoritative
+      && authoritative.conversationId === asset.conversationId
+      && !authoritative.messageId
+      && authoritative.status !== 'ready'
+      && authoritative.relativePath === tombstoneRelativePath,
+    )
+  }
+
+  private async moveCanonicalBackToTombstone(
+    originalPath: string,
+    originalIdentity: FileIdentity,
+    tombstone: string,
+  ): Promise<boolean> {
+    try {
+      const existingTombstone = await this.metadata(tombstone)
+      if (existingTombstone) {
+        const tombstoneIdentity = await this.verifyFile(tombstone)
+        if (
+          !sameNode(originalIdentity, tombstoneIdentity)
+          || originalIdentity.size !== tombstoneIdentity.size
+        ) return false
+        if (await this.metadata(originalPath) && !await this.tryPurge(originalPath)) return false
+        return true
+      }
+      const canonicalIdentity = await this.verifyFile(originalPath)
+      if (
+        !sameNode(originalIdentity, canonicalIdentity)
+        || originalIdentity.size !== canonicalIdentity.size
+      ) return false
+      await this.filesystem.rename(originalPath, tombstone)
+      const tombstoneIdentity = await this.verifyFile(tombstone)
+      return (
+        sameNode(originalIdentity, tombstoneIdentity)
+        && originalIdentity.size === tombstoneIdentity.size
+        && !await this.metadata(originalPath)
+      )
+    } catch {
+      return false
+    }
+  }
+
+  private async reconcileCanonicalNonReady(
+    asset: MediaAssetRecord,
+    originalPath: string,
+  ): Promise<void> {
+    try {
+      this.database.mediaAssets.update(asset.id, {
+        status: 'failed',
+        relativePath: asset.relativePath,
+        updatedAt: this.now(),
+      })
+    } catch {
+      // The authoritative reread below decides whether canonical bytes may remain.
+    }
+    let authoritative: MediaAssetRecord | undefined
+    try {
+      authoritative = this.database.mediaAssets.get(asset.id)
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+    if (!authoritative) {
+      await this.tryPurge(originalPath)
+      return
+    }
+    if (
+      authoritative.conversationId === asset.conversationId
+      && authoritative.relativePath === asset.relativePath
+      && (
+        authoritative.status !== 'ready'
+        || this.matchesOriginalAsset(authoritative, asset)
+      )
+    ) return
+    throw failure('INTERNAL_ERROR')
+  }
+
+  private async reconcileTombstoneAuthority(
+    asset: MediaAssetRecord,
+    originalIdentity: FileIdentity,
+    originalPath: string,
+    tombstone: string,
+    tombstoneRelativePath: string,
+    authorityBeforeMove: MediaAssetRecord | undefined,
+  ): Promise<void> {
+    let authoritative = authorityBeforeMove
+    if (!authoritative) {
+      try {
+        authoritative = this.database.mediaAssets.get(asset.id)
+      } catch {
+        throw failure('INTERNAL_ERROR')
+      }
+    }
+    if (!authoritative) {
+      await this.tryPurge(tombstone)
+      return
+    }
+    if (this.matchesTombstoneAsset(authoritative, asset, tombstoneRelativePath)) return
+
+    try {
+      this.database.mediaAssets.update(asset.id, {
+        status: 'failed',
+        relativePath: tombstoneRelativePath,
+        updatedAt: this.now(),
+      })
+    } catch {
+      // Resolve an acknowledgement loss through the authoritative reread.
+    }
+    try {
+      authoritative = this.database.mediaAssets.get(asset.id)
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+    if (!authoritative) {
+      await this.tryPurge(tombstone)
+      return
+    }
+    if (this.matchesTombstoneAsset(authoritative, asset, tombstoneRelativePath)) return
+    if (this.matchesOriginalAsset(authoritative, asset)) {
+      try {
+        if (!await this.metadata(originalPath)) {
+          await this.filesystem.rename(tombstone, originalPath)
+        }
+        const restoredIdentity = await this.verifyFile(originalPath)
+        if (
+          sameNode(originalIdentity, restoredIdentity)
+          && originalIdentity.size === restoredIdentity.size
+        ) return
+      } catch {
+        // Fall through to the fixed safe failure below.
+      }
+    }
+    throw failure('INTERNAL_ERROR')
   }
 
   private async cleanOrphanTombstones(): Promise<void> {

@@ -611,6 +611,122 @@ describe('MediaLifecycle', () => {
       .filter((name) => name.endsWith('.delete'))).toEqual([])
   })
 
+  it('returns rollback bytes to their tombstone when restoring original metadata does not commit', async () => {
+    const { database, mediaRoot } = setup()
+    const conversationId = 'conversation_rollback_failed'
+    const assetId = 'asset_rollback_failed'
+    const relativePath = `${conversationId}/${assetId}.png`
+    insertConversation(database, conversationId)
+    insertAsset(database, {
+      id: assetId,
+      conversationId,
+      relativePath,
+      createdAt: NOW - DAY - 1,
+    })
+    writeAsset(mediaRoot, conversationId, `${assetId}.png`, assetId)
+    let deleteAttempts = 0
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database, {
+        mediaAssets: {
+          ...database.mediaAssets,
+          update(id, patch) {
+            if (
+              id === assetId
+              && patch.status === 'ready'
+              && patch.relativePath === relativePath
+            ) throw new Error('rollback database unavailable')
+            return database.mediaAssets.update(id, patch)
+          },
+          delete(id) {
+            if (id === assetId && deleteAttempts++ === 0) {
+              throw new Error('delete database unavailable')
+            }
+            database.mediaAssets.delete(id)
+          },
+        },
+      }),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+
+    const retained = database.mediaAssets.get(assetId)
+    expect(retained).toMatchObject({
+      status: 'deleting',
+      relativePath: expect.stringMatching(/^\.quarantine\/.+\.delete$/),
+    })
+    expect(existsSync(join(mediaRoot, relativePath))).toBe(false)
+    expect(existsSync(join(mediaRoot, retained!.relativePath!))).toBe(true)
+
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toBeUndefined()
+    expect(existsSync(join(mediaRoot, relativePath))).toBe(false)
+    expect((await readdir(join(mediaRoot, '.quarantine')))
+      .filter((name) => name.endsWith('.delete'))).toEqual([])
+  })
+
+  it('keeps canonical rollback bytes when restoring original metadata commits before throwing', async () => {
+    const { database, mediaRoot } = setup()
+    const conversationId = 'conversation_rollback_ack'
+    const assetId = 'asset_rollback_ack'
+    const relativePath = `${conversationId}/${assetId}.png`
+    insertConversation(database, conversationId)
+    insertAsset(database, {
+      id: assetId,
+      conversationId,
+      relativePath,
+      createdAt: NOW - DAY - 1,
+    })
+    writeAsset(mediaRoot, conversationId, `${assetId}.png`, assetId)
+    let deleteAttempts = 0
+    let loseRollbackAcknowledgement = true
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database, {
+        mediaAssets: {
+          ...database.mediaAssets,
+          update(id, patch) {
+            const updated = database.mediaAssets.update(id, patch)
+            if (
+              loseRollbackAcknowledgement
+              && id === assetId
+              && patch.status === 'ready'
+              && patch.relativePath === relativePath
+            ) {
+              loseRollbackAcknowledgement = false
+              throw new Error('rollback acknowledgement lost')
+            }
+            return updated
+          },
+          delete(id) {
+            if (id === assetId && deleteAttempts++ === 0) {
+              throw new Error('delete database unavailable')
+            }
+            database.mediaAssets.delete(id)
+          },
+        },
+      }),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toMatchObject({
+      status: 'ready',
+      relativePath,
+    })
+    expect(existsSync(join(mediaRoot, relativePath))).toBe(true)
+
+    await lifecycle.recover()
+
+    expect(database.mediaAssets.get(assetId)).toBeUndefined()
+    expect(existsSync(join(mediaRoot, relativePath))).toBe(false)
+    expect((await readdir(join(mediaRoot, '.quarantine')))
+      .filter((name) => name.endsWith('.delete'))).toEqual([])
+  })
+
   it('fails closed on a symlinked conversation and does not expose its target path', async () => {
     const { database, mediaRoot } = setup()
     insertConversation(database, 'conversation_link')
