@@ -109,6 +109,7 @@ export function createMediaProtocolHandler(
 
     if (request.method === 'HEAD') return new Response(null, { status: range ? 206 : 200, headers })
     if (request.method !== 'GET') return new Response(null, { status: 405, headers })
+    if (asset.byteSize === 0) return new Response(null, { status: 200, headers })
 
     let handle: Awaited<ReturnType<typeof open>> | undefined
     try {

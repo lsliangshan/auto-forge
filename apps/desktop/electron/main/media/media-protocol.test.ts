@@ -100,6 +100,53 @@ describe('createMediaProtocolHandler', () => {
     expect(head.body).toBeNull()
   })
 
+  it('returns empty 200 GET and HEAD responses without opening a zero-byte asset', async () => {
+    const { resolveReadyAsset } = await fixture()
+    const asset = await resolveReadyAsset('asset_1')
+    const empty = {
+      ...asset,
+      id: 'empty_asset',
+      name: 'empty.png',
+      byteSize: 0,
+      absolutePath: join(asset.absolutePath, '..', 'empty_asset.png'),
+      relativePath: 'conversation_1/empty_asset.png',
+    }
+    resolveReadyAsset.mockImplementation(async (assetId: string) => {
+      if (assetId !== 'empty_asset') throw new Error('not available')
+      return empty
+    })
+    const handler = createMediaProtocolHandler({ resolveReadyAsset })
+
+    const get = await handler(new Request('autoforge-media://asset/empty_asset'))
+    const head = await handler(new Request('autoforge-media://asset/empty_asset', { method: 'HEAD' }))
+
+    expect(get.status).toBe(200)
+    expect(get.headers.get('content-length')).toBe('0')
+    expect((await get.arrayBuffer()).byteLength).toBe(0)
+    expect(head.status).toBe(200)
+    expect(head.headers.get('content-length')).toBe('0')
+    expect(head.body).toBeNull()
+  })
+
+  it('returns 416 for every range against a zero-byte asset without opening it', async () => {
+    const { resolveReadyAsset } = await fixture()
+    const asset = await resolveReadyAsset('asset_1')
+    resolveReadyAsset.mockResolvedValueOnce({
+      ...asset,
+      id: 'empty_asset',
+      byteSize: 0,
+      absolutePath: join(asset.absolutePath, '..', 'empty_asset.png'),
+      relativePath: 'conversation_1/empty_asset.png',
+    })
+
+    const response = await createMediaProtocolHandler({ resolveReadyAsset })(new Request(
+      'autoforge-media://asset/empty_asset', { headers: { range: 'bytes=0-' } },
+    ))
+
+    expect(response.status).toBe(416)
+    expect(response.headers.get('content-range')).toBe('bytes */0')
+  })
+
   it.each([
     'autoforge-media://asset/asset_1/extra',
     'autoforge-media://asset/%2e%2e',
