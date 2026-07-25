@@ -49,24 +49,25 @@ function detectIsoMedia(bytes: Uint8Array): DetectedMedia | undefined {
     brands.add(ascii(bytes, offset, 4))
   }
 
-  const formats = new Set<string>()
-  if (brands.has('avif') || brands.has('avis')) formats.add('avif')
-  if (brands.has('M4A ') || brands.has('M4B ')) formats.add('m4a')
-  if (brands.has('qt  ')) formats.add('quicktime')
-  if ([...brands].some((brand) => (
+  const specificFormats = new Set<string>()
+  if (brands.has('avif') || brands.has('avis')) specificFormats.add('avif')
+  if (brands.has('M4A ') || brands.has('M4B ')) specificFormats.add('m4a')
+  if (brands.has('qt  ')) specificFormats.add('quicktime')
+  if (specificFormats.size > 1) return undefined
+  const [specificFormat] = specificFormats
+  if (specificFormat === 'avif') return detected('image', 'image/avif', 'avif')
+  if (specificFormat === 'm4a') return detected('audio', 'audio/mp4', 'm4a')
+  if (specificFormat === 'quicktime') return detected('video', 'video/quicktime', 'mov')
+
+  const genericMp4 = [...brands].some((brand) => (
     brand === 'isom'
     || brand === 'iso2'
     || brand === 'mp41'
     || brand === 'mp42'
     || brand === 'avc1'
     || brand.startsWith('3g')
-  ))) formats.add('mp4')
-  if (formats.size !== 1) return undefined
-  const [format] = formats
-  if (format === 'avif') return detected('image', 'image/avif', 'avif')
-  if (format === 'm4a') return detected('audio', 'audio/mp4', 'm4a')
-  if (format === 'quicktime') return detected('video', 'video/quicktime', 'mov')
-  return format === 'mp4' ? detected('video', 'video/mp4', 'mp4') : undefined
+  ))
+  return genericMp4 ? detected('video', 'video/mp4', 'mp4') : undefined
 }
 
 function detectSvg(bytes: Uint8Array): DetectedMedia | undefined {

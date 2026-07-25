@@ -8,7 +8,6 @@ import {
   readdir,
   realpath,
   rename,
-  rm,
 } from 'node:fs/promises'
 import { basename, isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import {
@@ -93,7 +92,7 @@ export interface GeneratedStreamInput extends GeneratedWriterInput {
 export interface MediaAssetService {
   importPaths(input: MediaImportPathsInput): Promise<MediaAsset[]>
   importClipboardImage(input: MediaImportBytesInput): Promise<MediaAsset[]>
-  removeDraft(assetId: string, conversationId?: string): Promise<void>
+  removeDraft(assetId: string, conversationId: string): Promise<void>
   resolveReadyAsset(assetId: string, conversationId?: string): Promise<ResolvedMediaAsset>
   modelInput(conversationId: string, assetIds: string[]): Promise<ModelMediaInput[]>
   createGeneratedWriter(input: GeneratedWriterInput): Promise<GeneratedAssetWriter>
@@ -130,7 +129,6 @@ export interface MediaAssetFileSystem {
   readdir(path: string, options: { withFileTypes: true }): Promise<Dirent[]>
   realpath(path: string): Promise<string>
   rename(source: string, destination: string): Promise<void>
-  rm(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void>
 }
 
 interface StagedMedia {
@@ -162,7 +160,7 @@ function mappedFailure(error: unknown, fallback: AppErrorCode): AppError {
 }
 
 function assertIdentifier(value: string): void {
-  if (!ID_PATTERN.test(value)) throw failure('INVALID_INPUT')
+  if (typeof value !== 'string' || !ID_PATTERN.test(value)) throw failure('INVALID_INPUT')
 }
 
 function displayName(value: string): string {
@@ -252,7 +250,6 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     readdir,
     realpath,
     rename,
-    rm,
     ...options.filesystem,
   }
   let rootPromise: Promise<string> | undefined
@@ -409,39 +406,44 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     return identity
   }
 
-  const restoreQuarantinedSubstitute = async (quarantinePath: string, originalPath: string) => {
-    try {
-      await filesystem.rename(quarantinePath, originalPath)
-    } catch {
-      // The quarantined file is retained rather than deleted if restoration cannot be proven safe.
-    }
+  interface QuarantineLocation {
+    directory: string
+    directoryIdentity: StableFile
+    path: string
+    relativePath: string
   }
 
-  const quarantineAndDelete = async (path: string, expected?: StableFile): Promise<void> => {
-    const originalAncestors = await verifyManagedAncestors(path)
-    const originalIdentity = await verifyManagedFile(path, expected)
+  const newQuarantineLocation = async (): Promise<QuarantineLocation> => {
     const root = await mediaRoot()
-    const quarantineDirectory = join(root, '.quarantine')
-    await filesystem.mkdir(quarantineDirectory, { recursive: true })
-    const quarantineParentIdentity = await verifyManagedDirectory(quarantineDirectory)
-    const quarantinePath = join(quarantineDirectory, `${randomUUID()}.delete`)
+    const directory = join(root, '.quarantine')
+    await filesystem.mkdir(directory, { recursive: true })
+    const directoryIdentity = await verifyManagedDirectory(directory)
+    const path = join(directory, `${randomUUID()}.delete`)
     try {
-      await filesystem.lstat(quarantinePath)
+      await filesystem.lstat(path)
       throw failure('MEDIA_IMPORT_FAILED')
     } catch (error) {
       if (!missing(error)) throw error
     }
-
-    await filesystem.rename(path, quarantinePath)
-    let quarantinedIdentity: StableFile
-    try {
-      quarantinedIdentity = await verifyManagedFile(quarantinePath)
-    } catch (error) {
-      await restoreQuarantinedSubstitute(quarantinePath, path)
-      throw error
+    return {
+      directory,
+      directoryIdentity,
+      path,
+      relativePath: posix.join('.quarantine', basename(path)),
     }
+  }
+
+  const quarantineManagedFile = async (
+    path: string,
+    expected?: StableFile,
+    requestedLocation?: QuarantineLocation,
+  ): Promise<QuarantineLocation> => {
+    const location = requestedLocation ?? await newQuarantineLocation()
+    const originalAncestors = await verifyManagedAncestors(path)
+    const originalIdentity = await verifyManagedFile(path, expected)
+    await filesystem.rename(path, location.path)
+    const quarantinedIdentity = await verifyManagedFile(location.path)
     if (!sameNode(originalIdentity, quarantinedIdentity) || originalIdentity.size !== quarantinedIdentity.size) {
-      await restoreQuarantinedSubstitute(quarantinePath, path)
       throw failure('MEDIA_IMPORT_FAILED')
     }
     try {
@@ -452,49 +454,159 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
     }
     try {
       await reverifyAncestors(originalAncestors)
-      if (!sameNode(quarantineParentIdentity, await verifyManagedDirectory(quarantineDirectory))) {
+      if (!sameNode(location.directoryIdentity, await verifyManagedDirectory(location.directory))) {
         throw failure('MEDIA_IMPORT_FAILED')
       }
-      if (!sameFile(quarantinedIdentity, await verifyManagedFile(quarantinePath))) {
+      if (!sameFile(quarantinedIdentity, await verifyManagedFile(location.path))) {
+        throw failure('MEDIA_IMPORT_FAILED')
+      }
+      if (!sameNode(location.directoryIdentity, await verifyManagedDirectory(location.directory))) {
         throw failure('MEDIA_IMPORT_FAILED')
       }
     } catch (error) {
       throw mappedFailure(error, 'MEDIA_IMPORT_FAILED')
     }
+    return location
+  }
 
-    await filesystem.rm(quarantinePath, { force: true })
+  const restoreCanonicalCopy = async (
+    location: QuarantineLocation,
+    originalPath: string,
+    expected?: StableFile,
+  ): Promise<boolean> => {
+    let source: Awaited<ReturnType<typeof open>> | undefined
+    let destination: Awaited<ReturnType<typeof open>> | undefined
     try {
-      await filesystem.lstat(quarantinePath)
-      throw failure('MEDIA_IMPORT_FAILED')
-    } catch (error) {
-      if (!missing(error)) throw error
-    }
-    if (!sameNode(quarantineParentIdentity, await verifyManagedDirectory(quarantineDirectory))) {
-      throw failure('MEDIA_IMPORT_FAILED')
+      if (!sameNode(location.directoryIdentity, await verifyManagedDirectory(location.directory))) return false
+      const quarantineIdentity = await verifyManagedFile(location.path)
+      if (expected && (!sameNode(expected, quarantineIdentity) || expected.size !== quarantineIdentity.size)) {
+        return false
+      }
+      const originalAncestors = expected ? await verifyManagedAncestors(originalPath) : undefined
+      try {
+        await filesystem.lstat(originalPath)
+        return false
+      } catch (error) {
+        if (!missing(error)) return false
+      }
+
+      source = await filesystem.open(location.path, 'r')
+      const openedSource = snapshot(await source.stat())
+      if (!sameFile(quarantineIdentity, openedSource)) return false
+      destination = await filesystem.open(originalPath, 'wx', 0o600)
+      let byteSize = 0
+      for await (const value of source.createReadStream({ start: 0, autoClose: false })) {
+        const chunk = value as Buffer
+        byteSize += chunk.byteLength
+        await writeAll(destination, chunk)
+      }
+      await destination.sync()
+      const destinationIdentity = snapshot(await destination.stat())
+      await destination.close()
+      destination = undefined
+      await source.close()
+      source = undefined
+      const restoredMetadata = await filesystem.lstat(originalPath)
+      if (restoredMetadata.isSymbolicLink() || !restoredMetadata.isFile()) return false
+      const restoredIdentity = expected
+        ? await verifyManagedFile(originalPath)
+        : snapshot(restoredMetadata)
+      if (originalAncestors) await reverifyAncestors(originalAncestors)
+      return (
+        byteSize === quarantineIdentity.size
+        && destinationIdentity.size === quarantineIdentity.size
+        && sameFile(destinationIdentity, restoredIdentity)
+      )
+    } catch {
+      return false
+    } finally {
+      await destination?.close().catch(() => undefined)
+      await source?.close().catch(() => undefined)
     }
   }
 
   const cleanupManagedFile = async (path: string) => {
     try {
-      await quarantineAndDelete(path)
+      await quarantineManagedFile(path)
     } catch {
-      // Cleanup fails closed. Unverified paths are never passed to a destructive operation.
+      // Task 4 only moves verified files into inaccessible quarantine. Task 5 owns physical purge.
+    }
+  }
+
+  const restoreRecordAfterQuarantineFailure = async (
+    record: MediaAssetRecord,
+    originalPath: string,
+    identity: StableFile,
+    location: QuarantineLocation,
+  ) => {
+    let restored: boolean
+    try {
+      restored = sameFile(identity, await verifyManagedFile(originalPath))
+    } catch {
+      restored = await restoreCanonicalCopy(location, originalPath, identity)
+      if (!restored) await restoreCanonicalCopy(location, originalPath)
+    }
+    try {
+      database.mediaAssets.update(record.id, {
+        status: restored ? record.status : 'failed',
+        relativePath: restored ? record.relativePath : location.relativePath,
+        updatedAt: now(),
+      })
+    } catch {
+      // The pre-move deleting state remains non-ready and points at the quarantine tombstone.
     }
   }
 
   const removeRecordAndFiles = async (record: MediaAssetRecord) => {
-    if (record.relativePath) {
-      const path = await safeAssetPath(record)
-      await quarantineAndDelete(path)
+    if (record.messageId) throw failure('CONFLICT')
+    const originalPath = await safeAssetPath(record)
+    let identity: StableFile
+    try {
+      identity = await verifyManagedFile(originalPath)
+    } catch (error) {
+      if (!missing(error) || (record.status !== 'staging' && record.status !== 'failed')) throw error
+      const deleting = database.mediaAssets.update(record.id, { status: 'deleting', updatedAt: now() })
+      if (!deleting || deleting.messageId || deleting.conversationId !== record.conversationId) {
+        throw failure('CONFLICT')
+      }
+      try {
+        database.mediaAssets.delete(record.id)
+        return
+      } catch (deleteError) {
+        try {
+          database.mediaAssets.update(record.id, { status: 'failed', updatedAt: now() })
+        } catch {
+          // The deleting state is already non-ready.
+        }
+        throw deleteError
+      }
+    }
+
+    const location = await newQuarantineLocation()
+    const deleting = database.mediaAssets.update(record.id, {
+      status: 'deleting',
+      relativePath: location.relativePath,
+      updatedAt: now(),
+    })
+    if (!deleting || deleting.messageId || deleting.conversationId !== record.conversationId) {
+      if (deleting?.messageId) {
+        try {
+          database.mediaAssets.update(record.id, {
+            status: record.status,
+            relativePath: record.relativePath,
+            updatedAt: now(),
+          })
+        } catch {
+          // The claimed row remains non-removable; persistence recovery is external.
+        }
+      }
+      throw failure('CONFLICT')
     }
     try {
+      await quarantineManagedFile(originalPath, identity, location)
       database.mediaAssets.delete(record.id)
     } catch (error) {
-      try {
-        database.mediaAssets.update(record.id, { status: 'failed', updatedAt: now() })
-      } catch {
-        // The original persistence error remains authoritative.
-      }
+      await restoreRecordAfterQuarantineFailure(record, originalPath, identity, location)
       throw error
     }
   }
@@ -802,37 +914,13 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
 
     async removeDraft(assetId, conversationId) {
       assertIdentifier(assetId)
-      if (conversationId !== undefined) assertIdentifier(conversationId)
+      assertIdentifier(conversationId)
       const record = database.mediaAssets.get(assetId)
       if (!record) return
-      if (conversationId !== undefined && record.conversationId !== conversationId) {
-        throw failure('MEDIA_ASSET_UNAVAILABLE')
-      }
-      if (record.messageId) throw failure('CONFLICT')
-      let path: string | undefined
-      let fileDeleted = false
-      try {
-        path = await safeAssetPath(record)
-        const identity = await verifyManagedFile(path)
-        const deleting = database.mediaAssets.update(assetId, { status: 'deleting', updatedAt: now() })
-        if (!deleting || deleting.messageId) throw failure('CONFLICT')
-        await quarantineAndDelete(path, identity)
-        fileDeleted = true
-        database.mediaAssets.delete(assetId)
-      } catch (error) {
-        const current = database.mediaAssets.get(assetId)
-        if (current?.status === 'deleting') {
-          try {
-            database.mediaAssets.update(assetId, {
-              status: fileDeleted ? 'failed' : 'ready',
-              updatedAt: now(),
-            })
-          } catch {
-            // A failed restore remains non-ready rather than authorizing an unsafe delete.
-          }
-        }
+      if (record.conversationId !== conversationId) throw failure('MEDIA_ASSET_UNAVAILABLE')
+      await removeRecordAndFiles(record).catch((error: unknown) => {
         throw mappedFailure(error, 'MEDIA_IMPORT_FAILED')
-      }
+      })
     },
 
     async resolveReadyAsset(assetId, conversationId) {
@@ -1032,7 +1120,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       if (!Number.isFinite(olderThan) || olderThan < 0) throw failure('INVALID_INPUT')
       for (const record of database.mediaAssets.listUnclaimedBefore(olderThan)) {
         try {
-          await service.removeDraft(record.id)
+          await service.removeDraft(record.id, record.conversationId)
         } catch {
           // Cleanup is per-entry: unsafe or raced drafts remain for later recovery.
         }
@@ -1052,7 +1140,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
             try {
               const metadata = await filesystem.lstat(path)
               if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.mtimeMs >= olderThan) continue
-              await quarantineAndDelete(path, snapshot(metadata))
+              await quarantineManagedFile(path, snapshot(metadata))
             } catch {
               // One unsafe or raced orphan must not authorize deletion or block other entries.
             }

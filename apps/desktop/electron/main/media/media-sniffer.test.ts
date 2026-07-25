@@ -15,6 +15,10 @@ const extendedBox = (brand: string) => Buffer.concat([
   ascii(brand),
   Buffer.alloc(12),
 ])
+const ffmpegM4aFtyp = Buffer.from(
+  '0000001c667479704d344120000002004d34412069736f6d69736f32',
+  'hex',
+)
 const oggAudio = (codec: Buffer) => Buffer.concat([
   ascii('OggS'),
   Buffer.from([0, 0x02]),
@@ -40,7 +44,7 @@ describe('detectMediaType', () => {
     ['WAV', Buffer.concat([ascii('RIFF'), Buffer.alloc(4), ascii('WAVEfmt ')]), { kind: 'audio', mimeType: 'audio/wav', extension: 'wav', inlineSafe: true }],
     ['OGG Opus', oggAudio(ascii('OpusHead')), { kind: 'audio', mimeType: 'audio/ogg', extension: 'ogg', inlineSafe: true }],
     ['FLAC', ascii('fLaC'), { kind: 'audio', mimeType: 'audio/flac', extension: 'flac', inlineSafe: true }],
-    ['M4A', box('M4A '), { kind: 'audio', mimeType: 'audio/mp4', extension: 'm4a', inlineSafe: true }],
+    ['M4A', ffmpegM4aFtyp, { kind: 'audio', mimeType: 'audio/mp4', extension: 'm4a', inlineSafe: true }],
     ['MP4', box('isom'), { kind: 'video', mimeType: 'video/mp4', extension: 'mp4', inlineSafe: true }],
     ['WebM', ebml('webm'), { kind: 'video', mimeType: 'video/webm', extension: 'webm', inlineSafe: true }],
     ['QuickTime', box('qt  '), { kind: 'video', mimeType: 'video/quicktime', extension: 'mov', inlineSafe: true }],
@@ -74,6 +78,14 @@ describe('detectMediaType', () => {
       ascii('avif'),
       Buffer.alloc(4),
       ascii('M4A '),
+      Buffer.alloc(4),
+    ])],
+    ['M4A with conflicting AVIF compatibility', Buffer.concat([
+      Buffer.from([0, 0, 0, 24]),
+      ascii('ftyp'),
+      ascii('M4A '),
+      Buffer.alloc(4),
+      ascii('avif'),
       Buffer.alloc(4),
     ])],
   ] as const)('rejects %s', (_label, bytes) => {

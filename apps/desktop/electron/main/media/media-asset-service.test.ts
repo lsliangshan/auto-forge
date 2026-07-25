@@ -693,12 +693,12 @@ describe('MediaAssetService ready assets', () => {
     insertReadyAsset('asset_escape')
     const service = createMediaAssetService({ database, mediaRoot })
 
-    await expect(service.removeDraft('asset_escape')).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
+    await expect(service.removeDraft('asset_escape', 'conversation_1')).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
     expect(await readFile(outsideVictim)).toEqual(png)
     expect(database.mediaAssets.get('asset_escape')).toMatchObject({ status: 'ready' })
   })
 
-  it('restores an outside target and retains the row when the conversation parent is swapped at quarantine', async () => {
+  it('restores an outside target and leaves the asset row non-ready when the conversation parent is swapped', async () => {
     await mkdir(mediaRoot, { recursive: true })
     const canonicalMediaRoot = await realpath(mediaRoot)
     const conversationPath = join(canonicalMediaRoot, 'conversation_1')
@@ -726,13 +726,68 @@ describe('MediaAssetService ready assets', () => {
       },
     })
 
-    await expect(service.removeDraft('asset_swap')).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
+    await expect(service.removeDraft('asset_swap', 'conversation_1')).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
     expect(await readFile(outsideVictim)).toEqual(Buffer.from('outside-victim'))
     expect(await readFile(join(parkedConversation, 'asset_swap.png'))).toEqual(png)
-    expect(database.mediaAssets.get('asset_swap')).toMatchObject({ status: 'ready' })
+    expect(database.mediaAssets.get('asset_swap')).toMatchObject({
+      status: 'failed',
+      relativePath: expect.stringMatching(/^\.quarantine\/.+\.delete$/),
+    })
   })
 
-  it('restores a substituted target and retains the original managed file', async () => {
+  it('retains a quarantine tombstone and never deletes an outside victim after the final parent check is swapped', async () => {
+    await mkdir(mediaRoot, { recursive: true })
+    const canonicalMediaRoot = await realpath(mediaRoot)
+    const conversationPath = join(canonicalMediaRoot, 'conversation_1')
+    const stagingPath = join(conversationPath, '.staging')
+    const canonicalAsset = join(conversationPath, 'asset_final_swap.png')
+    const quarantineDirectory = join(canonicalMediaRoot, '.quarantine')
+    const parkedQuarantine = join(canonicalMediaRoot, '.quarantine-parked')
+    const outside = join(root, 'outside-final-quarantine-swap')
+    await mkdir(stagingPath, { recursive: true })
+    await mkdir(outside, { recursive: true })
+    await writeFile(canonicalAsset, png)
+    insertReadyAsset('asset_final_swap')
+    let quarantinePath = ''
+    let quarantineFileChecks = 0
+    let outsideVictim = ''
+    const service = createMediaAssetService({
+      database,
+      mediaRoot,
+      filesystem: {
+        rename: async (source, destination) => {
+          if (source === canonicalAsset) quarantinePath = destination
+          await rename(source, destination)
+        },
+        realpath: async (path) => {
+          const canonical = await realpath(path)
+          if (quarantinePath && path === quarantinePath) {
+            quarantineFileChecks += 1
+            if (quarantineFileChecks === 2) {
+              await rename(quarantineDirectory, parkedQuarantine)
+              await symlink(outside, quarantineDirectory)
+              outsideVictim = join(outside, basename(quarantinePath))
+              await writeFile(outsideVictim, 'outside-victim')
+            }
+          }
+          return canonical
+        },
+      },
+    })
+
+    await expect(service.removeDraft('asset_final_swap', 'conversation_1'))
+      .rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
+    expect(quarantineFileChecks).toBe(2)
+    expect(await readFile(outsideVictim, 'utf8')).toBe('outside-victim')
+    expect(await exists(canonicalAsset)).toBe(false)
+    expect(await readFile(join(parkedQuarantine, basename(quarantinePath)))).toEqual(png)
+    expect(database.mediaAssets.get('asset_final_swap')).toMatchObject({
+      status: 'failed',
+      relativePath: `.quarantine/${basename(quarantinePath)}`,
+    })
+  })
+
+  it('restores a substituted target and leaves the lost-identity asset row non-ready', async () => {
     await mkdir(mediaRoot, { recursive: true })
     const canonicalMediaRoot = await realpath(mediaRoot)
     const conversationPath = join(canonicalMediaRoot, 'conversation_1')
@@ -758,10 +813,13 @@ describe('MediaAssetService ready assets', () => {
       },
     })
 
-    await expect(service.removeDraft('asset_substitute')).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
+    await expect(service.removeDraft('asset_substitute', 'conversation_1')).rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
     expect(await readFile(parked)).toEqual(png)
     expect(await readFile(target, 'utf8')).toBe('substitute')
-    expect(database.mediaAssets.get('asset_substitute')).toMatchObject({ status: 'ready' })
+    expect(database.mediaAssets.get('asset_substitute')).toMatchObject({
+      status: 'failed',
+      relativePath: expect.stringMatching(/^\.quarantine\/.+\.delete$/),
+    })
   })
 
   it('does not follow a swapped conversation parent while cleaning orphan staging files', async () => {
@@ -828,7 +886,7 @@ describe('MediaAssetService ready assets', () => {
       mediaRoot,
     })
 
-    await expect(service.removeDraft('asset_claim_race')).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(service.removeDraft('asset_claim_race', 'conversation_1')).rejects.toMatchObject({ code: 'CONFLICT' })
     expect(database.mediaAssets.get('asset_claim_race')).toMatchObject({
       status: 'ready',
       messageId: 'message_asset_claim_race',
@@ -856,7 +914,28 @@ describe('MediaAssetService ready assets', () => {
     expect(await readFile(join(mediaRoot, 'conversation_2', 'asset_other_draft.png'))).toEqual(png)
   })
 
-  it('marks a removed draft failed when its database delete fails', async () => {
+  it('rejects draft removal when the conversation context is omitted', async () => {
+    database.conversations.insert({ id: 'conversation_2', title: 'Other' })
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_context_required' })
+    await service.importClipboardImage({
+      conversationId: 'conversation_2',
+      existingAssetIds: [],
+      bytes: png,
+      mimeType: 'image/png',
+      name: 'owned.png',
+    })
+    const removeWithoutConversation = service.removeDraft as unknown as (assetId: string) => Promise<void>
+
+    await expect(removeWithoutConversation('asset_context_required'))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(database.mediaAssets.get('asset_context_required')).toMatchObject({
+      conversationId: 'conversation_2',
+      status: 'ready',
+    })
+    expect(await readFile(join(mediaRoot, 'conversation_2', 'asset_context_required.png'))).toEqual(png)
+  })
+
+  it('restores canonical bytes and the ready row when database deletion fails', async () => {
     const importer = createMediaAssetService({ database, mediaRoot, id: () => 'asset_remove_delete_failure' })
     await importer.importClipboardImage({
       conversationId: 'conversation_1',
@@ -878,10 +957,13 @@ describe('MediaAssetService ready assets', () => {
       mediaRoot,
     })
 
-    await expect(service.removeDraft('asset_remove_delete_failure'))
+    await expect(service.removeDraft('asset_remove_delete_failure', 'conversation_1'))
       .rejects.toMatchObject({ code: 'MEDIA_IMPORT_FAILED' })
-    expect(database.mediaAssets.get('asset_remove_delete_failure')).toMatchObject({ status: 'failed' })
-    expect(await exists(join(mediaRoot, 'conversation_1', 'asset_remove_delete_failure.png'))).toBe(false)
+    expect(database.mediaAssets.get('asset_remove_delete_failure')).toMatchObject({
+      status: 'ready',
+      relativePath: 'conversation_1/asset_remove_delete_failure.png',
+    })
+    expect(await readFile(join(mediaRoot, 'conversation_1', 'asset_remove_delete_failure.png'))).toEqual(png)
   })
 
   it('cleans safe drafts while retaining a symlink-substituted entry and its outside target', async () => {
@@ -906,6 +988,35 @@ describe('MediaAssetService ready assets', () => {
     expect(await readFile(outside, 'utf8')).toBe('outside')
     expect(database.mediaAssets.get('asset_unsafe_cleanup')).toMatchObject({ status: 'ready' })
     expect(database.mediaAssets.get('asset_safe_cleanup')).toBeUndefined()
+  })
+
+  it.each(['staging', 'failed'] as const)('removes a stale %s row whose final file is missing', async (status) => {
+    const stagingPath = join(mediaRoot, 'conversation_1', '.staging')
+    const assetId = `asset_${status}_missing`
+    const orphanPath = join(stagingPath, `${status}-before-rename.part`)
+    await mkdir(stagingPath, { recursive: true })
+    await writeFile(orphanPath, png)
+    await utimes(orphanPath, new Date(1), new Date(1))
+    database.mediaAssets.insert({
+      id: assetId,
+      conversationId: 'conversation_1',
+      source: 'upload',
+      kind: 'image',
+      originalName: 'crash.png',
+      relativePath: `conversation_1/${assetId}.png`,
+      status,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const service = createMediaAssetService({ database, mediaRoot })
+
+    await service.cleanupDrafts(100)
+
+    expect(database.mediaAssets.get(assetId)).toBeUndefined()
+    expect(await exists(orphanPath)).toBe(false)
+    const tombstones = await readdir(join(mediaRoot, '.quarantine'))
+    expect(tombstones).toHaveLength(1)
+    expect(await readFile(join(mediaRoot, '.quarantine', tombstones[0]!))).toEqual(png)
   })
 
   it('rejects an over-limit model request before reading or encoding any asset', async () => {

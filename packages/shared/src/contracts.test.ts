@@ -90,6 +90,23 @@ describe('cross-process contracts', () => {
     expect(() => mediaAssetSchema.parse({ ...asset, base64: 'c2VjcmV0' })).toThrow()
   })
 
+  it('requires exact conversation ownership for public draft removal', () => {
+    const schema = ipcRequestSchemas[ipcChannels.mediaRemoveDraft]
+    expect(schema.parse({
+      conversationId: 'conversation_1',
+      assetId: 'asset_1',
+    })).toEqual({
+      conversationId: 'conversation_1',
+      assetId: 'asset_1',
+    })
+    expect(() => schema.parse({ assetId: 'asset_1' })).toThrow()
+    expect(() => schema.parse({
+      conversationId: 'conversation_1',
+      assetId: 'asset_1',
+      extra: true,
+    })).toThrow()
+  })
+
   it('applies only the documented generation defaults', () => {
     expect(generationOptionsSchema.parse({
       image: { count: 1 },

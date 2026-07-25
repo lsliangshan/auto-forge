@@ -61,6 +61,12 @@ export const mediaImportContextSchema = z.object({
 }).strict()
 export type MediaImportContext = z.infer<typeof mediaImportContextSchema>
 
+export const mediaRemoveDraftRequestSchema = z.object({
+  conversationId: identifierSchema,
+  assetId: identifierSchema,
+}).strict()
+export type MediaRemoveDraftRequest = z.infer<typeof mediaRemoveDraftRequestSchema>
+
 export const conversationGenerationPreferencesSchema = z.object({
   outputType: outputTypeSchema,
   models: z.object({
@@ -512,7 +518,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.mediaPickFiles]: mediaImportContextSchema,
   [ipcChannels.mediaImportDroppedFiles]: importDroppedFilesRequestSchema,
   [ipcChannels.mediaImportClipboardImage]: mediaImportContextSchema,
-  [ipcChannels.mediaRemoveDraft]: mediaAssetRequestSchema,
+  [ipcChannels.mediaRemoveDraft]: mediaRemoveDraftRequestSchema,
   [ipcChannels.mediaSaveCopy]: mediaAssetRequestSchema,
   [ipcChannels.mediaReveal]: mediaAssetRequestSchema,
   [ipcChannels.mediaPauseVideoJob]: mediaGenerationJobRequestSchema,
@@ -619,7 +625,7 @@ export interface DesktopAPI {
     pickFiles(context: MediaImportContext): Promise<MediaAsset[]>
     importDroppedFiles(context: MediaImportContext, files: readonly File[]): Promise<MediaAsset[]>
     importClipboardImage(context: MediaImportContext): Promise<MediaAsset[]>
-    removeDraft(assetId: string): Promise<void>
+    removeDraft(input: MediaRemoveDraftRequest): Promise<void>
     saveCopy(assetId: string): Promise<void>
     reveal(assetId: string): Promise<void>
     pauseVideoJob(jobId: string): Promise<void>
