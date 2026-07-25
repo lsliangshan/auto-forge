@@ -152,6 +152,168 @@ describe('OpenRouterProvider', () => {
     expect(events).toContainEqual({ type: 'usage', inputTokens: 7, outputTokens: 3, totalTokens: 10, costUsd: '0.001' })
   })
 
+  it('converts verified image, audio, and video content and requests audio output', async () => {
+    const fetch = vi.fn(async (...request: Parameters<typeof globalThis.fetch>) => {
+      void request
+      return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      ])
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await collect(provider.stream({
+      model: 'audio-model',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '描述这些媒体' },
+          { type: 'media', kind: 'image', mimeType: 'image/png', dataBase64: 'iVBORw==' },
+          { type: 'media', kind: 'audio', mimeType: 'audio/mpeg', dataBase64: 'AQID' },
+          { type: 'media', kind: 'video', mimeType: 'video/mp4', dataBase64: 'AAAA' },
+        ],
+      }],
+      output: { type: 'audio', voice: 'alloy', format: 'mp3' },
+    }))
+
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({
+      model: 'audio-model',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '描述这些媒体' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw==' } },
+          { type: 'input_audio', input_audio: { data: 'AQID', format: 'mp3' } },
+          { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
+        ],
+      }],
+      stream: true,
+      stream_options: { include_usage: true },
+      modalities: ['text', 'audio'],
+      audio: { voice: 'alloy', format: 'mp3' },
+    })
+  })
+
+  it.each([
+    ['an image part with audio MIME', { kind: 'image', mimeType: 'audio/mpeg' }],
+    ['an audio part with an unsupported MIME', { kind: 'audio', mimeType: 'audio/aac' }],
+    ['a video part with image MIME', { kind: 'video', mimeType: 'image/png' }],
+  ] as const)('rejects %s before fetching', async (_description, media) => {
+    const fetch = vi.fn(async () => sseResponse([]))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(collect(provider.stream({
+      model: 'media-model',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'media', ...media, dataBase64: 'AQID' }],
+      }],
+    }))).rejects.toMatchObject({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['audio/mpeg', 'mp3'],
+    ['audio/wav', 'wav'],
+    ['audio/ogg', 'ogg'],
+    ['audio/flac', 'flac'],
+    ['audio/mp4', 'm4a'],
+  ] as const)('maps verified %s input to exact %s wire format', async (mimeType, format) => {
+    const bodies: unknown[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        return sseResponse([
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        ])
+      }),
+    })
+
+    await collect(provider.stream({
+      model: 'audio-model',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'media', kind: 'audio', mimeType, dataBase64: 'AQID' }],
+      }],
+    }))
+
+    expect(bodies).toEqual([
+      expect.objectContaining({
+        messages: [{
+          role: 'user',
+          content: [{ type: 'input_audio', input_audio: { data: 'AQID', format } }],
+        }],
+      }),
+    ])
+  })
+
+  it('emits audio chunks in stream order while preserving text and usage events', async () => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => sseResponse([
+        'data: {"id":"audio_1","choices":[{"index":0,"delta":{"audio":{"data":"AQI=","transcript":"你"}}}]}\n\n',
+        'data: {"choices":[{"index":0,"delta":{"content":"文本","audio":{"data":"AwQ=","transcript":"好"}},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}\n\n',
+        'data: [DONE]\n\n',
+      ])),
+    })
+
+    const result = await collect(provider.stream({
+      model: 'audio-model',
+      messages: [{ role: 'user', content: '朗读' }],
+      output: { type: 'audio', format: 'wav' },
+    }))
+
+    expect(result).toEqual([
+      { type: 'generation', id: 'audio_1' },
+      { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AQI=', transcript: '你' },
+      { type: 'text_delta', choiceIndex: 0, text: '文本' },
+      { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AwQ=', transcript: '好' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      { type: 'usage', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+    ])
+  })
+
+  it('suppresses replayed audio chunks while preserving new chunks after a retry', async () => {
+    let attempt = 0
+    const provider = new OpenRouterProvider({
+      credential,
+      sleep: async () => undefined,
+      fetch: vi.fn(async () => {
+        attempt += 1
+        if (attempt === 1) {
+          const encoder = new TextEncoder()
+          let emitted = false
+          return new Response(new ReadableStream({
+            pull(controller) {
+              if (!emitted) {
+                emitted = true
+                controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}\n\n'))
+              } else {
+                controller.error(new TypeError('socket closed'))
+              }
+            },
+          }))
+        }
+        return sseResponse([
+          'data: {"choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}\n\n',
+          'data: {"choices":[{"index":0,"delta":{"audio":{"data":"AwQ="}},"finish_reason":"stop"}]}\n\n',
+          'data: [DONE]\n\n',
+        ])
+      }),
+    })
+
+    const result = await collect(provider.stream({
+      model: 'audio-model',
+      messages: [{ role: 'user', content: '朗读' }],
+      output: { type: 'audio', format: 'wav' },
+    }))
+
+    expect(result.filter((event) => event.type === 'audio_delta')).toEqual([
+      { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AQI=' },
+      { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AwQ=' },
+    ])
+  })
+
   it('merges stable capability metadata by exact model ID without dropping media-only models', async () => {
     const calls: Array<{ url: string; authorization?: string }> = []
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

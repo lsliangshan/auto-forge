@@ -404,6 +404,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           void agent.run({
             conversationId: input.conversationId,
             content: input.content,
+            userBlocks: [{ type: 'text', text: input.content }],
+            modelContent: input.content,
+            assetIds: [],
+            allowTools: true,
             provider: snapshot.activeProvider,
             model,
             requestId,

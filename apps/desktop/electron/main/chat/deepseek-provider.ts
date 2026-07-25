@@ -55,6 +55,8 @@ export class DeepSeekProvider extends OpenAiCompatibleProvider {
       modelsEndpoint: MODELS_ENDPOINT,
       parseModels: parseDeepSeekModels,
       includeUsageStreamOption: false,
+      supportsMediaInput: false,
+      supportsAudioOutput: false,
     }, {
       ...dependencies,
       credential: { get: () => dependencies.credential.get('deepseek_api_key') },

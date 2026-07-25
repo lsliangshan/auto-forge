@@ -41,6 +41,8 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       ],
       mergeModels: mergeOpenRouterModels,
       includeUsageStreamOption: true,
+      supportsMediaInput: true,
+      supportsAudioOutput: true,
     }, {
       ...dependencies,
       credential: { get: () => dependencies.credential.get('openrouter_api_key') },

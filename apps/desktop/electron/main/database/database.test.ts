@@ -66,7 +66,8 @@ function readyVideoAsset(id: string, conversationId: string) {
   }
 }
 
-type ReadyAssetFixture = ReturnType<typeof readyAsset> & {
+type ReadyAssetFixture = Omit<ReturnType<typeof readyAsset>, 'source'> & {
+  source: 'upload' | 'generated'
   width?: number
   height?: number
   durationMs?: number

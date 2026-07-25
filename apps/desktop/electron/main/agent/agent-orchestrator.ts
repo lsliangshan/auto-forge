@@ -15,6 +15,7 @@ import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from
 import { retrieveWorkflows } from '../workflows/retriever.js'
 import type { AppRepositories } from '../database/repositories.js'
 import type {
+  ModelContentPart,
   ModelMessage,
   ModelStreamEvent,
   ModelStreamRequest,
@@ -58,7 +59,8 @@ export interface AgentExecutionPort {
 export interface PersistUserInput {
   messageId: string
   conversationId: string
-  content: string
+  blocks: ChatBlock[]
+  assetIds: string[]
   createdAt: number
 }
 
@@ -104,13 +106,13 @@ export function createAgentPersistence(
 ): AgentPersistencePort {
   return {
     persistUser(input) {
-      repositories.messages.insert({
+      repositories.messages.insertWithAssets({
         id: input.messageId,
         conversationId: input.conversationId,
         role: 'user',
-        blocks: [{ type: 'text', text: input.content }],
+        blocks: input.blocks,
         createdAt: input.createdAt,
-      })
+      }, input.assetIds)
     },
     createRun(input) {
       repositories.chatRuns.insert({
@@ -165,6 +167,10 @@ export interface AgentOrchestratorDependencies {
 export interface AgentRunInput {
   conversationId: string
   content: string
+  userBlocks: ChatBlock[]
+  modelContent: string | ModelContentPart[]
+  assetIds: string[]
+  allowTools: boolean
   provider: ModelProviderId
   model: string
   requestId?: string
@@ -264,7 +270,8 @@ export class AgentOrchestrator {
     this.dependencies.persistence.persistUser({
       messageId: userMessageId,
       conversationId: input.conversationId,
-      content: input.content,
+      blocks: input.userBlocks,
+      assetIds: input.assetIds,
       createdAt: startedAt,
     })
     this.dependencies.persistence.createRun({
@@ -289,7 +296,7 @@ export class AgentOrchestrator {
       provider,
       model: input.model,
       blocks: [],
-      messages: [{ role: 'user', content: input.content }],
+      messages: [{ role: 'user', content: input.modelContent }],
       tools: [],
       workflows: new Map(),
       controller: new AbortController(),
@@ -298,16 +305,18 @@ export class AgentOrchestrator {
       cancelled: false,
     }
     this.activeByRequest.set(requestId, active)
-    try {
-      const candidates = this.retrieve(
-        input.content,
-        await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
-        RETRIEVAL_LIMIT,
-      )
-      active.tools = candidates.map(manifestTool)
-      active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
-    } catch (error) {
-      return this.finish(active, 'failed', asAppError(error))
+    if (input.allowTools) {
+      try {
+        const candidates = this.retrieve(
+          input.content,
+          await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
+          RETRIEVAL_LIMIT,
+        )
+        active.tools = candidates.map(manifestTool)
+        active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
+      } catch (error) {
+        return this.finish(active, 'failed', asAppError(error))
+      }
     }
     return this.driveExclusive(active)
   }

@@ -117,4 +117,35 @@ describe('DeepSeekProvider', () => {
     })
     expect(JSON.stringify(events)).not.toContain('private chain')
   })
+
+  it.each([
+    {
+      name: 'media input',
+      request: {
+        model: 'deepseek-v4-pro',
+        messages: [{
+          role: 'user' as const,
+          content: [{ type: 'media' as const, kind: 'image' as const, mimeType: 'image/png', dataBase64: 'AQID' }],
+        }],
+      },
+    },
+    {
+      name: 'audio output',
+      request: {
+        model: 'deepseek-v4-pro',
+        messages: [{ role: 'user' as const, content: '朗读' }],
+        output: { type: 'audio' as const, format: 'mp3' },
+      },
+    },
+  ])('rejects $name locally before reading credentials or fetching', async ({ request }) => {
+    const credential = { get: vi.fn(async () => 'sk-deepseek-private') }
+    const fetch = vi.fn(async () => sseResponse([]))
+    const provider = new DeepSeekProvider({ credential, fetch })
+
+    await expect(collect(provider.stream(request))).rejects.toMatchObject({
+      code: 'MODEL_MODALITY_UNSUPPORTED',
+    })
+    expect(credential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
 })

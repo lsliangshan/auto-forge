@@ -1,6 +1,7 @@
 import { createParser } from 'eventsource-parser'
 import { z } from 'zod'
 import { toSafeAppError, type AppError, type ModelInfo } from '@autoforge/shared'
+import type { ModelMediaInput } from '../media/media-asset-service.js'
 
 const MAX_ATTEMPTS = 4
 const MAX_RETRY_AFTER_MS = 5_000
@@ -15,8 +16,12 @@ const MAX_MODEL_NAME_LENGTH = 512
 const MAX_CAPABILITY_VALUE_LENGTH = 128
 const MAX_IMAGE_COUNT = 10
 
+export type ModelContentPart =
+  | { type: 'text'; text: string }
+  | ({ type: 'media' } & Pick<ModelMediaInput, 'kind' | 'mimeType' | 'dataBase64'>)
+
 export type ModelMessage =
-  | { role: 'system' | 'user'; content: string }
+  | { role: 'system' | 'user'; content: string | ModelContentPart[] }
   | { role: 'assistant'; content: string | null; tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> }
   | { role: 'tool'; content: string; tool_call_id: string }
 
@@ -29,6 +34,7 @@ export interface ModelStreamRequest {
   model: string
   messages: ModelMessage[]
   tools?: ModelTool[]
+  output?: { type: 'text' } | { type: 'audio'; voice?: string; format: string }
   signal?: AbortSignal
 }
 
@@ -38,6 +44,7 @@ export type ModelStreamEvent =
   | { type: 'tool_call'; choiceIndex: number; index: number; id: string; name: string; arguments: unknown }
   | { type: 'finish'; choiceIndex: number; reason: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; costUsd?: string }
+  | { type: 'audio_delta'; choiceIndex: number; dataBase64: string; transcript?: string }
 
 export interface ModelProvider {
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>
@@ -62,6 +69,8 @@ export interface OpenAiCompatibleProviderConfig {
   }>
   mergeModels?(general: ModelInfo[], optional: ModelInfo[][]): ModelInfo[]
   includeUsageStreamOption: boolean
+  supportsMediaInput: boolean
+  supportsAudioOutput: boolean
 }
 
 export interface OpenAiCompatibleProviderDependencies {
@@ -149,6 +158,10 @@ const streamChunkSchema = z.object({
     index: z.number().int().nonnegative(),
     delta: z.object({
       content: z.string().nullable().optional(),
+      audio: z.object({
+        data: z.string().min(1),
+        transcript: z.string().optional(),
+      }).passthrough().optional(),
       tool_calls: z.array(z.object({
         index: z.number().int().nonnegative(),
         id: z.string().optional(),
@@ -532,10 +545,73 @@ interface ToolAccumulator {
 
 interface ReplayState {
   text: Map<number, string>
+  audio: Map<number, Array<{ dataBase64: string; transcript?: string }>>
   generations: Set<string>
   tools: Set<string>
   finishes: Set<string>
   usages: Set<string>
+}
+
+const IMAGE_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'image/avif',
+  'image/svg+xml',
+])
+const AUDIO_FORMAT_BY_MIME = new Map([
+  ['audio/mpeg', 'mp3'],
+  ['audio/wav', 'wav'],
+  ['audio/ogg', 'ogg'],
+  ['audio/flac', 'flac'],
+  ['audio/mp4', 'm4a'],
+])
+const VIDEO_MIME_TYPES = new Set([
+  'video/mp4',
+  'video/quicktime',
+  'video/webm',
+])
+
+function assertSupportedRequest(request: ModelStreamRequest, config: OpenAiCompatibleProviderConfig): void {
+  if (request.output?.type === 'audio' && !config.supportsAudioOutput) {
+    throw failure('MODEL_MODALITY_UNSUPPORTED')
+  }
+  for (const message of request.messages) {
+    if (typeof message.content === 'string' || message.content === null) continue
+    for (const part of message.content) {
+      if (part.type !== 'media') continue
+      if (!config.supportsMediaInput) throw failure('MODEL_MODALITY_UNSUPPORTED')
+      const compatible = part.kind === 'image'
+        ? IMAGE_MIME_TYPES.has(part.mimeType)
+        : part.kind === 'audio'
+          ? AUDIO_FORMAT_BY_MIME.has(part.mimeType)
+          : VIDEO_MIME_TYPES.has(part.mimeType)
+      if (!compatible) throw failure('MODEL_MODALITY_UNSUPPORTED')
+    }
+  }
+}
+
+function wireContentPart(part: ModelContentPart): unknown {
+  if (part.type === 'text') return part
+  if (part.kind === 'image') {
+    return { type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
+  }
+  if (part.kind === 'audio') {
+    return {
+      type: 'input_audio',
+      input_audio: { data: part.dataBase64, format: AUDIO_FORMAT_BY_MIME.get(part.mimeType)! },
+    }
+  }
+  return { type: 'video_url', video_url: { url: `data:${part.mimeType};base64,${part.dataBase64}` } }
+}
+
+function wireMessages(messages: ModelMessage[]): unknown[] {
+  return messages.map((message) => (
+    'content' in message && Array.isArray(message.content)
+      ? { ...message, content: message.content.map(wireContentPart) }
+      : message
+  ))
 }
 
 export class OpenAiCompatibleProvider implements ModelProvider {
@@ -591,21 +667,34 @@ export class OpenAiCompatibleProvider implements ModelProvider {
   }
 
   async *stream(request: ModelStreamRequest): AsyncGenerator<ModelStreamEvent> {
+    assertSupportedRequest(request, this.config)
     const replay: ReplayState = {
-      text: new Map(), generations: new Set(), tools: new Set(), finishes: new Set(), usages: new Set(),
+      text: new Map(), audio: new Map(), generations: new Set(), tools: new Set(), finishes: new Set(), usages: new Set(),
     }
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       try {
         const secret = await this.secret()
-        const body = JSON.stringify({
-          model: request.model,
-          messages: request.messages,
-          ...(request.tools?.length ? { tools: request.tools } : {}),
-          stream: true,
-          ...(this.config.includeUsageStreamOption ? { stream_options: { include_usage: true } } : {}),
-        })
         let response: Response
+        let body: string | undefined
+        let messages: unknown[] | undefined
         try {
+          messages = wireMessages(request.messages)
+          body = JSON.stringify({
+            model: request.model,
+            messages,
+            ...(request.tools?.length ? { tools: request.tools } : {}),
+            stream: true,
+            ...(this.config.includeUsageStreamOption ? { stream_options: { include_usage: true } } : {}),
+            ...(request.output?.type === 'audio'
+              ? {
+                  modalities: ['text', 'audio'],
+                  audio: {
+                    ...(request.output.voice === undefined ? {} : { voice: request.output.voice }),
+                    format: request.output.format,
+                  },
+                }
+              : {}),
+          })
           response = await this.fetch(this.config.chatEndpoint, {
             method: 'POST',
             headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
@@ -616,6 +705,9 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           if (isAbort(error, request.signal)) throw failure('CANCELLED')
           if (error instanceof TypeError) throw new RetryableFailure(undefined, error)
           throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+        } finally {
+          body = undefined
+          messages = undefined
         }
         if (response.status === 429 || response.status >= 500) {
           await this.readDiagnostic('chat', response)
@@ -725,6 +817,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     if (!response.body) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
     const pending: ModelStreamEvent[] = []
     const attemptText = new Map<number, string>()
+    const attemptAudio = new Map<number, Array<{ dataBase64: string; transcript?: string }>>()
     const tools = new Map<string, ToolAccumulator>()
     let parserError: unknown
     let done = false
@@ -759,6 +852,27 @@ export class OpenAiCompatibleProvider implements ModelProvider {
               const suffix = cumulative.slice(delivered.length)
               replay.text.set(choice.index, cumulative)
               pending.push({ type: 'text_delta', choiceIndex: choice.index, text: suffix })
+            }
+          }
+          if (choice.delta.audio) {
+            const audio = {
+              dataBase64: choice.delta.audio.data,
+              ...(choice.delta.audio.transcript === undefined ? {} : { transcript: choice.delta.audio.transcript }),
+            }
+            const attemptChunks = attemptAudio.get(choice.index) ?? []
+            attemptChunks.push(audio)
+            attemptAudio.set(choice.index, attemptChunks)
+            const delivered = replay.audio.get(choice.index) ?? []
+            const chunkIndex = attemptChunks.length - 1
+            const previous = delivered[chunkIndex]
+            if (previous && (previous.dataBase64 !== audio.dataBase64 || previous.transcript !== audio.transcript)) {
+              parserError = new Error('Model provider retry replay diverged')
+              return
+            }
+            if (!previous) {
+              delivered.push(audio)
+              replay.audio.set(choice.index, delivered)
+              pending.push({ type: 'audio_delta', choiceIndex: choice.index, ...audio })
             }
           }
           for (const fragment of choice.delta.tool_calls ?? []) {
