@@ -18,6 +18,12 @@ function services(): DesktopIpcServices {
       deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'request_1' }),
       cancel: vi.fn(),
+      getGenerationPreferences: vi.fn(),
+      updateGenerationPreferences: vi.fn(),
+    },
+    media: {
+      pickFiles: vi.fn(), importDroppedFiles: vi.fn(), importClipboardImage: vi.fn(), removeDraft: vi.fn(),
+      saveCopy: vi.fn(), reveal: vi.fn(), pauseVideoJob: vi.fn(), resumeVideoJob: vi.fn(),
     },
     workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
     developer: {
@@ -99,6 +105,45 @@ describe('registerDesktopIpc', () => {
     await expect(app.invokeFrom('https://attacker.invalid/', ipcChannels.settingsGet))
       .rejects.toMatchObject({ code: 'UNTRUSTED_SENDER' })
     expect(app.dependencies.settings.get).not.toHaveBeenCalled()
+  })
+
+  it('validates fixed media and generation-preference requests before invoking services', async () => {
+    const app = harness()
+    const preferences = {
+      outputType: 'auto', models: {},
+      generation: {
+        image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+        audio: { format: 'mp3' },
+        video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      },
+    } as const
+    vi.mocked(app.dependencies.chat.getGenerationPreferences).mockResolvedValue(preferences)
+    vi.mocked(app.dependencies.chat.updateGenerationPreferences).mockResolvedValue(preferences)
+
+    await app.invoke(ipcChannels.mediaRemoveDraft, { conversationId: 'conversation_1', assetId: 'asset_1' })
+    await app.invoke(ipcChannels.chatGetGenerationPreferences, { conversationId: 'conversation_1' })
+    await app.invoke(ipcChannels.chatUpdateGenerationPreferences, { conversationId: 'conversation_1', preferences })
+
+    expect(app.dependencies.media.removeDraft).toHaveBeenCalledWith({ conversationId: 'conversation_1', assetId: 'asset_1' })
+    expect(app.dependencies.chat.getGenerationPreferences).toHaveBeenCalledWith('conversation_1')
+    expect(app.dependencies.chat.updateGenerationPreferences).toHaveBeenCalledWith('conversation_1', preferences)
+    await expect(app.invoke(ipcChannels.mediaImportDroppedFiles, {
+      conversationId: 'conversation_1', existingAssetIds: [], paths: Array.from({ length: 6 }, (_, index) => `/private/${index}.png`),
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(app.invoke(ipcChannels.chatUpdateGenerationPreferences, {
+      conversationId: 'conversation_1', preferences: { ...preferences, unexpected: true },
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+  })
+
+  it('rejects media operations from an iframe and never returns raw service failures', async () => {
+    const app = harness()
+    vi.mocked(app.dependencies.media.reveal).mockRejectedValueOnce(new Error('/private/asset.png unavailable'))
+
+    await expect(app.invokeFrom('http://127.0.0.1:5173/iframe', ipcChannels.mediaReveal, { assetId: 'asset_1' }))
+      .rejects.toMatchObject({ code: 'UNTRUSTED_SENDER' })
+    const failure = await app.invoke(ipcChannels.mediaReveal, { assetId: 'asset_1' }).catch((error) => error)
+    expect(failure).toMatchObject({ code: 'INTERNAL_ERROR' })
+    expect(JSON.stringify(failure)).not.toContain('/private/asset.png')
   })
 
   it('rejects a production file sender with an injected authority while allowing route hashes', async () => {

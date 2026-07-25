@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url'
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   safeStorage,
@@ -74,6 +75,29 @@ function initialize(): ApplicationRuntime {
         : await dialog.showOpenDialog(dialogOptions)
       return result.canceled ? undefined : result.filePaths[0]
     },
+    chooseMediaFiles: async (remainingSlots) => {
+      const dialogOptions: OpenDialogOptions = {
+        title: '选择媒体文件',
+        properties: ['openFile', 'multiSelections'],
+        filters: [{ name: 'Media', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'mp4', 'webm', 'mov'] }],
+      }
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+        : await dialog.showOpenDialog(dialogOptions)
+      return result.canceled ? [] : result.filePaths.slice(0, remainingSlots)
+    },
+    readClipboardImage: () => {
+      const image = clipboard.readImage()
+      if (image.isEmpty()) return undefined
+      return { bytes: image.toPNG(), mimeType: 'image/png', name: 'clipboard.png' }
+    },
+    chooseMediaSavePath: async (defaultName) => {
+      const result = mainWindow
+        ? await dialog.showSaveDialog(mainWindow, { defaultPath: defaultName })
+        : await dialog.showSaveDialog({ defaultPath: defaultName })
+      return result.canceled ? undefined : result.filePath
+    },
+    revealPath: (path) => { shell.showItemInFolder(path) },
     openExternal: (url) => shell.openExternal(url),
     emitChat: (event) => {
       const parsed = chatEventSchema.safeParse(event)

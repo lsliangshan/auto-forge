@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   chatBlockSchema,
+  conversationGenerationPreferencesSchema,
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
@@ -32,6 +33,7 @@ import type { Execution, WorkflowProject } from './database/repositories.js'
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
+import { createMediaAssetService } from './media/media-asset-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import {
   ExecutionService,
@@ -62,6 +64,10 @@ export interface ApplicationRuntimeOptions {
   openRouter?: ApplicationOpenRouterPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
   chooseProjectDirectory(): Promise<string | undefined>
+  chooseMediaFiles(remainingSlots: number): Promise<string[]>
+  readClipboardImage(): { bytes: Uint8Array; mimeType: 'image/png'; name: string } | undefined
+  chooseMediaSavePath(defaultName: string): Promise<string | undefined>
+  revealPath(path: string): void
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
@@ -72,6 +78,12 @@ export interface ApplicationRuntimeOptions {
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
 }
+
+const defaultGenerationPreferences = conversationGenerationPreferencesSchema.parse({
+  outputType: 'auto',
+  models: {},
+  generation: { image: { count: 1 }, audio: {}, video: {} },
+})
 
 export class MaintenanceGate {
   private maintenance = false
@@ -221,6 +233,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
+  const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
   const developmentSourceSelectors = new WeakMap<WorkflowExecutionSourceSelector, string>()
   const selectDevelopmentProject = (projectId: string): WorkflowExecutionSourceSelector => {
     const selector = Object.freeze({ kind: 'development-project' as const, projectId })
@@ -401,6 +414,53 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }
       },
       cancel: (requestId) => agent.cancel(requestId),
+      getGenerationPreferences: async (conversationId) => {
+        const conversation = database.conversations.get(conversationId)
+        if (!conversation) throw failure('NOT_FOUND')
+        return conversationGenerationPreferencesSchema.parse(
+          conversation.generationPreferences ?? defaultGenerationPreferences,
+        )
+      },
+      updateGenerationPreferences: async (conversationId, preferences) => {
+        const conversation = database.conversations.updateGenerationPreferences(conversationId, preferences)
+        if (!conversation?.generationPreferences) throw failure('NOT_FOUND')
+        return conversationGenerationPreferencesSchema.parse(conversation.generationPreferences)
+      },
+    },
+    media: {
+      pickFiles: async (context) => {
+        const remainingSlots = 5 - context.existingAssetIds.length
+        if (remainingSlots <= 0) return []
+        const paths = (await options.chooseMediaFiles(remainingSlots)).filter(Boolean)
+        return media.importPaths({ ...context, paths })
+      },
+      importDroppedFiles: (input) => media.importPaths(input),
+      importClipboardImage: async (context) => {
+        const image = options.readClipboardImage()
+        return image ? media.importClipboardImage({ ...context, ...image }) : []
+      },
+      removeDraft: ({ conversationId, assetId }) => media.removeDraft(assetId, conversationId),
+      saveCopy: async (assetId) => {
+        const asset = await media.resolveReadyAsset(assetId)
+        const destination = await options.chooseMediaSavePath(asset.name)
+        if (destination) await copyFile(asset.absolutePath, destination)
+      },
+      reveal: async (assetId) => {
+        const asset = await media.resolveReadyAsset(assetId)
+        options.revealPath(asset.absolutePath)
+      },
+      pauseVideoJob: async (jobId) => {
+        const job = database.mediaGenerationJobs.get(jobId)
+        if (!job) throw failure('NOT_FOUND')
+        if (!['pending', 'in_progress', 'downloading'].includes(job.status)) throw failure('CONFLICT')
+        database.mediaGenerationJobs.update(jobId, { status: 'paused' })
+      },
+      resumeVideoJob: async (jobId) => {
+        const job = database.mediaGenerationJobs.get(jobId)
+        if (!job) throw failure('NOT_FOUND')
+        if (job.status !== 'paused') throw failure('CONFLICT')
+        database.mediaGenerationJobs.update(jobId, { status: 'pending' })
+      },
     },
     workflows: {
       list: async (query?: WorkflowQuery) => {

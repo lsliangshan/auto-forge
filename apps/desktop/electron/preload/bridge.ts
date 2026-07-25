@@ -15,6 +15,10 @@ export interface IpcRendererPort {
   removeListener(channel: string, listener: RendererListener): void
 }
 
+export interface DesktopBridgePorts {
+  getPathForFile(file: File): string
+}
+
 function appErrorFromIpc(error: unknown): AppError {
   const message = error instanceof Error ? error.message : String(error)
   const match = /AUTOFORGE_APP_ERROR:([A-Z_]+)/.exec(message)
@@ -48,7 +52,7 @@ function subscribe<T>(
   }
 }
 
-export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
+export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBridgePorts): DesktopAPI {
   return {
     chat: {
       listConversations: () => invoke(ipcRenderer, ipcChannels.chatListConversations),
@@ -58,7 +62,22 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort): DesktopAPI {
       deleteConversation: (conversationId) => invoke(ipcRenderer, ipcChannels.chatDeleteConversation, { conversationId }),
       send: (input) => invoke(ipcRenderer, ipcChannels.chatSend, input),
       cancel: (requestId) => invoke(ipcRenderer, ipcChannels.chatCancel, { requestId }),
+      getGenerationPreferences: (conversationId) => invoke(ipcRenderer, ipcChannels.chatGetGenerationPreferences, { conversationId }),
+      updateGenerationPreferences: (conversationId, preferences) => invoke(ipcRenderer, ipcChannels.chatUpdateGenerationPreferences, { conversationId, preferences }),
       onEvent: (listener) => subscribe(ipcRenderer, ipcChannels.chatEvent, (payload) => chatEventSchema.safeParse(payload), listener),
+    },
+    media: {
+      pickFiles: (context) => invoke(ipcRenderer, ipcChannels.mediaPickFiles, context),
+      importDroppedFiles: (context, files) => {
+        const paths = files.map((file) => ports.getPathForFile(file)).filter((path): path is string => Boolean(path))
+        return invoke(ipcRenderer, ipcChannels.mediaImportDroppedFiles, { ...context, paths })
+      },
+      importClipboardImage: (context) => invoke(ipcRenderer, ipcChannels.mediaImportClipboardImage, context),
+      removeDraft: (input) => invoke(ipcRenderer, ipcChannels.mediaRemoveDraft, input),
+      saveCopy: (assetId) => invoke(ipcRenderer, ipcChannels.mediaSaveCopy, { assetId }),
+      reveal: (assetId) => invoke(ipcRenderer, ipcChannels.mediaReveal, { assetId }),
+      pauseVideoJob: (jobId) => invoke(ipcRenderer, ipcChannels.mediaPauseVideoJob, { jobId }),
+      resumeVideoJob: (jobId) => invoke(ipcRenderer, ipcChannels.mediaResumeVideoJob, { jobId }),
     },
     workflows: {
       list: (query) => invoke(ipcRenderer, ipcChannels.workflowsList, query),

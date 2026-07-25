@@ -2,29 +2,103 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { ChatSendInput, ModelInfo } from '@autoforge/shared'
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
 import { openAppDatabase } from './database/client.js'
 import { SecretStore } from './security/secret-store.js'
 
 const directories: string[] = []
 
+function chatInput(conversationId: string, content: string): ChatSendInput {
+  return {
+    conversationId,
+    content,
+    assetIds: [],
+    outputType: 'auto',
+    generation: {
+      image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      audio: { format: 'mp3' },
+      video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+    },
+  }
+}
+
+function modelInfo(id: string, name: string): ModelInfo {
+  return { id, name, inputModalities: ['text'], outputModalities: ['text'], supportsTools: false, generation: {} }
+}
+
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
 describe('createApplicationRuntime', () => {
+  it('keeps media paths in main while using explicit media ports and exact conversation preferences', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-'))
+    directories.push(root)
+    const source = join(root, 'private-source.png')
+    const copied = join(root, 'copied.png')
+    const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('payload')])
+    await writeFile(source, png)
+    const chooseMediaFiles = vi.fn<(remainingSlots: number) => Promise<string[]>>(async () => [])
+    const chooseMediaSavePath = vi.fn(async () => copied)
+    const revealPath = vi.fn()
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles,
+      readClipboardImage: () => ({ bytes: png, mimeType: 'image/png', name: 'clipboard.png' }),
+      chooseMediaSavePath,
+      revealPath,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
+      outputType: 'auto', models: {},
+    })
+    const preferences = {
+      outputType: 'image' as const, models: { image: 'image-model' },
+      generation: {
+        image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+        audio: { format: 'mp3' },
+        video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      },
+    } as const
+    await expect(runtime.services.chat.updateGenerationPreferences(conversation.id, preferences)).resolves.toEqual(preferences)
+    await expect(runtime.services.media.pickFiles({ conversationId: conversation.id, existingAssetIds: [] })).resolves.toEqual([])
+    chooseMediaFiles.mockResolvedValueOnce([source])
+    const [picked] = await runtime.services.media.pickFiles({ conversationId: conversation.id, existingAssetIds: [] })
+    const [clipboard] = await runtime.services.media.importClipboardImage({ conversationId: conversation.id, existingAssetIds: [picked!.id] })
+    expect(JSON.stringify([picked, clipboard])).not.toContain(root)
+    await runtime.services.media.saveCopy(picked!.id)
+    await runtime.services.media.reveal(picked!.id)
+    expect(chooseMediaSavePath).toHaveBeenCalledWith(picked!.name)
+    expect(revealPath).toHaveBeenCalledWith(expect.stringContaining(`${conversation.id}/`))
+    await expect(runtime.services.media.saveCopy('missing_asset')).rejects.toMatchObject({ code: 'MEDIA_ASSET_UNAVAILABLE' })
+    await runtime.close()
+  })
+
   it('stores provider credentials separately and routes new chats to the active provider default', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)
     const openrouter = {
-      listModels: vi.fn(async () => [{ id: 'openrouter/model', name: 'OpenRouter model' }]),
+      listModels: vi.fn(async () => [modelInfo('openrouter/model', 'OpenRouter model')]),
       validateCredential: vi.fn(async () => ({ valid: true })),
       stream: vi.fn(async function* () {
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       }),
     }
     const deepseek = {
-      listModels: vi.fn(async () => [{ id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' }]),
+      listModels: vi.fn(async () => [modelInfo('deepseek-v4-flash', 'deepseek-v4-flash')]),
       validateCredential: vi.fn(async () => ({ valid: true })),
       stream: vi.fn(async function* () {
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
@@ -43,6 +117,10 @@ describe('createApplicationRuntime', () => {
       },
       modelProviders: { openrouter, deepseek },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
@@ -60,11 +138,11 @@ describe('createApplicationRuntime', () => {
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
     await runtime.services.settings.update({ activeProvider: 'deepseek' })
     await expect(runtime.services.settings.listProviderModels('deepseek')).resolves.toEqual([
-      { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' },
+      modelInfo('deepseek-v4-flash', 'deepseek-v4-flash'),
     ])
 
     const conversation = await runtime.services.chat.createConversation()
-    await runtime.services.chat.send({ conversationId: conversation.id, content: 'hello' })
+    await runtime.services.chat.send(chatInput(conversation.id, 'hello'))
     await vi.waitFor(() => expect(deepseek.stream).toHaveBeenCalled())
     expect(openrouter.stream).not.toHaveBeenCalled()
     expect(deepseek.stream).toHaveBeenCalledWith(expect.objectContaining({
@@ -80,7 +158,7 @@ describe('createApplicationRuntime', () => {
       },
     })
     const openRouterConversation = await runtime.services.chat.createConversation()
-    await runtime.services.chat.send({ conversationId: openRouterConversation.id, content: 'hello from OpenRouter' })
+    await runtime.services.chat.send(chatInput(openRouterConversation.id, 'hello from OpenRouter'))
     await vi.waitFor(() => expect(openrouter.stream).toHaveBeenCalled())
     expect(openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({
       model: 'openrouter/text-default',
@@ -133,6 +211,10 @@ describe('createApplicationRuntime', () => {
       },
       modelProviders: { openrouter, deepseek },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
@@ -193,6 +275,10 @@ describe('createApplicationRuntime', () => {
         },
       },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
@@ -233,6 +319,10 @@ describe('createApplicationRuntime', () => {
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
       },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal,
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
@@ -245,7 +335,7 @@ describe('createApplicationRuntime', () => {
     expect(await runtime.services.chat.listConversations()).toEqual([conversation])
     expect(await runtime.services.chat.listMessages(conversation.id)).toEqual([])
     expect(await runtime.services.chat.renameConversation(conversation.id, 'Renamed')).toMatchObject({ title: 'Renamed' })
-    await runtime.services.chat.send({ conversationId: conversation.id, content: 'persist me' })
+    await runtime.services.chat.send(chatInput(conversation.id, 'persist me'))
     for (let index = 0; index < 30 && !chatEvents.some((event) => event.status === 'completed'); index += 1) await Promise.resolve()
     expect(await runtime.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
@@ -293,6 +383,10 @@ describe('createApplicationRuntime', () => {
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
       },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal,
       emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
     })
@@ -328,6 +422,10 @@ describe('createApplicationRuntime', () => {
         },
       },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal: async () => undefined,
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
@@ -335,7 +433,7 @@ describe('createApplicationRuntime', () => {
     })
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     const conversation = await runtime.services.chat.createConversation()
-    await runtime.services.chat.send({ conversationId: conversation.id, content: 'hello' })
+    await runtime.services.chat.send(chatInput(conversation.id, 'hello'))
 
     await expect(runtime.services.settings.clearLocalData('conversations'))
       .rejects.toMatchObject({ code: 'CONFLICT' })
@@ -405,6 +503,10 @@ describe('createApplicationRuntime', () => {
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
       },
       chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
     })

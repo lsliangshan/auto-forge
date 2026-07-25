@@ -5,6 +5,9 @@ import {
   toSafeAppError,
   type AppError,
   type DesktopAPI,
+  type MediaAsset,
+  type MediaImportContext,
+  type MediaRemoveDraftRequest,
 } from '@autoforge/shared'
 import type { z } from 'zod'
 import { isTrustedRendererUrl, type RendererTarget } from '../renderer-trust.js'
@@ -32,6 +35,16 @@ export interface IpcInvokeEvent {
 
 export interface DesktopIpcServices {
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
+  media: {
+    pickFiles(context: MediaImportContext): Promise<MediaAsset[]>
+    importDroppedFiles(input: MediaImportContext & { paths: string[] }): Promise<MediaAsset[]>
+    importClipboardImage(context: MediaImportContext): Promise<MediaAsset[]>
+    removeDraft(input: MediaRemoveDraftRequest): Promise<void>
+    saveCopy(assetId: string): Promise<void>
+    reveal(assetId: string): Promise<void>
+    pauseVideoJob(jobId: string): Promise<void>
+    resumeVideoJob(jobId: string): Promise<void>
+  }
   workflows: DesktopAPI['workflows']
   developer: DesktopAPI['developer']
   executions: Omit<DesktopAPI['executions'], 'onEvent'>
@@ -123,6 +136,16 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.chatDeleteConversation, (input) => options.services.chat.deleteConversation(input.conversationId))
   register(ipcChannels.chatSend, (input) => options.services.chat.send(input))
   register(ipcChannels.chatCancel, (input) => options.services.chat.cancel(input.requestId))
+  register(ipcChannels.chatGetGenerationPreferences, (input) => options.services.chat.getGenerationPreferences(input.conversationId))
+  register(ipcChannels.chatUpdateGenerationPreferences, (input) => options.services.chat.updateGenerationPreferences(input.conversationId, input.preferences))
+  register(ipcChannels.mediaPickFiles, (input) => options.services.media.pickFiles(input))
+  register(ipcChannels.mediaImportDroppedFiles, (input) => options.services.media.importDroppedFiles(input))
+  register(ipcChannels.mediaImportClipboardImage, (input) => options.services.media.importClipboardImage(input))
+  register(ipcChannels.mediaRemoveDraft, (input) => options.services.media.removeDraft(input))
+  register(ipcChannels.mediaSaveCopy, (input) => options.services.media.saveCopy(input.assetId))
+  register(ipcChannels.mediaReveal, (input) => options.services.media.reveal(input.assetId))
+  register(ipcChannels.mediaPauseVideoJob, (input) => options.services.media.pauseVideoJob(input.jobId))
+  register(ipcChannels.mediaResumeVideoJob, (input) => options.services.media.resumeVideoJob(input.jobId))
   register(ipcChannels.workflowsList, (input) => options.services.workflows.list(input))
   register(ipcChannels.workflowsGet, (input) => options.services.workflows.get(input.id, input.version))
   register(ipcChannels.workflowsSetEnabled, (input) => options.services.workflows.setEnabled(input.id, input.version, input.enabled))
