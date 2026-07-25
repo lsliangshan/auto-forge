@@ -314,6 +314,94 @@ describe('ExecutionService', () => {
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
+  it('cancels and removes an unstarted reservation during shutdown', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+
+    await harness.service.shutdown()
+
+    expect(harness.service.hasActiveExecutions()).toBe(false)
+    await expect(harness.service.startReserved(reservation, {
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('waits for a suspended starting reservation to cancel and settle', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const source = {
+      workflow, rootPath: trustedRootPath, entryPath: 'workers/workflow-runner.ts', integrity: 'valid' as const,
+    }
+    const harness = createHarness({
+      sourceResolver: { resolve: async () => { await gate; return source } },
+    })
+    const reservation = harness.service.reserve()
+    const starting = harness.service.startReserved(reservation, {
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+    })
+    await turn()
+    let stopped = false
+    const shutdown = harness.service.shutdown().then(() => { stopped = true })
+    await turn()
+    expect(stopped).toBe(false)
+
+    release()
+    const started = await starting
+    await shutdown
+
+    await expect(started.finished).resolves.toMatchObject({
+      status: 'cancelled',
+      errorCode: 'CANCELLED',
+    })
+    expect(harness.service.hasActiveExecutions()).toBe(false)
+    expect(harness.workerFactory.workers.size).toBe(0)
+  })
+
+  it('permanently rejects every execution start API as soon as shutdown begins', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const source = {
+      workflow, rootPath: trustedRootPath, entryPath: 'workers/workflow-runner.ts', integrity: 'valid' as const,
+    }
+    const harness = createHarness({
+      sourceResolver: { resolve: async () => { await gate; return source } },
+    })
+    const existing = harness.service.reserve()
+    const starting = harness.service.startReserved(existing, {
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+    })
+    await turn()
+    const shutdown = harness.service.shutdown()
+
+    expect(() => harness.service.reserve())
+      .toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    await expect(harness.service.start({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(harness.service.startReserved(existing, {
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+
+    release()
+    await starting
+    await shutdown
+    await expect(harness.service.start({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: {},
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
   it('cancels and settles a reserved start blocked before active registration without spawning', async () => {
     let release!: () => void
     const gate = new Promise<void>((resolvePromise) => { release = resolvePromise })
