@@ -1,0 +1,273 @@
+import { describe, expect, it } from 'vitest'
+import type {
+  ConversationGenerationPreferences,
+  GenerationOptions,
+  ModelInfo,
+  ModelProviderId,
+  ProviderDefaultModels,
+} from '@autoforge/shared'
+import type { ResolvedMediaAsset } from '../media/media-asset-service.js'
+import { resolveChatRoute } from './multimodal-router.js'
+
+const generation: GenerationOptions = {
+  image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+  audio: { format: 'mp3' },
+  video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+}
+
+function model(overrides: Partial<ModelInfo> & Pick<ModelInfo, 'id'>): ModelInfo {
+  return {
+    id: overrides.id,
+    name: overrides.name ?? overrides.id,
+    inputModalities: overrides.inputModalities ?? ['text'],
+    outputModalities: overrides.outputModalities ?? ['text'],
+    supportsTools: overrides.supportsTools ?? false,
+    generation: overrides.generation ?? {},
+  }
+}
+
+function asset(kind: ResolvedMediaAsset['kind'], overrides: Partial<ResolvedMediaAsset> = {}): ResolvedMediaAsset {
+  return {
+    id: overrides.id ?? `asset_${kind}`,
+    kind,
+    mimeType: overrides.mimeType ?? `${kind}/example`,
+    name: overrides.name ?? `${kind}.example`,
+    byteSize: overrides.byteSize ?? 1024,
+    conversationId: overrides.conversationId ?? 'conversation_1',
+    absolutePath: overrides.absolutePath ?? `/tmp/${kind}.example`,
+    relativePath: overrides.relativePath ?? `${kind}.example`,
+    inlineSafe: overrides.inlineSafe ?? true,
+  }
+}
+
+function input(overrides: Partial<Parameters<typeof resolveChatRoute>[0]> = {}) {
+  const models = overrides.models ?? [model({ id: 'text/model', supportsTools: true })]
+  return {
+    provider: 'openrouter' as ModelProviderId,
+    requestedOutput: 'auto' as const,
+    requestedGeneration: generation,
+    defaults: {
+      deepseek: { text: 'deepseek-chat' },
+      openrouter: { text: 'text/model' },
+    } satisfies ProviderDefaultModels,
+    conversationPreferences: {
+      outputType: 'auto',
+      models: {},
+      generation,
+    } satisfies ConversationGenerationPreferences,
+    models,
+    assets: [],
+    ...overrides,
+  }
+}
+
+describe('resolveChatRoute', () => {
+  it.each([
+    ['deepseek', [asset('image')], 'text', 'MODEL_MODALITY_UNSUPPORTED'],
+    ['openrouter', [], 'image', 'image'],
+    ['openrouter', [asset('image')], 'video', 'video'],
+    ['openrouter', [asset('audio')], 'image', 'MODEL_MODALITY_UNSUPPORTED'],
+  ] as const)('routes %s with attachments to %s', (provider, assets, requestedOutput, expected) => {
+    const models = provider === 'deepseek'
+      ? [model({ id: 'deepseek-chat', supportsTools: true })]
+      : [
+          model({
+            id: 'text/model',
+            inputModalities: ['text', 'image', 'audio'],
+            outputModalities: ['text'],
+            supportsTools: true,
+          }),
+          model({
+            id: 'image/model',
+            inputModalities: ['text', 'image'],
+            outputModalities: ['image'],
+            generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } },
+          }),
+          model({
+            id: 'video/model',
+            inputModalities: ['text', 'image'],
+            outputModalities: ['video'],
+            generation: { video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false } },
+          }),
+        ]
+    const defaults: ProviderDefaultModels = {
+      deepseek: { text: 'deepseek-chat' },
+      openrouter: { text: 'text/model', image: 'image/model', video: 'video/model' },
+    }
+    const resolve = () => resolveChatRoute(input({ provider, assets: [...assets], requestedOutput, models, defaults }))
+
+    if (expected === 'MODEL_MODALITY_UNSUPPORTED') {
+      expect(resolve).toThrow(expect.objectContaining({ code: expected }))
+      return
+    }
+    expect(resolve()).toMatchObject({ provider, model: `${expected}/model`, outputType: expected })
+  })
+
+  it('automatically resolves a single-output selected model', () => {
+    expect(resolveChatRoute(input({
+      requestedModel: 'image/model',
+      models: [model({
+        id: 'image/model',
+        outputModalities: ['image'],
+        generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } },
+      })],
+    }))).toMatchObject({ model: 'image/model', outputType: 'image', supportsTools: false })
+  })
+
+  it('requires an output choice for a first-use multi-output selected model', () => {
+    expect(resolveChatRoute(input({
+      requestedModel: 'multi/model',
+      models: [model({
+        id: 'multi/model',
+        outputModalities: ['video', 'text', 'image'],
+        generation: {
+          image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 },
+          video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false },
+        },
+      })],
+    }))).toEqual({ selectionRequired: true, compatibleOutputs: ['text', 'image', 'video'] })
+  })
+
+  it('uses the remembered output with the compatible remembered model before the provider default', () => {
+    const route = resolveChatRoute(input({
+      models: [
+        model({ id: 'default/image', outputModalities: ['image'], generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } } }),
+        model({ id: 'conversation/image', outputModalities: ['image'], generation: { image: { resolutions: ['2K'], aspectRatios: ['1:1'], formats: ['jpeg'], maxCount: 1 } } }),
+      ],
+      defaults: { deepseek: { text: 'deepseek-chat' }, openrouter: { image: 'default/image' } },
+      conversationPreferences: { outputType: 'image', models: { image: 'conversation/image' }, generation },
+      requestedGeneration: { ...generation, image: { count: 1, resolution: '2K', aspectRatio: '1:1', format: 'jpeg' } },
+    }))
+
+    expect(route).toMatchObject({ model: 'conversation/image', outputType: 'image' })
+  })
+
+  it('returns only deterministic compatible models when no explicit-output preference is usable', () => {
+    expect(resolveChatRoute(input({
+      requestedOutput: 'image',
+      models: [
+        model({ id: 'z/video', outputModalities: ['video'] }),
+        model({ id: 'z/image', outputModalities: ['image'], generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } } }),
+        model({ id: 'a/image', outputModalities: ['image'], generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } } }),
+      ],
+      defaults: { deepseek: { text: 'deepseek-chat' }, openrouter: {} },
+    }))).toEqual({
+      modelRequired: true,
+      outputType: 'image',
+      compatibleModels: [
+        expect.objectContaining({ id: 'a/image' }),
+        expect.objectContaining({ id: 'z/image' }),
+      ],
+    })
+  })
+
+  it('uses an exact requested model only when it supports the requested output', () => {
+    expect(() => resolveChatRoute(input({
+      requestedModel: 'text/model',
+      requestedOutput: 'image',
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
+  it('rejects a model that is absent from the active provider catalog', () => {
+    expect(() => resolveChatRoute(input({ requestedModel: 'missing/model' }))).toThrow(expect.objectContaining({ code: 'NOT_FOUND' }))
+  })
+
+  it('rejects catalog capabilities that conflict with DeepSeek text-only routing', () => {
+    expect(() => resolveChatRoute(input({
+      provider: 'deepseek',
+      requestedModel: 'deepseek-image',
+      models: [model({ id: 'deepseek-image', outputModalities: ['image'] })],
+      defaults: { deepseek: { text: 'deepseek-image' }, openrouter: {} },
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
+  it('accepts all and only the exact advertised media inputs for text understanding', () => {
+    const textModel = model({ id: 'understand/model', inputModalities: ['text', 'audio', 'video'], outputModalities: ['text'] })
+    expect(resolveChatRoute(input({ requestedModel: textModel.id, models: [textModel], assets: [asset('audio'), asset('video')] }))).toMatchObject({ outputType: 'text' })
+    expect(() => resolveChatRoute(input({ requestedModel: textModel.id, models: [textModel], assets: [asset('image')] }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
+  it('allows audio output to use every input modality advertised by its exact model', () => {
+    const audioModel = model({
+      id: 'audio/model',
+      inputModalities: ['text', 'image', 'audio', 'video'],
+      outputModalities: ['audio'],
+      generation: { audio: { voices: ['alloy'], formats: ['wav'] } },
+    })
+    expect(resolveChatRoute(input({
+      requestedModel: audioModel.id,
+      requestedOutput: 'audio',
+      models: [audioModel],
+      assets: [asset('image'), asset('audio'), asset('video')],
+      requestedGeneration: { ...generation, audio: { voice: 'alloy', format: 'wav' } },
+    }))).toMatchObject({ outputType: 'audio', supportsTools: false })
+  })
+
+  it('enables tools only for text-compatible text routes', () => {
+    const modelWithTools = model({ id: 'tool/model', supportsTools: true, outputModalities: ['text', 'audio'], generation: { audio: { voices: [], formats: ['mp3'] } } })
+    expect(resolveChatRoute(input({ requestedModel: modelWithTools.id, requestedOutput: 'text', models: [modelWithTools] }))).toMatchObject({ supportsTools: true })
+    expect(resolveChatRoute(input({ requestedModel: modelWithTools.id, requestedOutput: 'audio', models: [modelWithTools] }))).toMatchObject({ supportsTools: false })
+  })
+
+  it('validates count, total bytes, duplicate IDs, and resolved asset shape before route selection', () => {
+    const many = Array.from({ length: 6 }, (_, index) => asset('image', { id: `asset_${index}` }))
+    expect(() => resolveChatRoute(input({ assets: many }))).toThrow(expect.objectContaining({ code: 'MEDIA_ATTACHMENT_LIMIT_EXCEEDED' }))
+    expect(() => resolveChatRoute(input({ assets: [asset('image', { byteSize: 250 * 1024 * 1024 + 1 })] }))).toThrow(expect.objectContaining({ code: 'MEDIA_SIZE_LIMIT_EXCEEDED' }))
+    expect(() => resolveChatRoute(input({ assets: [asset('image'), asset('image')] }))).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+  })
+
+  it('normalizes only against advertised generation values and leaves caller inputs unchanged', () => {
+    const imageModel = model({
+      id: 'image/model',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['image'],
+      generation: { image: { resolutions: ['2K'], aspectRatios: ['1:1'], formats: ['jpeg'], maxCount: 1 } },
+    })
+    const requestedGeneration: GenerationOptions = structuredClone(generation)
+    const assets = [asset('image')]
+    const route = resolveChatRoute(input({
+      requestedModel: imageModel.id,
+      requestedOutput: 'image',
+      models: [imageModel],
+      assets,
+      requestedGeneration,
+    }))
+
+    expect(route).toMatchObject({ generation: { image: { count: 1, resolution: '2K', aspectRatio: '1:1', format: 'jpeg' } } })
+    expect(requestedGeneration).toEqual(generation)
+    expect(assets).toEqual([asset('image')])
+    if (!('assets' in route)) throw new Error('expected a resolved route')
+    expect(route.assets).not.toBe(assets)
+  })
+
+  it('fails locally when selected-output capability metadata cannot support a generation option', () => {
+    expect(() => resolveChatRoute(input({
+      requestedModel: 'image/model',
+      requestedOutput: 'image',
+      models: [model({ id: 'image/model', outputModalities: ['image'] })],
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
+  it('omits outputs and models that cannot execute their advertised generation mode', () => {
+    const brokenImage = model({ id: 'broken/image', outputModalities: ['image'] })
+    const image = model({
+      id: 'usable/image',
+      outputModalities: ['image'],
+      generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } },
+    })
+    expect(resolveChatRoute(input({
+      requestedOutput: 'image',
+      defaults: { deepseek: { text: 'deepseek-chat' }, openrouter: {} },
+      models: [brokenImage, image],
+    }))).toEqual({
+      modelRequired: true,
+      outputType: 'image',
+      compatibleModels: [expect.objectContaining({ id: 'usable/image' })],
+    })
+
+    expect(resolveChatRoute(input({
+      requestedModel: 'mixed/model',
+      models: [model({ id: 'mixed/model', outputModalities: ['text', 'image'] })],
+    }))).toMatchObject({ outputType: 'text' })
+  })
+})
