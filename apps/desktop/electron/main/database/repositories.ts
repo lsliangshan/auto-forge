@@ -3,6 +3,7 @@ import { z } from 'zod'
 import {
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  type ChatBlock,
   type ConversationGenerationPreferences,
   type MediaKind,
 } from '@autoforge/shared'
@@ -382,6 +383,18 @@ function mediaGenerationJobFromRow(row: Query): MediaGenerationJob {
   }
 }
 
+function assertMediaBlockMetadata(block: Extract<ChatBlock, { type: 'media' }>, asset: MediaAssetRecord): void {
+  if (
+    block.name !== asset.originalName
+    || block.kind !== asset.kind
+    || block.mimeType !== asset.mimeType
+    || block.byteSize !== asset.byteSize
+    || block.width !== asset.width
+    || block.height !== asset.height
+    || block.durationMs !== asset.durationMs
+  ) throw new Error('Media block metadata must match the asset')
+}
+
 function projectFromRow(row: Query): WorkflowProject {
   return { ...row, manifest: parse(row.manifestJson as string | null) } as WorkflowProject
 }
@@ -462,6 +475,9 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             if (stored.conversationId !== value.conversationId || stored.status !== 'ready' || stored.messageId !== undefined) {
               throw new Error('Media asset cannot be claimed')
             }
+            const block = blocks.find((candidate) => candidate.type === 'media' && candidate.assetId === assetId)
+            if (!block || block.type !== 'media') throw new Error('Media block is missing')
+            assertMediaBlockMetadata(block, stored)
           }
           database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
             ...value,
@@ -502,6 +518,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             if (stored.conversationId !== row.conversationId || stored.status !== 'ready' || stored.messageId !== undefined) {
               throw new Error('Media asset cannot be claimed')
             }
+            assertMediaBlockMetadata(parsedReplacement, stored)
             const claim = database.prepare("UPDATE media_assets SET message_id = @messageId, updated_at = @updatedAt WHERE id = @assetId AND conversation_id = @conversationId AND message_id IS NULL AND status = 'ready'")
             if (claim.run({ messageId, assetId: parsedReplacement.assetId, conversationId: row.conversationId, updatedAt: now() }).changes !== 1) {
               throw new Error('Media asset could not be claimed')

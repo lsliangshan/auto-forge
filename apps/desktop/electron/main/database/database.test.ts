@@ -56,6 +56,48 @@ function readyAsset(id: string, conversationId: string) {
   }
 }
 
+function readyVideoAsset(id: string, conversationId: string) {
+  return {
+    ...readyAsset(id, conversationId),
+    kind: 'video' as const,
+    mimeType: 'video/mp4',
+    originalName: `${id}.mp4`,
+    relativePath: `${conversationId}/${id}.mp4`,
+  }
+}
+
+type ReadyAssetFixture = ReturnType<typeof readyAsset> & {
+  width?: number
+  height?: number
+  durationMs?: number
+}
+
+function mediaBlockForAsset(asset: ReadyAssetFixture, blockId: string, purpose: 'input' | 'output') {
+  return {
+    type: 'media' as const,
+    blockId,
+    assetId: asset.id,
+    kind: asset.kind,
+    purpose,
+    name: asset.originalName,
+    mimeType: asset.mimeType,
+    byteSize: asset.byteSize,
+    ...(asset.width === undefined ? {} : { width: asset.width }),
+    ...(asset.height === undefined ? {} : { height: asset.height }),
+    ...(asset.durationMs === undefined ? {} : { durationMs: asset.durationMs }),
+  }
+}
+
+const mediaMetadataMismatches = [
+  ['kind', { kind: 'audio' as const }],
+  ['MIME type', { mimeType: 'image/jpeg' }],
+  ['byte size', { byteSize: 13 }],
+  ['display name', { name: 'other.png' }],
+  ['width', { width: 321 }],
+  ['height', { height: 241 }],
+  ['duration', { durationMs: undefined }],
+] as const
+
 function mediaMessage(id: string, conversationId: string, assetId: string) {
   return {
     id,
@@ -263,20 +305,20 @@ describe('openAppDatabase', () => {
       id: 'message_blocks', conversationId: 'conversation_blocks', role: 'assistant', createdAt: 1,
       blocks: [{ type: 'media_generation', blockId: 'block_video', jobId: 'job_video', kind: 'video', status: 'downloading' }],
     })
-    database.mediaAssets.insert({ ...readyAsset('asset_video', 'conversation_blocks'), source: 'generated' })
+    database.mediaAssets.insert({ ...readyVideoAsset('asset_video', 'conversation_blocks'), source: 'generated' })
 
     database.messages.replaceBlock('message_blocks', 'block_video', {
       type: 'media', blockId: 'block_video', assetId: 'asset_video', kind: 'video', purpose: 'output',
-      name: 'video.mp4', mimeType: 'video/mp4', byteSize: 12,
+      name: 'asset_video.mp4', mimeType: 'video/mp4', byteSize: 12,
     })
 
     expect(database.messages.get('message_blocks')?.blocks).toEqual([{
       type: 'media', blockId: 'block_video', assetId: 'asset_video', kind: 'video', purpose: 'output',
-      name: 'video.mp4', mimeType: 'video/mp4', byteSize: 12,
+      name: 'asset_video.mp4', mimeType: 'video/mp4', byteSize: 12,
     }])
     expect(() => database.messages.replaceBlock('message_blocks', 'block_video', {
       type: 'media', blockId: 'different_block', assetId: 'asset_video', kind: 'video', purpose: 'output',
-      name: 'video.mp4', mimeType: 'video/mp4', byteSize: 12,
+      name: 'asset_video.mp4', mimeType: 'video/mp4', byteSize: 12,
     })).toThrow()
     expect(() => database.messages.replaceBlock('message_blocks', 'block_video', {
       type: 'media', blockId: 'block_video', assetId: 'asset_video', kind: 'video', purpose: 'output',
@@ -359,6 +401,42 @@ describe('openAppDatabase', () => {
     }, assetIds)).toThrow()
     expect(database.messages.get('message_asset_binding')).toBeUndefined()
     expect(database.mediaAssets.listForConversation('conversation_asset_binding').every((asset) => asset.messageId === undefined)).toBe(true)
+  })
+
+  it.each(mediaMetadataMismatches)('rolls back an input claim with mismatched %s metadata', (_description, mismatch) => {
+    const database = openTestDatabase()
+    const asset = { ...readyAsset('asset_input_metadata', 'conversation_input_metadata'), width: 320, height: 240, durationMs: 1_000 }
+    database.conversations.insert({ id: 'conversation_input_metadata', title: 'Input metadata' })
+    database.mediaAssets.insert(asset)
+
+    expect(() => database.messages.insertWithAssets({
+      id: 'message_input_metadata', conversationId: 'conversation_input_metadata', role: 'user', createdAt: 1,
+      blocks: [{ ...mediaBlockForAsset(asset, 'block_input_metadata', 'input'), ...mismatch }],
+    }, [asset.id])).toThrow()
+
+    expect(database.messages.get('message_input_metadata')).toBeUndefined()
+    expect(database.mediaAssets.get(asset.id)?.messageId).toBeUndefined()
+  })
+
+  it.each(mediaMetadataMismatches)('rolls back a replacement claim with mismatched %s metadata', (_description, mismatch) => {
+    const database = openTestDatabase()
+    const asset = { ...readyAsset('asset_replacement_metadata', 'conversation_replacement_metadata'), source: 'generated' as const, width: 320, height: 240, durationMs: 1_000 }
+    database.conversations.insert({ id: 'conversation_replacement_metadata', title: 'Replacement metadata' })
+    database.messages.insert({
+      id: 'message_replacement_metadata', conversationId: 'conversation_replacement_metadata', role: 'assistant', createdAt: 1,
+      blocks: [{ type: 'media_generation', blockId: 'block_replacement_metadata', jobId: 'job_replacement_metadata', kind: 'image', status: 'in_progress' }],
+    })
+    database.mediaAssets.insert(asset)
+
+    expect(() => database.messages.replaceBlock('message_replacement_metadata', 'block_replacement_metadata', {
+      ...mediaBlockForAsset(asset, 'block_replacement_metadata', 'output'),
+      ...mismatch,
+    })).toThrow()
+
+    expect(database.messages.get('message_replacement_metadata')?.blocks).toEqual([
+      { type: 'media_generation', blockId: 'block_replacement_metadata', jobId: 'job_replacement_metadata', kind: 'image', status: 'in_progress' },
+    ])
+    expect(database.mediaAssets.get(asset.id)?.messageId).toBeUndefined()
   })
 
   it('rejects cross-conversation media generation job message and asset links without mutation', () => {
