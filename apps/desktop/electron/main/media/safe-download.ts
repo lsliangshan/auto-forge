@@ -206,31 +206,6 @@ function parseIpv4(address: string): readonly number[] | undefined {
   return octets.length === 4 ? octets : undefined
 }
 
-function prohibitedIpv4(address: string): boolean {
-  const octets = parseIpv4(address)
-  if (!octets) return true
-  const [first, second, third] = octets as [number, number, number, number]
-  return (
-    first === 0
-    || first === 10
-    || (first === 100 && second >= 64 && second <= 127)
-    || first === 127
-    || (first === 169 && second === 254)
-    || (first === 172 && second >= 16 && second <= 31)
-    || (first === 192 && second === 0 && third === 0)
-    || (first === 192 && second === 0 && third === 2)
-    || (first === 192 && second === 31 && third === 196)
-    || (first === 192 && second === 52 && third === 193)
-    || (first === 192 && second === 88 && third === 99)
-    || (first === 192 && second === 168)
-    || (first === 192 && second === 175 && third === 48)
-    || (first === 198 && (second === 18 || second === 19))
-    || (first === 198 && second === 51 && third === 100)
-    || (first === 203 && second === 0 && third === 113)
-    || first >= 224
-  )
-}
-
 function ipv6Bytes(address: string): Uint8Array | undefined {
   if (isIP(address) !== 6 || address.includes('%')) return undefined
   let normalized = address.toLowerCase()
@@ -265,7 +240,7 @@ function ipv6Bytes(address: string): Uint8Array | undefined {
   return bytes
 }
 
-function matchesPrefix(bytes: Uint8Array, prefix: readonly number[], bits: number): boolean {
+function matchesPrefix(bytes: Uint8Array, prefix: ArrayLike<number>, bits: number): boolean {
   const fullBytes = Math.floor(bits / 8)
   for (let index = 0; index < fullBytes; index += 1) {
     if (bytes[index] !== prefix[index]) return false
@@ -276,23 +251,93 @@ function matchesPrefix(bytes: Uint8Array, prefix: readonly number[], bits: numbe
   return (bytes[fullBytes]! & mask) === (prefix[fullBytes]! & mask)
 }
 
+interface AddressPrefix {
+  bytes: Uint8Array
+  bits: number
+}
+
+function addressPrefix(cidr: string, family: 4 | 6): AddressPrefix {
+  const separator = cidr.lastIndexOf('/')
+  const address = cidr.slice(0, separator)
+  const bits = Number(cidr.slice(separator + 1))
+  const bytes = family === 4 ? parseIpv4(address) : ipv6Bytes(address)
+  const maximumBits = family === 4 ? 32 : 128
+  if (!bytes || !Number.isInteger(bits) || bits < 0 || bits > maximumBits) {
+    throw new Error('Invalid embedded address prefix')
+  }
+  return { bytes: Uint8Array.from(bytes), bits }
+}
+
+// Policy snapshot: IANA IPv4 and IPv6 Special-Purpose Address Registries,
+// 2026-07-26. Every registered block is denied, including entries that IANA
+// marks globally reachable. The 2001::/23 umbrella covers its listed subranges.
+// Sources:
+// https://www.iana.org/assignments/iana-ipv4-special-registry/
+// https://www.iana.org/assignments/iana-ipv6-special-registry/
+const IANA_IPV4_SPECIAL_PREFIXES = [
+  '0.0.0.0/8',
+  '10.0.0.0/8',
+  '100.64.0.0/10',
+  '127.0.0.0/8',
+  '169.254.0.0/16',
+  '172.16.0.0/12',
+  '192.0.0.0/24',
+  '192.0.2.0/24',
+  '192.31.196.0/24',
+  '192.52.193.0/24',
+  '192.88.99.0/24',
+  '192.168.0.0/16',
+  '192.175.48.0/24',
+  '198.18.0.0/15',
+  '198.51.100.0/24',
+  '203.0.113.0/24',
+  '224.0.0.0/4',
+  '240.0.0.0/4',
+].map((cidr) => addressPrefix(cidr, 4))
+
+const IANA_IPV6_SPECIAL_PREFIXES = [
+  '::/128',
+  '::1/128',
+  '::ffff:0:0/96',
+  '64:ff9b::/96',
+  '64:ff9b:1::/48',
+  '100::/64',
+  '100:0:0:1::/64',
+  '2001::/23',
+  '2001:db8::/32',
+  '2002::/16',
+  '2620:4f:8000::/48',
+  '3fff::/20',
+  '5f00::/16',
+  'fc00::/7',
+  'fe80::/10',
+].map((cidr) => addressPrefix(cidr, 6))
+
+// Deprecated site-local and multicast space are non-public architecture ranges
+// outside the special-purpose registry snapshot and remain explicitly denied.
+const ADDITIONAL_NON_PUBLIC_IPV6_PREFIXES = [
+  'fec0::/10',
+  'ff00::/8',
+].map((cidr) => addressPrefix(cidr, 6))
+
+const IPV6_GLOBAL_UNICAST_PREFIX = addressPrefix('2000::/3', 6)
+
+function matchesAnyPrefix(bytes: Uint8Array, prefixes: readonly AddressPrefix[]): boolean {
+  return prefixes.some((prefix) => matchesPrefix(bytes, prefix.bytes, prefix.bits))
+}
+
+function prohibitedIpv4(address: string): boolean {
+  const bytes = parseIpv4(address)
+  return !bytes || matchesAnyPrefix(Uint8Array.from(bytes), IANA_IPV4_SPECIAL_PREFIXES)
+}
+
 function prohibitedIpv6(address: string): boolean {
   const bytes = ipv6Bytes(address)
-  if (!bytes) return true
   return (
-    !matchesPrefix(bytes, [0x20], 3)
-    || matchesPrefix(bytes, [0x00], 8)
-    || matchesPrefix(bytes, [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 64)
-    || matchesPrefix(bytes, [0x20, 0x01, 0x00], 23)
-    || matchesPrefix(bytes, [0x20, 0x01, 0x0d, 0xb8], 32)
-    || matchesPrefix(bytes, [0x20, 0x02], 16)
-    || matchesPrefix(bytes, [0x26, 0x20, 0x00, 0x4f, 0x80, 0x00], 48)
-    || matchesPrefix(bytes, [0x3f, 0xff, 0x00], 20)
-    || matchesPrefix(bytes, [0x5f, 0x00], 16)
-    || matchesPrefix(bytes, [0xfc], 7)
-    || matchesPrefix(bytes, [0xfe, 0x80], 10)
-    || matchesPrefix(bytes, [0xfe, 0xc0], 10)
-    || matchesPrefix(bytes, [0xff], 8)
+    !bytes
+    || !matchesPrefix(bytes, IPV6_GLOBAL_UNICAST_PREFIX.bytes, IPV6_GLOBAL_UNICAST_PREFIX.bits)
+    || matchesAnyPrefix(bytes, IANA_IPV6_SPECIAL_PREFIXES)
+    || matchesAnyPrefix(bytes, ADDITIONAL_NON_PUBLIC_IPV6_PREFIXES)
   )
 }
 
@@ -484,6 +529,7 @@ export class SafeMediaDownloader {
       let waitingForDrain = false
       let byteSize = 0
       let pendingWrites = 0
+      let declaredContentLength: number | undefined
       let responseContentType: string | undefined
 
       const clearConnectTimer = () => {
@@ -553,6 +599,10 @@ export class SafeMediaDownloader {
       }
       const completeBody = () => {
         if (!responseEnded || pendingWrites !== 0 || waitingForDrain) return
+        if (declaredContentLength !== undefined && byteSize !== declaredContentLength) {
+          fail()
+          return
+        }
         succeed({
           kind: 'body',
           byteSize,
@@ -572,7 +622,13 @@ export class SafeMediaDownloader {
       const onData = (chunk: Buffer | string) => {
         if (settled) return
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-        if (bytes.byteLength > options.maxBytes - byteSize) {
+        if (
+          bytes.byteLength > options.maxBytes - byteSize
+          || (
+            declaredContentLength !== undefined
+            && bytes.byteLength > declaredContentLength - byteSize
+          )
+        ) {
           fail()
           return
         }
@@ -627,15 +683,14 @@ export class SafeMediaDownloader {
           return
         }
 
-        let declaredLength: number | undefined
         try {
-          declaredLength = contentLength(response.headers['content-length'])
+          declaredContentLength = contentLength(response.headers['content-length'])
         } catch {
           cancelResponse()
           fail()
           return
         }
-        if (declaredLength !== undefined && declaredLength > options.maxBytes) {
+        if (declaredContentLength !== undefined && declaredContentLength > options.maxBytes) {
           cancelResponse()
           fail()
           return

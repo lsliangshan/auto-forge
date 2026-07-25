@@ -298,6 +298,94 @@ describe('SafeMediaDownloader URL and address validation', () => {
     expect(network.calls).toHaveLength(0)
   })
 
+  it.each([
+    ['unspecified', '::'],
+    ['loopback', '::1'],
+    ['IPv4-mapped start', '::ffff:0:0'],
+    ['IPv4-mapped end', '::ffff:ffff:ffff'],
+    ['well-known translation start', '64:ff9b::'],
+    ['well-known translation end', '64:ff9b::ffff:ffff'],
+    ['local translation start', '64:ff9b:1::'],
+    ['local translation end', '64:ff9b:1:ffff:ffff:ffff:ffff:ffff'],
+    ['discard-only start', '100::'],
+    ['discard-only end', '100::ffff:ffff:ffff:ffff'],
+    ['dummy prefix start', '100:0:0:1::'],
+    ['dummy prefix end', '100:0:0:1:ffff:ffff:ffff:ffff'],
+    ['IETF assignments start', '2001::'],
+    ['IETF assignments end', '2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['documentation start', '2001:db8::'],
+    ['documentation end', '2001:db8:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['6to4 start', '2002::'],
+    ['6to4 end', '2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['AS112 start', '2620:4f:8000::'],
+    ['AS112 end', '2620:4f:8000:ffff:ffff:ffff:ffff:ffff'],
+    ['documentation 3fff start', '3fff::'],
+    ['documentation 3fff end', '3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['segment-routing start', '5f00::'],
+    ['segment-routing end', '5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['unique-local start', 'fc00::'],
+    ['unique-local end', 'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['link-local start', 'fe80::'],
+    ['link-local end', 'febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['deprecated site-local start', 'fec0::'],
+    ['deprecated site-local end', 'feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['multicast start', 'ff00::'],
+    ['multicast end', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+  ])('rejects the IPv6 special-registry boundary %s', async (_name, address) => {
+    const { downloader, network } = setup([{ address, family: 6 }])
+    const promise = downloader.download(
+      'https://provider.example/result.png',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    )
+    await flushMicrotasks()
+    network.calls[0]?.request.emit('error', new Error('unexpected request'))
+
+    await expectSafeFailure(promise)
+    expect(network.calls).toHaveLength(0)
+  })
+
+  it.each([
+    ['before IETF assignments', '2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['after IETF assignments', '2001:200::1'],
+    ['before documentation', '2001:db7:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['after documentation', '2001:db9::1'],
+    ['before 6to4', '2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['after 6to4', '2003::1'],
+    ['before AS112', '2620:4f:7fff:ffff:ffff:ffff:ffff:ffff'],
+    ['after AS112', '2620:4f:8001::1'],
+    ['before 3fff documentation', '3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff'],
+    ['after 3fff documentation', '3fff:1000::1'],
+  ])('accepts the adjacent global-unicast address %s', async (_name, address) => {
+    const { downloader, network } = setup([{ address, family: 6 }])
+    const promise = downloader.download(
+      'https://provider.example/result.png',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    )
+    await waitFor(() => network.calls.length === 1)
+    network.connect(0)
+    const response = network.respond(0, 200, { 'content-length': '0' })
+    response.push(null)
+
+    await expect(promise).resolves.toEqual({ byteSize: 0 })
+  })
+
+  it('rejects a mixed DNS set containing a local translation address', async () => {
+    const { downloader, network } = setup([
+      PUBLIC_IPV4,
+      { address: '64:ff9b:1::a00:1', family: 6 },
+      PUBLIC_IPV6,
+    ])
+
+    await expectSafeFailure(downloader.download(
+      'https://provider.example/result.png',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    ))
+    expect(network.calls).toHaveLength(0)
+  })
+
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_SAFE_DOWNLOAD_BYTES + 1])(
     'rejects invalid or unbounded maxBytes %s before DNS',
     async (maxBytes) => {
@@ -471,7 +559,7 @@ describe('SafeMediaDownloader redirects and responses', () => {
     )
     await waitFor(() => network.calls.length === 1)
     network.connect(0)
-    const response = network.respond(0, 200, { 'content-length': '2' })
+    const response = network.respond(0, 200, { 'content-length': '5' })
     response.push('123')
     response.push('456')
 
@@ -480,6 +568,122 @@ describe('SafeMediaDownloader redirects and responses', () => {
     expect(response.destroyed).toBe(true)
     expect(sink.destroyed).toBe(false)
     expect(sink.writableEnded).toBe(false)
+  })
+
+  it('rejects a body longer than its declared Content-Length while still below maxBytes', async () => {
+    const { downloader, network, timers } = setup()
+    const sink = new RecordingSink()
+    const promise = downloader.download(
+      'https://provider.example/result.png',
+      sink,
+      { maxBytes: 10 },
+    )
+    await waitFor(() => network.calls.length === 1)
+    network.connect(0)
+    const response = network.respond(0, 200, { 'content-length': '2' })
+    response.push('ab')
+    response.push('c')
+    response.push(null)
+
+    await expectSafeFailure(promise)
+    expect(response.destroyed).toBe(true)
+    expect(timers.pending.size).toBe(0)
+    expect(sink.writableEnded).toBe(false)
+  })
+
+  it('rejects a body shorter than its declared Content-Length at end', async () => {
+    const { downloader, network, timers } = setup()
+    const sink = new RecordingSink()
+    const promise = downloader.download(
+      'https://provider.example/result.png',
+      sink,
+      { maxBytes: 10 },
+    )
+    await waitFor(() => network.calls.length === 1)
+    network.connect(0)
+    const response = network.respond(0, 200, { 'content-length': '4' })
+    response.push('abc')
+    response.push(null)
+
+    await expectSafeFailure(promise)
+    expect(response.destroyed).toBe(true)
+    expect(timers.pending.size).toBe(0)
+    expect(sink.bytes().toString()).toBe('abc')
+    expect(sink.writableEnded).toBe(false)
+  })
+
+  it.each([
+    ['comma-separated values', '2, 2'],
+    ['duplicate array values', ['2', '2']],
+    ['leading zero', '02'],
+    ['positive sign', '+2'],
+    ['decimal syntax', '2.0'],
+    ['surrounding whitespace', ' 2 '],
+    ['unsafe integer', '9007199254740992'],
+  ] as const)('rejects invalid Content-Length %s', async (_name, value) => {
+    const { downloader, network } = setup()
+    const sink = new RecordingSink()
+    const promise = downloader.download(
+      'https://provider.example/result.png',
+      sink,
+      { maxBytes: 10 },
+    )
+    await waitFor(() => network.calls.length === 1)
+    network.connect(0)
+    const response = network.respond(0, 200, {
+      'content-length': value,
+    } as unknown as IncomingMessage['headers'])
+
+    await expectSafeFailure(promise)
+    expect(response.destroyed).toBe(true)
+    expect(sink.bytes()).toHaveLength(0)
+  })
+
+  it.each([
+    ['zero bytes', '0', '', 0],
+    ['nonzero bytes', '2', 'ok', 2],
+  ] as const)('accepts exact %s Content-Length', async (_name, declared, body, byteSize) => {
+    const { downloader, network } = setup()
+    const sink = new RecordingSink()
+    const promise = downloader.download(
+      'https://provider.example/result.png',
+      sink,
+      { maxBytes: 10 },
+    )
+    await waitFor(() => network.calls.length === 1)
+    network.connect(0)
+    const response = network.respond(0, 200, { 'content-length': declared })
+    if (body) response.push(body)
+    response.push(null)
+
+    await expect(promise).resolves.toEqual({ byteSize })
+    expect(sink.bytes().toString()).toBe(body)
+    expect(sink.writableEnded).toBe(false)
+  })
+
+  it('does not carry a redirect Content-Length into the final response', async () => {
+    const { downloader, network } = setup()
+    const sink = new RecordingSink()
+    const promise = downloader.download(
+      'https://provider.example/start',
+      sink,
+      { maxBytes: 10 },
+    )
+    await waitFor(() => network.calls.length === 1)
+    network.connect(0)
+    const redirect = network.respond(0, 302, {
+      location: '/final',
+      'content-length': '999',
+    })
+    expect(redirect.destroyed).toBe(true)
+    await waitFor(() => network.calls.length === 2)
+    network.connect(1)
+    const final = network.respond(1, 200, { 'content-length': '2' })
+    final.push('ok')
+    final.push(null)
+
+    await expect(promise).resolves.toEqual({ byteSize: 2 })
+    expect(sink.bytes().toString()).toBe('ok')
   })
 
   it('streams with backpressure and does not end the caller-owned destination', async () => {
