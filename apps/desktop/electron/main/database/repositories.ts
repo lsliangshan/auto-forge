@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import { z } from 'zod'
 import {
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
@@ -184,6 +185,54 @@ export interface MediaGenerationJob {
 export type MediaGenerationJobPatch = Partial<Omit<MediaGenerationJob, 'id' | 'conversationId' | 'assistantMessageId' | 'provider' | 'model' | 'kind' | 'providerJobId' | 'createdAt'>>
 export type MessageInput = Omit<Message, 'executionId'> & { executionId?: string }
 
+const identifierSchema = z.string().trim().min(1)
+const nonnegativeIntegerSchema = z.number().finite().int().nonnegative()
+const positiveIntegerSchema = z.number().finite().int().positive()
+const mediaAssetRecordShape = {
+  id: identifierSchema,
+  conversationId: identifierSchema,
+  messageId: identifierSchema.optional(),
+  source: z.enum(['upload', 'generated']),
+  kind: z.enum(['image', 'audio', 'video']),
+  mimeType: z.string().trim().min(1).optional(),
+  originalName: z.string().trim().min(1),
+  relativePath: z.string().trim().min(1).optional(),
+  byteSize: nonnegativeIntegerSchema.optional(),
+  width: positiveIntegerSchema.optional(),
+  height: positiveIntegerSchema.optional(),
+  durationMs: nonnegativeIntegerSchema.optional(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  provider: z.string().trim().min(1).optional(),
+  model: z.string().trim().min(1).optional(),
+  status: z.enum(['staging', 'ready', 'failed', 'deleting']),
+  createdAt: nonnegativeIntegerSchema,
+  updatedAt: nonnegativeIntegerSchema,
+}
+
+const mediaAssetRecordSchema = z.object(mediaAssetRecordShape).strict().superRefine((asset, context) => {
+  if (asset.status !== 'ready') return
+  for (const field of ['relativePath', 'mimeType', 'byteSize', 'sha256'] as const) {
+    if (asset[field] === undefined) context.addIssue({ code: 'custom', path: [field], message: 'Ready media assets require complete file metadata' })
+  }
+})
+
+const mediaAssetPatchSchema = z.object({
+  source: mediaAssetRecordShape.source,
+  kind: mediaAssetRecordShape.kind,
+  mimeType: mediaAssetRecordShape.mimeType,
+  originalName: mediaAssetRecordShape.originalName,
+  relativePath: mediaAssetRecordShape.relativePath,
+  byteSize: mediaAssetRecordShape.byteSize,
+  width: mediaAssetRecordShape.width,
+  height: mediaAssetRecordShape.height,
+  durationMs: mediaAssetRecordShape.durationMs,
+  sha256: mediaAssetRecordShape.sha256,
+  provider: mediaAssetRecordShape.provider,
+  model: mediaAssetRecordShape.model,
+  status: mediaAssetRecordShape.status,
+  updatedAt: mediaAssetRecordShape.updatedAt,
+}).partial().strict()
+
 type Query = Record<string, unknown>
 type SqliteDatabase = Database.Database
 
@@ -290,7 +339,7 @@ function optional<T>(value: unknown): T | undefined {
 }
 
 function mediaAssetFromRow(row: Query): MediaAssetRecord {
-  return {
+  return mediaAssetRecordSchema.parse({
     id: row.id as string,
     conversationId: row.conversationId as string,
     messageId: optional<string>(row.messageId),
@@ -309,7 +358,7 @@ function mediaAssetFromRow(row: Query): MediaAssetRecord {
     status: row.status as MediaAssetStatus,
     createdAt: row.createdAt as number,
     updatedAt: row.updatedAt as number,
-  }
+  })
 }
 
 function mediaGenerationJobFromRow(row: Query): MediaGenerationJob {
@@ -399,7 +448,13 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       insertWithAssets(value, assetIds) {
         const blocks = chatBlockSchema.array().parse(value.blocks)
         transaction(database, () => {
-          if (new Set(assetIds).size !== assetIds.length) throw new Error('Duplicate media assets are not allowed')
+          const blockAssetIds = blocks.filter((block) => block.type === 'media').map((block) => block.assetId)
+          if (
+            new Set(assetIds).size !== assetIds.length
+            || new Set(blockAssetIds).size !== blockAssetIds.length
+            || assetIds.length !== blockAssetIds.length
+            || assetIds.some((assetId) => !blockAssetIds.includes(assetId))
+          ) throw new Error('Media assets must exactly match message blocks')
           for (const assetId of assetIds) {
             const asset = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, { id: assetId })
             if (!asset) throw new Error('Media asset not found')
@@ -440,6 +495,18 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
           const index = blocks.findIndex((block) => 'blockId' in block && block.blockId === blockId)
           if (index === -1) throw new Error('Message block not found')
+          if (parsedReplacement.type === 'media') {
+            const asset = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, { id: parsedReplacement.assetId })
+            if (!asset) throw new Error('Media asset not found')
+            const stored = mediaAssetFromRow(asset)
+            if (stored.conversationId !== row.conversationId || stored.status !== 'ready' || stored.messageId !== undefined) {
+              throw new Error('Media asset cannot be claimed')
+            }
+            const claim = database.prepare("UPDATE media_assets SET message_id = @messageId, updated_at = @updatedAt WHERE id = @assetId AND conversation_id = @conversationId AND message_id IS NULL AND status = 'ready'")
+            if (claim.run({ messageId, assetId: parsedReplacement.assetId, conversationId: row.conversationId, updatedAt: now() }).changes !== 1) {
+              throw new Error('Media asset could not be claimed')
+            }
+          }
           blocks[index] = parsedReplacement
           database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: messageId, blocksJson: JSON.stringify(blocks) })
         })
@@ -471,20 +538,21 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     },
     mediaAssets: {
       insert(value) {
+        const asset = mediaAssetRecordSchema.parse(value)
         transaction(database, () => database.prepare('INSERT INTO media_assets (id, conversation_id, message_id, source, kind, mime_type, original_name, relative_path, byte_size, width, height, duration_ms, sha256, provider, model, status, created_at, updated_at) VALUES (@id, @conversationId, @messageId, @source, @kind, @mimeType, @originalName, @relativePath, @byteSize, @width, @height, @durationMs, @sha256, @provider, @model, @status, @createdAt, @updatedAt)').run({
-          ...value,
-          messageId: value.messageId ?? null,
-          mimeType: value.mimeType ?? null,
-          relativePath: value.relativePath ?? null,
-          byteSize: value.byteSize ?? null,
-          width: value.width ?? null,
-          height: value.height ?? null,
-          durationMs: value.durationMs ?? null,
-          sha256: value.sha256 ?? null,
-          provider: value.provider ?? null,
-          model: value.model ?? null,
+          ...asset,
+          messageId: asset.messageId ?? null,
+          mimeType: asset.mimeType ?? null,
+          relativePath: asset.relativePath ?? null,
+          byteSize: asset.byteSize ?? null,
+          width: asset.width ?? null,
+          height: asset.height ?? null,
+          durationMs: asset.durationMs ?? null,
+          sha256: asset.sha256 ?? null,
+          provider: asset.provider ?? null,
+          model: asset.model ?? null,
         }))
-        const stored = this.get(value.id)
+        const stored = this.get(asset.id)
         if (!stored) throw new Error('Media asset was not persisted')
         return stored
       },
@@ -492,24 +560,47 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       listForConversation: (conversationId) => many<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE conversation_id = @conversationId ORDER BY created_at, id`, { conversationId }).map(mediaAssetFromRow),
       listUnclaimedBefore: (timestamp) => many<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE message_id IS NULL AND created_at < @timestamp ORDER BY created_at, id`, { timestamp }).map(mediaAssetFromRow),
       update(id, patch) {
-        transaction(database, () => database.prepare('UPDATE media_assets SET source = COALESCE(@source, source), kind = COALESCE(@kind, kind), mime_type = COALESCE(@mimeType, mime_type), original_name = COALESCE(@originalName, original_name), relative_path = COALESCE(@relativePath, relative_path), byte_size = COALESCE(@byteSize, byte_size), width = COALESCE(@width, width), height = COALESCE(@height, height), duration_ms = COALESCE(@durationMs, duration_ms), sha256 = COALESCE(@sha256, sha256), provider = COALESCE(@provider, provider), model = COALESCE(@model, model), status = COALESCE(@status, status), updated_at = @updatedAt WHERE id = @id').run({
-          id, ...patch, source: patch.source ?? null, kind: patch.kind ?? null, mimeType: patch.mimeType ?? null, originalName: patch.originalName ?? null, relativePath: patch.relativePath ?? null, byteSize: patch.byteSize ?? null, width: patch.width ?? null, height: patch.height ?? null, durationMs: patch.durationMs ?? null, sha256: patch.sha256 ?? null, provider: patch.provider ?? null, model: patch.model ?? null, status: patch.status ?? null, updatedAt: patch.updatedAt ?? now(),
-        }))
+        const validatedPatch = mediaAssetPatchSchema.parse(patch)
+        transaction(database, () => {
+          const row = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, { id })
+          if (!row) return
+          const updated = mediaAssetRecordSchema.parse({ ...mediaAssetFromRow(row), ...validatedPatch, updatedAt: validatedPatch.updatedAt ?? now() })
+          database.prepare('UPDATE media_assets SET source = @source, kind = @kind, mime_type = @mimeType, original_name = @originalName, relative_path = @relativePath, byte_size = @byteSize, width = @width, height = @height, duration_ms = @durationMs, sha256 = @sha256, provider = @provider, model = @model, status = @status, updated_at = @updatedAt WHERE id = @id').run({
+            ...updated,
+            mimeType: updated.mimeType ?? null,
+            relativePath: updated.relativePath ?? null,
+            byteSize: updated.byteSize ?? null,
+            width: updated.width ?? null,
+            height: updated.height ?? null,
+            durationMs: updated.durationMs ?? null,
+            sha256: updated.sha256 ?? null,
+            provider: updated.provider ?? null,
+            model: updated.model ?? null,
+          })
+        })
         return this.get(id)
       },
       delete: (id) => { transaction(database, () => database.prepare('DELETE FROM media_assets WHERE id = @id').run({ id })) },
     },
     mediaGenerationJobs: {
       insert(value) {
-        transaction(database, () => database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, @nextPollAt, @pollAttempts, @errorCode, @assetId, @createdAt, @updatedAt, @endedAt)').run({
-          ...value,
-          parametersJson: JSON.stringify(value.parameters),
-          nextPollAt: value.nextPollAt ?? null,
-          pollAttempts: value.pollAttempts ?? 0,
-          errorCode: value.errorCode ?? null,
-          assetId: value.assetId ?? null,
-          endedAt: value.endedAt ?? null,
-        }))
+        transaction(database, () => {
+          const message = one<{ conversationId: string }>(database, 'SELECT conversation_id AS conversationId FROM messages WHERE id = @id', { id: value.assistantMessageId })
+          if (!message || message.conversationId !== value.conversationId) throw new Error('Assistant message does not belong to the media job conversation')
+          if (value.assetId !== undefined) {
+            const asset = one<{ conversationId: string }>(database, 'SELECT conversation_id AS conversationId FROM media_assets WHERE id = @id', { id: value.assetId })
+            if (!asset || asset.conversationId !== value.conversationId) throw new Error('Media asset does not belong to the media job conversation')
+          }
+          database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, @nextPollAt, @pollAttempts, @errorCode, @assetId, @createdAt, @updatedAt, @endedAt)').run({
+            ...value,
+            parametersJson: JSON.stringify(value.parameters),
+            nextPollAt: value.nextPollAt ?? null,
+            pollAttempts: value.pollAttempts ?? 0,
+            errorCode: value.errorCode ?? null,
+            assetId: value.assetId ?? null,
+            endedAt: value.endedAt ?? null,
+          })
+        })
         const stored = this.get(value.id)
         if (!stored) throw new Error('Media generation job was not persisted')
         return stored
@@ -517,9 +608,18 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       get: (id) => { const row = one<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`, { id }); return row && mediaGenerationJobFromRow(row) },
       listResumable: (now) => many<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE status IN ('pending', 'in_progress', 'downloading') AND (next_poll_at IS NULL OR next_poll_at <= @now) ORDER BY next_poll_at, id`, { now }).map(mediaGenerationJobFromRow),
       update(id, patch) {
-        transaction(database, () => database.prepare('UPDATE media_generation_jobs SET status = COALESCE(@status, status), parameters_json = COALESCE(@parametersJson, parameters_json), next_poll_at = COALESCE(@nextPollAt, next_poll_at), poll_attempts = COALESCE(@pollAttempts, poll_attempts), error_code = COALESCE(@errorCode, error_code), asset_id = COALESCE(@assetId, asset_id), updated_at = @updatedAt, ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
-          id, ...patch, status: patch.status ?? null, parametersJson: patch.parameters === undefined ? null : JSON.stringify(patch.parameters), nextPollAt: patch.nextPollAt ?? null, pollAttempts: patch.pollAttempts ?? null, errorCode: patch.errorCode ?? null, assetId: patch.assetId ?? null, endedAt: patch.endedAt ?? null, updatedAt: patch.updatedAt ?? now(),
-        }))
+        transaction(database, () => {
+          const job = one<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`, { id })
+          if (!job) return
+          const stored = mediaGenerationJobFromRow(job)
+          if (patch.assetId !== undefined) {
+            const asset = one<{ conversationId: string }>(database, 'SELECT conversation_id AS conversationId FROM media_assets WHERE id = @id', { id: patch.assetId })
+            if (!asset || asset.conversationId !== stored.conversationId) throw new Error('Media asset does not belong to the media job conversation')
+          }
+          database.prepare('UPDATE media_generation_jobs SET status = COALESCE(@status, status), parameters_json = COALESCE(@parametersJson, parameters_json), next_poll_at = COALESCE(@nextPollAt, next_poll_at), poll_attempts = COALESCE(@pollAttempts, poll_attempts), error_code = COALESCE(@errorCode, error_code), asset_id = COALESCE(@assetId, asset_id), updated_at = @updatedAt, ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
+            id, ...patch, status: patch.status ?? null, parametersJson: patch.parameters === undefined ? null : JSON.stringify(patch.parameters), nextPollAt: patch.nextPollAt ?? null, pollAttempts: patch.pollAttempts ?? null, errorCode: patch.errorCode ?? null, assetId: patch.assetId ?? null, endedAt: patch.endedAt ?? null, updatedAt: patch.updatedAt ?? now(),
+          })
+        })
         return this.get(id)
       },
     },
