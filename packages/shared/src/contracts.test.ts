@@ -7,8 +7,12 @@ import {
   chatEventSchema,
   chatSendInputSchema,
   executionEventSchema,
+  generationOptionsSchema,
   ipcRequestSchemas,
   ipcChannels,
+  mediaAssetSchema,
+  mediaBlockSchema,
+  modelInfoSchema,
   providerCredentialStatusSchema,
   toSafeAppError,
   workerMessageSchema,
@@ -58,6 +62,84 @@ describe('cross-process contracts', () => {
       byteSize: 12,
       path: '/private/photo.png',
     })).toThrow()
+
+    expect(() => mediaBlockSchema.parse({
+      type: 'media',
+      blockId: 'block_1',
+      assetId: 'asset_1',
+      kind: 'image',
+      purpose: 'input',
+      name: 'photo.png',
+      mimeType: 'image/png',
+      byteSize: 12,
+      base64: 'c2VjcmV0',
+    })).toThrow()
+  })
+
+  it('rejects paths and encoded bytes from public media asset metadata', () => {
+    const asset = {
+      id: 'asset_1',
+      kind: 'image' as const,
+      name: 'photo.png',
+      mimeType: 'image/png',
+      byteSize: 12,
+    }
+
+    expect(mediaAssetSchema.parse(asset)).toEqual(asset)
+    expect(() => mediaAssetSchema.parse({ ...asset, path: '/private/photo.png' })).toThrow()
+    expect(() => mediaAssetSchema.parse({ ...asset, base64: 'c2VjcmV0' })).toThrow()
+  })
+
+  it('applies only the documented generation defaults', () => {
+    expect(generationOptionsSchema.parse({
+      image: { count: 1 },
+      audio: {},
+      video: {},
+    })).toEqual({
+      image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      audio: { format: 'mp3' },
+      video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+    })
+  })
+
+  it('requires capability-rich model metadata', () => {
+    const model = modelInfoSchema.parse({
+      id: 'openai/image-model',
+      name: 'Image model',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['image'],
+      supportsTools: false,
+      generation: {
+        image: {
+          resolutions: ['1K'],
+          aspectRatios: ['auto'],
+          formats: ['png'],
+          maxCount: 1,
+        },
+      },
+    })
+
+    expect(model.generation.image?.formats).toEqual(['png'])
+    expect(() => modelInfoSchema.parse({ ...model, supportsTools: undefined })).toThrow()
+  })
+
+  it('recognizes every safe media error code and no unknown code', () => {
+    const safeMediaCodes = [
+      'MEDIA_TYPE_UNSUPPORTED',
+      'MEDIA_ATTACHMENT_LIMIT_EXCEEDED',
+      'MEDIA_SIZE_LIMIT_EXCEEDED',
+      'MEDIA_MIME_MISMATCH',
+      'MEDIA_IMPORT_FAILED',
+      'MEDIA_ASSET_UNAVAILABLE',
+      'MEDIA_STORAGE_FULL',
+      'MODEL_MODALITY_UNSUPPORTED',
+      'MEDIA_GENERATION_FAILED',
+      'MEDIA_DOWNLOAD_FAILED',
+      'MEDIA_GENERATION_TIMEOUT',
+    ] as const
+
+    expect(safeMediaCodes.map((code) => appErrorCodeSchema.parse(code))).toEqual(safeMediaCodes)
+    expect(() => appErrorCodeSchema.parse('MEDIA_UNKNOWN')).toThrow()
   })
 
   it('replaces only the matching media block through a strict block update event', () => {
