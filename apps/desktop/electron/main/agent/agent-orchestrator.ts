@@ -75,6 +75,7 @@ export interface CreateRunInput {
 export interface CreateAssistantInput {
   messageId: string
   conversationId: string
+  initialBlocks: ChatBlock[]
   createdAt: number
 }
 
@@ -98,6 +99,7 @@ export interface AgentPersistencePort {
   createRun(input: CreateRunInput): void
   createAssistant(input: CreateAssistantInput): void
   updateAssistant(messageId: string, blocks: ChatBlock[]): unknown
+  replaceAssistantBlock(messageId: string, blockId: string, block: ChatBlock): unknown
   finalize(input: FinalizeAgentRunInput): void
 }
 
@@ -129,12 +131,15 @@ export function createAgentPersistence(
         id: input.messageId,
         conversationId: input.conversationId,
         role: 'assistant',
-        blocks: [],
+        blocks: input.initialBlocks,
         createdAt: input.createdAt,
       })
     },
     updateAssistant(messageId, blocks) {
       return repositories.messages.update(messageId, { blocks })
+    },
+    replaceAssistantBlock(messageId, blockId, block) {
+      return repositories.messages.replaceBlock(messageId, blockId, block)
     },
     finalize(input) {
       repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, {
@@ -284,6 +289,7 @@ export class AgentOrchestrator {
     this.dependencies.persistence.createAssistant({
       messageId,
       conversationId: input.conversationId,
+      initialBlocks: [],
       createdAt: startedAt,
     })
     const provider = this.dependencies.providers.get(input.provider)

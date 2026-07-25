@@ -61,8 +61,21 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     persistence: {
       persistUser(value) { records.users.push(value) },
       createRun() {},
-      createAssistant(value) { messages.set(value.messageId, { blocks: [] }) },
+      createAssistant(value) { messages.set(value.messageId, { blocks: value.initialBlocks }) },
       updateAssistant(messageId, blocks) { messages.set(messageId, { blocks }); return { blocks } },
+      replaceAssistantBlock(messageId, blockId, block) {
+        const current = messages.get(messageId)?.blocks ?? []
+        const blocks = current.map((candidate) => (
+          typeof candidate === 'object'
+          && candidate !== null
+          && 'blockId' in candidate
+          && candidate.blockId === blockId
+            ? block
+            : candidate
+        ))
+        messages.set(messageId, { blocks })
+        return { blocks }
+      },
       finalize(value) { records.terminal.push(value); messages.set(value.messageId, { blocks: value.blocks }) },
     },
     emit: (event) => { records.events.push(event) },
@@ -141,8 +154,9 @@ describe('AgentOrchestrator', () => {
   it('claims exact assets when the production persistence adapter inserts a user message', () => {
     const insert = vi.fn()
     const insertWithAssets = vi.fn()
+    const replaceBlock = vi.fn()
     const persistence = createAgentPersistence({
-      messages: { insert, insertWithAssets },
+      messages: { insert, insertWithAssets, replaceBlock },
       chatRuns: {},
     } as never)
     const blocks = [{ type: 'text' as const, text: '带附件' }]
@@ -163,6 +177,29 @@ describe('AgentOrchestrator', () => {
       createdAt: 10,
     }, ['asset_1'])
     expect(insert).not.toHaveBeenCalled()
+
+    const pending = {
+      type: 'media_generation' as const,
+      blockId: 'block_1',
+      jobId: 'request_1',
+      kind: 'image' as const,
+      status: 'in_progress' as const,
+    }
+    persistence.createAssistant({
+      messageId: 'assistant_1',
+      conversationId: 'conversation_1',
+      initialBlocks: [pending],
+      createdAt: 11,
+    })
+    expect(insert).toHaveBeenCalledWith({
+      id: 'assistant_1',
+      conversationId: 'conversation_1',
+      role: 'assistant',
+      blocks: [pending],
+      createdAt: 11,
+    })
+    persistence.replaceAssistantBlock('assistant_1', 'block_1', pending)
+    expect(replaceBlock).toHaveBeenCalledWith('assistant_1', 'block_1', pending)
   })
 
   it('skips workflow listing and retrieval when tools are disabled', async () => {
