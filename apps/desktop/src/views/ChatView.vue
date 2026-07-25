@@ -24,12 +24,6 @@
       </div>
     </div>
     <template v-else>
-      <div class="chat-controls">
-        <span>本次会话模型</span>
-        <el-select v-model="selectedModel" filterable placeholder="使用默认模型" :loading="settings.modelsLoading" clearable>
-          <el-option v-for="model in settings.modelOptions" :key="model.id" :label="model.name" :value="model.id" />
-        </el-select>
-      </div>
       <div
         class="messages af-scrollbar"
         aria-live="polite"
@@ -65,7 +59,9 @@
       <ChatComposer
         :disabled="false"
         :running="chat.isRunning"
-        @submit="chat.send($event, selectedModel || settings.defaultModel)"
+        :models="settings.models"
+        :default-model="defaultModel"
+        @submit="chat.send($event)"
         @cancel="chat.cancelCurrent"
       />
     </template>
@@ -74,7 +70,7 @@
 
 <script setup lang="ts">
 import { ChatDotRound, Loading } from '@element-plus/icons-vue'
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted } from 'vue'
 import ChatComposer from '../components/chat/ChatComposer.vue'
 import MessageBlock from '../components/chat/MessageBlock.vue'
 import { useChatStore } from '../stores/chat'
@@ -82,12 +78,18 @@ import { useSettingsStore } from '../stores/settings'
 
 const chat = useChatStore()
 const settings = useSettingsStore()
-const selectedModel = ref('')
-watch(
-  [() => settings.activeProvider, () => settings.defaultModel],
-  ([, defaultModel]) => { selectedModel.value = defaultModel },
-  { immediate: true },
-)
+const defaultModel = computed(() => {
+  const defaults = settings.settings?.defaultModels
+  if (!defaults) return ''
+  if (settings.activeProvider === 'deepseek') return defaults.deepseek.text
+  const output = chat.preferences.outputType
+  if (output !== 'auto') return defaults.openrouter[output] ?? ''
+  return defaults.openrouter.text
+    ?? defaults.openrouter.image
+    ?? defaults.openrouter.audio
+    ?? defaults.openrouter.video
+    ?? ''
+})
 onMounted(async () => {
   chat.ensureSubscriptions()
   if (!chat.conversations.length && !chat.loading) void chat.loadConversations()
@@ -98,7 +100,6 @@ onMounted(async () => {
 <style scoped>
 .chat-view { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--af-surface); }
 .messages { flex: 1; overflow: auto; padding: 18px clamp(20px, 5vw, 72px); }
-.chat-controls { display: flex; min-height: 44px; align-items: center; justify-content: flex-end; gap: 8px; border-bottom: 1px solid var(--af-border); padding: 6px 16px; background: var(--af-surface-muted); }.chat-controls span { color: var(--af-text-muted); font-size: 11px; }.chat-controls .el-select { width: min(300px, 45%); }
 .message { display: grid; grid-template-columns: 74px minmax(0, 760px); gap: 12px; max-width: 920px; margin: 0 auto; padding: 16px 0; border-bottom: 1px solid var(--af-border); }
 .message-role { padding-top: 2px; color: var(--af-text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }.message.user .message-role { color: var(--af-cobalt); }
 .message-body { min-width: 0; font-size: 14px; }
