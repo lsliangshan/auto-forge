@@ -227,6 +227,62 @@ describe('chat interactions', () => {
     ])
   })
 
+  it('aligns live text before a stable media anchor without duplicating snapshot content', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
+    vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const loading = store.selectConversation('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: 'A' },
+    })
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_1',
+      block: {
+        type: 'media_generation',
+        blockId: 'media_1',
+        jobId: 'job_1',
+        kind: 'image',
+        status: 'pending',
+      },
+    })
+    resolveMessages([{
+      id: 'assistant_1',
+      conversationId: 'conv_1',
+      role: 'assistant',
+      blocks: [
+        { type: 'text', text: 'A' },
+        {
+          type: 'media_generation',
+          blockId: 'media_1',
+          jobId: 'job_1',
+          kind: 'image',
+          status: 'pending',
+        },
+      ],
+      createdAt: '2026-07-25T00:00:00.000Z',
+    }])
+    await loading
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ id: 'assistant_1:text:0', type: 'text', text: 'A' }),
+      expect.objectContaining({
+        id: 'assistant_1:media_1',
+        type: 'media_generation',
+        blockId: 'media_1',
+      }),
+    ])
+  })
+
   it('appends only the non-overlapping suffix of an accumulated live text delta', async () => {
     const { api, emitChat } = createEventApi()
     let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void

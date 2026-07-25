@@ -99,6 +99,59 @@ function appendTextDelta(current: string, delta: string): string {
   return current + delta.slice(overlap)
 }
 
+function mergeMessageBlocks(
+  messageId: string,
+  persisted: UiChatBlock[],
+  live: UiChatBlock[],
+): UiChatBlock[] {
+  const blocks = [...persisted]
+  let cursor = 0
+  const nextAnchorIndex = (liveIndex: number): number => {
+    for (let index = liveIndex + 1; index < live.length; index += 1) {
+      const candidate = live[index]!
+      if (candidate.type === 'text') continue
+      const anchorIndex = blocks.findIndex((block, blockIndex) =>
+        blockIndex >= cursor && block.id === candidate.id)
+      if (anchorIndex >= 0) return anchorIndex
+    }
+    return blocks.length
+  }
+
+  for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
+    const liveBlock = live[liveIndex]!
+    if (liveBlock.type === 'text') {
+      const boundary = nextAnchorIndex(liveIndex)
+      const previousIndex = boundary - 1
+      const previous = previousIndex >= cursor ? blocks[previousIndex] : undefined
+      if (previous?.type === 'text') {
+        blocks[previousIndex] = {
+          ...previous,
+          text: appendTextDelta(previous.text, liveBlock.text),
+        }
+        cursor = previousIndex + 1
+      } else {
+        blocks.splice(boundary, 0, {
+          ...liveBlock,
+          id: blockIdentity(messageId, liveBlock, boundary),
+        })
+        cursor = boundary + 1
+      }
+      continue
+    }
+
+    const existingIndex = blocks.findIndex(({ id }) => id === liveBlock.id)
+    if (existingIndex >= 0) {
+      blocks[existingIndex] = liveBlock
+      cursor = Math.max(cursor, existingIndex + 1)
+    } else {
+      const boundary = nextAnchorIndex(liveIndex)
+      blocks.splice(boundary, 0, liveBlock)
+      cursor = boundary + 1
+    }
+  }
+  return blocks
+}
+
 function mergeMessageSnapshots(
   persisted: UiChatMessage[],
   live: UiChatMessage[],
@@ -108,31 +161,10 @@ function mergeMessageSnapshots(
   const merged = persisted.map((message) => {
     const liveMessage = liveMessages.get(message.id)
     if (!liveMessage) return message
-    const blocks = [...message.blocks]
-    for (const liveBlock of liveMessage.blocks) {
-      if (liveBlock.type === 'text') {
-        const previous = blocks.at(-1)
-        if (previous?.type === 'text') {
-          blocks[blocks.length - 1] = {
-            ...previous,
-            text: appendTextDelta(previous.text, liveBlock.text),
-          }
-        } else {
-          blocks.push({
-            ...liveBlock,
-            id: blockIdentity(message.id, liveBlock, blocks.length),
-          })
-        }
-        continue
-      }
-      const existingIndex = blocks.findIndex(({ id }) => id === liveBlock.id)
-      if (existingIndex >= 0) blocks[existingIndex] = liveBlock
-      else blocks.push(liveBlock)
-    }
     return {
       ...message,
       role: liveMessage.role,
-      blocks,
+      blocks: mergeMessageBlocks(message.id, message.blocks, liveMessage.blocks),
     }
   })
   return [
