@@ -564,6 +564,126 @@ describe('openAppDatabase', () => {
     expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
   })
 
+  it('atomically claims generated media, replaces its stable block, and finalizes the chat run', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_media_terminal', title: 'Media terminal' })
+    const pending = {
+      type: 'media_generation' as const,
+      blockId: 'block_media_terminal',
+      jobId: 'request_media_terminal',
+      kind: 'image' as const,
+      status: 'in_progress' as const,
+    }
+    database.messages.insert({
+      id: 'assistant_media_terminal',
+      conversationId: 'conversation_media_terminal',
+      role: 'assistant',
+      blocks: [pending],
+      createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_media_terminal',
+      conversationId: 'conversation_media_terminal',
+      requestId: 'request_media_terminal',
+      model: 'image-model',
+      status: 'running',
+      startedAt: 1,
+    })
+    const asset = {
+      ...readyAsset('asset_media_terminal', 'conversation_media_terminal'),
+      source: 'generated' as const,
+    }
+    database.mediaAssets.insert(asset)
+    const finalBlocks = [
+      mediaBlockForAsset(asset, 'block_media_terminal', 'output'),
+      { type: 'text' as const, text: 'transcript' },
+    ]
+
+    database.chatRuns.finalizeWithMessage(
+      'run_media_terminal',
+      'assistant_media_terminal',
+      {
+        blocks: finalBlocks,
+        status: 'completed',
+        endedAt: 2,
+        generationId: 'generation_media_terminal',
+        inputTokens: 3,
+        outputTokens: 4,
+        costUsd: '0.25',
+      },
+    )
+
+    expect(database.messages.get('assistant_media_terminal')?.blocks).toEqual(finalBlocks)
+    expect(database.mediaAssets.get(asset.id)?.messageId).toBe('assistant_media_terminal')
+    expect(database.chatRuns.get('run_media_terminal')).toMatchObject({
+      status: 'completed',
+      endedAt: 2,
+      generationId: 'generation_media_terminal',
+      inputTokens: 3,
+      outputTokens: 4,
+      costUsd: '0.25',
+    })
+  })
+
+  it('rolls back media ownership and message replacement when terminal run persistence fails', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-media-terminal-fault-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'conversation_media_rollback', title: 'Media rollback' })
+    const pending = {
+      type: 'media_generation' as const,
+      blockId: 'block_media_rollback',
+      jobId: 'request_media_rollback',
+      kind: 'image' as const,
+      status: 'in_progress' as const,
+    }
+    database.messages.insert({
+      id: 'assistant_media_rollback',
+      conversationId: 'conversation_media_rollback',
+      role: 'assistant',
+      blocks: [pending],
+      createdAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_media_rollback',
+      conversationId: 'conversation_media_rollback',
+      requestId: 'request_media_rollback',
+      model: 'image-model',
+      status: 'running',
+      startedAt: 1,
+    })
+    const asset = {
+      ...readyAsset('asset_media_rollback', 'conversation_media_rollback'),
+      source: 'generated' as const,
+    }
+    database.mediaAssets.insert(asset)
+    const faultInjector = new Database(path)
+    faultInjector.exec(`
+      CREATE TRIGGER fail_media_terminal_run_update
+      BEFORE UPDATE ON chat_runs
+      WHEN NEW.id = 'run_media_rollback'
+      BEGIN
+        SELECT RAISE(FAIL, 'injected terminal failure');
+      END;
+    `)
+    faultInjector.close()
+
+    expect(() => database.chatRuns.finalizeWithMessage(
+      'run_media_rollback',
+      'assistant_media_rollback',
+      {
+        blocks: [mediaBlockForAsset(asset, 'block_media_rollback', 'output')],
+        status: 'completed',
+        endedAt: 2,
+      },
+    )).toThrow()
+
+    expect(database.messages.get('assistant_media_rollback')?.blocks).toEqual([pending])
+    expect(database.mediaAssets.get(asset.id)?.messageId).toBeUndefined()
+    expect(database.chatRuns.get('run_media_rollback')?.status).toBe('running')
+  })
+
   it('redacts execution log text and metadata before persistence', () => {
     const database = openTestDatabase()
     database.executions.insert({

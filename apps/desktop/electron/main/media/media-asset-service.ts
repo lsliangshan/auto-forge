@@ -983,7 +983,6 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
       let byteSize = 0
       let encodedCharacters = 0
       let pending = ''
-      let sawPadding = false
       let state: 'open' | 'failed' | 'committing' | 'done' = 'open'
       let tail = Promise.resolve()
 
@@ -1019,7 +1018,6 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
         if (encodedCharacters > MAX_ENCODED_GENERATED_BYTES || !/^[A-Za-z0-9+/=]+$/.test(chunk)) {
           throw failure(encodedCharacters > MAX_ENCODED_GENERATED_BYTES ? 'MEDIA_SIZE_LIMIT_EXCEEDED' : 'MEDIA_GENERATION_FAILED')
         }
-        if (sawPadding) throw failure('MEDIA_GENERATION_FAILED')
         const combined = pending + chunk
         const completeLength = combined.length - (combined.length % 4)
         const complete = combined.slice(0, completeLength)
@@ -1036,7 +1034,6 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
             throw failure('MEDIA_GENERATION_FAILED')
           }
           await writeDecodedBatches(complete.slice(0, finalQuartetOffset))
-          sawPadding = true
           await writeDecoded(finalQuartet)
         } else {
           await writeDecodedBatches(complete)
@@ -1058,7 +1055,7 @@ export function createMediaAssetService(options: CreateMediaAssetServiceOptions)
           if (state !== 'open') throw failure('MEDIA_GENERATION_FAILED')
           state = 'committing'
           try {
-            if (pending.length === 1 || (sawPadding && pending.length > 0) || !/^[A-Za-z0-9+/]{0,3}$/.test(pending)) {
+            if (pending.length === 1 || !/^[A-Za-z0-9+/]{0,3}$/.test(pending)) {
               throw failure('MEDIA_GENERATION_FAILED')
             }
             if (pending.length > 0) await writeDecoded(pending)

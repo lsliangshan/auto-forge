@@ -395,6 +395,64 @@ function assertMediaBlockMetadata(block: Extract<ChatBlock, { type: 'media' }>, 
   ) throw new Error('Media block metadata must match the asset')
 }
 
+function claimReplacementMedia(
+  database: SqliteDatabase,
+  messageId: string,
+  conversationId: string,
+  previous: ChatBlock,
+  replacement: Extract<ChatBlock, { type: 'media' }>,
+): void {
+  if (
+    !('blockId' in previous)
+    || previous.blockId !== replacement.blockId
+    || (
+      previous.type === 'media_generation'
+        ? previous.kind !== replacement.kind
+        : previous.type !== 'media'
+          || previous.purpose !== 'output'
+          || previous.assetId !== replacement.assetId
+    )
+    || replacement.purpose !== 'output'
+  ) throw new Error('Media output must replace its matching generation block')
+
+  const row = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, {
+    id: replacement.assetId,
+  })
+  if (!row) throw new Error('Media asset not found')
+  const asset = mediaAssetFromRow(row)
+  if (
+    asset.conversationId !== conversationId
+    || asset.source !== 'generated'
+    || asset.status !== 'ready'
+    || (asset.messageId !== undefined && asset.messageId !== messageId)
+  ) throw new Error('Media asset cannot be claimed')
+  assertMediaBlockMetadata(replacement, asset)
+  if (asset.messageId === messageId) return
+
+  const claim = database.prepare("UPDATE media_assets SET message_id = @messageId, updated_at = @updatedAt WHERE id = @assetId AND conversation_id = @conversationId AND message_id IS NULL AND status = 'ready'")
+  if (claim.run({
+    messageId,
+    assetId: replacement.assetId,
+    conversationId,
+    updatedAt: now(),
+  }).changes !== 1) throw new Error('Media asset could not be claimed')
+}
+
+function assertUniqueFinalMediaBlocks(blocks: readonly ChatBlock[]): void {
+  const blockIds = new Set<string>()
+  const assetIds = new Set<string>()
+  for (const block of blocks) {
+    if ('blockId' in block) {
+      if (blockIds.has(block.blockId)) throw new Error('Message block IDs must be unique')
+      blockIds.add(block.blockId)
+    }
+    if (block.type === 'media') {
+      if (assetIds.has(block.assetId)) throw new Error('Message media assets must be unique')
+      assetIds.add(block.assetId)
+    }
+  }
+}
+
 function projectFromRow(row: Query): WorkflowProject {
   return { ...row, manifest: parse(row.manifestJson as string | null) } as WorkflowProject
 }
@@ -505,31 +563,28 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         if (!('blockId' in parsedReplacement) || parsedReplacement.blockId !== blockId) {
           throw new Error('Replacement block identity must match the updated block')
         }
-        transaction(database, () => {
+        return transaction(database, () => {
           const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id: messageId })
           if (!row) throw new Error('Message not found')
           const blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
           const index = blocks.findIndex((block) => 'blockId' in block && block.blockId === blockId)
           if (index === -1) throw new Error('Message block not found')
           if (parsedReplacement.type === 'media') {
-            const asset = one<Query>(database, `SELECT ${mediaAssetColumns} FROM media_assets WHERE id = @id`, { id: parsedReplacement.assetId })
-            if (!asset) throw new Error('Media asset not found')
-            const stored = mediaAssetFromRow(asset)
-            if (stored.conversationId !== row.conversationId || stored.status !== 'ready' || stored.messageId !== undefined) {
-              throw new Error('Media asset cannot be claimed')
-            }
-            assertMediaBlockMetadata(parsedReplacement, stored)
-            const claim = database.prepare("UPDATE media_assets SET message_id = @messageId, updated_at = @updatedAt WHERE id = @assetId AND conversation_id = @conversationId AND message_id IS NULL AND status = 'ready'")
-            if (claim.run({ messageId, assetId: parsedReplacement.assetId, conversationId: row.conversationId, updatedAt: now() }).changes !== 1) {
-              throw new Error('Media asset could not be claimed')
-            }
+            if (row.role !== 'assistant') throw new Error('Media output requires an assistant message')
+            claimReplacementMedia(
+              database,
+              messageId,
+              row.conversationId as string,
+              blocks[index]!,
+              parsedReplacement,
+            )
           }
           blocks[index] = parsedReplacement
           database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: messageId, blocksJson: JSON.stringify(blocks) })
+          const stored = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id: messageId })
+          if (!stored) throw new Error('Message not found')
+          return messageFromRow(stored)
         })
-        const stored = this.get(messageId)
-        if (!stored) throw new Error('Message not found')
-        return stored
       },
       failInterruptedMediaGenerations() {
         return transaction(database, () => {
@@ -655,10 +710,35 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
       },
       finalizeWithMessage(id, messageId, value) {
-        transaction(database, () => {
+        const blocks = chatBlockSchema.array().parse(value.blocks)
+        assertUniqueFinalMediaBlocks(blocks)
+        return transaction(database, () => {
+          const messageRow = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, {
+            id: messageId,
+          })
+          if (!messageRow || messageRow.role !== 'assistant') throw new Error('Assistant message not found')
+          const runRow = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          if (!runRow || runRow.conversationId !== messageRow.conversationId) {
+            throw new Error('Chat run does not belong to the assistant conversation')
+          }
+          const previousBlocks = chatBlockSchema.array().parse(parse(messageRow.blocksJson as string))
+          for (const block of blocks) {
+            if (block.type !== 'media') continue
+            const previous = previousBlocks.find((candidate) => (
+              'blockId' in candidate && candidate.blockId === block.blockId
+            ))
+            if (!previous) throw new Error('Message block not found')
+            claimReplacementMedia(
+              database,
+              messageId,
+              messageRow.conversationId as string,
+              previous,
+              block,
+            )
+          }
           const message = database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @messageId').run({
             messageId,
-            blocksJson: JSON.stringify(value.blocks),
+            blocksJson: JSON.stringify(blocks),
           })
           if (message.changes !== 1) throw new Error('Assistant message not found')
           const run = database.prepare('UPDATE chat_runs SET status = @status, generation_id = @generationId, input_tokens = @inputTokens, output_tokens = @outputTokens, cost_usd = @costUsd, error_code = @errorCode, ended_at = @endedAt WHERE id = @id').run({
@@ -672,10 +752,10 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             endedAt: value.endedAt,
           })
           if (run.changes !== 1) throw new Error('Chat run not found')
+          const stored = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          if (!stored) throw new Error('Chat run not found')
+          return stored
         })
-        const stored = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
-        if (!stored) throw new Error('Chat run not found')
-        return stored
       },
     },
     workflowProjects: {

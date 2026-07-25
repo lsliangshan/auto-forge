@@ -46,7 +46,6 @@ export interface MediaGenerationRunInput {
 interface ActiveGeneration {
   controller: AbortController
   writer?: GeneratedAssetWriter
-  outputClaimed?: boolean
 }
 
 interface PersistedGeneration {
@@ -164,8 +163,11 @@ export class MediaGenerationOrchestrator {
         : await this.generateAudio(input, persisted, active)
     } catch (error) {
       if (!persisted) throw error
-      if (active.outputClaimed) throw toSafeAppError(error)
-      return await this.fail(input, persisted, active, error)
+      try {
+        return await this.fail(input, persisted, active, error)
+      } catch (terminalError) {
+        throw toSafeAppError(terminalError)
+      }
     } finally {
       this.active.delete(input.requestId)
     }
@@ -253,7 +255,6 @@ export class MediaGenerationOrchestrator {
       input,
       persisted,
       mediaBlock(persisted.blockId, generated),
-      active,
       result.usage,
     )
   }
@@ -367,14 +368,13 @@ export class MediaGenerationOrchestrator {
     const generated = await writer.commit()
     await this.discardIfCancelled(generated, input.conversationId, active.controller.signal)
     const output = mediaBlock(persisted.blockId, generated)
-    return this.complete(input, persisted, output, active, usage, transcript, generationId)
+    return this.complete(input, persisted, output, usage, transcript, generationId)
   }
 
   private async complete(
     input: MediaGenerationRunInput,
     persisted: PersistedGeneration,
     output: Extract<ChatBlock, { type: 'media' }>,
-    active: ActiveGeneration,
     usage?: { inputTokens?: number; outputTokens?: number; costUsd?: string },
     transcript = '',
     generationId?: string,
@@ -384,28 +384,22 @@ export class MediaGenerationOrchestrator {
       ...(transcript ? [{ type: 'text' as const, text: transcript }] : []),
     ]
     try {
-      this.dependencies.persistence.replaceAssistantBlock(
-        persisted.messageId,
-        persisted.blockId,
-        output,
-      )
-      active.outputClaimed = true
+      this.dependencies.persistence.finalize({
+        runId: persisted.runId,
+        requestId: input.requestId,
+        messageId: persisted.messageId,
+        blocks,
+        status: 'completed',
+        endedAt: this.now(),
+        ...(generationId === undefined ? {} : { generationId }),
+        ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
+        ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
+        ...(usage?.costUsd === undefined ? {} : { costUsd: usage.costUsd }),
+      })
     } catch (error) {
       await this.dependencies.media.removeDraft(output.assetId, input.conversationId).catch(() => undefined)
       throw error
     }
-    this.dependencies.persistence.finalize({
-      runId: persisted.runId,
-      requestId: input.requestId,
-      messageId: persisted.messageId,
-      blocks,
-      status: 'completed',
-      endedAt: this.now(),
-      ...(generationId === undefined ? {} : { generationId }),
-      ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
-      ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
-      ...(usage?.costUsd === undefined ? {} : { costUsd: usage.costUsd }),
-    })
     this.safeEmit({
       type: 'block_update',
       conversationId: input.conversationId,
@@ -443,11 +437,6 @@ export class MediaGenerationOrchestrator {
       status: 'failed',
       errorCode: failure.code,
     }
-    this.dependencies.persistence.replaceAssistantBlock(
-      persisted.messageId,
-      persisted.blockId,
-      block,
-    )
     const status = failure.code === 'CANCELLED' ? 'cancelled' : 'failed'
     this.dependencies.persistence.finalize({
       runId: persisted.runId,

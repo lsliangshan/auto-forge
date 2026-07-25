@@ -1,4 +1,7 @@
 import { Buffer } from 'node:buffer'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Writable } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
 import type {
@@ -7,11 +10,16 @@ import type {
   GenerationOptions,
   MediaAsset,
 } from '@autoforge/shared'
-import type { AgentPersistencePort } from '../agent/agent-orchestrator.js'
+import {
+  createAgentPersistence,
+  type AgentPersistencePort,
+} from '../agent/agent-orchestrator.js'
+import { openAppDatabase } from '../database/client.js'
 import type {
   GeneratedAssetWriter,
   MediaAssetService,
 } from '../media/media-asset-service.js'
+import { createMediaAssetService } from '../media/media-asset-service.js'
 import type { ModelProvider } from './model-provider.js'
 import {
   MediaGenerationOrchestrator,
@@ -69,7 +77,6 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
   const calls: string[] = []
   const events: ChatEvent[] = []
   const finalizations: Array<Parameters<AgentPersistencePort['finalize']>[0]> = []
-  const replacements: Array<{ messageId: string; blockId: string; block: ChatBlock }> = []
   const writer: GeneratedAssetWriter = {
     appendBase64Chunk: vi.fn(async (chunk: string) => { calls.push(`append:${chunk}`) }),
     commit: vi.fn(async () => {
@@ -85,7 +92,6 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     updateAssistant: vi.fn(),
     replaceAssistantBlock: vi.fn((messageId, blockId, block) => {
       calls.push('replaceAssistantBlock')
-      replacements.push({ messageId, blockId, block })
       return { blocks: [block] }
     }),
     finalize: vi.fn((input) => {
@@ -114,11 +120,16 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
   }
   const generateImage = vi.fn<NonNullable<ModelProvider['generateImage']>>(async () => {
       calls.push('generateImage')
-      return { outputs: [{ type: 'base64' as const, dataBase64: 'iVBORw0KGgo=', mimeType: 'image/png' }] }
+      return {
+        outputs: [{ type: 'base64' as const, dataBase64: 'iVBORw0KGgo=', mimeType: 'image/png' }],
+        usage: { inputTokens: 2, outputTokens: 3, costUsd: '0.01' },
+      }
     })
   const stream = vi.fn<ModelProvider['stream']>(() => streamEvents([
       { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AQI=', transcript: '你' },
       { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AwQ=', transcript: '好' },
+      { type: 'generation', id: 'generation_audio' },
+      { type: 'usage', inputTokens: 5, outputTokens: 6, totalTokens: 11, costUsd: '0.02' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]))
   const provider = { generateImage, stream }
@@ -148,7 +159,6 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     media,
     persistence,
     provider,
-    replacements,
     writer,
   }
 }
@@ -185,22 +195,15 @@ describe('MediaGenerationOrchestrator', () => {
     }))
     expect(harness.calls.indexOf('persistUser')).toBeLessThan(harness.calls.indexOf('generateImage'))
     expect(harness.calls.indexOf('createAssistant')).toBeLessThan(harness.calls.indexOf('generateImage'))
-    expect(harness.calls.indexOf('commitGeneratedBase64')).toBeLessThan(harness.calls.indexOf('replaceAssistantBlock'))
-    expect(harness.replacements).toEqual([{
-      messageId: 'assistant_message',
-      blockId: 'generation_block',
-      block: expect.objectContaining({
-        type: 'media',
-        blockId: 'generation_block',
-        assetId: 'asset_image',
-        kind: 'image',
-        purpose: 'output',
-      }),
-    }])
+    expect(harness.calls.indexOf('commitGeneratedBase64')).toBeLessThan(harness.calls.indexOf('finalize'))
+    expect(harness.persistence.replaceAssistantBlock).not.toHaveBeenCalled()
     expect(harness.finalizations).toEqual([
       expect.objectContaining({
         status: 'completed',
         blocks: [expect.objectContaining({ type: 'media', blockId: 'generation_block' })],
+        inputTokens: 2,
+        outputTokens: 3,
+        costUsd: '0.01',
       }),
     ])
   })
@@ -224,8 +227,70 @@ describe('MediaGenerationOrchestrator', () => {
     expect(JSON.stringify({
       events: harness.events,
       finalizations: harness.finalizations,
-      replacements: harness.replacements,
     })).not.toContain('cdn.example')
+  })
+
+  it('fails safely when a URL image download fails and emits no success replacement', async () => {
+    const harness = createHarness()
+    harness.provider.generateImage.mockResolvedValue({
+      outputs: [{ type: 'url', url: 'https://cdn.example/failing-output.png' }],
+    })
+    vi.mocked(harness.dependencies.downloader.download).mockImplementation(
+      async (_url, destination) => {
+        destination.emit('error', Object.assign(new Error('secret download failure'), {
+          code: 'MEDIA_DOWNLOAD_FAILED',
+        }))
+        throw Object.assign(new Error('secret download failure'), { code: 'MEDIA_DOWNLOAD_FAILED' })
+      },
+    )
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+
+    const result = await orchestrator.runImage({ ...input, route: imageRoute })
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error: { code: 'MEDIA_DOWNLOAD_FAILED' },
+    })
+    expect(harness.finalizations.at(-1)).toMatchObject({
+      status: 'failed',
+      blocks: [expect.objectContaining({
+        type: 'media_generation',
+        status: 'failed',
+        errorCode: 'MEDIA_DOWNLOAD_FAILED',
+      })],
+    })
+    expect(harness.events.some((event) => (
+      event.type === 'block_update' && event.block.type === 'media'
+    ))).toBe(false)
+    expect(JSON.stringify(harness.events)).not.toContain('secret download failure')
+  })
+
+  it('cancels an active URL download by closing its destination and persists cancellation', async () => {
+    const harness = createHarness()
+    harness.provider.generateImage.mockResolvedValue({
+      outputs: [{ type: 'url', url: 'https://cdn.example/slow-output.png' }],
+    })
+    let downloadStarted = false
+    vi.mocked(harness.dependencies.downloader.download).mockImplementation(
+      async (_url, destination) => new Promise((_resolve, reject) => {
+        downloadStarted = true
+        const fail = () => reject(Object.assign(new Error('closed'), { code: 'MEDIA_DOWNLOAD_FAILED' }))
+        destination.once('error', fail)
+        destination.once('close', fail)
+      }),
+    )
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+    const running = orchestrator.runImage({ ...input, route: imageRoute })
+    await vi.waitFor(() => expect(downloadStarted).toBe(true))
+
+    await orchestrator.cancel('request_1')
+    const result = await running
+
+    expect(result).toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } })
+    expect(harness.finalizations.at(-1)).toMatchObject({
+      status: 'cancelled',
+      blocks: [expect.objectContaining({ errorCode: 'CANCELLED' })],
+    })
   })
 
   it('writes audio deltas in order, persists its transcript, and claims the output asset', async () => {
@@ -239,7 +304,7 @@ describe('MediaGenerationOrchestrator', () => {
     expect(harness.writer.appendBase64Chunk).toHaveBeenNthCalledWith(2, 'AwQ=')
     expect(harness.calls.indexOf('append:AQI=')).toBeLessThan(harness.calls.indexOf('append:AwQ='))
     expect(harness.calls.indexOf('append:AwQ=')).toBeLessThan(harness.calls.indexOf('writer.commit'))
-    expect(harness.replacements[0]?.block).toMatchObject({
+    expect(harness.finalizations[0]?.blocks[0]).toMatchObject({
       type: 'media',
       blockId: 'generation_block',
       assetId: 'asset_audio',
@@ -250,6 +315,12 @@ describe('MediaGenerationOrchestrator', () => {
       expect.objectContaining({ type: 'media', blockId: 'generation_block' }),
       { type: 'text', text: '你好' },
     ])
+    expect(harness.finalizations[0]).toMatchObject({
+      generationId: 'generation_audio',
+      inputTokens: 5,
+      outputTokens: 6,
+      costUsd: '0.02',
+    })
     expect(harness.provider.stream).toHaveBeenCalledWith(expect.objectContaining({
       model: 'audio-model',
       output: { type: 'audio', format: 'mp3' },
@@ -276,32 +347,55 @@ describe('MediaGenerationOrchestrator', () => {
       },
     })
     expect(harness.writer.abort).toHaveBeenCalledTimes(1)
-    expect(harness.replacements).toEqual([{
-      messageId: 'assistant_message',
-      blockId: 'generation_block',
-      block: {
+    expect(harness.finalizations[0]?.blocks).toEqual([{
         type: 'media_generation',
         blockId: 'generation_block',
         jobId: 'request_1',
         kind: 'audio',
         status: 'failed',
         errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
-      },
     }])
-    expect(harness.finalizations[0]?.blocks).toEqual([harness.replacements[0]!.block])
     expect(harness.events).toContainEqual(expect.objectContaining({
       type: 'block_update',
       blockId: 'generation_block',
-      block: harness.replacements[0]!.block,
+      block: harness.finalizations[0]!.blocks[0],
     }))
     expect(JSON.stringify(harness.events)).not.toContain('secret upstream body')
   })
 
-  it('removes an unclaimed generated output when atomic message replacement fails', async () => {
+  it('aborts audio staging and persists failure when writer commit fails', async () => {
     const harness = createHarness()
-    vi.mocked(harness.persistence.replaceAssistantBlock)
-      .mockImplementationOnce(() => { throw new Error('database write failed') })
-      .mockImplementationOnce((_messageId, _blockId, block) => ({ blocks: [block] }))
+    vi.mocked(harness.writer.commit).mockRejectedValue(
+      Object.assign(new Error('secret storage path'), { code: 'MEDIA_STORAGE_FULL' }),
+    )
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+
+    const result = await orchestrator.runAudio({ ...input, route: audioRoute })
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      error: { code: 'MEDIA_STORAGE_FULL' },
+    })
+    expect(harness.writer.abort).toHaveBeenCalledTimes(1)
+    expect(harness.finalizations.at(-1)).toMatchObject({
+      status: 'failed',
+      blocks: [expect.objectContaining({
+        type: 'media_generation',
+        status: 'failed',
+        errorCode: 'MEDIA_STORAGE_FULL',
+      })],
+    })
+    expect(JSON.stringify(harness.events)).not.toContain('secret storage path')
+  })
+
+  it('rolls back a failed atomic success terminal, cleans its output, then persists failure', async () => {
+    const harness = createHarness()
+    vi.mocked(harness.persistence.finalize)
+      .mockImplementationOnce(() => { throw new Error('atomic terminal write failed') })
+      .mockImplementationOnce((value) => {
+        harness.calls.push('finalize')
+        harness.finalizations.push(value)
+      })
     const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
 
     const result = await orchestrator.runImage({ ...input, route: imageRoute })
@@ -311,6 +405,7 @@ describe('MediaGenerationOrchestrator', () => {
       status: 'failed',
       error: { code: 'MEDIA_GENERATION_FAILED' },
     })
+    expect(harness.finalizations).toHaveLength(1)
     expect(harness.finalizations[0]?.blocks).toEqual([
       expect.objectContaining({
         type: 'media_generation',
@@ -318,6 +413,28 @@ describe('MediaGenerationOrchestrator', () => {
         status: 'failed',
       }),
     ])
+    expect(harness.events.some((event) => (
+      event.type === 'block_update' && event.block.type === 'media'
+    ))).toBe(false)
+  })
+
+  it('emits no terminal event when the atomic failure terminal itself does not commit', async () => {
+    const harness = createHarness()
+    harness.provider.generateImage.mockRejectedValue(
+      Object.assign(new Error('provider failed'), { code: 'MODEL_PROVIDER_REQUEST_FAILED' }),
+    )
+    vi.mocked(harness.persistence.finalize).mockImplementation(() => {
+      throw new Error('terminal transaction failed')
+    })
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+
+    await expect(orchestrator.runImage({ ...input, route: imageRoute }))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+
+    expect(harness.events.some((event) => event.type === 'block_update')).toBe(false)
+    expect(harness.events.some((event) => (
+      event.type === 'status' && event.status === 'failed'
+    ))).toBe(false)
   })
 
   it('aborts the provider and persists a cancelled generation state', async () => {
@@ -364,11 +481,94 @@ describe('MediaGenerationOrchestrator', () => {
     const result = await running
 
     expect(harness.media.removeDraft).toHaveBeenCalledWith('asset_image', 'conversation_1')
-    expect(harness.replacements[0]?.block).toMatchObject({
+    expect(harness.finalizations[0]?.blocks[0]).toMatchObject({
       type: 'media_generation',
       status: 'failed',
       errorCode: 'CANCELLED',
     })
     expect(result.status).toBe('cancelled')
+  })
+})
+
+describe('MediaGenerationOrchestrator persistence integration', () => {
+  it('persists independently padded audio deltas, transcript, usage, and ownership atomically', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-audio-orchestrator-'))
+    const database = openAppDatabase(join(root, 'database.sqlite'))
+    const mediaRoot = join(root, 'media')
+    const mp3 = Buffer.concat([
+      Buffer.from('ID3\u0004\u0000\u0000\u0000\u0000\u0000\u0000', 'binary'),
+      Buffer.from('audio'),
+    ])
+    const first = mp3.subarray(0, 11).toString('base64')
+    const second = mp3.subarray(11).toString('base64')
+    try {
+      database.conversations.insert({ id: 'conversation_audio_real', title: 'Audio real' })
+      const media = createMediaAssetService({
+        database,
+        mediaRoot,
+        id: () => 'asset_audio_real',
+      })
+      const provider: Pick<ModelProvider, 'stream' | 'generateImage'> = {
+        stream: () => streamEvents([
+          { type: 'generation', id: 'generation_audio_real' },
+          { type: 'audio_delta', choiceIndex: 0, dataBase64: first, transcript: '你' },
+          { type: 'audio_delta', choiceIndex: 0, dataBase64: second, transcript: '好' },
+          {
+            type: 'usage',
+            inputTokens: 7,
+            outputTokens: 9,
+            totalTokens: 16,
+            costUsd: '0.02',
+          },
+          { type: 'finish', choiceIndex: 0, reason: 'stop' },
+        ]),
+      }
+      const orchestrator = new MediaGenerationOrchestrator({
+        providers: { get: () => provider },
+        persistence: createAgentPersistence(database),
+        media,
+        downloader: { download: vi.fn() },
+        emit: () => undefined,
+        id: (() => {
+          const ids = ['user_audio_real', 'run_audio_real', 'assistant_audio_real', 'block_audio_real']
+          return () => ids.shift() ?? 'unexpected_id'
+        })(),
+        now: () => 100,
+      })
+
+      await expect(orchestrator.runAudio({
+        requestId: 'request_audio_real',
+        conversationId: 'conversation_audio_real',
+        prompt: 'say hello',
+        userBlocks: [{ type: 'text', text: 'say hello' }],
+        assetIds: [],
+        route: { ...audioRoute, model: 'audio-model-real' },
+      })).resolves.toEqual({ requestId: 'request_audio_real', status: 'completed' })
+
+      const assistant = database.messages.get('assistant_audio_real')
+      expect(assistant?.blocks).toEqual([
+        expect.objectContaining({
+          type: 'media',
+          blockId: 'block_audio_real',
+          assetId: 'asset_audio_real',
+          kind: 'audio',
+          purpose: 'output',
+        }),
+        { type: 'text', text: '你好' },
+      ])
+      const asset = database.mediaAssets.get('asset_audio_real')
+      expect(asset?.messageId).toBe('assistant_audio_real')
+      expect(await readFile(join(mediaRoot, asset!.relativePath!))).toEqual(mp3)
+      expect(database.chatRuns.get('run_audio_real')).toMatchObject({
+        status: 'completed',
+        generationId: 'generation_audio_real',
+        inputTokens: 7,
+        outputTokens: 9,
+        costUsd: '0.02',
+      })
+    } finally {
+      database.close()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

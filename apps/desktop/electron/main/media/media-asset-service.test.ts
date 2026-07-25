@@ -414,6 +414,33 @@ describe('MediaAssetService generated outputs', () => {
     expect(stagingWrites).toBeLessThanOrEqual(16)
   })
 
+  it('decodes consecutive independently padded SSE Base64 chunks in byte order', async () => {
+    const service = createMediaAssetService({ database, mediaRoot, id: () => 'asset_audio_chunks' })
+    const writer = await service.createGeneratedWriter({
+      conversationId: 'conversation_1',
+      messageId: 'message_audio_chunks',
+      kind: 'audio',
+      provider: 'openrouter',
+      model: 'audio-model',
+      name: 'generated-audio',
+    })
+    const first = mp3.subarray(0, 11)
+    const second = mp3.subarray(11)
+
+    await writer.appendBase64Chunk(first.toString('base64'))
+    await writer.appendBase64Chunk(second.toString('base64'))
+    const asset = await writer.commit()
+
+    expect(asset).toMatchObject({
+      id: 'asset_audio_chunks',
+      kind: 'audio',
+      mimeType: 'audio/mpeg',
+      byteSize: mp3.byteLength,
+    })
+    expect(await readFile(join(mediaRoot, 'conversation_1', 'asset_audio_chunks.mp3'))).toEqual(mp3)
+    expect(await stagingEntries()).toEqual([])
+  })
+
   it('rejects invalid cross-chunk Base64 and cleans staging', async () => {
     const service = createMediaAssetService({ database, mediaRoot })
     const writer = await service.createGeneratedWriter({
