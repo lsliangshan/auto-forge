@@ -10,8 +10,8 @@ const defaults: AppSettings = {
   logDirectory: '/logs',
   activeProvider: 'deepseek',
   defaultModels: {
-    openrouter: 'openai/gpt-4.1-mini',
-    deepseek: 'deepseek-v4-flash',
+    openrouter: { text: 'openai/gpt-4.1-mini' },
+    deepseek: { text: 'deepseek-v4-flash' },
   },
   showCosts: true,
   developerMode: false,
@@ -51,8 +51,8 @@ describe('SettingsService', () => {
       logDirectory: '/logs',
       activeProvider: 'deepseek',
       defaultModels: {
-        openrouter: 'legacy/openrouter-model',
-        deepseek: 'deepseek-v4-flash',
+        openrouter: { text: 'legacy/openrouter-model' },
+        deepseek: { text: 'deepseek-v4-flash' },
       },
       showCosts: true,
       developerMode: false,
@@ -94,19 +94,49 @@ describe('SettingsService', () => {
     expect(service.get().activeProvider).toBe('deepseek')
   })
 
+  it('migrates legacy provider strings to text defaults', () => {
+    const repository = settingsRepository({
+      activeProvider: 'openrouter',
+      defaultModels: { openrouter: 'openai/gpt-4.1-mini', deepseek: 'deepseek-chat' },
+    })
+    const service = new SettingsService(repository, defaults)
+
+    expect(service.get().defaultModels).toEqual({
+      deepseek: { text: 'deepseek-chat' },
+      openrouter: { text: 'openai/gpt-4.1-mini' },
+    })
+  })
+
+  it('preserves non-empty nested OpenRouter output defaults', () => {
+    const repository = settingsRepository({
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text-model', image: 'image-model', video: 'video-model' },
+      },
+    })
+    const service = new SettingsService(repository, defaults)
+
+    expect(service.get().defaultModels.openrouter.video).toBe('video-model')
+    expect(service.get().defaultModels.openrouter).toEqual({
+      text: 'text-model',
+      image: 'image-model',
+      video: 'video-model',
+    })
+  })
+
   it('updates one provider default without changing the other', () => {
     const service = new SettingsService(settingsRepository(), defaults)
 
     service.update({
       defaultModels: {
         ...service.get().defaultModels,
-        deepseek: 'deepseek-v4-pro',
+        deepseek: { text: 'deepseek-v4-pro' },
       },
     })
 
     expect(service.get().defaultModels).toEqual({
-      openrouter: 'openai/gpt-4.1-mini',
-      deepseek: 'deepseek-v4-pro',
+      openrouter: { text: 'openai/gpt-4.1-mini' },
+      deepseek: { text: 'deepseek-v4-pro' },
     })
   })
 })

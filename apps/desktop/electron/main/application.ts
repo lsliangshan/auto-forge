@@ -208,8 +208,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     logDirectory: options.paths.logs,
     activeProvider: 'deepseek',
     defaultModels: {
-      openrouter: 'openai/gpt-4.1-mini',
-      deepseek: 'deepseek-v4-flash',
+      openrouter: { text: 'openai/gpt-4.1-mini' },
+      deepseek: { text: 'deepseek-v4-flash' },
     },
     showCosts: true,
     developerMode: false,
@@ -383,14 +383,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const releaseStart = maintenance.beginStart()
         try {
           if (!database.conversations.get(input.conversationId)) throw failure('NOT_FOUND')
-          const requestId = randomUUID()
           const snapshot = settings.get()
+          const model = input.model ?? snapshot.defaultModels[snapshot.activeProvider].text
+          if (!model) throw failure('INVALID_INPUT')
+          const requestId = randomUUID()
           activeRequests.add(requestId)
           void agent.run({
             conversationId: input.conversationId,
             content: input.content,
             provider: snapshot.activeProvider,
-            model: input.model ?? snapshot.defaultModels[snapshot.activeProvider],
+            model,
             requestId,
           }).catch(() => activeRequests.delete(requestId))
           return { requestId }

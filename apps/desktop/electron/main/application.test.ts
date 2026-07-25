@@ -51,6 +51,10 @@ describe('createApplicationRuntime', () => {
 
     await expect(runtime.services.settings.get()).resolves.toMatchObject({
       activeProvider: 'deepseek',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
