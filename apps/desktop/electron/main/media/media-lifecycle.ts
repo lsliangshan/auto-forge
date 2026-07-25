@@ -557,12 +557,28 @@ export class MediaLifecycle {
     const roots = await this.ensureRoots()
     const tombstoneName = `${randomUUID()}.delete`
     const tombstone = join(this.quarantineRoot, tombstoneName)
-    const deleting = this.database.mediaAssets.update(asset.id, {
-      status: 'deleting',
-      relativePath: posix.join('.quarantine', tombstoneName),
-      updatedAt: this.now(),
-    })
-    if (!deleting || deleting.messageId) return
+    const tombstoneRelativePath = posix.join('.quarantine', tombstoneName)
+    let deleting: MediaAssetRecord | undefined
+    try {
+      deleting = this.database.mediaAssets.update(asset.id, {
+        status: 'deleting',
+        relativePath: tombstoneRelativePath,
+        updatedAt: this.now(),
+      })
+    } catch {
+      try {
+        deleting = this.database.mediaAssets.get(asset.id)
+      } catch {
+        return
+      }
+    }
+    if (
+      !deleting
+      || deleting.messageId
+      || deleting.conversationId !== asset.conversationId
+      || deleting.status !== 'deleting'
+      || deleting.relativePath !== tombstoneRelativePath
+    ) return
 
     try {
       await this.verifyDirectory(this.mediaRoot, roots.root)
@@ -575,29 +591,54 @@ export class MediaLifecycle {
         || originalIdentity.size !== quarantinedIdentity.size
       ) throw failure('MEDIA_IMPORT_FAILED')
       if (await this.metadata(originalPath)) throw failure('MEDIA_IMPORT_FAILED')
-      this.database.mediaAssets.delete(asset.id)
-      await this.tryPurge(tombstone)
     } catch {
-      let restored: boolean
+      await this.restoreUnclaimedAsset(asset, originalPath, originalIdentity, tombstone, tombstoneRelativePath)
+      return
+    }
+
+    try {
+      this.database.mediaAssets.delete(asset.id)
+    } catch {
+      let authoritative: MediaAssetRecord | undefined
       try {
-        if (!await this.metadata(originalPath) && await this.metadata(tombstone)) {
-          await this.filesystem.rename(tombstone, originalPath)
-        }
-        const restoredIdentity = await this.verifyFile(originalPath)
-        restored = sameNode(originalIdentity, restoredIdentity)
-          && originalIdentity.size === restoredIdentity.size
+        authoritative = this.database.mediaAssets.get(asset.id)
       } catch {
-        restored = false
+        return
       }
-      try {
-        this.database.mediaAssets.update(asset.id, {
-          status: restored ? asset.status : 'failed',
-          relativePath: restored ? asset.relativePath : posix.join('.quarantine', tombstoneName),
-          updatedAt: this.now(),
-        })
-      } catch {
-        // The deleting state is already non-ready and retains tombstone metadata.
+      if (authoritative) {
+        await this.restoreUnclaimedAsset(asset, originalPath, originalIdentity, tombstone, tombstoneRelativePath)
+        return
       }
+    }
+    await this.tryPurge(tombstone)
+  }
+
+  private async restoreUnclaimedAsset(
+    asset: MediaAssetRecord,
+    originalPath: string,
+    originalIdentity: FileIdentity,
+    tombstone: string,
+    tombstoneRelativePath: string,
+  ): Promise<void> {
+    let restored: boolean
+    try {
+      if (!await this.metadata(originalPath) && await this.metadata(tombstone)) {
+        await this.filesystem.rename(tombstone, originalPath)
+      }
+      const restoredIdentity = await this.verifyFile(originalPath)
+      restored = sameNode(originalIdentity, restoredIdentity)
+        && originalIdentity.size === restoredIdentity.size
+    } catch {
+      restored = false
+    }
+    try {
+      this.database.mediaAssets.update(asset.id, {
+        status: restored ? asset.status : 'failed',
+        relativePath: restored ? asset.relativePath : tombstoneRelativePath,
+        updatedAt: this.now(),
+      })
+    } catch {
+      // The deleting state is already non-ready and retains tombstone metadata.
     }
   }
 

@@ -9,6 +9,7 @@ import {
 import {
   lstat,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
@@ -499,6 +500,115 @@ describe('MediaLifecycle', () => {
     expect(database.mediaAssets.get('asset_b')).toBeUndefined()
     expect(existsSync(join(mediaRoot, 'conversation_drafts', 'asset_a.png'))).toBe(true)
     expect(existsSync(join(mediaRoot, 'conversation_drafts', 'asset_b.png'))).toBe(false)
+  })
+
+  it('converges when the deleting transition commits before reporting an error', async () => {
+    const { database, mediaRoot } = setup()
+    insertConversation(database, 'conversation_update_ack')
+    insertAsset(database, {
+      id: 'asset_update_ack',
+      conversationId: 'conversation_update_ack',
+      relativePath: 'conversation_update_ack/asset_update_ack.png',
+      createdAt: NOW - DAY - 1,
+    })
+    writeAsset(
+      mediaRoot,
+      'conversation_update_ack',
+      'asset_update_ack.png',
+      'asset_update_ack',
+    )
+    let loseAcknowledgement = true
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database, {
+        mediaAssets: {
+          ...database.mediaAssets,
+          update(id, patch) {
+            const updated = database.mediaAssets.update(id, patch)
+            if (
+              loseAcknowledgement
+              && id === 'asset_update_ack'
+              && patch.status === 'deleting'
+            ) {
+              loseAcknowledgement = false
+              throw new Error('commit acknowledgement lost')
+            }
+            return updated
+          },
+        },
+      }),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+    expect(existsSync(join(
+      mediaRoot,
+      'conversation_update_ack',
+      'asset_update_ack.png',
+    ))).toBe(false)
+    await lifecycle.recover()
+    expect(database.mediaAssets.get('asset_update_ack')).toBeUndefined()
+    expect(existsSync(join(
+      mediaRoot,
+      'conversation_update_ack',
+      'asset_update_ack.png',
+    ))).toBe(false)
+    expect(existsSync(join(mediaRoot, '.quarantine'))).toBe(true)
+    expect(
+      (await lstat(join(mediaRoot, '.quarantine'))).isDirectory(),
+    ).toBe(true)
+    expect((await readdir(join(mediaRoot, '.quarantine')))
+      .filter((name) => name.endsWith('.delete'))).toEqual([])
+  })
+
+  it('does not restore canonical bytes when asset deletion commits before throwing', async () => {
+    const { database, mediaRoot } = setup()
+    insertConversation(database, 'conversation_delete_ack')
+    insertAsset(database, {
+      id: 'asset_delete_ack',
+      conversationId: 'conversation_delete_ack',
+      relativePath: 'conversation_delete_ack/asset_delete_ack.png',
+      createdAt: NOW - DAY - 1,
+    })
+    writeAsset(
+      mediaRoot,
+      'conversation_delete_ack',
+      'asset_delete_ack.png',
+      'asset_delete_ack',
+    )
+    let loseAcknowledgement = true
+    const lifecycle = new MediaLifecycle({
+      database: databasePort(database, {
+        mediaAssets: {
+          ...database.mediaAssets,
+          delete(id) {
+            database.mediaAssets.delete(id)
+            if (loseAcknowledgement && id === 'asset_delete_ack') {
+              loseAcknowledgement = false
+              throw new Error('commit acknowledgement lost')
+            }
+          },
+        },
+      }),
+      mediaRoot,
+      now: () => NOW,
+    })
+
+    await lifecycle.recover()
+    expect(existsSync(join(
+      mediaRoot,
+      'conversation_delete_ack',
+      'asset_delete_ack.png',
+    ))).toBe(false)
+    await lifecycle.recover()
+    expect(database.mediaAssets.get('asset_delete_ack')).toBeUndefined()
+    expect(existsSync(join(
+      mediaRoot,
+      'conversation_delete_ack',
+      'asset_delete_ack.png',
+    ))).toBe(false)
+    expect((await readdir(join(mediaRoot, '.quarantine')))
+      .filter((name) => name.endsWith('.delete'))).toEqual([])
   })
 
   it('fails closed on a symlinked conversation and does not expose its target path', async () => {
