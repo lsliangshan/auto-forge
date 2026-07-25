@@ -227,6 +227,81 @@ describe('chat interactions', () => {
     ])
   })
 
+  it('appends only the non-overlapping suffix of an accumulated live text delta', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
+    vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const loading = store.selectConversation('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: 'AB' },
+    })
+    resolveMessages([{
+      id: 'assistant_1',
+      conversationId: 'conv_1',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: '已有A' }],
+      createdAt: '2026-07-25T00:00:00.000Z',
+    }])
+    await loading
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ id: 'assistant_1:text:0', type: 'text', text: '已有AB' }),
+    ])
+  })
+
+  it('appends live text after a persisted non-text block using its final position', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
+    vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const loading = store.selectConversation('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: '生成完成' },
+    })
+    resolveMessages([{
+      id: 'assistant_1',
+      conversationId: 'conv_1',
+      role: 'assistant',
+      blocks: [{
+        type: 'media_generation',
+        blockId: 'media_1',
+        jobId: 'job_1',
+        kind: 'image',
+        status: 'pending',
+      }],
+      createdAt: '2026-07-25T00:00:00.000Z',
+    }])
+    await loading
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({
+        id: 'assistant_1:media_1',
+        type: 'media_generation',
+        blockId: 'media_1',
+      }),
+      expect.objectContaining({
+        id: 'assistant_1:text:1',
+        type: 'text',
+        text: '生成完成',
+      }),
+    ])
+  })
+
   it('ignores a late message response after switching conversations', async () => {
     const { api } = createEventApi()
     let resolveFirst!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void

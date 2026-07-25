@@ -93,6 +93,12 @@ function persistedMessage(message: ChatMessage): UiChatMessage {
   }
 }
 
+function appendTextDelta(current: string, delta: string): string {
+  let overlap = Math.min(current.length, delta.length)
+  while (overlap > 0 && !current.endsWith(delta.slice(0, overlap))) overlap -= 1
+  return current + delta.slice(overlap)
+}
+
 function mergeMessageSnapshots(
   persisted: UiChatMessage[],
   live: UiChatMessage[],
@@ -102,24 +108,31 @@ function mergeMessageSnapshots(
   const merged = persisted.map((message) => {
     const liveMessage = liveMessages.get(message.id)
     if (!liveMessage) return message
-    const liveBlocks = new Map(liveMessage.blocks.map((block) => [block.id, block]))
-    const persistedBlockIds = new Set(message.blocks.map(({ id }) => id))
+    const blocks = [...message.blocks]
+    for (const liveBlock of liveMessage.blocks) {
+      if (liveBlock.type === 'text') {
+        const previous = blocks.at(-1)
+        if (previous?.type === 'text') {
+          blocks[blocks.length - 1] = {
+            ...previous,
+            text: appendTextDelta(previous.text, liveBlock.text),
+          }
+        } else {
+          blocks.push({
+            ...liveBlock,
+            id: blockIdentity(message.id, liveBlock, blocks.length),
+          })
+        }
+        continue
+      }
+      const existingIndex = blocks.findIndex(({ id }) => id === liveBlock.id)
+      if (existingIndex >= 0) blocks[existingIndex] = liveBlock
+      else blocks.push(liveBlock)
+    }
     return {
       ...message,
       role: liveMessage.role,
-      blocks: [
-        ...message.blocks.map((block) => {
-          const liveBlock = liveBlocks.get(block.id)
-          if (!liveBlock) return block
-          if (block.type === 'text' && liveBlock.type === 'text') {
-            if (liveBlock.text.startsWith(block.text)) return liveBlock
-            if (block.text.endsWith(liveBlock.text)) return block
-            return { ...liveBlock, text: `${block.text}${liveBlock.text}` }
-          }
-          return liveBlock
-        }),
-        ...liveMessage.blocks.filter(({ id }) => !persistedBlockIds.has(id)),
-      ],
+      blocks,
     }
   })
   return [
