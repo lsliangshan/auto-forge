@@ -366,9 +366,12 @@ const awaitingAcceptance = computed(() =>
   pendingByConversation.value[chat.selectedConversationId] !== undefined)
 
 function modelSupportsOutput(model: ModelInfo, output: ConcreteOutput): boolean {
-  if (!model.outputModalities.includes(output)) return false
-  if (output === 'text') return true
-  return Boolean(model.generation[output])
+  if (!model.outputModalities.includes(output)
+    || !model.inputModalities.includes('text')
+    || (output !== 'text' && !model.generation[output])) return false
+  if ((output === 'image' || output === 'video')
+    && chat.drafts.some(({ kind }) => kind !== 'image')) return false
+  return chat.drafts.every(({ kind }) => model.inputModalities.includes(kind))
 }
 
 function modelsForOutput(output: OutputType): ModelInfo[] {

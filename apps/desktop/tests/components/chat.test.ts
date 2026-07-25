@@ -164,7 +164,67 @@ describe('chat interactions', () => {
     emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'live_1', block: { type: 'text', text: '实时内容' } })
     resolveMessages([{ id: 'old_1', conversationId: 'conv_1', role: 'assistant', blocks: [{ type: 'text', text: '旧快照' }], createdAt: '2026-07-19T00:00:00.000Z' }])
     await loading
-    expect(store.messagesByConversation.conv_1?.map(({ id }) => id)).toEqual(['live_1'])
+    expect(store.messagesByConversation.conv_1?.map(({ id }) => id)).toEqual(['old_1', 'live_1'])
+  })
+
+  it('appends a live text delta to the persisted prefix for the same loading message', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
+    vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const loading = store.selectConversation('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: '新增' },
+    })
+    resolveMessages([{
+      id: 'assistant_1',
+      conversationId: 'conv_1',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: '已有' }],
+      createdAt: '2026-07-25T00:00:00.000Z',
+    }])
+    await loading
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ id: 'assistant_1:text:0', type: 'text', text: '已有新增' }),
+    ])
+  })
+
+  it('does not duplicate a live delta already included in the persisted snapshot', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
+    vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const loading = store.selectConversation('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: '新增' },
+    })
+    resolveMessages([{
+      id: 'assistant_1',
+      conversationId: 'conv_1',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: '已有新增' }],
+      createdAt: '2026-07-25T00:00:00.000Z',
+    }])
+    await loading
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ id: 'assistant_1:text:0', type: 'text', text: '已有新增' }),
+    ])
   })
 
   it('ignores a late message response after switching conversations', async () => {
@@ -640,6 +700,62 @@ describe('chat interactions', () => {
     expect(store.error).toContain('已拒绝本次导入')
   })
 
+  it('closes media admission and joins a suspended import before deleting its conversation', async () => {
+    const { api } = createEventApi()
+    let resolvePick!: (assets: MediaAsset[]) => void
+    vi.mocked(api.media.pickFiles).mockReturnValue(new Promise((resolve) => { resolvePick = resolve }))
+    vi.mocked(api.chat.deleteConversation).mockResolvedValue(undefined)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.conversations = [{
+      id: 'conversation_1',
+      title: '待删除',
+      createdAt: '2026-07-25T00:00:00.000Z',
+      updatedAt: '2026-07-25T00:00:00.000Z',
+    }]
+
+    const importing = store.pickDraftFiles()
+    await vi.waitFor(() => expect(api.media.pickFiles).toHaveBeenCalled())
+    const deleting = store.deleteConversation('conversation_1')
+    await Promise.resolve()
+    expect(api.chat.deleteConversation).not.toHaveBeenCalled()
+
+    await store.importClipboardDraft()
+    expect(api.media.importClipboardImage).not.toHaveBeenCalled()
+
+    resolvePick([mediaAsset('late_asset')])
+    await Promise.all([importing, deleting])
+
+    expect(api.chat.deleteConversation).toHaveBeenCalledWith('conversation_1')
+    expect(store.draftsByConversation.conversation_1).toBeUndefined()
+    expect(store.conversations).toEqual([])
+  })
+
+  it('reopens media admission when conversation deletion fails', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.chat.deleteConversation).mockRejectedValueOnce(new Error('delete failed'))
+    vi.mocked(api.media.pickFiles).mockResolvedValue([mediaAsset('after_failure')])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.conversations = [{
+      id: 'conversation_1',
+      title: '保留',
+      createdAt: '2026-07-25T00:00:00.000Z',
+      updatedAt: '2026-07-25T00:00:00.000Z',
+    }]
+
+    await store.deleteConversation('conversation_1')
+    await store.pickDraftFiles()
+
+    expect(api.media.pickFiles).toHaveBeenCalledWith({
+      conversationId: 'conversation_1',
+      existingAssetIds: [],
+    })
+    expect(store.drafts.map(({ id }) => id)).toEqual(['after_failure'])
+  })
+
   it('keeps late import, remove, send, and status failures out of the newly selected conversation', async () => {
     const { api, emitChat } = createEventApi()
     let rejectPick!: (error: Error) => void
@@ -789,6 +905,37 @@ describe('chat interactions', () => {
     expect(wrapper.emitted('submit')).toBeUndefined()
   })
 
+  it('mirrors Main request compatibility for attachments and required text input', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.draftsByConversation.conversation_1 = [mediaAsset('audio_input', 'audio')]
+    store.preferencesByConversation.conversation_1 = generationPreferences()
+    const multiOutput = modelInfo('multi/model', ['text', 'image'])
+    multiOutput.inputModalities = ['text', 'audio']
+    const audioOnlyInput = modelInfo('audio-only-input/model', ['text'])
+    audioOnlyInput.inputModalities = ['audio']
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [multiOutput],
+        defaultModel: 'multi/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('textarea').setValue('分析这段音频')
+    expect(wrapper.find('[data-testid="output-choice-required"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="output-type"] option[value="image"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
+
+    await wrapper.setProps({ models: [audioOnlyInput], defaultModel: 'audio-only-input/model' })
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="no-compatible-model"]').text()).toContain('没有兼容')
+  })
+
   it('normalizes stale values on output and model changes but preserves unpublished empty capability lists', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -879,22 +1026,33 @@ describe('chat interactions', () => {
         byteSize: 100,
       },
     })
-    resolveMessages([{
-      id: 'assistant_1',
-      conversationId: 'conversation_1',
-      role: 'assistant',
-      blocks: [{
-        type: 'media_generation',
-        blockId: 'media_1',
-        jobId: 'job_1',
-        kind: 'image',
-        status: 'pending',
-      }],
-      createdAt: '2026-07-25T00:00:00.000Z',
-    }])
+    resolveMessages([
+      {
+        id: 'history_1',
+        conversationId: 'conversation_1',
+        role: 'user',
+        blocks: [{ type: 'text', text: '保留的历史消息' }],
+        createdAt: '2026-07-24T00:00:00.000Z',
+      },
+      {
+        id: 'assistant_1',
+        conversationId: 'conversation_1',
+        role: 'assistant',
+        blocks: [{
+          type: 'media_generation',
+          blockId: 'media_1',
+          jobId: 'job_1',
+          kind: 'image',
+          status: 'pending',
+        }],
+        createdAt: '2026-07-25T00:00:00.000Z',
+      },
+    ])
     await loading
 
-    expect(store.messagesByConversation.conversation_1?.[0]?.blocks).toEqual([
+    expect(store.messagesByConversation.conversation_1?.map(({ id }) => id))
+      .toEqual(['history_1', 'assistant_1'])
+    expect(store.messagesByConversation.conversation_1?.[1]?.blocks).toEqual([
       expect.objectContaining({
         id: 'assistant_1:media_1',
         type: 'media',

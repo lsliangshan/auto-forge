@@ -22,6 +22,7 @@ const storeReleases = new WeakMap<object, () => void>()
 const disposeWrapped = new WeakSet<object>()
 const preferenceQueues = new WeakMap<object, Map<string, Promise<void>>>()
 const mediaQueues = new WeakMap<object, Map<string, Promise<void>>>()
+const closedMediaAdmissions = new WeakMap<object, Set<string>>()
 let localMessageSequence = 0
 
 function defaultGenerationPreferences(): ConversationGenerationPreferences {
@@ -92,6 +93,50 @@ function persistedMessage(message: ChatMessage): UiChatMessage {
   }
 }
 
+function mergeMessageSnapshots(
+  persisted: UiChatMessage[],
+  live: UiChatMessage[],
+): UiChatMessage[] {
+  const liveMessages = new Map(live.map((message) => [message.id, message]))
+  const persistedIds = new Set(persisted.map(({ id }) => id))
+  const merged = persisted.map((message) => {
+    const liveMessage = liveMessages.get(message.id)
+    if (!liveMessage) return message
+    const liveBlocks = new Map(liveMessage.blocks.map((block) => [block.id, block]))
+    const persistedBlockIds = new Set(message.blocks.map(({ id }) => id))
+    return {
+      ...message,
+      role: liveMessage.role,
+      blocks: [
+        ...message.blocks.map((block) => {
+          const liveBlock = liveBlocks.get(block.id)
+          if (!liveBlock) return block
+          if (block.type === 'text' && liveBlock.type === 'text') {
+            if (liveBlock.text.startsWith(block.text)) return liveBlock
+            if (block.text.endsWith(liveBlock.text)) return block
+            return { ...liveBlock, text: `${block.text}${liveBlock.text}` }
+          }
+          return liveBlock
+        }),
+        ...liveMessage.blocks.filter(({ id }) => !persistedBlockIds.has(id)),
+      ],
+    }
+  })
+  return [
+    ...merged,
+    ...live.filter(({ id }) => !persistedIds.has(id)),
+  ]
+}
+
+function closedAdmissions(store: object): Set<string> {
+  let closed = closedMediaAdmissions.get(store)
+  if (!closed) {
+    closed = new Set()
+    closedMediaAdmissions.set(store, closed)
+  }
+  return closed
+}
+
 export const useChatStore = defineStore('chat', {
   state: () => ({
     conversations: [] as ConversationSummary[],
@@ -106,6 +151,7 @@ export const useChatStore = defineStore('chat', {
     _loadVersion: 0,
     _selectionVersion: 0,
     _messageVersions: {} as Record<string, number>,
+    _messageLoadVersions: {} as Record<string, number>,
     _preferenceVersions: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
@@ -131,7 +177,9 @@ export const useChatStore = defineStore('chat', {
       this.activeRequestByConversation = {}
       this._terminalRequests = {}
       this._messageVersions = {}
+      this._messageLoadVersions = {}
       this._preferenceVersions = {}
+      closedMediaAdmissions.delete(this)
       this.loading = false
       this.error = ''
     },
@@ -187,6 +235,7 @@ export const useChatStore = defineStore('chat', {
         this._loadVersion += 1
         this.loading = false
         this.conversations.unshift(conversation)
+        closedAdmissions(this).delete(conversation.id)
         this.selectedConversationId = conversation.id
         this._selectionVersion += 1
         await this.loadGenerationPreferences(conversation.id)
@@ -204,30 +253,40 @@ export const useChatStore = defineStore('chat', {
       } catch (error) { this.error = displayError(error, '重命名失败') }
     },
     async deleteConversation(id: string) {
-      try {
-        await getDesktopApi().chat.deleteConversation(id)
-        this._loadVersion += 1
-        this.loading = false
-        this.conversations = this.conversations.filter((item) => item.id !== id)
-        delete this.messagesByConversation[id]
-        delete this.draftsByConversation[id]
-        delete this.preferencesByConversation[id]
-        this._preferenceVersions[id] = (this._preferenceVersions[id] ?? 0) + 1
-        if (this.selectedConversationId === id) {
-          this.selectedConversationId = this.conversations[0]?.id ?? ''
-          this._selectionVersion += 1
-          if (this.selectedConversationId) {
-            await Promise.all([
-              this.messagesByConversation[this.selectedConversationId] === undefined
-                ? this.loadMessages(this.selectedConversationId)
-                : undefined,
-              this.preferencesByConversation[this.selectedConversationId] === undefined
-                ? this.loadGenerationPreferences(this.selectedConversationId)
-                : undefined,
-            ])
+      const admissions = closedAdmissions(this)
+      if (admissions.has(id)) return
+      admissions.add(id)
+      await this.queueMediaOperation(id, async () => {
+        try {
+          await getDesktopApi().chat.deleteConversation(id)
+          this._loadVersion += 1
+          this.loading = false
+          this.conversations = this.conversations.filter((item) => item.id !== id)
+          delete this.messagesByConversation[id]
+          delete this.draftsByConversation[id]
+          delete this.preferencesByConversation[id]
+          delete this._messageVersions[id]
+          delete this._messageLoadVersions[id]
+          this._preferenceVersions[id] = (this._preferenceVersions[id] ?? 0) + 1
+          if (this.selectedConversationId === id) {
+            this.selectedConversationId = this.conversations[0]?.id ?? ''
+            this._selectionVersion += 1
+            if (this.selectedConversationId) {
+              await Promise.all([
+                this.messagesByConversation[this.selectedConversationId] === undefined
+                  ? this.loadMessages(this.selectedConversationId)
+                  : undefined,
+                this.preferencesByConversation[this.selectedConversationId] === undefined
+                  ? this.loadGenerationPreferences(this.selectedConversationId)
+                  : undefined,
+              ])
+            }
           }
+        } catch (error) {
+          admissions.delete(id)
+          this.error = displayError(error, '删除会话失败')
         }
-      } catch (error) { this.error = displayError(error, '删除会话失败') }
+      })
     },
     async selectConversation(id: string) {
       if (this.selectedConversationId !== id) {
@@ -241,14 +300,23 @@ export const useChatStore = defineStore('chat', {
     },
     async loadMessages(conversationId: string) {
       const selectionVersion = this._selectionVersion
-      const messageVersion = (this._messageVersions[conversationId] ?? 0) + 1
-      this._messageVersions[conversationId] = messageVersion
+      const mutationVersion = this._messageVersions[conversationId] ?? 0
+      const loadVersion = (this._messageLoadVersions[conversationId] ?? 0) + 1
+      this._messageLoadVersions[conversationId] = loadVersion
       try {
         const messages = await getDesktopApi().chat.listMessages(conversationId)
         if (this.selectedConversationId !== conversationId
           || selectionVersion !== this._selectionVersion
-          || messageVersion !== this._messageVersions[conversationId]) return
-        this.messagesByConversation[conversationId] = messages.map(persistedMessage)
+          || loadVersion !== this._messageLoadVersions[conversationId]) return
+        const snapshot = messages.map(persistedMessage)
+        if (mutationVersion !== (this._messageVersions[conversationId] ?? 0)) {
+          this.messagesByConversation[conversationId] = mergeMessageSnapshots(
+            snapshot,
+            this.messagesByConversation[conversationId] ?? [],
+          )
+        } else {
+          this.messagesByConversation[conversationId] = snapshot
+        }
       } catch (error) {
         if (this.selectedConversationId === conversationId && selectionVersion === this._selectionVersion) {
           this.error = displayError(error, '消息记录加载失败')
@@ -360,7 +428,7 @@ export const useChatStore = defineStore('chat', {
     async pickDraftFiles() {
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
-      if (!conversationId) return
+      if (!conversationId || closedAdmissions(this).has(conversationId)) return
       await this.queueMediaOperation(conversationId, async () => {
         if (epoch !== this._stateEpoch) return
         const existing = this.draftsByConversation[conversationId] ?? []
@@ -382,7 +450,9 @@ export const useChatStore = defineStore('chat', {
     async importDroppedDrafts(files: readonly File[]) {
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
-      if (!conversationId || files.length === 0) return
+      if (!conversationId
+        || files.length === 0
+        || closedAdmissions(this).has(conversationId)) return
       await this.queueMediaOperation(conversationId, async () => {
         if (epoch !== this._stateEpoch) return
         const existing = this.draftsByConversation[conversationId] ?? []
@@ -404,7 +474,7 @@ export const useChatStore = defineStore('chat', {
     async importClipboardDraft() {
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
-      if (!conversationId) return
+      if (!conversationId || closedAdmissions(this).has(conversationId)) return
       await this.queueMediaOperation(conversationId, async () => {
         if (epoch !== this._stateEpoch) return
         const existing = this.draftsByConversation[conversationId] ?? []
@@ -426,7 +496,7 @@ export const useChatStore = defineStore('chat', {
     async removeDraft(assetId: string) {
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
-      if (!conversationId) return
+      if (!conversationId || closedAdmissions(this).has(conversationId)) return
       await this.queueMediaOperation(conversationId, async () => {
         if (epoch !== this._stateEpoch) return
         try {
