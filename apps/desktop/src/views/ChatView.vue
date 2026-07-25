@@ -81,23 +81,29 @@ import { useSettingsStore } from '../stores/settings'
 const chat = useChatStore()
 const settings = useSettingsStore()
 type ConcreteOutput = Exclude<OutputType, 'auto'>
-const defaultModels = computed<Partial<Record<ConcreteOutput, string>>>(() => {
-  const defaults = settings.settings?.defaultModels
-  if (!defaults) return {}
-  if (settings.activeProvider === 'deepseek') return { text: defaults.deepseek.text }
-  return { ...defaults.openrouter }
-})
-const defaultModel = computed(() => {
+function providerDefaultFor(output: ConcreteOutput): string {
   const defaults = settings.settings?.defaultModels
   if (!defaults) return ''
-  if (settings.activeProvider === 'deepseek') return defaults.deepseek.text
+  if (settings.activeProvider === 'deepseek') {
+    return output === 'text' ? defaults.deepseek.text : ''
+  }
+  return defaults.openrouter[output] ?? ''
+}
+const defaultModels = computed<Partial<Record<ConcreteOutput, string>>>(() => {
+  if (settings.activeProvider === 'deepseek') return { text: providerDefaultFor('text') }
+  return Object.fromEntries(
+    (['text', 'image', 'audio', 'video'] as const)
+      .map((output) => [output, providerDefaultFor(output)])
+      .filter(([, model]) => model),
+  )
+})
+const defaultModel = computed(() => {
   const output = chat.preferences.outputType
-  if (output !== 'auto') return defaults.openrouter[output] ?? ''
-  return defaults.openrouter.text
-    ?? defaults.openrouter.image
-    ?? defaults.openrouter.audio
-    ?? defaults.openrouter.video
-    ?? ''
+  if (output !== 'auto') return providerDefaultFor(output)
+  return providerDefaultFor('text')
+    || providerDefaultFor('image')
+    || providerDefaultFor('audio')
+    || providerDefaultFor('video')
 })
 async function submit(
   input: Omit<ChatSendInput, 'conversationId'>,

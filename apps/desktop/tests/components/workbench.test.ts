@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
-import type { DesktopAPI } from '@autoforge/shared'
+import type { DesktopAPI, ModelInfo } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { routes } from '../../src/router/index'
@@ -11,6 +11,27 @@ import { useExecutionStore } from '../../src/stores/execution'
 import { useChatStore } from '../../src/stores/chat'
 import { useSettingsStore } from '../../src/stores/settings'
 import { useWorkflowStore } from '../../src/stores/workflow'
+
+function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']): ModelInfo {
+  return {
+    id,
+    name: id,
+    inputModalities: ['text'],
+    outputModalities: outputs,
+    supportsTools: outputs.includes('text'),
+    generation: {
+      ...(outputs.includes('image') ? {
+        image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 },
+      } : {}),
+      ...(outputs.includes('audio') ? {
+        audio: { voices: [], formats: ['mp3'] },
+      } : {}),
+      ...(outputs.includes('video') ? {
+        video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false },
+      } : {}),
+    },
+  }
+}
 
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
   return {
@@ -36,7 +57,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       get: vi.fn().mockResolvedValue({
         theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
         activeProvider: 'deepseek', defaultModels: {
-          openrouter: 'openai/gpt-4.1-mini', deepseek: 'deepseek-v4-flash',
+          openrouter: { text: 'openai/gpt-4.1-mini' }, deepseek: { text: 'deepseek-v4-flash' },
         }, showCosts: false, developerMode: false, permissionDefault: 'ask',
       }),
       update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(),
@@ -273,22 +294,176 @@ describe('workbench', () => {
     const api = createApi()
     const first = {
       theme: 'dark' as const, language: 'zh-CN' as const, dataDirectory: '/data', logDirectory: '/logs',
-      activeProvider: 'openrouter' as const, defaultModels: { openrouter: 'old', deepseek: 'deepseek-v4-flash' },
+      activeProvider: 'openrouter' as const,
+      defaultModels: { openrouter: { text: 'old' }, deepseek: { text: 'deepseek-v4-flash' } },
       showCosts: false, developerMode: false, permissionDefault: 'ask' as const,
     }
-    const second = { ...first, defaultModels: { ...first.defaultModels, openrouter: 'new' } }
+    const second = {
+      ...first,
+      defaultModels: { ...first.defaultModels, openrouter: { text: 'new' } },
+    }
     vi.mocked(api.settings.update).mockResolvedValueOnce(first).mockResolvedValueOnce(second)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useSettingsStore()
     await Promise.all([
       store.update({ theme: 'dark' }),
-      store.update({ defaultModels: { openrouter: 'new', deepseek: 'deepseek-v4-flash' } }),
+      store.update({
+        defaultModels: { openrouter: { text: 'new' }, deepseek: { text: 'deepseek-v4-flash' } },
+      }),
     ])
     expect(api.settings.update).toHaveBeenNthCalledWith(1, { theme: 'dark' })
     expect(api.settings.update).toHaveBeenNthCalledWith(2, {
-      defaultModels: { openrouter: 'new', deepseek: 'deepseek-v4-flash' },
+      defaultModels: { openrouter: { text: 'new' }, deepseek: { text: 'deepseek-v4-flash' } },
     })
-    expect(store.settings?.defaultModels.openrouter).toBe('new')
+    expect(store.settings?.defaultModels.openrouter.text).toBe('new')
+  })
+
+  it('saves rapid default-model changes into separate nested output slots without losing other defaults', async () => {
+    const api = createApi()
+    let persisted = await api.settings.get()
+    persisted = {
+      ...persisted,
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'openai/gpt-4.1-mini', audio: 'audio/original' },
+      },
+    }
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => {
+      persisted = { ...persisted, ...patch }
+      return persisted
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    store.settings = persisted
+
+    await Promise.all([
+      store.saveDefaultModel('image', 'google/gemini-2.5-flash-image'),
+      store.saveDefaultModel('video', 'video/new'),
+    ])
+
+    expect(api.settings.update).toHaveBeenNthCalledWith(1, {
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: {
+          text: 'openai/gpt-4.1-mini',
+          image: 'google/gemini-2.5-flash-image',
+          audio: 'audio/original',
+        },
+      },
+    })
+    expect(api.settings.update).toHaveBeenNthCalledWith(2, {
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: {
+          text: 'openai/gpt-4.1-mini',
+          image: 'google/gemini-2.5-flash-image',
+          audio: 'audio/original',
+          video: 'video/new',
+        },
+      },
+    })
+  })
+
+  it('clears only optional OpenRouter slots and never clears required DeepSeek text', async () => {
+    const api = createApi()
+    let persisted = {
+      ...await api.settings.get(),
+      activeProvider: 'openrouter' as const,
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text/model', image: 'image/model', audio: 'audio/model' },
+      },
+    }
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => {
+      persisted = { ...persisted, ...patch }
+      return persisted
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    store.settings = persisted
+
+    await store.saveDefaultModel('image', undefined)
+    expect(api.settings.update).toHaveBeenLastCalledWith({
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text/model', audio: 'audio/model' },
+      },
+    })
+
+    store.settings = { ...persisted, activeProvider: 'deepseek' }
+    await store.saveDefaultModel('text', undefined)
+    expect(api.settings.update).toHaveBeenCalledTimes(1)
+    expect(store.settings.defaultModels.deepseek.text).toBe('deepseek-chat')
+  })
+
+  it('binds a queued default-model save to the provider active when the user changed the slot', async () => {
+    const api = createApi()
+    let persisted = {
+      ...await api.settings.get(),
+      activeProvider: 'openrouter' as const,
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text/default' },
+      },
+    }
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => {
+      persisted = { ...persisted, ...patch } as typeof persisted
+      return persisted
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+    store.settings = persisted
+
+    await Promise.all([
+      store.update({ activeProvider: 'deepseek' }),
+      store.saveDefaultModel('image', 'image/openrouter'),
+    ])
+
+    expect(api.settings.update).toHaveBeenNthCalledWith(2, {
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text/default', image: 'image/openrouter' },
+      },
+    })
+  })
+
+  it('filters default choices by usable output capability and keeps a saved missing model truthful', () => {
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: createApi() })
+    const store = useSettingsStore()
+    store.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { audio: 'audio/saved-missing' },
+      },
+      showCosts: false, developerMode: false, permissionDefault: 'ask',
+    }
+    const imageWithoutGeneration = modelInfo('image/no-generation', ['image'])
+    imageWithoutGeneration.generation = {}
+    const imageWithoutTextInput = modelInfo('image/no-text-input', ['image'])
+    imageWithoutTextInput.inputModalities = ['image']
+    store.providerModels.openrouter = [
+      modelInfo('text/model', ['text']),
+      modelInfo('image/usable', ['image']),
+      imageWithoutGeneration,
+      imageWithoutTextInput,
+      modelInfo('audio/usable', ['audio']),
+    ]
+
+    expect(store.modelOptionsFor('image').map(({ id }) => id)).toEqual(['image/usable'])
+    expect(store.modelOptionsFor('audio')).toEqual([
+      {
+        id: 'audio/saved-missing',
+        name: 'audio/saved-missing（已保存模型）',
+        inputModalities: ['text'],
+        outputModalities: ['audio'],
+        supportsTools: false,
+        generation: { audio: { voices: [], formats: [] } },
+      },
+      modelInfo('audio/usable', ['audio']),
+    ])
   })
 
   it('uses DeepSeek while persisted settings are not loaded', () => {
@@ -309,8 +484,8 @@ describe('workbench', () => {
     }))
     vi.mocked(api.settings.listProviderModels).mockImplementation(async (provider) => (
       provider === 'openrouter'
-        ? [{ id: 'openrouter/model', name: 'OpenRouter model' }]
-        : [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' }]
+        ? [{ ...modelInfo('openrouter/model'), name: 'OpenRouter model' }]
+        : [{ ...modelInfo('deepseek-v4-flash'), name: 'DeepSeek V4 Flash' }]
     ))
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useSettingsStore()
@@ -332,15 +507,84 @@ describe('workbench', () => {
     store.settings = {
       theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
       activeProvider: 'deepseek', defaultModels: {
-        openrouter: 'openrouter/model', deepseek: 'deepseek-legacy',
+        openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-legacy' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
     }
-    store.providerModels.deepseek = [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' }]
+    store.providerModels.deepseek = [{
+      ...modelInfo('deepseek-v4-flash'),
+      name: 'DeepSeek V4 Flash',
+    }]
 
-    expect(store.modelOptions).toEqual([
-      { id: 'deepseek-legacy', name: 'deepseek-legacy（已保存模型）' },
-      { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    expect(store.modelOptionsFor('text')).toEqual([
+      {
+        id: 'deepseek-legacy',
+        name: 'deepseek-legacy（已保存模型）',
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsTools: false,
+        generation: {},
+      },
+      { ...modelInfo('deepseek-v4-flash'), name: 'DeepSeek V4 Flash' },
     ])
+  })
+
+  it('renders only the provider-specific default-model slots and marks empty optional slots as unset', async () => {
+    const deepseekApi = createApi()
+    vi.mocked(deepseekApi.settings.validateProviderCredential).mockResolvedValue({
+      provider: 'deepseek', configured: true, validation: 'valid',
+    })
+    vi.mocked(deepseekApi.settings.listProviderModels).mockResolvedValue([
+      modelInfo('deepseek-chat', ['text']),
+    ])
+    const deepseek = await mountApp('/settings', deepseekApi)
+    await vi.waitFor(() => expect(deepseek.wrapper.text()).toContain('默认文本模型'))
+    expect(deepseek.wrapper.text()).not.toContain('默认图片模型')
+    expect(deepseek.wrapper.findAll('[data-testid^="default-model-"]')).toHaveLength(1)
+    deepseek.wrapper.unmount()
+
+    const openrouterApi = createApi()
+    vi.mocked(openrouterApi.settings.get).mockResolvedValue({
+      ...await openrouterApi.settings.get(),
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: {
+          text: 'text/default',
+          audio: 'audio/saved-missing',
+        },
+      },
+    })
+    vi.mocked(openrouterApi.settings.validateProviderCredential).mockResolvedValue({
+      provider: 'openrouter', configured: true, validation: 'valid',
+    })
+    vi.mocked(openrouterApi.settings.listProviderModels).mockResolvedValue([
+      modelInfo('text/default', ['text']),
+      modelInfo('image/usable', ['image']),
+      modelInfo('audio/usable', ['audio']),
+      modelInfo('video/usable', ['video']),
+    ])
+    const openrouter = await mountApp('/settings', openrouterApi)
+    await vi.waitFor(() => expect(openrouter.wrapper.text()).toContain('默认视频模型'))
+    expect(openrouter.wrapper.text()).toContain('默认文本模型')
+    expect(openrouter.wrapper.text()).toContain('默认图片模型')
+    expect(openrouter.wrapper.text()).toContain('默认音频模型')
+    expect(openrouter.wrapper.findAll('[data-testid^="default-model-"]')).toHaveLength(4)
+    expect(openrouter.wrapper.getComponent('[data-testid="default-model-image"]').props('placeholder'))
+      .toBe('未设置')
+    expect(openrouter.wrapper.getComponent('[data-testid="default-model-video"]').props('placeholder'))
+      .toBe('未设置')
+    expect(openrouter.wrapper.text()).toContain('audio/saved-missing（已保存模型）')
+    const optionsFor = (output: string) => openrouter.wrapper.findAllComponents({ name: 'ElOption' })
+      .filter((option) => option.vm.$attrs['data-output'] === output)
+      .map((option) => option.props('label'))
+    expect(optionsFor('text'))
+      .toEqual(['text/default'])
+    expect(optionsFor('image'))
+      .toEqual(['image/usable'])
+    expect(optionsFor('audio'))
+      .toEqual(['audio/saved-missing（已保存模型）', 'audio/usable'])
+    expect(optionsFor('video'))
+      .toEqual(['video/usable'])
   })
 
   it('stops showing the previous provider model load after switching to an unconfigured provider', async () => {
@@ -352,7 +596,7 @@ describe('workbench', () => {
     vi.mocked(api.settings.update).mockResolvedValue({
       theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
       activeProvider: 'deepseek', defaultModels: {
-        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+        openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
     })
     vi.mocked(api.settings.validateProviderCredential).mockResolvedValue({
@@ -363,7 +607,7 @@ describe('workbench', () => {
     store.settings = {
       theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
       activeProvider: 'openrouter', defaultModels: {
-        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+        openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
     }
 
@@ -393,7 +637,7 @@ describe('workbench', () => {
     store.settings = {
       theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
       activeProvider: 'openrouter', defaultModels: {
-        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+        openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
     }
     store.credentials.openrouter = { provider: 'openrouter', configured: true, validation: 'valid' }
@@ -402,7 +646,7 @@ describe('workbench', () => {
     const models = store.loadModels('openrouter')
     await store.clearCredential()
     resolveValidation({ provider: 'openrouter', configured: true, validation: 'valid' })
-    resolveModels([{ id: 'stale/model', name: 'Stale model' }])
+    resolveModels([{ ...modelInfo('stale/model'), name: 'Stale model' }])
     await Promise.all([validation, models])
 
     expect(store.credentials.openrouter).toEqual({
@@ -420,7 +664,7 @@ describe('workbench', () => {
     vi.mocked(api.settings.update).mockResolvedValue({
       theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
       activeProvider: 'deepseek', defaultModels: {
-        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+        openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
     })
     vi.mocked(api.settings.validateProviderCredential).mockResolvedValue({
@@ -431,7 +675,7 @@ describe('workbench', () => {
     store.settings = {
       theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
       activeProvider: 'openrouter', defaultModels: {
-        openrouter: 'openrouter/model', deepseek: 'deepseek-v4-flash',
+        openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
     }
 

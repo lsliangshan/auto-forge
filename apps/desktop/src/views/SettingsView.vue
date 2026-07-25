@@ -95,25 +95,34 @@
           </el-button>
         </header>
         <div class="settings-form">
-          <label for="default-model">默认模型</label>
-          <el-select
-            id="default-model"
-            v-model="selectedModel"
-            filterable
-            placeholder="选择模型"
-            :loading="settings.modelsLoading"
-            :disabled="!settings.credential?.configured"
-            @change="saveModel"
+          <div
+            v-for="output in modelOutputs"
+            :key="output"
+            class="model-field"
           >
-            <el-option
-              v-for="model in settings.modelOptions"
-              :key="model.id"
-              :label="model.name"
-              :value="model.id"
+            <label :for="`default-model-${output}`">{{ modelOutputLabels[output] }}</label>
+            <el-select
+              :id="`default-model-${output}`"
+              :data-testid="`default-model-${output}`"
+              :model-value="settings.defaultModelFor(output)"
+              filterable
+              :clearable="settings.activeProvider === 'openrouter'"
+              :placeholder="settings.activeProvider === 'openrouter' ? '未设置' : '选择模型'"
+              :loading="settings.modelsLoading"
+              :disabled="!settings.credential?.configured"
+              @change="saveModel(output, $event)"
             >
-              <span>{{ model.name }}</span><small class="model-id">{{ model.id }}</small>
-            </el-option>
-          </el-select>
+              <el-option
+                v-for="model in settings.modelOptionsFor(output)"
+                :key="model.id"
+                :label="model.name"
+                :value="model.id"
+                :data-output="output"
+              >
+                <span>{{ model.name }}</span><small class="model-id">{{ model.id }}</small>
+              </el-option>
+            </el-select>
+          </div>
           <p
             v-if="!settings.credential?.configured"
             class="field-message"
@@ -235,7 +244,17 @@ import { useSettingsStore } from '../stores/settings'
 const settings = useSettingsStore()
 const apiKey = ref('')
 const selectedProvider = ref<ModelProviderId>('deepseek')
-const selectedModel = ref('')
+type ModelOutput = 'text' | 'image' | 'audio' | 'video'
+const modelOutputLabels: Record<ModelOutput, string> = {
+  text: '默认文本模型',
+  image: '默认图片模型',
+  audio: '默认音频模型',
+  video: '默认视频模型',
+}
+const modelOutputs = computed<ModelOutput[]>(() =>
+  settings.activeProvider === 'deepseek'
+    ? ['text']
+    : ['text', 'image', 'audio', 'video'])
 const providerLabel = computed(() => settings.activeProvider === 'deepseek' ? 'DeepSeek' : 'OpenRouter')
 const credentialLabel = computed(() => {
   const credential = settings.credential
@@ -250,7 +269,6 @@ const credentialTone = computed(() => settings.credential?.validation === 'valid
   ? 'success'
   : settings.credential?.configured ? 'warning' : '')
 watch(() => settings.activeProvider, (value) => { selectedProvider.value = value }, { immediate: true })
-watch(() => settings.defaultModel, (value) => { selectedModel.value = value }, { immediate: true })
 
 onMounted(async () => {
   if (!settings.settings && !settings.loading) await settings.load()
@@ -280,7 +298,9 @@ async function clearCredential() {
     await settings.clearCredential()
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
 }
-function saveModel(value: string) { if (value) void settings.saveDefaultModel(value) }
+function saveModel(output: ModelOutput, value: unknown) {
+  void settings.saveDefaultModel(output, typeof value === 'string' && value ? value : undefined)
+}
 async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
   try {
     const message = scope === 'all'
@@ -297,7 +317,7 @@ const formatScope = (scope: { origins?: string[]; paths?: string[] }) => JSON.st
 <style scoped>
 .settings-page { max-width: 880px; margin: 0 auto; padding: 20px 24px 60px; }.settings-section { scroll-margin-top: 16px; border: 1px solid var(--af-border); padding: 18px; background: var(--af-surface); }.settings-section + .settings-section { margin-top: 14px; }.settings-section header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--af-border); padding-bottom: 13px; }.settings-section h2 { margin: 0; color: var(--af-graphite); font-size: 15px; }.settings-section header p { margin: 4px 0 0; color: var(--af-text-muted); font-size: 12px; }
 .credential-status { display: flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--af-text-muted); font-size: 12px; }.credential-status.success { color: var(--af-success); }.credential-status.warning { color: var(--af-warning); }
-.settings-form { display: grid; gap: 8px; padding-top: 14px; }.settings-form > label, .settings-grid > label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.settings-form small, .field-message { margin: 0; color: var(--af-text-muted); font-size: 11px; }.settings-form > .el-button { justify-self: start; }
+.settings-form { display: grid; gap: 8px; padding-top: 14px; }.settings-form > label, .settings-grid > label, .model-field > label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.settings-form small, .field-message { margin: 0; color: var(--af-text-muted); font-size: 11px; }.settings-form > .el-button { justify-self: start; }.model-field { display: grid; gap: 8px; }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding-top: 15px; }.settings-grid label:not(.switch-row) { display: grid; gap: 7px; }.switch-row { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 0; }.model-id { float: right; margin-left: 18px; color: var(--af-text-muted); }
 .danger-zone { border-color: #efc6c2; }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
 .grant-list { margin-top: 12px; }.grant-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 10px 0; }.grant-row div { display: grid; gap: 3px; }.grant-row strong { font-size: 12px; }.grant-row small { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 11px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }

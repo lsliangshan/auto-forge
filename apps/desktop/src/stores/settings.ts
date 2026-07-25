@@ -14,6 +14,34 @@ import { useExecutionStore } from './execution'
 import { useWorkflowStore } from './workflow'
 
 const updateQueues = new WeakMap<object, Promise<AppSettings | undefined>>()
+type ModelOutput = 'text' | 'image' | 'audio' | 'video'
+
+function supportsOutput(model: ModelInfo, output: ModelOutput): boolean {
+  return model.inputModalities.includes('text')
+    && model.outputModalities.includes(output)
+    && (output === 'text' || model.generation[output] !== undefined)
+}
+
+function savedModelOption(id: string, output: ModelOutput): ModelInfo {
+  return {
+    id,
+    name: `${id}（已保存模型）`,
+    inputModalities: ['text'],
+    outputModalities: [output],
+    supportsTools: false,
+    generation: {
+      ...(output === 'image' ? {
+        image: { resolutions: [], aspectRatios: [], formats: [], maxCount: 1 },
+      } : {}),
+      ...(output === 'audio' ? {
+        audio: { voices: [], formats: [] },
+      } : {}),
+      ...(output === 'video' ? {
+        video: { resolutions: [], aspectRatios: [], durations: [], supportsAudio: false },
+      } : {}),
+    },
+  }
+}
 
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
@@ -44,13 +72,23 @@ export const useSettingsStore = defineStore('settings', {
     models(): ModelInfo[] {
       return this.providerModels[this.activeProvider]
     },
-    defaultModel(): string {
-      return this.settings?.defaultModels[this.activeProvider] ?? ''
+    defaultModelFor(): (output: ModelOutput) => string {
+      return (output) => {
+        const defaults = this.settings?.defaultModels
+        if (!defaults) return ''
+        if (this.activeProvider === 'deepseek') {
+          return output === 'text' ? defaults.deepseek.text : ''
+        }
+        return defaults.openrouter[output] ?? ''
+      }
     },
-    modelOptions(): ModelInfo[] {
-      const saved = this.defaultModel
-      if (!saved || this.models.some(({ id }) => id === saved)) return this.models
-      return [{ id: saved, name: `${saved}（已保存模型）` }, ...this.models]
+    modelOptionsFor(): (output: ModelOutput) => ModelInfo[] {
+      return (output) => {
+        const models = this.models.filter((model) => supportsOutput(model, output))
+        const saved = this.defaultModelFor(output)
+        if (!saved || models.some(({ id }) => id === saved)) return models
+        return [savedModelOption(saved, output), ...models]
+      }
     },
   },
   actions: {
@@ -78,11 +116,16 @@ export const useSettingsStore = defineStore('settings', {
         if (version === this._loadVersion) this.loading = false
       }
     },
-    async update(patch: AppSettingsPatch): Promise<AppSettings | undefined> {
+    async _queueUpdate(
+      createPatch: () => AppSettingsPatch | undefined,
+    ): Promise<AppSettings | undefined> {
       this.saving = true
       this.error = ''
       const operation = (updateQueues.get(this) ?? Promise.resolve(undefined))
-        .then(() => getDesktopApi().settings.update(patch))
+        .then(() => {
+          const patch = createPatch()
+          return patch ? getDesktopApi().settings.update(patch) : this.settings
+        })
       const settled = operation.catch(() => undefined)
       updateQueues.set(this, settled)
       try {
@@ -94,6 +137,9 @@ export const useSettingsStore = defineStore('settings', {
       } finally {
         if (updateQueues.get(this) === settled) this.saving = false
       }
+    },
+    async update(patch: AppSettingsPatch): Promise<AppSettings | undefined> {
+      return this._queueUpdate(() => patch)
     },
     async switchProvider(provider: ModelProviderId) {
       if (provider === this.activeProvider) return
@@ -181,11 +227,25 @@ export const useSettingsStore = defineStore('settings', {
         if (version === this._modelVersions[target] && target === this.activeProvider) this.modelsLoading = false
       }
     },
-    async saveDefaultModel(model: string) {
-      if (!this.settings || !model) return
+    async saveDefaultModel(output: ModelOutput, model: string | undefined) {
+      if (!this.settings) return
       const provider = this.activeProvider
-      await this.update({
-        defaultModels: { ...this.settings.defaultModels, [provider]: model },
+      const value = model?.trim() || undefined
+      if (provider === 'deepseek' && (output !== 'text' || !value)) return
+      await this._queueUpdate(() => {
+        if (!this.settings) return undefined
+        const defaultModels = {
+          deepseek: { ...this.settings.defaultModels.deepseek },
+          openrouter: { ...this.settings.defaultModels.openrouter },
+        }
+        if (provider === 'deepseek') {
+          defaultModels.deepseek.text = value!
+        } else if (value) {
+          defaultModels.openrouter[output] = value
+        } else {
+          delete defaultModels.openrouter[output]
+        }
+        return { defaultModels }
       })
     },
     async clearLocalData(scope: 'conversations' | 'executions' | 'all') {

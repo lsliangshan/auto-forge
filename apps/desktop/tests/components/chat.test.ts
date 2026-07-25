@@ -17,6 +17,8 @@ import ChatComposer from '../../src/components/chat/ChatComposer.vue'
 import MessageBlock from '../../src/components/chat/MessageBlock.vue'
 import { displayError } from '../../src/services/desktop-api'
 import { useChatStore } from '../../src/stores/chat'
+import { useSettingsStore } from '../../src/stores/settings'
+import ChatView from '../../src/views/ChatView.vue'
 
 const scopeHash = 'a'.repeat(64)
 
@@ -108,6 +110,49 @@ function createEventApi() {
 describe('chat interactions', () => {
   beforeEach(() => setActivePinia(createPinia()))
   afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+
+  it('passes the exact selected output default to the composer while auto continues to prefer text', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.conversations = [{
+      id: 'conversation_1',
+      title: '会话',
+      createdAt: '2026-07-25T00:00:00.000Z',
+      updatedAt: '2026-07-25T00:00:00.000Z',
+    }]
+    chat.selectedConversationId = 'conversation_1'
+    chat.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'image' })
+    const settings = useSettingsStore()
+    settings.settings = {
+      theme: 'system',
+      language: 'zh-CN',
+      dataDirectory: '/data',
+      logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text/default', image: 'image/default' },
+      },
+      showCosts: false,
+      developerMode: false,
+      permissionDefault: 'ask',
+    }
+    settings.providerModels.openrouter = [
+      modelInfo('text/default', ['text']),
+      modelInfo('image/default', ['image']),
+      modelInfo('audio/catalog-first', ['audio']),
+    ]
+    const wrapper = mount(ChatView, { global: { plugins: [ElementPlus] } })
+
+    expect(wrapper.getComponent(ChatComposer).props('defaultModel')).toBe('image/default')
+    chat.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'audio' })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.getComponent(ChatComposer).props('defaultModel')).toBe('')
+    chat.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'auto' })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.getComponent(ChatComposer).props('defaultModel')).toBe('text/default')
+  })
 
   it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
     const wrapper = mount(MessageBlock, {
