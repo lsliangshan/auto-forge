@@ -7,6 +7,11 @@ import type {
   ProviderDefaultModels,
 } from '@autoforge/shared'
 import type { ResolvedMediaAsset } from '../media/media-asset-service.js'
+import {
+  mergeOpenRouterModels,
+  parseOpenRouterModels,
+  parseOpenRouterVideoModels,
+} from './model-provider.js'
 import { resolveChatRoute } from './multimodal-router.js'
 
 const generation: GenerationOptions = {
@@ -269,5 +274,42 @@ describe('resolveChatRoute', () => {
       requestedModel: 'mixed/model',
       models: [model({ id: 'mixed/model', outputModalities: ['text', 'image'] })],
     }))).toMatchObject({ outputType: 'text' })
+  })
+
+  it('routes parser-produced audio and video capabilities with unpublished option limits', () => {
+    const models = mergeOpenRouterModels(parseOpenRouterModels({ data: [
+      { id: 'audio/model', name: 'Audio', architecture: { input_modalities: ['text'], output_modalities: ['audio'] } },
+      { id: 'video/model', name: 'Video', architecture: { input_modalities: ['text'], output_modalities: ['video'] } },
+    ] }), [[], parseOpenRouterVideoModels({ data: [{ id: 'video/model', name: 'Video' }] })])
+    const audio = models.find((candidate) => candidate.id === 'audio/model')!
+    const video = models.find((candidate) => candidate.id === 'video/model')!
+
+    expect(audio.generation.audio).toEqual({ voices: [], formats: [] })
+    expect(video.generation.video).toEqual({ resolutions: [], aspectRatios: [], durations: [], supportsAudio: false })
+    expect(resolveChatRoute(input({ requestedModel: audio.id, requestedOutput: 'audio', models }))).toMatchObject({
+      outputType: 'audio',
+      generation: { audio: { format: 'mp3' } },
+    })
+    expect(resolveChatRoute(input({ requestedModel: video.id, requestedOutput: 'video', models }))).toMatchObject({
+      outputType: 'video',
+      generation: { video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false } },
+    })
+  })
+
+  it('orders compatible model selections with fixed code-point comparison', () => {
+    const imageGeneration = { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } }
+    expect(resolveChatRoute(input({
+      requestedOutput: 'image',
+      defaults: { deepseek: { text: 'deepseek-chat' }, openrouter: {} },
+      models: [
+        model({ id: 'a/image', outputModalities: ['image'], generation: imageGeneration }),
+        model({ id: 'Z/image', outputModalities: ['image'], generation: imageGeneration }),
+      ],
+    }))).toMatchObject({
+      compatibleModels: [
+        expect.objectContaining({ id: 'Z/image' }),
+        expect.objectContaining({ id: 'a/image' }),
+      ],
+    })
   })
 })

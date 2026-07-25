@@ -168,20 +168,7 @@ function supportsRequest(model: ModelInfo, output: ConcreteOutput, assets: reado
 
 function supportsGeneration(model: ModelInfo, output: ConcreteOutput): boolean {
   if (output === 'text') return true
-  if (output === 'image') {
-    const capability = model.generation.image
-    return capability !== undefined
-      && capability.maxCount >= 1
-      && capability.resolutions.length > 0
-      && capability.aspectRatios.length > 0
-      && capability.formats.length > 0
-  }
-  if (output === 'audio') return (model.generation.audio?.formats.length ?? 0) > 0
-  const capability = model.generation.video
-  return capability !== undefined
-    && capability.resolutions.length > 0
-    && capability.aspectRatios.length > 0
-    && capability.durations.length > 0
+  return model.generation[output] !== undefined
 }
 
 function compatibleOutputs(model: ModelInfo, assets: readonly ResolvedMediaAsset[]): ConcreteOutput[] {
@@ -192,7 +179,11 @@ function compatibleModels(models: readonly ModelInfo[], output: ConcreteOutput, 
   return models
     .filter((candidate) => supportsRequest(candidate, output, assets))
     .slice()
-    .sort((left, right) => left.id.localeCompare(right.id))
+    .sort((left, right) => compareStrings(left.id, right.id))
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
 }
 
 function preferredModel(
@@ -298,13 +289,13 @@ function isPreferences(value: unknown): value is ConversationGenerationPreferenc
 
 function selectString(requested: string, advertised: readonly string[]): string {
   if (advertised.includes(requested)) return requested
-  if (advertised.length === 0) failure('MODEL_MODALITY_UNSUPPORTED')
+  if (advertised.length === 0) return requested
   return advertised[0]!
 }
 
 function selectNumber(requested: number, advertised: readonly number[]): number {
   if (advertised.includes(requested)) return requested
-  if (advertised.length === 0) failure('MODEL_MODALITY_UNSUPPORTED')
+  if (advertised.length === 0) return requested
   return advertised[0]!
 }
 
