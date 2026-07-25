@@ -12,6 +12,28 @@ function provider(models: ModelInfo[] = []): ModelProvider {
 }
 
 describe('ModelProviderRegistry', () => {
+  it('snapshots the provider mapping while preserving optional media operations', async () => {
+    const generateImage = vi.fn(async () => ({ outputs: [] }))
+    const openrouter = { ...provider(), generateImage }
+    const replacement = provider()
+    const providers: Record<'openrouter' | 'deepseek', ModelProvider> = {
+      openrouter,
+      deepseek: provider(),
+    }
+    const registry = new ModelProviderRegistry(providers)
+
+    providers.openrouter = replacement
+
+    expect(registry.get('openrouter')).toBe(openrouter)
+    await expect(registry.get('openrouter').generateImage?.({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+    })).resolves.toEqual({ outputs: [] })
+    expect(generateImage).toHaveBeenCalledTimes(1)
+  })
+
   it('routes only fixed providers and maps separate credential keys', async () => {
     const openRouterModels: ModelInfo[] = [{
       id: 'image/model',

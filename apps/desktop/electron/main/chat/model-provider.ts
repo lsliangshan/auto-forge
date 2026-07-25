@@ -1,6 +1,11 @@
 import { createParser } from 'eventsource-parser'
 import { z } from 'zod'
-import { toSafeAppError, type AppError, type ModelInfo } from '@autoforge/shared'
+import {
+  toSafeAppError,
+  type AppError,
+  type GenerationOptions,
+  type ModelInfo,
+} from '@autoforge/shared'
 import type { ModelMediaInput } from '../media/media-asset-service.js'
 
 const MAX_ATTEMPTS = 4
@@ -46,10 +51,43 @@ export type ModelStreamEvent =
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; costUsd?: string }
   | { type: 'audio_delta'; choiceIndex: number; dataBase64: string; transcript?: string }
 
+export interface ModelImageRequest {
+  model: string
+  prompt: string
+  options: GenerationOptions['image']
+  references: Array<{ mimeType: string; dataBase64: string }>
+  signal?: AbortSignal
+}
+
+export interface ModelImageResult {
+  outputs: Array<
+    | { type: 'base64'; dataBase64: string; mimeType?: string }
+    | { type: 'url'; url: string }
+  >
+  usage?: { inputTokens?: number; outputTokens?: number; costUsd?: string }
+}
+
+export interface ModelVideoRequest {
+  model: string
+  prompt: string
+  options: GenerationOptions['video']
+  references: Array<{ mimeType: string; dataBase64: string }>
+  signal?: AbortSignal
+}
+
+export type ModelVideoStatus =
+  | { status: 'pending' | 'in_progress' }
+  | { status: 'completed'; generationId?: string; costUsd?: string }
+  | { status: 'failed'; errorCode: AppError['code'] }
+
 export interface ModelProvider {
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>
   validateCredential(signal?: AbortSignal): Promise<{ valid: boolean }>
   stream(request: ModelStreamRequest): AsyncIterable<ModelStreamEvent>
+  generateImage?(request: ModelImageRequest): Promise<ModelImageResult>
+  submitVideo?(request: ModelVideoRequest): Promise<{ providerJobId: string; status: 'pending' | 'in_progress' }>
+  pollVideo?(providerJobId: string, signal?: AbortSignal): Promise<ModelVideoStatus>
+  downloadVideo?(providerJobId: string, signal?: AbortSignal): Promise<Response>
 }
 
 export interface ModelCredentialPort {
@@ -78,8 +116,15 @@ export interface OpenAiCompatibleProviderDependencies {
   fetch?: FetchPort
   sleep?: SleepPort
   random?: () => number
-  diagnostic?: (diagnostic: { operation: 'models' | 'chat'; status?: number; code?: string | number; error_type?: string }) => void
+  diagnostic?: (diagnostic: {
+    operation: ProviderOperation
+    status?: number
+    code?: string | number
+    error_type?: string
+  }) => void
 }
+
+export type ProviderOperation = 'models' | 'chat' | 'image' | 'video'
 
 const providerErrorSchema = z.object({
   code: z.union([z.string(), z.number()]).optional(),
@@ -233,7 +278,22 @@ function retryAfter(response: Response): number | undefined {
   return Math.max(0, Math.min(MAX_RETRY_AFTER_MS, milliseconds))
 }
 
-async function boundedResponseText(response: Response): Promise<string> {
+async function readResponseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (!signal) return reader.read()
+  if (signal.aborted) throw failure('CANCELLED')
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(failure('CANCELLED'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    reader.read().then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort)
+    })
+  })
+}
+
+async function boundedResponseText(response: Response, signal?: AbortSignal): Promise<string> {
   if (!response.body) return ''
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -241,7 +301,7 @@ async function boundedResponseText(response: Response): Promise<string> {
   let output = ''
   try {
     while (total < MAX_DIAGNOSTIC_BODY) {
-      const chunk = await reader.read()
+      const chunk = await readResponseChunk(reader, signal)
       if (chunk.done) break
       const remaining = MAX_DIAGNOSTIC_BODY - total
       const value = chunk.value.byteLength > remaining ? chunk.value.subarray(0, remaining) : chunk.value
@@ -257,22 +317,27 @@ async function boundedResponseText(response: Response): Promise<string> {
   }
 }
 
-async function boundedResponseJson(response: Response): Promise<unknown> {
+async function boundedResponseJson(
+  response: Response,
+  maximumBytes = MAX_MODEL_CATALOG_BODY,
+  signal?: AbortSignal,
+): Promise<unknown> {
   const declaredLength = response.headers.get('content-length')
-  if (declaredLength && Number(declaredLength) > MAX_MODEL_CATALOG_BODY) {
-    throw new Error('Model catalog response exceeded the size limit')
+  if (declaredLength && Number(declaredLength) > maximumBytes) {
+    throw new Error('Model provider response exceeded the size limit')
   }
-  if (!response.body) throw new Error('Model catalog response had no body')
+  if (!response.body) throw new Error('Model provider response had no body')
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let total = 0
   let output = ''
   try {
     while (true) {
-      const chunk = await reader.read()
+      if (signal?.aborted) throw failure('CANCELLED')
+      const chunk = await readResponseChunk(reader, signal)
       if (chunk.done) break
       total += chunk.value.byteLength
-      if (total > MAX_MODEL_CATALOG_BODY) throw new Error('Model catalog response exceeded the size limit')
+      if (total > maximumBytes) throw new Error('Model provider response exceeded the size limit')
       output += decoder.decode(chunk.value, { stream: true })
     }
     output += decoder.decode()
@@ -651,7 +716,7 @@ function wireMessages(messages: ModelMessage[]): unknown[] {
 }
 
 export class OpenAiCompatibleProvider implements ModelProvider {
-  private readonly fetch: FetchPort
+  protected readonly fetch: FetchPort
   private readonly sleep: SleepPort
   private readonly random: () => number
 
@@ -666,7 +731,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
 
   async listModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     const { response } = await this.fetchModels(signal)
-    if (!response.ok) await this.throwHttpFailure('models', response)
+    if (!response.ok) await this.throwHttpFailure('models', response, signal)
     let general: ModelInfo[]
     try {
       general = this.config.parseModels(await boundedResponseJson(response))
@@ -676,7 +741,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     if (!this.config.optionalModelCatalogs?.length) return general
     const results = await Promise.allSettled(this.config.optionalModelCatalogs.map(async (catalog) => {
       const { response: optionalResponse } = await this.fetchModels(signal, catalog.endpoint)
-      if (!optionalResponse.ok) await this.throwHttpFailure('models', optionalResponse)
+      if (!optionalResponse.ok) await this.throwHttpFailure('models', optionalResponse, signal)
       return catalog.parse(await boundedResponseJson(optionalResponse))
     }))
     if (signal?.aborted) throw failure('CANCELLED')
@@ -692,7 +757,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     try {
       const { response } = await this.fetchModels(signal)
       if (response.status === 401) return { valid: false }
-      if (!response.ok) await this.throwHttpFailure('models', response)
+      if (!response.ok) await this.throwHttpFailure('models', response, signal)
       this.config.parseModels(await boundedResponseJson(response))
       return { valid: true }
     } catch (error) {
@@ -746,10 +811,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           messages = undefined
         }
         if (response.status === 429 || response.status >= 500) {
-          await this.readDiagnostic('chat', response)
+          await this.readDiagnostic('chat', response, request.signal)
           throw new RetryableFailure(retryAfter(response))
         }
-        if (!response.ok) await this.throwHttpFailure('chat', response)
+        if (!response.ok) await this.throwHttpFailure('chat', response, request.signal)
 
         try {
           yield* this.parseStream(response, replay, request.signal)
@@ -797,7 +862,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         continue
       }
       if (response.status !== 429 && response.status < 500) return { response, secret }
-      await this.readDiagnostic('models', response)
+      await this.readDiagnostic('models', response, signal)
       if (attempt === MAX_ATTEMPTS - 1) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
       await this.retryDelay(attempt, retryAfter(response), signal)
     }
@@ -815,6 +880,61 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     }
   }
 
+  protected async authenticatedFetch(
+    endpoint: string,
+    operation: ProviderOperation,
+    signal: AbortSignal | undefined,
+    request: () => RequestInit,
+  ): Promise<Response> {
+    if (signal?.aborted) throw failure('CANCELLED')
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      if (signal?.aborted) throw failure('CANCELLED')
+      const secret = await this.secret()
+      if (signal?.aborted) throw failure('CANCELLED')
+      let init: RequestInit | undefined
+      let response: Response
+      try {
+        init = request()
+        const headers = new Headers(init.headers)
+        headers.set('authorization', `Bearer ${secret}`)
+        init.headers = Object.fromEntries(headers.entries())
+        init.signal = signal
+        response = await this.fetch(endpoint, init)
+      } catch (error) {
+        if (isAbort(error, signal)) throw failure('CANCELLED')
+        if (!(error instanceof TypeError) || attempt === MAX_ATTEMPTS - 1) {
+          throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+        }
+        await this.retryDelay(attempt, undefined, signal)
+        continue
+      } finally {
+        if (init) init.body = undefined
+        init = undefined
+      }
+      if (response.status !== 429 && response.status < 500) {
+        if (!response.ok) await this.throwHttpFailure(operation, response, signal)
+        return response
+      }
+      await this.readDiagnostic(operation, response, signal)
+      if (attempt === MAX_ATTEMPTS - 1) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+      await this.retryDelay(attempt, retryAfter(response), signal)
+    }
+    throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+  }
+
+  protected async boundedJson(
+    response: Response,
+    maximumBytes: number,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    try {
+      return await boundedResponseJson(response, maximumBytes, signal)
+    } catch (error) {
+      if (isAbort(error, signal)) throw failure('CANCELLED')
+      throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+    }
+  }
+
   private async secret(): Promise<string> {
     try {
       const value = await this.dependencies.credential.get()
@@ -826,23 +946,33 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     }
   }
 
-  private async throwHttpFailure(operation: 'models' | 'chat', response: Response): Promise<never> {
-    await this.readDiagnostic(operation, response)
+  private async throwHttpFailure(
+    operation: ProviderOperation,
+    response: Response,
+    signal?: AbortSignal,
+  ): Promise<never> {
+    await this.readDiagnostic(operation, response, signal)
+    if (signal?.aborted) throw failure('CANCELLED')
     if (response.status === 401) throw failure('CREDENTIAL_INVALID')
     if (response.status === 403) throw failure('MODEL_PROVIDER_ACCESS_DENIED')
     throw failure('MODEL_PROVIDER_REQUEST_FAILED')
   }
 
-  private async readDiagnostic(operation: 'models' | 'chat', response: Response): Promise<void> {
+  private async readDiagnostic(
+    operation: ProviderOperation,
+    response: Response,
+    signal?: AbortSignal,
+  ): Promise<void> {
     let metadata: { code?: string | number; error_type?: string } = {}
     try {
-      const parsed = JSON.parse(await boundedResponseText(response)) as unknown
+      const parsed = JSON.parse(await boundedResponseText(response, signal)) as unknown
       const envelope = z.object({ error: providerErrorSchema.optional() }).passthrough().safeParse(parsed)
       const direct = providerErrorSchema.safeParse(parsed)
       metadata = providerErrorMetadata(envelope.success && envelope.data.error
         ? envelope.data.error
         : direct.success ? direct.data : undefined)
-    } catch {
+    } catch (error) {
+      if (isAbort(error, signal)) throw failure('CANCELLED')
       // The body is deliberately drained but never forwarded to diagnostics.
     }
     if (!this.dependencies.diagnostic) return

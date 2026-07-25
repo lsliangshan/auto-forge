@@ -36,6 +36,509 @@ async function rejection(stream: AsyncIterable<OpenRouterStreamEvent>): Promise<
 const credential = { get: vi.fn(async () => 'sk-private') }
 
 describe('OpenRouterProvider', () => {
+  it('generates one image through the fixed endpoint with verified reference bytes', async () => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const calls: Array<{ input: string; init?: RequestInit; body: string }> = []
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ input: String(input), init: { ...init }, body: String(init?.body) })
+      return Response.json({
+        created: 1_748_372_400,
+        data: [{ b64_json: 'AQID', media_type: 'image/png', provider_detail: true }],
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5, cost: 0.04 },
+      })
+    })
+    const provider = new OpenRouterProvider({ credential: localCredential, fetch })
+
+    await expect(provider.generateImage({
+      model: 'google/gemini-2.5-flash-image',
+      prompt: 'watercolor harbor',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [{ mimeType: 'image/png', dataBase64: 'AQID' }],
+    })).resolves.toEqual({
+      outputs: [{ type: 'base64', dataBase64: 'AQID', mimeType: 'image/png' }],
+      usage: { inputTokens: 2, outputTokens: 3, costUsd: '0.04' },
+    })
+
+    expect(localCredential.get).toHaveBeenCalledTimes(1)
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(calls[0]?.input).toBe('https://openrouter.ai/api/v1/images')
+    expect(calls[0]?.init).toMatchObject({
+      method: 'POST',
+      headers: { authorization: 'Bearer sk-private', 'content-type': 'application/json' },
+    })
+    expect(JSON.parse(calls[0]!.body)).toEqual({
+      model: 'google/gemini-2.5-flash-image',
+      prompt: 'watercolor harbor',
+      n: 1,
+      resolution: '1K',
+      output_format: 'png',
+      input_references: [{
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,AQID' },
+      }],
+    })
+  })
+
+  it('accepts canonical HTTPS image outputs and preserves SVG MIME metadata', async () => {
+    const bodies: string[] = []
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(String(init?.body))
+      return bodies.length === 1
+        ? Response.json({ data: [{ url: 'https://media.example/generated.png' }] })
+        : Response.json({ data: [{ b64_json: 'PHN2Zz4=', media_type: 'image/svg+xml' }] })
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+    const request = {
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1 as const, resolution: '2K', aspectRatio: '16:9', format: 'svg' },
+      references: [],
+    }
+
+    await expect(provider.generateImage(request)).resolves.toEqual({
+      outputs: [{ type: 'url', url: 'https://media.example/generated.png' }],
+    })
+    await expect(provider.generateImage(request)).resolves.toEqual({
+      outputs: [{ type: 'base64', dataBase64: 'PHN2Zz4=', mimeType: 'image/svg+xml' }],
+    })
+
+    expect(JSON.parse(bodies[0]!)).toEqual({
+      model: 'image/model',
+      prompt: 'draw',
+      n: 1,
+      resolution: '2K',
+      aspect_ratio: '16:9',
+      output_format: 'svg',
+    })
+  })
+
+  it.each([
+    ['data URL', 'data:image/png;base64,AQID'],
+    ['file URL', 'file:///tmp/generated.png'],
+    ['HTTP URL', 'http://media.example/generated.png'],
+    ['credential URL', 'https://user:password@media.example/generated.png'],
+    ['non-default port', 'https://media.example:444/generated.png'],
+    ['fragment URL', 'https://media.example/generated.png#raw'],
+    ['non-canonical host', 'https://MEDIA.example/generated.png'],
+    ['dot-segment path', 'https://media.example/a/../generated.png'],
+    ['encoded dot-segment path', 'https://media.example/a/%2e%2e/generated.png'],
+  ])('rejects a provider %s image output with a fixed safe error', async (_description, url) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({ data: [{ url }] })),
+    })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+    })).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+  })
+
+  it.each([
+    ['a non-image MIME', [{ mimeType: 'audio/mpeg', dataBase64: 'AQID' }]],
+    ['an unsupported image MIME', [{ mimeType: 'image/bmp', dataBase64: 'AQID' }]],
+    ['a data URL instead of raw Base64', [{ mimeType: 'image/png', dataBase64: 'data:image/png;base64,AQID' }]],
+    ['non-canonical Base64', [{ mimeType: 'image/png', dataBase64: 'AQI' }]],
+    ['empty Base64', [{ mimeType: 'image/png', dataBase64: '' }]],
+    ['too many references', Array.from({ length: 6 }, () => ({ mimeType: 'image/png', dataBase64: 'AQID' }))],
+  ])('rejects %s before credential access or fetch', async (_description, references) => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const fetch = vi.fn(async () => Response.json({ data: [] }))
+    const provider = new OpenRouterProvider({ credential: localCredential, fetch })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(localCredential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['count', { count: 2, resolution: '1K', aspectRatio: 'auto', format: 'png' }],
+    ['resolution', { count: 1, resolution: '', aspectRatio: 'auto', format: 'png' }],
+    ['aspect ratio', { count: 1, resolution: '1K', aspectRatio: 'wide', format: 'png' }],
+    ['format', { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'x'.repeat(33) }],
+  ])('rejects an invalid image %s before credential access or fetch', async (_description, options) => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const fetch = vi.fn(async () => Response.json({ data: [] }))
+    const provider = new OpenRouterProvider({ credential: localCredential, fetch })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options,
+      references: [],
+    } as never)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(localCredential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [{ data: [{ b64_json: 'AQID', media_type: 'image/png' }], unexpected: true }],
+    [{ data: { b64_json: 'AQID', media_type: 'image/png' } }],
+    [{ data: [] }],
+    [{ data: [{ b64_json: 'AQI', media_type: 'image/png' }] }],
+    [{ data: [{ b64_json: 'AQID', media_type: 'audio/mpeg' }] }],
+    [{ data: [{ b64_json: 'AQID', url: 'https://media.example/generated.png' }] }],
+  ])('rejects malformed image response shape without returning provider data', async (payload) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json(payload)),
+    })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+    })).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+  })
+
+  it('submits, polls, and downloads video only through fixed ID-derived endpoints', async () => {
+    const successfulDownload = new Response('video-bytes', {
+      headers: { 'content-type': 'video/mp4' },
+    })
+    const calls: Array<{ input: string; body: string }> = []
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ input: String(input), body: String(init?.body) })
+      if (calls.length === 1) {
+        return Response.json({
+          id: 'abc123',
+          status: 'pending',
+          polling_url: 'http://attacker.example/poll',
+          download_url: 'file:///tmp/secret',
+        }, { status: 202 })
+      }
+      if (calls.length === 2) {
+        return Response.json({
+          id: 'abc123',
+          status: 'completed',
+          generation_id: 'gen-123',
+          polling_url: 'https://attacker.example/poll',
+          unsigned_urls: ['http://attacker.example/video'],
+          usage: { cost: 0.25, is_byok: false },
+        })
+      }
+      return successfulDownload
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.submitVideo({
+      model: 'google/veo-3.1',
+      prompt: 'slow camera move',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+    })).resolves.toEqual({ providerJobId: 'abc123', status: 'pending' })
+    await expect(provider.pollVideo('abc123')).resolves.toEqual({
+      status: 'completed',
+      generationId: 'gen-123',
+      costUsd: '0.25',
+    })
+    const downloaded = await provider.downloadVideo('abc123')
+
+    expect(downloaded).toBe(successfulDownload)
+    expect(downloaded.bodyUsed).toBe(false)
+    expect(calls.map((call) => call.input)).toEqual([
+      'https://openrouter.ai/api/v1/videos',
+      'https://openrouter.ai/api/v1/videos/abc123',
+      'https://openrouter.ai/api/v1/videos/abc123/content?index=0',
+    ])
+    expect(JSON.parse(calls[0]!.body)).toEqual({
+      model: 'google/veo-3.1',
+      prompt: 'slow camera move',
+      duration: 5,
+      resolution: '720p',
+      generate_audio: false,
+    })
+  })
+
+  it('submits verified video references with explicit aspect ratio and fresh retry bodies', async () => {
+    const bodies: string[] = []
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(String(init?.body))
+      if (bodies.length === 1) return new Response('busy', { status: 429 })
+      if (bodies.length === 2) return new Response('down', { status: 503 })
+      return Response.json({ id: 'job_1', status: 'in_progress' }, { status: 202 })
+    })
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch,
+      sleep: vi.fn(async () => undefined),
+      random: () => 0,
+    })
+
+    await expect(provider.submitVideo({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 10, resolution: '1080p', aspectRatio: '9:16', generateAudio: true },
+      references: [{ mimeType: 'image/webp', dataBase64: 'AQID' }],
+    })).resolves.toEqual({ providerJobId: 'job_1', status: 'in_progress' })
+
+    const expected = {
+      model: 'video/model',
+      prompt: 'animate',
+      duration: 10,
+      resolution: '1080p',
+      aspect_ratio: '9:16',
+      generate_audio: true,
+      input_references: [{
+        type: 'image_url',
+        image_url: { url: 'data:image/webp;base64,AQID' },
+      }],
+    }
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(bodies.map((body) => JSON.parse(body))).toEqual([expected, expected, expected])
+  })
+
+  it.each([
+    ['pending', { status: 'pending' }],
+    ['in_progress', { status: 'in_progress' }],
+    ['failed', { status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' }],
+  ] as const)('maps documented %s video status deterministically', async (status, expected) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({
+        id: 'job-1',
+        status,
+        error: 'RAW_PROVIDER_ERROR_MUST_NOT_ESCAPE',
+      })),
+    })
+
+    await expect(provider.pollVideo('job-1')).resolves.toEqual(expected)
+  })
+
+  it.each([
+    'cancelled',
+    'expired',
+    'complete',
+    '',
+  ])('rejects unknown video status %s with a fixed safe error', async (status) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({ id: 'job-1', status })),
+    })
+
+    await expect(provider.pollVideo('job-1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+  })
+
+  it.each([
+    '',
+    '../job',
+    'job/child',
+    'job%2Fchild',
+    'job%252Fchild',
+    'job?index=1',
+    'job#fragment',
+    'x'.repeat(201),
+  ])('rejects malformed provider job ID %s before credential access or fetch', async (providerJobId) => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const fetch = vi.fn(async () => Response.json({ id: providerJobId, status: 'pending' }))
+    const provider = new OpenRouterProvider({ credential: localCredential, fetch })
+
+    await expect(provider.pollVideo(providerJobId)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(provider.downloadVideo(providerJobId)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(localCredential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('keeps a valid provider job ID byte-for-byte in poll and content paths', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(Response.json({ id: 'Az_09-job', status: 'pending' }))
+      .mockResolvedValueOnce(new Response('bytes'))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await provider.pollVideo('Az_09-job')
+    await provider.downloadVideo('Az_09-job')
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([
+      'https://openrouter.ai/api/v1/videos/Az_09-job',
+      'https://openrouter.ai/api/v1/videos/Az_09-job/content?index=0',
+    ])
+  })
+
+  it.each([
+    [401, 'CREDENTIAL_INVALID', 1],
+    [403, 'MODEL_PROVIDER_ACCESS_DENIED', 1],
+    [429, 'MODEL_PROVIDER_REQUEST_FAILED', 4],
+    [503, 'MODEL_PROVIDER_REQUEST_FAILED', 4],
+  ] as const)('maps media HTTP %s safely with bounded retries', async (status, code, attempts) => {
+    const diagnostic = vi.fn()
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      error: {
+        code: status,
+        message: `RAW_PROVIDER_BODY_${'x'.repeat(3_000)}`,
+        metadata: { error_type: 'upstream_error' },
+      },
+    }), { status }))
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch,
+      diagnostic,
+      sleep: vi.fn(async () => undefined),
+    })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+    })).rejects.toMatchObject({ code })
+    expect(fetch).toHaveBeenCalledTimes(attempts)
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
+    expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it('rejects a non-2xx video download after draining only bounded diagnostics', async () => {
+    let cancelled = false
+    const encoder = new TextEncoder()
+    const fetch = vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(JSON.stringify({
+          error: { code: 403, message: `RAW_DOWNLOAD_BODY_${'x'.repeat(3_000)}` },
+        })))
+      },
+      cancel() { cancelled = true },
+    }), { status: 403 }))
+    const diagnostic = vi.fn()
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
+
+    await expect(provider.downloadVideo('job_1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_ACCESS_DENIED',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(cancelled).toBe(true)
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_DOWNLOAD_BODY')
+  })
+
+  it('maps malformed and oversized media JSON to a fixed safe error', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response('{"data":[', {
+        headers: { 'content-type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response('{}', {
+        headers: { 'content-length': String(40 * 1024 * 1024) },
+      }))
+      .mockResolvedValueOnce(Response.json({ id: 'different-job', status: 'pending' }))
+    const provider = new OpenRouterProvider({ credential, fetch })
+    const request = {
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+    }
+
+    await expect(provider.generateImage(request)).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    await expect(provider.generateImage(request)).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    await expect(provider.pollVideo('job_1')).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+  })
+
+  it('propagates cancellation before credential access, during fetch, and during retry backoff', async () => {
+    const preAborted = new AbortController()
+    preAborted.abort()
+    const preCredential = { get: vi.fn(async () => 'sk-private') }
+    const preFetch = vi.fn(async () => Response.json({ data: [] }))
+    const preProvider = new OpenRouterProvider({ credential: preCredential, fetch: preFetch })
+    const request = {
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+      signal: preAborted.signal,
+    }
+
+    await expect(preProvider.generateImage(request)).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(preCredential.get).not.toHaveBeenCalled()
+    expect(preFetch).not.toHaveBeenCalled()
+
+    const duringFetch = new AbortController()
+    const abortingFetch = vi.fn(async () => {
+      duringFetch.abort()
+      throw new DOMException('aborted', 'AbortError')
+    })
+    const fetchProvider = new OpenRouterProvider({ credential, fetch: abortingFetch })
+    await expect(fetchProvider.generateImage({ ...request, signal: duringFetch.signal }))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(abortingFetch).toHaveBeenCalledTimes(1)
+
+    const duringBackoff = new AbortController()
+    const backoffFetch = vi.fn(async () => new Response('busy', { status: 503 }))
+    const sleep = vi.fn(async (_milliseconds: number, signal?: AbortSignal) => {
+      duringBackoff.abort()
+      expect(signal?.aborted).toBe(true)
+      throw new DOMException('aborted', 'AbortError')
+    })
+    const backoffProvider = new OpenRouterProvider({ credential, fetch: backoffFetch, sleep })
+    await expect(backoffProvider.submitVideo({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+      signal: duringBackoff.signal,
+    })).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(backoffFetch).toHaveBeenCalledTimes(1)
+    expect(sleep).toHaveBeenCalledTimes(1)
+  })
+
+  it('maps cancellation while reading a media JSON body to CANCELLED', async () => {
+    const controller = new AbortController()
+    const encoder = new TextEncoder()
+    let emitted = false
+    const fetch = vi.fn(async () => new Response(new ReadableStream({
+      pull(streamController) {
+        if (!emitted) {
+          emitted = true
+          controller.abort()
+          streamController.enqueue(encoder.encode('{"data":['))
+        } else {
+          streamController.error(new DOMException('aborted', 'AbortError'))
+        }
+      },
+    })))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+      signal: controller.signal,
+    })).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('maps cancellation while draining a media error diagnostic to CANCELLED', async () => {
+    const controller = new AbortController()
+    const encoder = new TextEncoder()
+    let readerCancelled = false
+    const fetch = vi.fn(async () => new Response(new ReadableStream({
+      start(streamController) {
+        streamController.enqueue(encoder.encode('{"error":'))
+      },
+      pull() {
+        queueMicrotask(() => controller.abort())
+        return new Promise(() => undefined)
+      },
+      cancel() { readerCancelled = true },
+    }, { highWaterMark: 0 }), { status: 403 }))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.downloadVideo('job_1', controller.signal))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(readerCancelled).toBe(true)
+  })
+
   it.each([
     ['range zero', { type: 'range', min: 0, max: 0 }, 1],
     ['range one', { type: 'range', min: 1, max: 1 }, 1],

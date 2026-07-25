@@ -8,7 +8,11 @@ export function credentialKeyForProvider(provider: ModelProviderId): ProviderCre
 }
 
 export class ModelProviderRegistry {
-  constructor(private readonly providers: Record<ModelProviderId, ModelProvider>) {}
+  private readonly providers: Readonly<Record<ModelProviderId, ModelProvider>>
+
+  constructor(providers: Record<ModelProviderId, ModelProvider>) {
+    this.providers = { ...providers }
+  }
 
   get(provider: ModelProviderId): ModelProvider {
     return this.providers[provider]
