@@ -1,5 +1,12 @@
 import { z } from 'zod'
-import { chatBlockSchema, type ChatBlock, type ChatEvent, type ExecutionEvent, type ExecutionStatus } from './events.js'
+import {
+  chatBlockSchema,
+  mediaKindSchema,
+  type ChatBlock,
+  type ChatEvent,
+  type ExecutionEvent,
+  type ExecutionStatus,
+} from './events.js'
 import {
   capabilitySchema,
   capabilityScopeSchema,
@@ -10,6 +17,67 @@ import {
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
+
+const modalitySchema = z.enum(['text', 'image', 'audio', 'video'])
+
+export const outputTypeSchema = z.enum(['auto', 'text', 'image', 'audio', 'video'])
+export type OutputType = z.infer<typeof outputTypeSchema>
+
+export const generationOptionsSchema = z.object({
+  image: z.object({
+    count: z.literal(1),
+    resolution: z.string().default('1K'),
+    aspectRatio: z.string().default('auto'),
+    format: z.string().default('png'),
+  }).strict(),
+  audio: z.object({
+    voice: z.string().trim().min(1).optional(),
+    format: z.string().default('mp3'),
+  }).strict(),
+  video: z.object({
+    durationSeconds: z.number().int().positive().default(5),
+    resolution: z.string().default('720p'),
+    aspectRatio: z.string().default('auto'),
+    generateAudio: z.boolean().default(false),
+  }).strict(),
+}).strict()
+export type GenerationOptions = z.infer<typeof generationOptionsSchema>
+
+export const mediaAssetSchema = z.object({
+  id: identifierSchema,
+  kind: mediaKindSchema,
+  mimeType: nonEmptyStringSchema,
+  name: nonEmptyStringSchema,
+  byteSize: z.number().int().nonnegative(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+}).strict()
+export type MediaAsset = z.infer<typeof mediaAssetSchema>
+
+export const mediaImportContextSchema = z.object({
+  conversationId: identifierSchema,
+  existingAssetIds: z.array(identifierSchema).max(5),
+}).strict()
+export type MediaImportContext = z.infer<typeof mediaImportContextSchema>
+
+export const mediaRemoveDraftRequestSchema = z.object({
+  conversationId: identifierSchema,
+  assetId: identifierSchema,
+}).strict()
+export type MediaRemoveDraftRequest = z.infer<typeof mediaRemoveDraftRequestSchema>
+
+export const conversationGenerationPreferencesSchema = z.object({
+  outputType: outputTypeSchema,
+  models: z.object({
+    text: nonEmptyStringSchema.optional(),
+    image: nonEmptyStringSchema.optional(),
+    audio: nonEmptyStringSchema.optional(),
+    video: nonEmptyStringSchema.optional(),
+  }).strict(),
+  generation: generationOptionsSchema,
+}).strict()
+export type ConversationGenerationPreferences = z.infer<typeof conversationGenerationPreferencesSchema>
 
 export const conversationSummarySchema = z.object({
   id: identifierSchema,
@@ -33,9 +101,19 @@ export interface ChatMessage extends Omit<z.infer<typeof chatMessageSchema>, 'bl
 
 export const chatSendInputSchema = z.object({
   conversationId: identifierSchema,
-  content: nonEmptyStringSchema,
+  content: z.string().trim(),
+  assetIds: z.array(identifierSchema).max(5).default([]),
+  outputType: outputTypeSchema.default('auto'),
   model: nonEmptyStringSchema.optional(),
-}).strict()
+  generation: generationOptionsSchema,
+}).strict().superRefine(({ content, assetIds, outputType }, context) => {
+  if (!content && assetIds.length === 0) {
+    context.addIssue({ code: 'custom', message: 'Text or an attachment is required' })
+  }
+  if (!content && outputType !== 'text' && outputType !== 'auto') {
+    context.addIssue({ code: 'custom', message: 'Generation output requires a prompt' })
+  }
+})
 
 export type ChatSendInput = z.infer<typeof chatSendInputSchema>
 
@@ -238,8 +316,13 @@ export const modelProviderIdSchema = z.enum(['deepseek', 'openrouter'])
 export type ModelProviderId = z.infer<typeof modelProviderIdSchema>
 
 export const providerDefaultModelsSchema = z.object({
-  deepseek: nonEmptyStringSchema,
-  openrouter: nonEmptyStringSchema,
+  deepseek: z.object({ text: nonEmptyStringSchema }).strict(),
+  openrouter: z.object({
+    text: nonEmptyStringSchema.optional(),
+    image: nonEmptyStringSchema.optional(),
+    audio: nonEmptyStringSchema.optional(),
+    video: nonEmptyStringSchema.optional(),
+  }).strict(),
 }).strict()
 export type ProviderDefaultModels = z.infer<typeof providerDefaultModelsSchema>
 
@@ -277,6 +360,27 @@ export const modelInfoSchema = z.object({
   contextLength: z.number().int().positive().optional(),
   inputCostPerMillion: z.number().nonnegative().optional(),
   outputCostPerMillion: z.number().nonnegative().optional(),
+  inputModalities: z.array(modalitySchema),
+  outputModalities: z.array(modalitySchema),
+  supportsTools: z.boolean(),
+  generation: z.object({
+    image: z.object({
+      resolutions: z.array(z.string()),
+      aspectRatios: z.array(z.string()),
+      formats: z.array(z.string()),
+      maxCount: z.number().int().positive(),
+    }).strict().optional(),
+    audio: z.object({
+      voices: z.array(z.string()),
+      formats: z.array(z.string()),
+    }).strict().optional(),
+    video: z.object({
+      resolutions: z.array(z.string()),
+      aspectRatios: z.array(z.string()),
+      durations: z.array(z.number().int().positive()),
+      supportsAudio: z.boolean(),
+    }).strict().optional(),
+  }).strict(),
 }).strict()
 
 export type ModelInfo = z.infer<typeof modelInfoSchema>
@@ -295,7 +399,17 @@ export const ipcChannels = {
   chatDeleteConversation: 'chat:delete-conversation',
   chatSend: 'chat:send',
   chatCancel: 'chat:cancel',
+  chatGetGenerationPreferences: 'chat:get-generation-preferences',
+  chatUpdateGenerationPreferences: 'chat:update-generation-preferences',
   chatEvent: 'chat:event',
+  mediaPickFiles: 'media:pick-files',
+  mediaImportDroppedFiles: 'media:import-dropped-files',
+  mediaImportClipboardImage: 'media:import-clipboard-image',
+  mediaRemoveDraft: 'media:remove-draft',
+  mediaSaveCopy: 'media:save-copy',
+  mediaReveal: 'media:reveal',
+  mediaPauseVideoJob: 'media:pause-video-job',
+  mediaResumeVideoJob: 'media:resume-video-job',
   workflowsList: 'workflows:list',
   workflowsGet: 'workflows:get',
   workflowsSetEnabled: 'workflows:set-enabled',
@@ -337,6 +451,15 @@ export const renameConversationRequestSchema = z.object({
 }).strict()
 export const deleteConversationRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const cancelChatRequestSchema = z.object({ requestId: identifierSchema }).strict()
+export const generationPreferencesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const updateGenerationPreferencesRequestSchema = generationPreferencesRequestSchema.extend({
+  preferences: conversationGenerationPreferencesSchema,
+})
+export const importDroppedFilesRequestSchema = mediaImportContextSchema.extend({
+  paths: z.array(nonEmptyStringSchema).max(5),
+})
+export const mediaAssetRequestSchema = z.object({ assetId: identifierSchema }).strict()
+export const mediaGenerationJobRequestSchema = z.object({ jobId: identifierSchema }).strict()
 export const workflowListRequestSchema = workflowQuerySchema.optional()
 export const workflowGetRequestSchema = z.object({
   id: identifierSchema,
@@ -390,6 +513,16 @@ export const ipcRequestSchemas = {
   [ipcChannels.chatDeleteConversation]: deleteConversationRequestSchema,
   [ipcChannels.chatSend]: chatSendInputSchema,
   [ipcChannels.chatCancel]: cancelChatRequestSchema,
+  [ipcChannels.chatGetGenerationPreferences]: generationPreferencesRequestSchema,
+  [ipcChannels.chatUpdateGenerationPreferences]: updateGenerationPreferencesRequestSchema,
+  [ipcChannels.mediaPickFiles]: mediaImportContextSchema,
+  [ipcChannels.mediaImportDroppedFiles]: importDroppedFilesRequestSchema,
+  [ipcChannels.mediaImportClipboardImage]: mediaImportContextSchema,
+  [ipcChannels.mediaRemoveDraft]: mediaRemoveDraftRequestSchema,
+  [ipcChannels.mediaSaveCopy]: mediaAssetRequestSchema,
+  [ipcChannels.mediaReveal]: mediaAssetRequestSchema,
+  [ipcChannels.mediaPauseVideoJob]: mediaGenerationJobRequestSchema,
+  [ipcChannels.mediaResumeVideoJob]: mediaGenerationJobRequestSchema,
   [ipcChannels.workflowsList]: workflowListRequestSchema,
   [ipcChannels.workflowsGet]: workflowGetRequestSchema,
   [ipcChannels.workflowsSetEnabled]: workflowSetEnabledRequestSchema,
@@ -432,6 +565,16 @@ export const ipcResponseSchemas = {
   [ipcChannels.chatDeleteConversation]: voidResponseSchema,
   [ipcChannels.chatSend]: requestIdResponseSchema,
   [ipcChannels.chatCancel]: voidResponseSchema,
+  [ipcChannels.chatGetGenerationPreferences]: conversationGenerationPreferencesSchema,
+  [ipcChannels.chatUpdateGenerationPreferences]: conversationGenerationPreferencesSchema,
+  [ipcChannels.mediaPickFiles]: z.array(mediaAssetSchema),
+  [ipcChannels.mediaImportDroppedFiles]: z.array(mediaAssetSchema),
+  [ipcChannels.mediaImportClipboardImage]: z.array(mediaAssetSchema),
+  [ipcChannels.mediaRemoveDraft]: voidResponseSchema,
+  [ipcChannels.mediaSaveCopy]: voidResponseSchema,
+  [ipcChannels.mediaReveal]: voidResponseSchema,
+  [ipcChannels.mediaPauseVideoJob]: voidResponseSchema,
+  [ipcChannels.mediaResumeVideoJob]: voidResponseSchema,
   [ipcChannels.workflowsList]: z.array(workflowSummarySchema),
   [ipcChannels.workflowsGet]: workflowDetailSchema,
   [ipcChannels.workflowsSetEnabled]: voidResponseSchema,
@@ -471,7 +614,22 @@ export interface DesktopAPI {
     deleteConversation(conversationId: string): Promise<void>
     send(input: ChatSendInput): Promise<{ requestId: string }>
     cancel(requestId: string): Promise<void>
+    getGenerationPreferences(conversationId: string): Promise<ConversationGenerationPreferences>
+    updateGenerationPreferences(
+      conversationId: string,
+      preferences: ConversationGenerationPreferences,
+    ): Promise<ConversationGenerationPreferences>
     onEvent(listener: (event: ChatEvent) => void): () => void
+  }
+  media: {
+    pickFiles(context: MediaImportContext): Promise<MediaAsset[]>
+    importDroppedFiles(context: MediaImportContext, files: readonly File[]): Promise<MediaAsset[]>
+    importClipboardImage(context: MediaImportContext): Promise<MediaAsset[]>
+    removeDraft(input: MediaRemoveDraftRequest): Promise<void>
+    saveCopy(assetId: string): Promise<void>
+    reveal(assetId: string): Promise<void>
+    pauseVideoJob(jobId: string): Promise<void>
+    resumeVideoJob(jobId: string): Promise<void>
   }
   workflows: {
     list(query?: WorkflowQuery): Promise<WorkflowSummary[]>

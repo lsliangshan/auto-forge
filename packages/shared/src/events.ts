@@ -1,9 +1,35 @@
 import { z } from 'zod'
-import { appErrorSchema } from './errors.js'
+import { appErrorCodeSchema, appErrorSchema } from './errors.js'
 import { capabilitySchema, capabilityScopeSchema } from './worker-protocol.js'
 
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
+
+export const mediaKindSchema = z.enum(['image', 'audio', 'video'])
+export type MediaKind = z.infer<typeof mediaKindSchema>
+
+export const mediaBlockSchema = z.object({
+  type: z.literal('media'),
+  blockId: identifierSchema,
+  assetId: identifierSchema,
+  kind: mediaKindSchema,
+  purpose: z.enum(['input', 'output']),
+  name: z.string().trim().min(1),
+  mimeType: z.string().trim().min(1),
+  byteSize: z.number().int().nonnegative(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+}).strict()
+
+export const mediaGenerationBlockSchema = z.object({
+  type: z.literal('media_generation'),
+  blockId: identifierSchema,
+  jobId: identifierSchema,
+  kind: mediaKindSchema,
+  status: z.enum(['pending', 'in_progress', 'downloading', 'paused', 'failed']),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict()
 
 export const executionStatusSchema = z.enum([
   'queued',
@@ -47,6 +73,8 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     code: z.string().trim().min(1),
     message: z.string().trim().min(1),
   }).strict(),
+  mediaBlockSchema,
+  mediaGenerationBlockSchema,
 ])
 
 export type ChatBlock = z.infer<typeof chatBlockSchema>
@@ -65,7 +93,22 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     status: z.enum(['running', 'completed', 'cancelled', 'failed']),
     error: appErrorSchema.optional(),
   }).strict(),
-])
+  z.object({
+    type: z.literal('block_update'),
+    conversationId: identifierSchema,
+    messageId: identifierSchema,
+    blockId: identifierSchema,
+    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema]),
+  }).strict(),
+]).superRefine((event, context) => {
+  if (event.type === 'block_update' && event.blockId !== event.block.blockId) {
+    context.addIssue({
+      code: 'custom',
+      path: ['blockId'],
+      message: 'Replacement block identity must match the updated block',
+    })
+  }
+})
 
 export type ChatEvent = z.infer<typeof chatEventSchema>
 

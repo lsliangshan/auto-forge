@@ -1,0 +1,42 @@
+export const openRouterVideoModelsLiveFixture = {
+  data: [
+    {
+      id: 'alibaba/happyhorse-1.1',
+      name: 'Alibaba: HappyHorse 1.1',
+      description: 'Ignored live catalog metadata',
+      pricing: { prompt: '0', completion: '0' },
+      supported_resolutions: ['720p', '1080p'],
+      supported_aspect_ratios: ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9', '9:21'],
+      supported_durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      supported_frame_images: ['first_frame'],
+      generate_audio: null,
+    },
+    {
+      id: 'kwaivgi/kling-v3.0-std',
+      name: 'Kling: Video v3.0 Standard',
+      supported_resolutions: ['720p'],
+      supported_aspect_ratios: ['16:9', '9:16', '1:1'],
+      supported_durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      supported_frame_images: ['first_frame', 'last_frame'],
+      generate_audio: true,
+    },
+    {
+      id: 'openai/sora-2-pro',
+      name: 'OpenAI: Sora 2 Pro',
+      supported_resolutions: ['720p', '1080p'],
+      supported_aspect_ratios: ['16:9', '9:16'],
+      supported_durations: [4, 8, 12, 16, 20],
+      supported_frame_images: null,
+      generate_audio: true,
+    },
+    {
+      id: 'x-ai/grok-imagine-video-1.5',
+      name: 'xAI: Grok Imagine Video 1.5',
+      supported_resolutions: ['480p', '720p', '1080p'],
+      supported_aspect_ratios: null,
+      supported_durations: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+      supported_frame_images: ['first_frame'],
+      generate_audio: null,
+    },
+  ],
+} as const

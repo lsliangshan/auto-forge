@@ -7,20 +7,41 @@ import {
 
 const CHAT_ENDPOINT = 'https://api.deepseek.com/chat/completions'
 const MODELS_ENDPOINT = 'https://api.deepseek.com/models'
+const MAX_DEEPSEEK_MODELS = 1_000
+const MAX_MODEL_ID_LENGTH = 256
 
 const deepSeekModelsSchema = z.object({
   object: z.literal('list').optional(),
-  data: z.array(z.object({
-    id: z.string().trim().min(1),
-    object: z.literal('model').optional(),
-    owned_by: z.string().optional(),
-  }).passthrough()),
+  data: z.array(z.unknown()).max(MAX_DEEPSEEK_MODELS),
+}).passthrough()
+
+const deepSeekModelSchema = z.object({
+  id: z.string()
+    .min(1)
+    .max(MAX_MODEL_ID_LENGTH)
+    .refine((value) => value === value.trim()),
+  object: z.literal('model').optional(),
+  owned_by: z.string().max(256).optional(),
 }).passthrough()
 
 function parseDeepSeekModels(value: unknown): ModelInfo[] {
-  return deepSeekModelsSchema.parse(value).data
-    .map(({ id }) => ({ id, name: id }))
-    .sort((left, right) => left.id.localeCompare(right.id))
+  const models = new Map<string, ModelInfo>()
+  for (const entry of deepSeekModelsSchema.parse(value).data) {
+    const parsed = deepSeekModelSchema.safeParse(entry)
+    if (!parsed.success || models.has(parsed.data.id)) continue
+    const { id } = parsed.data
+    models.set(id, {
+      id,
+      name: id,
+      inputModalities: ['text'],
+      outputModalities: ['text'],
+      supportsTools: true,
+      generation: {},
+    })
+  }
+  return [...models.values()].sort((left, right) => (
+    left.id < right.id ? -1 : left.id > right.id ? 1 : 0
+  ))
 }
 
 export interface DeepSeekProviderDependencies extends Omit<OpenAiCompatibleProviderDependencies, 'credential'> {
@@ -34,6 +55,8 @@ export class DeepSeekProvider extends OpenAiCompatibleProvider {
       modelsEndpoint: MODELS_ENDPOINT,
       parseModels: parseDeepSeekModels,
       includeUsageStreamOption: false,
+      supportsMediaInput: false,
+      supportsAudioOutput: false,
     }, {
       ...dependencies,
       credential: { get: () => dependencies.credential.get('deepseek_api_key') },

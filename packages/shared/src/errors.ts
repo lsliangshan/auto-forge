@@ -18,6 +18,17 @@ export const appErrorCodeSchema = z.enum([
   'MODEL_PROVIDER_ACCESS_DENIED',
   'OPENROUTER_REQUEST_FAILED',
   'MODEL_PROVIDER_REQUEST_FAILED',
+  'MEDIA_TYPE_UNSUPPORTED',
+  'MEDIA_ATTACHMENT_LIMIT_EXCEEDED',
+  'MEDIA_SIZE_LIMIT_EXCEEDED',
+  'MEDIA_MIME_MISMATCH',
+  'MEDIA_IMPORT_FAILED',
+  'MEDIA_ASSET_UNAVAILABLE',
+  'MEDIA_STORAGE_FULL',
+  'MODEL_MODALITY_UNSUPPORTED',
+  'MEDIA_GENERATION_FAILED',
+  'MEDIA_DOWNLOAD_FAILED',
+  'MEDIA_GENERATION_TIMEOUT',
 ])
 
 export type AppErrorCode = z.infer<typeof appErrorCodeSchema>
@@ -47,6 +58,17 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   MODEL_PROVIDER_ACCESS_DENIED: 'The model provider denied access.',
   OPENROUTER_REQUEST_FAILED: 'The OpenRouter request failed.',
   MODEL_PROVIDER_REQUEST_FAILED: 'The model provider request failed.',
+  MEDIA_TYPE_UNSUPPORTED: 'This media type is not supported.',
+  MEDIA_ATTACHMENT_LIMIT_EXCEEDED: 'The attachment limit was exceeded.',
+  MEDIA_SIZE_LIMIT_EXCEEDED: 'The media size limit was exceeded.',
+  MEDIA_MIME_MISMATCH: 'The media type does not match its contents.',
+  MEDIA_IMPORT_FAILED: 'The media import failed.',
+  MEDIA_ASSET_UNAVAILABLE: 'The media asset is unavailable.',
+  MEDIA_STORAGE_FULL: 'There is not enough local storage for this media.',
+  MODEL_MODALITY_UNSUPPORTED: 'The selected model does not support this media request.',
+  MEDIA_GENERATION_FAILED: 'The media generation failed.',
+  MEDIA_DOWNLOAD_FAILED: 'The media download failed.',
+  MEDIA_GENERATION_TIMEOUT: 'The media generation timed out.',
 }
 
 export function toSafeAppError(error: unknown): AppError {

@@ -39,6 +39,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .af-status-dot.warning { background: var(--af-warning); }
 .af-status-dot.danger { background: var(--af-danger); }
 .af-truncate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-media-card, .af-media-generation { display: grid; width: min(100%, 640px); gap: 10px; overflow: hidden; border: 1px solid var(--af-border); border-radius: 10px; padding: 12px; background: var(--af-surface); }
+.af-media-image, .af-media-video { display: block; width: auto; max-width: min(100%, 560px); max-height: 420px; border-radius: 7px; object-fit: contain; background: var(--af-surface-muted); }
+.af-media-audio { display: block; width: min(100%, 520px); }
+.af-media-details { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 12px; }
+.af-media-metadata { flex: none; color: var(--af-text-muted); font-size: 12px; }
+.af-media-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.af-secondary-button { border: 1px solid var(--af-border-strong); border-radius: 6px; padding: 6px 10px; color: var(--af-text); background: var(--af-surface); cursor: pointer; }
+.af-secondary-button:hover:not(:disabled) { border-color: var(--af-cobalt); color: var(--af-cobalt); }
+.af-secondary-button:disabled { cursor: not-allowed; opacity: .55; }
+.af-media-action-error { margin: 0; color: var(--af-danger); font-size: 12px; }
+.af-media-generation-status { display: flex; align-items: center; gap: 8px; }
+.af-media-generation-warning { margin: 0; color: var(--af-warning); font-size: 12px; line-height: 1.5; }
+.af-media-generation-failure { display: grid; gap: 4px; color: var(--af-danger); }
+.af-media-generation.is-failed { border-color: #f2b8b5; background: #fff5f5; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }

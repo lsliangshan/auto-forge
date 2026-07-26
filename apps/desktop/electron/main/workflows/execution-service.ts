@@ -229,6 +229,8 @@ export class ExecutionService {
   private readonly reservationHandles = new WeakMap<ExecutionReservation, ReservationRecord>()
   private readonly reservationsById = new Map<string, ReservationRecord>()
   private readonly temporaryDirectories: TemporaryDirectoryPort
+  private stopped = false
+  private shutdownPromise?: Promise<void>
 
   constructor(private readonly dependencies: ExecutionServiceDependencies) {
     this.temporaryDirectories = dependencies.temporaryDirectories ?? {
@@ -242,6 +244,7 @@ export class ExecutionService {
   }
 
   reserve(): ExecutionReservation {
+    if (this.stopped) throw failure('CONFLICT')
     const handle = Object.freeze({ executionId: randomUUID() })
     const record: ReservationRecord = {
       handle,
@@ -272,6 +275,7 @@ export class ExecutionService {
     input: ExecutionStartInput,
     signal?: AbortSignal,
   ): Promise<StartedExecution> {
+    if (this.stopped) throw failure('CONFLICT')
     const record = this.reservationHandles.get(reservation)
     if (!record || record.handle !== reservation || record.started) throw failure('CONFLICT')
     if (record.cancelled || signal?.aborted) {
@@ -443,6 +447,29 @@ export class ExecutionService {
       // Termination below is authoritative even if the worker input is already closed.
     }
     await this.finish(executionId, 'cancelled', failure('CANCELLED'))
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise
+    this.stopped = true
+    this.shutdownPromise = this.drainShutdown()
+    return this.shutdownPromise
+  }
+
+  private async drainShutdown(): Promise<void> {
+    const executionIds = new Set([
+      ...this.reservationsById.keys(),
+      ...this.active.keys(),
+    ])
+    await Promise.allSettled([...executionIds].map(async (executionId) => {
+      await this.cancel(executionId)
+      const active = this.active.get(executionId)
+      if (active?.finishing) await active.finishing
+      else if (active) await active.finished.catch(() => undefined)
+    }))
+    await Promise.allSettled([...this.active.values()].map((active) => (
+      active.finishing ?? active.finished.then(() => undefined, () => undefined)
+    )))
   }
 
   private async resolveEntryPath(

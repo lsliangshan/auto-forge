@@ -4,6 +4,26 @@ import type { AppRepositories } from '../database/repositories.js'
 const settingsKey = 'app'
 type LegacySettings = Partial<AppSettings> & { defaultModel?: unknown }
 
+function providerTextDefault(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value
+  if (typeof value === 'object' && value !== null) {
+    const text = (value as { text?: unknown }).text
+    if (typeof text === 'string' && text.trim()) return text
+  }
+  return undefined
+}
+
+function openRouterDefaults(value: unknown): ProviderDefaultModels['openrouter'] {
+  const record = typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : {}
+  return Object.fromEntries(
+    ['text', 'image', 'audio', 'video']
+      .filter((key) => typeof record[key] === 'string' && String(record[key]).trim())
+      .map((key) => [key, record[key]]),
+  ) as ProviderDefaultModels['openrouter']
+}
+
 export class SettingsService {
   constructor(
     private readonly repository: AppRepositories['appSettings'],
@@ -23,9 +43,7 @@ export class SettingsService {
 
   private normalize(value: unknown): AppSettings {
     const stored = typeof value === 'object' && value !== null ? value as LegacySettings : {}
-    const storedDefaults = typeof stored.defaultModels === 'object' && stored.defaultModels !== null
-      ? stored.defaultModels as Partial<ProviderDefaultModels>
-      : {}
+    const storedDefaults = stored.defaultModels
     return {
       theme: stored.theme ?? this.defaults.theme,
       language: stored.language ?? this.defaults.language,
@@ -37,14 +55,16 @@ export class SettingsService {
           ? 'openrouter'
           : this.defaults.activeProvider,
       defaultModels: {
-        openrouter: typeof storedDefaults.openrouter === 'string' && storedDefaults.openrouter.trim()
-          ? storedDefaults.openrouter
-          : typeof stored.defaultModel === 'string' && stored.defaultModel.trim()
-            ? stored.defaultModel
-            : this.defaults.defaultModels.openrouter,
-        deepseek: typeof storedDefaults.deepseek === 'string' && storedDefaults.deepseek.trim()
-          ? storedDefaults.deepseek
-          : this.defaults.defaultModels.deepseek,
+        openrouter: {
+          ...openRouterDefaults(storedDefaults?.openrouter),
+          text: providerTextDefault(storedDefaults?.openrouter)
+            ?? providerTextDefault(stored.defaultModel)
+            ?? this.defaults.defaultModels.openrouter.text,
+        },
+        deepseek: {
+          text: providerTextDefault(storedDefaults?.deepseek)
+            ?? this.defaults.defaultModels.deepseek.text,
+        },
       },
       showCosts: stored.showCosts ?? this.defaults.showCosts,
       developerMode: stored.developerMode ?? this.defaults.developerMode,

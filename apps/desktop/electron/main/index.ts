@@ -3,8 +3,10 @@ import { fileURLToPath } from 'node:url'
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
+  protocol,
   safeStorage,
   session,
   shell,
@@ -15,6 +17,7 @@ import { chatEventSchema, executionEventSchema, ipcChannels } from '@autoforge/s
 import { createApplicationRuntime } from './application.js'
 import { registerDesktopIpc, type RendererTarget } from './ipc/register-ipc.js'
 import { startDesktopApplication } from './startup.js'
+import { createMediaProtocolHandler } from './media/media-protocol.js'
 import { createSecureWindow } from './window.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -23,6 +26,12 @@ let mainWindow: BrowserWindow | null = null
 let runtime: ApplicationRuntime | undefined
 let disposeIpc: (() => void) | undefined
 let quitting = false
+let mediaProtocolRegistered = false
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'autoforge-media',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+}])
 
 function developmentRendererTarget(raw: string | undefined): RendererTarget {
   if (!raw) throw new Error('The trusted development renderer URL is unavailable')
@@ -74,6 +83,29 @@ function initialize(): ApplicationRuntime {
         : await dialog.showOpenDialog(dialogOptions)
       return result.canceled ? undefined : result.filePaths[0]
     },
+    chooseMediaFiles: async (remainingSlots) => {
+      const dialogOptions: OpenDialogOptions = {
+        title: '选择媒体文件',
+        properties: ['openFile', 'multiSelections'],
+        filters: [{ name: 'Media', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'mp3', 'wav', 'ogg', 'flac', 'm4a', 'mp4', 'webm', 'mov'] }],
+      }
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+        : await dialog.showOpenDialog(dialogOptions)
+      return result.canceled ? [] : result.filePaths.slice(0, remainingSlots)
+    },
+    readClipboardImage: () => {
+      const image = clipboard.readImage()
+      if (image.isEmpty()) return undefined
+      return { bytes: image.toPNG(), mimeType: 'image/png', name: 'clipboard.png' }
+    },
+    chooseMediaSavePath: async (defaultName) => {
+      const result = mainWindow
+        ? await dialog.showSaveDialog(mainWindow, { defaultPath: defaultName })
+        : await dialog.showSaveDialog({ defaultPath: defaultName })
+      return result.canceled ? undefined : result.filePath
+    },
+    revealPath: (path) => { shell.showItemInFolder(path) },
     openExternal: (url) => shell.openExternal(url),
     emitChat: (event) => {
       const parsed = chatEventSchema.safeParse(event)
@@ -90,11 +122,16 @@ function initialize(): ApplicationRuntime {
 
 async function createMainWindow(application: ApplicationRuntime): Promise<void> {
   const target = rendererTarget()
+  if (!mediaProtocolRegistered) {
+    await protocol.handle('autoforge-media', createMediaProtocolHandler(application.mediaAssets))
+    mediaProtocolRegistered = true
+  }
   const created = await createSecureWindow({
     BrowserWindow,
     session: session.defaultSession,
     preloadPath: fileURLToPath(new URL('../preload/index.cjs', import.meta.url)),
     rendererTarget: target,
+    getMainWindow: () => mainWindow,
     beforeLoad: (window) => {
       mainWindow = window as BrowserWindow
       disposeIpc = registerDesktopIpc({

@@ -8,6 +8,7 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 export const conversations = sqliteTable('conversations', {
   id: text('id').primaryKey(),
   title: text('title').notNull(),
+  generationPreferencesJson: text('generation_preferences_json'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 }, (table) => [index('conversations_updated_at_idx').on(table.updatedAt)])
@@ -20,6 +21,49 @@ export const messages = sqliteTable('messages', {
   executionId: text('execution_id'),
   createdAt: integer('created_at').notNull(),
 }, (table) => [index('messages_conversation_created_at_idx').on(table.conversationId, table.createdAt, table.id)])
+
+export const mediaAssets = sqliteTable('media_assets', {
+  id: text('id').primaryKey(),
+  conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+  messageId: text('message_id').references(() => messages.id, { onDelete: 'set null' }),
+  source: text('source').notNull(),
+  kind: text('kind').notNull(),
+  mimeType: text('mime_type'),
+  originalName: text('original_name').notNull(),
+  relativePath: text('relative_path'),
+  byteSize: integer('byte_size'),
+  width: integer('width'),
+  height: integer('height'),
+  durationMs: integer('duration_ms'),
+  sha256: text('sha256'),
+  provider: text('provider'),
+  model: text('model'),
+  status: text('status').notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, (table) => [
+  index('media_assets_conversation_status_idx').on(table.conversationId, table.status, table.createdAt),
+  index('media_assets_unclaimed_idx').on(table.messageId, table.createdAt),
+])
+
+export const mediaGenerationJobs = sqliteTable('media_generation_jobs', {
+  id: text('id').primaryKey(),
+  conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+  assistantMessageId: text('assistant_message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
+  provider: text('provider').notNull(),
+  model: text('model').notNull(),
+  kind: text('kind').notNull(),
+  providerJobId: text('provider_job_id').notNull(),
+  status: text('status').notNull(),
+  parametersJson: text('parameters_json').notNull(),
+  nextPollAt: integer('next_poll_at'),
+  pollAttempts: integer('poll_attempts').notNull(),
+  errorCode: text('error_code'),
+  assetId: text('asset_id').references(() => mediaAssets.id, { onDelete: 'set null' }),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+  endedAt: integer('ended_at'),
+}, (table) => [index('media_generation_jobs_resume_idx').on(table.status, table.nextPollAt)])
 
 export const chatRuns = sqliteTable('chat_runs', {
   id: text('id').primaryKey(),

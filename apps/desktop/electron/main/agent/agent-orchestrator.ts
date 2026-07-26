@@ -15,6 +15,7 @@ import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from
 import { retrieveWorkflows } from '../workflows/retriever.js'
 import type { AppRepositories } from '../database/repositories.js'
 import type {
+  ModelContentPart,
   ModelMessage,
   ModelStreamEvent,
   ModelStreamRequest,
@@ -58,7 +59,8 @@ export interface AgentExecutionPort {
 export interface PersistUserInput {
   messageId: string
   conversationId: string
-  content: string
+  blocks: ChatBlock[]
+  assetIds: string[]
   createdAt: number
 }
 
@@ -73,7 +75,14 @@ export interface CreateRunInput {
 export interface CreateAssistantInput {
   messageId: string
   conversationId: string
+  initialBlocks: ChatBlock[]
   createdAt: number
+}
+
+export interface StartMediaGenerationInput {
+  user: PersistUserInput
+  run: CreateRunInput
+  assistant: CreateAssistantInput
 }
 
 export interface FinalizeAgentRunInput {
@@ -95,7 +104,9 @@ export interface AgentPersistencePort {
   persistUser(input: PersistUserInput): void
   createRun(input: CreateRunInput): void
   createAssistant(input: CreateAssistantInput): void
+  startMediaGeneration(input: StartMediaGenerationInput): void
   updateAssistant(messageId: string, blocks: ChatBlock[]): unknown
+  replaceAssistantBlock(messageId: string, blockId: string, block: ChatBlock): unknown
   finalize(input: FinalizeAgentRunInput): void
 }
 
@@ -104,13 +115,13 @@ export function createAgentPersistence(
 ): AgentPersistencePort {
   return {
     persistUser(input) {
-      repositories.messages.insert({
+      repositories.messages.insertWithAssets({
         id: input.messageId,
         conversationId: input.conversationId,
         role: 'user',
-        blocks: [{ type: 'text', text: input.content }],
+        blocks: input.blocks,
         createdAt: input.createdAt,
-      })
+      }, input.assetIds)
     },
     createRun(input) {
       repositories.chatRuns.insert({
@@ -127,15 +138,45 @@ export function createAgentPersistence(
         id: input.messageId,
         conversationId: input.conversationId,
         role: 'assistant',
-        blocks: [],
+        blocks: input.initialBlocks,
         createdAt: input.createdAt,
+      })
+    },
+    startMediaGeneration(input) {
+      repositories.chatRuns.startMediaGeneration({
+        userMessage: {
+          id: input.user.messageId,
+          conversationId: input.user.conversationId,
+          role: 'user',
+          blocks: input.user.blocks,
+          createdAt: input.user.createdAt,
+        },
+        userAssetIds: input.user.assetIds,
+        run: {
+          id: input.run.runId,
+          conversationId: input.run.conversationId,
+          requestId: input.run.requestId,
+          model: input.run.model,
+          status: 'running',
+          startedAt: input.run.startedAt,
+        },
+        assistantMessage: {
+          id: input.assistant.messageId,
+          conversationId: input.assistant.conversationId,
+          role: 'assistant',
+          blocks: input.assistant.initialBlocks,
+          createdAt: input.assistant.createdAt,
+        },
       })
     },
     updateAssistant(messageId, blocks) {
       return repositories.messages.update(messageId, { blocks })
     },
+    replaceAssistantBlock(messageId, blockId, block) {
+      return repositories.messages.replaceBlock(messageId, blockId, block)
+    },
     finalize(input) {
-      repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, {
+      repositories.chatRuns.finalizeWithMessage(input.runId, input.messageId, input.requestId, {
         blocks: input.blocks,
         status: input.status,
         endedAt: input.endedAt,
@@ -165,6 +206,10 @@ export interface AgentOrchestratorDependencies {
 export interface AgentRunInput {
   conversationId: string
   content: string
+  userBlocks: ChatBlock[]
+  modelContent: string | ModelContentPart[]
+  assetIds: string[]
+  allowTools: boolean
   provider: ModelProviderId
   model: string
   requestId?: string
@@ -264,7 +309,8 @@ export class AgentOrchestrator {
     this.dependencies.persistence.persistUser({
       messageId: userMessageId,
       conversationId: input.conversationId,
-      content: input.content,
+      blocks: input.userBlocks,
+      assetIds: input.assetIds,
       createdAt: startedAt,
     })
     this.dependencies.persistence.createRun({
@@ -277,6 +323,7 @@ export class AgentOrchestrator {
     this.dependencies.persistence.createAssistant({
       messageId,
       conversationId: input.conversationId,
+      initialBlocks: [],
       createdAt: startedAt,
     })
     const provider = this.dependencies.providers.get(input.provider)
@@ -289,7 +336,7 @@ export class AgentOrchestrator {
       provider,
       model: input.model,
       blocks: [],
-      messages: [{ role: 'user', content: input.content }],
+      messages: [{ role: 'user', content: input.modelContent }],
       tools: [],
       workflows: new Map(),
       controller: new AbortController(),
@@ -298,16 +345,18 @@ export class AgentOrchestrator {
       cancelled: false,
     }
     this.activeByRequest.set(requestId, active)
-    try {
-      const candidates = this.retrieve(
-        input.content,
-        await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
-        RETRIEVAL_LIMIT,
-      )
-      active.tools = candidates.map(manifestTool)
-      active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
-    } catch (error) {
-      return this.finish(active, 'failed', asAppError(error))
+    if (input.allowTools) {
+      try {
+        const candidates = this.retrieve(
+          input.content,
+          await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
+          RETRIEVAL_LIMIT,
+        )
+        active.tools = candidates.map(manifestTool)
+        active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
+      } catch (error) {
+        return this.finish(active, 'failed', asAppError(error))
+      }
     }
     return this.driveExclusive(active)
   }

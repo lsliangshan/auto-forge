@@ -15,8 +15,31 @@ export function openAppDatabase(path: string) {
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
     const executions = sqlite.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run(endedAt).changes
-    const chatRuns = sqlite.prepare("UPDATE chat_runs SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')").run(endedAt).changes
+    const preservedRequestIds = new Set(
+      repositories.mediaGenerationJobs.reconcileInterrupted(endedAt),
+    )
+    let chatRuns = 0
+    const interruptedRuns = sqlite.prepare(`
+      SELECT id, request_id AS requestId
+      FROM chat_runs
+      WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `).all() as Array<{ id: string; requestId: string }>
+    const failRun = sqlite.prepare(`
+      UPDATE chat_runs
+      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
+      WHERE id = @id
+        AND status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `)
+    for (const run of interruptedRuns) {
+      if (preservedRequestIds.has(run.requestId)) continue
+      chatRuns += failRun.run({ id: run.id, endedAt }).changes
+    }
+    repositories.messages.failInterruptedMediaGenerations()
     return { executions, chatRuns }
+  })()
+
+  const clearConversations = () => sqlite.transaction(() => {
+    sqlite.prepare('DELETE FROM conversations').run()
   })()
 
   const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => sqlite.transaction(() => {
@@ -30,6 +53,7 @@ export function openAppDatabase(path: string) {
     schemaVersion: () => (sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null }).version ?? 0,
     markInterruptedExecutions: () => repositories.executions.markInterrupted(),
     recoverInterrupted,
+    clearConversations,
     clearLocalData,
     ...repositories,
   }
