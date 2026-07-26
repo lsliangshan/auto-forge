@@ -873,6 +873,119 @@ describe('chat interactions', () => {
     expect(store.isRunning).toBe(false)
   })
 
+  it('awaits the first assistant block from the moment a valid send starts', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveSend!: (value: { requestId: string }) => void
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((resolve) => { resolveSend = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+    store.ensureSubscriptions()
+
+    const sending = store.send({
+      content: '立即显示 Loader',
+      assetIds: [],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+    })
+
+    expect(store.isAwaitingResponse).toBe(true)
+    emitChat({
+      type: 'status',
+      conversationId: 'conv_1',
+      requestId: 'req_loader',
+      status: 'running',
+    })
+    expect(store.isAwaitingResponse).toBe(true)
+
+    emitChat({
+      type: 'block',
+      conversationId: 'conv_1',
+      messageId: 'assistant_loader',
+      block: { type: 'text', text: '第一段回复' },
+    })
+    expect(store.isAwaitingResponse).toBe(false)
+
+    emitChat({
+      type: 'status',
+      conversationId: 'conv_1',
+      requestId: 'req_loader',
+      status: 'completed',
+    })
+    resolveSend({ requestId: 'req_loader' })
+    await sending
+  })
+
+  it.each(['completed', 'cancelled', 'failed'] as const)(
+    'clears awaiting response on content-free %s before send returns',
+    async (status) => {
+      const { api, emitChat } = createEventApi()
+      let resolveSend!: (value: { requestId: string }) => void
+      vi.mocked(api.chat.send).mockReturnValue(new Promise((resolve) => { resolveSend = resolve }))
+      Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+      const store = useChatStore()
+      store.selectedConversationId = 'conv_1'
+      store.ensureSubscriptions()
+
+      const sending = store.send({
+        content: '无内容终止',
+        assetIds: [],
+        outputType: 'text',
+        generation: generationPreferences().generation,
+      })
+      expect(store.isAwaitingResponse).toBe(true)
+
+      emitChat({
+        type: 'status',
+        conversationId: 'conv_1',
+        requestId: `req_${status}`,
+        status,
+      })
+      expect(store.isAwaitingResponse).toBe(false)
+
+      resolveSend({ requestId: `req_${status}` })
+      await sending
+    },
+  )
+
+  it('clears awaiting response when the first event is a block update', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+    store.awaitingResponseByConversation.conv_1 = true
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'block_update',
+      conversationId: 'conv_1',
+      messageId: 'assistant_media',
+      blockId: 'media_1',
+      block: {
+        type: 'media_generation',
+        blockId: 'media_1',
+        jobId: 'job_1',
+        kind: 'image',
+        status: 'in_progress',
+      },
+    })
+
+    expect(store.isAwaitingResponse).toBe(false)
+  })
+
+  it('keeps awaiting-response state isolated and clears it on local reset', () => {
+    const store = useChatStore()
+    store.awaitingResponseByConversation.conversation_a = true
+    store.selectedConversationId = 'conversation_a'
+    expect(store.isAwaitingResponse).toBe(true)
+
+    store.selectedConversationId = 'conversation_b'
+    expect(store.isAwaitingResponse).toBe(false)
+
+    store.resetLocalData()
+    expect(store.awaitingResponseByConversation).toEqual({})
+  })
+
   it('clears pending request and cancellation intent when Main rejects', async () => {
     const { api } = createEventApi()
     let rejectSend!: (error: Error) => void
@@ -889,11 +1002,13 @@ describe('chat interactions', () => {
     })
     await store.cancelCurrent()
     expect(store.isRunning).toBe(true)
+    expect(store.isAwaitingResponse).toBe(true)
 
     rejectSend(new Error('rejected'))
     expect(await sending).toBe(false)
 
     expect(store.isRunning).toBe(false)
+    expect(store.isAwaitingResponse).toBe(false)
     expect(store.pendingRequestByConversation.conv_1).toBeUndefined()
     expect(store._cancelRequestedByConversation.conv_1).toBeUndefined()
     expect(api.chat.cancel).not.toHaveBeenCalled()
@@ -1431,6 +1546,7 @@ describe('chat interactions', () => {
       createdAt: '2026-07-25T00:00:00.000Z',
       updatedAt: '2026-07-25T00:00:00.000Z',
     }]
+    store.awaitingResponseByConversation.conversation_1 = true
 
     const importing = store.pickDraftFiles()
     await vi.waitFor(() => expect(api.media.pickFiles).toHaveBeenCalled())
@@ -1446,6 +1562,7 @@ describe('chat interactions', () => {
 
     expect(api.chat.deleteConversation).toHaveBeenCalledWith('conversation_1')
     expect(store.draftsByConversation.conversation_1).toBeUndefined()
+    expect(store.awaitingResponseByConversation.conversation_1).toBeUndefined()
     expect(store.conversations).toEqual([])
   })
 

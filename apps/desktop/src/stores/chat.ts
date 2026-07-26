@@ -191,6 +191,7 @@ export const useChatStore = defineStore('chat', {
     preferencesByConversation: {} as Record<string, ConversationGenerationPreferences>,
     pendingRequestByConversation: {} as Record<string, true>,
     activeRequestByConversation: {} as Record<string, string>,
+    awaitingResponseByConversation: {} as Record<string, true>,
     _cancelRequestedByConversation: {} as Record<string, true>,
     _terminalRequests: {} as Record<string, true>,
     loading: false,
@@ -219,6 +220,9 @@ export const useChatStore = defineStore('chat', {
           || state.activeRequestByConversation[conversationId],
       )
     },
+    isAwaitingResponse(state): boolean {
+      return Boolean(state.awaitingResponseByConversation[state.selectedConversationId])
+    },
   },
   actions: {
     resetLocalData() {
@@ -232,6 +236,7 @@ export const useChatStore = defineStore('chat', {
       this.preferencesByConversation = {}
       this.pendingRequestByConversation = {}
       this.activeRequestByConversation = {}
+      this.awaitingResponseByConversation = {}
       this._cancelRequestedByConversation = {}
       this._terminalRequests = {}
       this._messageVersions = {}
@@ -325,6 +330,7 @@ export const useChatStore = defineStore('chat', {
           delete this.preferencesByConversation[id]
           delete this.pendingRequestByConversation[id]
           delete this.activeRequestByConversation[id]
+          delete this.awaitingResponseByConversation[id]
           delete this._cancelRequestedByConversation[id]
           delete this._messageVersions[id]
           delete this._messageLoadVersions[id]
@@ -580,6 +586,7 @@ export const useChatStore = defineStore('chat', {
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
       this.pendingRequestByConversation[conversationId] = true
+      this.awaitingResponseByConversation[conversationId] = true
       const drafts = this.draftsByConversation[conversationId] ?? []
       const draftById = new Map(drafts.map((asset) => [asset.id, asset]))
       const localId = `local-${Date.now()}-${++localMessageSequence}`
@@ -646,6 +653,7 @@ export const useChatStore = defineStore('chat', {
         return true
       } catch (error) {
         delete this.pendingRequestByConversation[conversationId]
+        delete this.awaitingResponseByConversation[conversationId]
         delete this._cancelRequestedByConversation[conversationId]
         this.messagesByConversation[conversationId] = (this.messagesByConversation[conversationId] ?? [])
           .filter(({ id }) => id !== localId)
@@ -671,6 +679,7 @@ export const useChatStore = defineStore('chat', {
         if (event.status === 'running') {
           if (!this._terminalRequests[event.requestId]) this.activeRequestByConversation[event.conversationId] = event.requestId
         } else {
+          delete this.awaitingResponseByConversation[event.conversationId]
           const matchedActive = this.activeRequestByConversation[event.conversationId] === event.requestId
           if (matchedActive) delete this.activeRequestByConversation[event.conversationId]
           if (this.pendingRequestByConversation[event.conversationId] || !matchedActive) {
@@ -686,6 +695,7 @@ export const useChatStore = defineStore('chat', {
         }
         return
       }
+      delete this.awaitingResponseByConversation[event.conversationId]
       this._messageVersions[event.conversationId] = (this._messageVersions[event.conversationId] ?? 0) + 1
       const messages = this.messagesByConversation[event.conversationId] ?? []
       let message = messages.find(({ id }) => id === event.messageId)
