@@ -199,6 +199,33 @@ describe('OpenRouterProvider', () => {
     })
   })
 
+  it('keeps a valid image when optional usage token counts are not safe integers', async () => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({
+        created: 1_748_372_400,
+        data: [{ b64_json: 'AQID', media_type: 'image/png' }],
+        usage: {
+          prompt_tokens: 2,
+          completion_tokens: 3.5,
+          total_tokens: 5.5,
+          cost: 0.04,
+        },
+      })),
+    })
+
+    await expect(provider.generateImage({
+      model: 'black-forest-labs/flux.2-flex',
+      prompt: 'draw a puppy',
+      options: { count: 1, resolution: '1K', aspectRatio: '16:9', format: 'png' },
+      parameterSupport: { resolution: false, aspectRatio: true, outputFormat: true },
+      references: [],
+    })).resolves.toEqual({
+      outputs: [{ type: 'base64', dataBase64: 'AQID', mimeType: 'image/png' }],
+      usage: { inputTokens: 2, costUsd: '0.04' },
+    })
+  })
+
   it.each([
     ['data URL', 'data:image/png;base64,AQID'],
     ['file URL', 'file:///tmp/generated.png'],

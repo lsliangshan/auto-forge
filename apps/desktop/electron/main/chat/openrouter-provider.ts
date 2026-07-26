@@ -113,9 +113,9 @@ const costSchema = z.union([
   z.string().min(1).max(64).refine((value) => Number.isFinite(Number(value)) && Number(value) >= 0),
 ])
 const mediaUsageSchema = z.object({
-  prompt_tokens: tokenCountSchema.optional(),
-  completion_tokens: tokenCountSchema.optional(),
-  total_tokens: tokenCountSchema.optional(),
+  prompt_tokens: z.unknown().optional(),
+  completion_tokens: z.unknown().optional(),
+  total_tokens: z.unknown().optional(),
   cost: costSchema.optional(),
 }).passthrough()
 const imageOutputSchema = z.object({
@@ -145,6 +145,11 @@ const videoJobSchema = z.object({
 
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
+}
+
+function safeTokenCount(value: unknown): number | undefined {
+  const parsed = tokenCountSchema.safeParse(value)
+  return parsed.success ? parsed.data : undefined
 }
 
 function canonicalHttpsUrl(value: string): string {
@@ -283,14 +288,16 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       }
       return { type: 'url', url: canonicalHttpsUrl(output.url!) }
     })
+    const inputTokens = safeTokenCount(parsed.data.usage?.prompt_tokens)
+    const outputTokens = safeTokenCount(parsed.data.usage?.completion_tokens)
     const usage = parsed.data.usage
       ? {
-          ...(parsed.data.usage.prompt_tokens === undefined
+          ...(inputTokens === undefined
             ? {}
-            : { inputTokens: parsed.data.usage.prompt_tokens }),
-          ...(parsed.data.usage.completion_tokens === undefined
+            : { inputTokens }),
+          ...(outputTokens === undefined
             ? {}
-            : { outputTokens: parsed.data.usage.completion_tokens }),
+            : { outputTokens }),
           ...(parsed.data.usage.cost === undefined
             ? {}
             : { costUsd: String(parsed.data.usage.cost) }),
