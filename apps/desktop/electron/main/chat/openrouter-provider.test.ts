@@ -4,9 +4,11 @@ import {
   type OpenRouterStreamEvent,
 } from './openrouter-provider.js'
 import {
+  mergeOpenRouterModels,
   parseOpenRouterImageModels,
   parseOpenRouterVideoModels,
 } from './model-provider.js'
+import { openRouterVideoModelsLiveFixture } from './openrouter-video-models-live.fixture.js'
 
 function sseResponse(chunks: string[], status = 200, headers?: Record<string, string>): Response {
   const encoder = new TextEncoder()
@@ -761,31 +763,132 @@ describe('OpenRouterProvider', () => {
       name: 'Same video model',
       supported_resolutions: ['1080p'],
       supported_aspect_ratios: ['16:9'],
+      supported_durations: [10],
+      supported_frame_images: null,
+      generate_audio: null,
     }
     const second = {
       id: 'duplicate/video',
       name: 'Same video model',
       supported_resolutions: ['720p'],
       supported_aspect_ratios: ['9:16'],
+      supported_durations: [5],
+      supported_frame_images: ['first_frame'],
+      generate_audio: true,
     }
     const expected = [{
       id: 'duplicate/video',
       name: 'Same video model',
-      inputModalities: [],
+      inputModalities: ['text', 'image'],
       outputModalities: ['video'],
       supportsTools: false,
       generation: {
         video: {
           resolutions: ['1080p', '720p'],
           aspectRatios: ['16:9', '9:16'],
-          durations: [],
-          supportsAudio: false,
+          durations: [5, 10],
+          supportsAudio: true,
         },
       },
     }]
 
     expect(parseOpenRouterVideoModels({ data: [first, second] })).toEqual(expected)
     expect(parseOpenRouterVideoModels({ data: [second, first] })).toEqual(expected)
+  })
+
+  it('parses nullable live video catalog fields into truthful prompt and generation capabilities', () => {
+    const models = parseOpenRouterVideoModels(openRouterVideoModelsLiveFixture)
+
+    expect(models).toHaveLength(4)
+    expect(models.find(({ id }) => id === 'kwaivgi/kling-v3.0-std')).toEqual({
+      id: 'kwaivgi/kling-v3.0-std',
+      name: 'Kling: Video v3.0 Standard',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['video'],
+      supportsTools: false,
+      generation: {
+        video: {
+          resolutions: ['720p'],
+          aspectRatios: ['16:9', '1:1', '9:16'],
+          durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+          supportsAudio: true,
+        },
+      },
+    })
+    expect(models.find(({ id }) => id === 'openai/sora-2-pro')).toMatchObject({
+      inputModalities: ['text'],
+      outputModalities: ['video'],
+      generation: { video: { supportsAudio: true } },
+    })
+    expect(models.find(({ id }) => id === 'alibaba/happyhorse-1.1')).toMatchObject({
+      inputModalities: ['text', 'image'],
+      generation: { video: { supportsAudio: false } },
+    })
+    expect(models.find(({ id }) => id === 'x-ai/grok-imagine-video-1.5')).toMatchObject({
+      inputModalities: ['text', 'image'],
+      generation: { video: { aspectRatios: [], supportsAudio: false } },
+    })
+  })
+
+  it('filters, bounds, sorts, and deduplicates video capability values per record', () => {
+    const models = parseOpenRouterVideoModels({ data: [
+      {
+        id: 'video/filtered',
+        name: 'Filtered video',
+        supported_resolutions: ['720p', '', '1080p', '720p', 42, 'x'.repeat(129)],
+        supported_aspect_ratios: ['9:16', '16:9', '9:16', null],
+        supported_durations: [10, 5, 10, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '5'],
+        supported_frame_images: ['', 'first_frame', 'first_frame', 42],
+        generate_audio: false,
+      },
+      {
+        id: 'video/oversized',
+        name: 'Oversized video',
+        supported_resolutions: Array.from({ length: 65 }, () => '720p'),
+      },
+    ] })
+
+    expect(models).toEqual([{
+      id: 'video/filtered',
+      name: 'Filtered video',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['video'],
+      supportsTools: false,
+      generation: {
+        video: {
+          resolutions: ['1080p', '720p'],
+          aspectRatios: ['16:9', '9:16'],
+          durations: [5, 10],
+          supportsAudio: false,
+        },
+      },
+    }])
+  })
+
+  it('preserves dedicated-only models without inventing missing image inputs', () => {
+    const image = parseOpenRouterImageModels({ data: [{
+      id: 'dedicated-only/image',
+      name: 'Dedicated image',
+      supported_parameters: {},
+    }] })
+    const video = parseOpenRouterVideoModels({ data: [{
+      id: 'dedicated-only/video',
+      name: 'Dedicated video',
+      supported_frame_images: null,
+    }] })
+
+    expect(mergeOpenRouterModels([], [image, video])).toEqual([
+      expect.objectContaining({
+        id: 'dedicated-only/image',
+        inputModalities: [],
+        outputModalities: ['image'],
+      }),
+      expect.objectContaining({
+        id: 'dedicated-only/video',
+        inputModalities: ['text'],
+        outputModalities: ['video'],
+      }),
+    ])
   })
 
   it('parses arbitrary SSE boundaries, CRLF comments, usage, choices, and indexed tool fragments', async () => {
@@ -1195,6 +1298,36 @@ describe('OpenRouterProvider', () => {
 
     await expect(provider.listModels()).resolves.toEqual([
       {
+        id: '__proto__',
+        name: 'Prototype key',
+        inputModalities: [],
+        outputModalities: ['image'],
+        supportsTools: false,
+        generation: {
+          image: {
+            resolutions: [],
+            aspectRatios: [],
+            formats: [],
+            maxCount: 1,
+          },
+        },
+      },
+      {
+        id: 'dedicated-only/image',
+        name: 'Not authoritative',
+        inputModalities: [],
+        outputModalities: ['image'],
+        supportsTools: false,
+        generation: {
+          image: {
+            resolutions: [],
+            aspectRatios: [],
+            formats: [],
+            maxCount: 1,
+          },
+        },
+      },
+      {
         id: 'google/gemini-2.5-flash-image',
         name: 'Nano Banana',
         inputModalities: ['text', 'image'],
@@ -1226,7 +1359,7 @@ describe('OpenRouterProvider', () => {
           video: {
             resolutions: ['1080p', '720p'],
             aspectRatios: ['16:9', '9:16'],
-            durations: [],
+            durations: [5, 10],
             supportsAudio: false,
           },
         },
@@ -1267,7 +1400,7 @@ describe('OpenRouterProvider', () => {
     expect(JSON.stringify(await provider.listModels())).not.toContain('sk-private')
   })
 
-  it('keeps the authoritative general list when optional catalogs fail or contain malformed entries', async () => {
+  it('keeps valid dedicated records while isolating optional catalog and record failures', async () => {
     const diagnostic = vi.fn()
     const fetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input)
@@ -1292,14 +1425,53 @@ describe('OpenRouterProvider', () => {
     })
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic })
 
-    await expect(provider.listModels()).resolves.toEqual([{
-      id: 'text/model',
-      name: 'Text model',
-      inputModalities: ['text'],
-      outputModalities: ['text'],
-      supportsTools: false,
-      generation: {},
-    }])
+    await expect(provider.listModels()).resolves.toEqual([
+      {
+        id: 'text/model',
+        name: 'Text model',
+        inputModalities: ['text'],
+        outputModalities: ['text', 'video'],
+        supportsTools: false,
+        generation: {
+          video: {
+            resolutions: [],
+            aspectRatios: [],
+            durations: [],
+            supportsAudio: false,
+          },
+        },
+      },
+      {
+        id: 'text/model-suffix',
+        name: 'Wrong exact ID',
+        inputModalities: ['text'],
+        outputModalities: ['video'],
+        supportsTools: false,
+        generation: {
+          video: {
+            resolutions: ['4K'],
+            aspectRatios: [],
+            durations: [],
+            supportsAudio: false,
+          },
+        },
+      },
+      {
+        id: 'text/model/variant',
+        name: 'Wrong exact ID',
+        inputModalities: ['text'],
+        outputModalities: ['video'],
+        supportsTools: false,
+        generation: {
+          video: {
+            resolutions: ['1080p'],
+            aspectRatios: [],
+            durations: [],
+            supportsAudio: false,
+          },
+        },
+      },
+    ])
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('optional-catalog-secret')
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(1000)
   })

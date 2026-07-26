@@ -197,8 +197,11 @@ const imageCapabilityModelSchema = z.object({
 const videoCapabilityModelSchema = z.object({
   id: boundedModelIdSchema,
   name: boundedModelNameSchema,
-  supported_resolutions: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
-  supported_aspect_ratios: z.array(boundedCapabilityValueSchema).max(MAX_CAPABILITY_VALUES).optional(),
+  supported_resolutions: z.array(z.unknown()).max(MAX_CAPABILITY_VALUES).nullish(),
+  supported_aspect_ratios: z.array(z.unknown()).max(MAX_CAPABILITY_VALUES).nullish(),
+  supported_durations: z.array(z.unknown()).max(MAX_CAPABILITY_VALUES).nullish(),
+  supported_frame_images: z.array(z.unknown()).max(MAX_CAPABILITY_VALUES).nullish(),
+  generate_audio: z.boolean().nullish(),
 }).passthrough()
 
 const modelContentPartSchema = z.discriminatedUnion('type', [
@@ -405,6 +408,15 @@ function sortedUniqueStrings(values: unknown[] | undefined): string[] {
   return [...new Set(valid)].sort(compareStrings)
 }
 
+function sortedUniquePositiveIntegers(values: unknown[] | null | undefined): number[] {
+  const valid = values?.filter((value): value is number => (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value > 0
+  )) ?? []
+  return [...new Set(valid)].sort((left, right) => left - right)
+}
+
 function sortedModalities(values: unknown[] | undefined): Array<'text' | 'image' | 'audio' | 'video'> {
   const order = ['text', 'image', 'audio', 'video'] as const
   const included = new Set(values?.flatMap((value) => {
@@ -563,18 +575,19 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
     const result = videoCapabilityModelSchema.safeParse(entry)
     if (!result.success) continue
     const model = result.data
+    const frameImages = sortedUniqueStrings(model.supported_frame_images ?? undefined)
     const candidate: ModelInfo = {
       id: model.id,
       name: model.name,
-      inputModalities: [],
+      inputModalities: frameImages.length ? ['text', 'image'] : ['text'],
       outputModalities: ['video'],
       supportsTools: false,
       generation: {
         video: {
-          resolutions: sortedUniqueStrings(model.supported_resolutions),
-          aspectRatios: sortedUniqueStrings(model.supported_aspect_ratios),
-          durations: [],
-          supportsAudio: false,
+          resolutions: sortedUniqueStrings(model.supported_resolutions ?? undefined),
+          aspectRatios: sortedUniqueStrings(model.supported_aspect_ratios ?? undefined),
+          durations: sortedUniquePositiveIntegers(model.supported_durations),
+          supportsAudio: model.generate_audio === true,
         },
       },
     }
@@ -588,12 +601,14 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
     byId.set(model.id, {
       ...existing,
       name: compareStrings(existing.name, candidate.name) <= 0 ? existing.name : candidate.name,
+      inputModalities: mergeModalities(existing.inputModalities, candidate.inputModalities),
+      outputModalities: mergeModalities(existing.outputModalities, candidate.outputModalities),
       generation: {
         video: {
           resolutions: sortedUniqueStrings([...existingVideo.resolutions, ...candidateVideo.resolutions]),
           aspectRatios: sortedUniqueStrings([...existingVideo.aspectRatios, ...candidateVideo.aspectRatios]),
-          durations: [],
-          supportsAudio: false,
+          durations: sortedUniquePositiveIntegers([...existingVideo.durations, ...candidateVideo.durations]),
+          supportsAudio: existingVideo.supportsAudio || candidateVideo.supportsAudio,
         },
       },
     })
@@ -606,7 +621,10 @@ export function mergeOpenRouterModels(general: ModelInfo[], optional: ModelInfo[
   for (const catalog of optional) {
     for (const dedicated of catalog) {
       const base = byId.get(dedicated.id)
-      if (!base) continue
+      if (!base) {
+        byId.set(dedicated.id, dedicated)
+        continue
+      }
       byId.set(base.id, {
         ...base,
         inputModalities: mergeModalities(base.inputModalities, dedicated.inputModalities),
