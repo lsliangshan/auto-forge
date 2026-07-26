@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run --config vitest.config.ts && vitest run --config vitest.node.config.ts",
     "stage:browser": "node scripts/stage-browser.mjs",
-    "dist:dir": "pnpm stage:browser && electron-builder --dir --config electron-builder.yml"
+    "prepare:native-electron": "node scripts/prepare-native-electron.mjs",
+    "verify:packaged-native": "node scripts/verify-packaged-native.mjs",
+    "dist:dir": "pnpm stage:browser && pnpm prepare:native-electron && electron-builder --dir --config electron-builder.yml && pnpm verify:packaged-native"
   },
   "dependencies": {
     "@autoforge/shared": "workspace:*",
