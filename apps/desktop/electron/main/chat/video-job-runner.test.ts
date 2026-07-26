@@ -204,7 +204,7 @@ describe('VideoJobRunner', () => {
       status: 'running',
     })
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'pending',
       parameters: {
         version: 1,
@@ -257,7 +257,7 @@ describe('VideoJobRunner', () => {
       status: 'failed',
     })
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
       errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
     })
@@ -290,7 +290,7 @@ describe('VideoJobRunner', () => {
     fault.exec(`
       CREATE TRIGGER fail_video_provider_bind
       BEFORE UPDATE OF provider_job_id ON media_generation_jobs
-      WHEN OLD.provider_job_id = 'autoforge_video_submission_intent'
+      WHEN OLD.provider_job_id = 'local:autoforge_video_submission_intent'
         AND NEW.provider_job_id <> OLD.provider_job_id
       BEGIN
         SELECT RAISE(FAIL, 'injected provider bind failure');
@@ -305,7 +305,7 @@ describe('VideoJobRunner', () => {
       status: 'failed',
     })
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
       errorCode: 'MEDIA_GENERATION_FAILED',
     })
@@ -334,14 +334,14 @@ describe('VideoJobRunner', () => {
     fault.exec(`
       CREATE TRIGGER fail_video_provider_bind_twice
       BEFORE UPDATE OF provider_job_id ON media_generation_jobs
-      WHEN OLD.provider_job_id = 'autoforge_video_submission_intent'
+      WHEN OLD.provider_job_id = 'local:autoforge_video_submission_intent'
         AND NEW.provider_job_id <> OLD.provider_job_id
       BEGIN
         SELECT RAISE(FAIL, 'injected provider bind failure');
       END;
       CREATE TRIGGER fail_immediate_intent_terminal
       BEFORE UPDATE OF status ON media_generation_jobs
-      WHEN OLD.provider_job_id = 'autoforge_video_submission_intent'
+      WHEN OLD.provider_job_id = 'local:autoforge_video_submission_intent'
         AND NEW.status = 'failed'
         AND NEW.updated_at = 1000
       BEGIN
@@ -353,7 +353,7 @@ describe('VideoJobRunner', () => {
 
     await expect(runner.submit(submitInput)).rejects.toBeDefined()
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'pending',
       parameters: expect.objectContaining({
         submission: { phase: 'intent' },
@@ -369,7 +369,7 @@ describe('VideoJobRunner', () => {
     const reopened = openAppDatabase(path)
     reopened.recoverInterrupted()
     expect(reopened.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
       errorCode: 'MEDIA_GENERATION_FAILED',
     })
@@ -415,6 +415,31 @@ describe('VideoJobRunner', () => {
     })
   })
 
+  it('binds the former sentinel text when a provider returns it as a valid provider ID', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.submitVideo!).mockResolvedValue({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'pending',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).resolves.toMatchObject({
+      status: 'pending',
+    })
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'pending',
+      nextPollAt: 3_000,
+    })
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(harness.provider.pollVideo).toHaveBeenCalledWith(
+      'autoforge_video_submission_intent',
+      expect.any(AbortSignal),
+    )
+  })
+
   it('fails an unbound intent during runner recovery without polling its sentinel', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -433,7 +458,7 @@ describe('VideoJobRunner', () => {
 
     expect(harness.provider.pollVideo).not.toHaveBeenCalled()
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
       errorCode: 'MEDIA_GENERATION_FAILED',
     })
@@ -471,7 +496,7 @@ describe('VideoJobRunner', () => {
 
     expect(harness.provider.pollVideo).not.toHaveBeenCalled()
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
     })
   })
@@ -497,7 +522,7 @@ describe('VideoJobRunner', () => {
     reopened.recoverInterrupted()
 
     expect(reopened.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
       errorCode: 'MEDIA_GENERATION_FAILED',
     })
@@ -1099,7 +1124,7 @@ describe('VideoJobRunner', () => {
       status: 'failed',
     })
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
-      providerJobId: 'autoforge_video_submission_intent',
+      providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
       errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
     })

@@ -165,7 +165,7 @@ export interface MediaAssetRecord {
 export type MediaAssetPatch = Partial<Omit<MediaAssetRecord, 'id' | 'conversationId' | 'messageId' | 'createdAt'>>
 
 export type MediaGenerationJobStatus = 'pending' | 'in_progress' | 'downloading' | 'paused' | 'completed' | 'failed'
-export const VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID = 'autoforge_video_submission_intent'
+export const VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID = 'local:autoforge_video_submission_intent'
 
 export interface MediaGenerationJob {
   id: string
