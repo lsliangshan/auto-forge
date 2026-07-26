@@ -1,18 +1,56 @@
-import { existsSync, readdirSync, statSync } from 'node:fs'
-import { basename, dirname, join, resolve } from 'node:path'
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import process from 'node:process'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath, URL } from 'node:url'
 
-const desktopDirectory = fileURLToPath(new URL('..', import.meta.url))
-const packageDirectory = process.argv[2]
-  ? resolve(process.cwd(), process.argv[2])
-  : findPackagedResources(join(desktopDirectory, 'dist'))
-if (!packageDirectory) throw new Error('Packaged app archive not found')
+const supportedTarget = {
+  platform: 'darwin',
+  arch: 'arm64',
+  outputDirectory: 'mac-arm64',
+  productDirectory: 'AutoForge.app',
+}
 
-const resourcesDirectory = existsSync(join(packageDirectory, 'app.asar'))
-  ? packageDirectory
-  : join(packageDirectory, 'Contents', 'Resources')
+if (process.platform !== supportedTarget.platform || process.arch !== supportedTarget.arch) {
+  throw new Error(
+    `Packaged native verification supports darwin/arm64 only; received ${process.platform}/${process.arch}`,
+  )
+}
+
+const desktopDirectory = realpathSync(fileURLToPath(new URL('..', import.meta.url)))
+const distDirectory = join(desktopDirectory, 'dist')
+const expectedPackage = join(
+  distDirectory,
+  supportedTarget.outputDirectory,
+  supportedTarget.productDirectory,
+)
+const requestedPackage = process.argv[2]
+  ? resolve(process.cwd(), process.argv[2])
+  : expectedPackage
+if (requestedPackage !== expectedPackage) {
+  throw new Error(
+    `Requested package does not match the supported packaged target: ${expectedPackage}`,
+  )
+}
+if (!existsSync(requestedPackage)) {
+  throw new Error(`Packaged app archive not found: ${requestedPackage}`)
+}
+
+const packageDirectory = realpathSync(requestedPackage)
+const realDistDirectory = realpathSync(distDirectory)
+const packageRelativePath = relative(realDistDirectory, packageDirectory)
+if (
+  packageRelativePath === '..'
+  || packageRelativePath.startsWith(`..${sep}`)
+  || isAbsolute(packageRelativePath)
+) {
+  throw new Error(`Packaged target resolves outside the desktop dist directory: ${packageDirectory}`)
+}
+if (packageDirectory !== requestedPackage) {
+  throw new Error(`Packaged target must not resolve through a symbolic link: ${requestedPackage}`)
+}
+
+const resourcesDirectory = join(packageDirectory, 'Contents', 'Resources')
 const appArchive = join(resourcesDirectory, 'app.asar')
 if (!existsSync(appArchive)) throw new Error(`Packaged app archive not found: ${appArchive}`)
 
@@ -29,7 +67,7 @@ if (!existsSync(nativeModule)) {
   throw new Error(`Packaged better-sqlite3 native module not found: ${nativeModule}`)
 }
 
-const executable = resolvePackagedExecutable(resourcesDirectory)
+const executable = resolvePackagedExecutable(packageDirectory)
 const databasePackage = join(appArchive, 'node_modules', 'better-sqlite3')
 
 const probe = [
@@ -51,38 +89,11 @@ if (result.status !== 0) {
   throw new Error(`Packaged better-sqlite3 probe failed with exit code ${result.status ?? 'unknown'}`)
 }
 
-function findPackagedResources(directory) {
-  if (!existsSync(directory)) return undefined
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name)
-    if (entry.isDirectory()) {
-      if (entry.name.endsWith('.app')) return path
-      const found = findPackagedResources(path)
-      if (found) return found
-    }
-    if (entry.isFile() && entry.name === 'app.asar') return dirname(path)
-  }
-  return undefined
-}
-
-function resolvePackagedExecutable(resourcesPath) {
-  if (basename(dirname(resourcesPath)) === 'Contents') {
-    const executableDirectory = join(dirname(resourcesPath), 'MacOS')
-    const executableName = readdirSync(executableDirectory).find((name) =>
-      statSync(join(executableDirectory, name)).isFile(),
-    )
-    if (!executableName) throw new Error(`No packaged executable found in ${executableDirectory}`)
-    return join(executableDirectory, executableName)
-  }
-
-  const executableDirectory = dirname(resourcesPath)
-  const executableName = readdirSync(executableDirectory).find((name) => {
-    const path = join(executableDirectory, name)
-    if (!statSync(path).isFile()) return false
-    return process.platform === 'win32'
-      ? name.endsWith('.exe') && !name.toLowerCase().includes('uninstall')
-      : (statSync(path).mode & 0o111) !== 0 && !name.startsWith('chrome_') && name !== 'chrome-sandbox'
-  })
+function resolvePackagedExecutable(appDirectory) {
+  const executableDirectory = join(appDirectory, 'Contents', 'MacOS')
+  const executableName = readdirSync(executableDirectory).find((name) =>
+    statSync(join(executableDirectory, name)).isFile(),
+  )
   if (!executableName) throw new Error(`No packaged executable found in ${executableDirectory}`)
   return join(executableDirectory, executableName)
 }
