@@ -619,6 +619,9 @@ function submit() {
   }
   const pendingId = ++pendingSequence
   pendingByConversation.value[conversationId] = pendingId
+  if (contentsByConversation.value[conversationId] === submittedContent) {
+    delete contentsByConversation.value[conversationId]
+  }
   let acknowledged = false
   emit('submit', payload, (accepted) => {
     if (acknowledged) return
@@ -626,9 +629,11 @@ function submit() {
     if (pendingByConversation.value[conversationId] === pendingId) {
       delete pendingByConversation.value[conversationId]
     }
-    if (accepted && contentsByConversation.value[conversationId] === submittedContent) {
-      delete contentsByConversation.value[conversationId]
-    }
+    if (accepted) return
+    const newerContent = contentsByConversation.value[conversationId] ?? ''
+    contentsByConversation.value[conversationId] = newerContent
+      ? `${submittedContent}\n\n${newerContent}`
+      : submittedContent
   })
 }
 

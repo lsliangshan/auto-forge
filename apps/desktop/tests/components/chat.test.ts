@@ -1366,7 +1366,7 @@ describe('chat interactions', () => {
     expect(store.error).toBe('')
   })
 
-  it('keeps composer text and drafts until Main accepts, and rolls back only the rejected optimistic message', async () => {
+  it('clears composer text immediately and restores it when Main rejects', async () => {
     const { api } = createEventApi()
     let rejectFirst!: (error: Error) => void
     vi.mocked(api.chat.send).mockReturnValueOnce(new Promise((_resolve, reject) => { rejectFirst = reject }))
@@ -1393,7 +1393,7 @@ describe('chat interactions', () => {
     await textarea.setValue('不能丢失')
     await wrapper.get('form').trigger('submit')
     await vi.waitFor(() => expect(api.chat.send).toHaveBeenCalledTimes(1))
-    expect((textarea.element as HTMLTextAreaElement).value).toBe('不能丢失')
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
     expect(store.messagesByConversation.conversation_1).toHaveLength(1)
 
     rejectFirst(new Error('rejected'))
@@ -1404,8 +1404,35 @@ describe('chat interactions', () => {
     vi.mocked(api.chat.send).mockResolvedValueOnce({ requestId: 'accepted' })
     await wrapper.get('form').trigger('submit')
     await vi.waitFor(() => expect(api.chat.send).toHaveBeenCalledTimes(2))
-    await vi.waitFor(() => expect((textarea.element as HTMLTextAreaElement).value).toBe(''))
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
     expect(store.drafts).toEqual([])
+  })
+
+  it('restores a rejected submission without overwriting a newer draft', async () => {
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'text' })
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    const textarea = wrapper.get('textarea')
+
+    await textarea.setValue('发送失败')
+    await wrapper.get('form').trigger('submit')
+    const acknowledge = wrapper.emitted('submit')?.[0]?.[1] as ((accepted: boolean) => void)
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+
+    await textarea.setValue('新的草稿')
+    acknowledge(false)
+    await wrapper.vm.$nextTick()
+
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('发送失败\n\n新的草稿')
   })
 
   it('keeps pending send acknowledgement isolated to its captured conversation', async () => {
@@ -1434,9 +1461,11 @@ describe('chat interactions', () => {
     expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
     await wrapper.get('form').trigger('submit')
     expect(wrapper.emitted('submit')).toHaveLength(2)
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+    await wrapper.get('textarea').setValue('会话 B 新草稿')
 
     acknowledgeA(true)
-    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('会话 B')
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('会话 B 新草稿')
   })
 
   it('disables unsupported outputs and cannot send without a compatible model', async () => {
