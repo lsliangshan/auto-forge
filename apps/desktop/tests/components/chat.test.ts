@@ -199,7 +199,13 @@ describe('chat interactions', () => {
       generation: generationPreferences().generation,
       model: 'text/default',
     })
-    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+    await vi.waitFor(() => {
+      const loader = wrapper.get('[data-testid="response-loader"]')
+      expect(loader.get('.message-role').text()).toBe('AutoForge')
+      expect(loader.text()).toContain('正在生成回复…')
+      expect(loader.find('.is-loading').exists()).toBe(true)
+      expect(messages.scrollTop).toBe(900)
+    })
 
     messages.scrollTop = 0
     emitChat({
@@ -208,7 +214,11 @@ describe('chat interactions', () => {
       messageId: 'assistant_1',
       block: { type: 'text', text: '第一段' },
     })
-    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-testid="response-loader"]').exists()).toBe(false)
+      expect(wrapper.text()).toContain('第一段')
+      expect(messages.scrollTop).toBe(900)
+    })
 
     messages.scrollTop = 0
     emitChat({

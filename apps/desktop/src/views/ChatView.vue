@@ -37,7 +37,7 @@
           {{ chat.error }}
         </div>
         <div
-          v-if="!chat.messages.length"
+          v-if="!chat.messages.length && !chat.isAwaitingResponse"
           class="chat-empty"
         >
           <h2>准备开始</h2><p>描述目标，模型会在需要时提出工作流和权限请求。</p>
@@ -54,6 +54,24 @@
               :key="block.id"
               :block="block"
             />
+          </div>
+        </article>
+        <article
+          v-if="chat.isAwaitingResponse"
+          class="message assistant"
+          data-testid="response-loader"
+        >
+          <span class="message-role">AutoForge</span>
+          <div class="message-body">
+            <div
+              class="response-loader"
+              role="status"
+            >
+              <el-icon class="is-loading">
+                <Loading />
+              </el-icon>
+              <span>正在生成回复…</span>
+            </div>
           </div>
         </article>
       </div>
@@ -139,6 +157,7 @@ onMounted(async () => {
 .message { display: grid; grid-template-columns: 74px minmax(0, 760px); gap: 12px; max-width: 920px; margin: 0 auto; padding: 16px 0; border-bottom: 1px solid var(--af-border); }
 .message-role { padding-top: 2px; color: var(--af-text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }.message.user .message-role { color: var(--af-cobalt); }
 .message-body { min-width: 0; font-size: 14px; }
+.response-loader { display: flex; align-items: center; gap: 7px; color: var(--af-text-muted); font-size: 12px; }
 .chat-empty { padding: 56px 20px; color: var(--af-text-muted); text-align: center; }.chat-empty h2 { color: var(--af-text); font-size: 18px; }.chat-empty p { font-size: 13px; }
 .af-empty > div { max-width: 420px; }.af-empty h2 { color: var(--af-graphite); font-size: 19px; }.af-empty p { line-height: 1.6; }
 </style>
