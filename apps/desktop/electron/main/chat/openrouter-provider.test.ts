@@ -865,6 +865,36 @@ describe('OpenRouterProvider', () => {
     }])
   })
 
+  it('bounds merged duplicate video capability arrays after normalization', () => {
+    const models = parseOpenRouterVideoModels({ data: [
+      {
+        id: 'video/bounded-merge',
+        name: 'Bounded merge',
+        supported_resolutions: Array.from({ length: 64 }, (_, index) => `r${String(index).padStart(3, '0')}`),
+        supported_aspect_ratios: Array.from({ length: 64 }, (_, index) => `a${String(index).padStart(3, '0')}`),
+        supported_durations: Array.from({ length: 64 }, (_, index) => index + 1),
+      },
+      {
+        id: 'video/bounded-merge',
+        name: 'Bounded merge',
+        supported_resolutions: Array.from({ length: 64 }, (_, index) => `r${String(index + 64).padStart(3, '0')}`),
+        supported_aspect_ratios: Array.from({ length: 64 }, (_, index) => `a${String(index + 64).padStart(3, '0')}`),
+        supported_durations: Array.from({ length: 64 }, (_, index) => index + 65),
+      },
+    ] })
+    const capability = models[0]?.generation.video
+
+    expect(capability?.resolutions).toHaveLength(64)
+    expect(capability?.resolutions.at(0)).toBe('r000')
+    expect(capability?.resolutions.at(-1)).toBe('r063')
+    expect(capability?.aspectRatios).toHaveLength(64)
+    expect(capability?.aspectRatios.at(0)).toBe('a000')
+    expect(capability?.aspectRatios.at(-1)).toBe('a063')
+    expect(capability?.durations).toHaveLength(64)
+    expect(capability?.durations.at(0)).toBe(1)
+    expect(capability?.durations.at(-1)).toBe(64)
+  })
+
   it('preserves dedicated-only models without inventing missing image inputs', () => {
     const image = parseOpenRouterImageModels({ data: [{
       id: 'dedicated-only/image',

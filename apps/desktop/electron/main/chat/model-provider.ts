@@ -405,7 +405,7 @@ function sortedUniqueStrings(values: unknown[] | undefined): string[] {
     const parsed = boundedCapabilityValueSchema.safeParse(value)
     return parsed.success ? [parsed.data] : []
   }) ?? []
-  return [...new Set(valid)].sort(compareStrings)
+  return [...new Set(valid)].sort(compareStrings).slice(0, MAX_CAPABILITY_VALUES)
 }
 
 function sortedUniquePositiveIntegers(values: unknown[] | null | undefined): number[] {
@@ -414,7 +414,7 @@ function sortedUniquePositiveIntegers(values: unknown[] | null | undefined): num
     && Number.isSafeInteger(value)
     && value > 0
   )) ?? []
-  return [...new Set(valid)].sort((left, right) => left - right)
+  return [...new Set(valid)].sort((left, right) => left - right).slice(0, MAX_CAPABILITY_VALUES)
 }
 
 function sortedModalities(values: unknown[] | undefined): Array<'text' | 'image' | 'audio' | 'video'> {
