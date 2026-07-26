@@ -236,6 +236,7 @@ export class MediaGenerationOrchestrator {
   ): Promise<AgentRunResult> {
     const provider = this.dependencies.providers.get(input.route.provider)
     if (!provider.generateImage) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+    if (!input.route.imageParameterSupport) throw toSafeAppError({ code: 'INVALID_INPUT' })
     const modelInputs = await this.dependencies.media.modelInput(
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
@@ -247,6 +248,7 @@ export class MediaGenerationOrchestrator {
       model: input.route.model,
       prompt: input.prompt,
       options: input.route.generation.image,
+      parameterSupport: input.route.imageParameterSupport,
       references: modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
       signal: active.controller.signal,
     })

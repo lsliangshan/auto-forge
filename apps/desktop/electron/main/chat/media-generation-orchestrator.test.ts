@@ -40,6 +40,11 @@ const imageRoute: ResolvedChatRoute = {
   outputType: 'image',
   assets: [],
   generation,
+  imageParameterSupport: {
+    resolution: false,
+    aspectRatio: true,
+    outputFormat: true,
+  },
 }
 
 const audioRoute: ResolvedChatRoute = {
@@ -203,6 +208,9 @@ describe('MediaGenerationOrchestrator', () => {
     expect(harness.calls.indexOf('startMediaGeneration')).toBeLessThan(
       harness.calls.indexOf('generateImage'),
     )
+    expect(harness.provider.generateImage).toHaveBeenCalledWith(expect.objectContaining({
+      parameterSupport: imageRoute.imageParameterSupport,
+    }))
     expect(harness.persistence.persistUser).not.toHaveBeenCalled()
     expect(harness.persistence.createRun).not.toHaveBeenCalled()
     expect(harness.persistence.createAssistant).not.toHaveBeenCalled()

@@ -82,6 +82,11 @@ const imageRequestSchema = z.object({
     aspectRatio: aspectRatioSchema,
     format: formatSchema,
   }).strict(),
+  parameterSupport: z.object({
+    resolution: z.boolean(),
+    aspectRatio: z.boolean(),
+    outputFormat: z.boolean(),
+  }).strict(),
   references: z.array(imageReferenceSchema).max(MAX_REFERENCE_COUNT),
   signal: abortSignalSchema.optional(),
 }).strict()
@@ -249,11 +254,15 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
             model: parsedRequest.model,
             prompt: parsedRequest.prompt,
             n: 1,
-            resolution: parsedRequest.options.resolution,
-            ...(parsedRequest.options.aspectRatio === 'auto'
-              ? {}
-              : { aspect_ratio: parsedRequest.options.aspectRatio }),
-            output_format: parsedRequest.options.format,
+            ...(parsedRequest.parameterSupport.resolution
+              ? { resolution: parsedRequest.options.resolution }
+              : {}),
+            ...(parsedRequest.parameterSupport.aspectRatio && parsedRequest.options.aspectRatio !== 'auto'
+              ? { aspect_ratio: parsedRequest.options.aspectRatio }
+              : {}),
+            ...(parsedRequest.parameterSupport.outputFormat
+              ? { output_format: parsedRequest.options.format }
+              : {}),
             ...(inputReferences.length ? { input_references: inputReferences } : {}),
           }),
         }

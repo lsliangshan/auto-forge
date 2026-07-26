@@ -60,8 +60,67 @@ async function rejection(stream: AsyncIterable<OpenRouterStreamEvent>): Promise<
 }
 
 const credential = { get: vi.fn(async () => 'sk-private') }
+const allImageParameters = {
+  resolution: true,
+  aspectRatio: true,
+  outputFormat: true,
+} as const
 
 describe('OpenRouterProvider', () => {
+  it('omits resolution when the selected image model does not advertise it', async () => {
+    const bodies: string[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(String(init?.body))
+        return Response.json({ data: [{ b64_json: 'AQID', media_type: 'image/png' }] })
+      }),
+    })
+
+    await expect(provider.generateImage({
+      model: 'black-forest-labs/flux.2-flex',
+      prompt: 'draw a puppy',
+      options: { count: 1, resolution: '1K', aspectRatio: '16:9', format: 'png' },
+      parameterSupport: { resolution: false, aspectRatio: true, outputFormat: true },
+      references: [],
+    })).resolves.toBeDefined()
+
+    expect(JSON.parse(bodies[0]!)).toEqual({
+      model: 'black-forest-labs/flux.2-flex',
+      prompt: 'draw a puppy',
+      n: 1,
+      aspect_ratio: '16:9',
+      output_format: 'png',
+    })
+  })
+
+  it('omits output format when the selected image model does not advertise it', async () => {
+    const bodies: string[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(String(init?.body))
+        return Response.json({ data: [{ b64_json: 'AQID', media_type: 'image/png' }] })
+      }),
+    })
+
+    await expect(provider.generateImage({
+      model: 'google/gemini-3-pro-image-preview',
+      prompt: 'draw a banana',
+      options: { count: 1, resolution: '2K', aspectRatio: '1:1', format: 'png' },
+      parameterSupport: { resolution: true, aspectRatio: true, outputFormat: false },
+      references: [],
+    })).resolves.toBeDefined()
+
+    expect(JSON.parse(bodies[0]!)).toEqual({
+      model: 'google/gemini-3-pro-image-preview',
+      prompt: 'draw a banana',
+      n: 1,
+      resolution: '2K',
+      aspect_ratio: '1:1',
+    })
+  })
+
   it('generates one image through the fixed endpoint with verified reference bytes', async () => {
     const localCredential = { get: vi.fn(async () => 'sk-private') }
     const calls: Array<{ input: string; init?: RequestInit; body: string }> = []
@@ -79,6 +138,7 @@ describe('OpenRouterProvider', () => {
       model: 'google/gemini-2.5-flash-image',
       prompt: 'watercolor harbor',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [{ mimeType: 'image/png', dataBase64: 'AQID' }],
     })).resolves.toEqual({
       outputs: [{ type: 'base64', dataBase64: 'AQID', mimeType: 'image/png' }],
@@ -118,6 +178,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1 as const, resolution: '2K', aspectRatio: '16:9', format: 'svg' },
+      parameterSupport: allImageParameters,
       references: [],
     }
 
@@ -158,6 +219,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
     })).rejects.toMatchObject({
       code: 'MODEL_PROVIDER_REQUEST_FAILED',
@@ -181,6 +243,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references,
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(localCredential.get).not.toHaveBeenCalled()
@@ -201,6 +264,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options,
+      parameterSupport: allImageParameters,
       references: [],
     } as never)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(localCredential.get).not.toHaveBeenCalled()
@@ -224,6 +288,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
     })).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
   })
@@ -412,6 +477,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
     })).rejects.toMatchObject({ code })
     expect(fetch).toHaveBeenCalledTimes(attempts)
@@ -442,6 +508,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
     })).rejects.toMatchObject({
       code: 'MODEL_PROVIDER_REQUEST_FAILED',
@@ -593,6 +660,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
     }
 
@@ -611,6 +679,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
       signal: preAborted.signal,
     }
@@ -664,6 +733,7 @@ describe('OpenRouterProvider', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
       references: [],
       signal: controller.signal,
     })).rejects.toMatchObject({ code: 'CANCELLED' })

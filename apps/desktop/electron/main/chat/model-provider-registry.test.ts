@@ -29,6 +29,7 @@ describe('ModelProviderRegistry', () => {
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: { resolution: true, aspectRatio: true, outputFormat: true },
       references: [],
     })).resolves.toEqual({ outputs: [] })
     expect(generateImage).toHaveBeenCalledTimes(1)

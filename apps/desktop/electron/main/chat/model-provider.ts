@@ -61,6 +61,7 @@ export interface ModelImageRequest {
   model: string
   prompt: string
   options: GenerationOptions['image']
+  parameterSupport: ModelImageParameterSupport
   references: Array<{ mimeType: string; dataBase64: string }>
   signal?: AbortSignal
 }
