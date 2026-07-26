@@ -284,20 +284,13 @@ describe('OpenRouterProvider', () => {
     })
   })
 
-  it('submits verified video references with explicit aspect ratio and fresh retry bodies', async () => {
+  it('submits verified video references with explicit aspect ratio', async () => {
     const bodies: string[] = []
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       bodies.push(String(init?.body))
-      if (bodies.length === 1) return new Response('busy', { status: 429 })
-      if (bodies.length === 2) return new Response('down', { status: 503 })
       return Response.json({ id: 'job_1', status: 'in_progress' }, { status: 202 })
     })
-    const provider = new OpenRouterProvider({
-      credential,
-      fetch,
-      sleep: vi.fn(async () => undefined),
-      random: () => 0,
-    })
+    const provider = new OpenRouterProvider({ credential, fetch })
 
     await expect(provider.submitVideo({
       model: 'video/model',
@@ -318,8 +311,8 @@ describe('OpenRouterProvider', () => {
         image_url: { url: 'data:image/webp;base64,AQID' },
       }],
     }
-    expect(fetch).toHaveBeenCalledTimes(3)
-    expect(bodies.map((body) => JSON.parse(body))).toEqual([expected, expected, expected])
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(bodies.map((body) => JSON.parse(body))).toEqual([expected])
   })
 
   it.each([
@@ -394,9 +387,10 @@ describe('OpenRouterProvider', () => {
   it.each([
     [401, 'CREDENTIAL_INVALID', 1],
     [403, 'MODEL_PROVIDER_ACCESS_DENIED', 1],
-    [429, 'MODEL_PROVIDER_REQUEST_FAILED', 4],
-    [503, 'MODEL_PROVIDER_REQUEST_FAILED', 4],
-  ] as const)('maps media HTTP %s safely with bounded retries', async (status, code, attempts) => {
+    [402, 'MODEL_PROVIDER_REQUEST_FAILED', 1],
+    [429, 'MODEL_PROVIDER_REQUEST_FAILED', 1],
+    [503, 'MODEL_PROVIDER_REQUEST_FAILED', 1],
+  ] as const)('maps media HTTP %s safely with bounded diagnostics', async (status, code, attempts) => {
     const diagnostic = vi.fn()
     const fetch = vi.fn(async () => new Response(JSON.stringify({
       error: {
@@ -421,6 +415,121 @@ describe('OpenRouterProvider', () => {
     expect(fetch).toHaveBeenCalledTimes(attempts)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it.each([
+    ['network TypeError', 'network'],
+    ['HTTP 429', 429],
+    ['HTTP 503', 503],
+  ] as const)('attempts a paid image POST only once on %s', async (_description, failure) => {
+    const diagnostic = vi.fn()
+    const fetch = vi.fn(async () => {
+      if (failure === 'network') throw new TypeError('socket closed')
+      return new Response(JSON.stringify({
+        error: {
+          code: failure,
+          message: `RAW_PROVIDER_BODY_${'x'.repeat(3_000)}`,
+          metadata: { error_type: 'upstream_error' },
+        },
+      }), { status: failure })
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      references: [],
+    })).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
+    expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it.each([
+    ['network TypeError', 'network'],
+    ['HTTP 429', 429],
+    ['HTTP 503', 503],
+  ] as const)('attempts a paid video submission POST only once on %s', async (_description, failure) => {
+    const diagnostic = vi.fn()
+    const fetch = vi.fn(async () => {
+      if (failure === 'network') throw new TypeError('socket closed')
+      return new Response(JSON.stringify({
+        error: {
+          code: failure,
+          message: `RAW_PROVIDER_BODY_${'x'.repeat(3_000)}`,
+          metadata: { error_type: 'upstream_error' },
+        },
+      }), { status: failure })
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep })
+
+    await expect(provider.submitVideo({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+    })).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
+    expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it.each([
+    ['network TypeError', 'network'],
+    ['HTTP 429', 429],
+    ['HTTP 503', 503],
+  ] as const)('attempts a paid audio-output POST only once on %s', async (_description, failure) => {
+    const diagnostic = vi.fn()
+    const fetch = vi.fn(async () => {
+      if (failure === 'network') throw new TypeError('socket closed')
+      return new Response(JSON.stringify({
+        error: {
+          code: failure,
+          message: `RAW_PROVIDER_BODY_${'x'.repeat(3_000)}`,
+          metadata: { error_type: 'upstream_error' },
+        },
+      }), { status: failure })
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep })
+
+    await expect(collect(provider.stream({
+      model: 'audio/model',
+      messages: [{ role: 'user', content: '朗读' }],
+      output: { type: 'audio', format: 'mp3' },
+    }))).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      message: 'The model provider request failed.',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
+    expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it('keeps bounded retries for idempotent video polling', async () => {
+    const fetch = vi.fn()
+      .mockRejectedValueOnce(new TypeError('socket closed'))
+      .mockResolvedValueOnce(new Response('busy', { status: 429 }))
+      .mockResolvedValueOnce(new Response('down', { status: 503 }))
+      .mockResolvedValueOnce(Response.json({ id: 'job_1', status: 'pending' }))
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep, random: () => 0 })
+
+    await expect(provider.pollVideo('job_1')).resolves.toEqual({ status: 'pending' })
+    expect(fetch).toHaveBeenCalledTimes(4)
+    expect(sleep).toHaveBeenCalledTimes(3)
   })
 
   it('treats an extra-key diagnostic envelope as malformed while keeping safe HTTP mapping', async () => {
@@ -526,13 +635,8 @@ describe('OpenRouterProvider', () => {
       throw new DOMException('aborted', 'AbortError')
     })
     const backoffProvider = new OpenRouterProvider({ credential, fetch: backoffFetch, sleep })
-    await expect(backoffProvider.submitVideo({
-      model: 'video/model',
-      prompt: 'animate',
-      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
-      references: [],
-      signal: duringBackoff.signal,
-    })).rejects.toMatchObject({ code: 'CANCELLED' })
+    await expect(backoffProvider.pollVideo('job_1', duringBackoff.signal))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
     expect(backoffFetch).toHaveBeenCalledTimes(1)
     expect(sleep).toHaveBeenCalledTimes(1)
   })
@@ -857,45 +961,33 @@ describe('OpenRouterProvider', () => {
     ])
   })
 
-  it('suppresses replayed audio chunks while preserving new chunks after a retry', async () => {
-    let attempt = 0
+  it('does not retry a paid audio-output POST after a streamed network failure', async () => {
+    const fetch = vi.fn(async () => {
+      const encoder = new TextEncoder()
+      let emitted = false
+      return new Response(new ReadableStream({
+        pull(controller) {
+          if (!emitted) {
+            emitted = true
+            controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}\n\n'))
+          } else {
+            controller.error(new TypeError('socket closed'))
+          }
+        },
+      }))
+    })
     const provider = new OpenRouterProvider({
       credential,
       sleep: async () => undefined,
-      fetch: vi.fn(async () => {
-        attempt += 1
-        if (attempt === 1) {
-          const encoder = new TextEncoder()
-          let emitted = false
-          return new Response(new ReadableStream({
-            pull(controller) {
-              if (!emitted) {
-                emitted = true
-                controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}\n\n'))
-              } else {
-                controller.error(new TypeError('socket closed'))
-              }
-            },
-          }))
-        }
-        return sseResponse([
-          'data: {"choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}\n\n',
-          'data: {"choices":[{"index":0,"delta":{"audio":{"data":"AwQ="}},"finish_reason":"stop"}]}\n\n',
-          'data: [DONE]\n\n',
-        ])
-      }),
+      fetch,
     })
 
-    const result = await collect(provider.stream({
+    await expect(collect(provider.stream({
       model: 'audio-model',
       messages: [{ role: 'user', content: '朗读' }],
       output: { type: 'audio', format: 'wav' },
-    }))
-
-    expect(result.filter((event) => event.type === 'audio_delta')).toEqual([
-      { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AQI=' },
-      { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AwQ=' },
-    ])
+    }))).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
   })
 
   it.each([

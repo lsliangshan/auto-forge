@@ -258,6 +258,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
           }),
         }
       },
+      { retry: 'never' },
     )
     const parsed = imageResponseSchema.safeParse(
       await this.boundedJson(response, MAX_MEDIA_JSON_BODY, parsedRequest.signal),
@@ -318,6 +319,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
           }),
         }
       },
+      { retry: 'never' },
     )
     const parsed = videoJobSchema.safeParse(
       await this.boundedJson(response, MAX_MEDIA_JSON_BODY, parsedRequest.signal),
@@ -337,6 +339,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       'video',
       signal,
       () => ({ method: 'GET' }),
+      { retry: 'idempotent' },
     )
     const parsed = videoJobSchema.safeParse(
       await this.boundedJson(response, MAX_MEDIA_JSON_BODY, signal),
@@ -371,6 +374,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       'video',
       signal,
       () => ({ method: 'GET' }),
+      { retry: 'idempotent' },
     )
   }
 }

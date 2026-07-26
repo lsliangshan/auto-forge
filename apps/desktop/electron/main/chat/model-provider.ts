@@ -125,6 +125,10 @@ export interface OpenAiCompatibleProviderDependencies {
 }
 
 export type ProviderOperation = 'models' | 'chat' | 'image' | 'video'
+type RetryPolicy = 'never' | 'idempotent'
+interface AuthenticatedFetchOptions {
+  retry: RetryPolicy
+}
 
 const providerErrorSchema = z.object({
   code: z.union([z.string(), z.number()]).optional(),
@@ -787,7 +791,8 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     const replay: ReplayState = {
       text: new Map(), audio: new Map(), generations: new Set(), tools: new Set(), finishes: new Set(), usages: new Set(),
     }
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    const maxAttempts = request.output?.type === 'audio' ? 1 : MAX_ATTEMPTS
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         const secret = await this.secret()
         let response: Response
@@ -845,7 +850,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         }
       } catch (error) {
-        if (!(error instanceof RetryableFailure) || attempt === MAX_ATTEMPTS - 1) {
+        if (!(error instanceof RetryableFailure) || attempt === maxAttempts - 1) {
           if (error instanceof RetryableFailure) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
           throw error
         }
@@ -900,9 +905,11 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     operation: ProviderOperation,
     signal: AbortSignal | undefined,
     request: () => RequestInit,
+    options: AuthenticatedFetchOptions,
   ): Promise<Response> {
     if (signal?.aborted) throw failure('CANCELLED')
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    const maxAttempts = options.retry === 'idempotent' ? MAX_ATTEMPTS : 1
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (signal?.aborted) throw failure('CANCELLED')
       const secret = await this.secret()
       if (signal?.aborted) throw failure('CANCELLED')
@@ -917,7 +924,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         response = await this.fetch(endpoint, init)
       } catch (error) {
         if (isAbort(error, signal)) throw failure('CANCELLED')
-        if (!(error instanceof TypeError) || attempt === MAX_ATTEMPTS - 1) {
+        if (!(error instanceof TypeError) || attempt === maxAttempts - 1) {
           throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         }
         await this.retryDelay(attempt, undefined, signal)
@@ -931,7 +938,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         return response
       }
       await this.readDiagnostic(operation, response, signal)
-      if (attempt === MAX_ATTEMPTS - 1) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+      if (attempt === maxAttempts - 1) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
       await this.retryDelay(attempt, retryAfter(response), signal)
     }
     throw failure('MODEL_PROVIDER_REQUEST_FAILED')
