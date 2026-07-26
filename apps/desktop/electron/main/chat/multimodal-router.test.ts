@@ -119,6 +119,35 @@ describe('resolveChatRoute', () => {
     }))).toMatchObject({ model: 'image/model', outputType: 'image', supportsTools: false })
   })
 
+  it('marks only advertised image request parameters as supported', () => {
+    const route = resolveChatRoute(input({
+      requestedModel: 'black-forest-labs/flux.2-flex',
+      requestedOutput: 'image',
+      models: [model({
+        id: 'black-forest-labs/flux.2-flex',
+        inputModalities: ['text', 'image'],
+        outputModalities: ['image'],
+        generation: {
+          image: {
+            resolutions: [],
+            aspectRatios: ['16:9'],
+            formats: ['png', 'jpeg'],
+            maxCount: 1,
+          },
+        },
+      })],
+    }))
+
+    expect(route).toMatchObject({
+      outputType: 'image',
+      imageParameterSupport: {
+        resolution: false,
+        aspectRatio: true,
+        outputFormat: true,
+      },
+    })
+  })
+
   it('requires an output choice for a first-use multi-output selected model', () => {
     expect(resolveChatRoute(input({
       requestedModel: 'multi/model',

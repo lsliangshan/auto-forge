@@ -51,6 +51,12 @@ export type ModelStreamEvent =
   | { type: 'usage'; inputTokens: number; outputTokens: number; totalTokens: number; costUsd?: string }
   | { type: 'audio_delta'; choiceIndex: number; dataBase64: string; transcript?: string }
 
+export interface ModelImageParameterSupport {
+  resolution: boolean
+  aspectRatio: boolean
+  outputFormat: boolean
+}
+
 export interface ModelImageRequest {
   model: string
   prompt: string

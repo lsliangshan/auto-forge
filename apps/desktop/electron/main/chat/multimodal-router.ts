@@ -9,6 +9,7 @@ import {
   type ProviderDefaultModels,
 } from '@autoforge/shared'
 import type { ResolvedMediaAsset } from '../media/media-asset-service.js'
+import type { ModelImageParameterSupport } from './model-provider.js'
 
 const MAX_ASSETS = 5
 const MAX_TOTAL_BYTES = 250 * 1024 * 1024
@@ -34,6 +35,7 @@ export interface ResolvedChatRoute {
   outputType: ConcreteOutput
   assets: ResolvedMediaAsset[]
   generation: GenerationOptions
+  imageParameterSupport?: ModelImageParameterSupport
 }
 
 export interface OutputSelectionRequired {
@@ -301,6 +303,7 @@ function selectNumber(requested: number, advertised: readonly number[]): number 
 
 function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteOutput): ResolvedChatRoute {
   if (!supportsRequest(model, output, input.assets)) failure('MODEL_MODALITY_UNSUPPORTED')
+  const imageCapability = output === 'image' ? model.generation.image : undefined
   return {
     provider: input.provider,
     model: model.id,
@@ -308,6 +311,13 @@ function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteO
     outputType: output,
     assets: input.assets.slice(),
     generation: normalizeGeneration(input.requestedGeneration, model, output),
+    ...(imageCapability ? {
+      imageParameterSupport: {
+        resolution: imageCapability.resolutions.length > 0,
+        aspectRatio: imageCapability.aspectRatios.length > 0,
+        outputFormat: imageCapability.formats.length > 0,
+      },
+    } : {}),
   }
 }
 
