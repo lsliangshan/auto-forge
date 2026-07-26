@@ -154,6 +154,75 @@ describe('chat interactions', () => {
     expect(wrapper.getComponent(ChatComposer).props('defaultModel')).toBe('text/default')
   })
 
+  it('scrolls to the latest local and incoming chat content after rendering', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveSend!: (value: { requestId: string }) => void
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((resolve) => { resolveSend = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.conversations = [{
+      id: 'conversation_1',
+      title: '会话',
+      createdAt: '2026-07-25T00:00:00.000Z',
+      updatedAt: '2026-07-25T00:00:00.000Z',
+    }]
+    chat.selectedConversationId = 'conversation_1'
+    chat.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'text',
+      models: { text: 'text/default' },
+    })
+    const settings = useSettingsStore()
+    settings.settings = {
+      theme: 'system',
+      language: 'zh-CN',
+      dataDirectory: '/data',
+      logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-chat' },
+        openrouter: { text: 'text/default' },
+      },
+      showCosts: false,
+      developerMode: false,
+      permissionDefault: 'ask',
+    }
+    settings.providerModels.openrouter = [modelInfo('text/default', ['text'])]
+    const wrapper = mount(ChatView, { global: { plugins: [ElementPlus] } })
+    const messages = wrapper.get('.messages').element as HTMLElement
+    Object.defineProperty(messages, 'scrollHeight', { configurable: true, value: 900 })
+
+    messages.scrollTop = 0
+    const sending = chat.send({
+      content: '本地消息',
+      assetIds: [],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+      model: 'text/default',
+    })
+    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+
+    messages.scrollTop = 0
+    emitChat({
+      type: 'block',
+      conversationId: 'conversation_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: '第一段' },
+    })
+    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+
+    messages.scrollTop = 0
+    emitChat({
+      type: 'block',
+      conversationId: 'conversation_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: '第二段' },
+    })
+    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+
+    resolveSend({ requestId: 'req_stream' })
+    await sending
+  })
+
   it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
     const wrapper = mount(MessageBlock, {
       props: {

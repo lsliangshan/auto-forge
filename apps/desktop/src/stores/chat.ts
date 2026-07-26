@@ -205,6 +205,9 @@ export const useChatStore = defineStore('chat', {
   }),
   getters: {
     messages(state): UiChatMessage[] { return state.messagesByConversation[state.selectedConversationId] ?? [] },
+    messageVersion(state): number {
+      return state._messageVersions[state.selectedConversationId] ?? 0
+    },
     drafts(state): MediaAsset[] { return state.draftsByConversation[state.selectedConversationId] ?? [] },
     preferences(state): ConversationGenerationPreferences {
       return state.preferencesByConversation[state.selectedConversationId] ?? defaultGenerationPreferences()

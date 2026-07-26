@@ -25,6 +25,7 @@
     </div>
     <template v-else>
       <div
+        ref="messagesRef"
         class="messages af-scrollbar"
         aria-live="polite"
       >
@@ -72,7 +73,7 @@
 <script setup lang="ts">
 import { ChatDotRound, Loading } from '@element-plus/icons-vue'
 import type { ChatSendInput, OutputType } from '@autoforge/shared'
-import { computed, onMounted } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import ChatComposer from '../components/chat/ChatComposer.vue'
 import MessageBlock from '../components/chat/MessageBlock.vue'
 import { useChatStore, type ChatSendAcknowledgement } from '../stores/chat'
@@ -80,6 +81,20 @@ import { useSettingsStore } from '../stores/settings'
 
 const chat = useChatStore()
 const settings = useSettingsStore()
+const messagesRef = ref<globalThis.HTMLElement>()
+
+async function scrollToLatest() {
+  await nextTick()
+  const messages = messagesRef.value
+  if (messages) messages.scrollTop = messages.scrollHeight
+}
+
+watch(
+  () => [chat.selectedConversationId, chat.messageVersion] as const,
+  () => { void scrollToLatest() },
+  { flush: 'post' },
+)
+
 type ConcreteOutput = Exclude<OutputType, 'auto'>
 function providerDefaultFor(output: ConcreteOutput): string {
   const defaults = settings.settings?.defaultModels
