@@ -61,10 +61,13 @@ const submitInput = {
 
 const submittedOutputAssetId = 'video_8072e20a4619b4b2251a7c9e4522ab22a9728450834087c29e18d2651db6f0c0'
 
-function createDatabase() {
-  const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-runner-'))
-  temporaryDirectories.push(directory)
-  const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
+function createDatabase(databasePath?: string) {
+  const path = databasePath ?? (() => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-runner-'))
+    temporaryDirectories.push(directory)
+    return join(directory, 'autoforge.sqlite')
+  })()
+  const database = openAppDatabase(path)
   database.conversations.insert({ id: submitInput.conversationId, title: 'Video' })
   return database
 }
@@ -82,7 +85,7 @@ function videoAsset(id: string): MediaAsset {
 function createHarness(
   overrides: Partial<VideoJobRunnerDependencies> = {},
 ) {
-  const database = createDatabase()
+  const database = overrides.database ?? createDatabase()
   const events: ChatEvent[] = []
   const provider: Pick<ModelProvider, 'submitVideo' | 'pollVideo' | 'downloadVideo'> = {
     submitVideo: vi.fn(async () => ({
@@ -171,6 +174,346 @@ async function flush(): Promise<void> {
 }
 
 describe('VideoJobRunner', () => {
+  it('persists a complete submission intent before the provider request can settle', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.submitVideo!).mockImplementation(async () => (
+      new Promise(() => undefined)
+    ))
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    void runner.submit(submitInput).catch(() => undefined)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(harness.provider.submitVideo).toHaveBeenCalledTimes(1)
+    expect(harness.database.messages.get('user_message_1')).toMatchObject({
+      role: 'user',
+      blocks: submitInput.userBlocks,
+    })
+    expect(harness.database.messages.get('assistant_video_1')?.blocks).toEqual([{
+      type: 'media_generation',
+      blockId: 'block_video_1',
+      jobId: 'request_video_1',
+      kind: 'video',
+      status: 'pending',
+    }])
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      requestId: 'request_video_1',
+      status: 'running',
+    })
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'pending',
+      parameters: {
+        version: 1,
+        options: generation.video,
+        submission: { phase: 'intent' },
+      },
+    })
+  })
+
+  it('rolls back a failed intent transaction before any provider request', async () => {
+    vi.useFakeTimers()
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-intent-failure-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = createDatabase(path)
+    const harness = createHarness({ database })
+    const fault = new Database(path)
+    fault.exec(`
+      CREATE TRIGGER fail_video_intent_insert
+      BEFORE INSERT ON media_generation_jobs
+      BEGIN
+        SELECT RAISE(FAIL, 'injected intent insert failure');
+      END;
+    `)
+    fault.close()
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).rejects.toMatchObject({
+      code: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.provider.submitVideo).not.toHaveBeenCalled()
+    expect(harness.media.modelInput).not.toHaveBeenCalled()
+    expect(harness.database.messages.listForConversation(submitInput.conversationId)).toEqual([])
+    expect(harness.database.chatRuns.get('run_video_1')).toBeUndefined()
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toBeUndefined()
+  })
+
+  it('returns a failed acknowledgement and atomically terminates the intent when provider submission rejects', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.submitVideo!).mockRejectedValue({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).resolves.toEqual({
+      jobId: 'request_video_1',
+      requestId: 'request_video_1',
+      status: 'failed',
+    })
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+      errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+    expect(harness.database.messages.get('assistant_video_1')?.blocks).toEqual([
+      expect.objectContaining({
+        status: 'failed',
+        errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
+      }),
+    ])
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'status',
+      requestId: 'request_video_1',
+      status: 'failed',
+    }))
+  })
+
+  it('keeps a complete diagnosable intent when the atomic provider bind fails', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-bind-failure-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = createDatabase(path)
+    const harness = createHarness({ database })
+    const fault = new Database(path)
+    fault.exec(`
+      CREATE TRIGGER fail_video_provider_bind
+      BEFORE UPDATE OF provider_job_id ON media_generation_jobs
+      WHEN OLD.provider_job_id = 'autoforge_video_submission_intent'
+        AND NEW.provider_job_id <> OLD.provider_job_id
+      BEGIN
+        SELECT RAISE(FAIL, 'injected provider bind failure');
+      END;
+    `)
+    fault.close()
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).resolves.toEqual({
+      jobId: 'request_video_1',
+      requestId: 'request_video_1',
+      status: 'failed',
+    })
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.database.messages.get('user_message_1')).toBeDefined()
+    expect(harness.database.messages.get('assistant_video_1')?.blocks).toEqual([
+      expect.objectContaining({
+        status: 'failed',
+        errorCode: 'MEDIA_GENERATION_FAILED',
+      }),
+    ])
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+  })
+
+  it('leaves a failed-to-bind intent recoverable when the immediate terminal write also fails', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-bind-and-fail-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = createDatabase(path)
+    const harness = createHarness({ database })
+    const fault = new Database(path)
+    fault.exec(`
+      CREATE TRIGGER fail_video_provider_bind_twice
+      BEFORE UPDATE OF provider_job_id ON media_generation_jobs
+      WHEN OLD.provider_job_id = 'autoforge_video_submission_intent'
+        AND NEW.provider_job_id <> OLD.provider_job_id
+      BEGIN
+        SELECT RAISE(FAIL, 'injected provider bind failure');
+      END;
+      CREATE TRIGGER fail_immediate_intent_terminal
+      BEFORE UPDATE OF status ON media_generation_jobs
+      WHEN OLD.provider_job_id = 'autoforge_video_submission_intent'
+        AND NEW.status = 'failed'
+        AND NEW.updated_at = 1000
+      BEGIN
+        SELECT RAISE(FAIL, 'injected immediate terminal failure');
+      END;
+    `)
+    fault.close()
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).rejects.toBeDefined()
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'pending',
+      parameters: expect.objectContaining({
+        submission: { phase: 'intent' },
+      }),
+    })
+    expect(harness.database.messages.get('user_message_1')).toBeDefined()
+    expect(harness.database.messages.get('assistant_video_1')).toBeDefined()
+    expect(harness.database.chatRuns.get('run_video_1')?.status).toBe('running')
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    database.close()
+
+    vi.setSystemTime(2_000)
+    const reopened = openAppDatabase(path)
+    reopened.recoverInterrupted()
+    expect(reopened.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(reopened.chatRuns.get('run_video_1')?.status).toBe('failed')
+    expect(reopened.messages.get('assistant_video_1')?.blocks).toEqual([
+      expect.objectContaining({ status: 'failed' }),
+    ])
+    reopened.close()
+  })
+
+  it('atomically binds the provider ID and matching active block before scheduling', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.submitVideo!).mockResolvedValue({
+      providerJobId: 'provider_bound',
+      status: 'in_progress',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).resolves.toMatchObject({
+      status: 'in_progress',
+    })
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'provider_bound',
+      status: 'in_progress',
+      nextPollAt: 3_000,
+      parameters: {
+        version: 1,
+        options: generation.video,
+      },
+    })
+    expect(harness.database.messages.get('assistant_video_1')?.blocks).toEqual([{
+      type: 'media_generation',
+      blockId: 'block_video_1',
+      jobId: 'request_video_1',
+      kind: 'video',
+      status: 'in_progress',
+    }])
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      requestId: 'request_video_1',
+      status: 'running',
+    })
+  })
+
+  it('fails an unbound intent during runner recovery without polling its sentinel', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.submitVideo!).mockImplementation(async () => (
+      new Promise(() => undefined)
+    ))
+    const submitting = new VideoJobRunner(harness.dependencies)
+    void submitting.submit(submitInput).catch(() => undefined)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const recovered = new VideoJobRunner(harness.dependencies)
+    await recovered.recover()
+    await flush()
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.database.messages.get('assistant_video_1')?.blocks).toEqual([
+      expect.objectContaining({
+        status: 'failed',
+        errorCode: 'MEDIA_GENERATION_FAILED',
+      }),
+    ])
+  })
+
+  it('never polls the reserved sentinel even when intent parameters are corrupt', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    vi.mocked(harness.provider.submitVideo!).mockImplementation(async () => (
+      new Promise(() => undefined)
+    ))
+    const submitting = new VideoJobRunner(harness.dependencies)
+    void submitting.submit(submitInput).catch(() => undefined)
+    await Promise.resolve()
+    await Promise.resolve()
+    harness.database.mediaGenerationJobs.update('request_video_1', {
+      parameters: {},
+      updatedAt: 1_001,
+    })
+
+    const recovered = new VideoJobRunner(harness.dependencies)
+    await recovered.recover()
+    await flush()
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+    })
+  })
+
+  it('reopens a crashed pre-bind intent as terminal instead of resumable', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-intent-recovery-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = createDatabase(path)
+    const harness = createHarness({ database })
+    vi.mocked(harness.provider.submitVideo!).mockImplementation(async () => (
+      new Promise(() => undefined)
+    ))
+    const submitting = new VideoJobRunner(harness.dependencies)
+    void submitting.submit(submitInput).catch(() => undefined)
+    await Promise.resolve()
+    await Promise.resolve()
+    database.close()
+
+    const reopened = openAppDatabase(path)
+    reopened.recoverInterrupted()
+
+    expect(reopened.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(reopened.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+    })
+    expect(reopened.messages.get('assistant_video_1')?.blocks).toEqual([
+      expect.objectContaining({
+        status: 'failed',
+        errorCode: 'MEDIA_GENERATION_FAILED',
+      }),
+    ])
+    expect(reopened.mediaGenerationJobs.listActive()).toEqual([])
+    reopened.close()
+  })
+
   it('atomically persists the submitted provider job, input claim, stable block, and chat run', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -225,12 +568,16 @@ describe('VideoJobRunner', () => {
       createdAt: 1,
       updatedAt: 1,
     })
-    vi.mocked(harness.media.modelInput).mockResolvedValue([{
-      assetId: 'reference_image',
-      kind: 'image',
-      mimeType: 'image/png',
-      dataBase64: 'iVBORw0KGgo=',
-    }])
+    vi.mocked(harness.media.modelInput).mockImplementation(async () => {
+      expect(harness.database.mediaAssets.get('reference_image')?.messageId)
+        .toBe('user_message_1')
+      return [{
+        assetId: 'reference_image',
+        kind: 'image',
+        mimeType: 'image/png',
+        dataBase64: 'iVBORw0KGgo=',
+      }]
+    })
     const referencedRoute: typeof route = {
       ...route,
       assets: [{
@@ -737,7 +1084,7 @@ describe('VideoJobRunner', () => {
     ))).toBe(false)
   })
 
-  it('rejects malformed provider job IDs before creating any local turn', async () => {
+  it('fails the durable intent when the provider returns a malformed job ID', async () => {
     vi.useFakeTimers()
     const harness = createHarness()
     vi.mocked(harness.provider.submitVideo!).mockResolvedValue({
@@ -746,12 +1093,22 @@ describe('VideoJobRunner', () => {
     })
     const runner = new VideoJobRunner(harness.dependencies)
 
-    await expect(runner.submit(submitInput)).rejects.toMatchObject({
-      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    await expect(runner.submit(submitInput)).resolves.toEqual({
+      jobId: 'request_video_1',
+      requestId: 'request_video_1',
+      status: 'failed',
     })
-    expect(harness.database.messages.listForConversation(submitInput.conversationId)).toEqual([])
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      providerJobId: 'autoforge_video_submission_intent',
+      status: 'failed',
+      errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
     expect(harness.database.mediaGenerationJobs.listActive()).toEqual([])
-    expect(harness.events).toEqual([])
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'status',
+      requestId: 'request_video_1',
+      status: 'failed',
+    }))
   })
 
   it('rejects a missing conversation before making a paid provider submission', async () => {
@@ -1067,7 +1424,7 @@ describe('VideoJobRunner', () => {
       .toBe('completed')
   })
 
-  it('waits for abort-ignoring model input cleanup without provider calls or local writes', async () => {
+  it('waits for abort-ignoring model input cleanup and terminally cancels its durable intent', async () => {
     vi.useFakeTimers()
     const harness = createHarness()
     let releaseModelInput!: () => void
@@ -1077,10 +1434,7 @@ describe('VideoJobRunner', () => {
       })
     ))
     const runner = new VideoJobRunner(harness.dependencies)
-    const submission = runner.submit(submitInput).then(
-      () => undefined,
-      (error: unknown) => error,
-    )
+    const submission = runner.submit(submitInput)
     await Promise.resolve()
 
     let stopped = false
@@ -1090,16 +1444,26 @@ describe('VideoJobRunner', () => {
     await Promise.resolve()
     expect(stopped).toBe(false)
     releaseModelInput()
-    expect(await submission).toMatchObject({ code: 'CANCELLED' })
+    expect(await submission).toMatchObject({ status: 'failed' })
     await stopping
 
     expect(harness.provider.submitVideo).not.toHaveBeenCalled()
-    expect(harness.database.messages.listForConversation(submitInput.conversationId)).toEqual([])
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'CANCELLED',
+    })
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'CANCELLED',
+    })
     expect(harness.database.mediaGenerationJobs.listActive()).toEqual([])
-    expect(harness.events).toEqual([])
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'status',
+      status: 'failed',
+    }))
   })
 
-  it('waits for an abort-ignoring provider submission without local writes or events', async () => {
+  it('waits for an abort-ignoring provider submission and terminally cancels its durable intent', async () => {
     vi.useFakeTimers()
     const harness = createHarness()
     let releaseProvider!: () => void
@@ -1112,10 +1476,7 @@ describe('VideoJobRunner', () => {
       })
     ))
     const runner = new VideoJobRunner(harness.dependencies)
-    const submission = runner.submit(submitInput).then(
-      () => undefined,
-      (error: unknown) => error,
-    )
+    const submission = runner.submit(submitInput)
     await Promise.resolve()
     await Promise.resolve()
 
@@ -1126,12 +1487,22 @@ describe('VideoJobRunner', () => {
     await Promise.resolve()
     expect(stopped).toBe(false)
     releaseProvider()
-    expect(await submission).toMatchObject({ code: 'CANCELLED' })
+    expect(await submission).toMatchObject({ status: 'failed' })
     await stopping
 
-    expect(harness.database.messages.listForConversation(submitInput.conversationId)).toEqual([])
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'CANCELLED',
+    })
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'CANCELLED',
+    })
     expect(harness.database.mediaGenerationJobs.listActive()).toEqual([])
-    expect(harness.events).toEqual([])
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'status',
+      status: 'failed',
+    }))
   })
 
   it('does not delete or claim an unrelated asset that collides with the deterministic recovery ID', async () => {

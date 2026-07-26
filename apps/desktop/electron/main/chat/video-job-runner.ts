@@ -9,12 +9,13 @@ import {
   type ChatEvent,
   type MediaAsset,
 } from '@autoforge/shared'
-import type {
-  AppRepositories,
-  MediaGenerationJob,
-  MediaGenerationJobStatus,
-  VideoGenerationTurnPreflightInput,
-  VideoGenerationTransition,
+import {
+  isVideoSubmissionIntent,
+  type AppRepositories,
+  type MediaGenerationJob,
+  type MediaGenerationJobStatus,
+  type VideoGenerationSubmissionIntentInput,
+  type VideoGenerationTransition,
 } from '../database/repositories.js'
 import {
   MEDIA_LIMITS,
@@ -69,7 +70,7 @@ export interface VideoJobRunnerDependencies {
 export interface SubmittedVideoJob {
   jobId: string
   requestId: string
-  status: 'pending' | 'in_progress'
+  status: 'pending' | 'in_progress' | 'failed'
 }
 
 function pollDelay(attempt: number): number {
@@ -97,10 +98,12 @@ interface VideoTerminalMetadata {
 function persistedParameters(
   options: SubmitVideoInput['route']['generation']['video'],
   terminal?: VideoTerminalMetadata,
+  submissionIntent = false,
 ): unknown {
   return {
     version: 1,
     options,
+    ...(submissionIntent ? { submission: { phase: 'intent' } } : {}),
     ...(terminal === undefined ? {} : { terminal }),
   }
 }
@@ -255,6 +258,7 @@ export class VideoJobRunner {
     }
 
     let controller: AbortController | undefined
+    let intent: MediaGenerationJob | undefined
     try {
       const preparedAt = this.now()
       const userMessageId = this.id()
@@ -300,13 +304,13 @@ export class VideoJobRunner {
           model: input.route.model,
           kind: 'video',
           status: 'pending',
-          parameters: persistedParameters(input.route.generation.video),
+          parameters: persistedParameters(input.route.generation.video, undefined, true),
           pollAttempts: 0,
           createdAt: preparedAt,
           updatedAt: preparedAt,
         },
-      } satisfies VideoGenerationTurnPreflightInput
-      this.dependencies.database.mediaGenerationJobs.preflightTurn(preparedTurn)
+      } satisfies VideoGenerationSubmissionIntentInput
+      intent = this.dependencies.database.mediaGenerationJobs.startSubmissionIntent(preparedTurn)
 
       controller = new AbortController()
       this.controllers.set(input.requestId, controller)
@@ -348,34 +352,23 @@ export class VideoJobRunner {
         ...preparedBlock,
         status: submitted.status,
       }
-      const job = this.dependencies.database.mediaGenerationJobs.insertTurn({
-        userMessage: {
-          ...preparedTurn.userMessage,
-          createdAt,
-        },
-        userAssetIds: preparedTurn.userAssetIds,
-        assistantMessage: {
-          ...preparedTurn.assistantMessage,
-          blocks: [block],
-          createdAt,
-        },
-        run: {
-          ...preparedTurn.run,
-          startedAt: createdAt,
-        },
-        job: {
-          ...preparedTurn.job,
+      const bound = this.dependencies.database.mediaGenerationJobs.bindSubmitted(
+        input.requestId,
+        {
           providerJobId: submitted.providerJobId,
           status: submitted.status,
+          parameters: persistedParameters(input.route.generation.video),
           nextPollAt: createdAt + pollDelay(1),
-          createdAt,
           updatedAt: createdAt,
         },
-      })
+      )
+      if (!bound) throw toSafeAppError({ code: 'CONFLICT' })
+      const { job } = bound
       this.safeEmit({
-        type: 'block',
+        type: 'block_update',
         conversationId: job.conversationId,
         messageId: job.assistantMessageId,
+        blockId: block.blockId,
         block,
       })
       this.safeEmit({
@@ -391,7 +384,20 @@ export class VideoJobRunner {
         status: submitted.status,
       }
     } catch (error) {
-      throw mappedFailure(error)
+      const safe = (
+        this.stopped
+        || controller?.signal.aborted
+      ) ? toSafeAppError({ code: 'CANCELLED' }) : mappedFailure(error)
+      if (!intent) throw safe
+      const current = this.dependencies.database.mediaGenerationJobs.get(intent.id)
+      if (current && ACTIVE_STATUSES.includes(current.status)) {
+        this.fail(current, safe.code)
+      }
+      return {
+        jobId: intent.id,
+        requestId: input.requestId,
+        status: 'failed',
+      }
     } finally {
       if (controller && this.controllers.get(input.requestId) === controller) {
         this.controllers.delete(input.requestId)
@@ -445,6 +451,10 @@ export class VideoJobRunner {
   async recover(): Promise<void> {
     if (this.stopped) return
     for (const job of this.dependencies.database.mediaGenerationJobs.listActive()) {
+      if (isVideoSubmissionIntent(job)) {
+        this.fail(job, 'MEDIA_GENERATION_FAILED')
+        continue
+      }
       this.schedule(job)
     }
   }
@@ -479,7 +489,11 @@ export class VideoJobRunner {
   }
 
   private schedule(job: MediaGenerationJob): void {
-    if (this.stopped || !ACTIVE_STATUSES.includes(job.status)) return
+    if (
+      this.stopped
+      || isVideoSubmissionIntent(job)
+      || !ACTIVE_STATUSES.includes(job.status)
+    ) return
     this.clearTimer(job.id)
     const deadline = job.createdAt + VIDEO_TIMEOUT_MS
     const target = job.status === 'downloading'
@@ -524,6 +538,10 @@ export class VideoJobRunner {
   private async process(jobId: string, controller: AbortController): Promise<void> {
     const job = this.dependencies.database.mediaGenerationJobs.get(jobId)
     if (!job || !ACTIVE_STATUSES.includes(job.status) || this.stopped) return
+    if (isVideoSubmissionIntent(job)) {
+      this.fail(job, 'MEDIA_GENERATION_FAILED')
+      return
+    }
     const deadline = job.createdAt + VIDEO_TIMEOUT_MS
     if (this.now() >= deadline) {
       this.fail(job, 'MEDIA_GENERATION_TIMEOUT')
@@ -549,6 +567,10 @@ export class VideoJobRunner {
   }
 
   private async poll(job: MediaGenerationJob, signal: AbortSignal): Promise<void> {
+    if (isVideoSubmissionIntent(job)) {
+      this.fail(job, 'MEDIA_GENERATION_FAILED')
+      return
+    }
     const provider = this.provider(modelProviderIdSchema.parse(job.provider))
     if (!provider.pollVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     const result = await provider.pollVideo(job.providerJobId, signal)
@@ -627,6 +649,10 @@ export class VideoJobRunner {
     signal: AbortSignal,
     terminal?: VideoTerminalMetadata,
   ): Promise<void> {
+    if (isVideoSubmissionIntent(job)) {
+      this.fail(job, 'MEDIA_GENERATION_FAILED')
+      return
+    }
     const completedMetadata = terminal ?? terminalMetadata(job.parameters)
     const assetId = outputAssetId(job.id)
     let asset: MediaAsset | undefined

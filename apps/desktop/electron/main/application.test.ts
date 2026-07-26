@@ -427,6 +427,26 @@ describe('createApplicationRuntime', () => {
       options: expect.objectContaining({ durationSeconds: 5, resolution: '720p' }),
     }))
 
+    submitVideo.mockRejectedValueOnce({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    const failedVideoConversation = await runtime.services.chat.createConversation()
+    await expect(runtime.services.chat.send({
+      ...chatInput(failedVideoConversation.id, 'fail this video'),
+      outputType: 'video',
+    })).resolves.toEqual({ requestId: expect.any(String) })
+    expect(await runtime.services.chat.listMessages(failedVideoConversation.id))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'user' }),
+        expect.objectContaining({
+          role: 'assistant',
+          blocks: [expect.objectContaining({
+            type: 'media_generation',
+            kind: 'video',
+            status: 'failed',
+            errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
+          })],
+        }),
+      ]))
+
     const automaticConversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.send({
       ...chatInput(automaticConversation.id, 'make an automatic image'),

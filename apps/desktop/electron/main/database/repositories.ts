@@ -165,6 +165,7 @@ export interface MediaAssetRecord {
 export type MediaAssetPatch = Partial<Omit<MediaAssetRecord, 'id' | 'conversationId' | 'messageId' | 'createdAt'>>
 
 export type MediaGenerationJobStatus = 'pending' | 'in_progress' | 'downloading' | 'paused' | 'completed' | 'failed'
+export const VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID = 'autoforge_video_submission_intent'
 
 export interface MediaGenerationJob {
   id: string
@@ -185,6 +186,21 @@ export interface MediaGenerationJob {
   endedAt?: number
 }
 
+export function isVideoSubmissionIntent(job: MediaGenerationJob): boolean {
+  return job.providerJobId === VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID
+}
+
+function hasVideoSubmissionIntentMarker(parameters: unknown): boolean {
+  if (
+    typeof parameters !== 'object'
+    || parameters === null
+    || !('submission' in parameters)
+    || typeof parameters.submission !== 'object'
+    || parameters.submission === null
+  ) return false
+  return 'phase' in parameters.submission && parameters.submission.phase === 'intent'
+}
+
 export type MediaGenerationJobPatch = Partial<Omit<MediaGenerationJob, 'id' | 'conversationId' | 'assistantMessageId' | 'provider' | 'model' | 'kind' | 'providerJobId' | 'createdAt'>>
 export type MessageInput = Omit<Message, 'executionId'> & { executionId?: string }
 
@@ -198,8 +214,16 @@ export interface VideoGenerationTurnInput {
 
 export type MediaGenerationTurnInput = Omit<VideoGenerationTurnInput, 'job'>
 
-export type VideoGenerationTurnPreflightInput = Omit<VideoGenerationTurnInput, 'job'> & {
+export type VideoGenerationSubmissionIntentInput = Omit<VideoGenerationTurnInput, 'job'> & {
   job: Omit<MediaGenerationJob, 'providerJobId'>
+}
+
+export interface BindSubmittedVideoInput {
+  providerJobId: string
+  status: 'pending' | 'in_progress'
+  parameters: unknown
+  nextPollAt: number
+  updatedAt: number
 }
 
 export interface VideoGenerationTransitionPatch {
@@ -329,7 +353,8 @@ export interface AppRepositories {
   mediaAssets: { insert(value: MediaAssetRecord): MediaAssetRecord; get(id: string): MediaAssetRecord | undefined; listForConversation(conversationId: string): MediaAssetRecord[]; listUnclaimedBefore(timestamp: number): MediaAssetRecord[]; update(id: string, patch: MediaAssetPatch): MediaAssetRecord | undefined; delete(id: string): void }
   mediaGenerationJobs: {
     insert(value: MediaGenerationJob): MediaGenerationJob
-    preflightTurn(value: VideoGenerationTurnPreflightInput): void
+    startSubmissionIntent(value: VideoGenerationSubmissionIntentInput): MediaGenerationJob
+    bindSubmitted(id: string, input: BindSubmittedVideoInput): VideoGenerationTransition | undefined
     insertTurn(value: VideoGenerationTurnInput): MediaGenerationJob
     get(id: string): MediaGenerationJob | undefined
     reconcileInterrupted(endedAt: number): string[]
@@ -594,7 +619,7 @@ function insertMessageWithAssets(
 
 function validateVideoGenerationTurn(
   database: SqliteDatabase,
-  value: VideoGenerationTurnPreflightInput,
+  value: VideoGenerationSubmissionIntentInput,
   providerJobId?: string,
 ): ChatBlock[] {
   const { userMessage, userAssetIds, assistantMessage, run, job } = value
@@ -769,6 +794,7 @@ function resumableVideoAssociation(
 ): ResumableVideoAssociation | undefined {
   if (
     job.kind !== 'video'
+    || isVideoSubmissionIntent(job)
     || !['pending', 'in_progress', 'downloading', 'paused'].includes(job.status)
   ) return undefined
   const run = one<ChatRun>(
@@ -1026,9 +1052,85 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         if (!stored) throw new Error('Media generation job was not persisted')
         return stored
       },
-      preflightTurn(value) {
+      startSubmissionIntent(value) {
+        const { userMessage, userAssetIds, assistantMessage, run, job } = value
+        if (!hasVideoSubmissionIntentMarker(job.parameters)) {
+          throw new Error('Video submission intent marker is required')
+        }
         transaction(database, () => {
-          validateVideoGenerationTurn(database, value)
+          const assistantBlocks = validateVideoGenerationTurn(database, value)
+          insertMessageWithAssets(database, userMessage, userAssetIds)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
+            ...assistantMessage,
+            blocksJson: JSON.stringify(assistantBlocks),
+            executionId: assistantMessage.executionId ?? null,
+          })
+          database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, NULL, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
+            ...job,
+            providerJobId: VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID,
+            parametersJson: JSON.stringify(job.parameters),
+            pollAttempts: job.pollAttempts ?? 0,
+          })
+        })
+        const stored = this.get(job.id)
+        if (!stored || !isVideoSubmissionIntent(stored)) {
+          throw new Error('Video submission intent was not persisted')
+        }
+        return stored
+      },
+      bindSubmitted(id, input) {
+        identifierSchema.parse(id)
+        identifierSchema.parse(input.providerJobId)
+        if (
+          input.providerJobId === VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID
+          || (input.status !== 'pending' && input.status !== 'in_progress')
+          || !Number.isFinite(input.nextPollAt)
+          || !Number.isFinite(input.updatedAt)
+        ) throw new Error('Invalid submitted video job')
+        return transaction(database, () => {
+          const row = one<Query>(database, `SELECT ${mediaGenerationJobColumns} FROM media_generation_jobs WHERE id = @id`, { id })
+          if (!row) return undefined
+          const job = mediaGenerationJobFromRow(row)
+          if (job.status !== 'pending' || !isVideoSubmissionIntent(job)) return undefined
+          const active = activeVideoBlock(database, job)
+          videoRun(database, job)
+          const replacement: Extract<ChatBlock, { type: 'media_generation' }> = {
+            ...active.block,
+            status: input.status,
+          }
+          delete replacement.errorCode
+          const message = updateVideoBlock(
+            database,
+            active.message.id,
+            active.blocks,
+            active.index,
+            replacement,
+          )
+          if (database.prepare(`
+            UPDATE media_generation_jobs
+            SET provider_job_id = @providerJobId,
+                status = @status,
+                parameters_json = @parametersJson,
+                next_poll_at = @nextPollAt,
+                poll_attempts = 0,
+                error_code = NULL,
+                updated_at = @updatedAt
+            WHERE id = @id
+              AND provider_job_id = @intentProviderJobId
+              AND status = 'pending'
+          `).run({
+            id,
+            providerJobId: input.providerJobId,
+            status: input.status,
+            parametersJson: JSON.stringify(input.parameters),
+            nextPollAt: input.nextPollAt,
+            updatedAt: input.updatedAt,
+            intentProviderJobId: VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID,
+          }).changes !== 1) throw new Error('Video provider bind was lost')
+          const stored = this.get(id)
+          if (!stored) throw new Error('Video job was not persisted')
+          return { job: stored, message, block: replacement }
         })
       },
       insertTurn(value) {
