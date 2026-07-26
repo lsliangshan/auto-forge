@@ -189,7 +189,9 @@ export const useChatStore = defineStore('chat', {
     messagesByConversation: {} as Record<string, UiChatMessage[]>,
     draftsByConversation: {} as Record<string, MediaAsset[]>,
     preferencesByConversation: {} as Record<string, ConversationGenerationPreferences>,
+    pendingRequestByConversation: {} as Record<string, true>,
     activeRequestByConversation: {} as Record<string, string>,
+    _cancelRequestedByConversation: {} as Record<string, true>,
     _terminalRequests: {} as Record<string, true>,
     loading: false,
     error: '' as string,
@@ -207,7 +209,13 @@ export const useChatStore = defineStore('chat', {
     preferences(state): ConversationGenerationPreferences {
       return state.preferencesByConversation[state.selectedConversationId] ?? defaultGenerationPreferences()
     },
-    isRunning(state): boolean { return Boolean(state.activeRequestByConversation[state.selectedConversationId]) },
+    isRunning(state): boolean {
+      const conversationId = state.selectedConversationId
+      return Boolean(
+        state.pendingRequestByConversation[conversationId]
+          || state.activeRequestByConversation[conversationId],
+      )
+    },
   },
   actions: {
     resetLocalData() {
@@ -219,7 +227,9 @@ export const useChatStore = defineStore('chat', {
       this.messagesByConversation = {}
       this.draftsByConversation = {}
       this.preferencesByConversation = {}
+      this.pendingRequestByConversation = {}
       this.activeRequestByConversation = {}
+      this._cancelRequestedByConversation = {}
       this._terminalRequests = {}
       this._messageVersions = {}
       this._messageLoadVersions = {}
@@ -310,6 +320,9 @@ export const useChatStore = defineStore('chat', {
           delete this.messagesByConversation[id]
           delete this.draftsByConversation[id]
           delete this.preferencesByConversation[id]
+          delete this.pendingRequestByConversation[id]
+          delete this.activeRequestByConversation[id]
+          delete this._cancelRequestedByConversation[id]
           delete this._messageVersions[id]
           delete this._messageLoadVersions[id]
           this._preferenceVersions[id] = (this._preferenceVersions[id] ?? 0) + 1
@@ -563,6 +576,7 @@ export const useChatStore = defineStore('chat', {
         || this.isRunning) return false
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
+      this.pendingRequestByConversation[conversationId] = true
       const drafts = this.draftsByConversation[conversationId] ?? []
       const draftById = new Map(drafts.map((asset) => [asset.id, asset]))
       const localId = `local-${Date.now()}-${++localMessageSequence}`
@@ -597,7 +611,8 @@ export const useChatStore = defineStore('chat', {
       this._messageVersions[conversationId] = (this._messageVersions[conversationId] ?? 0) + 1
       this.error = ''
       try {
-        const result = await getDesktopApi().chat.send({
+        const api = getDesktopApi()
+        const result = await api.chat.send({
           conversationId,
           content: clean,
           assetIds: [...input.assetIds],
@@ -605,13 +620,30 @@ export const useChatStore = defineStore('chat', {
           generation: copyGenerationOptions(input.generation),
           ...(input.model ? { model: input.model } : {}),
         })
+        delete this.pendingRequestByConversation[conversationId]
         const sentIds = new Set(input.assetIds)
         this.draftsByConversation[conversationId] = (this.draftsByConversation[conversationId] ?? [])
           .filter(({ id }) => !sentIds.has(id))
-        if (this._terminalRequests[result.requestId]) delete this._terminalRequests[result.requestId]
+        const alreadyTerminal = Boolean(this._terminalRequests[result.requestId])
+        if (alreadyTerminal) delete this._terminalRequests[result.requestId]
         else this.activeRequestByConversation[conversationId] = result.requestId
+        const cancellationRequested = Boolean(this._cancelRequestedByConversation[conversationId])
+        delete this._cancelRequestedByConversation[conversationId]
+        if (cancellationRequested && !alreadyTerminal) {
+          try {
+            await api.chat.cancel(result.requestId)
+          } catch (error) {
+            this.reportConversationError(
+              conversationId,
+              epoch,
+              displayError(error, '取消生成失败'),
+            )
+          }
+        }
         return true
       } catch (error) {
+        delete this.pendingRequestByConversation[conversationId]
+        delete this._cancelRequestedByConversation[conversationId]
         this.messagesByConversation[conversationId] = (this.messagesByConversation[conversationId] ?? [])
           .filter(({ id }) => id !== localId)
         this._messageVersions[conversationId] = (this._messageVersions[conversationId] ?? 0) + 1
@@ -622,7 +654,12 @@ export const useChatStore = defineStore('chat', {
     async cancelCurrent() {
       const conversationId = this.selectedConversationId
       const requestId = this.activeRequestByConversation[conversationId]
-      if (!requestId) return
+      if (!requestId) {
+        if (this.pendingRequestByConversation[conversationId]) {
+          this._cancelRequestedByConversation[conversationId] = true
+        }
+        return
+      }
       try { await getDesktopApi().chat.cancel(requestId) }
       catch (error) { this.error = displayError(error, '取消生成失败') }
     },
@@ -630,12 +667,14 @@ export const useChatStore = defineStore('chat', {
       if (event.type === 'status') {
         if (event.status === 'running') {
           if (!this._terminalRequests[event.requestId]) this.activeRequestByConversation[event.conversationId] = event.requestId
-        } else if (this.activeRequestByConversation[event.conversationId] === event.requestId) {
-          delete this.activeRequestByConversation[event.conversationId]
         } else {
-          this._terminalRequests[event.requestId] = true
-          const terminalRequestIds = Object.keys(this._terminalRequests)
-          if (terminalRequestIds.length > 100) delete this._terminalRequests[terminalRequestIds[0]!]
+          const matchedActive = this.activeRequestByConversation[event.conversationId] === event.requestId
+          if (matchedActive) delete this.activeRequestByConversation[event.conversationId]
+          if (this.pendingRequestByConversation[event.conversationId] || !matchedActive) {
+            this._terminalRequests[event.requestId] = true
+            const terminalRequestIds = Object.keys(this._terminalRequests)
+            if (terminalRequestIds.length > 100) delete this._terminalRequests[terminalRequestIds[0]!]
+          }
         }
         if (event.status === 'failed'
           && event.error

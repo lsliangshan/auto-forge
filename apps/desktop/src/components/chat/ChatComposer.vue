@@ -299,10 +299,11 @@
         v-if="running"
         type="danger"
         plain
+        data-testid="cancel-send"
         :disabled="disabled"
         @click="$emit('cancel')"
       >
-        取消生成
+        取消发送
       </el-button>
       <el-button
         v-else

@@ -770,6 +770,66 @@ describe('chat interactions', () => {
     expect(store.messagesByConversation.conv_2?.[0]?.blocks[0]).toMatchObject({ text: '第二个会话' })
   })
 
+  it('enters running state before Main accepts and cancels as soon as the request ID arrives', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveSend!: (value: { requestId: string }) => void
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((resolve) => { resolveSend = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+    store.ensureSubscriptions()
+
+    const sending = store.send({
+      content: '立即显示取消',
+      assetIds: [],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+    })
+
+    expect(store.isRunning).toBe(true)
+    await store.cancelCurrent()
+    expect(api.chat.cancel).not.toHaveBeenCalled()
+
+    resolveSend({ requestId: 'req_pending' })
+    await sending
+
+    expect(api.chat.cancel).toHaveBeenCalledWith('req_pending')
+    expect(store.isRunning).toBe(true)
+    emitChat({
+      type: 'status',
+      conversationId: 'conv_1',
+      requestId: 'req_pending',
+      status: 'cancelled',
+    })
+    expect(store.isRunning).toBe(false)
+  })
+
+  it('clears pending request and cancellation intent when Main rejects', async () => {
+    const { api } = createEventApi()
+    let rejectSend!: (error: Error) => void
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((_resolve, reject) => { rejectSend = reject }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+
+    const sending = store.send({
+      content: '会被拒绝',
+      assetIds: [],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+    })
+    await store.cancelCurrent()
+    expect(store.isRunning).toBe(true)
+
+    rejectSend(new Error('rejected'))
+    expect(await sending).toBe(false)
+
+    expect(store.isRunning).toBe(false)
+    expect(store.pendingRequestByConversation.conv_1).toBeUndefined()
+    expect(store._cancelRequestedByConversation.conv_1).toBeUndefined()
+    expect(api.chat.cancel).not.toHaveBeenCalled()
+  })
+
   it('does not resurrect a request that completed before send returned', async () => {
     const { api, emitChat } = createEventApi()
     let resolveSend!: (value: { requestId: string }) => void
@@ -785,8 +845,39 @@ describe('chat interactions', () => {
       outputType: 'text',
       generation: generationPreferences().generation,
     })
+    expect(store.isRunning).toBe(true)
+    await store.cancelCurrent()
+    expect(api.chat.cancel).not.toHaveBeenCalled()
+
     emitChat({ type: 'status', conversationId: 'conv_1', requestId: 'req_fast', status: 'completed' })
     resolveSend({ requestId: 'req_fast' })
+    await sending
+
+    expect(api.chat.cancel).not.toHaveBeenCalled()
+    expect(store.isRunning).toBe(false)
+  })
+
+  it('does not resurrect a pending request cancelled after its running event', async () => {
+    const { api, emitChat } = createEventApi()
+    let resolveSend!: (value: { requestId: string }) => void
+    vi.mocked(api.chat.send).mockReturnValue(new Promise((resolve) => { resolveSend = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+    store.ensureSubscriptions()
+
+    const sending = store.send({
+      content: '运行后取消',
+      assetIds: [],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+    })
+    emitChat({ type: 'status', conversationId: 'conv_1', requestId: 'req_race', status: 'running' })
+    await store.cancelCurrent()
+    expect(api.chat.cancel).toHaveBeenCalledWith('req_race')
+    emitChat({ type: 'status', conversationId: 'conv_1', requestId: 'req_race', status: 'cancelled' })
+
+    resolveSend({ requestId: 'req_race' })
     await sending
 
     expect(store.isRunning).toBe(false)
@@ -1406,6 +1497,20 @@ describe('chat interactions', () => {
     await vi.waitFor(() => expect(api.chat.send).toHaveBeenCalledTimes(2))
     expect((textarea.element as HTMLTextAreaElement).value).toBe('')
     expect(store.drafts).toEqual([])
+  })
+
+  it('labels the running action as cancel send', () => {
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: true,
+        models: [modelInfo('text/model', ['text'])],
+        defaultModel: 'text/model',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="cancel-send"]').text()).toBe('取消发送')
   })
 
   it('restores a rejected submission without overwriting a newer draft', async () => {
