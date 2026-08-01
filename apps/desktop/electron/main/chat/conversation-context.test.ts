@@ -336,6 +336,27 @@ describe('conversation context manager', () => {
     expect(store.advance).not.toHaveBeenCalled()
   })
 
+  it('rejects before compressing a prefix when the mutable barrier suffix cannot fit', async () => {
+    const messages: Message[] = [
+      user(1, 'compressible prefix'),
+      {
+        id: 'message_2', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,
+        blocks: [{
+          type: 'media_generation', blockId: 'block_2', jobId: 'job_2',
+          kind: 'video', status: 'downloading',
+        }],
+      },
+      user(3, 'large immutable suffix '.repeat(700)),
+    ]
+    const { manager, provider, store } = contextHarness({ messages })
+
+    await expect(manager.prepare(prepareInput({
+      provider, beforeOrdinal: 4,
+    }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
   it('advances monotonically across multiple chunks while retaining a raw tail', async () => {
     const { manager, provider, store } = contextHarness({ forceOverflow: true })
 

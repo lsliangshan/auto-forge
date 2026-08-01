@@ -336,6 +336,13 @@ export function createConversationContextManager(
         }
 
         const mutableBarrier = rawHistory.findIndex(({ mutable }) => mutable)
+        if (
+          mutableBarrier !== -1
+          && requestTokens([
+            summaryMessage(''),
+            ...rawHistory.slice(mutableBarrier).map(({ message }) => message),
+          ], input) > chatBudget
+        ) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
         const protectedByBarrier = mutableBarrier === -1
           ? 0
           : rawHistory.length - mutableBarrier
