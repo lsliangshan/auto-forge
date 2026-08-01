@@ -5,13 +5,14 @@
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
-    "predev": "install-electron && electron-rebuild -f -w better-sqlite3",
+    "predev": "pnpm prepare:native-electron",
     "dev": "electron-vite dev",
     "build": "electron-vite build && tsup electron/workers/workflow-runner.ts --format cjs --platform node --out-dir out/workers --clean false",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
-    "test": "vitest run --config vitest.config.ts && vitest run --config vitest.node.config.ts",
+    "pretest": "pnpm prepare:native-electron",
+    "test": "node scripts/run-vitest-electron.mjs run --config vitest.config.ts && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts",
     "stage:browser": "node scripts/stage-browser.mjs",
-    "prepare:native-electron": "node scripts/prepare-native-electron.mjs",
+    "prepare:native-electron": "install-electron && node scripts/prepare-native-electron.mjs",
     "verify:packaged-native": "node scripts/verify-packaged-native.mjs",
     "dist:dir": "pnpm stage:browser && pnpm prepare:native-electron && electron-builder --dir --config electron-builder.yml && pnpm verify:packaged-native"
   },
