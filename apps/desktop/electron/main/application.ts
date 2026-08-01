@@ -398,7 +398,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providers: providerRegistry,
     persistence,
     media,
-    downloader: new SafeMediaDownloader(),
+    downloader: new SafeMediaDownloader({
+      fetch: options.networkProxy.fetch.bind(options.networkProxy),
+    }),
     emit: emitChat,
   })
   const videoJobs = new VideoJobRunner({

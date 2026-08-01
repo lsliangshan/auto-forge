@@ -625,14 +625,23 @@ describe('createApplicationRuntime', () => {
   it('routes an explicit image request to OpenRouter image generation without invoking text chat', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-image-route-'))
     directories.push(root)
+    const generated = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'),
+      Buffer.from('generated'),
+    ])
+    const directFetch = vi.spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new TypeError('direct fetch is forbidden in this test'))
+    networkProxy.fetch.mockImplementation(async () => new Response(generated, {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(generated.byteLength),
+      },
+    }))
     const generateImage = vi.fn(async () => ({
       outputs: [{
-        type: 'base64' as const,
-        mimeType: 'image/png',
-        dataBase64: Buffer.concat([
-          Buffer.from('89504e470d0a1a0a', 'hex'),
-          Buffer.from('generated'),
-        ]).toString('base64'),
+        type: 'url' as const,
+        url: 'https://93.184.216.34/generated.png',
       }],
     }))
     const stream = vi.fn(async function* () {
@@ -684,7 +693,27 @@ describe('createApplicationRuntime', () => {
     })
 
     await vi.waitFor(() => expect(generateImage).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(networkProxy.fetch).toHaveBeenCalledWith(
+      'https://93.184.216.34/generated.png',
+      expect.objectContaining({
+        method: 'GET',
+        redirect: 'manual',
+        signal: expect.any(AbortSignal),
+      }),
+    ))
+    await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          role: 'assistant',
+          blocks: [expect.objectContaining({
+            type: 'media',
+            kind: 'image',
+            purpose: 'output',
+          })],
+        }),
+      ])))
     expect(stream).not.toHaveBeenCalled()
+    expect(directFetch).not.toHaveBeenCalled()
     await runtime.close()
   })
 

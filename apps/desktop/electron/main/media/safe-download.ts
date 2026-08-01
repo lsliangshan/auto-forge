@@ -1,7 +1,5 @@
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns'
-import type { ClientRequest, IncomingMessage } from 'node:http'
-import { request as httpsRequest, type RequestOptions } from 'node:https'
-import { isIP, type Socket } from 'node:net'
+import { isIP } from 'node:net'
 import { toSafeAppError, type AppError } from '@autoforge/shared'
 
 export const MAX_SAFE_DOWNLOAD_BYTES = 500 * 1024 * 1024
@@ -15,7 +13,6 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const CONTENT_TYPE_PATTERN = /^[!#$%&'*+.^_`|~0-9a-z-]+\/[!#$%&'*+.^_`|~0-9a-z-]+$/i
 
 type TimerHandle = unknown
-type PinnedLookup = NonNullable<RequestOptions['lookup']>
 
 export interface SafeDownloadOptions {
   maxBytes: number
@@ -32,11 +29,7 @@ export interface SafeDownloadResult {
 
 export interface SafeMediaDownloaderDependencies {
   resolveHost(hostname: string): Promise<readonly LookupAddress[]>
-  request(
-    url: URL,
-    options: RequestOptions,
-    callback: (response: IncomingMessage) => void,
-  ): ClientRequest
+  fetch(input: string, init: RequestInit): Promise<Response>
   setTimer(callback: () => void, milliseconds: number): TimerHandle
   clearTimer(handle: TimerHandle): void
 }
@@ -64,17 +57,6 @@ interface BodyResult extends SafeDownloadResult {
 }
 
 type RequestResult = RedirectResult | BodyResult
-
-interface LookupOptionsLike {
-  all?: boolean
-  family?: number | string
-}
-
-type LookupCallback = (
-  error: NodeJS.ErrnoException | null,
-  address?: string | readonly LookupAddress[],
-  family?: number,
-) => void
 
 function failure(): AppError {
   return toSafeAppError({ code: 'MEDIA_DOWNLOAD_FAILED' })
@@ -357,44 +339,15 @@ function publicAddresses(addresses: readonly LookupAddress[]): readonly LookupAd
   return validated
 }
 
-function unavailableAddress(): NodeJS.ErrnoException {
-  return Object.assign(new Error('Address unavailable'), { code: 'ENOTFOUND' })
-}
-
-function pinnedLookup(hostname: string, addresses: readonly LookupAddress[]): PinnedLookup {
-  const lookup = (
-    requestedHostname: string,
-    options: LookupOptionsLike | number,
-    callback: LookupCallback,
-  ): void => {
-    if (requestedHostname !== hostname) {
-      callback(unavailableAddress())
-      return
-    }
-    const lookupOptions = typeof options === 'number' ? { family: options } : options
-    const family = lookupOptions.family === 4 || lookupOptions.family === 'IPv4'
-      ? 4
-      : lookupOptions.family === 6 || lookupOptions.family === 'IPv6' ? 6 : 0
-    const eligible = family === 0 ? addresses : addresses.filter((answer) => answer.family === family)
-    if (eligible.length === 0) {
-      callback(unavailableAddress())
-      return
-    }
-    if (lookupOptions.all) callback(null, eligible)
-    else callback(null, eligible[0]!.address, eligible[0]!.family)
-  }
-  return lookup as PinnedLookup
-}
-
-function normalizedContentType(value: string | string[] | undefined): string | undefined {
+function normalizedContentType(value: string | null): string | undefined {
   if (typeof value !== 'string') return undefined
   const mediaType = value.split(';', 1)[0]!.trim().toLowerCase()
   return CONTENT_TYPE_PATTERN.test(mediaType) ? mediaType : undefined
 }
 
-function contentLength(value: string | string[] | undefined): number | undefined {
-  if (value === undefined) return undefined
-  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/u.test(value)) throw failure()
+function contentLength(value: string | null): number | undefined {
+  if (value === null) return undefined
+  if (!/^(?:0|[1-9]\d*)$/u.test(value)) throw failure()
   const parsed = Number(value)
   if (!Number.isSafeInteger(parsed)) throw failure()
   return parsed
@@ -412,7 +365,7 @@ export class SafeMediaDownloader {
   constructor(dependencies: Partial<SafeMediaDownloaderDependencies> = {}) {
     this.dependencies = {
       resolveHost: defaultResolveHost,
-      request: (url, options, callback) => httpsRequest(url, options, callback),
+      fetch: (input, init) => globalThis.fetch(input, init),
       setTimer: (callback, milliseconds) => setTimeout(callback, milliseconds),
       clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
       ...dependencies,
@@ -487,17 +440,15 @@ export class SafeMediaDownloader {
     while (true) {
       if (context.aborted) throw failure()
       const hostname = bareHostname(currentUrl)
-      let addresses: readonly LookupAddress[]
       try {
-        addresses = isIP(hostname) === 0
-          ? publicAddresses(await this.dependencies.resolveHost(hostname))
-          : publicAddresses([{ address: hostname, family: isIP(hostname) as 4 | 6 }])
+        if (isIP(hostname) === 0) publicAddresses(await this.dependencies.resolveHost(hostname))
+        else publicAddresses([{ address: hostname, family: isIP(hostname) as 4 | 6 }])
       } catch {
         throw failure()
       }
       if (context.aborted) throw failure()
 
-      const result = await this.requestOnce(currentUrl, hostname, addresses, destination, options, context)
+      const result = await this.requestOnce(currentUrl, destination, options, context)
       if (result.kind === 'body') {
         return {
           byteSize: result.byteSize,
@@ -512,23 +463,22 @@ export class SafeMediaDownloader {
 
   private requestOnce(
     url: URL,
-    hostname: string,
-    addresses: readonly LookupAddress[],
     destination: NodeJS.WritableStream,
     options: ValidatedOptions,
     context: DownloadContext,
   ): Promise<RequestResult> {
     return new Promise<RequestResult>((resolve, reject) => {
-      let request: ClientRequest
-      let socket: Socket | undefined
-      let response: IncomingMessage | undefined
+      const controller = new AbortController()
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+      let responseBody: Response['body']
       let connectTimer: TimerHandle | undefined
       let firstByteTimer: TimerHandle | undefined
       let settled = false
-      let responseEnded = false
+      let bodyEnded = false
       let waitingForDrain = false
       let byteSize = 0
       let pendingWrites = 0
+      let resumeAfterDrain: (() => void) | undefined
       let destinationWriteGuardInstalled = false
       let writeCallbackErrorObserved = false
       let writeErrorEventObserved = false
@@ -564,24 +514,19 @@ export class SafeMediaDownloader {
       const cleanup = () => {
         clearConnectTimer()
         clearFirstByteTimer()
-        request.removeListener('socket', onSocket)
-        request.removeListener('error', onRequestError)
-        socket?.removeListener('secureConnect', onConnected)
-        socket?.removeListener('error', onSocketError)
-        if (response) {
-          response.removeListener('data', onData)
-          response.removeListener('end', onEnd)
-          response.removeListener('error', onResponseError)
-          response.removeListener('aborted', onResponseAborted)
-          response.removeListener('close', onResponseClose)
-        }
         destination.removeListener('drain', onDrain)
+        waitingForDrain = false
+        resumeAfterDrain?.()
+        resumeAfterDrain = undefined
         releaseDestinationWriteGuardIfSettled()
         context.abortCurrent = undefined
       }
       const cancelOwnedStreams = () => {
-        if (response && !response.destroyed) response.destroy()
-        if (!request.destroyed) request.destroy()
+        controller.abort()
+        if (reader) void reader.cancel(failure()).catch(() => undefined)
+        else if (responseBody && typeof responseBody.cancel === 'function') {
+          void responseBody.cancel(failure()).catch(() => undefined)
+        }
       }
       const fail = () => {
         if (settled) return
@@ -601,31 +546,8 @@ export class SafeMediaDownloader {
         fail()
         releaseDestinationWriteGuardIfSettled()
       }
-      const cancelResponse = () => {
-        if (response && !response.destroyed) response.destroy()
-      }
-      const onConnected = () => {
-        if (settled) return
-        clearConnectTimer()
-        if (firstByteTimer === undefined) {
-          firstByteTimer = this.dependencies.setTimer(fail, options.firstByteTimeoutMs)
-        }
-      }
-      const onSocket = (connectedSocket: Socket) => {
-        socket = connectedSocket
-        socket.on('secureConnect', onConnected)
-        socket.on('error', onSocketError)
-        if (!socket.connecting) onConnected()
-      }
-      const onRequestError = () => fail()
-      const onSocketError = () => fail()
-      const onResponseError = () => fail()
-      const onResponseAborted = () => fail()
-      const onResponseClose = () => {
-        if (!responseEnded) fail()
-      }
       const completeBody = () => {
-        if (!responseEnded || pendingWrites !== 0 || waitingForDrain) return
+        if (!bodyEnded || pendingWrites !== 0 || waitingForDrain) return
         if (declaredContentLength !== undefined && byteSize !== declaredContentLength) {
           fail()
           return
@@ -640,15 +562,14 @@ export class SafeMediaDownloader {
         if (settled || !waitingForDrain) return
         waitingForDrain = false
         destination.removeListener('drain', onDrain)
-        if (responseEnded) {
-          completeBody()
-        } else {
-          response?.resume()
-        }
+        const resume = resumeAfterDrain
+        resumeAfterDrain = undefined
+        resume?.()
+        completeBody()
       }
-      const onData = (chunk: Buffer | string) => {
-        if (settled) return
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const writeChunk = (chunk: Uint8Array): Promise<void> | undefined => {
+        if (settled) return undefined
+        const bytes = Buffer.from(chunk)
         if (
           bytes.byteLength > options.maxBytes - byteSize
           || (
@@ -657,7 +578,7 @@ export class SafeMediaDownloader {
           )
         ) {
           fail()
-          return
+          return undefined
         }
         byteSize += bytes.byteLength
         pendingWrites += 1
@@ -675,85 +596,106 @@ export class SafeMediaDownloader {
           })
           if (accepted === false) {
             waitingForDrain = true
-            response?.pause()
             destination.on('drain', onDrain)
+            return new Promise<void>((resolveDrain) => { resumeAfterDrain = resolveDrain })
           }
         } catch {
           pendingWrites -= 1
           fail()
           releaseDestinationWriteGuardIfSettled()
         }
+        return undefined
       }
-      const onEnd = () => {
-        responseEnded = true
-        completeBody()
-      }
-      const onResponse = (incoming: IncomingMessage) => {
-        if (settled) {
-          incoming.destroy()
-          return
-        }
-        response = incoming
-        clearConnectTimer()
-        clearFirstByteTimer()
-        const statusCode = response.statusCode
-        if (!Number.isInteger(statusCode)) {
-          cancelResponse()
+      context.abortCurrent = fail
+      connectTimer = this.dependencies.setTimer(fail, options.connectTimeoutMs)
+      void (async () => {
+        let response: Response
+        try {
+          response = await this.dependencies.fetch(url.href, {
+            method: 'GET',
+            redirect: 'manual',
+            signal: controller.signal,
+          })
+        } catch {
           fail()
           return
         }
-        if (REDIRECT_STATUSES.has(statusCode!)) {
-          const location = response.headers.location
-          cancelResponse()
+        clearConnectTimer()
+        if (settled || context.aborted) {
+          if (response.body) void response.body.cancel(failure()).catch(() => undefined)
+          return
+        }
+        responseBody = response.body
+        if (
+          !Number.isInteger(response.status)
+          || !response.headers
+          || typeof response.headers.get !== 'function'
+        ) {
+          fail()
+          return
+        }
+
+        const body = responseBody
+        if (!body || typeof body.getReader !== 'function') {
+          fail()
+          return
+        }
+        try {
+          reader = body.getReader()
+        } catch {
+          fail()
+          return
+        }
+
+        if (REDIRECT_STATUSES.has(response.status)) {
+          const location = response.headers.get('location')
+          try { await reader.cancel(failure()) } catch { /* Lease release is owned by the managed fetch wrapper. */ }
           if (typeof location !== 'string') fail()
           else succeed({ kind: 'redirect', location })
           return
         }
-        if (statusCode! < 200 || statusCode! > 299) {
-          cancelResponse()
+        if (response.status < 200 || response.status > 299) {
           fail()
           return
         }
 
         try {
-          declaredContentLength = contentLength(response.headers['content-length'])
+          declaredContentLength = contentLength(response.headers.get('content-length'))
         } catch {
-          cancelResponse()
           fail()
           return
         }
         if (declaredContentLength !== undefined && declaredContentLength > options.maxBytes) {
-          cancelResponse()
           fail()
           return
         }
-        responseContentType = normalizedContentType(response.headers['content-type'])
-        response.on('data', onData)
-        response.on('end', onEnd)
-        response.on('error', onResponseError)
-        response.on('aborted', onResponseAborted)
-        response.on('close', onResponseClose)
-      }
+        responseContentType = normalizedContentType(response.headers.get('content-type'))
+        firstByteTimer = this.dependencies.setTimer(fail, options.firstByteTimeoutMs)
 
-      try {
-        request = this.dependencies.request(url, {
-          agent: false,
-          lookup: pinnedLookup(hostname, addresses),
-          method: 'GET',
-        }, onResponse)
-      } catch {
-        reject(failure())
-        return
-      }
-      context.abortCurrent = fail
-      request.on('socket', onSocket)
-      request.on('error', onRequestError)
-      connectTimer = this.dependencies.setTimer(fail, options.connectTimeoutMs)
-      try {
-        request.end()
-      } catch {
-        fail()
-      }
+        while (!settled) {
+          let result: ReadableStreamReadResult<Uint8Array>
+          try {
+            result = await reader.read()
+          } catch {
+            fail()
+            return
+          }
+          if (settled) return
+          if (result.done) {
+            clearFirstByteTimer()
+            bodyEnded = true
+            completeBody()
+            return
+          }
+          clearFirstByteTimer()
+          if (!(result.value instanceof Uint8Array)) {
+            fail()
+            return
+          }
+          const backpressure = writeChunk(result.value)
+          if (backpressure) await backpressure
+        }
+      })()
     })
   }
 }
