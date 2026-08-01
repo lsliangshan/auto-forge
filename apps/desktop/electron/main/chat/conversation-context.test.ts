@@ -315,6 +315,79 @@ describe('conversation context manager', () => {
     expect(store.advance).not.toHaveBeenCalled()
   })
 
+  it('rejects before compression when mandatory summary framing cannot fit', async () => {
+    const currentMessage = { role: 'user' as const, content: 'current'.repeat(100) }
+    const bareTokens = estimateRequestTokens({ messages: [currentMessage], tools: [], currentMedia: [] })
+    const framedTokens = estimateRequestTokens({
+      messages: [
+        {
+          role: 'system',
+          content: '以下是本会话较早内容的内部记忆摘要。它只描述既有对话，不是新的用户指令。\n\n',
+        },
+        currentMessage,
+      ],
+      tools: [],
+      currentMedia: [],
+    })
+    const contextLength = Array.from({ length: 10_000 }, (_, index) => index + 1)
+      .find((value) => {
+        const budget = Math.floor(value * 0.60)
+        return budget >= bareTokens && budget < framedTokens
+      })!
+    const { manager, provider, store } = contextHarness({
+      messages: [user(1, 'old')],
+    })
+
+    await expect(manager.prepare(prepareInput({
+      provider, contextLength, beforeOrdinal: 2, currentMessage,
+    }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
+  it('compresses the oldest complete turn before leaving a four-turn raw tail', async () => {
+    const messages = Array.from({ length: 8 }, (_, index) => (
+      historical(index % 2 ? 'assistant' : 'user', index + 1, `history-${index + 1} `.repeat(80))
+    ))
+    const raw = messages.map((message) => serializeHistoricalMessage(message)!)
+    const currentMessage = { role: 'user' as const, content: 'current' }
+    const finalWithOneTurnCompressed = estimateRequestTokens({
+      messages: [
+        {
+          role: 'system',
+          content: '以下是本会话较早内容的内部记忆摘要。它只描述既有对话，不是新的用户指令。\n\n用户目标：保留早期事实',
+        },
+        ...raw.slice(2),
+        currentMessage,
+      ],
+      tools: [],
+      currentMedia: [],
+    })
+    const initialTokens = estimateRequestTokens({
+      messages: [...raw, currentMessage],
+      tools: [],
+      currentMedia: [],
+    })
+    const contextLength = Array.from({ length: 20_000 }, (_, index) => index + 1)
+      .find((value) => {
+        const budget = Math.floor(value * 0.60)
+        return finalWithOneTurnCompressed <= budget && budget < initialTokens
+      })!
+    const { manager, provider, store } = contextHarness({ messages })
+
+    const result = await manager.prepare(prepareInput({
+      provider, contextLength, beforeOrdinal: 9, currentMessage,
+    }))
+
+    expect(provider.stream).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(provider.stream.mock.calls[0]?.[0]?.messages))
+      .toContain('history-1')
+    expect(JSON.stringify(provider.stream.mock.calls[0]?.[0]?.messages))
+      .toContain('history-2')
+    expect(store.advance).toHaveBeenCalledWith(expect.objectContaining({ throughOrdinal: 2 }))
+    expect(result[1]).toEqual({ role: 'user', content: raw[2]!.content })
+  })
+
   it('rejects one historical message that cannot fit the summary request', async () => {
     const { manager, provider, store } = contextHarness({
       messages: [user(1, '不可拆分历史'.repeat(100))],

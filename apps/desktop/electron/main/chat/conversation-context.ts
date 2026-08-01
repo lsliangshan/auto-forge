@@ -216,6 +216,20 @@ function selectCompressionChunk(
   if (!isCompressionChunkWithinBudget(summary, [eligible[0]!], budget)) {
     throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
   }
+  const completeTurnEnds = eligible.flatMap((message, index) => (
+    index > 0
+      && eligible[index - 1]!.message.role === 'user'
+      && message.message.role === 'assistant'
+      ? [index + 1]
+      : []
+  ))
+  const fittingTurnEnd = completeTurnEnds
+    .filter((end) => isCompressionChunkWithinBudget(summary, eligible.slice(0, end), budget))
+    .at(-1)
+  if (fittingTurnEnd !== undefined) return eligible.slice(0, fittingTurnEnd)
+
+  // A complete oldest turn cannot fit in the summary request. Make the only
+  // safe fallback at a persisted-message boundary so compression can progress.
   const chunk: HistoricalModelMessage[] = []
   for (const message of eligible) {
     const next = [...chunk, message]
@@ -223,6 +237,25 @@ function selectCompressionChunk(
     chunk.push(message)
   }
   return chunk
+}
+
+function protectedRawMessageCount(rawHistory: readonly HistoricalModelMessage[]): number {
+  let protectedCount = 0
+  while (
+    protectedCount < 8
+    && rawHistory.length - protectedCount >= 2
+    && rawHistory[rawHistory.length - protectedCount - 2]!.message.role === 'user'
+    && rawHistory[rawHistory.length - protectedCount - 1]!.message.role === 'assistant'
+  ) {
+    protectedCount += 2
+  }
+  if (rawHistory.length > protectedCount) return protectedCount
+  if (
+    rawHistory.length >= 2
+    && rawHistory[0]!.message.role === 'user'
+    && rawHistory[1]!.message.role === 'assistant'
+  ) return rawHistory.length - 2
+  return Math.max(0, rawHistory.length - 1)
 }
 
 async function streamSummary(
@@ -287,17 +320,14 @@ export function createConversationContextManager(
         ]
         if (requestTokens(history, input) <= chatBudget) return history
         if (rawHistory.length === 0) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+        if (requestTokens([summaryMessage('')], input) > chatBudget) {
+          throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+        }
 
-        // Four adjacent user/assistant turns are protected first. If that does
-        // not leave an eligible message, move the boundary one whole message.
-        const defaultProtectedCount = Math.min(8, rawHistory.length)
-        const protectedCount = defaultProtectedCount === rawHistory.length
-          ? Math.max(0, defaultProtectedCount - 1)
-          : defaultProtectedCount
         const chunk = selectCompressionChunk(
           summary,
           rawHistory,
-          protectedCount,
+          protectedRawMessageCount(rawHistory),
           summaryInputBudget,
         )
         if (chunk.length === 0) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
