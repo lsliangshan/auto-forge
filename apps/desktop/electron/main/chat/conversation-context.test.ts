@@ -1,9 +1,17 @@
-import { describe, expect, it } from 'vitest'
-import type { Message } from '../database/repositories.js'
+import { describe, expect, it, vi } from 'vitest'
+import type {
+  ConversationContextAdvanceInput,
+  ConversationContextRecord,
+  Message,
+} from '../database/repositories.js'
+import type { ModelStreamEvent } from './model-provider.js'
 import {
+  createConversationContextManager,
   currentMediaTokenReserve,
   estimateRequestTokens,
   estimateTextTokens,
+  type ConversationContextProviderPort,
+  type PrepareConversationContextInput,
   serializeHistoricalMessage,
 } from './conversation-context.js'
 
@@ -124,5 +132,214 @@ describe('conversation context primitives', () => {
     expect(currentMediaTokenReserve({ kind: 'video', durationMs: 60_000 })).toBe(7_680)
     expect(currentMediaTokenReserve({ kind: 'video' })).toBe(16_384)
     expect(currentMediaTokenReserve({ kind: 'video', durationMs: 300_000 })).toBe(16_384)
+  })
+})
+
+function historical(role: 'user' | 'assistant', ordinal: number, text: string): Message {
+  return {
+    id: `message_${ordinal}`,
+    conversationId: 'c1',
+    role,
+    ordinal,
+    blocks: [{ type: 'text', text }],
+    createdAt: ordinal,
+  }
+}
+
+const user = (ordinal: number, text: string) => historical('user', ordinal, text)
+const assistant = (ordinal: number, text: string) => historical('assistant', ordinal, text)
+
+function prepareInput(
+  overrides: Partial<PrepareConversationContextInput> = {},
+): PrepareConversationContextInput {
+  return {
+    conversationId: 'c1',
+    beforeOrdinal: 11,
+    provider: overrides.provider ?? {
+      stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {}),
+    },
+    model: 'tiny-model',
+    contextLength: 2_000,
+    currentMessage: { role: 'user', content: 'current' },
+    tools: [],
+    currentMedia: [],
+    signal: new AbortController().signal,
+    ...overrides,
+  }
+}
+
+function contextHarness(options: {
+  messages?: Message[]
+  context?: ConversationContextRecord
+  events?: ModelStreamEvent[]
+  forceOverflow?: boolean
+} = {}) {
+  let context = options.context
+  const advance = vi.fn((input: ConversationContextAdvanceInput) => {
+    if ((context?.throughOrdinal ?? 0) !== input.expectedThroughOrdinal) {
+      throw new Error('Conversation context checkpoint changed')
+    }
+    context = {
+      conversationId: input.conversationId,
+      summaryText: input.summaryText,
+      throughOrdinal: input.throughOrdinal,
+      estimatedTokens: input.estimatedTokens,
+      updatedAt: input.updatedAt,
+    }
+    return context
+  })
+  const provider = {
+    stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {
+      for (const event of options.events ?? [
+        { type: 'text_delta' as const, choiceIndex: 0, text: '用户目标：保留早期事实' },
+        { type: 'finish' as const, choiceIndex: 0, reason: 'stop' },
+      ]) yield event
+    }),
+  }
+  const repositories = {
+    messages: {
+      listBeforeOrdinal: vi.fn(() => options.messages ?? (
+        options.forceOverflow
+          ? Array.from({ length: 10 }, (_, index) => historical(index % 2 ? 'assistant' : 'user', index + 1, '很长的历史内容'.repeat(20)))
+          : []
+      )),
+    },
+    conversationContexts: {
+      get: vi.fn(() => context),
+      advance,
+    },
+  }
+  return {
+    manager: createConversationContextManager(repositories),
+    provider,
+    store: repositories.conversationContexts,
+  }
+}
+
+describe('conversation context manager', () => {
+  it('returns ordered raw history without calling the provider below budget', async () => {
+    const { manager, provider } = contextHarness({
+      messages: [user(1, '我的代号是青山'), assistant(2, '已记住')],
+    })
+
+    await expect(manager.prepare({
+      conversationId: 'c1', beforeOrdinal: 3,
+      provider, model: 'model', contextLength: 32_000,
+      currentMessage: { role: 'user', content: '我的代号是什么？' },
+      tools: [], currentMedia: [], signal: new AbortController().signal,
+    })).resolves.toEqual([
+      { role: 'user', content: '我的代号是青山' },
+      { role: 'assistant', content: '已记住' },
+    ])
+    expect(provider.stream).not.toHaveBeenCalled()
+  })
+
+  it('compresses oldest messages and returns a summary plus the protected tail', async () => {
+    const { manager, provider, store } = contextHarness({ forceOverflow: true })
+    const result = await manager.prepare(prepareInput({ provider }))
+
+    expect(provider.stream).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'tiny-model',
+      maxOutputTokens: 200,
+      messages: expect.arrayContaining([
+        expect.objectContaining({ role: 'system' }),
+      ]),
+    }))
+    expect(provider.stream.mock.calls[0]?.[0]).not.toHaveProperty('tools')
+    expect(store.advance).toHaveBeenCalledWith(expect.objectContaining({
+      expectedThroughOrdinal: 0,
+      summaryText: '用户目标：保留早期事实',
+      throughOrdinal: expect.any(Number),
+    }))
+    expect(result[0]).toEqual(expect.objectContaining({
+      role: 'system',
+      content: expect.stringContaining('用户目标：保留早期事实'),
+    }))
+    expect(result.at(-1)).toEqual(expect.objectContaining({ role: 'assistant' }))
+  })
+
+  it('compresses only messages after the stored checkpoint', async () => {
+    const messages = Array.from({ length: 12 }, (_, index) => (
+      historical(index % 2 ? 'assistant' : 'user', index + 1, `history-${index + 1} `.repeat(100))
+    ))
+    const { manager, provider, store } = contextHarness({
+      messages,
+      context: {
+        conversationId: 'c1', summaryText: 'old-summary',
+        throughOrdinal: 4, estimatedTokens: 4, updatedAt: 4,
+      },
+    })
+
+    await manager.prepare(prepareInput({ provider, beforeOrdinal: 13 }))
+
+    const compressionBody = JSON.stringify(provider.stream.mock.calls[0]?.[0]?.messages)
+    expect(compressionBody).toContain('old-summary')
+    expect(compressionBody).toContain('history-5')
+    expect(compressionBody).not.toContain('history-4')
+    expect(store.advance).toHaveBeenCalledWith(expect.objectContaining({
+      expectedThroughOrdinal: 4,
+    }))
+  })
+
+  it('advances monotonically across multiple chunks while retaining a raw tail', async () => {
+    const { manager, provider, store } = contextHarness({ forceOverflow: true })
+
+    const result = await manager.prepare(prepareInput({ provider }))
+
+    const throughOrdinals = store.advance.mock.calls.map(([input]) => input.throughOrdinal)
+    expect(throughOrdinals.length).toBeGreaterThan(1)
+    expect(throughOrdinals).toEqual([...throughOrdinals].sort((left, right) => left - right))
+    expect(result.at(-1)).toEqual(expect.objectContaining({ role: 'assistant' }))
+  })
+
+  it.each([
+    ['empty', []],
+    ['missing stop', [{ type: 'text_delta', choiceIndex: 0, text: 'partial' }]],
+    ['wrong finish', [{ type: 'text_delta', choiceIndex: 0, text: 'partial' }, { type: 'finish', choiceIndex: 0, reason: 'length' }]],
+  ] as const)('does not advance the checkpoint for %s compression', async (_name, events) => {
+    const { manager, provider, store } = contextHarness({ events: [...events], forceOverflow: true })
+    await expect(manager.prepare(prepareInput({ provider }))).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
+  it('rejects a current message that cannot fit by itself', async () => {
+    const { manager, provider, store } = contextHarness()
+    await expect(manager.prepare(prepareInput({
+      provider,
+      contextLength: 100,
+      currentMessage: { role: 'user', content: '当前输入'.repeat(100) },
+    }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
+  it('rejects one historical message that cannot fit the summary request', async () => {
+    const { manager, provider, store } = contextHarness({
+      messages: [user(1, '不可拆分历史'.repeat(100))],
+    })
+    await expect(manager.prepare(prepareInput({
+      provider, contextLength: 100, beforeOrdinal: 2,
+    }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
+  it('maps compression cancellation without advancing the checkpoint', async () => {
+    const { manager, store } = contextHarness({ forceOverflow: true })
+    const controller = new AbortController()
+    const provider = {
+      stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {
+        controller.abort()
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: 'never stored' }
+      }),
+    }
+
+    await expect(manager.prepare(prepareInput({
+      provider,
+      signal: controller.signal,
+    }))).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(store.advance).not.toHaveBeenCalled()
   })
 })

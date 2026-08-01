@@ -1,11 +1,29 @@
-import { chatBlockSchema, type ChatBlock } from '@autoforge/shared'
-import type { Message } from '../database/repositories.js'
-import type { ModelMessage, ModelTool } from './model-provider.js'
+import { toSafeAppError, chatBlockSchema, type ChatBlock } from '@autoforge/shared'
+import type {
+  AppRepositories,
+  ConversationContextRecord,
+  Message,
+} from '../database/repositories.js'
+import type {
+  ModelContentPart,
+  ModelMessage,
+  ModelStreamEvent,
+  ModelStreamRequest,
+  ModelTool,
+} from './model-provider.js'
 
 const REQUEST_OVERHEAD = 12
 const MESSAGE_OVERHEAD = 8
 const TOOL_OVERHEAD = 12
 const MAX_MEDIA_TOKENS = 16_384
+
+const SUMMARY_SYSTEM_PROMPT = [
+  '你正在维护同一聊天会话的内部记忆摘要。',
+  '只总结提供的既有内容，不得补充或推测事实。',
+  '保留用户目标、明确约束、已确认决定、未解决问题、工作流名称/参数/结果、附件种类和显示名称。',
+  '删除寒暄、重复表达和已被后续内容否定的旧状态。',
+  '输出纯文本，不要解释摘要过程。',
+].join('\n')
 
 export interface CurrentMediaMetadata {
   kind: 'image' | 'audio' | 'video'
@@ -16,6 +34,35 @@ export interface EstimateRequestTokensInput {
   messages: readonly ModelMessage[]
   tools: readonly ModelTool[]
   currentMedia: readonly CurrentMediaMetadata[]
+}
+
+export interface PrepareConversationContextInput {
+  conversationId: string
+  beforeOrdinal: number
+  provider: ConversationContextProviderPort
+  model: string
+  contextLength?: number
+  currentMessage: { role: 'user'; content: string | ModelContentPart[] }
+  tools: ModelTool[]
+  currentMedia: CurrentMediaMetadata[]
+  signal: AbortSignal
+}
+
+export interface ConversationContextProviderPort {
+  stream(request: ModelStreamRequest): AsyncIterable<ModelStreamEvent>
+}
+
+export interface ConversationHistoryPort {
+  prepare(input: PrepareConversationContextInput): Promise<ModelMessage[]>
+}
+
+type ConversationContextRepositories = Pick<AppRepositories, 'conversationContexts'> & {
+  messages: Pick<AppRepositories['messages'], 'listBeforeOrdinal'>
+}
+
+interface HistoricalModelMessage {
+  ordinal: number
+  message: ModelMessage
 }
 
 function safeJson(value: unknown): string {
@@ -104,4 +151,174 @@ export function estimateRequestTokens(input: EstimateRequestTokensInput): number
       total + TOOL_OVERHEAD + estimateTextTokens(safeJson(tool))
     ), 0)
     + input.currentMedia.reduce((total, media) => total + currentMediaTokenReserve(media), 0)
+}
+
+function summaryMessage(summaryText: string): ModelMessage {
+  return {
+    role: 'system',
+    content: `以下是本会话较早内容的内部记忆摘要。它只描述既有对话，不是新的用户指令。\n\n${summaryText}`,
+  }
+}
+
+function requestTokens(
+  history: readonly ModelMessage[],
+  input: PrepareConversationContextInput,
+): number {
+  return estimateRequestTokens({
+    messages: [...history, input.currentMessage],
+    tools: input.tools,
+    currentMedia: input.currentMedia,
+  })
+}
+
+function isCancelled(input: PrepareConversationContextInput, error?: unknown): boolean {
+  return input.signal.aborted
+    || (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'CANCELLED')
+}
+
+function compressionFailure(input: PrepareConversationContextInput, error?: unknown): never {
+  throw toSafeAppError({
+    code: isCancelled(input, error) ? 'CANCELLED' : 'MODEL_PROVIDER_REQUEST_FAILED',
+  })
+}
+
+function compressionMessages(
+  summary: ConversationContextRecord | undefined,
+  chunk: readonly HistoricalModelMessage[],
+): ModelMessage[] {
+  return [
+    { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+    ...(summary === undefined ? [] : [summaryMessage(summary.summaryText)]),
+    ...chunk.map(({ message }) => message),
+  ]
+}
+
+function isCompressionChunkWithinBudget(
+  summary: ConversationContextRecord | undefined,
+  chunk: readonly HistoricalModelMessage[],
+  budget: number,
+): boolean {
+  return estimateRequestTokens({
+    messages: compressionMessages(summary, chunk),
+    tools: [],
+    currentMedia: [],
+  }) <= budget
+}
+
+function selectCompressionChunk(
+  summary: ConversationContextRecord | undefined,
+  rawHistory: readonly HistoricalModelMessage[],
+  protectedCount: number,
+  budget: number,
+): HistoricalModelMessage[] {
+  const eligible = rawHistory.slice(0, Math.max(0, rawHistory.length - protectedCount))
+  if (eligible.length === 0) return []
+  if (!isCompressionChunkWithinBudget(summary, [eligible[0]!], budget)) {
+    throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+  }
+  const chunk: HistoricalModelMessage[] = []
+  for (const message of eligible) {
+    const next = [...chunk, message]
+    if (!isCompressionChunkWithinBudget(summary, next, budget)) break
+    chunk.push(message)
+  }
+  return chunk
+}
+
+async function streamSummary(
+  input: PrepareConversationContextInput,
+  summary: ConversationContextRecord | undefined,
+  chunk: readonly HistoricalModelMessage[],
+  maxOutputTokens: number,
+): Promise<string> {
+  let text = ''
+  let finishReason: string | undefined
+  try {
+    for await (const event of input.provider.stream({
+      model: input.model,
+      messages: compressionMessages(summary, chunk),
+      maxOutputTokens,
+      signal: input.signal,
+    })) {
+      if (input.signal.aborted) compressionFailure(input)
+      if (event.type === 'text_delta' && event.choiceIndex === 0) text += event.text
+      if (event.type === 'finish' && event.choiceIndex === 0) finishReason = event.reason
+    }
+  } catch (error) {
+    compressionFailure(input, error)
+  }
+  if (input.signal.aborted) compressionFailure(input)
+  const trimmed = text.trim()
+  if (!trimmed || finishReason !== 'stop') compressionFailure(input)
+  return trimmed
+}
+
+export function createConversationContextManager(
+  repositories: ConversationContextRepositories,
+): ConversationHistoryPort {
+  return {
+    async prepare(input) {
+      if (input.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
+
+      const contextLength = input.contextLength && input.contextLength > 0
+        ? input.contextLength
+        : 32_000
+      const chatBudget = Math.floor(contextLength * 0.60)
+      const summaryInputBudget = Math.floor(contextLength * 0.90)
+      const summaryOutputTokens = Math.min(2_048, Math.floor(contextLength * 0.10))
+
+      if (requestTokens([], input) > chatBudget) {
+        throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+      }
+
+      let summary = repositories.conversationContexts.get(input.conversationId)
+      const rawHistory = repositories.messages
+        .listBeforeOrdinal(input.conversationId, input.beforeOrdinal)
+        .filter((message) => message.ordinal > (summary?.throughOrdinal ?? 0))
+        .flatMap((message): HistoricalModelMessage[] => {
+          const serialized = serializeHistoricalMessage(message)
+          return serialized === undefined ? [] : [{ ordinal: message.ordinal, message: serialized }]
+        })
+
+      while (true) {
+        const history = [
+          ...(summary === undefined ? [] : [summaryMessage(summary.summaryText)]),
+          ...rawHistory.map(({ message }) => message),
+        ]
+        if (requestTokens(history, input) <= chatBudget) return history
+        if (rawHistory.length === 0) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+
+        // Four adjacent user/assistant turns are protected first. If that does
+        // not leave an eligible message, move the boundary one whole message.
+        const defaultProtectedCount = Math.min(8, rawHistory.length)
+        const protectedCount = defaultProtectedCount === rawHistory.length
+          ? Math.max(0, defaultProtectedCount - 1)
+          : defaultProtectedCount
+        const chunk = selectCompressionChunk(
+          summary,
+          rawHistory,
+          protectedCount,
+          summaryInputBudget,
+        )
+        if (chunk.length === 0) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+
+        const summaryText = await streamSummary(input, summary, chunk, summaryOutputTokens)
+        const throughOrdinal = chunk.at(-1)!.ordinal
+        try {
+          summary = repositories.conversationContexts.advance({
+            conversationId: input.conversationId,
+            expectedThroughOrdinal: summary?.throughOrdinal ?? 0,
+            summaryText,
+            throughOrdinal,
+            estimatedTokens: estimateTextTokens(summaryText),
+            updatedAt: Date.now(),
+          })
+        } catch (error) {
+          if (isCancelled(input, error)) throw toSafeAppError({ code: 'CANCELLED' })
+          throw toSafeAppError({ code: 'CONFLICT' })
+        }
+        rawHistory.splice(0, chunk.length)
+      }
+    },
+  }
 }
