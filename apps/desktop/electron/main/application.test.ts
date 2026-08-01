@@ -2,7 +2,7 @@ import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ChatSendInput, ModelInfo } from '@autoforge/shared'
+import type { ChatEvent, ChatSendInput, ModelInfo } from '@autoforge/shared'
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
 import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
@@ -304,6 +304,90 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send(chatInput(isolated.id, '独立问题'))
     await vi.waitFor(() => expect(captured).toHaveLength(3))
     expect(captured[2]?.messages).toEqual([{ role: 'user', content: '独立问题' }])
+    await runtime.close()
+  })
+
+  it('emits a terminal conflict for a concurrent same-conversation send without persisting it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-context-conflict-'))
+    directories.push(root)
+    let markFirstStarted!: () => void
+    let releaseFirst!: () => void
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve })
+    const firstReleased = new Promise<void>((resolve) => { releaseFirst = resolve })
+    let providerCalls = 0
+    const stream = vi.fn(async function* () {
+      providerCalls += 1
+      if (providerCalls === 1) {
+        markFirstStarted()
+        await firstReleased
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const chatEvents: ChatEvent[] = []
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      modelProviders: {
+        openrouter: {
+          listModels: vi.fn(async () => [modelInfo('openrouter/context', 'Context model')]),
+          validateCredential: vi.fn(async () => ({ valid: true })),
+          stream,
+        },
+      },
+      chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
+      openExternal: async () => undefined,
+      emitChat: (event) => { chatEvents.push(event) },
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/context' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+
+    const first = await runtime.services.chat.send(chatInput(conversation.id, 'first'))
+    await firstStarted
+    const duplicate = await runtime.services.chat.send(chatInput(conversation.id, 'duplicate'))
+
+    await vi.waitFor(() => expect(chatEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'status',
+        conversationId: conversation.id,
+        requestId: duplicate.requestId,
+        status: 'failed',
+        error: expect.objectContaining({ code: 'CONFLICT' }),
+      }),
+    ])))
+    expect(await runtime.services.chat.listMessages(conversation.id)).toEqual([
+      expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'first' }] }),
+      expect.objectContaining({ role: 'assistant', blocks: [] }),
+    ])
+
+    releaseFirst()
+    await vi.waitFor(() => expect(chatEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'status', requestId: first.requestId, status: 'completed' }),
+    ])))
+    const retry = await runtime.services.chat.send(chatInput(conversation.id, 'retry'))
+    await vi.waitFor(() => expect(chatEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'status', requestId: retry.requestId, status: 'completed' }),
+    ])))
+    expect(stream).toHaveBeenCalledTimes(2)
+    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(4)
     await runtime.close()
   })
 

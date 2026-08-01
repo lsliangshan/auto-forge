@@ -310,7 +310,15 @@ export class AgentOrchestrator {
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
-      return this.failedResult(requestId, 'CONFLICT')
+      const error = appFailure('CONFLICT')
+      this.safeEmit({
+        type: 'status',
+        conversationId: input.conversationId,
+        requestId,
+        status: 'failed',
+        error,
+      })
+      return { requestId, status: 'failed', error }
     }
     this.activeByConversation.set(input.conversationId, requestId)
     let active: ActiveAgentRun | undefined
