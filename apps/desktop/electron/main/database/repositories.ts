@@ -24,8 +24,22 @@ export interface Message {
   conversationId: string
   role: string
   blocks: unknown[]
+  ordinal: number
   executionId?: string
   createdAt: number
+}
+
+export interface ConversationContextRecord {
+  conversationId: string
+  summaryText: string
+  throughOrdinal: number
+  estimatedTokens: number
+  updatedAt: number
+}
+
+export interface ConversationContextAdvanceInput
+  extends ConversationContextRecord {
+  expectedThroughOrdinal: number
 }
 
 export interface ChatRun {
@@ -202,7 +216,7 @@ function hasVideoSubmissionIntentMarker(parameters: unknown): boolean {
 }
 
 export type MediaGenerationJobPatch = Partial<Omit<MediaGenerationJob, 'id' | 'conversationId' | 'assistantMessageId' | 'provider' | 'model' | 'kind' | 'providerJobId' | 'createdAt'>>
-export type MessageInput = Omit<Message, 'executionId'> & { executionId?: string }
+export type MessageInput = Omit<Message, 'ordinal' | 'executionId'> & { executionId?: string }
 
 export interface VideoGenerationTurnInput {
   userMessage: MessageInput
@@ -346,9 +360,14 @@ export interface AppRepositories {
     insertWithAssets(value: MessageInput, assetIds: string[]): Message
     get(id: string): Message | undefined
     listForConversation(conversationId: string): Message[]
+    listBeforeOrdinal(conversationId: string, beforeOrdinal: number): Message[]
     update(id: string, value: Partial<Pick<Message, 'blocks' | 'executionId'>>): Message | undefined
     replaceBlock(messageId: string, blockId: string, replacement: unknown): Message
     failInterruptedMediaGenerations(): number
+  }
+  conversationContexts: {
+    get(conversationId: string): ConversationContextRecord | undefined
+    advance(input: ConversationContextAdvanceInput): ConversationContextRecord
   }
   mediaAssets: { insert(value: MediaAssetRecord): MediaAssetRecord; get(id: string): MediaAssetRecord | undefined; listForConversation(conversationId: string): MediaAssetRecord[]; listUnclaimedBefore(timestamp: number): MediaAssetRecord[]; update(id: string, patch: MediaAssetPatch): MediaAssetRecord | undefined; delete(id: string): void }
   mediaGenerationJobs: {
@@ -408,7 +427,8 @@ export interface AppRepositories {
 }
 
 const conversationColumns = 'id, title, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
-const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, execution_id AS executionId, created_at AS createdAt'
+const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, ordinal, execution_id AS executionId, created_at AS createdAt'
+const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
 const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
 const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt'
@@ -417,7 +437,21 @@ const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, desc
 const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
 
 function messageFromRow(row: Query): Message {
-  return { ...row, blocks: parse(row.blocksJson as string) as unknown[] } as Message
+  return {
+    ...row,
+    blocks: parse(row.blocksJson as string) as unknown[],
+    ordinal: positiveIntegerSchema.parse(row.ordinal),
+  } as Message
+}
+
+function conversationContextFromRow(row: Query): ConversationContextRecord {
+  return {
+    conversationId: row.conversationId as string,
+    summaryText: row.summaryText as string,
+    throughOrdinal: nonnegativeIntegerSchema.parse(row.throughOrdinal),
+    estimatedTokens: nonnegativeIntegerSchema.parse(row.estimatedTokens),
+    updatedAt: row.updatedAt as number,
+  }
 }
 
 function conversationFromRow(row: Query): Conversation {
@@ -595,17 +629,40 @@ function validateMessageWithAssets(
   return blocks
 }
 
+function nextMessageOrdinal(database: SqliteDatabase, conversationId: string): number {
+  const row = one<{ ordinal: number }>(database, `
+    SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal
+    FROM messages
+    WHERE conversation_id = @conversationId
+  `, { conversationId })
+  if (!row || !Number.isSafeInteger(row.ordinal) || row.ordinal < 1) {
+    throw new Error('Message ordinal is invalid')
+  }
+  return row.ordinal
+}
+
+function insertMessage(
+  database: SqliteDatabase,
+  value: MessageInput,
+  blocks: unknown[] = value.blocks,
+): Message {
+  const ordinal = nextMessageOrdinal(database, value.conversationId)
+  database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @ordinal, @executionId, @createdAt)').run({
+    ...value,
+    blocksJson: JSON.stringify(blocks),
+    ordinal,
+    executionId: value.executionId ?? null,
+  })
+  return { ...value, blocks, ordinal }
+}
+
 function insertMessageWithAssets(
   database: SqliteDatabase,
   value: MessageInput,
   assetIds: readonly string[],
 ): Message {
   const blocks = validateMessageWithAssets(database, value, assetIds)
-  database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
-    ...value,
-    blocksJson: JSON.stringify(blocks),
-    executionId: value.executionId ?? null,
-  })
+  const message = insertMessage(database, value, blocks)
   const claim = database.prepare("UPDATE media_assets SET message_id = @messageId, updated_at = @updatedAt WHERE id = @assetId AND message_id IS NULL AND status = 'ready'")
   for (const assetId of assetIds) {
     if (claim.run({
@@ -614,7 +671,7 @@ function insertMessageWithAssets(
       updatedAt: now(),
     }).changes !== 1) throw new Error('Media asset could not be claimed')
   }
-  return { ...value, blocks }
+  return message
 }
 
 function validateVideoGenerationTurn(
@@ -893,8 +950,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     },
     messages: {
       insert(value) {
-        transaction(database, () => database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({ ...value, blocksJson: JSON.stringify(value.blocks), executionId: value.executionId ?? null }))
-        return value
+        return transaction(database, () => insertMessage(database, value))
       },
       insertWithAssets(value, assetIds) {
         transaction(database, () => insertMessageWithAssets(database, value, assetIds))
@@ -903,7 +959,13 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return stored
       },
       get: (id) => { const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id }); return row && messageFromRow(row) },
-      listForConversation: (conversationId) => many<Query>(database, `SELECT ${messageColumns} FROM messages WHERE conversation_id = @conversationId ORDER BY created_at, id`, { conversationId }).map(messageFromRow),
+      listForConversation: (conversationId) => many<Query>(database, `SELECT ${messageColumns} FROM messages WHERE conversation_id = @conversationId ORDER BY ordinal`, { conversationId }).map(messageFromRow),
+      listBeforeOrdinal: (conversationId, beforeOrdinal) => many<Query>(database, `
+        SELECT ${messageColumns}
+        FROM messages
+        WHERE conversation_id = @conversationId AND ordinal < @beforeOrdinal
+        ORDER BY ordinal
+      `, { conversationId, beforeOrdinal }).map(messageFromRow),
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE messages SET blocks_json = COALESCE(@blocksJson, blocks_json), execution_id = COALESCE(@executionId, execution_id) WHERE id = @id').run({ id, blocksJson: value.blocks === undefined ? null : JSON.stringify(value.blocks), executionId: value.executionId ?? null }))
         const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id })
@@ -980,6 +1042,31 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             if (changed) database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: row.id, blocksJson: JSON.stringify(blocks) })
           }
           return failed
+        })
+      },
+    },
+    conversationContexts: {
+      get: (conversationId) => {
+        const row = one<Query>(database, `
+          SELECT ${conversationContextColumns}
+          FROM conversation_contexts
+          WHERE conversation_id = @conversationId
+        `, { conversationId })
+        return row && conversationContextFromRow(row)
+      },
+      advance(input) {
+        return transaction(database, () => {
+          const result = input.expectedThroughOrdinal === 0
+            ? database.prepare('INSERT INTO conversation_contexts (conversation_id, summary_text, through_ordinal, estimated_tokens, updated_at) SELECT @conversationId, @summaryText, @throughOrdinal, @estimatedTokens, @updatedAt WHERE NOT EXISTS (SELECT 1 FROM conversation_contexts WHERE conversation_id = @conversationId)').run(input)
+            : database.prepare('UPDATE conversation_contexts SET summary_text = @summaryText, through_ordinal = @throughOrdinal, estimated_tokens = @estimatedTokens, updated_at = @updatedAt WHERE conversation_id = @conversationId AND through_ordinal = @expectedThroughOrdinal').run(input)
+          if (result.changes !== 1) throw new Error('Conversation context checkpoint changed')
+          const row = one<Query>(database, `
+            SELECT ${conversationContextColumns}
+            FROM conversation_contexts
+            WHERE conversation_id = @conversationId
+          `, { conversationId: input.conversationId })
+          if (!row) throw new Error('Conversation context was not persisted')
+          return conversationContextFromRow(row)
         })
       },
     },
@@ -1061,11 +1148,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const assistantBlocks = validateVideoGenerationTurn(database, value)
           insertMessageWithAssets(database, userMessage, userAssetIds)
           database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
-          database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
-            ...assistantMessage,
-            blocksJson: JSON.stringify(assistantBlocks),
-            executionId: assistantMessage.executionId ?? null,
-          })
+          insertMessage(database, assistantMessage, assistantBlocks)
           database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, NULL, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
             ...job,
             providerJobId: VIDEO_SUBMISSION_INTENT_PROVIDER_JOB_ID,
@@ -1143,11 +1226,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           )
           insertMessageWithAssets(database, userMessage, userAssetIds)
           database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
-          database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
-            ...assistantMessage,
-            blocksJson: JSON.stringify(assistantBlocks),
-            executionId: assistantMessage.executionId ?? null,
-          })
+          insertMessage(database, assistantMessage, assistantBlocks)
           database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, @nextPollAt, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
             ...job,
             parametersJson: JSON.stringify(job.parameters),
@@ -1370,11 +1449,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const assistantBlocks = validateMediaGenerationTurn(database, value)
           insertMessageWithAssets(database, userMessage, userAssetIds)
           database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
-          database.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, execution_id, created_at) VALUES (@id, @conversationId, @role, @blocksJson, @executionId, @createdAt)').run({
-            ...assistantMessage,
-            blocksJson: JSON.stringify(assistantBlocks),
-            executionId: assistantMessage.executionId ?? null,
-          })
+          insertMessage(database, assistantMessage, assistantBlocks)
         })
       },
       get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),

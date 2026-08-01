@@ -149,7 +149,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(2)
+    expect(database.schemaVersion()).toBe(3)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -157,9 +157,56 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(2)
+    expect(database.schemaVersion()).toBe(3)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
-    expect(database.messages.get('message_v1')?.blocks).toEqual([{ type: 'text', text: 'before upgrade' }])
+    expect(database.messages.get('message_v1')).toMatchObject({
+      blocks: [{ type: 'text', text: 'before upgrade' }],
+      ordinal: 1,
+    })
+  })
+
+  it('backfills insertion order and allocates independent conversation ordinals', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'c1', title: 'One' })
+    database.conversations.insert({ id: 'c2', title: 'Two' })
+    database.messages.insert({
+      id: 'z-user', conversationId: 'c1', role: 'user',
+      blocks: [{ type: 'text', text: 'first' }], createdAt: 10,
+    })
+    database.messages.insert({
+      id: 'a-assistant', conversationId: 'c1', role: 'assistant',
+      blocks: [{ type: 'text', text: 'second' }], createdAt: 10,
+    })
+    database.messages.insert({
+      id: 'other', conversationId: 'c2', role: 'user',
+      blocks: [{ type: 'text', text: 'independent' }], createdAt: 10,
+    })
+
+    expect(database.messages.listForConversation('c1').map(({ id, ordinal }) => ({ id, ordinal })))
+      .toEqual([{ id: 'z-user', ordinal: 1 }, { id: 'a-assistant', ordinal: 2 }])
+    expect(database.messages.listBeforeOrdinal('c1', 2).map(({ id, ordinal }) => ({ id, ordinal })))
+      .toEqual([{ id: 'z-user', ordinal: 1 }])
+    expect(database.messages.get('other')?.ordinal).toBe(1)
+  })
+
+  it('advances a summary atomically from the expected checkpoint', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'context-c', title: 'Context' })
+
+    expect(database.conversationContexts.get('context-c')).toBeUndefined()
+    expect(database.conversationContexts.advance({
+      conversationId: 'context-c', expectedThroughOrdinal: 0,
+      summaryText: 'Known fact', throughOrdinal: 2,
+      estimatedTokens: 4, updatedAt: 20,
+    })).toMatchObject({ summaryText: 'Known fact', throughOrdinal: 2 })
+    expect(() => database.conversationContexts.advance({
+      conversationId: 'context-c', expectedThroughOrdinal: 0,
+      summaryText: 'stale', throughOrdinal: 3,
+      estimatedTokens: 2, updatedAt: 21,
+    })).toThrow('Conversation context checkpoint changed')
+
+    database.conversations.delete('context-c')
+    expect(database.conversationContexts.get('context-c')).toBeUndefined()
   })
 
   it('recovers every nonterminal execution and chat run without claiming success', () => {
