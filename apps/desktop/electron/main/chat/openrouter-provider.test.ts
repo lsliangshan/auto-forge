@@ -1019,9 +1019,12 @@ describe('OpenRouterProvider', () => {
   })
 
   it('serializes a defined maximum output token count', async () => {
-    const fetch = vi.fn(async () => sseResponse([
-      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-    ]))
+    const fetch = vi.fn(async (...request: Parameters<typeof globalThis.fetch>) => {
+      void request
+      return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      ])
+    })
     const provider = new OpenRouterProvider({ credential, fetch })
 
     await collect(provider.stream({
@@ -1029,10 +1032,15 @@ describe('OpenRouterProvider', () => {
       messages: [{ role: 'user', content: 'compress' }],
       maxOutputTokens: 512,
     }))
+    await collect(provider.stream({
+      model: 'chat-model',
+      messages: [{ role: 'user', content: 'hello' }],
+    }))
 
     expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toMatchObject({
       max_tokens: 512,
     })
+    expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).not.toHaveProperty('max_tokens')
   })
 
   it('parses arbitrary SSE boundaries, CRLF comments, usage, choices, and indexed tool fragments', async () => {
