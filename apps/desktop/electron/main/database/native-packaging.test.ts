@@ -54,7 +54,7 @@ function fakePackagedApp(
   const executableDirectory = join(app, 'Contents', 'MacOS')
   mkdirSync(resources, { recursive: true })
   mkdirSync(executableDirectory, { recursive: true })
-  writeFileSync(join(resources, 'app.asar'), '')
+  mkdirSync(join(resources, 'app.asar'))
 
   if (options.nativeModule) {
     const nativeDirectory = join(
