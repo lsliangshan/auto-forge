@@ -13,7 +13,10 @@ import {
   mediaAssetSchema,
   mediaBlockSchema,
   modelInfoSchema,
+  normalizeProxySettings,
+  parseProxyBypassText,
   providerCredentialStatusSchema,
+  proxySettingsSchema,
   toSafeAppError,
   workerMessageSchema,
 } from './index'
@@ -33,10 +36,69 @@ describe('cross-process contracts', () => {
       showCosts: true,
       developerMode: false,
       permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     })
 
     expect(settings.activeProvider).toBe('deepseek')
     expect(() => appSettingsSchema.parse({ ...settings, activeProvider: 'custom' })).toThrow()
+  })
+
+  it('validates and normalizes strict proxy settings', () => {
+    const proxy = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      httpsProxy: 'https://proxy.example.com:8443',
+      socketProxy: 'socks5://127.0.0.1:7891',
+      bypassDomains: ['example.com', '*.internal.example', '10.0.0.0/8'],
+    }
+
+    expect(proxySettingsSchema.parse(proxy)).toEqual(proxy)
+    expect(appSettingsSchema.parse({
+      theme: 'system',
+      language: 'zh-CN',
+      dataDirectory: '/data',
+      logDirectory: '/logs',
+      activeProvider: 'deepseek',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
+      showCosts: true,
+      developerMode: false,
+      permissionDefault: 'ask',
+      proxy,
+    }).proxy).toEqual(proxy)
+    expect(appErrorCodeSchema.parse('NETWORK_PROXY_APPLY_FAILED'))
+      .toBe('NETWORK_PROXY_APPLY_FAILED')
+
+    expect(() => proxySettingsSchema.parse({ enabled: true, bypassDomains: [] })).toThrow()
+    expect(() => proxySettingsSchema.parse({
+      enabled: true,
+      httpProxy: 'http://user:pass@127.0.0.1:7890',
+      bypassDomains: [],
+    })).toThrow()
+    expect(() => proxySettingsSchema.parse({
+      enabled: true,
+      socketProxy: 'http://127.0.0.1:7891',
+      bypassDomains: [],
+    })).toThrow()
+    expect(() => proxySettingsSchema.parse({
+      enabled: true,
+      httpsProxy: 'http://127.0.0.1',
+      bypassDomains: [],
+    })).toThrow()
+
+    expect(parseProxyBypassText('Example.com,\n*.internal.example\nexample.com'))
+      .toEqual(['example.com', '*.internal.example'])
+    expect(normalizeProxySettings({
+      enabled: false,
+      httpProxy: ' http://LOCALHOST:7890 ',
+      bypassDomains: [' Example.com ', 'example.com'],
+    })).toEqual({
+      enabled: false,
+      httpProxy: 'http://localhost:7890',
+      bypassDomains: ['example.com'],
+    })
   })
 
   it('accepts strict persisted media blocks without paths or encoded bytes', () => {

@@ -41,6 +41,7 @@ const messages: Partial<Record<AppError['code'], string>> = {
   MEDIA_GENERATION_FAILED: '媒体生成失败',
   MEDIA_DOWNLOAD_FAILED: '媒体下载失败',
   MEDIA_GENERATION_TIMEOUT: '视频生成超时',
+  NETWORK_PROXY_APPLY_FAILED: '代理应用失败，已保留原配置',
   INTERNAL_ERROR: '操作失败，请稍后重试',
 }
 

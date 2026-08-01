@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { proxySettingsSchema } from './proxy-settings.js'
 import {
   chatBlockSchema,
   mediaKindSchema,
@@ -336,6 +337,7 @@ export const appSettingsSchema = z.object({
   showCosts: z.boolean(),
   developerMode: z.boolean(),
   permissionDefault: z.literal('ask'),
+  proxy: proxySettingsSchema,
 }).strict()
 
 export type AppSettings = z.infer<typeof appSettingsSchema>

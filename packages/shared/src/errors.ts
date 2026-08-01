@@ -30,6 +30,7 @@ export const appErrorCodeSchema = z.enum([
   'MEDIA_GENERATION_FAILED',
   'MEDIA_DOWNLOAD_FAILED',
   'MEDIA_GENERATION_TIMEOUT',
+  'NETWORK_PROXY_APPLY_FAILED',
 ])
 
 export type AppErrorCode = z.infer<typeof appErrorCodeSchema>
@@ -71,6 +72,7 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   MEDIA_GENERATION_FAILED: 'The media generation failed.',
   MEDIA_DOWNLOAD_FAILED: 'The media download failed.',
   MEDIA_GENERATION_TIMEOUT: 'The media generation timed out.',
+  NETWORK_PROXY_APPLY_FAILED: 'The network proxy configuration could not be applied.',
 }
 
 export function toSafeAppError(error: unknown): AppError {
