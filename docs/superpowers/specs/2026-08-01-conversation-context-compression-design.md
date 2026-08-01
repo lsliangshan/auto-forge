@@ -47,8 +47,9 @@ operations:
 `AgentOrchestrator` remains responsible for provider turns, workflow tools,
 approvals, cancellation, persistence of the current run, and UI events. It asks
 the context manager for the historical message prefix, then appends the current
-user message. The context manager receives an `AgentProviderPort` rather than
-creating a second provider registry or credential path.
+user message. The context manager receives a narrow streaming provider port
+that is structurally compatible with `AgentProviderPort`, rather than creating
+a second provider registry or credential path.
 
 Renderer, Preload, and IPC request/response shapes remain unchanged. The only
 Renderer-visible contract addition is a safe display mapping for the new
@@ -62,18 +63,22 @@ another user message. Runs in different conversations remain independent.
 
 For an admitted run, the order is:
 
-1. Read a stable snapshot of prior messages and the current summary checkpoint.
-2. Persist the current user message, chat run, and empty assistant message.
+1. Persist the current user message, obtain its conversation ordinal, and create
+   the chat run and empty assistant message.
+2. Read the current summary checkpoint and a stable history snapshot restricted
+   to ordinals lower than the current user message.
 3. Resolve workflow candidates and their tool schemas.
-4. Ask the context manager to fit the snapshot, summary, current input, and
+4. Ask the context manager to fit the history snapshot, summary, current input, and
    tools into the selected model budget. Any internal summary provider request
    occurs only after the user input is durable.
 5. Send `internal summary -> recent raw history -> current user input` to the
    normal provider stream.
 
-This preserves the existing guarantee that no provider or workflow operation
-precedes durable user input. Terminal cleanup removes both request and
-conversation admission entries.
+The ordinal cutoff prevents the just-persisted user message and empty assistant
+placeholder from entering history. It also lets snapshot or compression errors
+use the existing persisted assistant/run terminalization path. This preserves
+the guarantee that no provider or workflow operation precedes durable user
+input. Terminal cleanup removes both request and conversation admission entries.
 
 ## Persistence and Ordering
 
