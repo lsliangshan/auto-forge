@@ -3,14 +3,15 @@ import { createPinia, setActivePinia } from 'pinia'
 import { isProxy } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ElementPlus from 'element-plus'
-import type {
-  ApprovalDecision,
-  ChatEvent,
-  ConversationGenerationPreferences,
-  DesktopAPI,
-  ExecutionEvent,
-  MediaAsset,
-  ModelInfo,
+import {
+  appSettingsSchema,
+  type ApprovalDecision,
+  type ChatEvent,
+  type ConversationGenerationPreferences,
+  type DesktopAPI,
+  type ExecutionEvent,
+  type MediaAsset,
+  type ModelInfo,
 } from '@autoforge/shared'
 import ApprovalCard from '../../src/components/chat/ApprovalCard.vue'
 import ChatComposer from '../../src/components/chat/ChatComposer.vue'
@@ -137,7 +138,9 @@ describe('chat interactions', () => {
       showCosts: false,
       developerMode: false,
       permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
+    expect(() => appSettingsSchema.parse(settings.settings)).not.toThrow()
     settings.providerModels.openrouter = [
       modelInfo('text/default', ['text']),
       modelInfo('image/default', ['image']),
@@ -185,7 +188,9 @@ describe('chat interactions', () => {
       showCosts: false,
       developerMode: false,
       permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
+    expect(() => appSettingsSchema.parse(settings.settings)).not.toThrow()
     settings.providerModels.openrouter = [modelInfo('text/default', ['text'])]
     const wrapper = mount(ChatView, { global: { plugins: [ElementPlus] } })
     const messages = wrapper.get('.messages').element as HTMLElement

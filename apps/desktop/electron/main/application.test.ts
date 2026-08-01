@@ -3,10 +3,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { toSafeAppError, type ChatEvent, type ChatSendInput, type ModelInfo } from '@autoforge/shared'
-import { createApplicationRuntime as createRuntime, MaintenanceGate } from './application.js'
+import { createApplicationRuntime, MaintenanceGate } from './application.js'
 import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
 import { SecretStore } from './security/secret-store.js'
+import { SettingsService } from './settings/settings-service.js'
 
 const directories: string[] = []
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
@@ -32,13 +33,7 @@ function createNetworkProxy() {
 }
 
 let networkProxy = createNetworkProxy()
-type RuntimeOptions = Parameters<typeof createRuntime>[0]
-
-function createApplicationRuntime(
-  options: Omit<RuntimeOptions, 'networkProxy'> & { networkProxy?: RuntimeOptions['networkProxy'] },
-) {
-  return createRuntime({ networkProxy, ...options })
-}
+type RuntimeOptions = Parameters<typeof createApplicationRuntime>[0]
 
 function options(
   root: string,
@@ -55,7 +50,6 @@ function options(
       encrypt: async (value) => Buffer.from(value),
       decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
     },
-    networkProxy,
     chooseProjectDirectory: async () => undefined,
     chooseMediaFiles: async () => [],
     readClipboardImage: () => undefined,
@@ -64,6 +58,7 @@ function options(
     openExternal: async () => undefined,
     emitChat: vi.fn(),
     emitExecution: vi.fn(),
+    networkProxy,
     browserRuntime: { packaged: false },
     ...overrides,
   }
@@ -220,6 +215,31 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('restores the previous runtime proxy when settings persistence fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-persistence-rollback-'))
+    directories.push(root)
+    vi.spyOn(SettingsService.prototype, 'commit').mockImplementationOnce(() => {
+      throw new Error('settings write failed')
+    })
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+    const candidate = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    }
+
+    await expect(runtime.services.settings.update({ proxy: candidate }))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    expect(networkProxy.transition.mock.calls).toEqual([
+      [candidate],
+      [{ enabled: false, bypassDomains: [] }],
+    ])
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({
+      proxy: { enabled: false, bypassDomains: [] },
+    })
+    await runtime.close()
+  })
+
   it('keeps media paths in main while using explicit media ports and exact conversation preferences', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-'))
     directories.push(root)
@@ -247,7 +267,9 @@ describe('createApplicationRuntime', () => {
       chooseMediaSavePath,
       revealPath,
       openExternal: async () => undefined,
-      emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+      emitChat: vi.fn(), emitExecution: vi.fn(),
+      networkProxy,
+      browserRuntime: { packaged: false },
     })
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
@@ -315,6 +337,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
 
@@ -406,6 +429,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -482,6 +506,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -561,6 +586,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -633,6 +659,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -717,6 +744,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -878,6 +906,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     const conversation = await runtime.services.chat.createConversation()
@@ -943,6 +972,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
 
@@ -994,6 +1024,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     }
     const runtime = createApplicationRuntime(options)
@@ -1079,6 +1110,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -1137,6 +1169,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -1194,6 +1227,7 @@ describe('createApplicationRuntime', () => {
         openExternal: async () => undefined,
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
+        networkProxy,
         browserRuntime: { packaged: false },
       })
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -1262,6 +1296,7 @@ describe('createApplicationRuntime', () => {
         openExternal: async () => undefined,
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
+        networkProxy,
         browserRuntime: { packaged: false },
       }
       const runtime = createApplicationRuntime(options)
@@ -1340,6 +1375,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.recover()
@@ -1399,6 +1435,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     }
     const runtime = createApplicationRuntime(options)
@@ -1463,6 +1500,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     let status: Awaited<ReturnType<typeof runtime.services.settings.saveProviderApiKey>> | undefined
@@ -1507,6 +1545,7 @@ describe('createApplicationRuntime', () => {
       openExternal,
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
 
@@ -1577,7 +1616,9 @@ describe('createApplicationRuntime', () => {
       chooseMediaSavePath: async () => undefined,
       revealPath: () => undefined,
       openExternal,
-      emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+      emitChat: vi.fn(), emitExecution: vi.fn(),
+      networkProxy,
+      browserRuntime: { packaged: false },
     })
     await restarted.recover()
     expect(await restarted.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
@@ -1618,6 +1659,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
+      networkProxy,
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -1728,7 +1770,9 @@ describe('createApplicationRuntime', () => {
       chooseMediaSavePath: async () => undefined,
       revealPath: () => undefined,
       openExternal: async () => undefined,
-      emitChat: vi.fn(), emitExecution: vi.fn(), browserRuntime: { packaged: false },
+      emitChat: vi.fn(), emitExecution: vi.fn(),
+      networkProxy,
+      browserRuntime: { packaged: false },
       removeExecutionTemporaryDirectory: async (path: string) => {
         markCleanupStarted()
         await cleanupFinished
