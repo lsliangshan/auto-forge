@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ChatSendInput, ModelInfo } from '@autoforge/shared'
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
+import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
 import { SecretStore } from './security/secret-store.js'
 
@@ -233,6 +234,143 @@ describe('createApplicationRuntime', () => {
     })
     await expect(runtime.services.settings.validateProviderCredential('openrouter'))
       .resolves.toMatchObject({ provider: 'openrouter', configured: true, validation: 'denied' })
+    await runtime.close()
+  })
+
+  it('sends only same-conversation history to the second text turn without changing chat send output', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-context-history-'))
+    directories.push(root)
+    const captured: ModelStreamRequest[] = []
+    const stream = vi.fn(async function* (request: ModelStreamRequest) {
+      captured.push(request)
+      if (captured.length === 1) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '第一轮回答' }
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      modelProviders: {
+        openrouter: {
+          listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context model'), contextLength: 128_000 }]),
+          validateCredential: vi.fn(async () => ({ valid: true })),
+          stream,
+        },
+      },
+      chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(),
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/context' } },
+    })
+
+    const conversation = await runtime.services.chat.createConversation()
+    await expect(runtime.services.chat.send(chatInput(conversation.id, '第一轮问题')))
+      .resolves.toEqual({ requestId: expect.any(String) })
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'assistant', blocks: [{ type: 'text', text: '第一轮回答' }] }),
+      ])))
+
+    await runtime.services.chat.send(chatInput(conversation.id, '第二轮追问'))
+    await vi.waitFor(() => expect(captured).toHaveLength(2))
+    expect(captured[1]?.messages).toEqual([
+      { role: 'user', content: '第一轮问题' },
+      { role: 'assistant', content: '第一轮回答' },
+      { role: 'user', content: '第二轮追问' },
+    ])
+
+    const isolated = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(isolated.id, '独立问题'))
+    await vi.waitFor(() => expect(captured).toHaveLength(3))
+    expect(captured[2]?.messages).toEqual([{ role: 'user', content: '独立问题' }])
+    await runtime.close()
+  })
+
+  it('replaces historical media bytes and paths with a safe marker on a text follow-up', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-context-media-'))
+    directories.push(root)
+    const source = join(root, 'image.png')
+    const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('private-image-payload')])
+    await writeFile(source, png)
+    const captured: ModelStreamRequest[] = []
+    const stream = vi.fn(async function* (request: ModelStreamRequest) {
+      captured.push(request)
+      if (captured.length === 1) yield { type: 'text_delta' as const, choiceIndex: 0, text: '我看到了图片' }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const runtime = createApplicationRuntime({
+      paths: {
+        database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+        projects: join(root, 'projects'), installations: join(root, 'workflows'),
+        workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+      },
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value),
+        decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+      },
+      modelProviders: {
+        openrouter: {
+          listModels: vi.fn(async () => [{ ...visionTextModelInfo('openrouter/vision-context'), contextLength: 128_000 }]),
+          validateCredential: vi.fn(async () => ({ valid: true })),
+          stream,
+        },
+      },
+      chooseProjectDirectory: async () => undefined,
+      chooseMediaFiles: async () => [source],
+      readClipboardImage: () => undefined,
+      chooseMediaSavePath: async () => undefined,
+      revealPath: () => undefined,
+      openExternal: async () => undefined,
+      emitChat: vi.fn(),
+      emitExecution: vi.fn(),
+      browserRuntime: { packaged: false },
+    })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/vision-context' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({ conversationId: conversation.id, existingAssetIds: [] })
+    await runtime.services.chat.send({
+      ...chatInput(conversation.id, '第一轮图片问题'), assetIds: [asset!.id], outputType: 'text',
+    })
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    expect(JSON.stringify(captured[0]?.messages)).toContain(png.toString('base64'))
+    await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'assistant', blocks: [{ type: 'text', text: '我看到了图片' }] }),
+      ])))
+
+    await runtime.services.chat.send(chatInput(conversation.id, '第二轮只问文字'))
+    await vi.waitFor(() => expect(captured).toHaveLength(2))
+    const followUp = JSON.stringify(captured[1]?.messages)
+    expect(followUp).toContain('名称: image.png')
+    expect(followUp).not.toContain(png.toString('base64'))
+    expect(followUp).not.toContain(source)
     await runtime.close()
   })
 
