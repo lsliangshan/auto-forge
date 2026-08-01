@@ -1,14 +1,73 @@
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ChatEvent, ChatSendInput, ModelInfo } from '@autoforge/shared'
-import { createApplicationRuntime, MaintenanceGate } from './application.js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { toSafeAppError, type ChatEvent, type ChatSendInput, type ModelInfo } from '@autoforge/shared'
+import { createApplicationRuntime as createRuntime, MaintenanceGate } from './application.js'
 import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
 import { SecretStore } from './security/secret-store.js'
 
 const directories: string[] = []
+const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
+
+vi.mock('./startup.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./startup.js')>()
+  return {
+    ...actual,
+    removeInterruptedRuntimeDirectories: async (path: string) => {
+      recoveryProbe()
+      await actual.removeInterruptedRuntimeDirectories(path)
+    },
+  }
+})
+
+function createNetworkProxy() {
+  return {
+    initialize: vi.fn().mockResolvedValue(undefined),
+    transition: vi.fn().mockResolvedValue(undefined),
+    fetch: vi.fn(globalThis.fetch),
+    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
+  }
+}
+
+let networkProxy = createNetworkProxy()
+type RuntimeOptions = Parameters<typeof createRuntime>[0]
+
+function createApplicationRuntime(
+  options: Omit<RuntimeOptions, 'networkProxy'> & { networkProxy?: RuntimeOptions['networkProxy'] },
+) {
+  return createRuntime({ networkProxy, ...options })
+}
+
+function options(
+  root: string,
+  overrides: Partial<RuntimeOptions> = {},
+): RuntimeOptions {
+  return {
+    paths: {
+      database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
+      projects: join(root, 'projects'), installations: join(root, 'workflows'),
+      workflowRunner: join(root, 'workflow-runner.cjs'), temporary: root,
+    },
+    safeStorage: {
+      isAvailable: async () => true,
+      encrypt: async (value) => Buffer.from(value),
+      decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
+    },
+    networkProxy,
+    chooseProjectDirectory: async () => undefined,
+    chooseMediaFiles: async () => [],
+    readClipboardImage: () => undefined,
+    chooseMediaSavePath: async () => undefined,
+    revealPath: () => undefined,
+    openExternal: async () => undefined,
+    emitChat: vi.fn(),
+    emitExecution: vi.fn(),
+    browserRuntime: { packaged: false },
+    ...overrides,
+  }
+}
 
 function chatInput(conversationId: string, content: string): ChatSendInput {
   return {
@@ -84,10 +143,83 @@ function visionTextModelInfo(id: string): ModelInfo {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
 
+beforeEach(() => {
+  networkProxy = createNetworkProxy()
+  recoveryProbe.mockClear()
+})
+
 describe('createApplicationRuntime', () => {
+  it('initializes the saved proxy before runtime recovery continues', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-recovery-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+
+    await runtime.recover()
+
+    expect(networkProxy.initialize).toHaveBeenCalledWith({ enabled: false, bypassDomains: [] })
+    expect(networkProxy.initialize.mock.invocationCallOrder[0])
+      .toBeLessThan(recoveryProbe.mock.invocationCallOrder[0]!)
+    await runtime.close()
+  })
+
+  it('routes OpenRouter and DeepSeek credential validation through the managed fetch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-provider-'))
+    directories.push(root)
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('direct fetch is forbidden in this test'))
+    networkProxy.fetch.mockImplementation(async () => Response.json({ object: 'list', data: [] }))
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
+
+    await expect(runtime.services.settings.validateProviderCredential('openrouter'))
+      .resolves.toMatchObject({ validation: 'valid' })
+    await expect(runtime.services.settings.validateProviderCredential('deepseek'))
+      .resolves.toMatchObject({ validation: 'valid' })
+
+    expect(networkProxy.fetch).toHaveBeenCalledWith(
+      'https://openrouter.ai/api/v1/models',
+      expect.objectContaining({ headers: { authorization: 'Bearer sk-openrouter' } }),
+    )
+    expect(networkProxy.fetch).toHaveBeenCalledWith(
+      'https://api.deepseek.com/models',
+      expect.objectContaining({ headers: { authorization: 'Bearer sk-deepseek' } }),
+    )
+    await runtime.close()
+  })
+
+  it('applies proxy changes before committing settings', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-commit-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+
+    const next = await runtime.services.settings.update({
+      proxy: { enabled: true, httpProxy: 'http://127.0.0.1:7890', bypassDomains: [] },
+    })
+
+    expect(networkProxy.transition).toHaveBeenCalledWith(next.proxy)
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: next.proxy })
+    await runtime.close()
+  })
+
+  it('retains the old setting when proxy application fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-rollback-'))
+    directories.push(root)
+    networkProxy.transition.mockRejectedValueOnce(toSafeAppError({ code: 'NETWORK_PROXY_APPLY_FAILED' }))
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+
+    await expect(runtime.services.settings.update({
+      proxy: { enabled: true, socketProxy: 'socks5://127.0.0.1:7891', bypassDomains: [] },
+    })).rejects.toMatchObject({ code: 'NETWORK_PROXY_APPLY_FAILED' })
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({
+      proxy: { enabled: false, bypassDomains: [] },
+    })
+    await runtime.close()
+  })
+
   it('keeps media paths in main while using explicit media ports and exact conversation preferences', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-'))
     directories.push(root)

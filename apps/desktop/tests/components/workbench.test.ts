@@ -59,6 +59,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         activeProvider: 'deepseek', defaultModels: {
           openrouter: { text: 'openai/gpt-4.1-mini' }, deepseek: { text: 'deepseek-v4-flash' },
         }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+        proxy: { enabled: false, bypassDomains: [] },
       }),
       update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(),
       validateProviderCredential: vi.fn().mockImplementation(async (provider) => ({
@@ -297,6 +298,7 @@ describe('workbench', () => {
       activeProvider: 'openrouter' as const,
       defaultModels: { openrouter: { text: 'old' }, deepseek: { text: 'deepseek-v4-flash' } },
       showCosts: false, developerMode: false, permissionDefault: 'ask' as const,
+      proxy: { enabled: false, bypassDomains: [] },
     }
     const second = {
       ...first,
@@ -439,6 +441,7 @@ describe('workbench', () => {
         openrouter: { audio: 'audio/saved-missing' },
       },
       showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
     const imageWithoutGeneration = modelInfo('image/no-generation', ['image'])
     imageWithoutGeneration.generation = {}
@@ -477,6 +480,7 @@ describe('workbench', () => {
         openrouter: { image: 'catalog/incompatible' },
       },
       showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
     store.providerModels.openrouter = [modelInfo('catalog/incompatible', ['text'])]
 
@@ -494,6 +498,7 @@ describe('workbench', () => {
         openrouter: { audio: 'catalog/no-generation' },
       },
       showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
     const catalogModel = modelInfo('catalog/no-generation', ['audio'])
     catalogModel.generation = {}
@@ -545,6 +550,7 @@ describe('workbench', () => {
       activeProvider: 'deepseek', defaultModels: {
         openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-legacy' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
     store.providerModels.deepseek = [{
       ...modelInfo('deepseek-v4-flash'),
@@ -634,6 +640,7 @@ describe('workbench', () => {
       activeProvider: 'deepseek', defaultModels: {
         openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     })
     vi.mocked(api.settings.validateProviderCredential).mockResolvedValue({
       provider: 'deepseek', configured: false, validation: 'unchecked',
@@ -645,6 +652,7 @@ describe('workbench', () => {
       activeProvider: 'openrouter', defaultModels: {
         openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
 
     const oldLoad = store.loadModels('openrouter')
@@ -675,6 +683,7 @@ describe('workbench', () => {
       activeProvider: 'openrouter', defaultModels: {
         openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
     store.credentials.openrouter = { provider: 'openrouter', configured: true, validation: 'valid' }
 
@@ -702,6 +711,7 @@ describe('workbench', () => {
       activeProvider: 'deepseek', defaultModels: {
         openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     })
     vi.mocked(api.settings.validateProviderCredential).mockResolvedValue({
       provider: 'deepseek', configured: false, validation: 'unchecked',
@@ -713,6 +723,7 @@ describe('workbench', () => {
       activeProvider: 'openrouter', defaultModels: {
         openrouter: { text: 'openrouter/model' }, deepseek: { text: 'deepseek-v4-flash' },
       }, showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     }
 
     const oldLoad = store.loadModels('openrouter')

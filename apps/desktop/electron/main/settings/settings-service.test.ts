@@ -16,6 +16,7 @@ const defaults: AppSettings = {
   showCosts: true,
   developerMode: false,
   permissionDefault: 'ask',
+  proxy: { enabled: false, bypassDomains: [] },
 }
 
 function settingsRepository(initial?: unknown): AppRepositories['appSettings'] {
@@ -57,6 +58,7 @@ describe('SettingsService', () => {
       showCosts: true,
       developerMode: false,
       permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
     })
     expect(service.get()).not.toHaveProperty('defaultModel')
   })
@@ -185,5 +187,26 @@ describe('SettingsService', () => {
       openrouter: { text: 'openai/gpt-4.1-mini' },
       deepseek: { text: 'deepseek-v4-pro' },
     })
+  })
+
+  it('normalizes legacy settings to a disabled proxy without persisting preview', () => {
+    const repository = settingsRepository({ theme: 'dark' })
+    const service = new SettingsService(repository, defaults)
+    const candidate = service.preview({
+      proxy: {
+        enabled: true,
+        httpProxy: ' http://LOCALHOST:7890 ',
+        bypassDomains: [' Example.com '],
+      },
+    })
+
+    expect(service.get().proxy).toEqual({ enabled: false, bypassDomains: [] })
+    expect(candidate.proxy).toEqual({
+      enabled: true,
+      httpProxy: 'http://localhost:7890',
+      bypassDomains: ['example.com'],
+    })
+    expect(service.commit(candidate)).toEqual(candidate)
+    expect(service.get()).toEqual(candidate)
   })
 })

@@ -6,6 +6,7 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  net,
   protocol,
   safeStorage,
   session,
@@ -18,6 +19,7 @@ import { createApplicationRuntime } from './application.js'
 import { registerDesktopIpc, type RendererTarget } from './ipc/register-ipc.js'
 import { startDesktopApplication } from './startup.js'
 import { createMediaProtocolHandler } from './media/media-protocol.js'
+import { NetworkProxyService } from './network/network-proxy-service.js'
 import { createSecureWindow } from './window.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -56,8 +58,13 @@ function emit(channel: string, value: unknown): void {
   mainWindow.webContents.send(channel, value)
 }
 
-function initialize(): ApplicationRuntime {
+async function initialize(): Promise<ApplicationRuntime> {
   const userData = app.getPath('userData')
+  const networkProxy = new NetworkProxyService({
+    setProxy: (config) => session.defaultSession.setProxy(config),
+    closeAllConnections: () => session.defaultSession.closeAllConnections(),
+    fetch: (input, init) => net.fetch(input, init),
+  })
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -73,6 +80,7 @@ function initialize(): ApplicationRuntime {
       encrypt: async (value) => safeStorage.encryptString(value),
       decrypt: async (value) => ({ value: safeStorage.decryptString(value), shouldReEncrypt: false }),
     },
+    networkProxy,
     chooseProjectDirectory: async () => {
       const dialogOptions: OpenDialogOptions = {
         title: '注册本地工作流项目',

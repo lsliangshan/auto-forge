@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ipcChannels } from '@autoforge/shared'
+import { ipcChannels, toSafeAppError, type AppSettings } from '@autoforge/shared'
 import { pathToFileURL } from 'node:url'
 import {
   registerDesktopIpc,
@@ -7,6 +7,15 @@ import {
   type IpcInvokeEvent,
   type IpcMainPort,
 } from './register-ipc.js'
+
+const appSettings: AppSettings = {
+  theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+  activeProvider: 'deepseek', defaultModels: {
+    openrouter: { text: 'openai/gpt-4.1-mini' }, deepseek: { text: 'deepseek-v4-flash' },
+  },
+  showCosts: false, developerMode: false, permissionDefault: 'ask',
+  proxy: { enabled: false, bypassDomains: [] },
+}
 
 function services(): DesktopIpcServices {
   return {
@@ -33,7 +42,7 @@ function services(): DesktopIpcServices {
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
     permissions: { listGrants: vi.fn(), revoke: vi.fn() },
     settings: {
-      get: vi.fn(), update: vi.fn(),
+      get: vi.fn().mockResolvedValue(appSettings), update: vi.fn(),
       saveProviderApiKey: vi.fn(async (provider) => ({ provider, configured: true, validation: 'valid' as const })),
       clearProviderApiKey: vi.fn(),
       validateProviderCredential: vi.fn(async (provider) => ({ provider, configured: false, validation: 'unchecked' as const })),
@@ -77,6 +86,21 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('returns complete proxy settings', async () => {
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.settingsGet)).resolves.toEqual(appSettings)
+  })
+
+  it('preserves proxy application failures for the renderer', async () => {
+    const app = harness()
+    vi.mocked(app.dependencies.settings.update)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'NETWORK_PROXY_APPLY_FAILED' }))
+    await expect(app.invoke(ipcChannels.settingsUpdate, {
+      proxy: { enabled: true, httpProxy: 'http://127.0.0.1:7890', bypassDomains: [] },
+    })).rejects.toMatchObject({ code: 'NETWORK_PROXY_APPLY_FAILED' })
+  })
+
   it('rejects an invalid chat request before invoking the orchestrator', async () => {
     const app = harness()
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))

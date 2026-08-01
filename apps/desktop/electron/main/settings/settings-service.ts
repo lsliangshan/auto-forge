@@ -1,8 +1,14 @@
-import type { AppSettings, AppSettingsPatch, ProviderDefaultModels } from '@autoforge/shared'
+import {
+  normalizeProxySettings,
+  type AppSettings,
+  type AppSettingsPatch,
+  type ProviderDefaultModels,
+  type ProxySettings,
+} from '@autoforge/shared'
 import type { AppRepositories } from '../database/repositories.js'
 
 const settingsKey = 'app'
-type LegacySettings = Partial<AppSettings> & { defaultModel?: unknown }
+type LegacySettings = Omit<Partial<AppSettings>, 'proxy'> & { defaultModel?: unknown; proxy?: unknown }
 
 function providerTextDefault(value: unknown): string | undefined {
   if (typeof value === 'string' && value.trim()) return value
@@ -35,10 +41,18 @@ export class SettingsService {
     return this.normalize(setting?.value)
   }
 
+  preview(patch: AppSettingsPatch): AppSettings {
+    return this.normalize({ ...this.get(), ...patch })
+  }
+
+  commit(settings: AppSettings): AppSettings {
+    const normalized = this.normalize(settings)
+    this.repository.set(settingsKey, normalized)
+    return normalized
+  }
+
   update(patch: AppSettingsPatch): AppSettings {
-    const settings = this.normalize({ ...this.get(), ...patch })
-    this.repository.set(settingsKey, settings)
-    return settings
+    return this.commit(this.preview(patch))
   }
 
   private normalize(value: unknown): AppSettings {
@@ -69,6 +83,11 @@ export class SettingsService {
       showCosts: stored.showCosts ?? this.defaults.showCosts,
       developerMode: stored.developerMode ?? this.defaults.developerMode,
       permissionDefault: 'ask',
+      proxy: normalizeProxySettings(
+        typeof stored.proxy === 'object' && stored.proxy !== null
+          ? stored.proxy as ProxySettings
+          : this.defaults.proxy,
+      ),
     }
   }
 }

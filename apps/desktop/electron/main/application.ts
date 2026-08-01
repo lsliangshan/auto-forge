@@ -42,6 +42,7 @@ import { SettingsService } from './settings/settings-service.js'
 import { createMediaAssetService } from './media/media-asset-service.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
+import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import {
   ExecutionService,
@@ -69,6 +70,7 @@ export type ApplicationOpenRouterPort = ApplicationModelProviderPort
 export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
+  networkProxy: NetworkProxyPort
   openRouter?: ApplicationOpenRouterPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
   chooseProjectDirectory(): Promise<string | undefined>
@@ -254,10 +256,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     showCosts: true,
     developerMode: false,
     permissionDefault: 'ask',
+    proxy: { enabled: false, bypassDomains: [] },
   })
   const providerRegistry = new ModelProviderRegistry({
-    openrouter: options.modelProviders?.openrouter ?? options.openRouter ?? new OpenRouterProvider({ credential: secretStore }),
-    deepseek: options.modelProviders?.deepseek ?? new DeepSeekProvider({ credential: secretStore }),
+    openrouter: options.modelProviders?.openrouter ?? options.openRouter ?? new OpenRouterProvider({
+      credential: secretStore,
+      fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
+    }),
+    deepseek: options.modelProviders?.deepseek ?? new DeepSeekProvider({
+      credential: secretStore,
+      fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
+    }),
   })
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
@@ -786,7 +795,20 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     settings: {
       get: async () => settings.get(),
-      update: async (patch) => settings.update(patch),
+      update: async (patch) => {
+        const previous = settings.get()
+        const candidate = settings.preview(patch)
+        if (JSON.stringify(previous.proxy) === JSON.stringify(candidate.proxy)) {
+          return settings.commit(candidate)
+        }
+        await options.networkProxy.transition(candidate.proxy)
+        try {
+          return settings.commit(candidate)
+        } catch {
+          await options.networkProxy.transition(previous.proxy)
+          throw failure('INTERNAL_ERROR')
+        }
+      },
       saveProviderApiKey: async (provider, apiKey) => {
         await secretStore.set(credentialKeyForProvider(provider), apiKey)
         modelCatalog.delete(provider)
@@ -835,6 +857,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       resolveReadyAsset: media.resolveReadyAsset,
     },
     recover: async () => {
+      await options.networkProxy.initialize(settings.get().proxy)
       await mediaLifecycle.recover()
       database.recoverInterrupted()
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
