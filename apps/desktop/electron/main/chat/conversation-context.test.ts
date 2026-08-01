@@ -15,7 +15,7 @@ describe('conversation context primitives', () => {
         { type: 'text', text: '结果如下' },
         { type: 'workflow_proposal', workflowId: 'browser.search.baidu', workflowName: '百度搜索', args: { keyword: '天气' } },
         { type: 'execution_result', executionId: 'e1', summary: 'Workflow completed.' },
-        { type: 'media', blockId: 'b1', assetId: 'asset-private-id', kind: 'image', purpose: 'output', name: 'weather.png', mimeType: 'image/png', byteSize: 2048 },
+        { type: 'media', blockId: 'b1', assetId: 'asset-private-id', kind: 'image', purpose: 'output', name: 'weather.png', mimeType: 'image/png', byteSize: 2048, width: 4321, height: 5432, durationMs: 6543 },
       ],
     }
 
@@ -28,6 +28,9 @@ describe('conversation context primitives', () => {
     })
     expect(body).toContain('browser.search.baidu')
     expect(body).not.toContain('asset-private-id')
+    expect(body).not.toContain('4321')
+    expect(body).not.toContain('5432')
+    expect(body).not.toContain('6543')
     expect(body).not.toMatch(/base64|\/Users\/|file:\/\/|https?:\/\//i)
   })
 
@@ -88,9 +91,29 @@ describe('conversation context primitives', () => {
       currentMedia: [],
     })
 
+    // Hand-derived: request 12 + message 8 + JSON text estimate 14.
     expect(estimateTextTokens('hello 你好')).toBe(4)
-    expect(short).toBeGreaterThan(2)
-    expect(withTool).toBeGreaterThan(short)
+    expect(short).toBe(34)
+    // The tool contributes its 12-token protocol overhead plus 34 JSON tokens.
+    expect(withTool).toBe(80)
+    expect(withTool - short).toBe(46)
+  })
+
+  it('excludes current media Base64 while adding its reserve exactly once', () => {
+    const estimate = estimateRequestTokens({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'keep' },
+          { type: 'media', kind: 'image', mimeType: 'image/png', dataBase64: 'A'.repeat(1_000_000) },
+        ],
+      }],
+      tools: [],
+      currentMedia: [{ kind: 'image' }],
+    })
+
+    // Hand-derived: request 12 + message 8 + normalized 112-byte JSON (38) + image reserve 2,048.
+    expect(estimate).toBe(2_106)
   })
 
   it('reserves exact media budgets, including duration caps', () => {
