@@ -153,6 +153,7 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
     providers: { get: () => provider },
     workflows: registry,
     persistence: createAgentPersistence(database),
+    history: { prepare: async () => [] },
     policy,
     executions: executionService,
     emit: () => undefined,
@@ -188,7 +189,7 @@ describe('agent workflow integration', () => {
     const pending = await app.orchestrator.run({
       conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
       userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
-      modelContent: '使用百度搜索今日天气', assetIds: [], allowTools: true,
+      modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
       model: 'local-test-model', requestId: 'request_1',
     })
     expect(app.database.messages.listForConversation('conversation_1').find((message) => message.role === 'assistant')?.blocks).toEqual(expect.arrayContaining([
@@ -253,7 +254,7 @@ describe('agent workflow integration', () => {
     const pending = await app.orchestrator.run({
       conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
       userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
-      modelContent: '使用百度搜索今日天气', assetIds: [], allowTools: true,
+      modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
       model: 'local-test-model', requestId: 'cancel_request',
     })
     const resuming = app.orchestrator.resumeApproval({

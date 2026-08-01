@@ -26,6 +26,7 @@ import Ajv, { type AnySchema } from 'ajv'
 import { AgentOrchestrator, createAgentPersistence } from './agent/agent-orchestrator.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
+import { createConversationContextManager } from './chat/conversation-context.js'
 import type { ModelProvider } from './chat/model-provider.js'
 import { credentialKeyForProvider, ModelProviderRegistry } from './chat/model-provider-registry.js'
 import { OpenRouterProvider } from './chat/openrouter-provider.js'
@@ -372,10 +373,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
     try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
   }
+  const conversationContext = createConversationContextManager(database)
   const agent = new AgentOrchestrator({
     providers: providerRegistry,
     workflows: registry,
     persistence: createAgentPersistence(database),
+    history: conversationContext,
     policy,
     executions,
     emit: emitChat,
@@ -558,9 +561,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 userBlocks,
                 modelContent,
                 assetIds: input.assetIds,
+                currentMedia: resolved.assets.map(({ kind, durationMs }) => ({
+                  kind,
+                  ...(durationMs === undefined ? {} : { durationMs }),
+                })),
                 allowTools: route.supportsTools,
                 provider: route.provider,
                 model: route.model,
+                ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
                 requestId,
               })
             }).catch(() => undefined).finally(() => {

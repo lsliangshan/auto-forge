@@ -202,7 +202,7 @@ export interface AgentOrchestratorDependencies {
   persistence: AgentPersistencePort
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
   executions: AgentExecutionPort
-  history?: ConversationHistoryPort
+  history: ConversationHistoryPort
   emit: (event: ChatEvent) => void
   retrieve?: typeof retrieveWorkflows
   id?: () => string
@@ -217,7 +217,7 @@ export interface AgentRunInput {
   modelContent: string | ModelContentPart[]
   assetIds: string[]
   contextLength?: number
-  currentMedia?: CurrentMediaMetadata[]
+  currentMedia: CurrentMediaMetadata[]
   allowTools: boolean
   provider: ModelProviderId
   model: string
@@ -369,7 +369,7 @@ export class AgentOrchestrator {
         active.tools = candidates.map(manifestTool)
         active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
       }
-      const historyMessages = await this.dependencies.history?.prepare({
+      const historyMessages = await this.dependencies.history.prepare({
         conversationId: input.conversationId,
         beforeOrdinal: userPosition.ordinal,
         provider,
@@ -377,9 +377,9 @@ export class AgentOrchestrator {
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         currentMessage: { role: 'user', content: input.modelContent },
         tools: active.tools,
-        currentMedia: input.currentMedia ?? [],
+        currentMedia: input.currentMedia,
         signal: active.controller.signal,
-      }) ?? []
+      })
       active.messages = [
         ...historyMessages,
         { role: 'user', content: input.modelContent },
