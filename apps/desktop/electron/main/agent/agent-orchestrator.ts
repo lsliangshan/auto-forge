@@ -21,6 +21,7 @@ import type {
   ModelStreamRequest,
   ModelTool,
 } from '../chat/model-provider.js'
+import type { ConversationHistoryPort, CurrentMediaMetadata } from '../chat/conversation-context.js'
 
 const MAX_MODEL_TURNS = 8
 const RETRIEVAL_LIMIT = 8
@@ -64,6 +65,10 @@ export interface PersistUserInput {
   createdAt: number
 }
 
+export interface PersistedUserPosition {
+  ordinal: number
+}
+
 export interface CreateRunInput {
   runId: string
   conversationId: string
@@ -101,7 +106,7 @@ export interface FinalizeAgentRunInput {
 
 /** The final method must commit the assistant blocks and chat-run terminal state atomically. */
 export interface AgentPersistencePort {
-  persistUser(input: PersistUserInput): void
+  persistUser(input: PersistUserInput): PersistedUserPosition
   createRun(input: CreateRunInput): void
   createAssistant(input: CreateAssistantInput): void
   startMediaGeneration(input: StartMediaGenerationInput): void
@@ -115,13 +120,14 @@ export function createAgentPersistence(
 ): AgentPersistencePort {
   return {
     persistUser(input) {
-      repositories.messages.insertWithAssets({
+      const message = repositories.messages.insertWithAssets({
         id: input.messageId,
         conversationId: input.conversationId,
         role: 'user',
         blocks: input.blocks,
         createdAt: input.createdAt,
       }, input.assetIds)
+      return { ordinal: message.ordinal }
     },
     createRun(input) {
       repositories.chatRuns.insert({
@@ -196,6 +202,7 @@ export interface AgentOrchestratorDependencies {
   persistence: AgentPersistencePort
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
   executions: AgentExecutionPort
+  history?: ConversationHistoryPort
   emit: (event: ChatEvent) => void
   retrieve?: typeof retrieveWorkflows
   id?: () => string
@@ -209,6 +216,8 @@ export interface AgentRunInput {
   userBlocks: ChatBlock[]
   modelContent: string | ModelContentPart[]
   assetIds: string[]
+  contextLength?: number
+  currentMedia?: CurrentMediaMetadata[]
   allowTools: boolean
   provider: ModelProviderId
   model: string
@@ -287,6 +296,7 @@ function samePermission(
 export class AgentOrchestrator {
   private readonly activeByRequest = new Map<string, ActiveAgentRun>()
   private readonly activeByExecution = new Map<string, ActiveAgentRun>()
+  private readonly activeByConversation = new Map<string, string>()
   private readonly retrieve: typeof retrieveWorkflows
   private readonly id: () => string
   private readonly now: () => number
@@ -299,54 +309,58 @@ export class AgentOrchestrator {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
-    if (this.activeByRequest.has(requestId)) return this.failedResult(requestId, 'CONFLICT')
-    const userMessageId = this.id()
-    const runId = this.id()
-    const messageId = this.id()
-    const startedAt = this.now()
-
-    // This ordering is intentional: no provider or workflow operation can precede durable user input.
-    this.dependencies.persistence.persistUser({
-      messageId: userMessageId,
-      conversationId: input.conversationId,
-      blocks: input.userBlocks,
-      assetIds: input.assetIds,
-      createdAt: startedAt,
-    })
-    this.dependencies.persistence.createRun({
-      runId,
-      conversationId: input.conversationId,
-      requestId,
-      model: input.model,
-      startedAt,
-    })
-    this.dependencies.persistence.createAssistant({
-      messageId,
-      conversationId: input.conversationId,
-      initialBlocks: [],
-      createdAt: startedAt,
-    })
-    const provider = this.dependencies.providers.get(input.provider)
-
-    const active: ActiveAgentRun = {
-      requestId,
-      runId,
-      messageId,
-      conversationId: input.conversationId,
-      provider,
-      model: input.model,
-      blocks: [],
-      messages: [{ role: 'user', content: input.modelContent }],
-      tools: [],
-      workflows: new Map(),
-      controller: new AbortController(),
-      modelTurns: 0,
-      busy: false,
-      cancelled: false,
+    if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
+      return this.failedResult(requestId, 'CONFLICT')
     }
-    this.activeByRequest.set(requestId, active)
-    if (input.allowTools) {
-      try {
+    this.activeByConversation.set(input.conversationId, requestId)
+    let active: ActiveAgentRun | undefined
+    try {
+      const userMessageId = this.id()
+      const runId = this.id()
+      const messageId = this.id()
+      const startedAt = this.now()
+
+      // This ordering is intentional: no provider or workflow operation can precede durable user input.
+      const userPosition = this.dependencies.persistence.persistUser({
+        messageId: userMessageId,
+        conversationId: input.conversationId,
+        blocks: input.userBlocks,
+        assetIds: input.assetIds,
+        createdAt: startedAt,
+      })
+      this.dependencies.persistence.createRun({
+        runId,
+        conversationId: input.conversationId,
+        requestId,
+        model: input.model,
+        startedAt,
+      })
+      this.dependencies.persistence.createAssistant({
+        messageId,
+        conversationId: input.conversationId,
+        initialBlocks: [],
+        createdAt: startedAt,
+      })
+      const provider = this.dependencies.providers.get(input.provider)
+
+      active = {
+        requestId,
+        runId,
+        messageId,
+        conversationId: input.conversationId,
+        provider,
+        model: input.model,
+        blocks: [],
+        messages: [],
+        tools: [],
+        workflows: new Map(),
+        controller: new AbortController(),
+        modelTurns: 0,
+        busy: false,
+        cancelled: false,
+      }
+      this.activeByRequest.set(requestId, active)
+      if (input.allowTools) {
         const candidates = this.retrieve(
           input.content,
           await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
@@ -354,11 +368,30 @@ export class AgentOrchestrator {
         )
         active.tools = candidates.map(manifestTool)
         active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
-      } catch (error) {
-        return this.finish(active, 'failed', asAppError(error))
       }
+      const historyMessages = await this.dependencies.history?.prepare({
+        conversationId: input.conversationId,
+        beforeOrdinal: userPosition.ordinal,
+        provider,
+        model: input.model,
+        ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
+        currentMessage: { role: 'user', content: input.modelContent },
+        tools: active.tools,
+        currentMedia: input.currentMedia ?? [],
+        signal: active.controller.signal,
+      }) ?? []
+      active.messages = [
+        ...historyMessages,
+        { role: 'user', content: input.modelContent },
+      ]
+      return this.driveExclusive(active)
+    } catch (error) {
+      if (active) return this.finish(active, 'failed', asAppError(error))
+      if (this.activeByConversation.get(input.conversationId) === requestId) {
+        this.activeByConversation.delete(input.conversationId)
+      }
+      throw error
     }
-    return this.driveExclusive(active)
   }
 
   async resumeApproval(decision: ApprovalDecision): Promise<AgentRunResult> {
@@ -644,6 +677,9 @@ export class AgentOrchestrator {
     }
     active.terminal = result
     this.activeByRequest.delete(active.requestId)
+    if (this.activeByConversation.get(active.conversationId) === active.requestId) {
+      this.activeByConversation.delete(active.conversationId)
+    }
     if (active.pending) {
       this.activeByExecution.delete(active.pending.executionId)
       if (!active.pending.reservationStarted) {

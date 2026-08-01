@@ -91,7 +91,7 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     abort: vi.fn(async () => { calls.push('writer.abort') }),
   }
   const persistence: AgentPersistencePort = {
-    persistUser: vi.fn(() => { calls.push('persistUser') }),
+    persistUser: vi.fn(() => { calls.push('persistUser'); return { ordinal: 1 } }),
     createRun: vi.fn(() => { calls.push('createRun') }),
     createAssistant: vi.fn(() => { calls.push('createAssistant') }),
     startMediaGeneration: vi.fn(() => { calls.push('startMediaGeneration') }),

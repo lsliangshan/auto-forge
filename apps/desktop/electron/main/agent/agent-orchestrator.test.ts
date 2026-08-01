@@ -9,6 +9,7 @@ import {
   type ProviderStreamEvent,
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
+import type { ConversationHistoryPort } from '../chat/conversation-context.js'
 
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
@@ -28,6 +29,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
   records: { users: unknown[]; starts: unknown[]; decisions: unknown[]; discards: unknown[]; events: unknown[]; terminal: unknown[] }
   providerInstances: Record<ModelProviderId, AgentProviderPort>
   registry: { get: ReturnType<typeof vi.fn> }
+  history: { prepare: ReturnType<typeof vi.fn<ConversationHistoryPort['prepare']>> }
 } {
   const records = { users: [] as unknown[], starts: [] as unknown[], decisions: [] as unknown[], discards: [] as unknown[], events: [] as unknown[], terminal: [] as unknown[] }
   const messages = new Map<string, { blocks: unknown[] }>()
@@ -37,6 +39,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     deepseek: { stream: vi.fn(() => events(turns.shift() ?? [])) },
   }
   const registry = { get: vi.fn((provider: ModelProviderId) => providerInstances[provider]) }
+  const history = { prepare: vi.fn<ConversationHistoryPort['prepare']>(async () => []) }
   return {
     records,
     providers: registry,
@@ -59,7 +62,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
       cancel: async () => undefined,
     },
     persistence: {
-      persistUser(value) { records.users.push(value) },
+      persistUser(value) { records.users.push(value); return { ordinal: records.users.length } },
       createRun() {},
       createAssistant(value) { messages.set(value.messageId, { blocks: value.initialBlocks }) },
       startMediaGeneration() {},
@@ -80,6 +83,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
       finalize(value) { records.terminal.push(value); messages.set(value.messageId, { blocks: value.blocks }) },
     },
     emit: (event) => { records.events.push(event) },
+    history,
     id: (() => { let value = 0; return () => `id_${++value}` })(),
     now: () => 100,
   }
@@ -99,11 +103,140 @@ function textRunInput(
     userBlocks: [{ type: 'text', text: input.content }],
     modelContent: input.content,
     assetIds: [],
+    currentMedia: [],
     allowTools: true,
   }
 }
 
 describe('AgentOrchestrator', () => {
+  it('prepends prepared history before the current user message', async () => {
+    const dependencies = harness([[
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.history.prepare = vi.fn<ConversationHistoryPort['prepare']>(async () => [
+      { role: 'user', content: '我的代号是青山' },
+      { role: 'assistant', content: '已记住' },
+    ])
+    const currentMedia = [{ kind: 'audio' as const, durationMs: 1_000 }]
+
+    await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'c1', content: '我的代号是什么？', provider: 'openrouter', model: 'model',
+      }),
+      contextLength: 4_096,
+      currentMedia,
+    })
+
+    expect(dependencies.history.prepare).toHaveBeenCalledWith({
+      conversationId: 'c1',
+      beforeOrdinal: 1,
+      provider: dependencies.providerInstances.openrouter,
+      model: 'model',
+      contextLength: 4_096,
+      currentMessage: { role: 'user', content: '我的代号是什么？' },
+      tools: [{
+        type: 'function',
+        function: {
+          name: workflow.id,
+          description: workflow.description,
+          parameters: workflow.inputSchema,
+        },
+      }],
+      currentMedia,
+      signal: expect.any(AbortSignal),
+    })
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messages: [
+          { role: 'user', content: '我的代号是青山' },
+          { role: 'assistant', content: '已记住' },
+          { role: 'user', content: '我的代号是什么？' },
+        ],
+      }),
+    )
+  })
+
+  it('rejects only same-conversation concurrent runs before persistence', async () => {
+    const dependencies = harness([])
+    let started!: () => void
+    let release!: () => void
+    const providerStarted = new Promise<void>((resolve) => { started = resolve })
+    const providerReleased = new Promise<void>((resolve) => { release = resolve })
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
+      started()
+      await providerReleased
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const first = orchestrator.run(textRunInput({
+      conversationId: 'c1', content: 'first', provider: 'openrouter', model: 'm',
+    }))
+    await providerStarted
+    const duplicate = await orchestrator.run(textRunInput({
+      conversationId: 'c1', content: 'duplicate', provider: 'openrouter', model: 'm',
+    }))
+    const other = orchestrator.run(textRunInput({
+      conversationId: 'c2', content: 'other', provider: 'openrouter', model: 'm',
+    }))
+
+    expect(duplicate).toMatchObject({
+      status: 'failed', error: { code: 'CONFLICT' },
+    })
+    expect(dependencies.records.users).toHaveLength(2)
+    release()
+    await expect(Promise.all([first, other])).resolves.toEqual([
+      expect.objectContaining({ status: 'completed' }),
+      expect.objectContaining({ status: 'completed' }),
+    ])
+  })
+
+  it('keeps prepared summaries private from chat events', async () => {
+    const dependencies = harness([[
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.history.prepare = vi.fn<ConversationHistoryPort['prepare']>(async () => [
+      { role: 'system', content: '内部摘要：用户曾说过青山' },
+    ])
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'c1', content: '继续', provider: 'openrouter', model: 'm',
+    }))
+
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({
+      messages: [
+        { role: 'system', content: '内部摘要：用户曾说过青山' },
+        { role: 'user', content: '继续' },
+      ],
+    }))
+    expect(JSON.stringify(dependencies.records.events)).not.toContain('内部摘要')
+  })
+
+  it('finalizes a context-limit failure once and releases the conversation for retry', async () => {
+    const dependencies = harness([[
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.history.prepare = vi.fn<ConversationHistoryPort['prepare']>(async () => {
+      throw { code: 'CONTEXT_LIMIT_EXCEEDED' }
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const failed = await orchestrator.run(textRunInput({
+      conversationId: 'c1', content: '过长', provider: 'openrouter', model: 'm',
+    }))
+    dependencies.history.prepare = vi.fn<ConversationHistoryPort['prepare']>(async () => [])
+    const retried = await orchestrator.run(textRunInput({
+      conversationId: 'c1', content: '重试', provider: 'openrouter', model: 'm',
+    }))
+
+    expect(failed).toMatchObject({ status: 'failed', error: { code: 'CONTEXT_LIMIT_EXCEEDED' } })
+    expect(dependencies.records.terminal).toHaveLength(2)
+    expect(dependencies.records.terminal[0]).toMatchObject({
+      status: 'failed', errorCode: 'CONTEXT_LIMIT_EXCEEDED',
+    })
+    expect(retried).toMatchObject({ status: 'completed' })
+  })
+
   it('persists supplied display blocks with exact assets and sends normalized content only to the provider', async () => {
     const dependencies = harness([[
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
@@ -133,6 +266,7 @@ describe('AgentOrchestrator', () => {
       userBlocks,
       modelContent,
       assetIds: ['asset_image'],
+      currentMedia: [{ kind: 'image' }],
       allowTools: false,
       provider: 'openrouter',
       model: 'vision-model',
@@ -154,7 +288,7 @@ describe('AgentOrchestrator', () => {
 
   it('claims exact assets when the production persistence adapter inserts a user message', () => {
     const insert = vi.fn()
-    const insertWithAssets = vi.fn()
+    const insertWithAssets = vi.fn(() => ({ ordinal: 7 }))
     const replaceBlock = vi.fn()
     const persistence = createAgentPersistence({
       messages: { insert, insertWithAssets, replaceBlock },
@@ -162,13 +296,13 @@ describe('AgentOrchestrator', () => {
     } as never)
     const blocks = [{ type: 'text' as const, text: '带附件' }]
 
-    persistence.persistUser({
+    expect(persistence.persistUser({
       messageId: 'message_1',
       conversationId: 'conversation_1',
       blocks,
       assetIds: ['asset_1'],
       createdAt: 10,
-    })
+    })).toEqual({ ordinal: 7 })
 
     expect(insertWithAssets).toHaveBeenCalledWith({
       id: 'message_1',
@@ -238,6 +372,7 @@ describe('AgentOrchestrator', () => {
       userBlocks: [{ type: 'text', text: '描述图片' }],
       modelContent: '描述图片',
       assetIds: [],
+      currentMedia: [],
       allowTools: false,
       provider: 'openrouter',
       model: 'vision-model',
@@ -312,6 +447,7 @@ describe('AgentOrchestrator', () => {
       userBlocks: [{ type: 'text', text: '结合图片搜索' }],
       modelContent,
       assetIds: [],
+      currentMedia: [{ kind: 'image' }],
       allowTools: true,
       provider: 'openrouter',
       model: 'vision-model',
@@ -585,6 +721,7 @@ describe('AgentOrchestrator', () => {
         { type: 'media', kind: 'image', mimeType: 'image/png', dataBase64: 'AQID' },
       ],
       assetIds: [],
+      currentMedia: [{ kind: 'image' }],
       allowTools: false,
       provider: 'openrouter',
       model: 'vision-model',
