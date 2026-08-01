@@ -149,7 +149,7 @@
           <label class="switch-row">启用 VPN 代理<el-switch
             v-model="proxyDraft.enabled"
             data-testid="proxy-enabled"
-            @change="saveProxyDraft"
+            @change="saveChangedProxyDraft"
           /></label>
           <label for="http-proxy">http_proxy</label>
           <div data-testid="http-proxy">
@@ -158,6 +158,7 @@
               v-model="proxyDraft.httpProxy"
               :disabled="settings.saving"
               placeholder="http://127.0.0.1:7890"
+              @input="markProxyDraftDirty"
               @blur="saveProxyDraft"
             />
           </div>
@@ -168,6 +169,7 @@
               v-model="proxyDraft.httpsProxy"
               :disabled="settings.saving"
               placeholder="https://127.0.0.1:7890"
+              @input="markProxyDraftDirty"
               @blur="saveProxyDraft"
             />
           </div>
@@ -178,6 +180,7 @@
               v-model="proxyDraft.socketProxy"
               :disabled="settings.saving"
               placeholder="socks5://127.0.0.1:7890"
+              @input="markProxyDraftDirty"
               @blur="saveProxyDraft"
             />
           </div>
@@ -190,6 +193,7 @@
               :rows="3"
               :disabled="settings.saving"
               placeholder="example.com, *.internal.example"
+              @input="markProxyDraftDirty"
               @blur="saveProxyDraft"
             />
           </div>
@@ -330,6 +334,8 @@ const proxyDraft = reactive<ProxyDraft>({
   socketProxy: '',
   bypassText: '',
 })
+const proxyDraftRevision = ref(0)
+let appliedProxyRevision = 0
 const proxyValidationError = ref('')
 type ModelOutput = 'text' | 'image' | 'audio' | 'video'
 const modelOutputLabels: Record<ModelOutput, string> = {
@@ -359,13 +365,16 @@ const credentialTone = computed(() => settings.credential?.validation === 'valid
   ? 'success'
   : settings.credential?.configured ? 'warning' : '')
 watch(() => settings.activeProvider, (value) => { selectedProvider.value = value }, { immediate: true })
-watch(() => settings.settings?.proxy, (proxy) => {
-  if (!proxy) return
+function applyProxyDraft(proxy: ProxySettings) {
   proxyDraft.enabled = proxy.enabled
   proxyDraft.httpProxy = proxy.httpProxy ?? ''
   proxyDraft.httpsProxy = proxy.httpsProxy ?? ''
   proxyDraft.socketProxy = proxy.socketProxy ?? ''
   proxyDraft.bypassText = proxy.bypassDomains.join('\n')
+}
+watch(() => settings.settings?.proxy, (proxy) => {
+  if (!proxy || proxyDraftRevision.value !== appliedProxyRevision) return
+  applyProxyDraft(proxy)
 }, { immediate: true, deep: true })
 
 onMounted(async () => {
@@ -399,6 +408,13 @@ async function clearCredential() {
 function saveModel(output: ModelOutput, value: unknown) {
   void settings.saveDefaultModel(output, typeof value === 'string' && value ? value : undefined)
 }
+function markProxyDraftDirty() {
+  proxyDraftRevision.value += 1
+}
+function saveChangedProxyDraft() {
+  markProxyDraftDirty()
+  void saveProxyDraft()
+}
 async function saveProxyDraft() {
   proxyValidationError.value = ''
   const bypassEntries = proxyDraft.bypassText
@@ -429,7 +445,11 @@ async function saveProxyDraft() {
       : '请输入不包含用户名、密码和路径的有效代理地址'
     return
   }
-  await settings.update({ proxy })
+  const revision = proxyDraftRevision.value
+  const updated = await settings.update({ proxy })
+  if (!updated || revision !== proxyDraftRevision.value) return
+  appliedProxyRevision = revision
+  applyProxyDraft(updated.proxy)
 }
 async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
   try {

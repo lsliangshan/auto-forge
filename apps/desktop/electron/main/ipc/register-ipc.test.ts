@@ -116,6 +116,25 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.settings.update).not.toHaveBeenCalled()
   })
 
+  it('rejects invalid bypass array entries before updating settings', async () => {
+    const app = harness()
+
+    for (const bypassEntry of [
+      'https://example.com',
+      'example.com:443',
+      'example.com/path',
+      '',
+      'example.com,internal.example',
+      'example.com\ninternal.example',
+    ]) {
+      await expect(app.invoke(ipcChannels.settingsUpdate, {
+        proxy: { enabled: false, bypassDomains: ['example.com', bypassEntry] },
+      })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+
+    expect(app.dependencies.settings.update).not.toHaveBeenCalled()
+  })
+
   it('rejects an invalid chat request before invoking the orchestrator', async () => {
     const app = harness()
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))

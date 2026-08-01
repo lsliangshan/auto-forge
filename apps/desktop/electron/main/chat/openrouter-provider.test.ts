@@ -98,6 +98,71 @@ describe('OpenRouterProvider', () => {
     ])).resolves.toBe('applied')
   })
 
+  it('cancels an oversized managed catalog body before rejecting', async () => {
+    let bodyCancelled = false
+    const networkProxy = new NetworkProxyService({
+      setProxy: vi.fn(async () => undefined),
+      closeAllConnections: vi.fn(async () => undefined),
+      fetch: vi.fn(async () => new Response(new ReadableStream({
+        pull() { return new Promise<void>(() => undefined) },
+        cancel() { bodyCancelled = true },
+      }, { highWaterMark: 0 }), {
+        headers: { 'content-length': String((4 * 1024 * 1024) + 1) },
+      })),
+    })
+    await networkProxy.initialize({ enabled: false, bypassDomains: [] })
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: (input, init) => networkProxy.fetch(input instanceof URL ? input.toString() : input, init),
+    })
+
+    await expect(provider.listModels()).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    const transition = networkProxy.transition({
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    })
+
+    await expect(Promise.race([
+      transition.then(() => 'applied'),
+      new Promise((resolve) => setTimeout(resolve, 25, 'blocked')),
+    ])).resolves.toBe('applied')
+    expect(bodyCancelled).toBe(true)
+  })
+
+  it('cancels a managed SSE body when DONE arrives before physical EOF', async () => {
+    let bodyCancelled = false
+    const encoder = new TextEncoder()
+    const networkProxy = new NetworkProxyService({
+      setProxy: vi.fn(async () => undefined),
+      closeAllConnections: vi.fn(async () => undefined),
+      fetch: vi.fn(async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        },
+        cancel() { bodyCancelled = true },
+      }, { highWaterMark: 0 }))),
+    })
+    await networkProxy.initialize({ enabled: false, bypassDomains: [] })
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: (input, init) => networkProxy.fetch(input instanceof URL ? input.toString() : input, init),
+    })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] }))).resolves.toEqual([])
+    const transition = networkProxy.transition({
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    })
+
+    await expect(Promise.race([
+      transition.then(() => 'applied'),
+      new Promise((resolve) => setTimeout(resolve, 25, 'blocked')),
+    ])).resolves.toBe('applied')
+    expect(bodyCancelled).toBe(true)
+  })
+
   it('omits resolution when the selected image model does not advertise it', async () => {
     const bodies: string[] = []
     const provider = new OpenRouterProvider({

@@ -281,7 +281,7 @@ describe('BrowserCapabilityService', () => {
 
     await service.open(contextOne, 'https://example.com')
     proxiedSnapshot.playwrightArgs[0] = '--proxy-server=http://changed.invalid:7890'
-    snapshot = { enabled: false, bypassRules: '<local>', playwrightArgs: [] }
+    snapshot = { enabled: false, bypassRules: '<local>', playwrightArgs: ['--no-proxy-server'] }
     await service.url(contextOne)
     await service.open(contextTwo, 'https://example.com')
 
@@ -290,7 +290,7 @@ describe('BrowserCapabilityService', () => {
         '--proxy-server=http=http://127.0.0.1:7890;https=http://127.0.0.1:7890',
         '--proxy-bypass-list=<local>;example.com',
       ],
-      [],
+      ['--no-proxy-server'],
     ])
     expect(service.activeContexts(contextOne.executionId)).toBe(1)
     expect(contextClosures).toBe(0)
@@ -320,10 +320,14 @@ describe('BrowserCapabilityService', () => {
     const opening = service.open({ ...approvedContext, executionId: 'exec_proxy_pending' }, 'https://example.com')
     await snapshotRequested.promise
     expect(launches).toEqual([])
-    snapshotReady.resolve({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })
+    snapshotReady.resolve({
+      enabled: false,
+      bypassRules: '<local>',
+      playwrightArgs: ['--no-proxy-server'],
+    })
 
     await opening
-    expect(launches).toEqual([[]])
+    expect(launches).toEqual([['--no-proxy-server']])
     await service.closeExecution('exec_proxy_pending')
   })
 
@@ -801,6 +805,7 @@ describe('packaged Chromium runtime resolution', () => {
       headless: false,
       executablePath: await import('node:fs/promises').then(({ realpath }) => realpath(executablePath)),
       serviceWorkers: 'block',
+      args: ['--no-proxy-server'],
     })
     await service.closeExecution(approvedContext.executionId)
     await rm(resourcesPath, { recursive: true, force: true })

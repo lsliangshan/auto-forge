@@ -2,6 +2,26 @@ import { z } from 'zod'
 
 const domainPattern = /^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u
 
+function explicitProxyPort(value: string): string | undefined {
+  const schemeEnd = value.indexOf('://')
+  if (schemeEnd < 0) return undefined
+  const authorityStart = schemeEnd + 3
+  const authorityRemainder = value.slice(authorityStart)
+  const authorityEnd = authorityRemainder.search(/[/?#]/u)
+  const authority = authorityEnd < 0
+    ? authorityRemainder
+    : authorityRemainder.slice(0, authorityEnd)
+  const hostnameAndPort = authority.slice(authority.lastIndexOf('@') + 1)
+  const portSeparator = hostnameAndPort.startsWith('[')
+    ? hostnameAndPort.indexOf(']') + 1
+    : hostnameAndPort.lastIndexOf(':')
+  if (portSeparator <= 0 || hostnameAndPort[portSeparator] !== ':') return undefined
+  const rawPort = hostnameAndPort.slice(portSeparator + 1)
+  if (!/^\d+$/u.test(rawPort)) return undefined
+  const port = Number(rawPort)
+  return Number.isSafeInteger(port) && port <= 65_535 ? String(port) : undefined
+}
+
 function canonicalProxyUrl(
   value: string,
   protocols: ReadonlySet<string>,
@@ -9,14 +29,15 @@ function canonicalProxyUrl(
   try {
     const trimmed = value.trim()
     const parsed = new URL(trimmed)
+    const port = explicitProxyPort(trimmed)
     if (!protocols.has(parsed.protocol)
       || parsed.username !== ''
       || parsed.password !== ''
-      || parsed.port === ''
+      || port === undefined
       || (parsed.pathname !== '' && parsed.pathname !== '/')
       || parsed.search !== ''
       || parsed.hash !== '') return undefined
-    return `${parsed.protocol}//${parsed.host}`
+    return `${parsed.protocol}//${parsed.hostname}:${port}`
   } catch {
     return undefined
   }
@@ -34,12 +55,18 @@ const socketProxySchema = z.string().superRefine((value, context) => {
   }
 })
 
+const proxyBypassEntrySchema = z.string().superRefine((value, context) => {
+  if (/[,\r\n]/u.test(value) || parseProxyBypassEntry(value) === undefined) {
+    context.addIssue({ code: 'custom', message: 'Invalid proxy bypass entry' })
+  }
+})
+
 export const proxySettingsSchema = z.object({
   enabled: z.boolean(),
   httpProxy: httpProxySchema.optional(),
   httpsProxy: httpProxySchema.optional(),
   socketProxy: socketProxySchema.optional(),
-  bypassDomains: z.array(z.string()).max(256),
+  bypassDomains: z.array(proxyBypassEntrySchema).max(256),
 }).strict().superRefine((value, context) => {
   if (value.enabled && !value.httpProxy && !value.httpsProxy && !value.socketProxy) {
     context.addIssue({ code: 'custom', path: ['enabled'], message: 'At least one proxy is required' })
@@ -99,11 +126,12 @@ function normalizeProxyAddress(value: string | undefined, protocols: ReadonlySet
 }
 
 export function normalizeProxySettings(value: ProxySettings): ProxySettings {
+  const parsed = proxySettingsSchema.parse(value)
   return proxySettingsSchema.parse({
-    enabled: value.enabled,
-    httpProxy: normalizeProxyAddress(value.httpProxy, new Set(['http:', 'https:'])),
-    httpsProxy: normalizeProxyAddress(value.httpsProxy, new Set(['http:', 'https:'])),
-    socketProxy: normalizeProxyAddress(value.socketProxy, new Set(['socks4:', 'socks5:'])),
-    bypassDomains: parseProxyBypassText(value.bypassDomains.join('\n')),
+    enabled: parsed.enabled,
+    httpProxy: normalizeProxyAddress(parsed.httpProxy, new Set(['http:', 'https:'])),
+    httpsProxy: normalizeProxyAddress(parsed.httpsProxy, new Set(['http:', 'https:'])),
+    socketProxy: normalizeProxyAddress(parsed.socketProxy, new Set(['socks4:', 'socks5:'])),
+    bypassDomains: [...new Set(parsed.bypassDomains.map((entry) => parseProxyBypassEntry(entry)!))],
   })
 }

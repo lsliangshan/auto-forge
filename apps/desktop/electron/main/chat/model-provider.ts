@@ -337,9 +337,14 @@ async function boundedResponseJson(
   maximumBytes = MAX_MODEL_CATALOG_BODY,
   signal?: AbortSignal,
 ): Promise<unknown> {
-  if (signal?.aborted) throw failure('CANCELLED')
+  const cancelBody = async () => response.body?.cancel().catch(() => undefined)
+  if (signal?.aborted) {
+    await cancelBody()
+    throw failure('CANCELLED')
+  }
   const declaredLength = response.headers.get('content-length')
   if (declaredLength && Number(declaredLength) > maximumBytes) {
+    await cancelBody()
     throw new Error('Model provider response exceeded the size limit')
   }
   if (!response.body) throw new Error('Model provider response had no body')
@@ -1144,12 +1149,15 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     })
     const decoder = new TextDecoder()
     const reader = response.body.getReader()
-    let normalCompletion = false
+    let physicalEof = false
     try {
       while (!done) {
         if (signal?.aborted) throw failure('CANCELLED')
         const result = await reader.read()
-        if (result.done) break
+        if (result.done) {
+          physicalEof = true
+          break
+        }
         parser.feed(decoder.decode(result.value, { stream: true }))
         if (parserError) throw parserError
         while (pending.length) yield pending.shift()!
@@ -1159,9 +1167,8 @@ export class OpenAiCompatibleProvider implements ModelProvider {
       if (parserError) throw parserError
       while (pending.length) yield pending.shift()!
       if (!done && !explicitTerminal) throw new RetryableFailure()
-      normalCompletion = true
     } finally {
-      if (!normalCompletion) await reader.cancel().catch(() => undefined)
+      if (!physicalEof) await reader.cancel().catch(() => undefined)
       reader.releaseLock()
     }
   }

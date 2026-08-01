@@ -89,7 +89,7 @@ describe('proxyConfigFor', () => {
       snapshot: {
         enabled: false,
         bypassRules: '<local>',
-        playwrightArgs: [],
+        playwrightArgs: ['--no-proxy-server'],
       },
     })
   })
@@ -418,35 +418,40 @@ describe('NetworkProxyService', () => {
     await expect(service.snapshot()).resolves.toEqual(proxyConfigFor(previousSettings).snapshot)
   })
 
-  it('keeps rollback failures best-effort and reopens the previous generation safely', async () => {
+  it('enters a terminal unavailable state when rollback cannot restore enabled routing', async () => {
     const session = fakeSession()
     const service = new NetworkProxyService(session)
     const previousSettings = proxySettings(7890)
-    const nextSettings = proxySettings(7891)
     await service.initialize(previousSettings)
     session.setProxy.mockClear()
     session.closeAllConnections.mockClear()
     session.setProxy
-      .mockRejectedValueOnce(new Error('candidate http://127.0.0.1:7891 failed'))
+      .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error('rollback http://127.0.0.1:7890 failed'))
-    session.closeAllConnections.mockRejectedValueOnce(
-      new Error('rollback close http://127.0.0.1:7890 failed'),
-    )
+    session.closeAllConnections
+      .mockRejectedValueOnce(new Error('candidate direct cleanup failed'))
+      .mockRejectedValueOnce(new Error('rollback close http://127.0.0.1:7890 failed'))
 
-    const transition = service.transition(nextSettings)
+    const transition = service.transition(directSettings)
     const queuedFetch = service.fetch('https://after.example')
-    const error = await transition.catch((caught: unknown) => caught)
-    await queuedFetch
+    const queuedSnapshot = service.snapshot()
 
-    expect(error).toEqual({
+    const safeError = {
       code: 'NETWORK_PROXY_APPLY_FAILED',
       message: 'The network proxy configuration could not be applied.',
-    })
-    expect(JSON.stringify(error)).not.toContain('127.0.0.1')
+    }
+    await expect(transition).rejects.toEqual(safeError)
+    await expect(queuedFetch).rejects.toEqual(safeError)
+    await expect(queuedSnapshot).rejects.toEqual(safeError)
+    await expect(service.fetch('https://future.example')).rejects.toEqual(safeError)
+    await expect(service.snapshot()).rejects.toEqual(safeError)
+    await expect(service.transition(previousSettings)).rejects.toEqual(safeError)
+
     expect(session.setProxy).toHaveBeenCalledTimes(2)
-    expect(session.closeAllConnections).toHaveBeenCalledOnce()
-    await expect(service.snapshot()).resolves.toEqual(proxyConfigFor(previousSettings).snapshot)
-    expect(session.fetch).toHaveBeenCalledOnce()
+    expect(session.setProxy).toHaveBeenNthCalledWith(1, proxyConfigFor(directSettings).electron)
+    expect(session.setProxy).toHaveBeenNthCalledWith(2, proxyConfigFor(previousSettings).electron)
+    expect(session.closeAllConnections).toHaveBeenCalledTimes(2)
+    expect(session.fetch).not.toHaveBeenCalled()
   })
 
   it('throws a safe error from initialization instead of silently downgrading', async () => {

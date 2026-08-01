@@ -102,6 +102,53 @@ describe('cross-process contracts', () => {
     })
   })
 
+  it('preserves explicit default proxy ports for domains and IPv6 literals', () => {
+    for (const [field, address, canonical] of [
+      ['httpProxy', 'http://PROXY.example:80', 'http://proxy.example:80'],
+      ['httpsProxy', 'https://PROXY.example:443', 'https://proxy.example:443'],
+      ['httpProxy', 'http://[2001:db8::1]:80', 'http://[2001:db8::1]:80'],
+      ['httpsProxy', 'https://[2001:db8::1]:443', 'https://[2001:db8::1]:443'],
+    ] as const) {
+      expect(normalizeProxySettings({
+        enabled: true,
+        [field]: address,
+        bypassDomains: [],
+      })).toEqual({
+        enabled: true,
+        [field]: canonical,
+        bypassDomains: [],
+      })
+    }
+
+    expect(() => proxySettingsSchema.parse({
+      enabled: true,
+      httpProxy: 'http://proxy.example',
+      bypassDomains: [],
+    })).toThrow()
+  })
+
+  it('rejects every invalid bypass array entry instead of filtering it', () => {
+    for (const bypassEntry of [
+      'https://example.com',
+      'example.com:443',
+      'example.com/path',
+      '',
+      '   ',
+      'example.com,internal.example',
+      'example.com\ninternal.example',
+    ]) {
+      expect(() => proxySettingsSchema.parse({
+        enabled: false,
+        bypassDomains: [bypassEntry],
+      })).toThrow()
+    }
+
+    expect(() => normalizeProxySettings({
+      enabled: false,
+      bypassDomains: ['example.com', 'https://private.example'],
+    })).toThrow()
+  })
+
   it('accepts strict persisted media blocks without paths or encoded bytes', () => {
     expect(chatBlockSchema.parse({
       type: 'media',

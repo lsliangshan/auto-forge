@@ -902,6 +902,49 @@ describe('workbench', () => {
     })
   })
 
+  it('preserves the newer enabled draft when blur succeeds and the queued switch fails', async () => {
+    const api = createApi()
+    const initial = await api.settings.get()
+    let finishBlur!: (settings: AppSettings) => void
+    const blurUpdate = new Promise<AppSettings>((resolve) => { finishBlur = resolve })
+    let updateCount = 0
+    vi.mocked(api.settings.update).mockImplementation(async () => {
+      updateCount += 1
+      if (updateCount === 1) return blurUpdate
+      throw {
+        code: 'NETWORK_PROXY_APPLY_FAILED',
+        message: 'unsafe raw address',
+      }
+    })
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+
+    await wrapper.get('[data-testid="http-proxy"] input').setValue('http://127.0.0.1:7890')
+    await wrapper.get('[data-testid="http-proxy"] input').trigger('blur')
+    await vi.waitFor(() => expect(useSettingsStore().saving).toBe(true))
+    await wrapper.get('[data-testid="proxy-enabled"]').trigger('click')
+    finishBlur({ ...initial, proxy: {
+      enabled: false,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    } })
+
+    await vi.waitFor(() => expect(api.settings.update).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(wrapper.text()).toContain('代理应用失败，已保留原配置'))
+    expect(api.settings.update).toHaveBeenLastCalledWith({
+      proxy: {
+        enabled: true,
+        httpProxy: 'http://127.0.0.1:7890',
+        bypassDomains: [],
+      },
+    })
+    expect(useSettingsStore().settings?.proxy.enabled).toBe(false)
+    expect(wrapper.get('[data-testid="proxy-enabled"] input').attributes('aria-checked')).toBe('true')
+    expect((wrapper.get('[data-testid="http-proxy"] input').element as HTMLInputElement).value)
+      .toBe('http://127.0.0.1:7890')
+    expect(wrapper.text()).not.toContain('unsafe raw address')
+  })
+
   it('keeps entered addresses when proxying is disabled', async () => {
     const { wrapper, api } = await mountApp('/settings', await apiWithEnabledProxy())
     await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))

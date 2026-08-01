@@ -367,7 +367,7 @@ export class BrowserCapabilityService implements CapabilityPort {
       }),
     }
     this.proxySnapshot = options.proxySnapshot
-      ?? (async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] }))
+      ?? (async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: ['--no-proxy-server'] }))
     this.runtime = options.runtime ?? { packaged: false }
   }
 

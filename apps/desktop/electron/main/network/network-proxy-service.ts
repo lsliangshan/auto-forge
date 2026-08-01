@@ -1,4 +1,4 @@
-import { toSafeAppError, type ProxySettings } from '@autoforge/shared'
+import { toSafeAppError, type AppError, type ProxySettings } from '@autoforge/shared'
 
 export interface ProxySessionPort {
   setProxy(config: {
@@ -50,7 +50,7 @@ export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
       snapshot: {
         enabled: false,
         bypassRules: electronBypass,
-        playwrightArgs: frozenArgs([]),
+        playwrightArgs: frozenArgs(['--no-proxy-server']),
       },
     }
   }
@@ -93,9 +93,11 @@ export class NetworkProxyService implements NetworkProxyPort {
   private drainWaiters = new Set<() => void>()
   private entryBarrier: Promise<void> = Promise.resolve()
   private releaseEntryBarrier: (() => void) | undefined
+  private rejectEntryBarrier: ((error: AppError) => void) | undefined
   private transitionQueue: Promise<void> = Promise.resolve()
   private current = proxyConfigFor({ enabled: false, bypassDomains: [] })
   private pendingTransitions = 0
+  private terminalError: AppError | undefined
 
   constructor(private readonly session: ProxySessionPort) {}
 
@@ -104,20 +106,25 @@ export class NetworkProxyService implements NetworkProxyPort {
   }
 
   transition(settings: ProxySettings): Promise<void> {
+    if (this.terminalError) return Promise.reject(this.terminalError)
     const candidate = proxyConfigFor(settings)
     this.pendingTransitions += 1
     this.closeEntryBarrier()
 
-    const operation = this.transitionQueue.then(() => this.apply(candidate))
+    const operation = this.transitionQueue.then(() => {
+      if (this.terminalError) throw this.terminalError
+      return this.apply(candidate)
+    })
     this.transitionQueue = operation.catch(() => undefined)
 
     return operation.finally(() => {
       this.pendingTransitions -= 1
-      if (this.pendingTransitions === 0) this.openEntryBarrier()
+      if (this.pendingTransitions === 0 && !this.terminalError) this.openEntryBarrier()
     })
   }
 
   async fetch(input: string | Request, init?: RequestInit): Promise<Response> {
+    if (this.terminalError) throw this.terminalError
     const release = await this.acquireLease()
     let response: Response
     try {
@@ -165,9 +172,11 @@ export class NetworkProxyService implements NetworkProxyPort {
   }
 
   async snapshot(): Promise<NetworkProxySnapshot> {
+    if (this.terminalError) throw this.terminalError
     while (true) {
       const barrier = this.entryBarrier
       await barrier
+      if (this.terminalError) throw this.terminalError
       if (barrier === this.entryBarrier && !this.releaseEntryBarrier) {
         return copySnapshot(this.current.snapshot)
       }
@@ -176,8 +185,10 @@ export class NetworkProxyService implements NetworkProxyPort {
 
   private async acquireLease(): Promise<() => void> {
     while (true) {
+      if (this.terminalError) throw this.terminalError
       const barrier = this.entryBarrier
       await barrier
+      if (this.terminalError) throw this.terminalError
       if (barrier !== this.entryBarrier || this.releaseEntryBarrier) continue
 
       this.activeLeases += 1
@@ -197,15 +208,28 @@ export class NetworkProxyService implements NetworkProxyPort {
 
   private closeEntryBarrier(): void {
     if (this.releaseEntryBarrier) return
-    this.entryBarrier = new Promise((resolve) => {
+    const barrier = new Promise<void>((resolve, reject) => {
       this.releaseEntryBarrier = resolve
+      this.rejectEntryBarrier = reject
     })
+    void barrier.catch(() => undefined)
+    this.entryBarrier = barrier
   }
 
   private openEntryBarrier(): void {
     const release = this.releaseEntryBarrier
     this.releaseEntryBarrier = undefined
+    this.rejectEntryBarrier = undefined
     release?.()
+  }
+
+  private enterTerminalState(error: AppError): void {
+    if (this.terminalError) return
+    this.terminalError = error
+    const reject = this.rejectEntryBarrier
+    this.releaseEntryBarrier = undefined
+    this.rejectEntryBarrier = undefined
+    reject?.(error)
   }
 
   private waitForLeasesToDrain(): Promise<void> {
@@ -221,17 +245,20 @@ export class NetworkProxyService implements NetworkProxyPort {
       await this.session.closeAllConnections()
       this.current = candidate
     } catch {
+      let restored = true
       try {
         await this.session.setProxy(previous.electron)
       } catch {
-        // Best-effort rollback preserves the published previous generation.
+        restored = false
       }
       try {
         await this.session.closeAllConnections()
       } catch {
-        // The safe error below must not expose either Electron failure.
+        restored = false
       }
-      throw toSafeAppError({ code: 'NETWORK_PROXY_APPLY_FAILED' })
+      const error = toSafeAppError({ code: 'NETWORK_PROXY_APPLY_FAILED' })
+      if (!restored) this.enterTerminalState(error)
+      throw error
     }
   }
 }
