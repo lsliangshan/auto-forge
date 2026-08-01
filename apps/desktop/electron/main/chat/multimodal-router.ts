@@ -31,6 +31,7 @@ export interface ResolveChatRouteInput {
 export interface ResolvedChatRoute {
   provider: ModelProviderId
   model: string
+  contextLength?: number
   supportsTools: boolean
   outputType: ConcreteOutput
   assets: ResolvedMediaAsset[]
@@ -307,6 +308,7 @@ function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteO
   return {
     provider: input.provider,
     model: model.id,
+    ...(model.contextLength === undefined ? {} : { contextLength: model.contextLength }),
     supportsTools: output === 'text' && model.supportsTools && model.inputModalities.includes('text'),
     outputType: output,
     assets: input.assets.slice(),

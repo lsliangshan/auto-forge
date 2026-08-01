@@ -576,6 +576,7 @@ describe('chat interactions', () => {
     ['MEDIA_GENERATION_FAILED', '媒体生成失败'],
     ['MEDIA_DOWNLOAD_FAILED', '媒体下载失败'],
     ['MEDIA_GENERATION_TIMEOUT', '视频生成超时'],
+    ['CONTEXT_LIMIT_EXCEEDED', '当前输入和会话上下文超出模型限制，请缩短输入或新建会话'],
   ] as const)('maps %s to its safe localized message', (code, message) => {
     expect(displayError({ code, message: 'unsafe provider details' })).toBe(message)
   })

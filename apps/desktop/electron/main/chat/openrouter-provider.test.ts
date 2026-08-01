@@ -1018,6 +1018,23 @@ describe('OpenRouterProvider', () => {
     ])
   })
 
+  it('serializes a defined maximum output token count', async () => {
+    const fetch = vi.fn(async () => sseResponse([
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    ]))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await collect(provider.stream({
+      model: 'summary-model',
+      messages: [{ role: 'user', content: 'compress' }],
+      maxOutputTokens: 512,
+    }))
+
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toMatchObject({
+      max_tokens: 512,
+    })
+  })
+
   it('parses arbitrary SSE boundaries, CRLF comments, usage, choices, and indexed tool fragments', async () => {
     const payload = [
       ': keep-alive\r\n\r\n',

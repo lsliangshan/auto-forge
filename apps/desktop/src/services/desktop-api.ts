@@ -29,6 +29,7 @@ const messages: Partial<Record<AppError['code'], string>> = {
   MODEL_PROVIDER_ACCESS_DENIED: '供应商拒绝了该模型请求，请检查模型权限、内容策略或 Guardrail 设置',
   MODEL_PROVIDER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
   OPENROUTER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
+  CONTEXT_LIMIT_EXCEEDED: '当前输入和会话上下文超出模型限制，请缩短输入或新建会话',
   MEDIA_TYPE_UNSUPPORTED: '不支持此媒体格式',
   MEDIA_ATTACHMENT_LIMIT_EXCEEDED: '每条消息最多添加 5 个附件',
   MEDIA_SIZE_LIMIT_EXCEEDED: '媒体文件大小超出限制',

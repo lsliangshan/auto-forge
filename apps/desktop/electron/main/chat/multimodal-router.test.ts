@@ -24,6 +24,7 @@ function model(overrides: Partial<ModelInfo> & Pick<ModelInfo, 'id'>): ModelInfo
   return {
     id: overrides.id,
     name: overrides.name ?? overrides.id,
+    ...(overrides.contextLength === undefined ? {} : { contextLength: overrides.contextLength }),
     inputModalities: overrides.inputModalities ?? ['text'],
     outputModalities: overrides.outputModalities ?? ['text'],
     supportsTools: overrides.supportsTools ?? false,
@@ -117,6 +118,19 @@ describe('resolveChatRoute', () => {
         generation: { image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 } },
       })],
     }))).toMatchObject({ model: 'image/model', outputType: 'image', supportsTools: false })
+  })
+
+  it('carries the selected model context limit into the resolved route', () => {
+    const resolved = resolveChatRoute(input({
+      models: [model({ id: 'bounded/model', contextLength: 131_072 })],
+      requestedModel: 'bounded/model',
+      requestedOutput: 'text',
+    }))
+
+    expect(resolved).toMatchObject({
+      model: 'bounded/model',
+      contextLength: 131_072,
+    })
   })
 
   it('marks only advertised image request parameters as supported', () => {

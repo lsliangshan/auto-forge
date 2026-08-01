@@ -40,6 +40,7 @@ export interface ModelStreamRequest {
   messages: ModelMessage[]
   tools?: ModelTool[]
   output?: { type: 'text' } | { type: 'audio'; voice?: string; format: string }
+  maxOutputTokens?: number
   signal?: AbortSignal
 }
 
@@ -829,6 +830,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
             model: request.model,
             messages,
             ...(request.tools?.length ? { tools: request.tools } : {}),
+            ...(request.maxOutputTokens === undefined ? {} : { max_tokens: request.maxOutputTokens }),
             stream: true,
             ...(this.config.includeUsageStreamOption ? { stream_options: { include_usage: true } } : {}),
             ...(request.output?.type === 'audio'

@@ -159,6 +159,11 @@ describe('cross-process contracts', () => {
     expect(() => appErrorCodeSchema.parse('MEDIA_UNKNOWN')).toThrow()
   })
 
+  it('recognizes the safe context-limit error code', () => {
+    expect(appErrorCodeSchema.parse('CONTEXT_LIMIT_EXCEEDED'))
+      .toBe('CONTEXT_LIMIT_EXCEEDED')
+  })
+
   it('replaces only the matching media block through a strict block update event', () => {
     expect(chatEventSchema.parse({
       type: 'block_update',
