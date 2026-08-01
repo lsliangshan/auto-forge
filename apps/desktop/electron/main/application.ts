@@ -298,6 +298,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
     runtime: options.browserRuntime,
+    proxySnapshot: () => options.networkProxy.snapshot(),
     profileDirectories: {
       create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-browser-')) },
       remove: (path) => rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }),

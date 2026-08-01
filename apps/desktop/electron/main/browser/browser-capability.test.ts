@@ -79,11 +79,18 @@ function fakeCDPSession() {
   }
 }
 
-function fakeLauncher(options: { close?: () => Promise<void> } = {}) {
+function fakeLauncher(options: {
+  close?: () => Promise<void>
+  onLaunch?: (launchOptions: { args?: string[] }) => void
+  onGoto?: (url: string) => void
+} = {}) {
   let currentUrl = 'about:blank'
   let contextCloseListener: (() => void) | undefined
   const page = {
-    goto: async (url: string) => { currentUrl = url },
+    goto: async (url: string) => {
+      currentUrl = url
+      options.onGoto?.(url)
+    },
     url: () => currentUrl,
     isClosed: () => false,
     once: () => undefined,
@@ -106,7 +113,13 @@ function fakeLauncher(options: { close?: () => Promise<void> } = {}) {
   }
   return {
     executablePath: () => process.execPath,
-    launchPersistentContext: async () => context as never,
+    launchPersistentContext: async (
+      _directory: string,
+      launchOptions: { args?: string[] },
+    ) => {
+      options.onLaunch?.(launchOptions)
+      return context as never
+    },
   }
 }
 
@@ -233,6 +246,99 @@ describe('BrowserCapabilityService', () => {
     await expect(browser.open(approvedContext, 'https://example.com')).rejects.toMatchObject(denied())
     expect(browser.activeContexts(approvedContext.executionId)).toBe(0)
     expect(profiles.created).toEqual([])
+  })
+
+  it('uses an immutable proxy snapshot for each new browser context', async () => {
+    let snapshot: {
+      enabled: boolean
+      proxyRules?: string
+      bypassRules: string
+      playwrightArgs: string[]
+    } = {
+      enabled: true,
+      proxyRules: 'http=http://127.0.0.1:7890;https=http://127.0.0.1:7890',
+      bypassRules: '<local>,example.com',
+      playwrightArgs: [
+        '--proxy-server=http=http://127.0.0.1:7890;https=http://127.0.0.1:7890',
+        '--proxy-bypass-list=<local>;example.com',
+      ],
+    }
+    const proxiedSnapshot = snapshot
+    const launches: string[][] = []
+    let contextClosures = 0
+    let navigations = 0
+    const service = new BrowserCapabilityService({
+      authorization: { authorize: () => undefined },
+      proxySnapshot: async () => snapshot,
+      launcher: fakeLauncher({
+        close: async () => { contextClosures += 1 },
+        onLaunch: (launchOptions) => launches.push(launchOptions.args ?? []),
+        onGoto: () => { navigations += 1 },
+      }),
+    })
+    const contextOne: BrowserCapabilityContext = { ...approvedContext, executionId: 'exec_proxy_one' }
+    const contextTwo: BrowserCapabilityContext = { ...approvedContext, executionId: 'exec_proxy_two' }
+
+    await service.open(contextOne, 'https://example.com')
+    proxiedSnapshot.playwrightArgs[0] = '--proxy-server=http://changed.invalid:7890'
+    snapshot = { enabled: false, bypassRules: '<local>', playwrightArgs: [] }
+    await service.url(contextOne)
+    await service.open(contextTwo, 'https://example.com')
+
+    expect(launches).toEqual([
+      [
+        '--proxy-server=http=http://127.0.0.1:7890;https=http://127.0.0.1:7890',
+        '--proxy-bypass-list=<local>;example.com',
+      ],
+      [],
+    ])
+    expect(service.activeContexts(contextOne.executionId)).toBe(1)
+    expect(contextClosures).toBe(0)
+    expect(navigations).toBe(2)
+
+    await service.closeExecution(contextOne.executionId)
+    await service.closeExecution(contextTwo.executionId)
+  })
+
+  it('waits for an asynchronous proxy snapshot before launching a new browser context', async () => {
+    const snapshotRequested = deferred()
+    const snapshotReady = deferred<{
+      enabled: boolean
+      bypassRules: string
+      playwrightArgs: string[]
+    }>()
+    const launches: string[][] = []
+    const service = new BrowserCapabilityService({
+      authorization: { authorize: () => undefined },
+      proxySnapshot: async () => {
+        snapshotRequested.resolve()
+        return snapshotReady.promise
+      },
+      launcher: fakeLauncher({ onLaunch: (launchOptions) => launches.push(launchOptions.args ?? []) }),
+    })
+
+    const opening = service.open({ ...approvedContext, executionId: 'exec_proxy_pending' }, 'https://example.com')
+    await snapshotRequested.promise
+    expect(launches).toEqual([])
+    snapshotReady.resolve({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })
+
+    await opening
+    expect(launches).toEqual([[]])
+    await service.closeExecution('exec_proxy_pending')
+  })
+
+  it('propagates a proxy snapshot failure without launching a browser context', async () => {
+    let launches = 0
+    const service = new BrowserCapabilityService({
+      authorization: { authorize: () => undefined },
+      proxySnapshot: async () => { throw new Error('proxy snapshot unavailable') },
+      launcher: fakeLauncher({ onLaunch: () => { launches += 1 } }),
+    })
+    const context: BrowserCapabilityContext = { ...approvedContext, executionId: 'exec_proxy_rejected' }
+
+    await expect(service.open(context, 'https://example.com')).rejects.toThrow('proxy snapshot unavailable')
+    expect(launches).toBe(0)
+    expect(service.activeContexts(context.executionId)).toBe(0)
   })
 
   it('uses only CSS and role/name locators and requires one exact match', async () => {

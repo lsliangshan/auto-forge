@@ -20,6 +20,7 @@ import {
   type WorkerCapabilityRequest,
 } from '@autoforge/shared'
 import type { PolicyEngine } from '../permissions/policy-engine.js'
+import type { NetworkProxySnapshot } from '../network/network-proxy-service.js'
 import type { CapabilityContext, CapabilityPort } from '../workflows/execution-service.js'
 
 type BrowserCapability = Extract<Capability, `browser.${string}`>
@@ -48,7 +49,12 @@ interface BrowserLauncher {
   executablePath(): string
   launchPersistentContext(
     userDataDirectory: string,
-    options: { headless: boolean; executablePath: string; serviceWorkers: 'block' },
+    options: {
+      headless: boolean
+      executablePath: string
+      serviceWorkers: 'block'
+      args?: string[]
+    },
   ): Promise<BrowserContext>
 }
 
@@ -68,6 +74,7 @@ export interface BrowserCapabilityServiceOptions {
   headless?: boolean
   launcher?: BrowserLauncher
   profileDirectories?: BrowserProfileDirectories
+  proxySnapshot?: () => Promise<NetworkProxySnapshot>
   runtime?: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
 }
 
@@ -338,6 +345,7 @@ export class BrowserCapabilityService implements CapabilityPort {
   private readonly headless: boolean
   private readonly launcher: BrowserLauncher
   private readonly profiles: BrowserProfileDirectories
+  private readonly proxySnapshot: () => Promise<NetworkProxySnapshot>
   private readonly runtime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
   private readonly executions = new Map<string, ExecutionBrowserState>()
   private readonly pageOwners = new WeakMap<Page, string>()
@@ -358,6 +366,8 @@ export class BrowserCapabilityService implements CapabilityPort {
         retryDelay: 100,
       }),
     }
+    this.proxySnapshot = options.proxySnapshot
+      ?? (async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] }))
     this.runtime = options.runtime ?? { packaged: false }
   }
 
@@ -513,6 +523,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     const executablePath = await resolveBrowserExecutablePath(this.runtime.packaged
       ? this.runtime
       : { ...this.runtime, developmentExecutablePath: this.launcher.executablePath() })
+    const proxy = await this.proxySnapshot()
     const profilePath = await this.profiles.create()
     state.profilePath = profilePath
     let context: BrowserContext
@@ -521,6 +532,7 @@ export class BrowserCapabilityService implements CapabilityPort {
         headless: this.headless,
         executablePath,
         serviceWorkers: 'block',
+        ...(proxy.playwrightArgs.length ? { args: [...proxy.playwrightArgs] } : {}),
       })
     } catch (error) {
       try {
