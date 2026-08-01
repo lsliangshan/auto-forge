@@ -10,6 +10,22 @@ const MODELS_ENDPOINT = 'https://api.deepseek.com/models'
 const MAX_DEEPSEEK_MODELS = 1_000
 const MAX_MODEL_ID_LENGTH = 256
 
+type ProviderFetch = NonNullable<OpenAiCompatibleProviderDependencies['fetch']>
+
+function releaseUnauthorizedResponse(fetch: ProviderFetch): ProviderFetch {
+  return async (input, init) => {
+    const response = await fetch(input, init)
+    if (response.status === 401 && !response.bodyUsed) {
+      try {
+        await response.body?.cancel()
+      } catch {
+        // The status remains authoritative when a transport cannot cancel its body.
+      }
+    }
+    return response
+  }
+}
+
 const deepSeekModelsSchema = z.object({
   object: z.literal('list').optional(),
   data: z.array(z.unknown()).max(MAX_DEEPSEEK_MODELS),
@@ -50,6 +66,7 @@ export interface DeepSeekProviderDependencies extends Omit<OpenAiCompatibleProvi
 
 export class DeepSeekProvider extends OpenAiCompatibleProvider {
   constructor(dependencies: DeepSeekProviderDependencies) {
+    const fetch = releaseUnauthorizedResponse(dependencies.fetch ?? globalThis.fetch)
     super({
       chatEndpoint: CHAT_ENDPOINT,
       modelsEndpoint: MODELS_ENDPOINT,
@@ -59,6 +76,7 @@ export class DeepSeekProvider extends OpenAiCompatibleProvider {
       supportsAudioOutput: false,
     }, {
       ...dependencies,
+      fetch,
       credential: { get: () => dependencies.credential.get('deepseek_api_key') },
     })
   }

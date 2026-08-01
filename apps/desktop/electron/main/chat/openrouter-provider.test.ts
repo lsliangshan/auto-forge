@@ -9,6 +9,7 @@ import {
   parseOpenRouterVideoModels,
 } from './model-provider.js'
 import { openRouterVideoModelsLiveFixture } from './openrouter-video-models-live.fixture.js'
+import { NetworkProxyService } from '../network/network-proxy-service.js'
 
 function sseResponse(chunks: string[], status = 200, headers?: Record<string, string>): Response {
   const encoder = new TextEncoder()
@@ -67,6 +68,36 @@ const allImageParameters = {
 } as const
 
 describe('OpenRouterProvider', () => {
+  it('releases a managed 401 response before returning an invalid credential result', async () => {
+    const networkProxy = new NetworkProxyService({
+      setProxy: vi.fn(async () => undefined),
+      closeAllConnections: vi.fn(async () => undefined),
+      fetch: vi.fn(async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('unauthorized'))
+          controller.close()
+        },
+      }), { status: 401 })),
+    })
+    await networkProxy.initialize({ enabled: false, bypassDomains: [] })
+    const provider = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => 'diagnostic-non-secret') },
+      fetch: (input, init) => networkProxy.fetch(input instanceof URL ? input.toString() : input, init),
+    })
+
+    await expect(provider.validateCredential()).resolves.toEqual({ valid: false })
+    const transition = networkProxy.transition({
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    })
+
+    await expect(Promise.race([
+      transition.then(() => 'applied'),
+      new Promise((resolve) => setTimeout(resolve, 25, 'blocked')),
+    ])).resolves.toBe('applied')
+  })
+
   it('omits resolution when the selected image model does not advertise it', async () => {
     const bodies: string[] = []
     const provider = new OpenRouterProvider({

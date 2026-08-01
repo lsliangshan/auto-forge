@@ -29,6 +29,22 @@ const MAX_IMAGE_BASE64_LENGTH = Math.ceil((20 * 1024 * 1024) / 3) * 4
 const MAX_PROMPT_LENGTH = 1_000_000
 const MAX_OPTION_LENGTH = 128
 
+type ProviderFetch = NonNullable<OpenAiCompatibleProviderDependencies['fetch']>
+
+function releaseUnauthorizedResponse(fetch: ProviderFetch): ProviderFetch {
+  return async (input, init) => {
+    const response = await fetch(input, init)
+    if (response.status === 401 && !response.bodyUsed) {
+      try {
+        await response.body?.cancel()
+      } catch {
+        // The status remains authoritative when a transport cannot cancel its body.
+      }
+    }
+    return response
+  }
+}
+
 const imageMimeTypeSchema = z.enum([
   'image/png',
   'image/jpeg',
@@ -226,6 +242,7 @@ export interface OpenRouterProviderDependencies extends Omit<OpenAiCompatiblePro
 
 export class OpenRouterProvider extends OpenAiCompatibleProvider {
   constructor(dependencies: OpenRouterProviderDependencies) {
+    const fetch = releaseUnauthorizedResponse(dependencies.fetch ?? globalThis.fetch)
     super({
       chatEndpoint: CHAT_ENDPOINT,
       modelsEndpoint: MODELS_ENDPOINT,
@@ -240,6 +257,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       supportsAudioOutput: true,
     }, {
       ...dependencies,
+      fetch,
       credential: { get: () => dependencies.credential.get('openrouter_api_key') },
     })
   }

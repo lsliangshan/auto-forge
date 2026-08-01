@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
-import type { DesktopAPI, ModelInfo } from '@autoforge/shared'
+import type { AppSettings, DesktopAPI, ModelInfo } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { routes } from '../../src/router/index'
@@ -70,6 +70,23 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
   }
+}
+
+async function apiWithEnabledProxy(): Promise<DesktopAPI> {
+  const api = createApi()
+  const settings = {
+    ...await api.settings.get(),
+    proxy: {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      httpsProxy: 'https://proxy.example.com:8443',
+      socketProxy: 'socks5://127.0.0.1:7891',
+      bypassDomains: ['example.com'],
+    },
+  }
+  vi.mocked(api.settings.get).mockResolvedValue(settings)
+  vi.mocked(api.settings.update).mockImplementation(async (patch) => ({ ...settings, ...patch }))
+  return api
 }
 
 async function mountApp(path = '/chat', api = createApi()) {
@@ -823,6 +840,132 @@ describe('workbench', () => {
       expect.any(Object),
     )
     confirm.mockRestore()
+  })
+
+  it('shows and saves normalized VPN proxy settings without per-character updates', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => ({
+      ...await api.settings.get(),
+      ...patch,
+    }))
+    const { wrapper } = await mountApp('/settings', api)
+
+    await vi.waitFor(() => expect(wrapper.text()).toContain('VPN 代理'))
+    expect(wrapper.text()).toContain('http_proxy')
+    expect(wrapper.text()).toContain('https_proxy')
+    expect(wrapper.text()).toContain('socket_proxy')
+
+    await wrapper.get('[data-testid="http-proxy"] input').setValue(' http://LOCALHOST:7890 ')
+    expect(api.settings.update).not.toHaveBeenCalled()
+    await wrapper.get('[data-testid="proxy-bypass"] textarea').setValue('Example.com\n*.internal.example')
+    await wrapper.get('[data-testid="proxy-enabled"]').trigger('click')
+
+    await vi.waitFor(() => expect(api.settings.update).toHaveBeenCalledWith({
+      proxy: {
+        enabled: true,
+        httpProxy: 'http://localhost:7890',
+        bypassDomains: ['example.com', '*.internal.example'],
+      },
+    }))
+  })
+
+  it('accepts enabling while the address blur save is still pending', async () => {
+    const api = createApi()
+    let finishFirst!: (settings: AppSettings) => void
+    const firstUpdate = new Promise<AppSettings>((resolve) => { finishFirst = resolve })
+    let updateCount = 0
+    vi.mocked(api.settings.update).mockImplementation(async (patch) => {
+      updateCount += 1
+      if (updateCount === 1) return firstUpdate
+      return { ...await api.settings.get(), ...patch }
+    })
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+
+    await wrapper.get('[data-testid="http-proxy"] input').setValue('http://127.0.0.1:7890')
+    await wrapper.get('[data-testid="http-proxy"] input').trigger('blur')
+    await vi.waitFor(() => expect(useSettingsStore().saving).toBe(true))
+    await wrapper.get('[data-testid="proxy-enabled"]').trigger('click')
+
+    finishFirst({ ...await api.settings.get(), proxy: {
+      enabled: false,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    } })
+    await vi.waitFor(() => expect(api.settings.update).toHaveBeenCalledTimes(2))
+    expect(api.settings.update).toHaveBeenLastCalledWith({
+      proxy: {
+        enabled: true,
+        httpProxy: 'http://127.0.0.1:7890',
+        bypassDomains: [],
+      },
+    })
+  })
+
+  it('keeps entered addresses when proxying is disabled', async () => {
+    const { wrapper, api } = await mountApp('/settings', await apiWithEnabledProxy())
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+    await wrapper.get('[data-testid="proxy-enabled"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.update).toHaveBeenCalledWith({
+      proxy: expect.objectContaining({ enabled: false, httpProxy: 'http://127.0.0.1:7890' }),
+    }))
+    expect((wrapper.get('[data-testid="http-proxy"] input').element as HTMLInputElement).value)
+      .toBe('http://127.0.0.1:7890')
+    expect((wrapper.get('[data-testid="https-proxy"] input').element as HTMLInputElement).value)
+      .toBe('https://proxy.example.com:8443')
+    expect((wrapper.get('[data-testid="socket-proxy"] input').element as HTMLInputElement).value)
+      .toBe('socks5://127.0.0.1:7891')
+    expect((wrapper.get('[data-testid="proxy-bypass"] textarea').element as HTMLTextAreaElement).value)
+      .toBe('example.com')
+  })
+
+  it('keeps the draft and shows the safe error when Main rejects proxy application', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.update).mockRejectedValue({
+      code: 'NETWORK_PROXY_APPLY_FAILED',
+      message: 'unsafe raw address',
+    })
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+    await wrapper.get('[data-testid="http-proxy"] input').setValue('http://127.0.0.1:7890')
+    await wrapper.get('[data-testid="proxy-enabled"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('代理应用失败，已保留原配置'))
+    const store = useSettingsStore()
+    expect(wrapper.text()).not.toContain('unsafe raw address')
+    expect(wrapper.text()).toContain('已关闭，网络请求直连')
+    expect(store.settings?.proxy).toEqual({ enabled: false, bypassDomains: [] })
+    expect(wrapper.get('[data-testid="proxy-enabled"] input').attributes('aria-checked')).toBe('true')
+    expect((wrapper.get('[data-testid="http-proxy"] input').element as HTMLInputElement).value)
+      .toBe('http://127.0.0.1:7890')
+  })
+
+  it('validates an enabled proxy has an address before updating settings', async () => {
+    const { wrapper, api } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+    await wrapper.get('[data-testid="proxy-enabled"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('启用代理时至少填写一个代理地址'))
+    expect(api.settings.update).not.toHaveBeenCalled()
+  })
+
+  it('rejects credential-bearing proxy URLs locally without exposing the entered value', async () => {
+    const { wrapper, api } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+    await wrapper.get('[data-testid="http-proxy"] input')
+      .setValue('http://user:password@127.0.0.1:7890')
+    await wrapper.get('[data-testid="http-proxy"] input').trigger('blur')
+    await vi.waitFor(() => expect(wrapper.text())
+      .toContain('请输入不包含用户名、密码和路径的有效代理地址'))
+    expect(wrapper.text()).not.toContain('user:password')
+    expect(api.settings.update).not.toHaveBeenCalled()
+  })
+
+  it('rejects malformed bypass entries locally', async () => {
+    const { wrapper, api } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+    await wrapper.get('[data-testid="proxy-bypass"] textarea').setValue('https://example.com')
+    await wrapper.get('[data-testid="proxy-bypass"] textarea').trigger('blur')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('代理忽略域名格式不正确'))
+    expect(api.settings.update).not.toHaveBeenCalled()
   })
 
   it('clears a successfully saved key from the settings input without retaining it in state', async () => {

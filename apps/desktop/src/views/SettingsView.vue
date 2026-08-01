@@ -139,6 +139,73 @@
       </section>
 
       <section
+        id="proxy"
+        class="settings-section"
+      >
+        <header>
+          <div><h2>VPN 代理</h2><p>为 AutoForge 内的网络请求设置本机 VPN 代理。</p></div><span class="proxy-status">{{ proxyStatusLabel }}</span>
+        </header>
+        <div class="settings-form">
+          <label class="switch-row">启用 VPN 代理<el-switch
+            v-model="proxyDraft.enabled"
+            data-testid="proxy-enabled"
+            @change="saveProxyDraft"
+          /></label>
+          <label for="http-proxy">http_proxy</label>
+          <div data-testid="http-proxy">
+            <el-input
+              id="http-proxy"
+              v-model="proxyDraft.httpProxy"
+              :disabled="settings.saving"
+              placeholder="http://127.0.0.1:7890"
+              @blur="saveProxyDraft"
+            />
+          </div>
+          <label for="https-proxy">https_proxy</label>
+          <div data-testid="https-proxy">
+            <el-input
+              id="https-proxy"
+              v-model="proxyDraft.httpsProxy"
+              :disabled="settings.saving"
+              placeholder="https://127.0.0.1:7890"
+              @blur="saveProxyDraft"
+            />
+          </div>
+          <label for="socket-proxy">socket_proxy</label>
+          <div data-testid="socket-proxy">
+            <el-input
+              id="socket-proxy"
+              v-model="proxyDraft.socketProxy"
+              :disabled="settings.saving"
+              placeholder="socks5://127.0.0.1:7890"
+              @blur="saveProxyDraft"
+            />
+          </div>
+          <label for="proxy-bypass">代理忽略的域名</label>
+          <div data-testid="proxy-bypass">
+            <el-input
+              id="proxy-bypass"
+              v-model="proxyDraft.bypassText"
+              type="textarea"
+              :rows="3"
+              :disabled="settings.saving"
+              placeholder="example.com, *.internal.example"
+              @blur="saveProxyDraft"
+            />
+          </div>
+          <p
+            v-if="proxyValidationError"
+            class="field-message proxy-validation-error"
+            role="alert"
+          >
+            {{ proxyValidationError }}
+          </p>
+          <small>AutoForge 始终绕过 &lt;local&gt;（localhost、127.0.0.1 和 ::1）；系统外部浏览器和其他外部应用不受此设置控制。</small>
+          <small>代理可观察请求的目标地址，并可能读取明文 HTTP 内容。</small>
+        </div>
+      </section>
+
+      <section
         id="appearance"
         class="settings-section"
       >
@@ -236,14 +303,34 @@
 
 <script setup lang="ts">
 import { Refresh } from '@element-plus/icons-vue'
-import type { ModelProviderId } from '@autoforge/shared'
+import {
+  normalizeProxySettings,
+  parseProxyBypassText,
+  type ModelProviderId,
+  type ProxySettings,
+} from '@autoforge/shared'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
 
 const settings = useSettingsStore()
 const apiKey = ref('')
 const selectedProvider = ref<ModelProviderId>('deepseek')
+type ProxyDraft = {
+  enabled: ProxySettings['enabled']
+  httpProxy: string
+  httpsProxy: string
+  socketProxy: string
+  bypassText: string
+}
+const proxyDraft = reactive<ProxyDraft>({
+  enabled: false,
+  httpProxy: '',
+  httpsProxy: '',
+  socketProxy: '',
+  bypassText: '',
+})
+const proxyValidationError = ref('')
 type ModelOutput = 'text' | 'image' | 'audio' | 'video'
 const modelOutputLabels: Record<ModelOutput, string> = {
   text: '默认文本模型',
@@ -256,6 +343,9 @@ const modelOutputs = computed<ModelOutput[]>(() =>
     ? ['text']
     : ['text', 'image', 'audio', 'video'])
 const providerLabel = computed(() => settings.activeProvider === 'deepseek' ? 'DeepSeek' : 'OpenRouter')
+const proxyStatusLabel = computed(() => settings.settings?.proxy.enabled
+  ? '已启用，APP 内网络请求使用此代理'
+  : '已关闭，网络请求直连')
 const credentialLabel = computed(() => {
   const credential = settings.credential
   if (!credential?.configured) return '未设置 API Key'
@@ -269,6 +359,14 @@ const credentialTone = computed(() => settings.credential?.validation === 'valid
   ? 'success'
   : settings.credential?.configured ? 'warning' : '')
 watch(() => settings.activeProvider, (value) => { selectedProvider.value = value }, { immediate: true })
+watch(() => settings.settings?.proxy, (proxy) => {
+  if (!proxy) return
+  proxyDraft.enabled = proxy.enabled
+  proxyDraft.httpProxy = proxy.httpProxy ?? ''
+  proxyDraft.httpsProxy = proxy.httpsProxy ?? ''
+  proxyDraft.socketProxy = proxy.socketProxy ?? ''
+  proxyDraft.bypassText = proxy.bypassDomains.join('\n')
+}, { immediate: true, deep: true })
 
 onMounted(async () => {
   if (!settings.settings && !settings.loading) await settings.load()
@@ -301,6 +399,38 @@ async function clearCredential() {
 function saveModel(output: ModelOutput, value: unknown) {
   void settings.saveDefaultModel(output, typeof value === 'string' && value ? value : undefined)
 }
+async function saveProxyDraft() {
+  proxyValidationError.value = ''
+  const bypassEntries = proxyDraft.bypassText
+    .split(/[,\n]/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  const bypassDomains = parseProxyBypassText(proxyDraft.bypassText)
+  if (bypassDomains.length > 256
+    || bypassEntries.some((entry) => parseProxyBypassText(entry).length !== 1)) {
+    proxyValidationError.value = '代理忽略域名格式不正确'
+    return
+  }
+  let proxy: ProxySettings
+  try {
+    proxy = normalizeProxySettings({
+      enabled: proxyDraft.enabled,
+      ...(proxyDraft.httpProxy.trim() ? { httpProxy: proxyDraft.httpProxy } : {}),
+      ...(proxyDraft.httpsProxy.trim() ? { httpsProxy: proxyDraft.httpsProxy } : {}),
+      ...(proxyDraft.socketProxy.trim() ? { socketProxy: proxyDraft.socketProxy } : {}),
+      bypassDomains,
+    })
+  } catch {
+    proxyValidationError.value = proxyDraft.enabled
+      && !proxyDraft.httpProxy.trim()
+      && !proxyDraft.httpsProxy.trim()
+      && !proxyDraft.socketProxy.trim()
+      ? '启用代理时至少填写一个代理地址'
+      : '请输入不包含用户名、密码和路径的有效代理地址'
+    return
+  }
+  await settings.update({ proxy })
+}
 async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
   try {
     const message = scope === 'all'
@@ -316,8 +446,9 @@ const formatScope = (scope: { origins?: string[]; paths?: string[] }) => JSON.st
 
 <style scoped>
 .settings-page { max-width: 880px; margin: 0 auto; padding: 20px 24px 60px; }.settings-section { scroll-margin-top: 16px; border: 1px solid var(--af-border); padding: 18px; background: var(--af-surface); }.settings-section + .settings-section { margin-top: 14px; }.settings-section header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--af-border); padding-bottom: 13px; }.settings-section h2 { margin: 0; color: var(--af-graphite); font-size: 15px; }.settings-section header p { margin: 4px 0 0; color: var(--af-text-muted); font-size: 12px; }
-.credential-status { display: flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--af-text-muted); font-size: 12px; }.credential-status.success { color: var(--af-success); }.credential-status.warning { color: var(--af-warning); }
+.credential-status, .proxy-status { display: flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--af-text-muted); font-size: 12px; }.credential-status.success { color: var(--af-success); }.credential-status.warning { color: var(--af-warning); }
 .settings-form { display: grid; gap: 8px; padding-top: 14px; }.settings-form > label, .settings-grid > label, .model-field > label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.settings-form small, .field-message { margin: 0; color: var(--af-text-muted); font-size: 11px; }.settings-form > .el-button { justify-self: start; }.model-field { display: grid; gap: 8px; }
+.proxy-validation-error { color: var(--af-danger); }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding-top: 15px; }.settings-grid label:not(.switch-row) { display: grid; gap: 7px; }.switch-row { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 0; }.model-id { float: right; margin-left: 18px; color: var(--af-text-muted); }
 .danger-zone { border-color: #efc6c2; }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
 .grant-list { margin-top: 12px; }.grant-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 10px 0; }.grant-row div { display: grid; gap: 3px; }.grant-row strong { font-size: 12px; }.grant-row small { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 11px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }

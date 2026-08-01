@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { DeepSeekProvider } from './deepseek-provider.js'
 import type { ModelStreamEvent } from './model-provider.js'
+import { NetworkProxyService } from '../network/network-proxy-service.js'
 
 function sseResponse(chunks: string[]): Response {
   const encoder = new TextEncoder()
@@ -19,6 +20,36 @@ async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelSt
 }
 
 describe('DeepSeekProvider', () => {
+  it('releases a managed 401 response before returning an invalid credential result', async () => {
+    const networkProxy = new NetworkProxyService({
+      setProxy: vi.fn(async () => undefined),
+      closeAllConnections: vi.fn(async () => undefined),
+      fetch: vi.fn(async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('unauthorized'))
+          controller.close()
+        },
+      }), { status: 401 })),
+    })
+    await networkProxy.initialize({ enabled: false, bypassDomains: [] })
+    const provider = new DeepSeekProvider({
+      credential: { get: vi.fn(async () => 'diagnostic-non-secret') },
+      fetch: (input, init) => networkProxy.fetch(input instanceof URL ? input.toString() : input, init),
+    })
+
+    await expect(provider.validateCredential()).resolves.toEqual({ valid: false })
+    const transition = networkProxy.transition({
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    })
+
+    await expect(Promise.race([
+      transition.then(() => 'applied'),
+      new Promise((resolve) => setTimeout(resolve, 25, 'blocked')),
+    ])).resolves.toBe('applied')
+  })
+
   it('uses the fixed models endpoint and only the DeepSeek credential', async () => {
     const credential = { get: vi.fn(async () => 'sk-deepseek-private') }
     const fetch = vi.fn(async (...request: Parameters<typeof globalThis.fetch>) => {

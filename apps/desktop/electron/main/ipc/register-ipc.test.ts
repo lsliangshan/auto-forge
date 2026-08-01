@@ -101,6 +101,21 @@ describe('registerDesktopIpc', () => {
     })).rejects.toMatchObject({ code: 'NETWORK_PROXY_APPLY_FAILED' })
   })
 
+  it('rejects extra proxy keys and malformed proxy URLs before updating settings', async () => {
+    const app = harness()
+
+    for (const proxy of [
+      { enabled: false, bypassDomains: [], unexpected: true },
+      { enabled: true, httpProxy: 'http://user:password@127.0.0.1:7890', bypassDomains: [] },
+      { enabled: true, socketProxy: 'http://127.0.0.1:7891', bypassDomains: [] },
+    ]) {
+      await expect(app.invoke(ipcChannels.settingsUpdate, { proxy }))
+        .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+
+    expect(app.dependencies.settings.update).not.toHaveBeenCalled()
+  })
+
   it('rejects an invalid chat request before invoking the orchestrator', async () => {
     const app = harness()
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))
