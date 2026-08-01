@@ -117,7 +117,7 @@ interface NetworkProxyService {
   initialize(settings: ProxySettings): Promise<void>
   transition(settings: ProxySettings): Promise<void>
   fetch(input: string | Request, init?: RequestInit): Promise<Response>
-  snapshot(): NetworkProxySnapshot
+  snapshot(): Promise<NetworkProxySnapshot>
 }
 ```
 
@@ -181,9 +181,10 @@ interface NetworkProxyService {
 
 ### 自动化浏览器
 
-`BrowserCapabilityService` 接收只读代理快照提供器。创建 `launchPersistentContext` 时把当时的代理规则转换为 Chromium `--proxy-server` 和 `--proxy-bypass-list` 参数。
+`BrowserCapabilityService` 接收异步只读代理快照提供器。创建 `launchPersistentContext` 时先等待正在进行的代理切换，再把当时的代理规则转换为 Chromium `--proxy-server` 和 `--proxy-bypass-list` 参数。
 
 - 已创建上下文不变，不关闭、不重载页面。
+- 代理切换期间发起的新上下文创建会等待切换完成，不会取得旧快照。
 - 同一工作流后续 `fill/click/url` 保持当前上下文和旧代理。
 - 当前工作流关闭后销毁上下文；以后新建上下文读取新快照。
 - 新旧工作流可以在代理切换后短时间并存，各自使用创建时快照。
