@@ -63,6 +63,7 @@ type ConversationContextRepositories = Pick<AppRepositories, 'conversationContex
 interface HistoricalModelMessage {
   ordinal: number
   message: ModelMessage
+  mutable: boolean
 }
 
 function safeJson(value: unknown): string {
@@ -107,6 +108,12 @@ export function serializeHistoricalMessage(message: Message): ModelMessage | und
     .join('\n')
     .trim()
   return content ? { role: message.role, content } : undefined
+}
+
+function hasMutableMediaGeneration(message: Message): boolean {
+  return chatBlockSchema.array().parse(message.blocks).some((block) => (
+    block.type === 'media_generation' && block.status !== 'failed'
+  ))
 }
 
 export function estimateTextTokens(text: string): number {
@@ -310,7 +317,11 @@ export function createConversationContextManager(
         .filter((message) => message.ordinal > (summary?.throughOrdinal ?? 0))
         .flatMap((message): HistoricalModelMessage[] => {
           const serialized = serializeHistoricalMessage(message)
-          return serialized === undefined ? [] : [{ ordinal: message.ordinal, message: serialized }]
+          return serialized === undefined ? [] : [{
+            ordinal: message.ordinal,
+            message: serialized,
+            mutable: hasMutableMediaGeneration(message),
+          }]
         })
 
       while (true) {
@@ -324,10 +335,14 @@ export function createConversationContextManager(
           throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
         }
 
+        const mutableBarrier = rawHistory.findIndex(({ mutable }) => mutable)
+        const protectedByBarrier = mutableBarrier === -1
+          ? 0
+          : rawHistory.length - mutableBarrier
         const chunk = selectCompressionChunk(
           summary,
           rawHistory,
-          protectedRawMessageCount(rawHistory),
+          Math.max(protectedRawMessageCount(rawHistory), protectedByBarrier),
           summaryInputBudget,
         )
         if (chunk.length === 0) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })

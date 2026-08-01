@@ -281,6 +281,61 @@ describe('conversation context manager', () => {
     }))
   })
 
+  it('keeps a mutable media-generation message behind the checkpoint across later updates', async () => {
+    const mutable: Message = {
+      id: 'message_2', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,
+      blocks: [{
+        type: 'media_generation', blockId: 'block_2', jobId: 'job_2',
+        kind: 'image', status: 'in_progress',
+      }],
+    }
+    const messages = [
+      user(1, 'old '.repeat(1_000)),
+      mutable,
+      ...Array.from({ length: 8 }, (_, index) => (
+        historical(index % 2 ? 'assistant' : 'user', index + 3, `recent-${index + 3}`)
+      )),
+    ]
+    const { manager, provider, store } = contextHarness({ messages })
+
+    const first = await manager.prepare(prepareInput({ provider }))
+
+    expect(store.advance).toHaveBeenCalledWith(expect.objectContaining({ throughOrdinal: 1 }))
+    expect(JSON.stringify(provider.stream.mock.calls[0]?.[0]?.messages)).not.toContain('in_progress')
+    expect(JSON.stringify(first)).toContain('in_progress')
+
+    mutable.blocks = [{
+      type: 'media_generation', blockId: 'block_2', jobId: 'job_2',
+      kind: 'image', status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED',
+    }]
+    const later = await manager.prepare(prepareInput({
+      provider, contextLength: 32_000,
+    }))
+
+    expect(JSON.stringify(later)).toContain('failed')
+    expect(JSON.stringify(later)).toContain('MEDIA_GENERATION_FAILED')
+  })
+
+  it('rejects overflow instead of compressing through a mutable media-generation barrier', async () => {
+    const messages: Message[] = [
+      {
+        id: 'message_1', conversationId: 'c1', role: 'assistant', ordinal: 1, createdAt: 1,
+        blocks: [{
+          type: 'media_generation', blockId: 'block_1', jobId: 'job_1',
+          kind: 'video', status: 'paused',
+        }],
+      },
+      user(2, 'after barrier '.repeat(700)),
+    ]
+    const { manager, provider, store } = contextHarness({ messages })
+
+    await expect(manager.prepare(prepareInput({
+      provider, beforeOrdinal: 3,
+    }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
   it('advances monotonically across multiple chunks while retaining a raw tail', async () => {
     const { manager, provider, store } = contextHarness({ forceOverflow: true })
 
