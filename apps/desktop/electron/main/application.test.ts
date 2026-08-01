@@ -218,10 +218,18 @@ describe('createApplicationRuntime', () => {
   it('restores the previous runtime proxy when settings persistence fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-persistence-rollback-'))
     directories.push(root)
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+    const previous = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7891',
+      bypassDomains: ['previous.example'],
+    }
+    await runtime.services.settings.update({ proxy: previous })
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: previous })
+    networkProxy.transition.mockClear()
     vi.spyOn(SettingsService.prototype, 'commit').mockImplementationOnce(() => {
       throw new Error('settings write failed')
     })
-    const runtime = createApplicationRuntime(options(root, { networkProxy }))
     const candidate = {
       enabled: true,
       httpProxy: 'http://127.0.0.1:7890',
@@ -232,11 +240,9 @@ describe('createApplicationRuntime', () => {
       .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
     expect(networkProxy.transition.mock.calls).toEqual([
       [candidate],
-      [{ enabled: false, bypassDomains: [] }],
+      [previous],
     ])
-    await expect(runtime.services.settings.get()).resolves.toMatchObject({
-      proxy: { enabled: false, bypassDomains: [] },
-    })
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: previous })
     await runtime.close()
   })
 
