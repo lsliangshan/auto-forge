@@ -63,6 +63,10 @@ function canonicalIpLiteral(value: string): string | undefined {
   }
 }
 
+function isIpLiteral(value: string): boolean {
+  return /^[0-9.]+$/u.test(value) || value.includes(':')
+}
+
 function parseProxyBypassEntry(value: string): string | undefined {
   const normalized = value.trim().toLowerCase()
   if (!normalized) return undefined
@@ -71,7 +75,7 @@ function parseProxyBypassEntry(value: string): string | undefined {
   if (cidrParts.length === 2) {
     const [address, prefix] = cidrParts
     const canonicalAddress = canonicalIpLiteral(address)
-    if (!canonicalAddress || !/^\d+$/u.test(prefix)) return undefined
+    if (!canonicalAddress || !isIpLiteral(address) || !/^\d+$/u.test(prefix)) return undefined
     const prefixLength = Number(prefix)
     const maximumPrefixLength = canonicalAddress.includes(':') ? 128 : 32
     return prefixLength <= maximumPrefixLength ? `${canonicalAddress}/${prefixLength}` : undefined
@@ -79,7 +83,7 @@ function parseProxyBypassEntry(value: string): string | undefined {
   if (cidrParts.length !== 1) return undefined
 
   const canonicalIp = canonicalIpLiteral(normalized)
-  if (canonicalIp && (/^[0-9.]+$/u.test(normalized) || normalized.includes(':'))) return canonicalIp
+  if (canonicalIp && isIpLiteral(normalized)) return canonicalIp
   return domainPattern.test(normalized) ? normalized : undefined
 }
 

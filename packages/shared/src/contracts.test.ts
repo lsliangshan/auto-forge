@@ -90,6 +90,7 @@ describe('cross-process contracts', () => {
 
     expect(parseProxyBypassText('Example.com,\n*.internal.example\nexample.com'))
       .toEqual(['example.com', '*.internal.example'])
+    expect(parseProxyBypassText('example.com/24\nlocalhost/24')).toEqual([])
     expect(normalizeProxySettings({
       enabled: false,
       httpProxy: ' http://LOCALHOST:7890 ',
