@@ -41,6 +41,7 @@ import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { createMediaAssetService } from './media/media-asset-service.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
+import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
@@ -71,6 +72,7 @@ export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
   networkProxy: NetworkProxyPort
+  mediaTransport?: PinnedMediaTransportPort
   openRouter?: ApplicationOpenRouterPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
   chooseProjectDirectory(): Promise<string | undefined>
@@ -400,7 +402,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     persistence,
     media,
     downloader: new SafeMediaDownloader({
-      fetch: options.networkProxy.fetch.bind(options.networkProxy),
+      transport: options.mediaTransport ?? new PinnedMediaTransport(),
+      withTransportLease: options.networkProxy.withTransportLease.bind(options.networkProxy),
     }),
     emit: emitChat,
   })

@@ -1,7 +1,13 @@
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns'
 import { isIP } from 'node:net'
-import { toSafeAppError, type AppError } from '@autoforge/shared'
-import { validatedPublicAddresses } from './media-route.js'
+import { toSafeAppError, type AppError, type ProxySettings } from '@autoforge/shared'
+import type { NetworkTransportSnapshot } from '../network/network-proxy-service.js'
+import { selectMediaRoute, validatedPublicAddresses, type MediaRouteSelection } from './media-route.js'
+import {
+  PinnedMediaTransport,
+  type PinnedMediaTransportPort,
+  type SafeMediaResponse,
+} from './pinned-media-transport.js'
 
 export const MAX_SAFE_DOWNLOAD_BYTES = 500 * 1024 * 1024
 
@@ -30,7 +36,10 @@ export interface SafeDownloadResult {
 
 export interface SafeMediaDownloaderDependencies {
   resolveHost(hostname: string): Promise<readonly LookupAddress[]>
-  fetch(input: string, init: RequestInit): Promise<Response>
+  transport: PinnedMediaTransportPort
+  withTransportLease<T>(
+    operation: (snapshot: NetworkTransportSnapshot) => Promise<T>,
+  ): Promise<T>
   setTimer(callback: () => void, milliseconds: number): TimerHandle
   clearTimer(handle: TimerHandle): void
 }
@@ -197,6 +206,24 @@ function contentLength(value: string | null): number | undefined {
   return parsed
 }
 
+function rawHeaderValues(rawHeaders: readonly string[], name: string): string[] {
+  if (rawHeaders.length % 2 !== 0) throw failure()
+  const values: string[] = []
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    const key = rawHeaders[index]
+    const value = rawHeaders[index + 1]
+    if (typeof key !== 'string' || typeof value !== 'string') throw failure()
+    if (key.toLowerCase() === name) values.push(value)
+  }
+  return values
+}
+
+function singleRawHeader(rawHeaders: readonly string[], name: string): string | null {
+  const values = rawHeaderValues(rawHeaders, name)
+  if (values.length > 1) throw failure()
+  return values[0] ?? null
+}
+
 /**
  * Downloads HTTPS media into a caller-owned destination.
  *
@@ -209,7 +236,13 @@ export class SafeMediaDownloader {
   constructor(dependencies: Partial<SafeMediaDownloaderDependencies> = {}) {
     this.dependencies = {
       resolveHost: defaultResolveHost,
-      fetch: (input, init) => globalThis.fetch(input, init),
+      transport: new PinnedMediaTransport(),
+      withTransportLease: async (operation) => operation({
+        settings: Object.freeze({
+          enabled: false,
+          bypassDomains: Object.freeze([] as string[]) as string[],
+        }),
+      }),
       setTimer: (callback, milliseconds) => setTimeout(callback, milliseconds),
       clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
       ...dependencies,
@@ -269,7 +302,16 @@ export class SafeMediaDownloader {
       destination.on('error', onDestinationError)
       destination.on('close', onDestinationClose)
       totalTimer = this.dependencies.setTimer(fail, validated.totalTimeoutMs)
-      void this.downloadValidated(initialUrl, destination, validated, context).then(succeed, fail)
+      void this.dependencies.withTransportLease(async ({ settings }) => {
+        if (context.aborted) throw failure()
+        return this.downloadValidated(
+          initialUrl,
+          destination,
+          validated,
+          context,
+          settings,
+        )
+      }).then(succeed, fail)
     })
   }
 
@@ -278,21 +320,39 @@ export class SafeMediaDownloader {
     destination: NodeJS.WritableStream,
     options: ValidatedOptions,
     context: DownloadContext,
+    settings: ProxySettings,
   ): Promise<SafeDownloadResult> {
     let currentUrl = initialUrl
     let redirectCount = 0
     while (true) {
       if (context.aborted) throw failure()
       const hostname = bareHostname(currentUrl)
+      let addresses: readonly LookupAddress[]
       try {
-        if (isIP(hostname) === 0) validatedPublicAddresses(await this.dependencies.resolveHost(hostname))
-        else validatedPublicAddresses([{ address: hostname, family: isIP(hostname) as 4 | 6 }])
+        addresses = isIP(hostname) === 0
+          ? validatedPublicAddresses(await this.dependencies.resolveHost(hostname))
+          : validatedPublicAddresses([{
+              address: hostname,
+              family: isIP(hostname) as 4 | 6,
+            }])
       } catch {
         throw failure()
       }
       if (context.aborted) throw failure()
 
-      const result = await this.requestOnce(currentUrl, destination, options, context)
+      let selection: MediaRouteSelection
+      try {
+        selection = selectMediaRoute(settings, hostname, addresses)
+      } catch {
+        throw failure()
+      }
+      const result = await this.requestOnce(
+        currentUrl,
+        selection,
+        destination,
+        options,
+        context,
+      )
       if (result.kind === 'body') {
         return {
           byteSize: result.byteSize,
@@ -307,6 +367,7 @@ export class SafeMediaDownloader {
 
   private requestOnce(
     url: URL,
+    selection: MediaRouteSelection,
     destination: NodeJS.WritableStream,
     options: ValidatedOptions,
     context: DownloadContext,
@@ -314,10 +375,11 @@ export class SafeMediaDownloader {
     return new Promise<RequestResult>((resolve, reject) => {
       const controller = new AbortController()
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
-      let responseBody: Response['body']
+      let cancelResponse: SafeMediaResponse['cancel'] | undefined
       let connectTimer: TimerHandle | undefined
       let firstByteTimer: TimerHandle | undefined
       let settled = false
+      let responseCancelled = false
       let bodyEnded = false
       let waitingForDrain = false
       let byteSize = 0
@@ -365,19 +427,17 @@ export class SafeMediaDownloader {
         releaseDestinationWriteGuardIfSettled()
         context.abortCurrent = undefined
       }
-      const cancelOwnedStreams = () => {
+      const cancelOwnedStreams = async () => {
         controller.abort()
-        if (reader) void reader.cancel(failure()).catch(() => undefined)
-        else if (responseBody && typeof responseBody.cancel === 'function') {
-          void responseBody.cancel(failure()).catch(() => undefined)
-        }
+        if (responseCancelled || !cancelResponse) return
+        responseCancelled = true
+        try { await cancelResponse(failure()) } catch { /* Teardown errors stay inside the downloader boundary. */ }
       }
       const fail = () => {
         if (settled) return
         settled = true
         cleanup()
-        cancelOwnedStreams()
-        reject(failure())
+        void cancelOwnedStreams().then(() => reject(failure()))
       }
       const succeed = (result: RequestResult) => {
         if (settled) return
@@ -453,33 +513,43 @@ export class SafeMediaDownloader {
       context.abortCurrent = fail
       connectTimer = this.dependencies.setTimer(fail, options.connectTimeoutMs)
       void (async () => {
-        let response: Response
-        try {
-          response = await this.dependencies.fetch(url.href, {
-            method: 'GET',
-            redirect: 'manual',
-            signal: controller.signal,
-          })
-        } catch {
+        let response: SafeMediaResponse | undefined
+        for (const candidate of selection.destinationAddresses) {
+          try {
+            response = await this.dependencies.transport.request({
+              url,
+              destinationAddress: candidate.address,
+              route: selection.route,
+              signal: controller.signal,
+            })
+            break
+          } catch {
+            if (controller.signal.aborted || context.aborted) {
+              fail()
+              return
+            }
+          }
+        }
+        if (!response) {
           fail()
           return
         }
         clearConnectTimer()
+        if (typeof response.cancel === 'function') cancelResponse = response.cancel.bind(response)
         if (settled || context.aborted) {
-          if (response.body) void response.body.cancel(failure()).catch(() => undefined)
+          await cancelOwnedStreams()
           return
         }
-        responseBody = response.body
         if (
-          !Number.isInteger(response.status)
-          || !response.headers
-          || typeof response.headers.get !== 'function'
+          !Number.isInteger(response.statusCode)
+          || !Array.isArray(response.rawHeaders)
+          || typeof response.cancel !== 'function'
         ) {
           fail()
           return
         }
 
-        const body = responseBody
+        const body = response.body
         if (!body || typeof body.getReader !== 'function') {
           fail()
           return
@@ -491,20 +561,33 @@ export class SafeMediaDownloader {
           return
         }
 
-        if (REDIRECT_STATUSES.has(response.status)) {
-          const location = response.headers.get('location')
-          try { await reader.cancel(failure()) } catch { /* Lease release is owned by the managed fetch wrapper. */ }
-          if (typeof location !== 'string') fail()
+        if (REDIRECT_STATUSES.has(response.statusCode)) {
+          let location: string | null
+          try {
+            location = singleRawHeader(response.rawHeaders, 'location')
+          } catch {
+            fail()
+            return
+          }
+          await cancelOwnedStreams()
+          if (location === null) fail()
           else succeed({ kind: 'redirect', location })
           return
         }
-        if (response.status < 200 || response.status > 299) {
+        if (response.statusCode < 200 || response.statusCode > 299) {
           fail()
           return
         }
 
         try {
-          declaredContentLength = contentLength(response.headers.get('content-length'))
+          declaredContentLength = contentLength(singleRawHeader(
+            response.rawHeaders,
+            'content-length',
+          ))
+          responseContentType = normalizedContentType(singleRawHeader(
+            response.rawHeaders,
+            'content-type',
+          ))
         } catch {
           fail()
           return
@@ -513,7 +596,6 @@ export class SafeMediaDownloader {
           fail()
           return
         }
-        responseContentType = normalizedContentType(response.headers.get('content-type'))
         firstByteTimer = this.dependencies.setTimer(fail, options.firstByteTimeoutMs)
 
         while (!settled) {

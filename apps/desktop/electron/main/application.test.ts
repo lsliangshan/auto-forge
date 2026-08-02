@@ -6,6 +6,7 @@ import { toSafeAppError, type ChatEvent, type ChatSendInput, type ModelInfo } fr
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
 import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
+import type { NetworkProxyPort, NetworkTransportSnapshot } from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 
@@ -24,11 +25,19 @@ vi.mock('./startup.js', async (importOriginal) => {
 })
 
 function createNetworkProxy() {
+  const settings = Object.freeze({
+    enabled: false,
+    bypassDomains: Object.freeze([] as string[]) as string[],
+  })
+  const withTransportLease = vi.fn((
+    operation: (snapshot: NetworkTransportSnapshot) => Promise<unknown>,
+  ): Promise<unknown> => operation({ settings })) as unknown as NetworkProxyPort['withTransportLease']
   return {
     initialize: vi.fn().mockResolvedValue(undefined),
     transition: vi.fn().mockResolvedValue(undefined),
     fetch: vi.fn(globalThis.fetch),
     snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
+    withTransportLease,
   }
 }
 
@@ -631,12 +640,20 @@ describe('createApplicationRuntime', () => {
     ])
     const directFetch = vi.spyOn(globalThis, 'fetch')
       .mockRejectedValue(new TypeError('direct fetch is forbidden in this test'))
-    networkProxy.fetch.mockImplementation(async () => new Response(generated, {
-      status: 200,
-      headers: {
-        'content-type': 'image/png',
-        'content-length': String(generated.byteLength),
-      },
+    const mediaRequest = vi.fn(async () => ({
+      statusCode: 200,
+      statusMessage: 'OK',
+      rawHeaders: [
+        'content-type', 'image/png',
+        'content-length', String(generated.byteLength),
+      ],
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(Uint8Array.from(generated))
+          controller.close()
+        },
+      }),
+      cancel: vi.fn(async () => undefined),
     }))
     const generateImage = vi.fn(async () => ({
       outputs: [{
@@ -675,6 +692,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
+      mediaTransport: { request: mediaRequest },
       browserRuntime: { packaged: false },
     })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -693,14 +711,12 @@ describe('createApplicationRuntime', () => {
     })
 
     await vi.waitFor(() => expect(generateImage).toHaveBeenCalledTimes(1))
-    await vi.waitFor(() => expect(networkProxy.fetch).toHaveBeenCalledWith(
-      'https://93.184.216.34/generated.png',
-      expect.objectContaining({
-        method: 'GET',
-        redirect: 'manual',
-        signal: expect.any(AbortSignal),
-      }),
-    ))
+    await vi.waitFor(() => expect(mediaRequest).toHaveBeenCalledWith(expect.objectContaining({
+      url: new URL('https://93.184.216.34/generated.png'),
+      destinationAddress: '93.184.216.34',
+      route: { kind: 'direct' },
+      signal: expect.any(AbortSignal),
+    })))
     await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({
@@ -712,6 +728,7 @@ describe('createApplicationRuntime', () => {
           })],
         }),
       ])))
+    expect(networkProxy.withTransportLease).toHaveBeenCalledOnce()
     expect(stream).not.toHaveBeenCalled()
     expect(directFetch).not.toHaveBeenCalled()
     await runtime.close()

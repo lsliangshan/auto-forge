@@ -1,6 +1,14 @@
 import type { LookupAddress } from 'node:dns'
 import { Writable } from 'node:stream'
+import type { ProxySettings } from '@autoforge/shared'
 import { describe, expect, it, vi } from 'vitest'
+import type { NetworkTransportSnapshot } from '../network/network-proxy-service.js'
+import type {
+  PinnedMediaRequest,
+  PinnedMediaTransportPort,
+  SafeMediaResponse,
+} from './pinned-media-transport.js'
+import type { MediaRoute } from './media-route.js'
 import {
   MAX_SAFE_DOWNLOAD_BYTES,
   SafeMediaDownloader,
@@ -9,6 +17,10 @@ import {
 
 const PUBLIC_IPV4: LookupAddress = { address: '93.184.216.34', family: 4 }
 const PUBLIC_IPV6: LookupAddress = { address: '2606:4700:4700::1111', family: 6 }
+const DIRECT_SETTINGS: ProxySettings = Object.freeze({
+  enabled: false,
+  bypassDomains: Object.freeze([] as string[]) as string[],
+})
 const SAFE_ERROR = {
   code: 'MEDIA_DOWNLOAD_FAILED',
   message: 'The media download failed.',
@@ -36,10 +48,9 @@ class ManualTimers {
   }
 }
 
-interface FetchCall {
-  input: string
-  init: RequestInit
-  resolve(response: Response): void
+interface TransportCall {
+  input: PinnedMediaRequest
+  resolve(response: SafeMediaResponse): void
   reject(error: unknown): void
   responded: boolean
 }
@@ -87,51 +98,98 @@ class ControlledBody {
   }
 }
 
-class FakeFetch {
-  readonly calls: FetchCall[] = []
+function rawHeaderPairs(headers: HeadersInit): string[] {
+  if (headers instanceof Headers) return [...headers.entries()].flatMap(([key, value]) => [key, value])
+  if (Array.isArray(headers)) return headers.flatMap(([key, value]) => [key, value])
+  return Object.entries(headers).flatMap(([key, value]) => [key, value])
+}
 
-  readonly fetch: SafeMediaDownloaderDependencies['fetch'] = (input, init) => (
-    new Promise<Response>((resolve, reject) => {
-      const call: FetchCall = { input, init, resolve, reject, responded: false }
+function bytes(value: string): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      if (value) controller.enqueue(Uint8Array.from(Buffer.from(value)))
+      controller.close()
+    },
+  })
+}
+
+function safeResponse({
+  body = bytes(''),
+  headers = [],
+  statusCode = 200,
+  cancel = vi.fn(async () => undefined),
+}: {
+  body?: ReadableStream<Uint8Array>
+  headers?: readonly string[]
+  statusCode?: number
+  cancel?: SafeMediaResponse['cancel']
+} = {}): SafeMediaResponse {
+  return {
+    statusCode,
+    statusMessage: '',
+    rawHeaders: headers,
+    body,
+    cancel,
+  }
+}
+
+class FakeTransport implements PinnedMediaTransportPort {
+  readonly calls: TransportCall[] = []
+
+  readonly request: PinnedMediaTransportPort['request'] = (input) => (
+    new Promise<SafeMediaResponse>((resolve, reject) => {
+      const call: TransportCall = { input, resolve, reject, responded: false }
       this.calls.push(call)
-      init.signal?.addEventListener('abort', () => {
-        if (!call.responded) reject(init.signal?.reason ?? new DOMException('Aborted', 'AbortError'))
+      input.signal.addEventListener('abort', () => {
+        if (!call.responded) reject(input.signal.reason ?? new DOMException('Aborted', 'AbortError'))
       }, { once: true })
     })
   )
 
   connect(index: number): void {
-    if (!this.calls[index]) throw new Error(`No fetch call at index ${index}`)
+    if (!this.calls[index]) throw new Error(`No transport call at index ${index}`)
   }
 
   respond(index: number, status: number, headers: HeadersInit = {}): ControlledBody {
     const call = this.calls[index]!
     const body = new ControlledBody()
     call.responded = true
-    call.resolve(new Response(body.stream, { status, headers }))
+    call.resolve(safeResponse({
+      body: body.stream,
+      headers: rawHeaderPairs(headers),
+      statusCode: status,
+      cancel: async (reason) => { body.cancel(reason) },
+    }))
     return body
   }
 
   respondWithoutBody(index: number, status = 204, headers: HeadersInit = {}): void {
     const call = this.calls[index]!
     call.responded = true
-    call.resolve(new Response(null, { status, headers }))
+    call.resolve({
+      ...safeResponse({ headers: rawHeaderPairs(headers), statusCode: status }),
+      body: undefined,
+    } as unknown as SafeMediaResponse)
   }
 
-  respondMalformed(index: number, response: Partial<Response>): void {
+  respondMalformed(index: number, response: Partial<SafeMediaResponse>): void {
     const call = this.calls[index]!
     call.responded = true
-    call.resolve(response as Response)
+    call.resolve(response as SafeMediaResponse)
   }
 
   respondWithRawHeaders(index: number, status: number, headers: Record<string, unknown>): ControlledBody {
     const body = new ControlledBody()
     this.respondMalformed(index, {
-      status,
-      headers: {
-        get: (name: string) => headers[name.toLowerCase()] ?? null,
-      } as unknown as Headers,
+      statusCode: status,
+      statusMessage: '',
+      rawHeaders: Object.entries(headers).flatMap(([key, value]) => (
+        Array.isArray(value)
+          ? value.flatMap((entry) => [key, entry])
+          : [key, value]
+      )) as unknown as string[],
       body: body.stream,
+      cancel: async (reason) => { body.cancel(reason) },
     })
     return body
   }
@@ -210,12 +268,12 @@ function setup(
   answers: readonly LookupAddress[] = [PUBLIC_IPV4],
   overrides: Partial<SafeMediaDownloaderDependencies> = {},
 ) {
-  const network = new FakeFetch()
+  const network = new FakeTransport()
   const timers = new ManualTimers()
   const resolveHost = vi.fn(async () => answers)
   const downloader = new SafeMediaDownloader({
     resolveHost,
-    fetch: network.fetch,
+    transport: network,
     setTimer: timers.set,
     clearTimer: timers.clear,
     ...overrides,
@@ -239,20 +297,15 @@ async function expectSafeFailure(promise: Promise<unknown>): Promise<void> {
   await expect(promise).rejects.toEqual(SAFE_ERROR)
 }
 
-describe('SafeMediaDownloader managed fetch transport', () => {
-  it('streams a managed fetch response into the caller-owned destination', async () => {
-    const fetch = vi.fn(async () => new Response(new ReadableStream({
-      start(controller) {
-        controller.enqueue(new Uint8Array([1, 2, 3]))
-        controller.close()
-      },
-    }), {
-      status: 200,
-      headers: { 'content-type': 'image/png', 'content-length': '3' },
+describe('SafeMediaDownloader pinned transport', () => {
+  it('streams a pinned response into the caller-owned destination', async () => {
+    const request = vi.fn(async () => safeResponse({
+      body: bytes('\x01\x02\x03'),
+      headers: ['content-type', 'image/png', 'content-length', '3'],
     }))
     const downloader = new SafeMediaDownloader({
       resolveHost: async () => [PUBLIC_IPV4],
-      fetch,
+      transport: { request },
     })
     const sink = new RecordingSink()
 
@@ -261,18 +314,108 @@ describe('SafeMediaDownloader managed fetch transport', () => {
       sink,
       { maxBytes: 10, connectTimeoutMs: 1 },
     )).resolves.toEqual({ byteSize: 3, contentType: 'image/png' })
-    expect(fetch).toHaveBeenCalledWith(
-      'https://provider.example/result.png',
-      expect.objectContaining({
-        method: 'GET',
-        redirect: 'manual',
-        signal: expect.any(AbortSignal),
-      }),
-    )
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      url: new URL('https://provider.example/result.png'),
+      destinationAddress: '93.184.216.34',
+      route: { kind: 'direct' },
+      signal: expect.any(AbortSignal),
+    }))
     expect(sink.bytes()).toEqual(Buffer.from([1, 2, 3]))
   })
 
-  it('revalidates redirects and rejects a private redirect before a second fetch', async () => {
+  it('connects only to the address returned by this download resolver', async () => {
+    const request = vi.fn(async ({ destinationAddress }: PinnedMediaRequest) => {
+      expect(destinationAddress).toBe('93.184.216.34')
+      return safeResponse({ body: bytes('ok'), headers: ['content-length', '2'] })
+    })
+    const downloader = new SafeMediaDownloader({
+      resolveHost: vi.fn(async () => [{ address: '93.184.216.34', family: 4 }]),
+      transport: { request },
+    })
+
+    await expect(downloader.download(
+      'https://ambient-dns-must-not-run.invalid/file',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    )).resolves.toEqual({ byteSize: 2 })
+    expect(request).toHaveBeenCalledOnce()
+  })
+
+  it('holds one transport lease from initial DNS through redirect and final body cleanup', async () => {
+    const events: string[] = []
+    const resolveHost = vi.fn(async (hostname: string) => {
+      events.push(`dns:${hostname}`)
+      return [PUBLIC_IPV4]
+    })
+    const request = vi.fn(async ({ url }: PinnedMediaRequest) => {
+      events.push(`request:${url.hostname}`)
+      if (url.hostname === 'first.example') {
+        return safeResponse({
+          statusCode: 302,
+          headers: ['location', 'https://second.example/final'],
+          cancel: async () => { events.push('cancel:first.example') },
+        })
+      }
+      return safeResponse({
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(Uint8Array.from(Buffer.from('ok')))
+            controller.close()
+            events.push('body:end')
+          },
+        }),
+        headers: ['content-length', '2'],
+      })
+    })
+    const withTransportLease = vi.fn(async (
+      operation: (snapshot: NetworkTransportSnapshot) => Promise<unknown>,
+    ) => {
+      events.push('lease:start')
+      try { return await operation({ settings: DIRECT_SETTINGS }) }
+      finally { events.push('lease:end') }
+    }) as unknown as SafeMediaDownloaderDependencies['withTransportLease']
+    const downloader = new SafeMediaDownloader({
+      resolveHost,
+      transport: { request },
+      withTransportLease,
+    })
+
+    await expect(downloader.download(
+      'https://first.example/start',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    )).resolves.toEqual({ byteSize: 2 })
+    expect(events).toEqual([
+      'lease:start',
+      'dns:first.example',
+      'request:first.example',
+      'cancel:first.example',
+      'dns:second.example',
+      'request:second.example',
+      'body:end',
+      'lease:end',
+    ])
+  })
+
+  it('does not resolve or request when the transport lease rejects', async () => {
+    const resolveHost = vi.fn(async () => [PUBLIC_IPV4])
+    const request = vi.fn(async () => safeResponse())
+    const downloader = new SafeMediaDownloader({
+      resolveHost,
+      transport: { request },
+      withTransportLease: vi.fn(async () => { throw new Error('lease unavailable') }),
+    })
+
+    await expectSafeFailure(downloader.download(
+      'https://provider.example/result.png',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    ))
+    expect(resolveHost).not.toHaveBeenCalled()
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('revalidates redirects and rejects a private redirect before a second request', async () => {
     const resolveHost = vi.fn()
       .mockResolvedValueOnce([PUBLIC_IPV4])
       .mockResolvedValueOnce([{ address: '10.0.0.1', family: 4 }])
@@ -332,7 +475,7 @@ describe('SafeMediaDownloader managed fetch transport', () => {
       timers.fire(failurePoint === 'total' ? 33 : 22)
 
       await expectSafeFailure(promise)
-      expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+      expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
       expect(body.cancel).toHaveBeenCalledOnce()
       expect(timers.pending.size).toBe(0)
     }
@@ -379,7 +522,7 @@ describe('SafeMediaDownloader managed fetch transport', () => {
     sink.release(new Error('sensitive destination path'))
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     expect(body.cancel).toHaveBeenCalledOnce()
     expect(sink.writableEnded).toBe(false)
   })
@@ -398,7 +541,7 @@ describe('SafeMediaDownloader managed fetch transport', () => {
     sink.emit('close')
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     expect(body.cancel).toHaveBeenCalledOnce()
   })
 
@@ -412,11 +555,23 @@ describe('SafeMediaDownloader managed fetch transport', () => {
     await waitFor(() => network.calls.length === 1)
     const responseBody = new ControlledBody()
     network.respondMalformed(0, part === 'status'
-      ? { status: Number.NaN, headers: new Headers(), body: responseBody.stream }
-      : { status: 200, headers: new Headers(), body: {} as NonNullable<Response['body']> })
+      ? {
+          statusCode: Number.NaN,
+          statusMessage: '',
+          rawHeaders: [],
+          body: responseBody.stream,
+          cancel: async (reason) => { responseBody.cancel(reason) },
+        }
+      : {
+          statusCode: 200,
+          statusMessage: '',
+          rawHeaders: [],
+          body: {} as ReadableStream<Uint8Array>,
+          cancel: vi.fn(async () => undefined),
+        })
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     if (part === 'status') expect(responseBody.cancel).toHaveBeenCalledOnce()
   })
 
@@ -430,18 +585,19 @@ describe('SafeMediaDownloader managed fetch transport', () => {
     await waitFor(() => network.calls.length === 1)
     const cancel = vi.fn(async () => undefined)
     network.respondMalformed(0, {
-      status: 200,
-      headers: new Headers(),
+      statusCode: 200,
+      statusMessage: '',
+      rawHeaders: [],
       body: {
         getReader: () => ({
           read: vi.fn().mockRejectedValue(new Error('secret body')),
-          cancel,
         }),
-      } as unknown as NonNullable<Response['body']>,
+      } as unknown as ReadableStream<Uint8Array>,
+      cancel,
     })
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     expect(cancel).toHaveBeenCalledOnce()
   })
 })
@@ -635,7 +791,7 @@ describe('SafeMediaDownloader URL and address validation', () => {
     },
   )
 
-  it('validates the complete DNS answer set before invoking managed fetch', async () => {
+  it('validates the complete DNS answer set before invoking pinned transport', async () => {
     const { downloader, network, resolveHost } = setup([PUBLIC_IPV4, PUBLIC_IPV6])
     const sink = new RecordingSink()
     const promise = downloader.download(
@@ -646,12 +802,188 @@ describe('SafeMediaDownloader URL and address validation', () => {
     await waitFor(() => network.calls.length === 1)
     expect(resolveHost).toHaveBeenCalledWith('provider.example')
     expect(network.calls[0]).toMatchObject({
-      input: 'https://provider.example/result.png',
-      init: { method: 'GET', redirect: 'manual' },
+      input: {
+        url: new URL('https://provider.example/result.png'),
+        destinationAddress: PUBLIC_IPV4.address,
+        route: { kind: 'direct' },
+        signal: expect.any(AbortSignal),
+      },
     })
     const response = network.respond(0, 200)
     response.push(null)
     await expect(promise).resolves.toEqual({ byteSize: 0 })
+  })
+})
+
+describe('SafeMediaDownloader route and address pinning', () => {
+  it.each([
+    [
+      'disabled direct',
+      { enabled: false, bypassDomains: [] },
+      'provider.example',
+      [PUBLIC_IPV4],
+      { kind: 'direct' },
+      PUBLIC_IPV4.address,
+    ],
+    [
+      'exact domain bypass',
+      { enabled: true, httpsProxy: 'http://proxy.example:8443', bypassDomains: ['provider.example'] },
+      'provider.example',
+      [PUBLIC_IPV4],
+      { kind: 'direct' },
+      PUBLIC_IPV4.address,
+    ],
+    [
+      'wildcard domain bypass',
+      { enabled: true, httpsProxy: 'http://proxy.example:8443', bypassDomains: ['*.example'] },
+      'provider.example',
+      [PUBLIC_IPV4],
+      { kind: 'direct' },
+      PUBLIC_IPV4.address,
+    ],
+    [
+      'IP bypass',
+      { enabled: true, httpsProxy: 'http://proxy.example:8443', bypassDomains: ['1.1.1.1'] },
+      'provider.example',
+      [PUBLIC_IPV4, { address: '1.1.1.1', family: 4 }],
+      { kind: 'direct' },
+      '1.1.1.1',
+    ],
+    [
+      'CIDR bypass',
+      { enabled: true, httpsProxy: 'http://proxy.example:8443', bypassDomains: ['1.1.1.0/24'] },
+      'provider.example',
+      [PUBLIC_IPV4, { address: '1.1.1.1', family: 4 }],
+      { kind: 'direct' },
+      '1.1.1.1',
+    ],
+    [
+      'HTTPS proxy priority',
+      {
+        enabled: true,
+        httpsProxy: 'http://secure-proxy.example:8443',
+        socketProxy: 'socks5://socket-proxy.example:1080',
+        httpProxy: 'http://plain-proxy.example:8080',
+        bypassDomains: [],
+      },
+      'provider.example',
+      [PUBLIC_IPV4],
+      { kind: 'http-connect', proxyUrl: 'http://secure-proxy.example:8443' },
+      PUBLIC_IPV4.address,
+    ],
+    [
+      'SOCKS proxy fallback',
+      {
+        enabled: true,
+        socketProxy: 'socks5://socket-proxy.example:1080',
+        httpProxy: 'http://plain-proxy.example:8080',
+        bypassDomains: [],
+      },
+      'provider.example',
+      [PUBLIC_IPV4],
+      { kind: 'socks', proxyUrl: 'socks5://socket-proxy.example:1080' },
+      PUBLIC_IPV4.address,
+    ],
+    [
+      'HTTP proxy fallback',
+      { enabled: true, httpProxy: 'http://plain-proxy.example:8080', bypassDomains: [] },
+      'provider.example',
+      [PUBLIC_IPV4],
+      { kind: 'http-connect', proxyUrl: 'http://plain-proxy.example:8080' },
+      PUBLIC_IPV4.address,
+    ],
+  ] as Array<[
+    string,
+    ProxySettings,
+    string,
+    readonly LookupAddress[],
+    MediaRoute,
+    string,
+  ]>)(
+    'uses $0',
+    async (_name, settings, hostname, answers, expectedRoute, expectedAddress) => {
+      const request = vi.fn(async () => safeResponse({ headers: ['content-length', '0'] }))
+      const downloader = new SafeMediaDownloader({
+        resolveHost: vi.fn(async () => answers),
+        transport: { request },
+        withTransportLease: async (operation) => operation({ settings }),
+      })
+
+      await expect(downloader.download(
+        `https://${hostname}/result.png`,
+        new RecordingSink(),
+        { maxBytes: 10 },
+      )).resolves.toEqual({ byteSize: 0 })
+      expect(request).toHaveBeenCalledWith(expect.objectContaining({
+        route: expectedRoute,
+        destinationAddress: expectedAddress,
+      }))
+    },
+  )
+
+  it('tries validated destination addresses sequentially until response headers arrive', async () => {
+    const request = vi.fn()
+      .mockRejectedValueOnce(new Error('first address failed'))
+      .mockResolvedValueOnce(safeResponse({
+        body: bytes('ok'),
+        headers: ['content-length', '2'],
+      }))
+    const downloader = new SafeMediaDownloader({
+      resolveHost: vi.fn(async () => [PUBLIC_IPV4, { address: '1.1.1.1', family: 4 }]),
+      transport: { request },
+    })
+
+    await expect(downloader.download(
+      'https://provider.example/result.png',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    )).resolves.toEqual({ byteSize: 2 })
+    expect(request.mock.calls.map(([input]) => input.destinationAddress)).toEqual([
+      '93.184.216.34',
+      '1.1.1.1',
+    ])
+  })
+
+  it('does not try another address after an accepted response body fails', async () => {
+    const request = vi.fn(async () => safeResponse({
+      body: new ReadableStream({
+        pull(controller) { controller.error(new Error('private upstream body failure')) },
+      }),
+    }))
+    const downloader = new SafeMediaDownloader({
+      resolveHost: vi.fn(async () => [PUBLIC_IPV4, { address: '1.1.1.1', family: 4 }]),
+      transport: { request },
+    })
+
+    await expectSafeFailure(downloader.download(
+      'https://provider.example/result.png?secret=token',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    ))
+    expect(request).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    [
+      'CONNECT',
+      { enabled: true, httpsProxy: 'http://proxy.example:8443', bypassDomains: [] },
+    ],
+    [
+      'SOCKS',
+      { enabled: true, socketProxy: 'socks5://proxy.example:1080', bypassDomains: [] },
+    ],
+  ] as Array<[string, ProxySettings]>)('sanitizes a %s transport failure', async (_name, settings) => {
+    const downloader = new SafeMediaDownloader({
+      resolveHost: vi.fn(async () => [PUBLIC_IPV4]),
+      transport: { request: vi.fn(async () => { throw new Error('secret proxy failure') }) },
+      withTransportLease: async (operation) => operation({ settings }),
+    })
+
+    await expectSafeFailure(downloader.download(
+      'https://provider.example/result.png?secret=token',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    ))
   })
 })
 
@@ -758,7 +1090,7 @@ describe('SafeMediaDownloader redirects and responses', () => {
     response.push('sensitive provider error')
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
   })
 
   it('prechecks Content-Length and does not write an oversized body', async () => {
@@ -816,7 +1148,7 @@ describe('SafeMediaDownloader redirects and responses', () => {
     response.push(null)
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     expect(timers.pending.size).toBe(0)
     expect(sink.writableEnded).toBe(false)
   })
@@ -836,7 +1168,7 @@ describe('SafeMediaDownloader redirects and responses', () => {
     response.push(null)
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     expect(timers.pending.size).toBe(0)
     expect(sink.bytes().toString()).toBe('abc')
     expect(sink.writableEnded).toBe(false)
@@ -865,6 +1197,34 @@ describe('SafeMediaDownloader redirects and responses', () => {
     await expectSafeFailure(promise)
     expect(response.destroyed).toBe(true)
     expect(sink.bytes()).toHaveLength(0)
+  })
+
+  it.each([
+    ['duplicate length', ['content-length', '2', 'Content-Length', '2']],
+    ['conflicting length', ['content-length', '2', 'Content-Length', '3']],
+    ['odd raw header array', ['content-length']],
+    ['non-string raw value', ['content-length', 2] as unknown as string[]],
+  ])('rejects %s', async (_name, rawHeaders) => {
+    const cancel = vi.fn(async () => undefined)
+    const downloader = new SafeMediaDownloader({
+      resolveHost: vi.fn(async () => [PUBLIC_IPV4]),
+      transport: {
+        request: vi.fn(async () => safeResponse({
+          body: bytes('ok'),
+          headers: rawHeaders,
+          cancel,
+        })),
+      },
+    })
+
+    await expect(downloader.download(
+      'https://provider.example/result.png',
+      new RecordingSink(),
+      { maxBytes: 10 },
+    )).rejects.toMatchObject({
+      code: 'MEDIA_DOWNLOAD_FAILED',
+    })
+    expect(cancel).toHaveBeenCalledOnce()
   })
 
   it.each([
@@ -1018,7 +1378,7 @@ describe('SafeMediaDownloader failure lifecycle', () => {
       timers.fire(timeout.milliseconds)
 
       await expectSafeFailure(promise)
-      expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+      expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
       if (response) expect(response.destroyed).toBe(true)
       expect(timers.pending.size).toBe(0)
     }
@@ -1071,8 +1431,8 @@ describe('SafeMediaDownloader failure lifecycle', () => {
       // Failure remains prompt and does not wait for the caller-owned sink.
       await expectSafeFailure(promise)
       expect(timers.pending.size).toBe(0)
-      expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
-      expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+      expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
+      expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
       expect(sink.listenerCount('error')).toBe(baselineErrorListeners + 1)
       expect(sink.listenerCount('close')).toBe(baselineCloseListeners)
       expect(sink.writableEnded).toBe(false)
@@ -1128,7 +1488,7 @@ describe('SafeMediaDownloader failure lifecycle', () => {
     else sink.emit('close')
 
     await expectSafeFailure(promise)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: true })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: true })
     expect(response.destroyed).toBe(true)
     expect(sink.writableEnded).toBe(false)
   })
@@ -1151,7 +1511,7 @@ describe('SafeMediaDownloader failure lifecycle', () => {
 
     await expect(promise).resolves.toEqual({ byteSize: 2 })
     expect(timers.pending.size).toBe(0)
-    expect(network.calls[0]!.init.signal).toMatchObject({ aborted: false })
+    expect(network.calls[0]!.input.signal).toMatchObject({ aborted: false })
     expect(response.eventNames()).toEqual([])
     expect(sink.listenerCount('error')).toBe(errorListeners)
     expect(sink.listenerCount('close')).toBe(closeListeners)
