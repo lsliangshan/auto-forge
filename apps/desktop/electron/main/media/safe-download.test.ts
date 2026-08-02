@@ -397,6 +397,56 @@ describe('SafeMediaDownloader pinned transport', () => {
     ])
   })
 
+  it('keeps the lease until in-flight redirect cancellation completes after total timeout', async () => {
+    const events: string[] = []
+    const timers = new ManualTimers()
+    let releaseCancellation!: () => void
+    const cancel = vi.fn(async () => {
+      events.push('cancel:start')
+      await new Promise<void>((resolve) => { releaseCancellation = resolve })
+      events.push('cancel:end')
+    })
+    const withTransportLease = vi.fn(async (
+      operation: (snapshot: NetworkTransportSnapshot) => Promise<unknown>,
+    ) => {
+      events.push('lease:start')
+      try { return await operation({ settings: DIRECT_SETTINGS }) }
+      finally { events.push('lease:end') }
+    }) as unknown as SafeMediaDownloaderDependencies['withTransportLease']
+    const downloader = new SafeMediaDownloader({
+      resolveHost: vi.fn(async () => [PUBLIC_IPV4]),
+      transport: {
+        request: vi.fn(async () => safeResponse({
+          statusCode: 302,
+          headers: ['location', 'https://second.example/final'],
+          cancel,
+        })),
+      },
+      withTransportLease,
+      setTimer: timers.set,
+      clearTimer: timers.clear,
+    })
+    const promise = downloader.download(
+      'https://first.example/start',
+      new RecordingSink(),
+      { maxBytes: 10, totalTimeoutMs: 33 },
+    )
+    await waitFor(() => cancel.mock.calls.length === 1)
+
+    timers.fire(33)
+    await expectSafeFailure(promise)
+    await flushMicrotasks()
+
+    try {
+      expect([...events]).toEqual(['lease:start', 'cancel:start'])
+    } finally {
+      releaseCancellation()
+      await waitFor(() => events.includes('lease:end'))
+    }
+    expect(events).toEqual(['lease:start', 'cancel:start', 'cancel:end', 'lease:end'])
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
   it('does not resolve or request when the transport lease rejects', async () => {
     const resolveHost = vi.fn(async () => [PUBLIC_IPV4])
     const request = vi.fn(async () => safeResponse())

@@ -379,7 +379,7 @@ export class SafeMediaDownloader {
       let connectTimer: TimerHandle | undefined
       let firstByteTimer: TimerHandle | undefined
       let settled = false
-      let responseCancelled = false
+      let responseCancellation: Promise<void> | undefined
       let bodyEnded = false
       let waitingForDrain = false
       let byteSize = 0
@@ -427,11 +427,14 @@ export class SafeMediaDownloader {
         releaseDestinationWriteGuardIfSettled()
         context.abortCurrent = undefined
       }
-      const cancelOwnedStreams = async () => {
+      const cancelOwnedStreams = (): Promise<void> => {
         controller.abort()
-        if (responseCancelled || !cancelResponse) return
-        responseCancelled = true
-        try { await cancelResponse(failure()) } catch { /* Teardown errors stay inside the downloader boundary. */ }
+        const cancel = cancelResponse
+        if (!cancel) return Promise.resolve()
+        responseCancellation ??= (async () => {
+          try { await cancel(failure()) } catch { /* Teardown errors stay inside the downloader boundary. */ }
+        })()
+        return responseCancellation
       }
       const fail = () => {
         if (settled) return
