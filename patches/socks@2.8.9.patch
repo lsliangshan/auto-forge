@@ -1,5 +1,5 @@
 diff --git a/build/client/socksclient.js b/build/client/socksclient.js
-index 09b1f55767aa7221dee5b78077b2a2bdd332b9c6..5448f7716d834614e91e8bdbd5e3820ba9f73b73 100644
+index 09b1f55767aa7221dee5b78077b2a2bdd332b9c6..f7e3f0b5bcfe149397f0578773662982a8b3a995 100644
 --- a/build/client/socksclient.js
 +++ b/build/client/socksclient.js
 @@ -235,7 +235,7 @@ class SocksClient extends events_1.EventEmitter {
@@ -11,3 +11,42 @@ index 09b1f55767aa7221dee5b78077b2a2bdd332b9c6..5448f7716d834614e91e8bdbd5e3820b
          }
          // Attach Socket error handlers.
          this.socket.once('close', this.onClose);
+@@ -352,7 +352,7 @@ class SocksClient extends events_1.EventEmitter {
+      * @param had_error
+      */
+     onCloseHandler() {
+-        this.closeSocket(constants_1.ERRORS.SocketClosed);
++        this.closeSocket(constants_1.ERRORS.SocketClosed, true);
+     }
+     /**
+      * Handles Socket error event.
+@@ -380,14 +380,22 @@ class SocksClient extends events_1.EventEmitter {
+-    closeSocket(err) {
++    closeSocket(err, socketClosed = false) {
+         // Make sure only one 'error' event is fired for the lifetime of this SocksClient instance.
+         if (this.state !== constants_1.SocksClientState.Error) {
+             // Set internal state to Error.
+             this.setState(constants_1.SocksClientState.Error);
+-            // Destroy Socket
+-            this.socket.destroy();
+-            // Remove internal listeners
+-            this.removeInternalSocketHandlers();
+-            // Fire 'error' event.
+-            this.emit('error', new util_1.SocksClientError(err, this.options));
++            const emitError = () => {
++                // Remove internal listeners
++                this.removeInternalSocketHandlers();
++                // Fire 'error' event.
++                this.emit('error', new util_1.SocksClientError(err, this.options));
++            };
++            if (socketClosed) {
++                emitError();
++            }
++            else {
++                // Destroy Socket and defer the error until its close event.
++                this.socket.once('close', emitError);
++                this.socket.destroy();
++            }
+         }
+     }
+     /**

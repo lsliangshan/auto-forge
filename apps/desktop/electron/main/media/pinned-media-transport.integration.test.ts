@@ -1,9 +1,12 @@
 import { readFile } from 'node:fs/promises'
-import { createServer as createHttpServer, type IncomingMessage } from 'node:http'
+import { EventEmitter } from 'node:events'
+import { createServer as createHttpServer, type ClientRequest, type IncomingMessage } from 'node:http'
 import { createServer as createHttpsServer, request as httpsRequest, type RequestOptions } from 'node:https'
-import { createServer as createNetServer, connect as netConnect, type Server, type Socket } from 'node:net'
+import { createServer as createNetServer, connect as netConnect, Socket, type Server } from 'node:net'
 import { createSecureContext, type TLSSocket } from 'node:tls'
 import { afterEach, describe, expect, it } from 'vitest'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+import { SocksProxyAgent } from 'socks-proxy-agent'
 import type { MediaRoute } from './media-route.js'
 import { PinnedMediaTransport } from './pinned-media-transport.js'
 
@@ -312,6 +315,93 @@ function hangingTcpProxy(): { server: Server; started: Promise<void> } {
   return { server, started }
 }
 
+interface WithheldClientClose {
+  connected: Promise<Socket>
+  closeAttempted: Promise<void>
+  release: () => void
+  restore: () => void
+}
+
+function withholdClientClose(proxyPort: number): WithheldClientClose {
+  const originalEmit = Socket.prototype.emit
+  const targetSockets = new WeakSet<Socket>()
+  let withheldClose: { socket: Socket; args: unknown[] } | undefined
+  let connectedMarked = false
+  let restored = false
+  let markConnected!: (socket: Socket) => void
+  let markCloseAttempted!: () => void
+  const connected = new Promise<Socket>((resolve) => { markConnected = resolve })
+  const closeAttempted = new Promise<void>((resolve) => { markCloseAttempted = resolve })
+
+  Socket.prototype.emit = (function (
+    this: Socket,
+    eventName: string | symbol,
+    ...args: unknown[]
+  ): boolean {
+    if (
+      !connectedMarked
+      && (eventName === 'connect' || eventName === 'secureConnect')
+      && this.remotePort === proxyPort
+    ) {
+      connectedMarked = true
+      targetSockets.add(this)
+      markConnected(this)
+    }
+    if (eventName === 'close' && targetSockets.has(this)) {
+      if (!withheldClose) {
+        withheldClose = { socket: this, args }
+        markCloseAttempted()
+      }
+      return true
+    }
+    return Reflect.apply(originalEmit, this, [eventName, ...args]) as boolean
+  }) as typeof Socket.prototype.emit
+
+  const restore = (): void => {
+    if (restored) return
+    restored = true
+    Socket.prototype.emit = originalEmit
+  }
+  const release = (): void => {
+    const close = withheldClose
+    withheldClose = undefined
+    restore()
+    if (close) Reflect.apply(originalEmit, close.socket, ['close', ...close.args])
+  }
+  return { connected, closeAttempted, release, restore }
+}
+
+async function observeNegotiationRejection(
+  proxyPort: number,
+  ready: Promise<void>,
+  connect: (request: ClientRequest, signal: AbortSignal) => Promise<Socket>,
+): Promise<{ error: unknown; rejectedBeforeClose: boolean }> {
+  const withheld = withholdClientClose(proxyPort)
+  const controller = new AbortController()
+  let rejected = false
+  try {
+    const pending = connect(new EventEmitter() as ClientRequest, controller.signal)
+    const observed = pending.then(
+      () => { throw new Error('Expected proxy negotiation to fail') },
+      (error: unknown) => {
+        rejected = true
+        return error
+      },
+    )
+    await Promise.all([withheld.connected, ready])
+
+    controller.abort(new Error('forced proxy negotiation failure'))
+    await withheld.closeAttempted
+    const rejectedBeforeClose = rejected
+    withheld.release()
+    const error = await observed
+    return { error, rejectedBeforeClose }
+  } finally {
+    withheld.release()
+    withheld.restore()
+  }
+}
+
 describe('PinnedMediaTransport loopback routing', () => {
   it('connects directly to the numeric address with original SNI and Host despite proxy environment variables', async () => {
     const origin = await originServer()
@@ -573,18 +663,9 @@ describe('PinnedMediaTransport loopback routing', () => {
     await hanging.started
 
     controller.abort(new Error('private abort reason'))
-    const observed = await pending.then(
-      () => undefined,
-      (error: unknown) => ({
-        error,
-        closedCount: activeServers.get(hanging.server)?.closedCount,
-      }),
-    )
+    const observed = await pending.then(() => undefined, (error: unknown) => error)
 
-    expect(observed).toEqual({
-      error: { code: 'MEDIA_DOWNLOAD_FAILED', message: 'The media download failed.' },
-      closedCount: 1,
-    })
+    expect(observed).toEqual({ code: 'MEDIA_DOWNLOAD_FAILED', message: 'The media download failed.' })
     await expectListenerSocketsClosed(hanging.server, 1)
   }, 1_000)
 
@@ -605,20 +686,68 @@ describe('PinnedMediaTransport loopback routing', () => {
     await started
 
     controller.abort(new Error('private abort reason'))
-    const observed = await pending.then(
-      () => undefined,
-      (error: unknown) => ({
-        error,
-        tcpClosedCount: activeServers.get(proxy)?.closedCount,
-        tlsClosedCount: activeServers.get(proxy)?.secureClosedCount,
-      }),
+    const observed = await pending.then(() => undefined, (error: unknown) => error)
+
+    expect(observed).toEqual({ code: 'MEDIA_DOWNLOAD_FAILED', message: 'The media download failed.' })
+    await expectHttpsProxySocketsClosed(proxy, 1, 1)
+  }, 1_000)
+
+  it.each([
+    ['HTTP CONNECT', (port: number, request: ClientRequest, signal: AbortSignal) => (
+      new HttpsProxyAgent(`http://127.0.0.1:${port}`, { signal }).connect(request, {
+        host: '127.0.0.1',
+        port: 443,
+        secureEndpoint: true,
+      })
+    )],
+    ['SOCKS4', (port: number, request: ClientRequest, signal: AbortSignal) => (
+      new SocksProxyAgent(`socks4://127.0.0.1:${port}`, { socketOptions: { signal } }).connect(request, {
+        host: '127.0.0.1',
+        port: 443,
+        secureEndpoint: true,
+      })
+    )],
+    ['SOCKS5', (port: number, request: ClientRequest, signal: AbortSignal) => (
+      new SocksProxyAgent(`socks5://127.0.0.1:${port}`, { socketOptions: { signal } }).connect(request, {
+        host: '127.0.0.1',
+        port: 443,
+        secureEndpoint: true,
+      })
+    )],
+  ])('waits for the local %s negotiation socket close event before rejecting', async (_name, connect) => {
+    const hanging = hangingTcpProxy()
+    const proxyPort = await listen(hanging.server)
+    const observed = await observeNegotiationRejection(
+      proxyPort,
+      hanging.started,
+      (request, signal) => connect(proxyPort, request, signal),
     )
 
-    expect(observed).toEqual({
-      error: { code: 'MEDIA_DOWNLOAD_FAILED', message: 'The media download failed.' },
-      tcpClosedCount: 1,
-      tlsClosedCount: 1,
-    })
+    expect(observed.error).toBeInstanceOf(Error)
+    expect(observed.rejectedBeforeClose).toBe(false)
+    await expectListenerSocketsClosed(hanging.server, 1)
+  }, 1_000)
+
+  it('waits for the local HTTPS CONNECT negotiation socket close event before rejecting', async () => {
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const proxy = createHttpsServer({ key, cert })
+    proxy.on('connect', () => { markStarted() })
+    const proxyPort = await listen(proxy)
+    const observed = await observeNegotiationRejection(
+      proxyPort,
+      started,
+      (request, signal) => new HttpsProxyAgent(
+        `https://127.0.0.1:${proxyPort}` as string,
+        { ca: cert, signal },
+      ).connect(
+        request,
+        { host: '127.0.0.1', port: 443, secureEndpoint: true },
+      ),
+    )
+
+    expect(observed.error).toBeInstanceOf(Error)
+    expect(observed.rejectedBeforeClose).toBe(false)
     await expectHttpsProxySocketsClosed(proxy, 1, 1)
   }, 1_000)
 })

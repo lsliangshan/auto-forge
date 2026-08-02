@@ -146,7 +146,6 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
       let cleaned = false
       let requestStarted = false
       let requestClosed = false
-      let pendingNegotiationAbort = false
       let abortRejection: Promise<void> | undefined
       let markRequestClosed!: () => void
       const requestClosure = new Promise<void>((resolveClosure) => {
@@ -219,10 +218,6 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
           terminal()
           if (request && !requestClosed) await requestClosure
           if (proxySocketClosure) await proxySocketClosure
-          if (pendingNegotiationAbort) {
-            // Let the peer observe the signal-closed negotiation socket before the lease can continue.
-            await new Promise<void>((resolveTurn) => setTimeout(resolveTurn, 0))
-          }
           rejectSafely()
         })()
       }
@@ -236,7 +231,6 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
       }
       const onAbort = (): void => {
         if (requestStarted && input.route.kind !== 'direct' && !proxySocket) {
-          pendingNegotiationAbort = true
           return
         }
         rejectAfterAbortClosure()

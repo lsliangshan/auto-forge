@@ -1,0 +1,46 @@
+diff --git a/dist/parse-proxy-response.js b/dist/parse-proxy-response.js
+index 6f0b9e0..3fcb55f 100644
+--- a/dist/parse-proxy-response.js
++++ b/dist/parse-proxy-response.js
+@@ -19,15 +19,19 @@ export function parseProxyResponse(socket) {
+             socket.removeListener('error', onerror);
+             socket.removeListener('readable', read);
+         }
++        function rejectAfterClose(err) {
++            cleanup();
++            const rejectError = () => reject(err);
++            socket.once('close', rejectError);
++            socket.destroy();
++        }
+         function onend() {
+-            cleanup();
+             debug('onend');
+-            reject(new Error('Proxy connection ended before receiving CONNECT response'));
++            rejectAfterClose(new Error('Proxy connection ended before receiving CONNECT response'));
+         }
+         function onerror(err) {
+-            cleanup();
+             debug('onerror %o', err);
+-            reject(err);
++            rejectAfterClose(err);
+         }
+         function ondata(b) {
+             buffers.push(b);
+@@ -47,7 +55,6 @@ export function parseProxyResponse(socket) {
+             const firstLine = headerParts.shift();
+             if (!firstLine) {
+-                socket.destroy();
+-                return reject(new Error('No header received from proxy CONNECT response'));
++                return rejectAfterClose(new Error('No header received from proxy CONNECT response'));
+             }
+             const firstLineParts = firstLine.split(' ');
+             const statusCode = +firstLineParts[1];
+@@ -61,7 +68,6 @@ export function parseProxyResponse(socket) {
+                 const firstColon = header.indexOf(':');
+                 if (firstColon === -1) {
+-                    socket.destroy();
+-                    return reject(new Error(`Invalid header from proxy CONNECT response: "${header}"`));
++                    return rejectAfterClose(new Error(`Invalid header from proxy CONNECT response: "${header}"`));
+                 }
+                 const key = header.slice(0, firstColon).toLowerCase();
+                 const value = header.slice(firstColon + 1).trimStart();

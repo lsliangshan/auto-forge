@@ -11,4 +11,5 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - happy-dom@20.11.0
 patchedDependencies:
+  https-proxy-agent@9.1.0: patches/https-proxy-agent@9.1.0.patch
   socks@2.8.9: patches/socks@2.8.9.patch
