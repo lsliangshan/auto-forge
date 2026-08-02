@@ -1,0 +1,205 @@
+import type { Agent, ClientRequest, IncomingMessage } from 'node:http'
+import {
+  Agent as HttpsAgent,
+  request as httpsRequest,
+  type RequestOptions,
+} from 'node:https'
+import { isIP } from 'node:net'
+import { Readable } from 'node:stream'
+import { toSafeAppError, type AppError } from '@autoforge/shared'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+import { SocksProxyAgent } from 'socks-proxy-agent'
+import type { MediaRoute } from './media-route.js'
+
+export interface PinnedMediaRequest {
+  url: URL
+  destinationAddress: string
+  route: MediaRoute
+  signal: AbortSignal
+}
+
+export interface SafeMediaResponse {
+  statusCode: number
+  statusMessage: string
+  rawHeaders: readonly string[]
+  body: ReadableStream<Uint8Array>
+  cancel(reason?: unknown): Promise<void>
+}
+
+export interface PinnedMediaTransportPort {
+  request(input: PinnedMediaRequest): Promise<SafeMediaResponse>
+}
+
+interface PinnedMediaTransportDependencies {
+  httpsRequest: typeof httpsRequest
+  originPort: number
+  originCa?: string | Buffer
+  proxyCa?: string | Buffer
+}
+
+const productionDependencies: PinnedMediaTransportDependencies = {
+  httpsRequest,
+  originPort: 443,
+}
+
+function failure(): AppError {
+  return toSafeAppError({ code: 'MEDIA_DOWNLOAD_FAILED' })
+}
+
+function bareHostname(url: URL): string {
+  return url.hostname.startsWith('[') && url.hostname.endsWith(']')
+    ? url.hostname.slice(1, -1)
+    : url.hostname
+}
+
+function agentFor(
+  route: MediaRoute,
+  dependencies: PinnedMediaTransportDependencies,
+): Agent {
+  if (route.kind === 'direct') return new HttpsAgent({ keepAlive: false })
+  if (route.kind === 'http-connect') {
+    return new HttpsProxyAgent(route.proxyUrl, {
+      keepAlive: false,
+      ...(dependencies.proxyCa ? { ca: dependencies.proxyCa } : {}),
+    })
+  }
+  if (route.kind === 'socks') {
+    return new SocksProxyAgent(route.proxyUrl, { keepAlive: false })
+  }
+  throw failure()
+}
+
+function validateInput(input: PinnedMediaRequest): void {
+  if (
+    typeof input !== 'object'
+    || input === null
+    || !(input.url instanceof URL)
+    || input.url.protocol !== 'https:'
+    || input.url.port !== ''
+    || input.url.username !== ''
+    || input.url.password !== ''
+    || isIP(input.destinationAddress) === 0
+    || typeof input.route !== 'object'
+    || input.route === null
+  ) throw failure()
+
+  if (input.route.kind === 'socks' && isIP(input.destinationAddress) === 6) {
+    let protocol: string
+    try {
+      protocol = new URL(input.route.proxyUrl).protocol
+    } catch {
+      throw failure()
+    }
+    if (protocol === 'socks4:' || protocol === 'socks4a:') throw failure()
+  }
+}
+
+export class PinnedMediaTransport implements PinnedMediaTransportPort {
+  private readonly dependencies: PinnedMediaTransportDependencies
+
+  constructor(dependencies: Partial<PinnedMediaTransportDependencies> = {}) {
+    this.dependencies = { ...productionDependencies, ...dependencies }
+  }
+
+  async request(input: PinnedMediaRequest): Promise<SafeMediaResponse> {
+    validateInput(input)
+
+    let agent: Agent
+    try {
+      agent = agentFor(input.route, this.dependencies)
+    } catch {
+      throw failure()
+    }
+
+    const originalHostname = bareHostname(input.url)
+    const requestOptions: RequestOptions = {
+      protocol: 'https:',
+      hostname: input.destinationAddress,
+      port: this.dependencies.originPort,
+      method: 'GET',
+      path: `${input.url.pathname}${input.url.search}`,
+      headers: { host: input.url.host, accept: '*/*' },
+      servername: isIP(originalHostname) === 0 ? originalHostname : undefined,
+      rejectUnauthorized: true,
+      signal: input.signal,
+      agent,
+      ...(this.dependencies.originCa ? { ca: this.dependencies.originCa } : {}),
+    }
+
+    return new Promise<SafeMediaResponse>((resolve, reject) => {
+      let request: ClientRequest | undefined
+      let response: IncomingMessage | undefined
+      let settled = false
+      let requestDestroyed = false
+      let responseDestroyed = false
+      let cleaned = false
+
+      const destroyRequest = (): void => {
+        if (requestDestroyed || !request) return
+        requestDestroyed = true
+        request.destroy()
+      }
+      const destroyResponse = (): void => {
+        if (responseDestroyed || !response) return
+        responseDestroyed = true
+        response.destroy()
+      }
+      const cleanup = (): void => {
+        if (cleaned) return
+        cleaned = true
+        input.signal.removeEventListener('abort', onAbort)
+        agent.destroy()
+      }
+      const terminal = (): void => {
+        destroyRequest()
+        cleanup()
+      }
+      const rejectSafely = (): void => {
+        if (settled) return
+        settled = true
+        reject(failure())
+      }
+      const fail = (): void => {
+        terminal()
+        rejectSafely()
+      }
+      const onAbort = (): void => {
+        fail()
+      }
+
+      try {
+        request = this.dependencies.httpsRequest(requestOptions, (incoming) => {
+          response = incoming
+          incoming.once('end', terminal)
+          incoming.once('aborted', terminal)
+          incoming.once('error', terminal)
+          incoming.once('close', terminal)
+
+          const safeResponse: SafeMediaResponse = {
+            statusCode: incoming.statusCode ?? 0,
+            statusMessage: incoming.statusMessage ?? '',
+            rawHeaders: [...incoming.rawHeaders],
+            body: Readable.toWeb(incoming) as ReadableStream<Uint8Array>,
+            cancel: async (): Promise<void> => {
+              destroyResponse()
+              terminal()
+            },
+          }
+          if (settled) {
+            destroyResponse()
+            terminal()
+            return
+          }
+          settled = true
+          resolve(safeResponse)
+        })
+        request.once('error', fail)
+        input.signal.addEventListener('abort', onAbort, { once: true })
+        if (input.signal.aborted) onAbort()
+        else request.end()
+      } catch {
+        fail()
+      }
+    })
+  }
+}
