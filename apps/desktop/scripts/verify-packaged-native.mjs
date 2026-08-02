@@ -69,17 +69,29 @@ if (!existsSync(nativeModule)) {
 
 const executable = resolvePackagedExecutable(packageDirectory)
 const databasePackage = join(appArchive, 'node_modules', 'better-sqlite3')
+const httpsProxyAgentPackage = join(appArchive, 'node_modules', 'https-proxy-agent', 'dist', 'index.js')
+const socksProxyAgentPackage = join(appArchive, 'node_modules', 'socks-proxy-agent', 'dist', 'index.js')
 
 const probe = [
   'const Database = require(process.argv[1])',
+  'const { HttpsProxyAgent } = require(process.argv[2])',
+  'const { SocksProxyAgent } = require(process.argv[3])',
+  'if (typeof HttpsProxyAgent !== "function") throw new Error("Packaged https-proxy-agent load failed")',
+  'if (typeof SocksProxyAgent !== "function") throw new Error("Packaged socks-proxy-agent load failed")',
   'const database = new Database(":memory:")',
   'const result = database.prepare("select 1 as ok").get()',
   'database.close()',
   'if (result.ok !== 1) throw new Error("Packaged SQLite query failed")',
-  'console.log(`Packaged better-sqlite3 loaded under Electron ${process.versions.electron}`)',
+  'console.log(`Packaged proxy agents and better-sqlite3 loaded under Electron ${process.versions.electron}`)',
 ].join(';')
 
-const result = spawnSync(executable, ['-e', probe, databasePackage], {
+const result = spawnSync(executable, [
+  '-e',
+  probe,
+  databasePackage,
+  httpsProxyAgentPackage,
+  socksProxyAgentPackage,
+], {
   env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   stdio: 'inherit',
 })
