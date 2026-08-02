@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { createServer as createNetServer, connect as netConnect, type Server, type Socket } from 'node:net'
-import { createSecureContext } from 'node:tls'
+import { createSecureContext, type TLSSocket } from 'node:tls'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { MediaRoute } from './media-route.js'
 import { PinnedMediaTransport } from './pinned-media-transport.js'
@@ -11,14 +11,65 @@ const fixtureDirectory = new URL('./test-fixtures/', import.meta.url)
 const key = await readFile(new URL('pinned-media-test-key.pem', fixtureDirectory))
 const cert = await readFile(new URL('pinned-media-test-cert.pem', fixtureDirectory))
 
-const activeServers = new Map<Server, Set<Socket>>()
+interface ListenerState {
+  sockets: Set<Socket>
+  acceptedCount: number
+  peerEndCount: number
+  closedCount: number
+  closePromises: Promise<void>[]
+  peerEndWaiters: Set<() => void>
+  secureSockets: Set<TLSSocket>
+  secureAcceptedCount: number
+  secureClosedCount: number
+  secureClosePromises: Promise<void>[]
+}
 
-async function listen(server: Server): Promise<number> {
-  const sockets = new Set<Socket>()
-  activeServers.set(server, sockets)
+const activeServers = new Map<Server, ListenerState>()
+
+async function listen(
+  server: Server,
+  options: { closeOnPeerEnd?: boolean } = {},
+): Promise<number> {
+  const state: ListenerState = {
+    sockets: new Set<Socket>(),
+    acceptedCount: 0,
+    peerEndCount: 0,
+    closedCount: 0,
+    closePromises: [],
+    peerEndWaiters: new Set(),
+    secureSockets: new Set(),
+    secureAcceptedCount: 0,
+    secureClosedCount: 0,
+    secureClosePromises: [],
+  }
+  activeServers.set(server, state)
   server.on('connection', (socket) => {
-    sockets.add(socket)
-    socket.once('close', () => sockets.delete(socket))
+    state.acceptedCount += 1
+    state.sockets.add(socket)
+    socket.once('end', () => {
+      state.peerEndCount += 1
+      for (const resolve of state.peerEndWaiters) resolve()
+      state.peerEndWaiters.clear()
+      if (options.closeOnPeerEnd) socket.destroy()
+    })
+    state.closePromises.push(new Promise<void>((resolve) => {
+      socket.once('close', () => {
+        state.closedCount += 1
+        state.sockets.delete(socket)
+        resolve()
+      })
+    }))
+  })
+  server.on('secureConnection', (socket: TLSSocket) => {
+    state.secureAcceptedCount += 1
+    state.secureSockets.add(socket)
+    state.secureClosePromises.push(new Promise<void>((resolve) => {
+      socket.once('close', () => {
+        state.secureClosedCount += 1
+        state.secureSockets.delete(socket)
+        resolve()
+      })
+    }))
   })
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
@@ -32,11 +83,52 @@ async function listen(server: Server): Promise<number> {
   return address.port
 }
 
+async function expectHttpsProxySocketsClosed(
+  server: Server,
+  expectedTcpCount: number,
+  expectedTlsCount: number,
+): Promise<void> {
+  const state = activeServers.get(server)
+  if (!state) throw new Error('Test listener is not tracked')
+  expect(state.acceptedCount).toBe(expectedTcpCount)
+  expect(state.closePromises).toHaveLength(expectedTcpCount)
+  expect(state.secureAcceptedCount).toBe(expectedTlsCount)
+  expect(state.secureClosePromises).toHaveLength(expectedTlsCount)
+  await Promise.all([...state.closePromises, ...state.secureClosePromises])
+  expect(state.closedCount).toBe(expectedTcpCount)
+  expect(state.sockets.size).toBe(0)
+  expect(state.secureClosedCount).toBe(expectedTlsCount)
+  expect(state.secureSockets.size).toBe(0)
+}
+
+async function waitForPeerEndCount(state: ListenerState, expectedCount: number): Promise<void> {
+  while (state.peerEndCount < expectedCount) {
+    await new Promise<void>((resolve) => state.peerEndWaiters.add(resolve))
+  }
+}
+
+async function expectListenerSocketsClosed(
+  server: Server,
+  expectedCount: number,
+  expectedPeerEndCount = expectedCount,
+): Promise<void> {
+  const state = activeServers.get(server)
+  if (!state) throw new Error('Test listener is not tracked')
+  expect(state.acceptedCount).toBe(expectedCount)
+  expect(state.closePromises).toHaveLength(expectedCount)
+  await waitForPeerEndCount(state, expectedPeerEndCount)
+  await Promise.all(state.closePromises)
+  expect(state.peerEndCount).toBe(expectedPeerEndCount)
+  expect(state.closedCount).toBe(expectedCount)
+  expect(state.sockets.size).toBe(0)
+}
+
 afterEach(async () => {
   const entries = [...activeServers]
   activeServers.clear()
-  await Promise.all(entries.map(async ([server, sockets]) => {
-    for (const socket of sockets) socket.destroy()
+  await Promise.all(entries.map(async ([server, state]) => {
+    for (const socket of state.secureSockets) socket.destroy()
+    for (const socket of state.sockets) socket.destroy()
     if (!server.listening) return
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }))
@@ -59,7 +151,7 @@ async function originServer() {
     response.end('ok')
   })
   const port = await listen(server)
-  return { port, servernames, hosts }
+  return { server, port, servernames, hosts }
 }
 
 async function requestThrough(
@@ -224,6 +316,7 @@ describe('PinnedMediaTransport loopback routing', () => {
       }
     }
 
+    await expectListenerSocketsClosed(origin.server, 1, 0)
     expect(origin.servernames).toEqual(['media.test'])
     expect(origin.hosts).toEqual(['media.test'])
   })
@@ -233,13 +326,15 @@ describe('PinnedMediaTransport loopback routing', () => {
     const connectAuthorities: string[] = []
     const proxy = createHttpServer()
     proxy.on('connect', connectHandler(origin.port, connectAuthorities))
-    const proxyPort = await listen(proxy)
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
 
     await expect(requestThrough(origin.port, {
       kind: 'http-connect',
       proxyUrl: `http://127.0.0.1:${proxyPort}`,
     })).resolves.toBe('ok')
 
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectListenerSocketsClosed(proxy, 1)
     expect(connectAuthorities).toEqual([`127.0.0.1:${origin.port}`])
     expect(connectAuthorities[0]).not.toContain('media.test')
     expect(origin.servernames).toEqual(['media.test'])
@@ -251,7 +346,7 @@ describe('PinnedMediaTransport loopback routing', () => {
     const connectAuthorities: string[] = []
     const proxy = createHttpsServer({ key, cert })
     proxy.on('connect', connectHandler(origin.port, connectAuthorities))
-    const proxyPort = await listen(proxy)
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
     const route = {
       kind: 'http-connect' as const,
       proxyUrl: `https://127.0.0.1:${proxyPort}`,
@@ -262,6 +357,8 @@ describe('PinnedMediaTransport loopback routing', () => {
       code: 'MEDIA_DOWNLOAD_FAILED',
     })
 
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectHttpsProxySocketsClosed(proxy, 2, 1)
     expect(connectAuthorities).toEqual([`127.0.0.1:${origin.port}`])
     expect(connectAuthorities[0]).not.toContain('media.test')
     expect(origin.servernames).toEqual(['media.test'])
@@ -271,13 +368,16 @@ describe('PinnedMediaTransport loopback routing', () => {
   it('uses IPv4 ATYP with the numeric destination over SOCKS5', async () => {
     const origin = await originServer()
     const observations: Socks5Observation[] = []
-    const proxyPort = await listen(socks5Server(origin.port, observations))
+    const proxy = socks5Server(origin.port, observations)
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
 
     await expect(requestThrough(origin.port, {
       kind: 'socks',
       proxyUrl: `socks5://127.0.0.1:${proxyPort}`,
     })).resolves.toBe('ok')
 
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectListenerSocketsClosed(proxy, 1)
     expect(observations).toEqual([{
       addressType: 0x01,
       address: '127.0.0.1',
@@ -291,13 +391,16 @@ describe('PinnedMediaTransport loopback routing', () => {
   it('uses the four numeric address bytes without a SOCKS4a domain suffix', async () => {
     const origin = await originServer()
     const observations: Socks4Observation[] = []
-    const proxyPort = await listen(socks4Server(origin.port, observations))
+    const proxy = socks4Server(origin.port, observations)
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
 
     await expect(requestThrough(origin.port, {
       kind: 'socks',
       proxyUrl: `socks4://127.0.0.1:${proxyPort}`,
     })).resolves.toBe('ok')
 
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectListenerSocketsClosed(proxy, 1)
     expect(observations).toEqual([{
       address: '127.0.0.1',
       port: origin.port,

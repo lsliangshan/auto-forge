@@ -238,6 +238,30 @@ describe('PinnedMediaTransport lifecycle', () => {
     },
   )
 
+  it('replaces post-header body read failures with the fixed safe error', async () => {
+    const harness = requestHarness()
+    const transport = new PinnedMediaTransport({ httpsRequest: harness.httpsRequest })
+    const pending = transport.request(input())
+    const incoming = harness.respond()
+    const response = await pending
+    const reader = response.body.getReader()
+    const reading = reader.read()
+    const privateError = Object.assign(new Error('private response body detail'), {
+      upstreamCode: 'SECRET_UPSTREAM_CODE',
+      responseMetadata: { token: 'secret-token' },
+    })
+
+    incoming.destroy(privateError)
+    const observed = await reading.then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+
+    expect(observed).toEqual(SAFE_ERROR)
+    expect(observed).not.toBe(privateError)
+    expect(JSON.stringify(observed)).not.toMatch(/private|secret|upstream/i)
+  })
+
   it('cancels without exposing the reason and tears down response, request, and agent idempotently', async () => {
     const harness = requestHarness()
     const transport = new PinnedMediaTransport({ httpsRequest: harness.httpsRequest })

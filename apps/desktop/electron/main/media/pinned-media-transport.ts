@@ -4,7 +4,7 @@ import {
   request as httpsRequest,
   type RequestOptions,
 } from 'node:https'
-import { isIP } from 'node:net'
+import { isIP, type Socket } from 'node:net'
 import { Readable } from 'node:stream'
 import { toSafeAppError, type AppError } from '@autoforge/shared'
 import { HttpsProxyAgent } from 'https-proxy-agent'
@@ -59,12 +59,12 @@ function agentFor(
   if (route.kind === 'direct') return new HttpsAgent({ keepAlive: false })
   if (route.kind === 'http-connect') {
     return new HttpsProxyAgent(route.proxyUrl, {
-      keepAlive: false,
+      keepAlive: true,
       ...(dependencies.proxyCa ? { ca: dependencies.proxyCa } : {}),
     })
   }
   if (route.kind === 'socks') {
-    return new SocksProxyAgent(route.proxyUrl, { keepAlive: false })
+    return new SocksProxyAgent(route.proxyUrl, { keepAlive: true })
   }
   throw failure()
 }
@@ -129,9 +129,12 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
     return new Promise<SafeMediaResponse>((resolve, reject) => {
       let request: ClientRequest | undefined
       let response: IncomingMessage | undefined
+      let proxySocket: Socket | undefined
       let settled = false
       let requestDestroyed = false
       let responseDestroyed = false
+      let proxySocketDestroyed = false
+      let gracefulProxyShutdown = false
       let cleaned = false
 
       const destroyRequest = (): void => {
@@ -144,15 +147,50 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
         responseDestroyed = true
         response.destroy()
       }
+      const destroyProxySocket = (): void => {
+        if (proxySocketDestroyed || !proxySocket) return
+        proxySocketDestroyed = true
+        proxySocket.destroy()
+      }
       const cleanup = (): void => {
         if (cleaned) return
         cleaned = true
         input.signal.removeEventListener('abort', onAbort)
         agent.destroy()
       }
-      const terminal = (): void => {
+      const finishTerminal = (): void => {
+        destroyProxySocket()
+        destroyResponse()
         destroyRequest()
         cleanup()
+      }
+      const terminal = (graceful = false): void => {
+        if (cleaned) return
+        if (gracefulProxyShutdown) {
+          if (!graceful) finishTerminal()
+          return
+        }
+        if (graceful && proxySocket && !proxySocket.destroyed) {
+          gracefulProxyShutdown = true
+          const activeProxySocket = proxySocket
+          const finishProxy = (): void => {
+            if (activeProxySocket.destroyed) {
+              finishTerminal()
+              return
+            }
+            activeProxySocket.once('close', finishTerminal)
+            activeProxySocket.end()
+          }
+          const originSocket = response?.socket
+          if (originSocket && !originSocket.destroyed && !originSocket.writableEnded) {
+            originSocket.once('close', finishProxy)
+            originSocket.end()
+          } else {
+            finishProxy()
+          }
+          return
+        }
+        finishTerminal()
       }
       const rejectSafely = (): void => {
         if (settled) return
@@ -170,19 +208,46 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
       try {
         request = this.dependencies.httpsRequest(requestOptions, (incoming) => {
           response = incoming
-          incoming.once('end', terminal)
+          let responseEnded = false
+          incoming.once('end', () => {
+            responseEnded = true
+            terminal(true)
+          })
           incoming.once('aborted', terminal)
           incoming.once('error', terminal)
-          incoming.once('close', terminal)
+          incoming.once('close', () => {
+            if (!responseEnded) terminal()
+          })
+
+          const sourceReader = (
+            Readable.toWeb(incoming) as ReadableStream<Uint8Array>
+          ).getReader()
+          const body = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              try {
+                const result = await sourceReader.read()
+                if (result.done) controller.close()
+                else controller.enqueue(result.value)
+              } catch {
+                terminal()
+                controller.error(failure())
+              }
+            },
+            async cancel() {
+              try { await sourceReader.cancel() } catch { /* The fixed error boundary owns cancellation. */ }
+              terminal()
+            },
+          })
 
           const safeResponse: SafeMediaResponse = {
             statusCode: incoming.statusCode ?? 0,
             statusMessage: incoming.statusMessage ?? '',
             rawHeaders: [...incoming.rawHeaders],
-            body: Readable.toWeb(incoming) as ReadableStream<Uint8Array>,
+            body,
             cancel: async (): Promise<void> => {
               destroyResponse()
               terminal()
+              try { await sourceReader.cancel() } catch { /* Teardown never exposes an upstream error. */ }
             },
           }
           if (settled) {
@@ -192,6 +257,10 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
           }
           settled = true
           resolve(safeResponse)
+        })
+        request.once('proxy', (event: { socket: Socket }) => {
+          proxySocket = event.socket
+          if (cleaned) destroyProxySocket()
         })
         request.once('error', fail)
         input.signal.addEventListener('abort', onAbort, { once: true })
