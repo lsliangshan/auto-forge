@@ -17,11 +17,18 @@ export interface NetworkProxySnapshot {
   playwrightArgs: string[]
 }
 
+export interface NetworkTransportSnapshot {
+  settings: ProxySettings
+}
+
 export interface NetworkProxyPort {
   initialize(settings: ProxySettings): Promise<void>
   transition(settings: ProxySettings): Promise<void>
   fetch(input: string | Request, init?: RequestInit): Promise<Response>
   snapshot(): Promise<NetworkProxySnapshot>
+  withTransportLease<T>(
+    operation: (snapshot: NetworkTransportSnapshot) => Promise<T>,
+  ): Promise<T>
 }
 
 interface ElectronProxyConfig {
@@ -33,13 +40,22 @@ interface ElectronProxyConfig {
 interface NetworkProxyConfig {
   electron: ElectronProxyConfig
   snapshot: NetworkProxySnapshot
+  settings: ProxySettings
 }
 
 function frozenArgs(args: string[]): string[] {
   return Object.freeze([...args]) as string[]
 }
 
+function copyProxySettings(settings: ProxySettings): ProxySettings {
+  return Object.freeze({
+    ...settings,
+    bypassDomains: Object.freeze([...settings.bypassDomains]) as string[],
+  })
+}
+
 export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
+  const frozenSettings = copyProxySettings(settings)
   const bypassDomains = [...new Set(settings.bypassDomains)]
   const electronBypass = ['<local>', ...bypassDomains].join(',')
   const chromiumBypass = ['<local>', ...bypassDomains].join(';')
@@ -52,6 +68,7 @@ export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
         bypassRules: electronBypass,
         playwrightArgs: frozenArgs(['--no-proxy-server']),
       },
+      settings: frozenSettings,
     }
   }
 
@@ -78,6 +95,7 @@ export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
         `--proxy-bypass-list=${chromiumBypass}`,
       ]),
     },
+    settings: frozenSettings,
   }
 }
 
@@ -169,6 +187,21 @@ export class NetworkProxyService implements NetworkProxyPort {
       statusText: response.statusText,
       headers: response.headers,
     })
+  }
+
+  async withTransportLease<T>(
+    operation: (snapshot: NetworkTransportSnapshot) => Promise<T>,
+  ): Promise<T> {
+    if (this.terminalError) throw this.terminalError
+    const release = await this.acquireLease()
+    try {
+      if (this.terminalError) throw this.terminalError
+      return await operation(Object.freeze({
+        settings: copyProxySettings(this.current.settings),
+      }))
+    } finally {
+      release()
+    }
   }
 
   async snapshot(): Promise<NetworkProxySnapshot> {

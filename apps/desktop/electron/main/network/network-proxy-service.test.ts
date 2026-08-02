@@ -4,6 +4,7 @@ import {
   NetworkProxyService,
   proxyConfigFor,
   type ProxySessionPort,
+  type NetworkTransportSnapshot,
 } from './network-proxy-service.js'
 
 interface Deferred<T> {
@@ -80,6 +81,7 @@ describe('proxyConfigFor', () => {
           '--proxy-bypass-list=<local>;example.com',
         ],
       },
+      settings: enabled,
     })
   })
 
@@ -91,6 +93,7 @@ describe('proxyConfigFor', () => {
         bypassRules: '<local>',
         playwrightArgs: ['--no-proxy-server'],
       },
+      settings: { enabled: false, bypassDomains: [] },
     })
   })
 
@@ -155,6 +158,51 @@ describe('proxyConfigFor', () => {
 })
 
 describe('NetworkProxyService', () => {
+  it('holds an immutable transport settings snapshot until the operation settles', async () => {
+    const session = fakeSession()
+    const service = new NetworkProxyService(session)
+    const active = proxySettings(7890)
+    await service.initialize(active)
+    const operationDone = deferred<void>()
+    let captured!: NetworkTransportSnapshot
+
+    const lease = service.withTransportLease(async (snapshot) => {
+      captured = snapshot
+      await operationDone.promise
+    })
+    await flushMicrotasks()
+
+    expect(Object.isFrozen(captured)).toBe(true)
+    expect(Object.isFrozen(captured.settings)).toBe(true)
+    expect(Object.isFrozen(captured.settings.bypassDomains)).toBe(true)
+    expect(() => { captured.settings.enabled = false }).toThrow()
+    expect(() => { captured.settings.bypassDomains.push('mutated.example') }).toThrow()
+
+    const transition = service.transition(proxySettings(7891))
+    await flushMicrotasks()
+    expect(session.setProxy).not.toHaveBeenLastCalledWith(
+      proxyConfigFor(proxySettings(7891)).electron,
+    )
+
+    operationDone.resolve()
+    await lease
+    await transition
+    expect(session.setProxy).toHaveBeenLastCalledWith(
+      proxyConfigFor(proxySettings(7891)).electron,
+    )
+  })
+
+  it('releases a transport lease when the operation rejects', async () => {
+    const service = new NetworkProxyService(fakeSession())
+    const secretError = new Error('operation detail')
+
+    await expect(service.withTransportLease(async () => {
+      throw secretError
+    })).rejects.toBe(secretError)
+
+    await expect(service.transition(proxySettings(7892))).resolves.toBeUndefined()
+  })
+
   it('holds a fetch lease until the response body ends and gates new fetches', async () => {
     const session = fakeSession()
     const firstBody = deferred<ReadableStreamReadResult<Uint8Array>>()
@@ -446,6 +494,11 @@ describe('NetworkProxyService', () => {
     await expect(service.fetch('https://future.example')).rejects.toEqual(safeError)
     await expect(service.snapshot()).rejects.toEqual(safeError)
     await expect(service.transition(previousSettings)).rejects.toEqual(safeError)
+    const operation = vi.fn(async () => undefined)
+    await expect(service.withTransportLease(operation)).rejects.toMatchObject({
+      code: 'NETWORK_PROXY_APPLY_FAILED',
+    })
+    expect(operation).not.toHaveBeenCalled()
 
     expect(session.setProxy).toHaveBeenCalledTimes(2)
     expect(session.setProxy).toHaveBeenNthCalledWith(1, proxyConfigFor(directSettings).electron)
