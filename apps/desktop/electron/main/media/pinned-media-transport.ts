@@ -174,16 +174,16 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
           gracefulProxyShutdown = true
           const activeProxySocket = proxySocket
           const finishProxy = (): void => {
-            if (activeProxySocket.destroyed) {
+            if (activeProxySocket.destroyed || activeProxySocket.writableFinished) {
               finishTerminal()
               return
             }
-            activeProxySocket.once('close', finishTerminal)
+            activeProxySocket.once('finish', finishTerminal)
             activeProxySocket.end()
           }
           const originSocket = response?.socket
-          if (originSocket && !originSocket.destroyed && !originSocket.writableEnded) {
-            originSocket.once('close', finishProxy)
+          if (originSocket && !originSocket.destroyed && !originSocket.writableFinished) {
+            originSocket.once('finish', finishProxy)
             originSocket.end()
           } else {
             finishProxy()

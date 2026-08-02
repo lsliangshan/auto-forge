@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http'
-import { createServer as createHttpsServer } from 'node:https'
+import { createServer as createHttpsServer, request as httpsRequest, type RequestOptions } from 'node:https'
 import { createServer as createNetServer, connect as netConnect, type Server, type Socket } from 'node:net'
 import { createSecureContext, type TLSSocket } from 'node:tls'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -134,13 +134,14 @@ afterEach(async () => {
   }))
 })
 
-async function originServer() {
+async function originServer(options: { allowHalfOpen?: boolean } = {}) {
   const servernames: string[] = []
   const hosts: Array<string | undefined> = []
   const secureContext = createSecureContext({ key, cert })
   const server = createHttpsServer({
     key,
     cert,
+    ...options,
     SNICallback(servername, callback) {
       servernames.push(servername)
       callback(null, secureContext)
@@ -340,6 +341,63 @@ describe('PinnedMediaTransport loopback routing', () => {
     expect(origin.servernames).toEqual(['media.test'])
     expect(origin.hosts).toEqual(['media.test'])
   })
+
+  it('finishes local cleanup when the origin keeps its TLS writable side open', async () => {
+    const origin = await originServer({ allowHalfOpen: true })
+    let originTlsClosed = false
+    const originTlsEnded = new Promise<void>((resolve) => {
+      origin.server.once('secureConnection', (socket) => {
+        socket.once('end', resolve)
+        socket.once('close', () => { originTlsClosed = true })
+      })
+    })
+    const proxy = createHttpServer()
+    proxy.on('connect', connectHandler(origin.port, []))
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+    let requestDestroyCount = 0
+    let agentDestroyCount = 0
+    const observedHttpsRequest = ((
+      requestOptions: RequestOptions,
+      callback: (response: IncomingMessage) => void,
+    ) => {
+      const agent = requestOptions.agent
+      if (!agent || typeof agent === 'boolean') throw new Error('Expected a per-request agent')
+      const originalAgentDestroy = agent.destroy.bind(agent)
+      agent.destroy = () => {
+        agentDestroyCount += 1
+        originalAgentDestroy()
+      }
+      const request = httpsRequest(requestOptions, callback)
+      const originalRequestDestroy = request.destroy.bind(request)
+      request.destroy = ((error?: Error) => {
+        requestDestroyCount += 1
+        return originalRequestDestroy(error)
+      }) as typeof request.destroy
+      return request
+    }) as typeof httpsRequest
+    const transport = new PinnedMediaTransport({
+      httpsRequest: observedHttpsRequest,
+      originPort: origin.port,
+      originCa: cert,
+    })
+
+    const response = await transport.request({
+      url: new URL('https://media.test/asset'),
+      destinationAddress: '127.0.0.1',
+      route: {
+        kind: 'http-connect',
+        proxyUrl: `http://127.0.0.1:${proxyPort}`,
+      },
+      signal: new AbortController().signal,
+    })
+    await expect(new Response(response.body).text()).resolves.toBe('ok')
+
+    await originTlsEnded
+    expect(originTlsClosed).toBe(false)
+    expect(requestDestroyCount).toBe(1)
+    expect(agentDestroyCount).toBe(1)
+    await expectListenerSocketsClosed(proxy, 1)
+  }, 1_000)
 
   it('verifies the HTTPS proxy certificate while keeping CONNECT numeric', async () => {
     const origin = await originServer()
