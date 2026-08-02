@@ -10,3 +10,5 @@ allowBuilds:
   playwright-chromium: true
 minimumReleaseAgeExclude:
   - happy-dom@20.11.0
+patchedDependencies:
+  socks@2.8.9: patches/socks@2.8.9.patch

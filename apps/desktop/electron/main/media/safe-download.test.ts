@@ -356,14 +356,19 @@ describe('SafeMediaDownloader pinned transport', () => {
           cancel: async () => { events.push('cancel:first.example') },
         })
       }
+      let delivered = false
       return safeResponse({
         body: new ReadableStream({
-          start(controller) {
-            controller.enqueue(Uint8Array.from(Buffer.from('ok')))
+          pull(controller) {
+            if (!delivered) {
+              delivered = true
+              controller.enqueue(Uint8Array.from(Buffer.from('ok')))
+              return
+            }
             controller.close()
-            events.push('body:end')
+            events.push('body:eof')
           },
-        }),
+        }, { highWaterMark: 0 }),
         headers: ['content-length', '2'],
       })
     })
@@ -392,7 +397,7 @@ describe('SafeMediaDownloader pinned transport', () => {
       'cancel:first.example',
       'dns:second.example',
       'request:second.example',
-      'body:end',
+      'body:eof',
       'lease:end',
     ])
   })

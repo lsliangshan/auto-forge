@@ -1,5 +1,8 @@
 # VPN proxy settings final fix report
 
+> Historical report: superseded by the pinned media transport design and
+> `docs/superpowers/plans/2026-08-02-pinned-safe-media-transport-implementation.md`.
+
 Date: 2026-08-02
 
 Reviewed base: `ba7b85914d4ec585b34dd32bc76971e87f29f56d`

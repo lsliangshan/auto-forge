@@ -98,7 +98,7 @@ const result = spawnSync(executable, [
 
 if (result.error) throw result.error
 if (result.status !== 0) {
-  throw new Error(`Packaged better-sqlite3 probe failed with exit code ${result.status ?? 'unknown'}`)
+  throw new Error(`Packaged runtime dependency probe failed with exit code ${result.status ?? 'unknown'}`)
 }
 
 function resolvePackagedExecutable(appDirectory) {

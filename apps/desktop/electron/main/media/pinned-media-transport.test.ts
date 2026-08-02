@@ -32,7 +32,7 @@ interface RequestHarness {
 
 function requestHarness(): RequestHarness {
   const emitter = new EventEmitter()
-  const destroy = vi.fn()
+  const destroy = vi.fn(() => { queueMicrotask(() => emitter.emit('close')) })
   const end = vi.fn()
   const request = Object.assign(emitter, { destroy, end }) as unknown as ClientRequest
   let capturedOptions: RequestOptions | undefined
@@ -96,7 +96,8 @@ describe('PinnedMediaTransport request boundary', () => {
       path: '/asset.png?size=2',
       headers: { host: 'media.example', accept: '*/*' },
       agent: expect.anything(),
-      signal: expect.any(AbortSignal),
+      checkServerIdentity: expect.any(Function),
+      rejectUnauthorized: true,
     }), expect.any(Function))
     expect(harness.end).toHaveBeenCalledOnce()
 

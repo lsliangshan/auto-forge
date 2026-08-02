@@ -1,0 +1,13 @@
+diff --git a/build/client/socksclient.js b/build/client/socksclient.js
+index 09b1f55767aa7221dee5b78077b2a2bdd332b9c6..5448f7716d834614e91e8bdbd5e3820ba9f73b73 100644
+--- a/build/client/socksclient.js
++++ b/build/client/socksclient.js
+@@ -235,7 +235,7 @@ class SocksClient extends events_1.EventEmitter {
+             this.socket = existingSocket;
+         }
+         else {
+-            this.socket = new net.Socket();
++            this.socket = new net.Socket(this.options.socket_options);
+         }
+         // Attach Socket error handlers.
+         this.socket.once('close', this.onClose);

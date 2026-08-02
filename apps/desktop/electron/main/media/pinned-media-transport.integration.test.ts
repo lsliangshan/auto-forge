@@ -158,15 +158,15 @@ async function originServer(options: { allowHalfOpen?: boolean } = {}) {
 async function requestThrough(
   originPort: number,
   route: MediaRoute,
-  options: { proxyCa?: Buffer } = {},
+  options: { proxyCa?: Buffer; url?: URL } = {},
 ): Promise<string> {
   const transport = new PinnedMediaTransport({
     originPort,
     originCa: cert,
-    ...options,
+    ...(options.proxyCa ? { proxyCa: options.proxyCa } : {}),
   })
   const response = await transport.request({
-    url: new URL('https://media.test/asset'),
+    url: options.url ?? new URL('https://media.test/asset'),
     destinationAddress: '127.0.0.1',
     route,
     signal: new AbortController().signal,
@@ -298,6 +298,20 @@ function socks4Server(originPort: number, observations: Socks4Observation[]): Se
   })
 }
 
+function hangingTcpProxy(): { server: Server; started: Promise<void> } {
+  let markStarted!: () => void
+  let marked = false
+  const started = new Promise<void>((resolve) => { markStarted = resolve })
+  const server = createNetServer((client) => {
+    client.once('data', () => {
+      if (marked) return
+      marked = true
+      markStarted()
+    })
+  })
+  return { server, started }
+}
+
 describe('PinnedMediaTransport loopback routing', () => {
   it('connects directly to the numeric address with original SNI and Host despite proxy environment variables', async () => {
     const origin = await originServer()
@@ -340,6 +354,70 @@ describe('PinnedMediaTransport loopback routing', () => {
     expect(connectAuthorities[0]).not.toContain('media.test')
     expect(origin.servernames).toEqual(['media.test'])
     expect(origin.hosts).toEqual(['media.test'])
+  })
+
+  it('verifies an IP-literal origin over HTTP CONNECT without sending IP SNI', async () => {
+    const origin = await originServer()
+    const connectAuthorities: string[] = []
+    const proxy = createHttpServer()
+    proxy.on('connect', connectHandler(origin.port, connectAuthorities))
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+
+    await expect(requestThrough(origin.port, {
+      kind: 'http-connect',
+      proxyUrl: `http://127.0.0.1:${proxyPort}`,
+    }, {
+      url: new URL('https://127.0.0.1/asset'),
+    })).resolves.toBe('ok')
+
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectListenerSocketsClosed(proxy, 1)
+    expect(connectAuthorities).toEqual([`127.0.0.1:${origin.port}`])
+    expect(origin.servernames).toEqual([])
+    expect(origin.hosts).toEqual(['127.0.0.1'])
+  })
+
+  it('verifies an IP-literal origin over SOCKS without sending IP SNI', async () => {
+    const origin = await originServer()
+    const observations: Socks5Observation[] = []
+    const proxy = socks5Server(origin.port, observations)
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+
+    await expect(requestThrough(origin.port, {
+      kind: 'socks',
+      proxyUrl: `socks5://127.0.0.1:${proxyPort}`,
+    }, {
+      url: new URL('https://127.0.0.1/asset'),
+    })).resolves.toBe('ok')
+
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectListenerSocketsClosed(proxy, 1)
+    expect(observations).toEqual([{
+      addressType: 0x01,
+      address: '127.0.0.1',
+      port: origin.port,
+    }])
+    expect(origin.servernames).toEqual([])
+    expect(origin.hosts).toEqual(['127.0.0.1'])
+  })
+
+  it('rejects a proxied origin certificate that does not match the original IP literal', async () => {
+    const origin = await originServer()
+    const proxy = createHttpServer()
+    proxy.on('connect', connectHandler(origin.port, []))
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+
+    await expect(requestThrough(origin.port, {
+      kind: 'http-connect',
+      proxyUrl: `http://127.0.0.1:${proxyPort}`,
+    }, {
+      url: new URL('https://127.0.0.2/asset'),
+    })).rejects.toMatchObject({ code: 'MEDIA_DOWNLOAD_FAILED' })
+
+    await expectListenerSocketsClosed(origin.server, 1, 0)
+    await expectListenerSocketsClosed(proxy, 1)
+    expect(origin.servernames).toEqual([])
+    expect(origin.hosts).toEqual([])
   })
 
   it('finishes local cleanup when the origin keeps its TLS writable side open', async () => {
@@ -467,4 +545,80 @@ describe('PinnedMediaTransport loopback routing', () => {
     expect(origin.servernames).toEqual(['media.test'])
     expect(origin.hosts).toEqual(['media.test'])
   })
+
+  it.each([
+    ['HTTP CONNECT', (port: number): MediaRoute => ({
+      kind: 'http-connect',
+      proxyUrl: `http://127.0.0.1:${port}`,
+    })],
+    ['SOCKS4', (port: number): MediaRoute => ({
+      kind: 'socks',
+      proxyUrl: `socks4://127.0.0.1:${port}`,
+    })],
+    ['SOCKS5', (port: number): MediaRoute => ({
+      kind: 'socks',
+      proxyUrl: `socks5://127.0.0.1:${port}`,
+    })],
+  ])('closes a hanging %s negotiation before rejecting an aborted request', async (_name, routeFor) => {
+    const hanging = hangingTcpProxy()
+    const proxyPort = await listen(hanging.server)
+    const controller = new AbortController()
+    const transport = new PinnedMediaTransport()
+    const pending = transport.request({
+      url: new URL('https://media.test/asset'),
+      destinationAddress: '127.0.0.1',
+      route: routeFor(proxyPort),
+      signal: controller.signal,
+    })
+    await hanging.started
+
+    controller.abort(new Error('private abort reason'))
+    const observed = await pending.then(
+      () => undefined,
+      (error: unknown) => ({
+        error,
+        closedCount: activeServers.get(hanging.server)?.closedCount,
+      }),
+    )
+
+    expect(observed).toEqual({
+      error: { code: 'MEDIA_DOWNLOAD_FAILED', message: 'The media download failed.' },
+      closedCount: 1,
+    })
+    await expectListenerSocketsClosed(hanging.server, 1)
+  }, 1_000)
+
+  it('closes a hanging HTTPS CONNECT negotiation before rejecting an aborted request', async () => {
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const proxy = createHttpsServer({ key, cert })
+    proxy.on('connect', () => { markStarted() })
+    const proxyPort = await listen(proxy)
+    const controller = new AbortController()
+    const transport = new PinnedMediaTransport({ proxyCa: cert })
+    const pending = transport.request({
+      url: new URL('https://media.test/asset'),
+      destinationAddress: '127.0.0.1',
+      route: { kind: 'http-connect', proxyUrl: `https://127.0.0.1:${proxyPort}` },
+      signal: controller.signal,
+    })
+    await started
+
+    controller.abort(new Error('private abort reason'))
+    const observed = await pending.then(
+      () => undefined,
+      (error: unknown) => ({
+        error,
+        tcpClosedCount: activeServers.get(proxy)?.closedCount,
+        tlsClosedCount: activeServers.get(proxy)?.secureClosedCount,
+      }),
+    )
+
+    expect(observed).toEqual({
+      error: { code: 'MEDIA_DOWNLOAD_FAILED', message: 'The media download failed.' },
+      tcpClosedCount: 1,
+      tlsClosedCount: 1,
+    })
+    await expectHttpsProxySocketsClosed(proxy, 1, 1)
+  }, 1_000)
 })

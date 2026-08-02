@@ -6,6 +6,7 @@ import {
 } from 'node:https'
 import { isIP, type Socket } from 'node:net'
 import { Readable } from 'node:stream'
+import { checkServerIdentity } from 'node:tls'
 import { toSafeAppError, type AppError } from '@autoforge/shared'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
@@ -55,16 +56,21 @@ function bareHostname(url: URL): string {
 function agentFor(
   route: MediaRoute,
   dependencies: PinnedMediaTransportDependencies,
+  signal: AbortSignal,
 ): Agent {
   if (route.kind === 'direct') return new HttpsAgent({ keepAlive: false })
   if (route.kind === 'http-connect') {
     return new HttpsProxyAgent(route.proxyUrl, {
       keepAlive: true,
+      signal,
       ...(dependencies.proxyCa ? { ca: dependencies.proxyCa } : {}),
     })
   }
   if (route.kind === 'socks') {
-    return new SocksProxyAgent(route.proxyUrl, { keepAlive: true })
+    return new SocksProxyAgent(route.proxyUrl, {
+      keepAlive: true,
+      socketOptions: { signal },
+    })
   }
   throw failure()
 }
@@ -106,7 +112,7 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
 
     let agent: Agent
     try {
-      agent = agentFor(input.route, this.dependencies)
+      agent = agentFor(input.route, this.dependencies, input.signal)
     } catch {
       throw failure()
     }
@@ -120,8 +126,10 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
       path: `${input.url.pathname}${input.url.search}`,
       headers: { host: input.url.host, accept: '*/*' },
       servername: isIP(originalHostname) === 0 ? originalHostname : undefined,
+      checkServerIdentity: (_hostname, certificate) => (
+        checkServerIdentity(originalHostname, certificate)
+      ),
       rejectUnauthorized: true,
-      signal: input.signal,
       agent,
       ...(this.dependencies.originCa ? { ca: this.dependencies.originCa } : {}),
     }
@@ -136,6 +144,15 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
       let proxySocketDestroyed = false
       let gracefulProxyShutdown = false
       let cleaned = false
+      let requestStarted = false
+      let requestClosed = false
+      let pendingNegotiationAbort = false
+      let abortRejection: Promise<void> | undefined
+      let markRequestClosed!: () => void
+      const requestClosure = new Promise<void>((resolveClosure) => {
+        markRequestClosed = resolveClosure
+      })
+      let proxySocketClosure: Promise<void> | undefined
 
       const destroyRequest = (): void => {
         if (requestDestroyed || !request) return
@@ -197,12 +214,32 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
         settled = true
         reject(failure())
       }
+      const rejectAfterAbortClosure = (): void => {
+        abortRejection ??= (async () => {
+          terminal()
+          if (request && !requestClosed) await requestClosure
+          if (proxySocketClosure) await proxySocketClosure
+          if (pendingNegotiationAbort) {
+            // Let the peer observe the signal-closed negotiation socket before the lease can continue.
+            await new Promise<void>((resolveTurn) => setTimeout(resolveTurn, 0))
+          }
+          rejectSafely()
+        })()
+      }
       const fail = (): void => {
+        if (input.signal.aborted) {
+          rejectAfterAbortClosure()
+          return
+        }
         terminal()
         rejectSafely()
       }
       const onAbort = (): void => {
-        fail()
+        if (requestStarted && input.route.kind !== 'direct' && !proxySocket) {
+          pendingNegotiationAbort = true
+          return
+        }
+        rejectAfterAbortClosure()
       }
 
       try {
@@ -260,12 +297,22 @@ export class PinnedMediaTransport implements PinnedMediaTransportPort {
         })
         request.once('proxy', (event: { socket: Socket }) => {
           proxySocket = event.socket
+          proxySocketClosure = event.socket.destroyed
+            ? Promise.resolve()
+            : new Promise<void>((resolveClosure) => event.socket.once('close', resolveClosure))
           if (cleaned) destroyProxySocket()
+        })
+        request.once('close', () => {
+          requestClosed = true
+          markRequestClosed()
         })
         request.once('error', fail)
         input.signal.addEventListener('abort', onAbort, { once: true })
         if (input.signal.aborted) onAbort()
-        else request.end()
+        else {
+          requestStarted = true
+          request.end()
+        }
       } catch {
         fail()
       }

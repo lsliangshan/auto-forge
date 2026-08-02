@@ -469,6 +469,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
   }
 
+  let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
     chat: {
       listConversations: async () => database.conversations.list().map((conversation) => ({
@@ -801,19 +802,23 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     settings: {
       get: async () => settings.get(),
-      update: async (patch) => {
-        const previous = settings.get()
-        const candidate = settings.preview(patch)
-        if (JSON.stringify(previous.proxy) === JSON.stringify(candidate.proxy)) {
-          return settings.commit(candidate)
-        }
-        await options.networkProxy.transition(candidate.proxy)
-        try {
-          return settings.commit(candidate)
-        } catch {
-          await options.networkProxy.transition(previous.proxy)
-          throw failure('INTERNAL_ERROR')
-        }
+      update: (patch) => {
+        const transaction = settingsUpdateTail.then(async () => {
+          const previous = settings.get()
+          const candidate = settings.preview(patch)
+          if (JSON.stringify(previous.proxy) === JSON.stringify(candidate.proxy)) {
+            return settings.commit(candidate)
+          }
+          await options.networkProxy.transition(candidate.proxy)
+          try {
+            return settings.commit(candidate)
+          } catch {
+            await options.networkProxy.transition(previous.proxy)
+            throw failure('INTERNAL_ERROR')
+          }
+        })
+        settingsUpdateTail = transaction.then(() => undefined, () => undefined)
+        return transaction
       },
       saveProviderApiKey: async (provider, apiKey) => {
         await secretStore.set(credentialKeyForProvider(provider), apiKey)

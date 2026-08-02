@@ -105,7 +105,7 @@ describe('verify-packaged-native', () => {
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('simulated require failure')
-    expect(result.stderr).toContain('Packaged better-sqlite3 probe failed with exit code 17')
+    expect(result.stderr).toContain('Packaged runtime dependency probe failed with exit code 17')
   })
 
   it('verifies the current mac-arm64 target instead of an older valid sibling', () => {
@@ -123,7 +123,7 @@ describe('verify-packaged-native', () => {
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('current target failed')
-    expect(result.stderr).toContain('Packaged better-sqlite3 probe failed with exit code 23')
+    expect(result.stderr).toContain('Packaged runtime dependency probe failed with exit code 23')
   })
 
   it('rejects an explicitly requested package for the wrong architecture', () => {

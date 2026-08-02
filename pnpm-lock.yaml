@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  socks@2.8.9: f5e35c062deb8caf649a88875d5cf3eccf6a9b44ef76f09b6912440a7f6c6a22
+
 importers:
 
   .:
@@ -6312,11 +6315,11 @@ snapshots:
     dependencies:
       agent-base: 9.0.0
       debug: 4.4.3(supports-color@7.2.0)
-      socks: 2.8.9
+      socks: 2.8.9(patch_hash=f5e35c062deb8caf649a88875d5cf3eccf6a9b44ef76f09b6912440a7f6c6a22)
     transitivePeerDependencies:
       - supports-color
 
-  socks@2.8.9:
+  socks@2.8.9(patch_hash=f5e35c062deb8caf649a88875d5cf3eccf6a9b44ef76f09b6912440a7f6c6a22):
     dependencies:
       ip-address: 10.4.0
       smart-buffer: 4.2.0

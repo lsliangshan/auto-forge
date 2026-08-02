@@ -2,7 +2,13 @@ import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { toSafeAppError, type ChatEvent, type ChatSendInput, type ModelInfo } from '@autoforge/shared'
+import {
+  toSafeAppError,
+  type ChatEvent,
+  type ChatSendInput,
+  type ModelInfo,
+  type ProxySettings,
+} from '@autoforge/shared'
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
 import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
@@ -38,6 +44,40 @@ function createNetworkProxy() {
     fetch: vi.fn(globalThis.fetch),
     snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
     withTransportLease,
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+function serializedProxyHarness() {
+  const firstStarted = deferred<void>()
+  const releaseFirst = deferred<void>()
+  let transitionTail = Promise.resolve()
+  let transitionIndex = 0
+  let liveProxy: ProxySettings = { enabled: false, bypassDomains: [] }
+  const transition = vi.fn((next: ProxySettings) => {
+    const index = transitionIndex++
+    const result = transitionTail.then(async () => {
+      if (index === 0) {
+        firstStarted.resolve()
+        await releaseFirst.promise
+      }
+      liveProxy = structuredClone(next)
+    })
+    transitionTail = result.catch(() => undefined)
+    return result
+  })
+  return {
+    networkProxy: { ...createNetworkProxy(), transition },
+    firstStarted: firstStarted.promise,
+    releaseFirst: () => releaseFirst.resolve(),
+    liveProxy: () => structuredClone(liveProxy),
   }
 }
 
@@ -252,6 +292,95 @@ describe('createApplicationRuntime', () => {
       [previous],
     ])
     await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: previous })
+    await runtime.close()
+  })
+
+  it('keeps the successful second proxy generation live after a concurrent first commit fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-concurrent-first-fails-'))
+    directories.push(root)
+    const proxy = serializedProxyHarness()
+    const runtime = createApplicationRuntime(options(root, { networkProxy: proxy.networkProxy }))
+    const realCommit = SettingsService.prototype.commit
+    vi.spyOn(SettingsService.prototype, 'commit').mockImplementation(function (this: SettingsService, settings) {
+      if (settings.proxy.httpProxy === 'http://127.0.0.1:7890') throw new Error('first commit failed')
+      return realCommit.call(this, settings)
+    })
+    const firstProxy = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: ['first.example'],
+    }
+    const secondProxy = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7891',
+      bypassDomains: ['second.example'],
+    }
+
+    const first = runtime.services.settings.update({ proxy: firstProxy })
+    await proxy.firstStarted
+    const second = runtime.services.settings.update({ proxy: secondProxy })
+    proxy.releaseFirst()
+
+    await expect(first).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    await expect(second).resolves.toMatchObject({ proxy: secondProxy })
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: secondProxy })
+    expect(proxy.liveProxy()).toEqual(secondProxy)
+    await runtime.close()
+  })
+
+  it('rolls a failed second proxy commit back to the successful first concurrent generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-concurrent-second-fails-'))
+    directories.push(root)
+    const proxy = serializedProxyHarness()
+    const runtime = createApplicationRuntime(options(root, { networkProxy: proxy.networkProxy }))
+    const realCommit = SettingsService.prototype.commit
+    vi.spyOn(SettingsService.prototype, 'commit').mockImplementation(function (this: SettingsService, settings) {
+      if (settings.proxy.httpProxy === 'http://127.0.0.1:7891') throw new Error('second commit failed')
+      return realCommit.call(this, settings)
+    })
+    const firstProxy = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: ['first.example'],
+    }
+    const secondProxy = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7891',
+      bypassDomains: ['second.example'],
+    }
+
+    const first = runtime.services.settings.update({ proxy: firstProxy })
+    await proxy.firstStarted
+    const second = runtime.services.settings.update({ proxy: secondProxy })
+    proxy.releaseFirst()
+
+    await expect(first).resolves.toMatchObject({ proxy: firstProxy })
+    await expect(second).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: firstProxy })
+    expect(proxy.liveProxy()).toEqual(firstProxy)
+    await runtime.close()
+  })
+
+  it('serializes a settings-only patch behind an in-flight proxy transaction', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-settings-concurrent-'))
+    directories.push(root)
+    const proxy = serializedProxyHarness()
+    const runtime = createApplicationRuntime(options(root, { networkProxy: proxy.networkProxy }))
+    const firstProxy = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: [],
+    }
+
+    const proxyUpdate = runtime.services.settings.update({ proxy: firstProxy })
+    await proxy.firstStarted
+    const settingsOnlyUpdate = runtime.services.settings.update({ theme: 'dark' })
+    proxy.releaseFirst()
+
+    await expect(proxyUpdate).resolves.toMatchObject({ proxy: firstProxy })
+    await expect(settingsOnlyUpdate).resolves.toMatchObject({ theme: 'dark', proxy: firstProxy })
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({ theme: 'dark', proxy: firstProxy })
+    expect(proxy.liveProxy()).toEqual(firstProxy)
     await runtime.close()
   })
 
