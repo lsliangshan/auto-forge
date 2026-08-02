@@ -127,6 +127,19 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it.each([
+    ['httpProxy', 'http://proxy.example:0'],
+    ['httpsProxy', 'https://proxy.example:0'],
+    ['socketProxy', 'socks4://proxy.example:0'],
+    ['socketProxy', 'socks5://proxy.example:0'],
+  ] as const)('rejects port zero for %s', (field, address) => {
+    expect(() => proxySettingsSchema.parse({
+      enabled: true,
+      [field]: address,
+      bypassDomains: [],
+    })).toThrow()
+  })
+
   it('rejects every invalid bypass array entry instead of filtering it', () => {
     for (const bypassEntry of [
       'https://example.com',

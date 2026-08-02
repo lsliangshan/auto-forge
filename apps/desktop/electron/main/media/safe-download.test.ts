@@ -117,11 +117,13 @@ function safeResponse({
   body = bytes(''),
   headers = [],
   statusCode = 200,
+  closed = Promise.resolve(),
   cancel = vi.fn(async () => undefined),
 }: {
   body?: ReadableStream<Uint8Array>
   headers?: readonly string[]
   statusCode?: number
+  closed?: Promise<void>
   cancel?: SafeMediaResponse['cancel']
 } = {}): SafeMediaResponse {
   return {
@@ -129,6 +131,7 @@ function safeResponse({
     statusMessage: '',
     rawHeaders: headers,
     body,
+    closed,
     cancel,
   }
 }
@@ -189,6 +192,7 @@ class FakeTransport implements PinnedMediaTransportPort {
           : [key, value]
       )) as unknown as string[],
       body: body.stream,
+      closed: Promise.resolve(),
       cancel: async (reason) => { body.cancel(reason) },
     })
     return body
@@ -436,16 +440,22 @@ describe('SafeMediaDownloader pinned transport', () => {
       new RecordingSink(),
       { maxBytes: 10, totalTimeoutMs: 33 },
     )
+    let settled = false
+    void promise.then(
+      () => { settled = true },
+      () => { settled = true },
+    )
     await waitFor(() => cancel.mock.calls.length === 1)
 
     timers.fire(33)
-    await expectSafeFailure(promise)
     await flushMicrotasks()
 
     try {
+      expect(settled).toBe(false)
       expect([...events]).toEqual(['lease:start', 'cancel:start'])
     } finally {
       releaseCancellation()
+      await expectSafeFailure(promise)
       await waitFor(() => events.includes('lease:end'))
     }
     expect(events).toEqual(['lease:start', 'cancel:start', 'cancel:end', 'lease:end'])

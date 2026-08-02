@@ -54,7 +54,7 @@ interface ValidatedOptions {
 
 interface DownloadContext {
   aborted: boolean
-  abortCurrent?: () => void
+  abortCurrent?: () => Promise<void>
 }
 
 interface RedirectResult {
@@ -275,6 +275,7 @@ export class SafeMediaDownloader {
       const context: DownloadContext = { aborted: false }
       let settled = false
       let totalTimer: TimerHandle | undefined
+      let failureCleanup: Promise<void> | undefined
 
       const cleanup = () => {
         if (totalTimer !== undefined) this.dependencies.clearTimer(totalTimer)
@@ -282,13 +283,16 @@ export class SafeMediaDownloader {
         destination.removeListener('error', onDestinationError)
         destination.removeListener('close', onDestinationClose)
       }
-      const fail = () => {
-        if (settled) return
+      const fail = (): Promise<void> => {
+        if (settled) return failureCleanup ?? Promise.resolve()
         settled = true
         context.aborted = true
-        context.abortCurrent?.()
+        const abortCurrent = context.abortCurrent
         cleanup()
-        reject(failure())
+        failureCleanup = (async () => {
+          try { await abortCurrent?.() } finally { reject(failure()) }
+        })()
+        return failureCleanup
       }
       const succeed = (result: SafeDownloadResult) => {
         if (settled) return
@@ -296,12 +300,12 @@ export class SafeMediaDownloader {
         cleanup()
         resolve(result)
       }
-      const onDestinationError = () => fail()
-      const onDestinationClose = () => fail()
+      const onDestinationError = () => { void fail() }
+      const onDestinationClose = () => { void fail() }
 
       destination.on('error', onDestinationError)
       destination.on('close', onDestinationClose)
-      totalTimer = this.dependencies.setTimer(fail, validated.totalTimeoutMs)
+      totalTimer = this.dependencies.setTimer(() => { void fail() }, validated.totalTimeoutMs)
       void this.dependencies.withTransportLease(async ({ settings }) => {
         if (context.aborted) throw failure()
         return this.downloadValidated(
@@ -376,10 +380,13 @@ export class SafeMediaDownloader {
       const controller = new AbortController()
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
       let cancelResponse: SafeMediaResponse['cancel'] | undefined
+      let responseClosed: Promise<void> | undefined
+      let pendingTransportRequest: Promise<SafeMediaResponse> | undefined
       let connectTimer: TimerHandle | undefined
       let firstByteTimer: TimerHandle | undefined
       let settled = false
-      let responseCancellation: Promise<void> | undefined
+      let settlement: Promise<void> | undefined
+      let streamClosure: Promise<void> | undefined
       let bodyEnded = false
       let waitingForDrain = false
       let byteSize = 0
@@ -425,28 +432,57 @@ export class SafeMediaDownloader {
         resumeAfterDrain?.()
         resumeAfterDrain = undefined
         releaseDestinationWriteGuardIfSettled()
-        context.abortCurrent = undefined
+      }
+      const releaseAbortCurrent = () => {
+        if (context.abortCurrent === fail) context.abortCurrent = undefined
+      }
+      const captureResponse = (response: SafeMediaResponse): void => {
+        if (typeof response.cancel === 'function') cancelResponse = response.cancel.bind(response)
+        if (
+          response.closed
+          && typeof response.closed === 'object'
+          && typeof response.closed.then === 'function'
+        ) responseClosed = Promise.resolve(response.closed)
+      }
+      const awaitResponseClosed = async (): Promise<void> => {
+        try { await responseClosed } catch { /* Teardown errors stay inside the downloader boundary. */ }
       }
       const cancelOwnedStreams = (): Promise<void> => {
-        controller.abort()
-        const cancel = cancelResponse
-        if (!cancel) return Promise.resolve()
-        responseCancellation ??= (async () => {
-          try { await cancel(failure()) } catch { /* Teardown errors stay inside the downloader boundary. */ }
+        streamClosure ??= (async () => {
+          controller.abort()
+          const pending = pendingTransportRequest
+          if (pending && !cancelResponse) {
+            try { captureResponse(await pending) } catch { /* Request rejection owns pre-header teardown. */ }
+          }
+          const cancel = cancelResponse
+          if (cancel) {
+            try { await cancel(failure()) } catch { /* Teardown errors stay inside the downloader boundary. */ }
+          }
+          await awaitResponseClosed()
         })()
-        return responseCancellation
+        return streamClosure
       }
-      const fail = () => {
-        if (settled) return
+      const fail = (): Promise<void> => {
+        if (settled) {
+          if (settlement) void cancelOwnedStreams()
+          return settlement ?? Promise.resolve()
+        }
         settled = true
         cleanup()
-        void cancelOwnedStreams().then(() => reject(failure()))
+        settlement = cancelOwnedStreams().then(() => {
+          releaseAbortCurrent()
+          reject(failure())
+        })
+        return settlement
       }
       const succeed = (result: RequestResult) => {
         if (settled) return
         settled = true
         cleanup()
-        resolve(result)
+        settlement = awaitResponseClosed().then(() => {
+          releaseAbortCurrent()
+          resolve(result)
+        })
       }
       function onPendingDestinationError(): void {
         writeErrorEventObserved = true
@@ -514,21 +550,26 @@ export class SafeMediaDownloader {
         return undefined
       }
       context.abortCurrent = fail
-      connectTimer = this.dependencies.setTimer(fail, options.connectTimeoutMs)
+      connectTimer = this.dependencies.setTimer(() => { void fail() }, options.connectTimeoutMs)
       void (async () => {
         let response: SafeMediaResponse | undefined
         for (const candidate of selection.destinationAddresses) {
           try {
-            response = await this.dependencies.transport.request({
+            const transportRequest = this.dependencies.transport.request({
               url,
               destinationAddress: candidate.address,
               route: selection.route,
               signal: controller.signal,
             })
+            pendingTransportRequest = transportRequest
+            response = await transportRequest
+            captureResponse(response)
+            if (pendingTransportRequest === transportRequest) pendingTransportRequest = undefined
             break
           } catch {
+            pendingTransportRequest = undefined
             if (controller.signal.aborted || context.aborted) {
-              fail()
+              await fail()
               return
             }
           }
@@ -538,7 +579,6 @@ export class SafeMediaDownloader {
           return
         }
         clearConnectTimer()
-        if (typeof response.cancel === 'function') cancelResponse = response.cancel.bind(response)
         if (settled || context.aborted) {
           await cancelOwnedStreams()
           return
@@ -547,6 +587,9 @@ export class SafeMediaDownloader {
           !Number.isInteger(response.statusCode)
           || !Array.isArray(response.rawHeaders)
           || typeof response.cancel !== 'function'
+          || !response.closed
+          || typeof response.closed !== 'object'
+          || typeof response.closed.then !== 'function'
         ) {
           fail()
           return
@@ -599,7 +642,7 @@ export class SafeMediaDownloader {
           fail()
           return
         }
-        firstByteTimer = this.dependencies.setTimer(fail, options.firstByteTimeoutMs)
+        firstByteTimer = this.dependencies.setTimer(() => { void fail() }, options.firstByteTimeoutMs)
 
         while (!settled) {
           let result: ReadableStreamReadResult<Uint8Array>

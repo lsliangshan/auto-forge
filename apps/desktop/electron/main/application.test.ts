@@ -12,7 +12,11 @@ import {
 import { createApplicationRuntime, MaintenanceGate } from './application.js'
 import type { ModelStreamRequest } from './chat/model-provider.js'
 import { openAppDatabase } from './database/client.js'
-import type { NetworkProxyPort, NetworkTransportSnapshot } from './network/network-proxy-service.js'
+import {
+  NetworkProxyService,
+  type NetworkProxyPort,
+  type NetworkTransportSnapshot,
+} from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 
@@ -38,9 +42,11 @@ function createNetworkProxy() {
   const withTransportLease = vi.fn((
     operation: (snapshot: NetworkTransportSnapshot) => Promise<unknown>,
   ): Promise<unknown> => operation({ settings })) as unknown as NetworkProxyPort['withTransportLease']
+  const transition = vi.fn().mockResolvedValue(undefined)
   return {
     initialize: vi.fn().mockResolvedValue(undefined),
-    transition: vi.fn().mockResolvedValue(undefined),
+    transition,
+    transitionOrFailClosed: transition,
     fetch: vi.fn(globalThis.fetch),
     snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
     withTransportLease,
@@ -74,7 +80,7 @@ function serializedProxyHarness() {
     return result
   })
   return {
-    networkProxy: { ...createNetworkProxy(), transition },
+    networkProxy: { ...createNetworkProxy(), transition, transitionOrFailClosed: transition },
     firstStarted: firstStarted.promise,
     releaseFirst: () => releaseFirst.resolve(),
     liveProxy: () => structuredClone(liveProxy),
@@ -292,6 +298,55 @@ describe('createApplicationRuntime', () => {
       [previous],
     ])
     await expect(runtime.services.settings.get()).resolves.toMatchObject({ proxy: previous })
+    await runtime.close()
+  })
+
+  it('fails managed networking closed when durable proxy rollback cannot replace the rejected candidate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-terminal-rollback-'))
+    directories.push(root)
+    const candidateRestored = deferred<void>()
+    const session = {
+      setProxy: vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('durable direct rollback failed'))
+        .mockImplementationOnce(() => candidateRestored.promise),
+      closeAllConnections: vi.fn().mockResolvedValue(undefined),
+      fetch: vi.fn(async () => new Response(null, { status: 204 })),
+    }
+    const managedProxy = new NetworkProxyService(session)
+    const runtime = createApplicationRuntime(options(root, { networkProxy: managedProxy }))
+    vi.spyOn(SettingsService.prototype, 'commit').mockImplementationOnce(() => {
+      throw new Error('settings write failed')
+    })
+    const candidate = {
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7890',
+      bypassDomains: ['candidate.example'],
+    }
+
+    const update = runtime.services.settings.update({ proxy: candidate })
+    await vi.waitFor(() => expect(session.setProxy).toHaveBeenCalledTimes(3))
+    const queuedSnapshot = managedProxy.snapshot()
+    const queuedFetch = managedProxy.fetch('https://queued.example')
+    candidateRestored.resolve()
+
+    const safeError = {
+      code: 'NETWORK_PROXY_APPLY_FAILED',
+      message: 'The network proxy configuration could not be applied.',
+    }
+    await expect(update).rejects.toEqual(safeError)
+    await expect(queuedSnapshot).rejects.toEqual(safeError)
+    await expect(queuedFetch).rejects.toEqual(safeError)
+    await expect(runtime.services.settings.get()).resolves.toMatchObject({
+      proxy: { enabled: false, bypassDomains: [] },
+    })
+    await expect(managedProxy.snapshot()).rejects.toEqual(safeError)
+    await expect(managedProxy.fetch('https://future.example')).rejects.toEqual(safeError)
+    await expect(managedProxy.transition(candidate)).rejects.toEqual(safeError)
+    const operation = vi.fn(async () => undefined)
+    await expect(managedProxy.withTransportLease(operation)).rejects.toEqual(safeError)
+    expect(operation).not.toHaveBeenCalled()
+    expect(session.fetch).not.toHaveBeenCalled()
     await runtime.close()
   })
 
@@ -782,6 +837,7 @@ describe('createApplicationRuntime', () => {
           controller.close()
         },
       }),
+      closed: Promise.resolve(),
       cancel: vi.fn(async () => undefined),
     }))
     const generateImage = vi.fn(async () => ({

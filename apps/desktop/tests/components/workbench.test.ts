@@ -1002,6 +1002,22 @@ describe('workbench', () => {
     expect(api.settings.update).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['HTTP', 'http-proxy', 'http://127.0.0.1:0'],
+    ['HTTPS', 'https-proxy', 'https://127.0.0.1:0'],
+    ['SOCKS4', 'socket-proxy', 'socks4://127.0.0.1:0'],
+    ['SOCKS5', 'socket-proxy', 'socks5://127.0.0.1:0'],
+  ])('rejects a %s port-zero proxy locally', async (_name, testId, address) => {
+    const { wrapper, api } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))
+    await wrapper.get(`[data-testid="${testId}"] input`).setValue(address)
+    await wrapper.get(`[data-testid="${testId}"] input`).trigger('blur')
+
+    await vi.waitFor(() => expect(wrapper.text())
+      .toContain('请输入不包含用户名、密码和路径的有效代理地址'))
+    expect(api.settings.update).not.toHaveBeenCalled()
+  })
+
   it('rejects malformed bypass entries locally', async () => {
     const { wrapper, api } = await mountApp('/settings')
     await vi.waitFor(() => expect(wrapper.text()).toContain('默认文本模型'))

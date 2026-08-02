@@ -813,7 +813,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           try {
             return settings.commit(candidate)
           } catch {
-            await options.networkProxy.transition(previous.proxy)
+            await options.networkProxy.transitionOrFailClosed(previous.proxy)
             throw failure('INTERNAL_ERROR')
           }
         })

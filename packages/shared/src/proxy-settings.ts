@@ -19,7 +19,7 @@ function explicitProxyPort(value: string): string | undefined {
   const rawPort = hostnameAndPort.slice(portSeparator + 1)
   if (!/^\d+$/u.test(rawPort)) return undefined
   const port = Number(rawPort)
-  return Number.isSafeInteger(port) && port <= 65_535 ? String(port) : undefined
+  return Number.isSafeInteger(port) && port >= 1 && port <= 65_535 ? String(port) : undefined
 }
 
 function canonicalProxyUrl(

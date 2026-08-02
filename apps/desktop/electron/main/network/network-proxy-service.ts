@@ -24,6 +24,7 @@ export interface NetworkTransportSnapshot {
 export interface NetworkProxyPort {
   initialize(settings: ProxySettings): Promise<void>
   transition(settings: ProxySettings): Promise<void>
+  transitionOrFailClosed(settings: ProxySettings): Promise<void>
   fetch(input: string | Request, init?: RequestInit): Promise<Response>
   snapshot(): Promise<NetworkProxySnapshot>
   withTransportLease<T>(
@@ -124,14 +125,29 @@ export class NetworkProxyService implements NetworkProxyPort {
   }
 
   transition(settings: ProxySettings): Promise<void> {
+    return this.queueTransition(settings, false)
+  }
+
+  transitionOrFailClosed(settings: ProxySettings): Promise<void> {
+    return this.queueTransition(settings, true)
+  }
+
+  private queueTransition(settings: ProxySettings, failClosed: boolean): Promise<void> {
     if (this.terminalError) return Promise.reject(this.terminalError)
     const candidate = proxyConfigFor(settings)
     this.pendingTransitions += 1
     this.closeEntryBarrier()
 
-    const operation = this.transitionQueue.then(() => {
+    const operation = this.transitionQueue.then(async () => {
       if (this.terminalError) throw this.terminalError
-      return this.apply(candidate)
+      try {
+        await this.apply(candidate)
+      } catch (error) {
+        if (failClosed) {
+          this.enterTerminalState(toSafeAppError({ code: 'NETWORK_PROXY_APPLY_FAILED' }))
+        }
+        throw error
+      }
     })
     this.transitionQueue = operation.catch(() => undefined)
 

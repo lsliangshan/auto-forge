@@ -3,12 +3,16 @@ import { EventEmitter } from 'node:events'
 import { createServer as createHttpServer, type ClientRequest, type IncomingMessage } from 'node:http'
 import { createServer as createHttpsServer, request as httpsRequest, type RequestOptions } from 'node:https'
 import { createServer as createNetServer, connect as netConnect, Socket, type Server } from 'node:net'
+import { Writable } from 'node:stream'
 import { createSecureContext, type TLSSocket } from 'node:tls'
-import { afterEach, describe, expect, it } from 'vitest'
+import type { ProxySettings } from '@autoforge/shared'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
+import { NetworkProxyService, type ProxySessionPort } from '../network/network-proxy-service.js'
 import type { MediaRoute } from './media-route.js'
 import { PinnedMediaTransport } from './pinned-media-transport.js'
+import { SafeMediaDownloader } from './safe-download.js'
 
 const fixtureDirectory = new URL('./test-fixtures/', import.meta.url)
 const key = await readFile(new URL('pinned-media-test-key.pem', fixtureDirectory))
@@ -402,6 +406,152 @@ async function observeNegotiationRejection(
   }
 }
 
+class RecordingSink extends Writable {
+  readonly chunks: Buffer[] = []
+
+  override _write(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    this.chunks.push(Buffer.from(chunk))
+    callback()
+  }
+}
+
+class ManualTimers {
+  private nextHandle = 1
+  private readonly pending = new Map<number, { callback: () => void; milliseconds: number }>()
+
+  readonly set = (callback: () => void, milliseconds: number): number => {
+    const handle = this.nextHandle++
+    this.pending.set(handle, { callback, milliseconds })
+    return handle
+  }
+
+  readonly clear = (handle: unknown): void => {
+    this.pending.delete(handle as number)
+  }
+
+  fire(milliseconds: number): void {
+    const entry = [...this.pending.entries()].find(([, timer]) => timer.milliseconds === milliseconds)
+    if (!entry) throw new Error(`No pending ${milliseconds} ms timer`)
+    this.pending.delete(entry[0])
+    entry[1].callback()
+  }
+}
+
+function mappedTransport(
+  originPort: number,
+  options: { proxyCa?: Buffer; onResponse?: (response: IncomingMessage) => void } = {},
+): PinnedMediaTransport {
+  const mappedRequest = ((
+    requestOptions: RequestOptions,
+    callback: (response: IncomingMessage) => void,
+  ) => httpsRequest({ ...requestOptions, hostname: '127.0.0.1' }, (response) => {
+    callback(response)
+    options.onResponse?.(response)
+  })) as typeof httpsRequest
+  return new PinnedMediaTransport({
+    httpsRequest: mappedRequest,
+    originPort,
+    originCa: cert,
+    ...(options.proxyCa ? { proxyCa: options.proxyCa } : {}),
+  })
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 20; index += 1) await Promise.resolve()
+}
+
+async function expectManagedLeaseHeldUntilLocalClose(options: {
+  settings: ProxySettings
+  targetPort: number
+  ready: Promise<void>
+  trigger: () => void
+  transport: PinnedMediaTransport
+  expected: 'success' | 'failure'
+  timers?: ManualTimers
+}): Promise<void> {
+  const session: ProxySessionPort = {
+    setProxy: vi.fn(async () => undefined),
+    closeAllConnections: vi.fn(async () => undefined),
+    fetch: vi.fn(async () => new Response(null, { status: 204 })),
+  }
+  const networkProxy = new NetworkProxyService(session)
+  await networkProxy.initialize(options.settings)
+  vi.mocked(session.setProxy).mockClear()
+  vi.mocked(session.closeAllConnections).mockClear()
+  const withheld = withholdClientClose(options.targetPort)
+  const downloader = new SafeMediaDownloader({
+    resolveHost: async () => [{ address: '93.184.216.34', family: 4 }],
+    transport: options.transport,
+    withTransportLease: networkProxy.withTransportLease.bind(networkProxy),
+    ...(options.timers ? {
+      setTimer: options.timers.set,
+      clearTimer: options.timers.clear,
+    } : {}),
+  })
+  const download = downloader.download(
+    'https://media.test/asset',
+    new RecordingSink(),
+    {
+      maxBytes: 16,
+      maxRedirects: 0,
+      ...(options.timers ? { connectTimeoutMs: 17 } : {}),
+    },
+  )
+  let downloadSettled = false
+  void download.then(
+    () => { downloadSettled = true },
+    () => { downloadSettled = true },
+  )
+  let transitioned = false
+  let nextLeaseEntered = false
+  let transition: Promise<void> | undefined
+  let nextLease: Promise<void> | undefined
+
+  try {
+    await Promise.all([withheld.connected, options.ready])
+    transition = networkProxy.transition({ enabled: false, bypassDomains: [] }).then(() => {
+      transitioned = true
+    })
+    nextLease = networkProxy.withTransportLease(async () => {
+      nextLeaseEntered = true
+    })
+    options.trigger()
+    await withheld.closeAttempted
+    await flushMicrotasks()
+
+    expect(downloadSettled).toBe(false)
+    expect(transitioned).toBe(false)
+    expect(nextLeaseEntered).toBe(false)
+    expect(session.setProxy).not.toHaveBeenCalled()
+
+    withheld.release()
+    if (options.expected === 'success') {
+      await expect(download).resolves.toEqual({ byteSize: 2 })
+    } else {
+      await expect(download).rejects.toEqual({
+        code: 'MEDIA_DOWNLOAD_FAILED',
+        message: 'The media download failed.',
+      })
+    }
+    await transition
+    await nextLease
+    expect(transitioned).toBe(true)
+    expect(nextLeaseEntered).toBe(true)
+  } finally {
+    withheld.release()
+    withheld.restore()
+    await Promise.allSettled([
+      download,
+      ...(transition ? [transition] : []),
+      ...(nextLease ? [nextLease] : []),
+    ])
+  }
+}
+
 describe('PinnedMediaTransport loopback routing', () => {
   it('connects directly to the numeric address with original SNI and Host despite proxy environment variables', async () => {
     const origin = await originServer()
@@ -750,4 +900,143 @@ describe('PinnedMediaTransport loopback routing', () => {
     expect(observed.rejectedBeforeClose).toBe(false)
     await expectHttpsProxySocketsClosed(proxy, 1, 1)
   }, 1_000)
+})
+
+describe('SafeMediaDownloader physical-close lease boundary', () => {
+  it('keeps a direct success EOF inside the lease until the local socket close event', async () => {
+    let markReady!: () => void
+    let releaseResponse!: () => void
+    const ready = new Promise<void>((resolve) => { markReady = resolve })
+    const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve })
+    const origin = createHttpsServer({ key, cert }, (_request, response) => {
+      markReady()
+      void responseGate.then(() => {
+        response.writeHead(200, { 'content-length': '2' })
+        response.end('ok')
+      })
+    })
+    const originPort = await listen(origin)
+
+    await expectManagedLeaseHeldUntilLocalClose({
+      settings: { enabled: false, bypassDomains: [] },
+      targetPort: originPort,
+      ready,
+      trigger: releaseResponse,
+      transport: mappedTransport(originPort),
+      expected: 'success',
+    })
+  }, 2_000)
+
+  it('keeps HTTP CONNECT redirect cancellation inside the lease until proxy close', async () => {
+    let markReady!: () => void
+    let releaseHeaders!: () => void
+    const ready = new Promise<void>((resolve) => { markReady = resolve })
+    const headerGate = new Promise<void>((resolve) => { releaseHeaders = resolve })
+    const origin = createHttpsServer({ key, cert }, (_request, response) => {
+      markReady()
+      void headerGate.then(() => {
+        response.writeHead(302, { location: 'https://redirected.test/final' })
+        response.flushHeaders()
+      })
+    })
+    const originPort = await listen(origin)
+    const proxy = createHttpServer()
+    proxy.on('connect', connectHandler(originPort, []))
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+
+    await expectManagedLeaseHeldUntilLocalClose({
+      settings: {
+        enabled: true,
+        httpsProxy: `http://127.0.0.1:${proxyPort}`,
+        bypassDomains: [],
+      },
+      targetPort: proxyPort,
+      ready,
+      trigger: releaseHeaders,
+      transport: mappedTransport(originPort),
+      expected: 'failure',
+    })
+  }, 2_000)
+
+  it('keeps an HTTPS CONNECT pre-header timeout inside the lease until proxy close', async () => {
+    let markReady!: () => void
+    const ready = new Promise<void>((resolve) => { markReady = resolve })
+    const proxy = createHttpsServer({ key, cert })
+    proxy.on('connect', () => { markReady() })
+    const proxyPort = await listen(proxy)
+    const timers = new ManualTimers()
+
+    await expectManagedLeaseHeldUntilLocalClose({
+      settings: {
+        enabled: true,
+        httpsProxy: `https://127.0.0.1:${proxyPort}`,
+        bypassDomains: [],
+      },
+      targetPort: proxyPort,
+      ready,
+      trigger: () => timers.fire(17),
+      transport: mappedTransport(443, { proxyCa: cert }),
+      expected: 'failure',
+      timers,
+    })
+  }, 2_000)
+
+  it('keeps a SOCKS4 body error inside the lease until proxy close', async () => {
+    let markReady!: () => void
+    let failBody!: () => void
+    const ready = new Promise<void>((resolve) => { markReady = resolve })
+    const origin = createHttpsServer({ key, cert }, (_request, response) => {
+      response.writeHead(200, { 'content-length': '4' })
+      response.write('a')
+    })
+    const originPort = await listen(origin)
+    const proxy = socks4Server(originPort, [])
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+
+    await expectManagedLeaseHeldUntilLocalClose({
+      settings: {
+        enabled: true,
+        socketProxy: `socks4://127.0.0.1:${proxyPort}`,
+        bypassDomains: [],
+      },
+      targetPort: proxyPort,
+      ready,
+      trigger: () => failBody(),
+      transport: mappedTransport(originPort, {
+        onResponse: (response) => {
+          failBody = () => { response.destroy(new Error('forced body failure')) }
+          markReady()
+        },
+      }),
+      expected: 'failure',
+    })
+  }, 2_000)
+
+  it('keeps a SOCKS5 TLS error inside the lease until proxy close', async () => {
+    let markReady!: () => void
+    let failTls!: () => void
+    const ready = new Promise<void>((resolve) => { markReady = resolve })
+    const origin = createNetServer((socket) => {
+      socket.once('data', () => {
+        failTls = () => { socket.end('not tls') }
+        markReady()
+      })
+    })
+    const originPort = await listen(origin)
+    const proxy = socks5Server(originPort, [])
+    const proxyPort = await listen(proxy, { closeOnPeerEnd: true })
+
+    await expectManagedLeaseHeldUntilLocalClose({
+      settings: {
+        enabled: true,
+        socketProxy: `socks5://127.0.0.1:${proxyPort}`,
+        bypassDomains: [],
+      },
+      targetPort: proxyPort,
+      ready,
+      trigger: () => failTls(),
+      transport: mappedTransport(originPort),
+      expected: 'failure',
+    })
+  }, 2_000)
 })
