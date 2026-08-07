@@ -17,8 +17,20 @@ const appSettings: AppSettings = {
   proxy: { enabled: false, bypassDomains: [] },
 }
 
+const authSession = {
+  user: { id: 'user_1', account: 'Alice' },
+  authenticatedAt: '2026-08-07T00:00:00.000Z',
+}
+
 function services(): DesktopIpcServices {
   return {
+    auth: {
+      getSession: vi.fn().mockResolvedValue(null),
+      login: vi.fn().mockResolvedValue(authSession),
+      register: vi.fn().mockResolvedValue(authSession),
+      logout: vi.fn().mockResolvedValue(undefined),
+      requireSession: vi.fn().mockResolvedValue(authSession),
+    },
     chat: {
       listConversations: vi.fn().mockResolvedValue([]),
       listMessages: vi.fn().mockResolvedValue([]),
@@ -86,6 +98,40 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('allows the fixed authentication operations without an existing session', async () => {
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.authGetSession)).resolves.toBeNull()
+    await expect(app.invoke(ipcChannels.authRegister, {
+      account: 'Alice', password: 'password',
+    })).resolves.toEqual(authSession)
+    await expect(app.invoke(ipcChannels.authLogin, {
+      account: 'Alice', password: 'password',
+    })).resolves.toEqual(authSession)
+    await expect(app.invoke(ipcChannels.authLogout)).resolves.toBeUndefined()
+    expect(app.dependencies.auth.requireSession).not.toHaveBeenCalled()
+  })
+
+  it('rejects business operations without a session', async () => {
+    const app = harness()
+    vi.mocked(app.dependencies.auth.requireSession)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
+
+    await expect(app.invoke(ipcChannels.chatListConversations))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(app.dependencies.chat.listConversations).not.toHaveBeenCalled()
+  })
+
+  it('validates sender and input before requiring a session', async () => {
+    const app = harness()
+
+    await expect(app.invokeFrom('https://attacker.invalid/', ipcChannels.settingsGet))
+      .rejects.toMatchObject({ code: 'UNTRUSTED_SENDER' })
+    await expect(app.invoke(ipcChannels.chatListMessages, {}))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(app.dependencies.auth.requireSession).not.toHaveBeenCalled()
+  })
+
   it('returns complete proxy settings', async () => {
     const app = harness()
 

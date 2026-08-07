@@ -11,13 +11,16 @@ export class DesktopBridgeUnavailableError extends Error {
 
 export function getDesktopApi(): DesktopAPI {
   const api = window.autoForge
-  if (!api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
+  if (!api?.auth || !api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
     throw new DesktopBridgeUnavailableError()
   }
   return api
 }
 
 const messages: Partial<Record<AppError['code'], string>> = {
+  AUTH_REQUIRED: '请先登录',
+  AUTH_INVALID_CREDENTIALS: '账号或密码错误',
+  AUTH_ACCOUNT_EXISTS: '该账号已存在',
   CANCELLED: '操作已取消',
   INVALID_INPUT: '输入内容无效',
   NOT_FOUND: '请求的内容不存在',

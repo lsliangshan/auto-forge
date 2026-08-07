@@ -54,6 +54,12 @@ function subscribe<T>(
 
 export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBridgePorts): DesktopAPI {
   return {
+    auth: {
+      getSession: () => invoke(ipcRenderer, ipcChannels.authGetSession),
+      login: (input) => invoke(ipcRenderer, ipcChannels.authLogin, input),
+      register: (input) => invoke(ipcRenderer, ipcChannels.authRegister, input),
+      logout: () => invoke(ipcRenderer, ipcChannels.authLogout),
+    },
     chat: {
       listConversations: () => invoke(ipcRenderer, ipcChannels.chatListConversations),
       listMessages: (conversationId) => invoke(ipcRenderer, ipcChannels.chatListMessages, { conversationId }),

@@ -122,17 +122,25 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   const register = <Channel extends RequestChannel>(
     channel: Channel,
     operation: (input: z.infer<(typeof ipcRequestSchemas)[Channel]>) => unknown | Promise<unknown>,
+    registration: { anonymous?: boolean } = {},
   ) => {
     options.ipcMain.handle(channel, (event, input) => invokeValidated(
       channel,
       event,
       input,
       options,
-      operation as (value: never) => unknown | Promise<unknown>,
+      (async (value: never) => {
+        if (!registration.anonymous) await options.services.auth.requireSession()
+        return operation(value)
+      }) as (value: never) => unknown | Promise<unknown>,
     ))
     registered.push(channel)
   }
 
+  register(ipcChannels.authGetSession, () => options.services.auth.getSession(), { anonymous: true })
+  register(ipcChannels.authLogin, (input) => options.services.auth.login(input), { anonymous: true })
+  register(ipcChannels.authRegister, (input) => options.services.auth.register(input), { anonymous: true })
+  register(ipcChannels.authLogout, () => options.services.auth.logout(), { anonymous: true })
   register(ipcChannels.chatListConversations, () => options.services.chat.listConversations())
   register(ipcChannels.chatListMessages, (input) => options.services.chat.listMessages(input.conversationId))
   register(ipcChannels.chatCreateConversation, () => options.services.chat.createConversation())

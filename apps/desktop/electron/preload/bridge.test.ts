@@ -21,6 +21,23 @@ function harness(ports: Partial<DesktopBridgePorts> = {}) {
 }
 
 describe('preload desktop bridge', () => {
+  it('maps the fixed local authentication methods', async () => {
+    const app = harness()
+    await app.api.auth.getSession()
+    await app.api.auth.login({ account: 'Alice', password: 'password' })
+    await app.api.auth.register({ account: 'Bob', password: 'password' })
+    await app.api.auth.logout()
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.authGetSession, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.authLogin, {
+      account: 'Alice', password: 'password',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.authRegister, {
+      account: 'Bob', password: 'password',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.authLogout, undefined)
+  })
+
   it('uses literal fixed channels without exposing a generic transport', async () => {
     const app = harness()
     await app.api.chat.renameConversation('c1', 'Renamed')
