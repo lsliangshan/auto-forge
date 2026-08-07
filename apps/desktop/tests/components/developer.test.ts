@@ -83,6 +83,10 @@ const project: DeveloperProject = {
 function createApi() {
   let executionListener: ((event: ExecutionEvent) => void) | undefined
   const api = {
+    auth: {
+      getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
+      logout: vi.fn().mockResolvedValue(undefined),
+    },
     chat: {}, workflows: {}, permissions: {}, settings: {}, system: {},
     developer: {
       listProjects: vi.fn().mockResolvedValue([project]), createProject: vi.fn(), registerProject: vi.fn(),

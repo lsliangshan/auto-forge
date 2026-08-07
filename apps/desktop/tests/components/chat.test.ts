@@ -76,6 +76,10 @@ function createEventApi() {
   const executionUnsubscribe = vi.fn()
   const decide = vi.fn<(input: ApprovalDecision) => Promise<void>>().mockResolvedValue(undefined)
   const api = {
+    auth: {
+      getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
+      logout: vi.fn().mockResolvedValue(undefined),
+    },
     chat: {
       listConversations: vi.fn().mockResolvedValue([]), createConversation: vi.fn(),
       listMessages: vi.fn().mockResolvedValue([]),

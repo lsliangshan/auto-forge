@@ -35,6 +35,10 @@ function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']
 
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
   return {
+    auth: {
+      getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
+      logout: vi.fn().mockResolvedValue(undefined),
+    },
     chat: {
       listConversations: vi.fn().mockResolvedValue([]), createConversation: vi.fn(),
       listMessages: vi.fn().mockResolvedValue([]),
