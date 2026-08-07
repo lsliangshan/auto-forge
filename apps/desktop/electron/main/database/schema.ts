@@ -197,3 +197,18 @@ export const encryptedSecrets = sqliteTable('encrypted_secrets', {
   ciphertextBase64: text('ciphertext_base64').notNull(),
   updatedAt: integer('updated_at').notNull(),
 })
+
+export const localUsers = sqliteTable('local_users', {
+  id: text('id').primaryKey(),
+  account: text('account').notNull(),
+  accountNormalized: text('account_normalized').notNull(),
+  passwordDigest: text('password_digest').notNull(),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, (table) => [uniqueIndex('local_users_account_normalized_unique').on(table.accountNormalized)])
+
+export const localAuthSession = sqliteTable('local_auth_session', {
+  id: integer('id').primaryKey(),
+  userId: text('user_id').notNull().references(() => localUsers.id, { onDelete: 'cascade' }),
+  authenticatedAt: integer('authenticated_at').notNull(),
+})

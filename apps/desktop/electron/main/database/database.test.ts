@@ -29,6 +29,28 @@ function createV1Database() {
   return openAppDatabase(path)
 }
 
+function createV3Database() {
+  const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-v3-'))
+  temporaryDirectories.push(directory)
+  const path = join(directory, 'autoforge.sqlite')
+  const sqlite = new Database(path)
+  for (const [index, fileName] of [
+    '0001_init.sql',
+    '0002_multimodal_media.sql',
+    '0003_conversation_context.sql',
+  ].entries()) {
+    sqlite.exec(readFileSync(fileURLToPath(new URL(`../../../resources/migrations/${fileName}`, import.meta.url)), 'utf8'))
+    sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
+      .run(index + 1, index + 1)
+  }
+  sqlite.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
+    .run('conversation_v3', 'Persisted v3', 1, 1)
+  sqlite.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('message_v3', 'conversation_v3', 'user', JSON.stringify([{ type: 'text', text: 'before auth' }]), 1, 1)
+  sqlite.close()
+  return openAppDatabase(path)
+}
+
 const defaultConversationGenerationPreferences: ConversationGenerationPreferences = {
   outputType: 'auto',
   models: {},
@@ -149,7 +171,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(3)
+    expect(database.schemaVersion()).toBe(4)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -157,12 +179,54 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(3)
+    expect(database.schemaVersion()).toBe(4)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
       ordinal: 1,
     })
+  })
+
+  it('upgrades a populated v3 database without losing business data', () => {
+    const database = createV3Database()
+
+    expect(database.schemaVersion()).toBe(4)
+    expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
+    expect(database.messages.get('message_v3')).toMatchObject({
+      blocks: [{ type: 'text', text: 'before auth' }],
+      ordinal: 1,
+    })
+  })
+
+  it('stores local users and one persistent authentication session', () => {
+    const database = openTestDatabase()
+    const user = {
+      id: 'user_1', account: 'Alice', accountNormalized: 'alice',
+      passwordDigest: 'digest', createdAt: 10, updatedAt: 10,
+    }
+
+    expect(database.localAuth.createUserAndSession(user, 11)).toMatchObject({
+      user: { id: 'user_1', account: 'Alice' }, authenticatedAt: 11,
+    })
+    expect(database.localAuth.findUserByNormalizedAccount('alice')).toEqual(user)
+    expect(database.localAuth.getCurrentSession()).toMatchObject({ user: { id: 'user_1' } })
+    database.localAuth.clearSession()
+    database.localAuth.clearSession()
+    expect(database.localAuth.getCurrentSession()).toBeUndefined()
+  })
+
+  it('rejects a case-insensitive duplicate without replacing the current session', () => {
+    const database = openTestDatabase()
+    database.localAuth.createUserAndSession({
+      id: 'user_1', account: 'Alice', accountNormalized: 'alice',
+      passwordDigest: 'digest-1', createdAt: 10, updatedAt: 10,
+    }, 11)
+
+    expect(database.localAuth.createUserAndSession({
+      id: 'user_2', account: 'ALICE', accountNormalized: 'alice',
+      passwordDigest: 'digest-2', createdAt: 12, updatedAt: 12,
+    }, 13)).toBeUndefined()
+    expect(database.localAuth.getCurrentSession()?.user.id).toBe('user_1')
   })
 
   it('backfills insertion order and allocates independent conversation ordinals', () => {
