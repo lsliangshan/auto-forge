@@ -1,7 +1,11 @@
 <template>
   <AuthLayout>
-    <h1 id="auth-title">注册本地账号</h1>
-    <p class="auth-description">账号只保存在这台设备上，注册成功后将自动登录。</p>
+    <h1 id="auth-title">
+      注册本地账号
+    </h1>
+    <p class="auth-description">
+      账号只保存在这台设备上，注册成功后将自动登录。
+    </p>
     <form
       data-testid="register-form"
       class="auth-form"
@@ -52,7 +56,9 @@
       </el-button>
     </form>
     <p class="auth-switch">
-      已有本地账号？<RouterLink to="/login">返回登录</RouterLink>
+      已有本地账号？<RouterLink to="/login">
+        返回登录
+      </RouterLink>
     </p>
   </AuthLayout>
 </template>

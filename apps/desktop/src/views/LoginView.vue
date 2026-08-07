@@ -1,7 +1,11 @@
 <template>
   <AuthLayout>
-    <h1 id="auth-title">登录 AutoForge</h1>
-    <p class="auth-description">使用保存在这台设备上的本地账号继续。</p>
+    <h1 id="auth-title">
+      登录 AutoForge
+    </h1>
+    <p class="auth-description">
+      使用保存在这台设备上的本地账号继续。
+    </p>
     <form
       data-testid="login-form"
       class="auth-form"
@@ -42,7 +46,9 @@
       </el-button>
     </form>
     <p class="auth-switch">
-      还没有本地账号？<RouterLink to="/register">去注册</RouterLink>
+      还没有本地账号？<RouterLink to="/register">
+        去注册
+      </RouterLink>
     </p>
   </AuthLayout>
 </template>
