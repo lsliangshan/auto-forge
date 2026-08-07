@@ -21,6 +21,31 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 
 const modalitySchema = z.enum(['text', 'image', 'audio', 'video'])
 
+export const authAccountSchema = z.string().trim().regex(/^[A-Za-z0-9_]{3,32}$/)
+export const authPasswordSchema = z.string().superRefine((value, context) => {
+  const length = Array.from(value).length
+  if (length < 8 || length > 72) {
+    context.addIssue({ code: 'custom', message: 'Password must contain 8 to 72 Unicode code points' })
+  }
+})
+export const authCredentialsSchema = z.object({
+  account: authAccountSchema,
+  password: authPasswordSchema,
+}).strict()
+export type AuthCredentials = z.infer<typeof authCredentialsSchema>
+
+export const authUserSchema = z.object({
+  id: identifierSchema,
+  account: authAccountSchema,
+}).strict()
+export type AuthUser = z.infer<typeof authUserSchema>
+
+export const authSessionSchema = z.object({
+  user: authUserSchema,
+  authenticatedAt: timestampSchema,
+}).strict()
+export type AuthSession = z.infer<typeof authSessionSchema>
+
 export const outputTypeSchema = z.enum(['auto', 'text', 'image', 'audio', 'video'])
 export type OutputType = z.infer<typeof outputTypeSchema>
 
@@ -394,6 +419,10 @@ export const appInfoSchema = z.object({
 export type AppInfo = z.infer<typeof appInfoSchema>
 
 export const ipcChannels = {
+  authGetSession: 'auth:get-session',
+  authLogin: 'auth:login',
+  authRegister: 'auth:register',
+  authLogout: 'auth:logout',
   chatListConversations: 'chat:list-conversations',
   chatListMessages: 'chat:list-messages',
   chatCreateConversation: 'chat:create-conversation',
@@ -508,6 +537,10 @@ export const openExternalRequestSchema = z.object({
 }).strict()
 
 export const ipcRequestSchemas = {
+  [ipcChannels.authGetSession]: z.undefined(),
+  [ipcChannels.authLogin]: authCredentialsSchema,
+  [ipcChannels.authRegister]: authCredentialsSchema,
+  [ipcChannels.authLogout]: z.undefined(),
   [ipcChannels.chatListConversations]: z.undefined(),
   [ipcChannels.chatListMessages]: listMessagesRequestSchema,
   [ipcChannels.chatCreateConversation]: createConversationRequestSchema,
@@ -560,6 +593,10 @@ const requestIdResponseSchema = z.object({ requestId: identifierSchema }).strict
 const executionIdResponseSchema = z.object({ executionId: identifierSchema }).strict()
 
 export const ipcResponseSchemas = {
+  [ipcChannels.authGetSession]: authSessionSchema.nullable(),
+  [ipcChannels.authLogin]: authSessionSchema,
+  [ipcChannels.authRegister]: authSessionSchema,
+  [ipcChannels.authLogout]: voidResponseSchema,
   [ipcChannels.chatListConversations]: z.array(conversationSummarySchema),
   [ipcChannels.chatListMessages]: z.array(chatMessageSchema),
   [ipcChannels.chatCreateConversation]: conversationSummarySchema,
@@ -608,6 +645,12 @@ export const ipcResponseSchemas = {
 } as const
 
 export interface DesktopAPI {
+  auth: {
+    getSession(): Promise<AuthSession | null>
+    login(input: AuthCredentials): Promise<AuthSession>
+    register(input: AuthCredentials): Promise<AuthSession>
+    logout(): Promise<void>
+  }
   chat: {
     listConversations(): Promise<ConversationSummary[]>
     listMessages(conversationId: string): Promise<ChatMessage[]>

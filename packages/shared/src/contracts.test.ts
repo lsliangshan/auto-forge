@@ -3,12 +3,14 @@ import {
   appErrorCodeSchema,
   appSettingsSchema,
   approvalDecisionSchema,
+  authCredentialsSchema,
   chatBlockSchema,
   chatEventSchema,
   chatSendInputSchema,
   executionEventSchema,
   generationOptionsSchema,
   ipcRequestSchemas,
+  ipcResponseSchemas,
   ipcChannels,
   mediaAssetSchema,
   mediaBlockSchema,
@@ -22,6 +24,30 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('validates local authentication credentials by normalized account and code-point password length', () => {
+    expect(authCredentialsSchema.parse({ account: '  Alice_1  ', password: '密码密码密码密码' }))
+      .toEqual({ account: 'Alice_1', password: '密码密码密码密码' })
+    expect(() => authCredentialsSchema.parse({ account: 'a b', password: 'password' })).toThrow()
+    expect(() => authCredentialsSchema.parse({ account: 'alice', password: 'short' })).toThrow()
+    expect(() => authCredentialsSchema.parse({ account: 'alice', password: 'x'.repeat(73) })).toThrow()
+  })
+
+  it('exposes fixed authentication IPC contracts', () => {
+    expect(ipcChannels.authGetSession).toBe('auth:get-session')
+    expect(ipcRequestSchemas[ipcChannels.authLogin].parse({ account: 'alice', password: 'password' }))
+      .toEqual({ account: 'alice', password: 'password' })
+    expect(ipcResponseSchemas[ipcChannels.authGetSession].parse(null)).toBeNull()
+    expect(ipcResponseSchemas[ipcChannels.authRegister].parse({
+      user: { id: 'user_1', account: 'Alice' },
+      authenticatedAt: '2026-08-07T00:00:00.000Z',
+    })).toMatchObject({ user: { account: 'Alice' } })
+  })
+
+  it.each(['AUTH_REQUIRED', 'AUTH_INVALID_CREDENTIALS', 'AUTH_ACCOUNT_EXISTS'] as const)(
+    'keeps %s as a safe application error',
+    (code) => expect(toSafeAppError({ code })).toMatchObject({ code }),
+  )
+
   it('accepts only fixed model providers with independent defaults', () => {
     const settings = appSettingsSchema.parse({
       theme: 'system',
