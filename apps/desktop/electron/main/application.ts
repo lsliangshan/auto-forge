@@ -24,6 +24,7 @@ import {
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import Ajv, { type AnySchema } from 'ajv'
 import { AgentOrchestrator, createAgentPersistence } from './agent/agent-orchestrator.js'
+import { LocalAuthService } from './auth/local-auth-service.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
@@ -243,6 +244,7 @@ function executionSummary(execution: Execution): ExecutionSummary {
 
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
+  const auth = new LocalAuthService(database.localAuth)
   const maintenance = new MaintenanceGate()
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
   const settings = new SettingsService(database.appSettings, {
@@ -355,7 +357,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (['queued', 'awaiting_approval', 'running'].includes(event.status)) activeExecutions.add(event.executionId)
       else activeExecutions.delete(event.executionId)
     }
-    try { options.emitExecution(event) } catch { /* Renderer events are observational. */ }
+    if (auth.isAuthenticated()) {
+      try { options.emitExecution(event) } catch { /* Renderer events are observational. */ }
+    }
   }
   const executions = new ExecutionService({
     repositories: database,
@@ -383,7 +387,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         occurredAt: new Date().toISOString(),
       })
     }
-    try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
+    if (auth.isAuthenticated()) {
+      try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
+    }
   }
   const conversationContext = createConversationContextManager(database)
   const agent = new AgentOrchestrator({
@@ -471,6 +477,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
 
   let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
+    auth: {
+      getSession: () => auth.getSession(),
+      login: (input) => auth.login(input),
+      register: (input) => auth.register(input),
+      logout: () => auth.logout(),
+      requireSession: () => auth.requireSession(),
+    },
     chat: {
       listConversations: async () => database.conversations.list().map((conversation) => ({
         id: conversation.id,

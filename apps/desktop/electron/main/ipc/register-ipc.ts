@@ -4,6 +4,7 @@ import {
   ipcResponseSchemas,
   toSafeAppError,
   type AppError,
+  type AuthSession,
   type DesktopAPI,
   type MediaAsset,
   type MediaImportContext,
@@ -34,6 +35,9 @@ export interface IpcInvokeEvent {
 }
 
 export interface DesktopIpcServices {
+  auth: DesktopAPI['auth'] & {
+    requireSession(): Promise<AuthSession>
+  }
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
   media: {
     pickFiles(context: MediaImportContext): Promise<MediaAsset[]>

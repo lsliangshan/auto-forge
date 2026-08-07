@@ -203,6 +203,70 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('exposes persistent local authentication through runtime services', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    await expect(runtime.services.auth.getSession()).resolves.toBeNull()
+    await expect(runtime.services.auth.requireSession()).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    const registered = await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    expect(registered.user.account).toBe('Alice')
+    await expect(runtime.services.auth.getSession()).resolves.toEqual(registered)
+    await runtime.services.auth.logout()
+    await expect(runtime.services.auth.getSession()).resolves.toBeNull()
+    await runtime.close()
+  })
+
+  it('forwards chat events only while a local session is authenticated', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-events-'))
+    directories.push(root)
+    const emitChat = vi.fn()
+    const runtime = createApplicationRuntime(options(root, {
+      openRouter: {
+        listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      },
+      emitChat,
+    }))
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const current = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...current.defaultModels, openrouter: { text: 'openrouter/text' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const settleEvents = async () => {
+      for (let index = 0; index < 5; index += 1) {
+        await new Promise<void>((resolve) => { setImmediate(resolve) })
+      }
+    }
+
+    await runtime.services.chat.send(chatInput(conversation.id, 'anonymous'))
+    await settleEvents()
+    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(2)
+    expect(emitChat).not.toHaveBeenCalled()
+
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    const authenticated = await runtime.services.chat.send(chatInput(conversation.id, 'authenticated'))
+    await vi.waitFor(() => expect(emitChat.mock.calls.some(([event]) => (
+      event.type === 'status'
+      && event.requestId === authenticated.requestId
+      && event.status === 'completed'
+    ))).toBe(true))
+
+    await runtime.services.auth.logout()
+    const forwardedCount = emitChat.mock.calls.length
+    await runtime.services.chat.send(chatInput(conversation.id, 'logged out'))
+    await settleEvents()
+    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(6)
+    expect(emitChat).toHaveBeenCalledTimes(forwardedCount)
+    await runtime.close()
+  })
+
   it('initializes the saved proxy before runtime recovery continues', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-proxy-recovery-'))
     directories.push(root)
@@ -708,6 +772,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const settings = await runtime.services.settings.get()
     await runtime.services.settings.update({
