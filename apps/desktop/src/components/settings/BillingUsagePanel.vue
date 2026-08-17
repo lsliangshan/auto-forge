@@ -53,9 +53,18 @@
           统计自 {{ formatMonthStart(usage.monthStartedAt) }}
         </p>
         <dl class="billing-summary">
-          <div><dt>输入 Token</dt><dd>{{ formatTokens(activeUsage.inputTokens) }}</dd></div>
-          <div><dt>输出 Token</dt><dd>{{ formatTokens(activeUsage.outputTokens) }}</dd></div>
-          <div data-testid="billing-summary-total"><dt>总 Token</dt><dd>{{ formatTokens(activeUsage.totalTokens) }}</dd></div>
+          <div>
+            <dt>输入 Token</dt>
+            <dd>{{ formatTokens(activeUsage.inputTokens) }}</dd>
+          </div>
+          <div>
+            <dt>输出 Token</dt>
+            <dd>{{ formatTokens(activeUsage.outputTokens) }}</dd>
+          </div>
+          <div data-testid="billing-summary-total">
+            <dt>总 Token</dt>
+            <dd>{{ formatTokens(activeUsage.totalTokens) }}</dd>
+          </div>
         </dl>
         <p
           v-if="!activeUsage.models.length"
@@ -69,7 +78,20 @@
         >
           <table class="billing-table">
             <thead>
-              <tr><th scope="col">模型</th><th scope="col">输入 Token</th><th scope="col">输出 Token</th><th scope="col">总 Token</th></tr>
+              <tr>
+                <th scope="col">
+                  模型
+                </th>
+                <th scope="col">
+                  输入 Token
+                </th>
+                <th scope="col">
+                  输出 Token
+                </th>
+                <th scope="col">
+                  总 Token
+                </th>
+              </tr>
             </thead>
             <tbody>
               <tr
