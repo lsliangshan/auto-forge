@@ -197,12 +197,16 @@
       <div class="sidebar-toolbar">
         <span class="af-panel-heading">设置</span>
       </div>
-      <a href="#provider">大模型供应商</a>
-      <a href="#model">默认模型</a>
-      <a href="#appearance">外观与行为</a>
-      <a href="#permissions">已保存授权</a>
-      <a href="#data">本地数据</a>
-      <a href="#about">关于 AutoForge</a>
+      <button
+        v-for="section in settingsSections"
+        :key="section.id"
+        class="settings-section-link"
+        type="button"
+        data-testid="settings-section-nav-item"
+        @click="scrollToSettingsSection(section.id)"
+      >
+        {{ section.label }}
+      </button>
     </template>
   </aside>
 </template>
@@ -249,6 +253,20 @@ const executionStatuses: { label: string; value: ExecutionStatus }[] = [
   { label: '执行中', value: 'running' }, { label: '已完成', value: 'completed' },
   { label: '失败', value: 'failed' }, { label: '已取消', value: 'cancelled' }, { label: '已中断', value: 'interrupted' },
 ]
+const settingsSections = [
+  { id: 'provider', label: '大模型供应商' },
+  { id: 'model', label: '默认模型' },
+  { id: 'billing', label: 'Token 账单' },
+  { id: 'proxy', label: 'VPN 代理' },
+  { id: 'appearance', label: '外观与行为' },
+  { id: 'data', label: '本地数据' },
+  { id: 'permissions', label: '已保存授权' },
+  { id: 'about', label: '关于 AutoForge' },
+] as const
+
+function scrollToSettingsSection(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 function applyWorkflowFilters() {
   void workflow.load({
@@ -305,6 +323,6 @@ onMounted(() => {
 .sidebar-state small { color: #8a939f; }.sidebar-error { color: var(--af-danger); font-size: 12px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 11px; font-weight: 650; }
 .native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: white; font-size: 11px; }
-a { border-radius: 5px; padding: 8px 9px; color: var(--af-text); font-size: 13px; text-decoration: none; }
-a:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
+.settings-section-link { width: 100%; border: 0; border-radius: 5px; padding: 8px 9px; color: var(--af-text); background: transparent; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
+.settings-section-link:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 </style>

@@ -879,7 +879,7 @@ describe('workbench', () => {
     })
 
     const { wrapper } = await mountApp('/settings', api)
-    await vi.waitFor(() => expect(wrapper.text()).toContain('Token 账单'))
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="billing-summary-total"]').exists()).toBe(true))
     expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
     expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('1,234')
     expect(wrapper.text()).toContain('month/model')
@@ -905,6 +905,49 @@ describe('workbench', () => {
     await vi.waitFor(() => expect(failingApp.wrapper.get('[data-testid="billing-panel"] [role="alert"]').text())
       .toBe('Token 用量加载失败'))
     expect(failingApp.wrapper.text()).toContain('大模型供应商')
+  })
+
+  it('matches every settings sidebar item to the rendered section order', async () => {
+    const { wrapper } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.find('#about').exists()).toBe(true))
+
+    const menuLabels = wrapper.findAll('[data-testid="settings-section-nav-item"]')
+      .map((item) => item.text())
+    const sectionLabels = wrapper.findAll('.settings-page .settings-section h2')
+      .map((heading) => heading.text())
+
+    expect(menuLabels).toEqual([
+      '大模型供应商',
+      '默认模型',
+      'Token 账单',
+      'VPN 代理',
+      '外观与行为',
+      '本地数据',
+      '已保存授权',
+      '关于 AutoForge',
+    ])
+    expect(menuLabels).toEqual(sectionLabels)
+  })
+
+  it('scrolls to a settings section without leaving the settings route', async () => {
+    const { wrapper, router } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.find('#proxy').exists()).toBe(true))
+    const scrollIntoView = vi.fn()
+    const proxySection = wrapper.get('#proxy').element
+    proxySection.scrollIntoView = scrollIntoView
+    const getElementById = vi.spyOn(document, 'getElementById').mockReturnValue(proxySection)
+
+    try {
+      const proxyButton = wrapper.findAll('[data-testid="settings-section-nav-item"]')
+        .find((item) => item.text() === 'VPN 代理')
+      expect(proxyButton).toBeDefined()
+      await proxyButton?.trigger('click')
+
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' })
+      expect(router.currentRoute.value.fullPath).toBe('/settings')
+    } finally {
+      getElementById.mockRestore()
+    }
   })
 
   it('loads app information and revokes an exact saved permission grant', async () => {
@@ -992,7 +1035,7 @@ describe('workbench', () => {
     }))
     const { wrapper } = await mountApp('/settings', api)
 
-    await vi.waitFor(() => expect(wrapper.text()).toContain('VPN 代理'))
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="http-proxy"]').exists()).toBe(true))
     expect(wrapper.text()).toContain('http_proxy')
     expect(wrapper.text()).toContain('https_proxy')
     expect(wrapper.text()).toContain('socket_proxy')
