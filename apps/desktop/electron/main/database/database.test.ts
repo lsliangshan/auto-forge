@@ -936,7 +936,7 @@ describe('openAppDatabase', () => {
     })
   })
 
-  it('groups token usage trends and excludes the query end point', () => {
+  it('groups token usage trends by local calendar boundaries and excludes the query end point', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_usage_trends', title: 'Usage trends' })
     const local = (year: number, month: number, day: number, hour = 0) => (
@@ -965,6 +965,7 @@ describe('openAppDatabase', () => {
       endedAt: local(2026, 0, 2),
     }
 
+    insert('previous_month', local(2025, 11, 31, 8), 1, 2)
     insert('hour_a', local(2026, 0, 1, 8), 2, 1)
     insert('hour_b', local(2026, 0, 1, 8) + 1_000, 3, 4)
     insert('at_end', query.endedAt, 50, 50)
@@ -974,9 +975,11 @@ describe('openAppDatabase', () => {
       { bucket: '8', inputTokens: 5, outputTokens: 5, totalTokens: 10 },
     ])
     expect(usage.week.trend).toEqual([
+      { bucket: '2025-12-31', inputTokens: 1, outputTokens: 2, totalTokens: 3 },
       { bucket: '2026-01-01', inputTokens: 5, outputTokens: 5, totalTokens: 10 },
     ])
     expect(usage.allTime.trend).toEqual([
+      { bucket: '2025-12', inputTokens: 1, outputTokens: 2, totalTokens: 3 },
       { bucket: '2026-01', inputTokens: 5, outputTokens: 5, totalTokens: 10 },
     ])
   })
