@@ -430,8 +430,45 @@ describe('cross-process contracts', () => {
       month: period('2026-07-31T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 9, 4),
       allTime: period('2026-07-01T01:00:00.000Z', '2026-08-17T04:30:00.000Z', 12, 6),
     }
+    const withTodayTokenCounts = (inputTokens: number, outputTokens: number) => {
+      const totalTokens = inputTokens + outputTokens
+      return {
+        ...snapshot,
+        today: {
+          ...snapshot.today,
+          inputTokens,
+          outputTokens,
+          totalTokens,
+          models: [{ ...snapshot.today.models[0], inputTokens, outputTokens, totalTokens }],
+          trend: [{ ...snapshot.today.trend[0], inputTokens, outputTokens, totalTokens }],
+        },
+      }
+    }
 
     expect(tokenUsageSnapshotSchema.parse(snapshot)).toEqual(snapshot)
+    for (const [description, inputTokens, outputTokens] of [
+      ['negative token count', -1, 3],
+      ['fractional token count', 1.5, 3],
+      ['unsafe token count', Number.MAX_SAFE_INTEGER + 1, 0],
+    ] as const) {
+      expect(() => tokenUsageSnapshotSchema.parse(withTodayTokenCounts(inputTokens, outputTokens)), description)
+        .toThrow()
+    }
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      generatedAt: 'not-a-timestamp',
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: { ...snapshot.today, startedAt: 'not-a-timestamp' },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        trend: [{ ...snapshot.today.trend[0], startedAt: 'not-a-timestamp' }],
+      },
+    })).toThrow()
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
       today: { ...snapshot.today, startedAt: '2026-08-18T00:00:00.000Z' },
@@ -456,6 +493,16 @@ describe('cross-process contracts', () => {
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
       today: { ...snapshot.today, inputTokens: 8, totalTokens: 11 },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        models: [
+          ...snapshot.today.models,
+          { model: 'alpha/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        ],
+      },
     })).toThrow()
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
