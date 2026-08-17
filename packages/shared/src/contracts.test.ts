@@ -444,6 +444,14 @@ describe('cross-process contracts', () => {
         },
       }
     }
+    const expectTimestampFailure = (value: unknown, path: Array<string | number>) => {
+      const result = tokenUsageSnapshotSchema.safeParse(value)
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path, code: 'invalid_format', format: 'datetime' }),
+      ]))
+    }
 
     expect(tokenUsageSnapshotSchema.parse(snapshot)).toEqual(snapshot)
     for (const [description, inputTokens, outputTokens] of [
@@ -454,21 +462,21 @@ describe('cross-process contracts', () => {
       expect(() => tokenUsageSnapshotSchema.parse(withTodayTokenCounts(inputTokens, outputTokens)), description)
         .toThrow()
     }
-    expect(() => tokenUsageSnapshotSchema.parse({
+    expectTimestampFailure({
       ...snapshot,
       generatedAt: 'not-a-timestamp',
-    })).toThrow()
-    expect(() => tokenUsageSnapshotSchema.parse({
+    }, ['generatedAt'])
+    expectTimestampFailure({
       ...snapshot,
       today: { ...snapshot.today, startedAt: 'not-a-timestamp' },
-    })).toThrow()
-    expect(() => tokenUsageSnapshotSchema.parse({
+    }, ['today', 'startedAt'])
+    expectTimestampFailure({
       ...snapshot,
       today: {
         ...snapshot.today,
         trend: [{ ...snapshot.today.trend[0], startedAt: 'not-a-timestamp' }],
       },
-    })).toThrow()
+    }, ['today', 'trend', 0, 'startedAt'])
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
       today: { ...snapshot.today, startedAt: '2026-08-18T00:00:00.000Z' },
