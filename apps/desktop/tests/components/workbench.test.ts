@@ -908,7 +908,26 @@ describe('workbench', () => {
 
   it('shows the selected range, both charts and keeps the period while refreshing', async () => {
     const api = createApi()
-    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usageSnapshot(10))
+    const usage = usageSnapshot(10)
+    usage.yesterday = {
+      ...usage.yesterday,
+      inputTokens: 1_200,
+      outputTokens: 34,
+      totalTokens: 1_234,
+      models: [{ model: 'precise/model', inputTokens: 1_200, outputTokens: 34, totalTokens: 1_234 }],
+      trend: [{
+        startedAt: usage.yesterday.startedAt,
+        inputTokens: 1_200,
+        outputTokens: 34,
+        totalTokens: 1_234,
+      }],
+    }
+    const refreshedUsage = usageSnapshot(99, 'refreshed/model')
+    let resolveRefresh!: (value: TokenUsageSnapshot) => void
+    const refreshResponse = new Promise<TokenUsageSnapshot>((resolve) => { resolveRefresh = resolve })
+    vi.mocked(api.settings.getTokenUsage)
+      .mockResolvedValueOnce(usage)
+      .mockReturnValueOnce(refreshResponse)
     const { wrapper } = await mountApp('/settings', api)
     await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10'))
 
@@ -917,22 +936,59 @@ describe('workbench', () => {
       year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
     }).format(new Date(Date.parse('2026-08-16T16:00:00.000Z') - 1))
     expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain(expectedYesterdayEnd)
-    expect(wrapper.find('[data-testid="token-usage-line-chart"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="token-usage-bar-chart"]').exists()).toBe(true)
-    expect(wrapper.get('.billing-table').attributes('aria-label')).toBe('模型 Token 精确用量')
-    expect(wrapper.findAll('.billing-table th').every((cell) => cell.attributes('scope') === 'col')).toBe(true)
+
+    const contentOrder = wrapper.findAll('.billing-chart-section, .billing-table-wrap')
+    expect(contentOrder.map((item) => {
+      if (item.find('[data-testid="token-usage-line-chart"]').exists()) return 'line'
+      if (item.find('[data-testid="token-usage-bar-chart"]').exists()) return 'bar'
+      if (item.find('.billing-table').exists()) return 'table'
+      return 'unknown'
+    })).toEqual(['line', 'bar', 'table'])
+
+    const chartSections = wrapper.findAll('.billing-chart-section')
+    expect(chartSections).toHaveLength(2)
+    expect(chartSections.map((section) => {
+      const labelledBy = section.attributes('aria-labelledby')
+      const heading = section.get(`#${labelledBy}`)
+      expect(heading.element.tagName).toBe('H3')
+      return heading.text()
+    })).toEqual(['Token 趋势', '模型用量'])
+
+    const table = wrapper.get('.billing-table')
+    expect(table.attributes('aria-label')).toBe('模型 Token 精确用量')
+    const headers = table.findAll('th')
+    expect(headers).toHaveLength(4)
+    expect(headers.map((cell) => cell.text()))
+      .toEqual(['模型', '输入 Token', '输出 Token', '总 Token'])
+    expect(headers.map((cell) => cell.attributes('scope'))).toEqual(['col', 'col', 'col', 'col'])
+    expect(table.get('tbody tr').findAll('td').map((cell) => cell.text()))
+      .toEqual(['precise/model', '1,200', '34', '1,234'])
 
     await wrapper.get('#tab-month').trigger('click')
     expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain('2026')
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10')
 
-    await wrapper.get('[data-testid="billing-refresh"]').trigger('click')
+    const refreshClick = wrapper.get('[data-testid="billing-refresh"]').trigger('click')
     await vi.waitFor(() => expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(2))
+    expect(wrapper.get('#tab-month').attributes('aria-selected')).toBe('true')
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10')
+
+    resolveRefresh(refreshedUsage)
+    await refreshClick
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('99'))
     expect(wrapper.get('#tab-month').attributes('aria-selected')).toBe('true')
   })
 
   it('shows zero cards and one empty state instead of charts and table', async () => {
     const api = createApi()
-    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usageSnapshot(0))
+    const usage = usageSnapshot(0)
+    usage.today.trend = [{
+      startedAt: usage.today.startedAt,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    }]
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usage)
     const { wrapper } = await mountApp('/settings', api)
     await vi.waitFor(() => expect(wrapper.text()).toContain('暂无 Token 用量记录'))
     expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('0')
