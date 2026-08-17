@@ -870,7 +870,7 @@ describe('openAppDatabase', () => {
     expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
   })
 
-  it('summarizes retained token usage by model for the current month and all time', () => {
+  it('summarizes retained token usage by model across five periods', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
     const insert = (
@@ -891,40 +891,94 @@ describe('openAppDatabase', () => {
       ...(outputTokens === undefined ? {} : { outputTokens }),
     })
 
-    insert('before_alpha', 'alpha/model', 'completed', 99, 10, 5)
-    insert('month_alpha', 'alpha/model', 'failed', 100, 7)
-    insert('month_beta', 'beta/model', 'cancelled', 101, undefined, 9)
-    insert('month_zero', 'zero/model', 'completed', 102, 0, 0)
-    insert('ignored', 'ignored/model', 'completed', 103)
+    const query = {
+      yesterdayStartedAt: 100,
+      todayStartedAt: 200,
+      weekStartedAt: 180,
+      monthStartedAt: 50,
+      endedAt: 300,
+    }
 
-    expect(database.chatRuns.summarizeTokenUsage(100)).toEqual({
-      month: {
-        inputTokens: 7,
-        outputTokens: 9,
-        totalTokens: 16,
-        models: [
-          { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
-          { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
-          { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-        ],
-      },
-      allTime: {
-        inputTokens: 17,
-        outputTokens: 14,
-        totalTokens: 31,
-        models: [
-          { model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22 },
-          { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
-          { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-        ],
-      },
+    insert('before_month', 'alpha/model', 'completed', 49, 10, 5)
+    insert('yesterday', 'alpha/model', 'failed', 100, 7)
+    insert('today', 'beta/model', 'cancelled', 200, undefined, 9)
+    insert('today_zero', 'zero/model', 'completed', 201, 0, 0)
+    insert('at_end', 'ignored/model', 'completed', 300, 99, 99)
+    insert('no_usage', 'ignored/model', 'completed', 250)
+
+    const usage = database.chatRuns.summarizeTokenUsage(query)
+    expect(usage.allTimeStartedAt).toBe(49)
+    expect(usage.today.models).toEqual([
+      { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+      { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    ])
+    expect(usage.yesterday.models).toEqual([
+      { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+    ])
+    expect(usage.week.models).toEqual(usage.today.models)
+    expect(usage.month.models).toEqual([
+      { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+      { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    ])
+    expect(usage.allTime.models[0]).toEqual({
+      model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22,
     })
+    expect(usage.allTime.models.some(({ model }) => model === 'ignored/model')).toBe(false)
 
     database.clearLocalData('conversations')
-    expect(database.chatRuns.summarizeTokenUsage(100)).toEqual({
-      month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+    expect(database.chatRuns.summarizeTokenUsage(query)).toEqual({
+      today: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
+      yesterday: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
+      week: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
+      month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
+      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
     })
+  })
+
+  it('groups token usage trends and excludes the query end point', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_usage_trends', title: 'Usage trends' })
+    const local = (year: number, month: number, day: number, hour = 0) => (
+      new Date(year, month, day, hour).getTime()
+    )
+    const insert = (
+      id: string,
+      startedAt: number,
+      inputTokens: number,
+      outputTokens: number,
+    ) => database.chatRuns.insert({
+      id,
+      conversationId: 'conversation_usage_trends',
+      requestId: `request_${id}`,
+      model: 'alpha/model',
+      status: 'completed',
+      startedAt,
+      inputTokens,
+      outputTokens,
+    })
+    const query = {
+      yesterdayStartedAt: local(2025, 11, 31),
+      todayStartedAt: local(2026, 0, 1),
+      weekStartedAt: local(2025, 11, 29),
+      monthStartedAt: local(2026, 0, 1),
+      endedAt: local(2026, 0, 2),
+    }
+
+    insert('hour_a', local(2026, 0, 1, 8), 2, 1)
+    insert('hour_b', local(2026, 0, 1, 8) + 1_000, 3, 4)
+    insert('at_end', query.endedAt, 50, 50)
+
+    const usage = database.chatRuns.summarizeTokenUsage(query)
+    expect(usage.today.trend).toEqual([
+      { bucket: '8', inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+    ])
+    expect(usage.week.trend).toEqual([
+      { bucket: '2026-01-01', inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+    ])
+    expect(usage.allTime.trend).toEqual([
+      { bucket: '2026-01', inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+    ])
   })
 
   it('atomically claims generated media, replaces its stable block, and finalizes the chat run', () => {
