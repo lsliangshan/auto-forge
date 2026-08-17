@@ -34,7 +34,7 @@
 - Consumes: `SettingsView.vue` 和 `BillingUsagePanel.vue` 已存在的元素 ID：`provider`、`model`、`billing`、`proxy`、`appearance`、`data`、`permissions`、`about`。
 - Produces: `settingsSections: readonly { id: string; label: string }[]` 和 `scrollToSettingsSection(id: string): void`，供 `ContextSidebar.vue` 模板生成按钮并处理点击。
 
-- [ ] **Step 1: 编写菜单一一对应的失败测试**
+- [x] **Step 1: 编写菜单一一对应的失败测试**
 
 在 `workbench` 测试组中加入：
 
@@ -62,7 +62,7 @@ it('matches every settings sidebar item to the rendered section order', async ()
 })
 ```
 
-- [ ] **Step 2: 运行测试并确认因菜单按钮尚不存在而失败**
+- [x] **Step 2: 运行测试并确认因菜单按钮尚不存在而失败**
 
 Run:
 
@@ -72,7 +72,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: FAIL；`menuLabels` 为 `[]`，与八项期望不一致。
 
-- [ ] **Step 3: 编写滚动且不导航的失败测试**
+- [x] **Step 3: 编写滚动且不导航的失败测试**
 
 在同一测试组中加入：
 
@@ -93,7 +93,7 @@ it('scrolls to a settings section without leaving the settings route', async () 
 })
 ```
 
-- [ ] **Step 4: 运行测试并确认因设置菜单按钮尚不存在而失败**
+- [x] **Step 4: 运行测试并确认因设置菜单按钮尚不存在而失败**
 
 Run:
 
@@ -103,7 +103,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: FAIL；找不到文本为“VPN 代理”的 `settings-section-nav-item`，滚动函数未被调用。
 
-- [ ] **Step 5: 实现静态映射和最小滚动函数**
+- [x] **Step 5: 实现静态映射和最小滚动函数**
 
 在 `ContextSidebar.vue` 的设置模板中用按钮替换六个锚点：
 
@@ -146,7 +146,7 @@ function scrollToSettingsSection(id: string) {
 .settings-section-link:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 ```
 
-- [ ] **Step 6: 运行两个针对性测试并确认通过**
+- [x] **Step 6: 运行两个针对性测试并确认通过**
 
 Run:
 
@@ -156,7 +156,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: PASS；2 tests passed。
 
-- [ ] **Step 7: 运行工作台组件测试和桌面端类型检查**
+- [x] **Step 7: 运行工作台组件测试和桌面端类型检查**
 
 Run:
 
@@ -168,7 +168,7 @@ git diff --check
 
 Expected: 所有命令退出码为 0；组件测试无失败，类型检查无错误，差异无空白问题。
 
-- [ ] **Step 8: 核对范围并提交实现**
+- [x] **Step 8: 核对范围并提交实现**
 
 Run:
 
