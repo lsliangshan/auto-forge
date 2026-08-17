@@ -348,6 +348,84 @@ describe('chat interactions', () => {
     await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
   })
 
+  it('renders common Markdown as semantic chat content', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message_1:block_text',
+        type: 'text',
+        text: '# 标题\n\n**重点**\n\n- 第一项\n- 第二项\n\n使用 `pnpm test`',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('h1').text()).toBe('标题')
+    expect(wrapper.get('strong').text()).toBe('重点')
+    expect(wrapper.findAll('li').map((item) => item.text())).toEqual(['第一项', '第二项'])
+    expect(wrapper.get('p code').text()).toBe('pnpm test')
+  })
+
+  it('escapes raw HTML instead of creating live chat elements', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message_1:block_text',
+        type: 'text',
+        text: '<script>window.compromised = true</script>\n\n<img src=x onerror="window.compromised = true">',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('script').exists()).toBe(false)
+    expect(wrapper.find('img').exists()).toBe(false)
+    expect(wrapper.text()).toContain('<script>window.compromised = true</script>')
+    expect(wrapper.text()).toContain('<img src=x onerror="window.compromised = true">')
+  })
+
+  it('renders an unknown fenced language as escaped plain code', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message_1:block_text',
+        type: 'text',
+        text: '```unknownlang\n<unsafe>& value\n```',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const code = wrapper.get('pre code')
+    expect(code.classes()).toContain('language-unknownlang')
+    expect(code.element.textContent).toBe('<unsafe>& value\n')
+    expect(code.find('unsafe').exists()).toBe(false)
+  })
+
+  it('renders and highlights a fenced TypeScript code block', () => {
+    const source = [
+      '```ts',
+      '// singleton.ts',
+      'class MyService {',
+      '  public doWork(): void {',
+      '    console.log("Working...");',
+      '  }',
+      '}',
+      'export const myService = new MyService();',
+      '```',
+    ].join('\n')
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message_1:block_text',
+        type: 'text',
+        text: source,
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const code = wrapper.get('pre code')
+    expect(code.classes()).toContain('hljs')
+    expect(code.classes()).toContain('language-ts')
+    expect(code.find('.hljs-keyword').exists()).toBe(true)
+    expect(code.element.textContent).toContain('  public doWork(): void {')
+    expect(code.element.textContent).toContain('    console.log("Working...");')
+    expect(wrapper.text()).not.toContain('```ts')
+  })
+
   it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
     const wrapper = mount(MessageBlock, {
       props: {
