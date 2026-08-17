@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
-import type { AppSettings, DesktopAPI, ModelInfo } from '@autoforge/shared'
+import type { AppSettings, DesktopAPI, ModelInfo, TokenUsageSnapshot } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { routes } from '../../src/router/index'
@@ -29,6 +29,28 @@ function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']
       ...(outputs.includes('video') ? {
         video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false },
       } : {}),
+    },
+  }
+}
+
+function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSnapshot {
+  return {
+    monthStartedAt: '2026-08-01T00:00:00.000Z',
+    month: {
+      inputTokens: totalTokens,
+      outputTokens: 0,
+      totalTokens,
+      models: totalTokens === 0
+        ? []
+        : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
+    },
+    allTime: {
+      inputTokens: totalTokens,
+      outputTokens: 0,
+      totalTokens,
+      models: totalTokens === 0
+        ? []
+        : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
     },
   }
 }
@@ -800,6 +822,42 @@ describe('workbench', () => {
     expect(executions.items).toEqual([])
     expect(api.settings.clearLocalData).toHaveBeenCalledWith('all')
     expect(api.workflows.list).toHaveBeenCalled()
+    expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps only the newest token usage response and isolates billing errors', async () => {
+    const api = createApi()
+    let resolveFirst!: (value: TokenUsageSnapshot) => void
+    vi.mocked(api.settings.getTokenUsage)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+      .mockResolvedValueOnce(usageSnapshot(20, 'new/model'))
+      .mockRejectedValueOnce(new Error('billing unavailable'))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+
+    const first = store.loadTokenUsage()
+    await store.loadTokenUsage()
+    resolveFirst(usageSnapshot(10, 'old/model'))
+    await first
+    expect(store.tokenUsage?.allTime.models[0]?.model).toBe('new/model')
+
+    await store.loadTokenUsage()
+    expect(store.tokenUsageError).toBe('Token 用量加载失败')
+    expect(store.error).toBe('')
+    expect(store.tokenUsage?.allTime.totalTokens).toBe(20)
+  })
+
+  it('refreshes token usage after clearing conversations but not executions', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useSettingsStore()
+
+    await store.clearLocalData('conversations')
+    expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
+
+    vi.mocked(api.settings.getTokenUsage).mockClear()
+    await store.clearLocalData('executions')
+    expect(api.settings.getTokenUsage).not.toHaveBeenCalled()
   })
 
   it('loads app information and revokes an exact saved permission grant', async () => {

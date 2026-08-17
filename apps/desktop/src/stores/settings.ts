@@ -7,6 +7,7 @@ import type {
   ModelProviderId,
   PermissionGrant,
   ProviderCredentialStatus,
+  TokenUsageSnapshot,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
@@ -56,11 +57,15 @@ export const useSettingsStore = defineStore('settings', {
     } as Record<ModelProviderId, ModelInfo[]>,
     grants: [] as PermissionGrant[],
     appInfo: undefined as AppInfo | undefined,
+    tokenUsage: undefined as TokenUsageSnapshot | undefined,
     loading: false,
     modelsLoading: false,
+    tokenUsageLoading: false,
     saving: false,
     error: '',
+    tokenUsageError: '',
     _loadVersion: 0,
+    _tokenUsageVersion: 0,
     _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
     _modelVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
   }),
@@ -92,6 +97,21 @@ export const useSettingsStore = defineStore('settings', {
     },
   },
   actions: {
+    async loadTokenUsage() {
+      const version = ++this._tokenUsageVersion
+      this.tokenUsageLoading = true
+      this.tokenUsageError = ''
+      try {
+        const usage = await getDesktopApi().settings.getTokenUsage()
+        if (version === this._tokenUsageVersion) this.tokenUsage = usage
+      } catch (error) {
+        if (version === this._tokenUsageVersion) {
+          this.tokenUsageError = displayError(error, 'Token 用量加载失败')
+        }
+      } finally {
+        if (version === this._tokenUsageVersion) this.tokenUsageLoading = false
+      }
+    },
     async load() {
       const version = ++this._loadVersion
       this.loading = true
@@ -255,7 +275,11 @@ export const useSettingsStore = defineStore('settings', {
         await getDesktopApi().settings.clearLocalData(scope)
         if (scope === 'conversations' || scope === 'all') useChatStore().resetLocalData()
         if (scope === 'executions' || scope === 'all') useExecutionStore().resetLocalData()
-        if (scope === 'all') await Promise.all([useWorkflowStore().load(), this.load()])
+        if (scope === 'all') {
+          await Promise.all([useWorkflowStore().load(), this.load(), this.loadTokenUsage()])
+        } else if (scope === 'conversations') {
+          await this.loadTokenUsage()
+        }
       } catch (error) {
         this.error = displayError(error, '本地数据清理失败')
         throw error
