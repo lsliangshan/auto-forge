@@ -1,11 +1,12 @@
 <template>
   <div class="message-block">
-    <!-- eslint-disable-next-line vue/no-v-html -->
+    <!-- eslint-disable vue/no-v-html -->
     <div
       v-if="block.type === 'text'"
       class="message-markdown"
       v-html="renderMarkdown(block.text)"
     />
+    <!-- eslint-enable vue/no-v-html -->
     <div
       v-else-if="block.type === 'reasoning_status'"
       class="reasoning"
