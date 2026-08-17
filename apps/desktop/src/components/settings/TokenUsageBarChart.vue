@@ -1,5 +1,9 @@
 <template>
-  <div ref="element" class="token-chart" data-testid="token-usage-bar-chart" />
+  <div
+    ref="element"
+    class="token-chart"
+    data-testid="token-usage-bar-chart"
+  />
 </template>
 
 <script setup lang="ts">

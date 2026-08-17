@@ -1,5 +1,6 @@
 import { mount } from '@vue/test-utils'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import TokenUsageBarChart from '../../src/components/settings/TokenUsageBarChart.vue'
 import TokenUsageLineChart from '../../src/components/settings/TokenUsageLineChart.vue'
 import { barChartOption, lineChartOption } from '../../src/components/settings/token-usage-chart-options'
 
@@ -19,6 +20,26 @@ vi.mock('echarts/components', () => ({
   DataZoomComponent: {},
 }))
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }))
+
+function stubResizeObserver() {
+  let resizeCallback!: () => void
+  const observe = vi.fn()
+  const disconnect = vi.fn()
+  vi.stubGlobal('ResizeObserver', class {
+    constructor(callback: () => void) {
+      resizeCallback = callback
+    }
+
+    observe(element: Element) {
+      observe(element)
+    }
+
+    disconnect() {
+      disconnect()
+    }
+  })
+  return { observe, disconnect, resize: () => resizeCallback() }
+}
 
 const period = {
   startedAt: '2026-08-16T16:00:00.000Z',
@@ -41,9 +62,28 @@ describe('token usage chart options', () => {
       { name: '输出 Token', type: 'line', data: [1, 2] },
       { name: '总 Token', type: 'line', data: [3, 7] },
     ])
-    const formatter = (option.tooltip as { formatter: (value: unknown) => string }).formatter
-    expect(formatter([{ dataIndex: 0, seriesName: '输入 Token', value: 2 }]))
-      .toContain('输入 Token: 2')
+    const tooltip = option.tooltip as { renderMode: string; formatter: (value: unknown) => string }
+    expect(tooltip.renderMode).toBe('richText')
+    expect(tooltip.formatter([
+      { dataIndex: 0, seriesName: '输入 Token', value: '2' },
+      { dataIndex: 0, seriesName: '输出 Token', value: 1 },
+      { dataIndex: 0, seriesName: '总 Token', value: 3 },
+    ])).toBe([
+      '2026/8/17 00:00 — 2026/8/17 01:00',
+      '输入 Token: 2',
+      '输出 Token: 1',
+      '总 Token: 3',
+    ].join('\n'))
+    expect(tooltip.formatter([
+      { dataIndex: 1, seriesName: '输入 Token', value: 5 },
+      { dataIndex: 1, seriesName: '输出 Token', value: 2 },
+      { dataIndex: 1, seriesName: '总 Token', value: 7 },
+    ])).toBe([
+      '2026/8/17 01:00 — 2026/8/17 12:00',
+      '输入 Token: 5',
+      '输出 Token: 2',
+      '总 Token: 7',
+    ].join('\n'))
 
     const longTrend = Array.from({ length: 13 }, (_, index) => ({
       startedAt: new Date(2025, index, 1).toISOString(),
@@ -52,11 +92,13 @@ describe('token usage chart options', () => {
       totalTokens: 0,
     }))
     expect(lineChartOption({ ...period, trend: longTrend }, 'allTime').dataZoom).toHaveLength(2)
+    expect(lineChartOption({ ...period, trend: longTrend.slice(0, 12) }, 'allTime').dataZoom)
+      .toHaveLength(0)
   })
 
   it('builds stacked model bars and enables zoom after eight models', () => {
     const models = Array.from({ length: 9 }, (_, index) => ({
-      model: `model/${index}`,
+      model: index === 0 ? 'provider/very-long-model-identifier' : `model/${index}`,
       inputTokens: index + 1,
       outputTokens: index,
       totalTokens: index * 2 + 1,
@@ -67,36 +109,51 @@ describe('token usage chart options', () => {
       { name: '输出 Token', type: 'bar', stack: 'tokens' },
     ])
     expect(option.dataZoom).toHaveLength(2)
-    const formatter = (option.tooltip as { formatter: (value: unknown) => string }).formatter
-    expect(formatter([{ dataIndex: 0 }])).toContain('model/0')
+    expect(barChartOption(models.slice(0, 8)).dataZoom).toHaveLength(0)
+    const tooltip = option.tooltip as { renderMode: string; formatter: (value: unknown) => string }
+    expect(tooltip.renderMode).toBe('richText')
+    expect(tooltip.formatter([{ dataIndex: 0 }])).toBe([
+      'provider/very-long-model-identifier',
+      '输入 Token: 1',
+      '输出 Token: 0',
+      '总 Token: 1',
+    ].join('\n'))
   })
 })
 
 describe('token usage chart lifecycle', () => {
-  it('updates, resizes and disposes a line chart instance', async () => {
-    let resizeCallback!: () => void
-    const disconnect = vi.fn()
-    vi.stubGlobal('ResizeObserver', class {
-      constructor(callback: () => void) {
-        resizeCallback = callback
-      }
+  beforeEach(() => vi.clearAllMocks())
+  afterEach(() => vi.unstubAllGlobals())
 
-      observe() {}
-      disconnect() {
-        disconnect()
-      }
-    })
+  it('updates, resizes and disposes a line chart instance', async () => {
+    const observer = stubResizeObserver()
 
     const wrapper = mount(TokenUsageLineChart, { props: { period, periodKey: 'today' } })
     expect(init).toHaveBeenCalledTimes(1)
-    expect(chart.setOption).toHaveBeenCalledTimes(1)
-    resizeCallback()
+    expect(observer.observe).toHaveBeenCalledWith(
+      wrapper.get('[data-testid="token-usage-line-chart"]').element,
+    )
+    expect(chart.setOption).toHaveBeenNthCalledWith(1, expect.any(Object), { notMerge: true })
+    observer.resize()
     expect(chart.resize).toHaveBeenCalledTimes(1)
     await wrapper.setProps({ periodKey: 'month' })
-    expect(chart.setOption).toHaveBeenCalledTimes(2)
+    expect(chart.setOption).toHaveBeenNthCalledWith(2, expect.any(Object), { notMerge: true })
     wrapper.unmount()
-    expect(disconnect).toHaveBeenCalledTimes(1)
+    expect(observer.disconnect).toHaveBeenCalledTimes(1)
     expect(chart.dispose).toHaveBeenCalledTimes(1)
-    vi.unstubAllGlobals()
+  })
+
+  it('initializes and disposes a bar chart instance', () => {
+    const observer = stubResizeObserver()
+
+    const wrapper = mount(TokenUsageBarChart, { props: { models: period.models } })
+    expect(init).toHaveBeenCalledTimes(1)
+    expect(observer.observe).toHaveBeenCalledWith(
+      wrapper.get('[data-testid="token-usage-bar-chart"]').element,
+    )
+    expect(chart.setOption).toHaveBeenCalledWith(expect.any(Object), { notMerge: true })
+    wrapper.unmount()
+    expect(observer.disconnect).toHaveBeenCalledTimes(1)
+    expect(chart.dispose).toHaveBeenCalledTimes(1)
   })
 })
