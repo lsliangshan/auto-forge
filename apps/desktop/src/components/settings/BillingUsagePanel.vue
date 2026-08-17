@@ -54,23 +54,44 @@
           <div
             data-testid="billing-summary-input"
           >
-            <dt>输入 Token</dt>
-            <dd :style="{ color: tokenColors.input }">
+            <dt>
+              <span
+                class="billing-summary-marker"
+                aria-hidden="true"
+                :style="{ backgroundColor: tokenColors.input }"
+              />
+              输入 Token
+            </dt>
+            <dd :style="{ color: tokenColors.total }">
               {{ formatTokens(activeUsage.inputTokens) }}
             </dd>
           </div>
           <div
             data-testid="billing-summary-output"
           >
-            <dt>输出 Token</dt>
-            <dd :style="{ color: tokenColors.output }">
+            <dt>
+              <span
+                class="billing-summary-marker"
+                aria-hidden="true"
+                :style="{ backgroundColor: tokenColors.output }"
+              />
+              输出 Token
+            </dt>
+            <dd :style="{ color: tokenColors.total }">
               {{ formatTokens(activeUsage.outputTokens) }}
             </dd>
           </div>
           <div
             data-testid="billing-summary-total"
           >
-            <dt>总 Token</dt>
+            <dt>
+              <span
+                class="billing-summary-marker"
+                aria-hidden="true"
+                :style="{ backgroundColor: tokenColors.total }"
+              />
+              总 Token
+            </dt>
             <dd :style="{ color: tokenColors.total }">
               {{ formatTokens(activeUsage.totalTokens) }}
             </dd>
@@ -270,8 +291,18 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 }
 
 .billing-summary dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--af-text-muted);
   font-size: 12px;
+}
+
+.billing-summary-marker {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
 }
 
 .billing-summary dd {

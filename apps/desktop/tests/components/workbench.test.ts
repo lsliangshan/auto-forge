@@ -916,12 +916,17 @@ describe('workbench', () => {
     expect(wrapper.text()).toContain('today/model')
     document.body.append(wrapper.element)
     try {
-      expect(getComputedStyle(wrapper.get('[data-testid="billing-summary-input"] dd').element).color)
-        .toBe(computedColor(tokenColors.input))
-      expect(getComputedStyle(wrapper.get('[data-testid="billing-summary-output"] dd').element).color)
-        .toBe(computedColor(tokenColors.output))
-      expect(getComputedStyle(wrapper.get('[data-testid="billing-summary-total"] dd').element).color)
-        .toBe(computedColor(tokenColors.total))
+      for (const [testId, markerColor] of [
+        ['billing-summary-input', tokenColors.input],
+        ['billing-summary-output', tokenColors.output],
+        ['billing-summary-total', tokenColors.total],
+      ] as const) {
+        const card = wrapper.get(`[data-testid="${testId}"]`)
+        const marker = card.get('.billing-summary-marker')
+        expect(marker.attributes('aria-hidden')).toBe('true')
+        expect(getComputedStyle(marker.element).backgroundColor).toBe(computedColor(markerColor))
+        expect(getComputedStyle(card.get('dd').element).color).toBe(computedColor(tokenColors.total))
+      }
     } finally {
       wrapper.element.remove()
     }
