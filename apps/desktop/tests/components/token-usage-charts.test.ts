@@ -74,6 +74,7 @@ describe('token usage chart options', () => {
       { name: '输出 Token', type: 'line', data: [1, 2] },
       { name: '总 Token', type: 'line', data: [3, 7] },
     ])
+    expect(option.legend).toMatchObject({ top: 8 })
     const tooltip = option.tooltip as { renderMode: string; formatter: (value: unknown) => string }
     expect(tooltip.renderMode).toBe('richText')
     expect(tooltip.formatter([
@@ -120,6 +121,7 @@ describe('token usage chart options', () => {
       { name: '输入 Token', type: 'bar', stack: 'tokens' },
       { name: '输出 Token', type: 'bar', stack: 'tokens' },
     ])
+    expect(option.legend).toMatchObject({ top: 8 })
     expect(option.dataZoom).toHaveLength(2)
     expect(barChartOption(models.slice(0, 8)).dataZoom).toHaveLength(0)
     const tooltip = option.tooltip as { renderMode: string; formatter: (value: unknown) => string }

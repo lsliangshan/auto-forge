@@ -56,7 +56,7 @@ export function lineChartOption(
         ].join('\n')
       },
     },
-    legend: { data: ['输入 Token', '输出 Token', '总 Token'] },
+    legend: { data: ['输入 Token', '输出 Token', '总 Token'], top: 8 },
     grid: { left: 16, right: 18, top: 48, bottom: zoom ? 76 : 32, containLabel: true },
     xAxis: { type: 'category', boundaryGap: false, data: labels },
     yAxis: { type: 'value', minInterval: 1 },
@@ -111,7 +111,7 @@ export function barChartOption(models: ModelTokenUsage[]): EChartsCoreOption {
         ].join('\n')
       },
     },
-    legend: { data: ['输入 Token', '输出 Token'] },
+    legend: { data: ['输入 Token', '输出 Token'], top: 8 },
     grid: { left: 16, right: 18, top: 48, bottom: zoom ? 76 : 48, containLabel: true },
     xAxis: {
       type: 'category',
