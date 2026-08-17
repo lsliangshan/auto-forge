@@ -138,6 +138,13 @@
         </div>
       </section>
 
+      <BillingUsagePanel
+        :usage="settings.tokenUsage"
+        :loading="settings.tokenUsageLoading"
+        :error="settings.tokenUsageError"
+        @refresh="settings.loadTokenUsage"
+      />
+
       <section
         id="proxy"
         class="settings-section"
@@ -316,6 +323,7 @@ import {
 } from '@autoforge/shared'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import BillingUsagePanel from '../components/settings/BillingUsagePanel.vue'
 import { useSettingsStore } from '../stores/settings'
 
 const settings = useSettingsStore()
@@ -395,7 +403,10 @@ watch(() => settings.settings?.proxy, (proxy) => {
 }, { immediate: true, deep: true })
 
 onMounted(async () => {
-  if (!settings.settings && !settings.loading) await settings.load()
+  await Promise.all([
+    !settings.settings && !settings.loading ? settings.load() : Promise.resolve(),
+    settings.loadTokenUsage(),
+  ])
 })
 async function changeProvider(provider: ModelProviderId) {
   const previous = settings.activeProvider

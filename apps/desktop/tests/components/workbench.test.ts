@@ -860,6 +860,53 @@ describe('workbench', () => {
     expect(api.settings.getTokenUsage).not.toHaveBeenCalled()
   })
 
+  it('renders monthly and all-time token usage and refreshes it from settings', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue({
+      monthStartedAt: '2026-08-01T00:00:00.000Z',
+      month: {
+        inputTokens: 1_200,
+        outputTokens: 34,
+        totalTokens: 1_234,
+        models: [{ model: 'month/model', inputTokens: 1_200, outputTokens: 34, totalTokens: 1_234 }],
+      },
+      allTime: {
+        inputTokens: 50_000,
+        outputTokens: 6_789,
+        totalTokens: 56_789,
+        models: [{ model: 'all/model', inputTokens: 50_000, outputTokens: 6_789, totalTokens: 56_789 }],
+      },
+    })
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('Token 账单'))
+    expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('1,234')
+    expect(wrapper.text()).toContain('month/model')
+
+    await wrapper.get('#tab-allTime').trigger('click')
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('56,789')
+    expect(wrapper.text()).toContain('all/model')
+
+    await wrapper.get('[data-testid="billing-refresh"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(2))
+  })
+
+  it('shows token usage empty and isolated error states', async () => {
+    const emptyApi = createApi()
+    vi.mocked(emptyApi.settings.getTokenUsage).mockResolvedValue(usageSnapshot(0))
+    const emptyApp = await mountApp('/settings', emptyApi)
+    await vi.waitFor(() => expect(emptyApp.wrapper.text()).toContain('暂无 Token 用量记录'))
+    emptyApp.wrapper.unmount()
+
+    const failingApi = createApi()
+    vi.mocked(failingApi.settings.getTokenUsage).mockRejectedValue(new Error('billing unavailable'))
+    const failingApp = await mountApp('/settings', failingApi)
+    await vi.waitFor(() => expect(failingApp.wrapper.get('[data-testid="billing-panel"] [role="alert"]').text())
+      .toBe('Token 用量加载失败'))
+    expect(failingApp.wrapper.text()).toContain('大模型供应商')
+  })
+
   it('loads app information and revokes an exact saved permission grant', async () => {
     const api = createApi()
     vi.mocked(api.permissions.listGrants).mockResolvedValue([{
