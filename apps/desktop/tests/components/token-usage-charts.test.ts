@@ -21,6 +21,18 @@ vi.mock('echarts/components', () => ({
 }))
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }))
 
+const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+})
+
+function rangeLabel(startedAt: string, endedAt: string) {
+  return `${dateTimeFormatter.format(new Date(startedAt))} — ${dateTimeFormatter.format(new Date(endedAt))}`
+}
+
 function stubResizeObserver() {
   let resizeCallback!: () => void
   const observe = vi.fn()
@@ -69,7 +81,7 @@ describe('token usage chart options', () => {
       { dataIndex: 0, seriesName: '输出 Token', value: 1 },
       { dataIndex: 0, seriesName: '总 Token', value: 3 },
     ])).toBe([
-      '2026/8/17 00:00 — 2026/8/17 01:00',
+      rangeLabel(period.trend[0].startedAt, period.trend[1].startedAt),
       '输入 Token: 2',
       '输出 Token: 1',
       '总 Token: 3',
@@ -79,7 +91,7 @@ describe('token usage chart options', () => {
       { dataIndex: 1, seriesName: '输出 Token', value: 2 },
       { dataIndex: 1, seriesName: '总 Token', value: 7 },
     ])).toBe([
-      '2026/8/17 01:00 — 2026/8/17 12:00',
+      rangeLabel(period.trend[1].startedAt, period.endedAt),
       '输入 Token: 5',
       '输出 Token: 2',
       '总 Token: 7',
@@ -133,10 +145,12 @@ describe('token usage chart lifecycle', () => {
     expect(observer.observe).toHaveBeenCalledWith(
       wrapper.get('[data-testid="token-usage-line-chart"]').element,
     )
+    expect(chart.setOption).toHaveBeenCalledTimes(1)
     expect(chart.setOption).toHaveBeenNthCalledWith(1, expect.any(Object), { notMerge: true })
     observer.resize()
     expect(chart.resize).toHaveBeenCalledTimes(1)
     await wrapper.setProps({ periodKey: 'month' })
+    expect(chart.setOption).toHaveBeenCalledTimes(2)
     expect(chart.setOption).toHaveBeenNthCalledWith(2, expect.any(Object), { notMerge: true })
     wrapper.unmount()
     expect(observer.disconnect).toHaveBeenCalledTimes(1)
@@ -151,6 +165,7 @@ describe('token usage chart lifecycle', () => {
     expect(observer.observe).toHaveBeenCalledWith(
       wrapper.get('[data-testid="token-usage-bar-chart"]').element,
     )
+    expect(chart.setOption).toHaveBeenCalledTimes(1)
     expect(chart.setOption).toHaveBeenCalledWith(expect.any(Object), { notMerge: true })
     wrapper.unmount()
     expect(observer.disconnect).toHaveBeenCalledTimes(1)
