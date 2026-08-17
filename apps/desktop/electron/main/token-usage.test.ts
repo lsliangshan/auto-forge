@@ -124,6 +124,60 @@ describe('createTokenUsageSnapshot', () => {
     }
   })
 
+  it('keeps both elapsed buckets for the repeated daylight-saving hour', () => {
+    const previous = process.env.TZ
+    process.env.TZ = 'America/New_York'
+    try {
+      const yesterdayStartedAt = new Date(2026, 10, 1).getTime()
+      const endedAt = new Date(2026, 10, 2).getTime()
+      const snapshot = createTokenUsageSnapshot(new Date(endedAt), () => ({
+        today: zeroRecord(),
+        yesterday: {
+          inputTokens: 9,
+          outputTokens: 14,
+          totalTokens: 23,
+          models: [
+            { model: 'alpha/model', inputTokens: 9, outputTokens: 14, totalTokens: 23 },
+          ],
+          trend: [
+            { bucket: '1', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+            { bucket: '2', inputTokens: 7, outputTokens: 11, totalTokens: 18 },
+          ],
+        },
+        week: zeroRecord(),
+        month: zeroRecord(),
+        allTime: zeroRecord(),
+      }))
+
+      expect(snapshot.yesterday.trend).toHaveLength(25)
+      expect(snapshot.yesterday.trend.slice(1, 3)).toEqual([
+        {
+          startedAt: new Date(yesterdayStartedAt + 3_600_000).toISOString(),
+          inputTokens: 2,
+          outputTokens: 3,
+          totalTokens: 5,
+        },
+        {
+          startedAt: new Date(yesterdayStartedAt + 7_200_000).toISOString(),
+          inputTokens: 7,
+          outputTokens: 11,
+          totalTokens: 18,
+        },
+      ])
+      expect(Date.parse(snapshot.yesterday.trend[2]!.startedAt)
+        - Date.parse(snapshot.yesterday.trend[1]!.startedAt)).toBe(3_600_000)
+      expect(snapshot.yesterday.trend.reduce((sum, point) => sum + point.inputTokens, 0))
+        .toBe(snapshot.yesterday.inputTokens)
+      expect(snapshot.yesterday.trend.reduce((sum, point) => sum + point.outputTokens, 0))
+        .toBe(snapshot.yesterday.outputTokens)
+      expect(snapshot.yesterday.trend.reduce((sum, point) => sum + point.totalTokens, 0))
+        .toBe(snapshot.yesterday.totalTokens)
+    } finally {
+      if (previous === undefined) delete process.env.TZ
+      else process.env.TZ = previous
+    }
+  })
+
   it('excludes the bucket beginning exactly at the period end', () => {
     const now = new Date(2026, 7, 17, 2)
     const todayStartedAt = new Date(2026, 7, 17).getTime()
