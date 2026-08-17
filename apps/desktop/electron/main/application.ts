@@ -46,6 +46,7 @@ import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pin
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
+import { createTokenUsageSnapshot } from './token-usage.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
@@ -844,14 +845,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       validateProviderCredential: credentialStatus,
       listProviderModels: (provider) => getModelCatalog(provider),
-      getTokenUsage: async () => {
-        const current = new Date()
-        const monthStartedAt = new Date(current.getFullYear(), current.getMonth(), 1).getTime()
-        return {
-          monthStartedAt: new Date(monthStartedAt).toISOString(),
-          ...database.chatRuns.summarizeTokenUsage(monthStartedAt),
-        }
-      },
+      getTokenUsage: async () => createTokenUsageSnapshot(
+        new Date(),
+        (query) => database.chatRuns.summarizeTokenUsage(query),
+      ),
       clearLocalData: async (scope) => {
         await maintenance.runExclusive(
           () => activeRequests.size > 0

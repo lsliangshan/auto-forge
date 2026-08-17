@@ -22,6 +22,29 @@ const authSession = {
   authenticatedAt: '2026-08-07T00:00:00.000Z',
 }
 
+const emptyUsagePeriod = (startedAt: string, endedAt: string) => ({
+  startedAt,
+  endedAt,
+  inputTokens: 0,
+  outputTokens: 0,
+  totalTokens: 0,
+  models: [],
+  trend: [],
+})
+
+const emptyUsageSnapshot = () => {
+  const generatedAt = '2026-08-17T04:00:00.000Z'
+  const todayStartedAt = '2026-08-16T16:00:00.000Z'
+  return {
+    generatedAt,
+    today: emptyUsagePeriod(todayStartedAt, generatedAt),
+    yesterday: emptyUsagePeriod('2026-08-15T16:00:00.000Z', todayStartedAt),
+    week: emptyUsagePeriod(todayStartedAt, generatedAt),
+    month: emptyUsagePeriod('2026-07-31T16:00:00.000Z', generatedAt),
+    allTime: emptyUsagePeriod(generatedAt, generatedAt),
+  }
+}
+
 function services(): DesktopIpcServices {
   return {
     auth: {
@@ -59,11 +82,7 @@ function services(): DesktopIpcServices {
       clearProviderApiKey: vi.fn(),
       validateProviderCredential: vi.fn(async (provider) => ({ provider, configured: false, validation: 'unchecked' as const })),
       listProviderModels: vi.fn(async () => []),
-      getTokenUsage: vi.fn().mockResolvedValue({
-        monthStartedAt: '2026-08-01T00:00:00.000Z',
-        month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-        allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-      }),
+      getTokenUsage: vi.fn().mockResolvedValue(emptyUsageSnapshot()),
       clearLocalData: vi.fn(),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
@@ -213,6 +232,9 @@ describe('registerDesktopIpc', () => {
     const app = harness()
 
     await expect(app.invoke(ipcChannels.settingsGetTokenUsage)).resolves.toMatchObject({
+      today: { totalTokens: 0 },
+      yesterday: { totalTokens: 0 },
+      week: { totalTokens: 0 },
       month: { totalTokens: 0 },
       allTime: { totalTokens: 0 },
     })
@@ -223,9 +245,8 @@ describe('registerDesktopIpc', () => {
   it('rejects invalid token usage service output', async () => {
     const app = harness()
     vi.mocked(app.dependencies.settings.getTokenUsage).mockResolvedValueOnce({
-      monthStartedAt: '2026-08-01T00:00:00.000Z',
-      month: { inputTokens: 0, outputTokens: 0, totalTokens: 1, models: [] },
-      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+      ...emptyUsageSnapshot(),
+      today: { ...emptyUsageSnapshot().today, totalTokens: 1 },
     } as never)
 
     await expect(app.invoke(ipcChannels.settingsGetTokenUsage))

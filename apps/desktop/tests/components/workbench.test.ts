@@ -33,25 +33,37 @@ function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']
   }
 }
 
-function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSnapshot {
+function usagePeriod(
+  startedAt: string,
+  endedAt: string,
+  totalTokens: number,
+  model = 'alpha/model',
+) {
   return {
-    monthStartedAt: '2026-08-01T00:00:00.000Z',
-    month: {
-      inputTokens: totalTokens,
-      outputTokens: 0,
-      totalTokens,
-      models: totalTokens === 0
-        ? []
-        : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
-    },
-    allTime: {
-      inputTokens: totalTokens,
-      outputTokens: 0,
-      totalTokens,
-      models: totalTokens === 0
-        ? []
-        : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
-    },
+    startedAt,
+    endedAt,
+    inputTokens: totalTokens,
+    outputTokens: 0,
+    totalTokens,
+    models: totalTokens === 0
+      ? []
+      : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
+    trend: totalTokens === 0
+      ? []
+      : [{ startedAt, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
+  }
+}
+
+function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSnapshot {
+  const generatedAt = '2026-08-17T04:00:00.000Z'
+  const todayStartedAt = '2026-08-16T16:00:00.000Z'
+  return {
+    generatedAt,
+    today: usagePeriod(todayStartedAt, generatedAt, totalTokens, model),
+    yesterday: usagePeriod('2026-08-15T16:00:00.000Z', todayStartedAt, totalTokens, model),
+    week: usagePeriod(todayStartedAt, generatedAt, totalTokens, model),
+    month: usagePeriod('2026-07-31T16:00:00.000Z', generatedAt, totalTokens, model),
+    allTime: usagePeriod('2026-07-01T00:00:00.000Z', generatedAt, totalTokens, model),
   }
 }
 
@@ -92,11 +104,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         provider, configured: false, validation: 'unchecked',
       })),
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
-      getTokenUsage: vi.fn().mockResolvedValue({
-        monthStartedAt: '2026-08-01T00:00:00.000Z',
-        month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-        allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-      }),
+      getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
