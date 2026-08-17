@@ -28,6 +28,7 @@
         ref="messagesRef"
         class="messages af-scrollbar"
         aria-live="polite"
+        @scroll="updateScrollFollowing"
       >
         <div
           v-if="chat.error"
@@ -100,15 +101,32 @@ import { useSettingsStore } from '../stores/settings'
 const chat = useChatStore()
 const settings = useSettingsStore()
 const messagesRef = ref<globalThis.HTMLElement>()
+const BOTTOM_FOLLOW_THRESHOLD_PX = 20
+const shouldFollowLatest = ref(true)
 
-async function scrollToLatest() {
+function updateScrollFollowing() {
+  const messages = messagesRef.value
+  if (!messages) return
+  const distanceFromBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight
+  shouldFollowLatest.value = distanceFromBottom <= BOTTOM_FOLLOW_THRESHOLD_PX
+}
+
+async function scrollToLatest(force = false) {
+  if (force) shouldFollowLatest.value = true
   await nextTick()
+  if (!force && !shouldFollowLatest.value) return
   const messages = messagesRef.value
   if (messages) messages.scrollTop = messages.scrollHeight
 }
 
 watch(
-  () => [chat.selectedConversationId, chat.messageVersion] as const,
+  () => chat.selectedConversationId,
+  () => { void scrollToLatest(true) },
+  { flush: 'post' },
+)
+
+watch(
+  () => chat.messageVersion,
   () => { void scrollToLatest() },
   { flush: 'post' },
 )
@@ -142,7 +160,9 @@ async function submit(
   input: Omit<ChatSendInput, 'conversationId'>,
   acknowledge: ChatSendAcknowledgement,
 ) {
-  acknowledge(await chat.send(input))
+  const sending = chat.send(input)
+  void scrollToLatest(true)
+  acknowledge(await sending)
 }
 onMounted(async () => {
   chat.ensureSubscriptions()

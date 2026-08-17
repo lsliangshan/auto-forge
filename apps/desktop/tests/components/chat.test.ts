@@ -112,6 +112,58 @@ function createEventApi() {
   return { api, decide, chatUnsubscribe, executionUnsubscribe, emitChat: (event: ChatEvent) => chatListener?.(event), emitExecution: (event: ExecutionEvent) => executionListener?.(event) }
 }
 
+function mountScrollableChat() {
+  const { api, emitChat } = createEventApi()
+  Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+  const chat = useChatStore()
+  chat.conversations = [
+    {
+      id: 'conversation_1',
+      title: '会话一',
+      createdAt: '2026-07-25T00:00:00.000Z',
+      updatedAt: '2026-07-25T00:00:00.000Z',
+    },
+    {
+      id: 'conversation_2',
+      title: '会话二',
+      createdAt: '2026-07-25T00:00:00.000Z',
+      updatedAt: '2026-07-25T00:00:00.000Z',
+    },
+  ]
+  chat.selectedConversationId = 'conversation_1'
+  chat.preferencesByConversation.conversation_1 = generationPreferences({
+    outputType: 'text',
+    models: { text: 'text/default' },
+  })
+  chat.preferencesByConversation.conversation_2 = generationPreferences({
+    outputType: 'text',
+    models: { text: 'text/default' },
+  })
+  const settings = useSettingsStore()
+  settings.settings = {
+    theme: 'system',
+    language: 'zh-CN',
+    dataDirectory: '/data',
+    logDirectory: '/logs',
+    activeProvider: 'openrouter',
+    defaultModels: {
+      deepseek: { text: 'deepseek-chat' },
+      openrouter: { text: 'text/default' },
+    },
+    showCosts: false,
+    developerMode: false,
+    permissionDefault: 'ask',
+    proxy: { enabled: false, bypassDomains: [] },
+  }
+  expect(() => appSettingsSchema.parse(settings.settings)).not.toThrow()
+  settings.providerModels.openrouter = [modelInfo('text/default', ['text'])]
+  const wrapper = mount(ChatView, { global: { plugins: [ElementPlus] } })
+  const messages = wrapper.get('.messages').element as HTMLElement
+  Object.defineProperty(messages, 'scrollHeight', { configurable: true, value: 900 })
+  Object.defineProperty(messages, 'clientHeight', { configurable: true, value: 400 })
+  return { chat, emitChat, messages, wrapper }
+}
+
 describe('chat interactions', () => {
   beforeEach(() => setActivePinia(createPinia()))
   afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
@@ -240,6 +292,60 @@ describe('chat interactions', () => {
 
     resolveSend({ requestId: 'req_stream' })
     await sending
+  })
+
+  it('preserves manual scroll during AI updates and resumes within 20px of bottom', async () => {
+    const { emitChat, messages, wrapper } = mountScrollableChat()
+    const emitText = (text: string) => emitChat({
+      type: 'block',
+      conversationId: 'conversation_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text },
+    })
+
+    messages.scrollTop = 400
+    await wrapper.get('.messages').trigger('scroll')
+    emitText('第一段')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('第一段'))
+    expect(messages.scrollTop).toBe(400)
+
+    emitText('第二段')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('第一段第二段'))
+    expect(messages.scrollTop).toBe(400)
+
+    messages.scrollTop = 480
+    await wrapper.get('.messages').trigger('scroll')
+    emitText('第三段')
+    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+
+    messages.scrollTop = 481
+    await wrapper.get('.messages').trigger('scroll')
+    emitText('第四段')
+    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
+  })
+
+  it('forces the latest position after a local submit or conversation switch', async () => {
+    const { chat, messages, wrapper } = mountScrollableChat()
+    const acknowledge = vi.fn()
+
+    messages.scrollTop = 400
+    await wrapper.get('.messages').trigger('scroll')
+    wrapper.getComponent(ChatComposer).vm.$emit('submit', {
+      content: '主动发送',
+      assetIds: [],
+      outputType: 'text',
+      generation: generationPreferences().generation,
+      model: 'text/default',
+    }, acknowledge)
+    await vi.waitFor(() => {
+      expect(messages.scrollTop).toBe(900)
+      expect(acknowledge).toHaveBeenCalledWith(true)
+    })
+
+    messages.scrollTop = 400
+    await wrapper.get('.messages').trigger('scroll')
+    chat.selectedConversationId = 'conversation_2'
+    await vi.waitFor(() => expect(messages.scrollTop).toBe(900))
   })
 
   it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
