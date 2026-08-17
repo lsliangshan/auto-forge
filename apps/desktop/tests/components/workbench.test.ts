@@ -950,6 +950,93 @@ describe('workbench', () => {
     }
   })
 
+  it('keeps click selection and accessibility state in sync', async () => {
+    const { wrapper } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.find('#proxy').exists()).toBe(true))
+    const items = wrapper.findAll('[data-testid="settings-section-nav-item"]')
+
+    expect(items[0]?.classes()).toContain('active')
+    expect(items[0]?.attributes('aria-current')).toBe('location')
+
+    const proxySection = wrapper.get('#proxy').element
+    proxySection.scrollIntoView = vi.fn()
+    const getElementById = vi.spyOn(document, 'getElementById').mockReturnValue(proxySection)
+    try {
+      await items[3]?.trigger('click')
+      expect(items[0]?.classes()).not.toContain('active')
+      expect(items[0]?.attributes('aria-current')).toBeUndefined()
+      expect(items[3]?.classes()).toContain('active')
+      expect(items[3]?.attributes('aria-current')).toBe('location')
+    } finally {
+      getElementById.mockRestore()
+    }
+  })
+
+  it('selects the current section while scrolling and the final section at the bottom', async () => {
+    const scrollContainer = document.createElement('div')
+    Object.defineProperties(scrollContainer, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1000 },
+    })
+    scrollContainer.scrollTop = 100
+    scrollContainer.getBoundingClientRect = () => ({ top: 50 } as DOMRect)
+    const tops: Record<string, number> = {
+      provider: 20, model: 40, billing: 100, proxy: 160,
+      appearance: 220, data: 280, permissions: 340, about: 400,
+    }
+    const sectionElements = Object.fromEntries(Object.entries(tops).map(([id]) => {
+      const element = document.createElement('section')
+      element.getBoundingClientRect = () => ({ top: tops[id] } as DOMRect)
+      return [id, element]
+    }))
+    const querySelector = vi.spyOn(document, 'querySelector').mockReturnValue(scrollContainer)
+    const getElementById = vi.spyOn(document, 'getElementById')
+      .mockImplementation((id) => sectionElements[id] ?? null)
+
+    try {
+      const { wrapper } = await mountApp('/settings')
+      await vi.waitFor(() => expect(wrapper.findAll('[data-testid="settings-section-nav-item"]')[1]?.classes())
+        .toContain('active'))
+
+      tops.billing = 70
+      scrollContainer.dispatchEvent(new Event('scroll'))
+      await wrapper.vm.$nextTick()
+      expect(wrapper.findAll('[data-testid="settings-section-nav-item"]')[2]?.classes()).toContain('active')
+
+      scrollContainer.scrollTop = 600
+      scrollContainer.dispatchEvent(new Event('scroll'))
+      await wrapper.vm.$nextTick()
+      expect(wrapper.findAll('[data-testid="settings-section-nav-item"]')[7]?.classes()).toContain('active')
+    } finally {
+      querySelector.mockRestore()
+      getElementById.mockRestore()
+    }
+  })
+
+  it('removes settings scroll listeners on route changes and unmount', async () => {
+    const scrollContainer = document.createElement('div')
+    const addEventListener = vi.spyOn(scrollContainer, 'addEventListener')
+    const removeEventListener = vi.spyOn(scrollContainer, 'removeEventListener')
+    const querySelector = vi.spyOn(document, 'querySelector').mockReturnValue(scrollContainer)
+
+    try {
+      const { wrapper, router } = await mountApp('/settings')
+      await vi.waitFor(() => expect(addEventListener)
+        .toHaveBeenCalledWith('scroll', expect.any(Function), { passive: true }))
+
+      await router.push('/chat')
+      await wrapper.vm.$nextTick()
+      expect(removeEventListener).toHaveBeenCalledWith('scroll', expect.any(Function))
+
+      await router.push('/settings')
+      await vi.waitFor(() => expect(addEventListener).toHaveBeenCalledTimes(2))
+      wrapper.unmount()
+      expect(removeEventListener).toHaveBeenCalledTimes(2)
+    } finally {
+      querySelector.mockRestore()
+    }
+  })
+
   it('loads app information and revokes an exact saved permission grant', async () => {
     const api = createApi()
     vi.mocked(api.permissions.listGrants).mockResolvedValue([{

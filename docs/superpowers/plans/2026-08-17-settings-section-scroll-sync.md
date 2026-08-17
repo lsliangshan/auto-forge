@@ -36,7 +36,7 @@
 - Consumes: `.workspace-content` 滚动容器，以及现有模块 ID `provider`、`model`、`billing`、`proxy`、`appearance`、`data`、`permissions`、`about`。
 - Produces: `SettingsSectionId`、`activeSettingsSection`、`syncActiveSettingsSection()`、`setupSettingsScrollSync()` 和 `detachSettingsScrollSync()`，供组件模板和生命周期使用。
 
-- [ ] **Step 1: 编写初始选中与点击选中的失败测试**
+- [x] **Step 1: 编写初始选中与点击选中的失败测试**
 
 在现有设置导航测试后加入：
 
@@ -64,7 +64,7 @@ it('keeps click selection and accessibility state in sync', async () => {
 })
 ```
 
-- [ ] **Step 2: 运行初始/点击选中测试并确认失败**
+- [x] **Step 2: 运行初始/点击选中测试并确认失败**
 
 Run:
 
@@ -74,7 +74,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: FAIL；第一个按钮尚无 `active` 类和 `aria-current`。
 
-- [ ] **Step 3: 编写手动滚动与底部规则的失败测试**
+- [x] **Step 3: 编写手动滚动与底部规则的失败测试**
 
 加入：
 
@@ -123,7 +123,7 @@ it('selects the current section while scrolling and the final section at the bot
 
 The container top is 50, so the decision line is 74. Initially `model` at 40 is the last section above the line; after moving `billing` to 70 it becomes current. At `scrollTop = 600`, `scrollTop + clientHeight === scrollHeight`, so `about` becomes current.
 
-- [ ] **Step 4: 运行滚动同步测试并确认失败**
+- [x] **Step 4: 运行滚动同步测试并确认失败**
 
 Run:
 
@@ -133,7 +133,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: FAIL；现有组件没有绑定 `.workspace-content` 的滚动监听，也不会更新 `active` 类。
 
-- [ ] **Step 5: 编写监听生命周期的失败测试**
+- [x] **Step 5: 编写监听生命周期的失败测试**
 
 加入：
 
@@ -163,7 +163,7 @@ it('removes settings scroll listeners on route changes and unmount', async () =>
 })
 ```
 
-- [ ] **Step 6: 运行生命周期测试并确认失败**
+- [x] **Step 6: 运行生命周期测试并确认失败**
 
 Run:
 
@@ -173,7 +173,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: FAIL；滚动容器尚未收到 `addEventListener('scroll', ...)`。
 
-- [ ] **Step 7: 实现唯一选中状态和模板语义**
+- [x] **Step 7: 实现唯一选中状态和模板语义**
 
 给菜单按钮增加：
 
@@ -194,7 +194,7 @@ function scrollToSettingsSection(id: SettingsSectionId) {
 }
 ```
 
-- [ ] **Step 8: 实现滚动判定和监听生命周期**
+- [x] **Step 8: 实现滚动判定和监听生命周期**
 
 把 Vue import 扩展为：
 
@@ -254,7 +254,7 @@ watch(() => route.name, setupSettingsScrollSync)
 onBeforeUnmount(detachSettingsScrollSync)
 ```
 
-- [ ] **Step 9: 增加选中样式**
+- [x] **Step 9: 增加选中样式**
 
 将菜单状态样式更新为：
 
@@ -263,7 +263,7 @@ onBeforeUnmount(detachSettingsScrollSync)
 .settings-section-link.active { font-weight: 650; }
 ```
 
-- [ ] **Step 10: 运行五个设置导航测试并确认通过**
+- [x] **Step 10: 运行五个设置导航测试并确认通过**
 
 Run:
 
@@ -273,7 +273,7 @@ pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run -
 
 Expected: PASS；5 tests passed。
 
-- [ ] **Step 11: 运行完整相关验证**
+- [x] **Step 11: 运行完整相关验证**
 
 Run:
 
@@ -286,7 +286,7 @@ git diff --check
 
 Expected: 工作台组件测试全部通过，类型检查和构建退出码为 0，差异无空白错误。构建允许依赖包现有的 Rollup `#__PURE__` 注释警告。
 
-- [ ] **Step 12: 核对范围并提交**
+- [x] **Step 12: 核对范围并提交**
 
 Run:
 

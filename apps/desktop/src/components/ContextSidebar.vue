@@ -201,8 +201,10 @@
         v-for="section in settingsSections"
         :key="section.id"
         class="settings-section-link"
+        :class="{ active: activeSettingsSection === section.id }"
         type="button"
         data-testid="settings-section-nav-item"
+        :aria-current="activeSettingsSection === section.id ? 'location' : undefined"
         @click="scrollToSettingsSection(section.id)"
       >
         {{ section.label }}
@@ -215,7 +217,7 @@
 import { ChatDotRound, Delete, Edit, Plus, Search } from '@element-plus/icons-vue'
 import type { ExecutionStatus } from '@autoforge/shared'
 import { ElMessageBox } from 'element-plus'
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
@@ -263,9 +265,48 @@ const settingsSections = [
   { id: 'permissions', label: '已保存授权' },
   { id: 'about', label: '关于 AutoForge' },
 ] as const
+type SettingsSectionId = typeof settingsSections[number]['id']
+const activeSettingsSection = ref<SettingsSectionId>(settingsSections[0].id)
+let settingsScrollContainer: HTMLElement | null = null
 
-function scrollToSettingsSection(id: string) {
+function scrollToSettingsSection(id: SettingsSectionId) {
+  activeSettingsSection.value = id
   document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+function syncActiveSettingsSection() {
+  if (!settingsScrollContainer) return
+  const { scrollTop, scrollHeight, clientHeight } = settingsScrollContainer
+  if (scrollTop > 0 && scrollTop + clientHeight >= scrollHeight - 1) {
+    activeSettingsSection.value = settingsSections[settingsSections.length - 1].id
+    return
+  }
+  const decisionLine = settingsScrollContainer.getBoundingClientRect().top + 24
+  let activeId: SettingsSectionId = settingsSections[0].id
+  for (const section of settingsSections) {
+    const element = document.getElementById(section.id)
+    if (!element) continue
+    if (element.getBoundingClientRect().top > decisionLine) break
+    activeId = section.id
+  }
+  activeSettingsSection.value = activeId
+}
+
+function detachSettingsScrollSync() {
+  settingsScrollContainer?.removeEventListener('scroll', syncActiveSettingsSection)
+  settingsScrollContainer = null
+}
+
+function setupSettingsScrollSync() {
+  detachSettingsScrollSync()
+  activeSettingsSection.value = settingsSections[0].id
+  if (route.name !== 'settings') return
+  void nextTick(() => {
+    if (route.name !== 'settings') return
+    settingsScrollContainer = document.querySelector<HTMLElement>('.workspace-content')
+    settingsScrollContainer?.addEventListener('scroll', syncActiveSettingsSection, { passive: true })
+    syncActiveSettingsSection()
+  })
 }
 
 function applyWorkflowFilters() {
@@ -305,7 +346,10 @@ async function deleteConversation(id: string, title: string) {
 
 onMounted(() => {
   if (route.name === 'chat' && !chat.conversations.length && !chat.loading) void chat.loadConversations()
+  setupSettingsScrollSync()
 })
+watch(() => route.name, setupSettingsScrollSync)
+onBeforeUnmount(detachSettingsScrollSync)
 </script>
 
 <style scoped>
@@ -324,5 +368,6 @@ onMounted(() => {
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 11px; font-weight: 650; }
 .native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: white; font-size: 11px; }
 .settings-section-link { width: 100%; border: 0; border-radius: 5px; padding: 8px 9px; color: var(--af-text); background: transparent; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
-.settings-section-link:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
+.settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
+.settings-section-link.active { font-weight: 650; }
 </style>
