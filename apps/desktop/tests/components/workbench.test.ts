@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils'
+import { mount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
@@ -6,11 +6,14 @@ import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
 import type { AppSettings, DesktopAPI, ModelInfo, TokenUsageSnapshot } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
+import { tokenColors } from '../../src/components/settings/token-usage-chart-options'
 import { routes } from '../../src/router/index'
 import { useExecutionStore } from '../../src/stores/execution'
 import { useChatStore } from '../../src/stores/chat'
 import { useSettingsStore } from '../../src/stores/settings'
 import { useWorkflowStore } from '../../src/stores/workflow'
+
+const mountedAppWrappers: VueWrapper[] = []
 
 function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']): ModelInfo {
   return {
@@ -144,6 +147,7 @@ async function mountApp(path = '/chat', api = createApi()) {
       },
     },
   })
+  mountedAppWrappers.push(wrapper)
   await Promise.resolve()
   return { wrapper, router, api, pinia }
 }
@@ -153,7 +157,12 @@ describe('workbench', () => {
     vi.clearAllMocks()
     setActivePinia(createPinia())
   })
-  afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+  afterEach(() => {
+    for (const wrapper of mountedAppWrappers.splice(0)) {
+      if (wrapper.exists()) wrapper.unmount()
+    }
+    Reflect.deleteProperty(window, 'autoForge')
+  })
 
   it('renders exactly the five confirmed navigation items', async () => {
     const { wrapper } = await mountApp()
@@ -896,6 +905,12 @@ describe('workbench', () => {
       .toEqual(['今日', '昨日', '本周', '本月', '累计'])
     expect(wrapper.get('#tab-today').attributes('aria-selected')).toBe('true')
     expect(wrapper.text()).toContain('today/model')
+    expect(wrapper.get('[data-testid="billing-summary-input"]')
+      .element.style.getPropertyValue('--billing-summary-color')).toBe(tokenColors.input)
+    expect(wrapper.get('[data-testid="billing-summary-output"]')
+      .element.style.getPropertyValue('--billing-summary-color')).toBe(tokenColors.output)
+    expect(wrapper.get('[data-testid="billing-summary-total"]')
+      .element.style.getPropertyValue('--billing-summary-color')).toBe(tokenColors.total)
 
     for (const [key, expected] of [
       ['yesterday', '20'], ['week', '30'], ['month', '40'], ['allTime', '50'],

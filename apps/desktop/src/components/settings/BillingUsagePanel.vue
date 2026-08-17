@@ -51,15 +51,24 @@
           {{ formatRange(activeUsage, activePeriod) }}
         </p>
         <dl class="billing-summary">
-          <div>
+          <div
+            data-testid="billing-summary-input"
+            :style="{ '--billing-summary-color': tokenColors.input }"
+          >
             <dt>输入 Token</dt>
             <dd>{{ formatTokens(activeUsage.inputTokens) }}</dd>
           </div>
-          <div>
+          <div
+            data-testid="billing-summary-output"
+            :style="{ '--billing-summary-color': tokenColors.output }"
+          >
             <dt>输出 Token</dt>
             <dd>{{ formatTokens(activeUsage.outputTokens) }}</dd>
           </div>
-          <div data-testid="billing-summary-total">
+          <div
+            data-testid="billing-summary-total"
+            :style="{ '--billing-summary-color': tokenColors.total }"
+          >
             <dt>总 Token</dt>
             <dd>{{ formatTokens(activeUsage.totalTokens) }}</dd>
           </div>
@@ -138,6 +147,7 @@ import type { TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '
 import { computed, ref } from 'vue'
 import TokenUsageBarChart from './TokenUsageBarChart.vue'
 import TokenUsageLineChart from './TokenUsageLineChart.vue'
+import { tokenColors } from './token-usage-chart-options'
 
 const props = defineProps<{
   usage?: TokenUsageSnapshot
@@ -263,6 +273,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .billing-summary dd {
   margin: 6px 0 0;
+  color: var(--billing-summary-color);
   font-size: 20px;
   font-weight: 700;
 }
