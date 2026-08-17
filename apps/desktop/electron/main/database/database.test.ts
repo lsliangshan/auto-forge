@@ -870,6 +870,63 @@ describe('openAppDatabase', () => {
     expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
   })
 
+  it('summarizes retained token usage by model for the current month and all time', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
+    const insert = (
+      id: string,
+      model: string,
+      status: 'completed' | 'failed' | 'cancelled',
+      startedAt: number,
+      inputTokens?: number,
+      outputTokens?: number,
+    ) => database.chatRuns.insert({
+      id,
+      conversationId: 'conversation_usage',
+      requestId: `request_${id}`,
+      model,
+      status,
+      startedAt,
+      ...(inputTokens === undefined ? {} : { inputTokens }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+    })
+
+    insert('before_alpha', 'alpha/model', 'completed', 99, 10, 5)
+    insert('month_alpha', 'alpha/model', 'failed', 100, 7)
+    insert('month_beta', 'beta/model', 'cancelled', 101, undefined, 9)
+    insert('month_zero', 'zero/model', 'completed', 102, 0, 0)
+    insert('ignored', 'ignored/model', 'completed', 103)
+
+    expect(database.chatRuns.summarizeTokenUsage(100)).toEqual({
+      month: {
+        inputTokens: 7,
+        outputTokens: 9,
+        totalTokens: 16,
+        models: [
+          { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+          { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+          { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        ],
+      },
+      allTime: {
+        inputTokens: 17,
+        outputTokens: 14,
+        totalTokens: 31,
+        models: [
+          { model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22 },
+          { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+          { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        ],
+      },
+    })
+
+    database.clearLocalData('conversations')
+    expect(database.chatRuns.summarizeTokenUsage(100)).toEqual({
+      month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+    })
+  })
+
   it('atomically claims generated media, replaces its stable block, and finalizes the chat run', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_media_terminal', title: 'Media terminal' })

@@ -57,6 +57,25 @@ export interface ChatRun {
   endedAt?: number
 }
 
+export interface ModelTokenUsageRecord {
+  model: string
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+}
+
+export interface TokenUsagePeriodRecord {
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  models: ModelTokenUsageRecord[]
+}
+
+export interface TokenUsageSnapshotRecord {
+  month: TokenUsagePeriodRecord
+  allTime: TokenUsagePeriodRecord
+}
+
 export interface WorkflowProject {
   id: string
   name: string
@@ -401,6 +420,7 @@ export interface AppRepositories {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
     startMediaGeneration(value: MediaGenerationTurnInput): void
     get(id: string): ChatRun | undefined
+    summarizeTokenUsage(monthStartedAt: number): TokenUsageSnapshotRecord
     update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
     finalizeWithMessage(
       id: string,
@@ -435,6 +455,50 @@ const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS req
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
+
+interface TokenUsageRow {
+  model: string
+  allTimeInputTokens: number
+  allTimeOutputTokens: number
+  monthInputTokens: number
+  monthOutputTokens: number
+  monthRows: number
+}
+
+function safeTokenCount(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error('Token usage exceeded the supported range')
+  }
+  return value
+}
+
+function tokenUsagePeriod(
+  rows: TokenUsageRow[],
+  period: 'month' | 'allTime',
+): TokenUsagePeriodRecord {
+  const models = rows
+    .filter((row) => period === 'allTime' || safeTokenCount(row.monthRows) > 0)
+    .map((row): ModelTokenUsageRecord => {
+      const inputTokens = safeTokenCount(
+        period === 'month' ? row.monthInputTokens : row.allTimeInputTokens,
+      )
+      const outputTokens = safeTokenCount(
+        period === 'month' ? row.monthOutputTokens : row.allTimeOutputTokens,
+      )
+      const totalTokens = safeTokenCount(inputTokens + outputTokens)
+      return { model: row.model, inputTokens, outputTokens, totalTokens }
+    })
+    .sort((left, right) => right.totalTokens - left.totalTokens
+      || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0))
+  const inputTokens = safeTokenCount(models.reduce((sum, model) => sum + model.inputTokens, 0))
+  const outputTokens = safeTokenCount(models.reduce((sum, model) => sum + model.outputTokens, 0))
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: safeTokenCount(inputTokens + outputTokens),
+    models,
+  }
+}
 
 function messageFromRow(row: Query): Message {
   return {
@@ -1453,6 +1517,25 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         })
       },
       get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),
+      summarizeTokenUsage(monthStartedAt) {
+        const start = safeTokenCount(monthStartedAt)
+        const rows = many<TokenUsageRow>(database, `
+          SELECT
+            model,
+            SUM(COALESCE(input_tokens, 0)) AS allTimeInputTokens,
+            SUM(COALESCE(output_tokens, 0)) AS allTimeOutputTokens,
+            SUM(CASE WHEN started_at >= @monthStartedAt THEN COALESCE(input_tokens, 0) ELSE 0 END) AS monthInputTokens,
+            SUM(CASE WHEN started_at >= @monthStartedAt THEN COALESCE(output_tokens, 0) ELSE 0 END) AS monthOutputTokens,
+            SUM(CASE WHEN started_at >= @monthStartedAt THEN 1 ELSE 0 END) AS monthRows
+          FROM chat_runs
+          WHERE input_tokens IS NOT NULL OR output_tokens IS NOT NULL
+          GROUP BY model
+        `, { monthStartedAt: start })
+        return {
+          month: tokenUsagePeriod(rows, 'month'),
+          allTime: tokenUsagePeriod(rows, 'allTime'),
+        }
+      },
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE chat_runs SET status = COALESCE(@status, status), generation_id = COALESCE(@generationId, generation_id), input_tokens = COALESCE(@inputTokens, input_tokens), output_tokens = COALESCE(@outputTokens, output_tokens), cost_usd = COALESCE(@costUsd, cost_usd), error_code = COALESCE(@errorCode, error_code), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
           id, status: null, generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
