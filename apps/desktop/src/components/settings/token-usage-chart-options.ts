@@ -18,6 +18,14 @@ const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit',
   minute: '2-digit',
 })
+const dateTimeWithSecondsFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+})
 
 interface TooltipItem {
   dataIndex: number
@@ -46,8 +54,13 @@ function rangeLabel(startedAt: string, endedAt: string) {
   let startLabel = dateTimeFormatter.format(start)
   let endLabel = dateTimeFormatter.format(end)
   if (startLabel === endLabel) {
-    startLabel = `${startLabel} ${utcOffsetLabel(start)}`
-    endLabel = `${endLabel} ${utcOffsetLabel(end)}`
+    if (start.getTimezoneOffset() !== end.getTimezoneOffset()) {
+      startLabel = `${startLabel} ${utcOffsetLabel(start)}`
+      endLabel = `${endLabel} ${utcOffsetLabel(end)}`
+    } else {
+      startLabel = dateTimeWithSecondsFormatter.format(start)
+      endLabel = dateTimeWithSecondsFormatter.format(end)
+    }
   }
   return `${startLabel} — ${endLabel}`
 }

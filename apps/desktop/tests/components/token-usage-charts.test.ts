@@ -32,6 +32,14 @@ const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit',
   minute: '2-digit',
 })
+const dateTimeWithSecondsFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+})
 
 function rangeLabel(startedAt: string, endedAt: string) {
   return `${dateTimeFormatter.format(new Date(startedAt))} — ${dateTimeFormatter.format(new Date(endedAt))}`
@@ -115,6 +123,28 @@ describe('token usage chart options', () => {
     expect(tooltip.formatter([
       { dataIndex: 0, seriesName: '输入 Token', value: '2000' },
     ])).toContain('{input|●} 输入 Token: 2,000')
+
+    const shortStartedAt = '2026-08-17T04:00:00.000Z'
+    const shortEndedAt = '2026-08-17T04:00:30.000Z'
+    const shortOption = lineChartOption({
+      ...period,
+      startedAt: shortStartedAt,
+      endedAt: shortEndedAt,
+      trend: [{ startedAt: shortStartedAt, inputTokens: 7, outputTokens: 3, totalTokens: 10 }],
+    }, 'today')
+    const shortFormatter = (
+      shortOption.tooltip as { formatter: (value: unknown) => string }
+    ).formatter
+    const shortRange = shortFormatter([
+      { dataIndex: 0, seriesName: '输入 Token', value: 7 },
+    ]).split('\n')[0]
+    const [shortStartLabel, shortEndLabel] = shortRange.split(' — ')
+    expect(shortRange).toBe([
+      dateTimeWithSecondsFormatter.format(new Date(shortStartedAt)),
+      dateTimeWithSecondsFormatter.format(new Date(shortEndedAt)),
+    ].join(' — '))
+    expect(shortRange).not.toContain('UTC')
+    expect(shortStartLabel).not.toBe(shortEndLabel)
 
     const longTrend = Array.from({ length: 13 }, (_, index) => ({
       startedAt: new Date(2025, index, 1).toISOString(),
