@@ -984,6 +984,78 @@ describe('openAppDatabase', () => {
     ])
   })
 
+  it('rejects token usage when a SQLite aggregate exceeds the safe integer range', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'conversation_usage_overflow', title: 'Usage overflow' })
+    const query = {
+      yesterdayStartedAt: 100,
+      todayStartedAt: 200,
+      weekStartedAt: 100,
+      monthStartedAt: 100,
+      endedAt: 300,
+    }
+
+    database.chatRuns.insert({
+      id: 'usage_overflow_a',
+      conversationId: 'conversation_usage_overflow',
+      requestId: 'request_usage_overflow_a',
+      model: 'alpha/model',
+      status: 'completed',
+      startedAt: 200,
+      inputTokens: Number.MAX_SAFE_INTEGER,
+    })
+    database.chatRuns.insert({
+      id: 'usage_overflow_b',
+      conversationId: 'conversation_usage_overflow',
+      requestId: 'request_usage_overflow_b',
+      model: 'alpha/model',
+      status: 'completed',
+      startedAt: 201,
+      inputTokens: 1,
+    })
+
+    expect(() => database.chatRuns.summarizeTokenUsage(query))
+      .toThrow('Token usage exceeded the supported range')
+  })
+
+  it('keeps repeated local hours in distinct elapsed-hour buckets', () => {
+    const previous = process.env.TZ
+    process.env.TZ = 'America/New_York'
+    try {
+      const database = openTestDatabase()
+      database.conversations.insert({ id: 'conversation_usage_fallback', title: 'Usage fallback' })
+      const query = {
+        yesterdayStartedAt: Date.parse('2026-10-31T00:00:00-04:00'),
+        todayStartedAt: Date.parse('2026-11-01T00:00:00-04:00'),
+        weekStartedAt: Date.parse('2026-10-26T00:00:00-04:00'),
+        monthStartedAt: Date.parse('2026-11-01T00:00:00-04:00'),
+        endedAt: Date.parse('2026-11-02T00:00:00-05:00'),
+      }
+      const insert = (id: string, startedAt: number, inputTokens: number) => (
+        database.chatRuns.insert({
+          id,
+          conversationId: 'conversation_usage_fallback',
+          requestId: `request_${id}`,
+          model: 'alpha/model',
+          status: 'completed',
+          startedAt,
+          inputTokens,
+        })
+      )
+
+      insert('usage_first_0130', Date.parse('2026-11-01T01:30:00-04:00'), 1)
+      insert('usage_second_0130', Date.parse('2026-11-01T01:30:00-05:00'), 2)
+
+      expect(database.chatRuns.summarizeTokenUsage(query).today.trend).toEqual([
+        { bucket: '1', inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+        { bucket: '2', inputTokens: 2, outputTokens: 0, totalTokens: 2 },
+      ])
+    } finally {
+      if (previous === undefined) delete process.env.TZ
+      else process.env.TZ = previous
+    }
+  })
+
   it('atomically claims generated media, replaces its stable block, and finalizes the chat run', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_media_terminal', title: 'Media terminal' })
