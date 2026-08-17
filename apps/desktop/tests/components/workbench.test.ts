@@ -70,6 +70,15 @@ function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSn
   }
 }
 
+function computedColor(value: string) {
+  const probe = document.createElement('span')
+  probe.style.color = value
+  document.body.append(probe)
+  const color = getComputedStyle(probe).color
+  probe.remove()
+  return color
+}
+
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
   return {
     auth: {
@@ -905,12 +914,17 @@ describe('workbench', () => {
       .toEqual(['今日', '昨日', '本周', '本月', '累计'])
     expect(wrapper.get('#tab-today').attributes('aria-selected')).toBe('true')
     expect(wrapper.text()).toContain('today/model')
-    expect(wrapper.get('[data-testid="billing-summary-input"]')
-      .element.style.getPropertyValue('--billing-summary-color')).toBe(tokenColors.input)
-    expect(wrapper.get('[data-testid="billing-summary-output"]')
-      .element.style.getPropertyValue('--billing-summary-color')).toBe(tokenColors.output)
-    expect(wrapper.get('[data-testid="billing-summary-total"]')
-      .element.style.getPropertyValue('--billing-summary-color')).toBe(tokenColors.total)
+    document.body.append(wrapper.element)
+    try {
+      expect(getComputedStyle(wrapper.get('[data-testid="billing-summary-input"] dd').element).color)
+        .toBe(computedColor(tokenColors.input))
+      expect(getComputedStyle(wrapper.get('[data-testid="billing-summary-output"] dd').element).color)
+        .toBe(computedColor(tokenColors.output))
+      expect(getComputedStyle(wrapper.get('[data-testid="billing-summary-total"] dd').element).color)
+        .toBe(computedColor(tokenColors.total))
+    } finally {
+      wrapper.element.remove()
+    }
 
     for (const [key, expected] of [
       ['yesterday', '20'], ['week', '30'], ['month', '40'], ['allTime', '50'],
