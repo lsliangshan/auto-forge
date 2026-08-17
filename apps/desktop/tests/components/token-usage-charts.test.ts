@@ -2,11 +2,7 @@ import { mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TokenUsageBarChart from '../../src/components/settings/TokenUsageBarChart.vue'
 import TokenUsageLineChart from '../../src/components/settings/TokenUsageLineChart.vue'
-import {
-  barChartOption,
-  lineChartOption,
-  tokenColors,
-} from '../../src/components/settings/token-usage-chart-options'
+import { barChartOption, lineChartOption } from '../../src/components/settings/token-usage-chart-options'
 
 const chart = vi.hoisted(() => ({
   setOption: vi.fn(),
@@ -91,38 +87,36 @@ describe('token usage chart options', () => {
       .toBe(true)
     const tooltip = option.tooltip as {
       renderMode: string
-      textStyle: { rich: Record<string, { color: string }> }
       formatter: (value: unknown) => string
     }
     expect(tooltip.renderMode).toBe('richText')
-    expect(tooltip.textStyle.rich).toEqual({
-      input: { color: tokenColors.input },
-      output: { color: tokenColors.output },
-      total: { color: tokenColors.total },
-    })
+    expect(tooltip).not.toHaveProperty('textStyle')
+    const inputMarker = '{lineInputMarker|●} '
+    const outputMarker = '{lineOutputMarker|●} '
+    const totalMarker = '{lineTotalMarker|●} '
     expect(tooltip.formatter([
-      { dataIndex: 0, seriesName: '输入 Token', value: '2' },
-      { dataIndex: 0, seriesName: '输出 Token', value: 1 },
-      { dataIndex: 0, seriesName: '总 Token', value: 3 },
+      { dataIndex: 0, seriesName: '输入 Token', value: '2', marker: inputMarker },
+      { dataIndex: 0, seriesName: '输出 Token', value: 1, marker: outputMarker },
+      { dataIndex: 0, seriesName: '总 Token', value: 3, marker: totalMarker },
     ])).toBe([
       rangeLabel(period.trend[0].startedAt, period.trend[1].startedAt),
-      '{input|●} 输入 Token: 2',
-      '{output|●} 输出 Token: 1',
-      '{total|●} 总 Token: 3',
+      `${inputMarker}输入 Token: 2`,
+      `${outputMarker}输出 Token: 1`,
+      `${totalMarker}总 Token: 3`,
     ].join('\n'))
     expect(tooltip.formatter([
-      { dataIndex: 1, seriesName: '输入 Token', value: 5 },
-      { dataIndex: 1, seriesName: '输出 Token', value: 2 },
-      { dataIndex: 1, seriesName: '总 Token', value: 7 },
+      { dataIndex: 1, seriesName: '输入 Token', value: 5, marker: inputMarker },
+      { dataIndex: 1, seriesName: '输出 Token', value: 2, marker: outputMarker },
+      { dataIndex: 1, seriesName: '总 Token', value: 7, marker: totalMarker },
     ])).toBe([
       rangeLabel(period.trend[1].startedAt, period.endedAt),
-      '{input|●} 输入 Token: 5',
-      '{output|●} 输出 Token: 2',
-      '{total|●} 总 Token: 7',
+      `${inputMarker}输入 Token: 5`,
+      `${outputMarker}输出 Token: 2`,
+      `${totalMarker}总 Token: 7`,
     ].join('\n'))
     expect(tooltip.formatter([
-      { dataIndex: 0, seriesName: '输入 Token', value: '2000' },
-    ])).toContain('{input|●} 输入 Token: 2,000')
+      { dataIndex: 0, seriesName: '输入 Token', value: '2000', marker: inputMarker },
+    ])).toContain(`${inputMarker}输入 Token: 2,000`)
 
     const shortStartedAt = '2026-08-17T04:00:00.000Z'
     const shortEndedAt = '2026-08-17T04:00:30.000Z'
@@ -174,20 +168,40 @@ describe('token usage chart options', () => {
     expect(barChartOption(models.slice(0, 8)).dataZoom).toHaveLength(0)
     const tooltip = option.tooltip as {
       renderMode: string
-      textStyle: { rich: Record<string, { color: string }> }
       formatter: (value: unknown) => string
     }
     expect(tooltip.renderMode).toBe('richText')
-    expect(tooltip.textStyle.rich).toEqual({
-      input: { color: tokenColors.input },
-      output: { color: tokenColors.output },
-    })
-    expect(tooltip.formatter([{ dataIndex: 0 }])).toBe([
+    expect(tooltip).not.toHaveProperty('textStyle')
+    const inputMarker = '{barInputMarker|●} '
+    const outputMarker = '{barOutputMarker|●} '
+    expect(tooltip.formatter([
+      { dataIndex: 0, seriesName: '输入 Token', value: 1, marker: inputMarker },
+      { dataIndex: 0, seriesName: '输出 Token', value: 0, marker: outputMarker },
+    ])).toBe([
       'provider/very-long-model-identifier',
-      '{input|●} 输入 Token: 1',
-      '{output|●} 输出 Token: 0',
+      `${inputMarker}输入 Token: 1`,
+      `${outputMarker}输出 Token: 0`,
       '总 Token: 1',
     ].join('\n'))
+
+    const unsafeModel = '{input|literal-model}\r\nnext}'
+    const unsafeOption = barChartOption([
+      { model: unsafeModel, inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+    ])
+    const unsafeFormatter = (
+      unsafeOption.tooltip as { formatter: (value: unknown) => string }
+    ).formatter
+    const unsafeTooltip = unsafeFormatter([
+      { dataIndex: 0, seriesName: '输入 Token', value: 1, marker: inputMarker },
+      { dataIndex: 0, seriesName: '输出 Token', value: 2, marker: outputMarker },
+    ])
+    const withoutMarkers = unsafeTooltip
+      .replace(inputMarker, '')
+      .replace(outputMarker, '')
+    expect(withoutMarkers).not.toMatch(/\{[A-Za-z0-9_]+\|/)
+    expect(unsafeTooltip.split('\n')).toHaveLength(4)
+    expect(unsafeTooltip.split('\n')[0].replaceAll('\u2060', ''))
+      .toBe('{input|literal-model}\\r\\nnext}')
   })
 
   it('disambiguates repeated local hours during daylight-saving fallback', async () => {
@@ -216,10 +230,13 @@ describe('token usage chart options', () => {
       expect(labels[0]).not.toBe(labels[1])
       expect(labels).toEqual(['01:00 UTC-04:00', '01:00 UTC-05:00'])
       const formatter = (option.tooltip as { formatter: (value: unknown) => string }).formatter
-      const range = formatter([{ dataIndex: 0, seriesName: '输入 Token', value: 1 }])
+      const firstRange = formatter([{ dataIndex: 0, seriesName: '输入 Token', value: 1 }])
         .split('\n')[0]
-      expect(range).toContain('UTC-04:00')
-      expect(range).toContain('UTC-05:00')
+      expect(firstRange).toContain('UTC-04:00')
+      expect(firstRange).toContain('UTC-05:00')
+      const secondRange = formatter([{ dataIndex: 1, seriesName: '输入 Token', value: 2 }])
+        .split('\n')[0]
+      expect(secondRange.match(/UTC-05:00/g)).toHaveLength(2)
     } finally {
       if (previousTimezone === undefined) delete process.env.TZ
       else process.env.TZ = previousTimezone

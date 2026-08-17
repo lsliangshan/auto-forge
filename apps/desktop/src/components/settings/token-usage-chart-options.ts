@@ -31,12 +31,7 @@ interface TooltipItem {
   dataIndex: number
   seriesName: string
   value: unknown
-}
-
-const richTokenBySeriesName: Record<string, 'input' | 'output' | 'total'> = {
-  '输入 Token': 'input',
-  '输出 Token': 'output',
-  '总 Token': 'total',
+  marker?: string
 }
 
 function utcOffsetLabel(value: Date) {
@@ -48,12 +43,15 @@ function utcOffsetLabel(value: Date) {
   return `UTC${sign}${hours}:${minutes}`
 }
 
-function rangeLabel(startedAt: string, endedAt: string) {
+function rangeLabel(startedAt: string, endedAt: string, repeatedHour = false) {
   const start = new Date(startedAt)
   const end = new Date(endedAt)
   let startLabel = dateTimeFormatter.format(start)
   let endLabel = dateTimeFormatter.format(end)
-  if (startLabel === endLabel) {
+  if (repeatedHour) {
+    startLabel = `${startLabel} ${utcOffsetLabel(start)}`
+    endLabel = `${endLabel} ${utcOffsetLabel(end)}`
+  } else if (startLabel === endLabel) {
     if (start.getTimezoneOffset() !== end.getTimezoneOffset()) {
       startLabel = `${startLabel} ${utcOffsetLabel(start)}`
       endLabel = `${endLabel} ${utcOffsetLabel(end)}`
@@ -63,6 +61,13 @@ function rangeLabel(startedAt: string, endedAt: string) {
     }
   }
   return `${startLabel} — ${endLabel}`
+}
+
+function richTextLiteral(value: string) {
+  return value
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\{/g, '{\u2060')
 }
 
 export function lineChartOption(
@@ -86,7 +91,9 @@ export function lineChartOption(
   )
   const rangeLabels = period.trend.map((point, index) => {
     const next = period.trend[index + 1]?.startedAt ?? period.endedAt
-    return rangeLabel(point.startedAt, next)
+    const repeatedHour = (periodKey === 'today' || periodKey === 'yesterday')
+      && duplicateLabels.has(baseLabels[index])
+    return rangeLabel(point.startedAt, next, repeatedHour)
   })
 
   return {
@@ -95,23 +102,14 @@ export function lineChartOption(
     tooltip: {
       trigger: 'axis',
       renderMode: 'richText',
-      textStyle: {
-        rich: {
-          input: { color: tokenColors.input },
-          output: { color: tokenColors.output },
-          total: { color: tokenColors.total },
-        },
-      },
       formatter: (parameters: unknown) => {
         const items = (Array.isArray(parameters) ? parameters : [parameters]) as TooltipItem[]
         const index = items[0]?.dataIndex ?? 0
         return [
           rangeLabels[index] ?? '',
-          ...items.map((item) => {
-            const token = richTokenBySeriesName[item.seriesName]
-            const marker = token ? `{${token}|●} ` : ''
-            return `${marker}${item.seriesName}: ${tokenFormatter.format(Number(item.value))}`
-          }),
+          ...items.map((item) =>
+            `${item.marker ?? ''}${item.seriesName}: ${tokenFormatter.format(Number(item.value))}`,
+          ),
         ].join('\n')
       },
     },
@@ -158,20 +156,16 @@ export function barChartOption(models: ModelTokenUsage[]): EChartsCoreOption {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
       renderMode: 'richText',
-      textStyle: {
-        rich: {
-          input: { color: tokenColors.input },
-          output: { color: tokenColors.output },
-        },
-      },
       formatter: (parameters: unknown) => {
         const items = (Array.isArray(parameters) ? parameters : [parameters]) as TooltipItem[]
         const model = models[items[0]?.dataIndex ?? 0]
         if (!model) return ''
+        const inputMarker = items.find((item) => item.seriesName === '输入 Token')?.marker ?? ''
+        const outputMarker = items.find((item) => item.seriesName === '输出 Token')?.marker ?? ''
         return [
-          model.model,
-          `{input|●} 输入 Token: ${tokenFormatter.format(model.inputTokens)}`,
-          `{output|●} 输出 Token: ${tokenFormatter.format(model.outputTokens)}`,
+          richTextLiteral(model.model),
+          `${inputMarker}输入 Token: ${tokenFormatter.format(model.inputTokens)}`,
+          `${outputMarker}输出 Token: ${tokenFormatter.format(model.outputTokens)}`,
           `总 Token: ${tokenFormatter.format(model.totalTokens)}`,
         ].join('\n')
       },
