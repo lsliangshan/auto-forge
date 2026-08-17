@@ -115,11 +115,11 @@
               <el-option
                 v-for="model in settings.modelOptionsFor(output)"
                 :key="model.id"
-                :label="model.name"
+                :label="modelSelectLabel(model)"
                 :value="model.id"
                 :data-output="output"
               >
-                <span>{{ model.name }}</span><small class="model-id">{{ model.id }}</small>
+                <span>{{ modelSelectLabel(model) }}</span><small class="model-id">{{ model.id }}</small>
               </el-option>
             </el-select>
           </div>
@@ -310,6 +310,7 @@ import { Refresh } from '@element-plus/icons-vue'
 import {
   normalizeProxySettings,
   parseProxyBypassText,
+  type ModelInfo,
   type ModelProviderId,
   type ProxySettings,
 } from '@autoforge/shared'
@@ -349,6 +350,22 @@ const modelOutputs = computed<ModelOutput[]>(() =>
     ? ['text']
     : ['text', 'image', 'audio', 'video'])
 const providerLabel = computed(() => settings.activeProvider === 'deepseek' ? 'DeepSeek' : 'OpenRouter')
+const modelPriceNumberFormatter = new Intl.NumberFormat('en-US', {
+  maximumSignificantDigits: 6,
+})
+function formatModelPrice(price: number | undefined): string {
+  return price === undefined
+    ? '—'
+    : `$${modelPriceNumberFormatter.format(price)}/M`
+}
+function modelPriceLabel(model: ModelInfo): string {
+  return `输入 ${formatModelPrice(model.inputCostPerMillion)} · 输出 ${formatModelPrice(model.outputCostPerMillion)}`
+}
+function modelSelectLabel(model: ModelInfo): string {
+  return settings.activeProvider === 'openrouter'
+    ? `${model.name} · ${modelPriceLabel(model)}`
+    : model.name
+}
 const proxyStatusLabel = computed(() => settings.settings?.proxy.enabled
   ? '已启用，APP 内网络请求使用此代理'
   : '已关闭，网络请求直连')

@@ -603,6 +603,12 @@ describe('workbench', () => {
     await vi.waitFor(() => expect(deepseek.wrapper.text()).toContain('默认文本模型'))
     expect(deepseek.wrapper.text()).not.toContain('默认图片模型')
     expect(deepseek.wrapper.findAll('[data-testid^="default-model-"]')).toHaveLength(1)
+    const deepseekOptions = deepseek.wrapper.findAllComponents({ name: 'ElOption' })
+      .filter((option) => option.vm.$attrs['data-output'] === 'text')
+    expect(deepseekOptions.map((option) => option.props('label'))).toEqual([
+      'deepseek-v4-flash（已保存模型）',
+      'deepseek-chat',
+    ])
     deepseek.wrapper.unmount()
 
     const openrouterApi = createApi()
@@ -621,10 +627,22 @@ describe('workbench', () => {
       provider: 'openrouter', configured: true, validation: 'valid',
     })
     vi.mocked(openrouterApi.settings.listProviderModels).mockResolvedValue([
-      modelInfo('text/default', ['text']),
-      modelInfo('image/usable', ['image']),
+      {
+        ...modelInfo('text/default', ['text']),
+        name: 'Text Default',
+        inputCostPerMillion: 0.4,
+        outputCostPerMillion: 1.6,
+      },
+      {
+        ...modelInfo('image/usable', ['image']),
+        inputCostPerMillion: 0,
+        outputCostPerMillion: 0.0000001,
+      },
       modelInfo('audio/usable', ['audio']),
-      modelInfo('video/usable', ['video']),
+      {
+        ...modelInfo('video/usable', ['video']),
+        inputCostPerMillion: 0.25,
+      },
     ])
     const openrouter = await mountApp('/settings', openrouterApi)
     await vi.waitFor(() => expect(openrouter.wrapper.text()).toContain('默认视频模型'))
@@ -640,14 +658,24 @@ describe('workbench', () => {
     const optionsFor = (output: string) => openrouter.wrapper.findAllComponents({ name: 'ElOption' })
       .filter((option) => option.vm.$attrs['data-output'] === output)
       .map((option) => option.props('label'))
-    expect(optionsFor('text'))
-      .toEqual(['text/default'])
-    expect(optionsFor('image'))
-      .toEqual(['image/usable'])
-    expect(optionsFor('audio'))
-      .toEqual(['audio/saved-missing（已保存模型）', 'audio/usable'])
-    expect(optionsFor('video'))
-      .toEqual(['video/usable'])
+    expect(optionsFor('text')).toEqual([
+      'Text Default · 输入 $0.4/M · 输出 $1.6/M',
+    ])
+    expect(optionsFor('image')).toEqual([
+      'image/usable · 输入 $0/M · 输出 $0.0000001/M',
+    ])
+    expect(optionsFor('audio')).toEqual([
+      'audio/saved-missing（已保存模型） · 输入 — · 输出 —',
+      'audio/usable · 输入 — · 输出 —',
+    ])
+    expect(optionsFor('video')).toEqual([
+      'video/usable · 输入 $0.25/M · 输出 —',
+    ])
+    expect(
+      openrouter.wrapper
+        .get('[data-testid="default-model-text"] .el-select__placeholder')
+        .text(),
+    ).toBe('Text Default · 输入 $0.4/M · 输出 $1.6/M')
   })
 
   it('stops showing the previous provider model load after switching to an unconfigured provider', async () => {
