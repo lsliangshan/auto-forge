@@ -27,13 +27,20 @@ function denseTrend(
   endedAt: number,
   granularity: TokenUsageGranularityRecord,
 ): TokenUsageTrendPoint[] {
-  if (startedAt >= endedAt) return []
+  const sparse = new Map<string, TokenUsagePeriodRecord['trend'][number]>()
+  for (const point of record.trend) {
+    if (sparse.has(point.bucket)) {
+      throw new Error(`Duplicate token usage trend bucket: ${point.bucket}`)
+    }
+    sparse.set(point.bucket, point)
+  }
 
-  const sparse = new Map(record.trend.map((point) => [point.bucket, point]))
   const output: TokenUsageTrendPoint[] = []
   if (granularity === 'hour') {
     for (let index = 0, cursor = startedAt; cursor < endedAt; index += 1, cursor += hourMs) {
-      const point = sparse.get(String(index))
+      const bucket = String(index)
+      const point = sparse.get(bucket)
+      sparse.delete(bucket)
       output.push({
         startedAt: new Date(cursor).toISOString(),
         inputTokens: point?.inputTokens ?? 0,
@@ -41,23 +48,43 @@ function denseTrend(
         totalTokens: point?.totalTokens ?? 0,
       })
     }
-    return output
+  } else if (startedAt < endedAt) {
+    let cursor = granularity === 'month'
+      ? new Date(new Date(startedAt).getFullYear(), new Date(startedAt).getMonth(), 1)
+      : dayStart(new Date(startedAt))
+    while (cursor.getTime() < endedAt) {
+      const bucket = localKey(cursor, granularity)
+      const point = sparse.get(bucket)
+      sparse.delete(bucket)
+      output.push({
+        startedAt: new Date(Math.max(cursor.getTime(), startedAt)).toISOString(),
+        inputTokens: point?.inputTokens ?? 0,
+        outputTokens: point?.outputTokens ?? 0,
+        totalTokens: point?.totalTokens ?? 0,
+      })
+      cursor = granularity === 'month'
+        ? new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1)
+        : new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1)
+    }
   }
 
-  let cursor = granularity === 'month'
-    ? new Date(new Date(startedAt).getFullYear(), new Date(startedAt).getMonth(), 1)
-    : dayStart(new Date(startedAt))
-  while (cursor.getTime() < endedAt) {
-    const point = sparse.get(localKey(cursor, granularity))
-    output.push({
-      startedAt: new Date(Math.max(cursor.getTime(), startedAt)).toISOString(),
-      inputTokens: point?.inputTokens ?? 0,
-      outputTokens: point?.outputTokens ?? 0,
-      totalTokens: point?.totalTokens ?? 0,
-    })
-    cursor = granularity === 'month'
-      ? new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1)
-      : new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1)
+  const unconsumed = sparse.keys().next().value
+  if (unconsumed !== undefined) {
+    throw new Error(`Token usage trend bucket is outside the period: ${unconsumed}`)
+  }
+
+  let inputTokens = 0
+  let outputTokens = 0
+  let totalTokens = 0
+  for (const point of output) {
+    inputTokens += point.inputTokens
+    outputTokens += point.outputTokens
+    totalTokens += point.totalTokens
+  }
+  if (inputTokens !== record.inputTokens
+    || outputTokens !== record.outputTokens
+    || totalTokens !== record.totalTokens) {
+    throw new Error('Token usage trend totals do not match the period')
   }
   return output
 }

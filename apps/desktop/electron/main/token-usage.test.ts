@@ -29,6 +29,7 @@ describe('createTokenUsageSnapshot', () => {
       monthStartedAt: new Date(2026, 7, 1).getTime(),
       endedAt: now.getTime(),
     })
+    expect(summarize).toHaveBeenCalledTimes(1)
     expect(snapshot.generatedAt).toBe(now.toISOString())
     expect(snapshot.yesterday.endedAt).toBe(new Date(2026, 7, 19).toISOString())
     expect(snapshot.today.endedAt).toBe(snapshot.generatedAt)
@@ -121,5 +122,79 @@ describe('createTokenUsageSnapshot', () => {
       if (previous === undefined) delete process.env.TZ
       else process.env.TZ = previous
     }
+  })
+
+  it('excludes the bucket beginning exactly at the period end', () => {
+    const now = new Date(2026, 7, 17, 2)
+    const todayStartedAt = new Date(2026, 7, 17).getTime()
+    const snapshot = createTokenUsageSnapshot(now, () => ({
+      today: zeroRecord(),
+      yesterday: zeroRecord(),
+      week: zeroRecord(),
+      month: zeroRecord(),
+      allTime: zeroRecord(),
+    }))
+
+    expect(snapshot.today.trend.map(({ startedAt }) => startedAt)).toEqual([
+      new Date(todayStartedAt).toISOString(),
+      new Date(todayStartedAt + 3_600_000).toISOString(),
+    ])
+  })
+
+  it('rejects a sparse bucket outside the period', () => {
+    const now = new Date(2026, 7, 17, 2)
+
+    expect(() => createTokenUsageSnapshot(now, () => ({
+      today: {
+        inputTokens: 1,
+        outputTokens: 0,
+        totalTokens: 1,
+        models: [{ model: 'alpha/model', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
+        trend: [{ bucket: '2', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
+      },
+      yesterday: zeroRecord(),
+      week: zeroRecord(),
+      month: zeroRecord(),
+      allTime: zeroRecord(),
+    }))).toThrowError('Token usage trend bucket is outside the period: 2')
+  })
+
+  it('rejects duplicate sparse buckets', () => {
+    const now = new Date(2026, 7, 17, 2)
+
+    expect(() => createTokenUsageSnapshot(now, () => ({
+      today: {
+        inputTokens: 2,
+        outputTokens: 0,
+        totalTokens: 2,
+        models: [{ model: 'alpha/model', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
+        trend: [
+          { bucket: '0', inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+          { bucket: '0', inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+        ],
+      },
+      yesterday: zeroRecord(),
+      week: zeroRecord(),
+      month: zeroRecord(),
+      allTime: zeroRecord(),
+    }))).toThrowError('Duplicate token usage trend bucket: 0')
+  })
+
+  it('rejects dense trend totals that do not match the period', () => {
+    const now = new Date(2026, 7, 17, 2)
+
+    expect(() => createTokenUsageSnapshot(now, () => ({
+      today: {
+        inputTokens: 2,
+        outputTokens: 0,
+        totalTokens: 2,
+        models: [{ model: 'alpha/model', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
+        trend: [{ bucket: '0', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
+      },
+      yesterday: zeroRecord(),
+      week: zeroRecord(),
+      month: zeroRecord(),
+      allTime: zeroRecord(),
+    }))).toThrowError('Token usage trend totals do not match the period')
   })
 })
