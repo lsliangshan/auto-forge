@@ -2,7 +2,11 @@ import { mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TokenUsageBarChart from '../../src/components/settings/TokenUsageBarChart.vue'
 import TokenUsageLineChart from '../../src/components/settings/TokenUsageLineChart.vue'
-import { barChartOption, lineChartOption } from '../../src/components/settings/token-usage-chart-options'
+import {
+  barChartOption,
+  lineChartOption,
+  tokenColors,
+} from '../../src/components/settings/token-usage-chart-options'
 
 const chart = vi.hoisted(() => ({
   setOption: vi.fn(),
@@ -75,17 +79,28 @@ describe('token usage chart options', () => {
       { name: '总 Token', type: 'line', data: [3, 7] },
     ])
     expect(option.legend).toMatchObject({ top: 8 })
-    const tooltip = option.tooltip as { renderMode: string; formatter: (value: unknown) => string }
+    expect((option.xAxis as { data: string[] }).data.every((label) => !label.includes('UTC')))
+      .toBe(true)
+    const tooltip = option.tooltip as {
+      renderMode: string
+      textStyle: { rich: Record<string, { color: string }> }
+      formatter: (value: unknown) => string
+    }
     expect(tooltip.renderMode).toBe('richText')
+    expect(tooltip.textStyle.rich).toEqual({
+      input: { color: tokenColors.input },
+      output: { color: tokenColors.output },
+      total: { color: tokenColors.total },
+    })
     expect(tooltip.formatter([
       { dataIndex: 0, seriesName: '输入 Token', value: '2' },
       { dataIndex: 0, seriesName: '输出 Token', value: 1 },
       { dataIndex: 0, seriesName: '总 Token', value: 3 },
     ])).toBe([
       rangeLabel(period.trend[0].startedAt, period.trend[1].startedAt),
-      '输入 Token: 2',
-      '输出 Token: 1',
-      '总 Token: 3',
+      '{input|●} 输入 Token: 2',
+      '{output|●} 输出 Token: 1',
+      '{total|●} 总 Token: 3',
     ].join('\n'))
     expect(tooltip.formatter([
       { dataIndex: 1, seriesName: '输入 Token', value: 5 },
@@ -93,10 +108,13 @@ describe('token usage chart options', () => {
       { dataIndex: 1, seriesName: '总 Token', value: 7 },
     ])).toBe([
       rangeLabel(period.trend[1].startedAt, period.endedAt),
-      '输入 Token: 5',
-      '输出 Token: 2',
-      '总 Token: 7',
+      '{input|●} 输入 Token: 5',
+      '{output|●} 输出 Token: 2',
+      '{total|●} 总 Token: 7',
     ].join('\n'))
+    expect(tooltip.formatter([
+      { dataIndex: 0, seriesName: '输入 Token', value: '2000' },
+    ])).toContain('{input|●} 输入 Token: 2,000')
 
     const longTrend = Array.from({ length: 13 }, (_, index) => ({
       startedAt: new Date(2025, index, 1).toISOString(),
@@ -124,14 +142,59 @@ describe('token usage chart options', () => {
     expect(option.legend).toMatchObject({ top: 8 })
     expect(option.dataZoom).toHaveLength(2)
     expect(barChartOption(models.slice(0, 8)).dataZoom).toHaveLength(0)
-    const tooltip = option.tooltip as { renderMode: string; formatter: (value: unknown) => string }
+    const tooltip = option.tooltip as {
+      renderMode: string
+      textStyle: { rich: Record<string, { color: string }> }
+      formatter: (value: unknown) => string
+    }
     expect(tooltip.renderMode).toBe('richText')
+    expect(tooltip.textStyle.rich).toEqual({
+      input: { color: tokenColors.input },
+      output: { color: tokenColors.output },
+    })
     expect(tooltip.formatter([{ dataIndex: 0 }])).toBe([
       'provider/very-long-model-identifier',
-      '输入 Token: 1',
-      '输出 Token: 0',
+      '{input|●} 输入 Token: 1',
+      '{output|●} 输出 Token: 0',
       '总 Token: 1',
     ].join('\n'))
+  })
+
+  it('disambiguates repeated local hours during daylight-saving fallback', async () => {
+    const previousTimezone = process.env.TZ
+    try {
+      process.env.TZ = 'America/New_York'
+      vi.resetModules()
+      const { lineChartOption: newYorkLineChartOption } = await import(
+        '../../src/components/settings/token-usage-chart-options'
+      )
+      const fallbackPeriod = {
+        startedAt: '2026-11-01T05:00:00.000Z',
+        endedAt: '2026-11-01T07:00:00.000Z',
+        inputTokens: 3,
+        outputTokens: 3,
+        totalTokens: 6,
+        models: [{ model: 'model/dst', inputTokens: 3, outputTokens: 3, totalTokens: 6 }],
+        trend: [
+          { startedAt: '2026-11-01T05:00:00.000Z', inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          { startedAt: '2026-11-01T06:00:00.000Z', inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+        ],
+      }
+
+      const option = newYorkLineChartOption(fallbackPeriod, 'today')
+      const labels = (option.xAxis as { data: string[] }).data
+      expect(labels[0]).not.toBe(labels[1])
+      expect(labels).toEqual(['01:00 UTC-04:00', '01:00 UTC-05:00'])
+      const formatter = (option.tooltip as { formatter: (value: unknown) => string }).formatter
+      const range = formatter([{ dataIndex: 0, seriesName: '输入 Token', value: 1 }])
+        .split('\n')[0]
+      expect(range).toContain('UTC-04:00')
+      expect(range).toContain('UTC-05:00')
+    } finally {
+      if (previousTimezone === undefined) delete process.env.TZ
+      else process.env.TZ = previousTimezone
+      vi.resetModules()
+    }
   })
 })
 
