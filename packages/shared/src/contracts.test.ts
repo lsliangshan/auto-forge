@@ -20,6 +20,7 @@ import {
   providerCredentialStatusSchema,
   proxySettingsSchema,
   toSafeAppError,
+  tokenUsageSnapshotSchema,
   workerMessageSchema,
 } from './index'
 
@@ -398,6 +399,57 @@ describe('cross-process contracts', () => {
     expect(appErrorCodeSchema.parse('MODEL_PROVIDER_ACCESS_DENIED')).toBe('MODEL_PROVIDER_ACCESS_DENIED')
     expect(appErrorCodeSchema.parse('MODEL_PROVIDER_REQUEST_FAILED')).toBe('MODEL_PROVIDER_REQUEST_FAILED')
     expect(appErrorCodeSchema.parse('OPENROUTER_REQUEST_FAILED')).toBe('OPENROUTER_REQUEST_FAILED')
+  })
+
+  it('requires internally consistent token usage snapshots', () => {
+    const snapshot = {
+      monthStartedAt: '2026-08-01T00:00:00.000Z',
+      month: {
+        inputTokens: 7,
+        outputTokens: 3,
+        totalTokens: 10,
+        models: [{ model: 'alpha/model', inputTokens: 7, outputTokens: 3, totalTokens: 10 }],
+      },
+      allTime: {
+        inputTokens: 9,
+        outputTokens: 6,
+        totalTokens: 15,
+        models: [
+          { model: 'alpha/model', inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+          { model: 'beta/model', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+        ],
+      },
+    }
+
+    expect(tokenUsageSnapshotSchema.parse(snapshot)).toEqual(snapshot)
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      month: { ...snapshot.month, totalTokens: 9 },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      allTime: {
+        ...snapshot.allTime,
+        models: [...snapshot.allTime.models, snapshot.allTime.models[0]],
+      },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      month: { ...snapshot.month, inputTokens: Number.MAX_SAFE_INTEGER + 1 },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      monthStartedAt: 'not-a-timestamp',
+    })).toThrow()
+    for (const inputTokens of [-1, 1.5]) {
+      expect(() => tokenUsageSnapshotSchema.parse({
+        ...snapshot,
+        month: { ...snapshot.month, inputTokens },
+      })).toThrow()
+    }
+    expect(ipcChannels.settingsGetTokenUsage).toBe('settings:get-token-usage')
+    expect(ipcRequestSchemas[ipcChannels.settingsGetTokenUsage].parse(undefined)).toBeUndefined()
+    expect(ipcResponseSchemas[ipcChannels.settingsGetTokenUsage].parse(snapshot)).toEqual(snapshot)
   })
 
   it('requires exact pending workflow identity on approval blocks', () => {

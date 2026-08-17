@@ -844,6 +844,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       validateProviderCredential: credentialStatus,
       listProviderModels: (provider) => getModelCatalog(provider),
+      getTokenUsage: async () => {
+        const current = new Date()
+        const monthStartedAt = new Date(current.getFullYear(), current.getMonth(), 1).getTime()
+        return {
+          monthStartedAt: new Date(monthStartedAt).toISOString(),
+          ...database.chatRuns.summarizeTokenUsage(monthStartedAt),
+        }
+      },
       clearLocalData: async (scope) => {
         await maintenance.runExclusive(
           () => activeRequests.size > 0

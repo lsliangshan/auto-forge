@@ -203,6 +203,49 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('returns a local-calendar-month token usage snapshot', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-token-usage-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const database = openAppDatabase(databasePath)
+    database.conversations.insert({ id: 'usage_conversation', title: 'Usage' })
+    database.chatRuns.insert({
+      id: 'usage_run',
+      conversationId: 'usage_conversation',
+      requestId: 'usage_request',
+      model: 'alpha/model',
+      status: 'failed',
+      startedAt: new Date(2026, 7, 1).getTime(),
+      inputTokens: 4,
+      outputTokens: 6,
+    })
+    database.close()
+
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 7, 17, 12))
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await expect(runtime.services.settings.getTokenUsage()).resolves.toEqual({
+        monthStartedAt: new Date(2026, 7, 1).toISOString(),
+        month: {
+          inputTokens: 4,
+          outputTokens: 6,
+          totalTokens: 10,
+          models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
+        },
+        allTime: {
+          inputTokens: 4,
+          outputTokens: 6,
+          totalTokens: 10,
+          models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
+        },
+      })
+    } finally {
+      await runtime.close()
+      vi.useRealTimers()
+    }
+  })
+
   it('exposes persistent local authentication through runtime services', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-'))
     directories.push(root)

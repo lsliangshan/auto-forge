@@ -412,6 +412,67 @@ export const modelInfoSchema = z.object({
 
 export type ModelInfo = z.infer<typeof modelInfoSchema>
 
+const safeTokenCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+const tokenUsageShape = {
+  inputTokens: safeTokenCountSchema,
+  outputTokens: safeTokenCountSchema,
+  totalTokens: safeTokenCountSchema,
+}
+
+export const modelTokenUsageSchema = z.object({
+  model: nonEmptyStringSchema,
+  ...tokenUsageShape,
+}).strict().superRefine((usage, context) => {
+  const total = usage.inputTokens + usage.outputTokens
+  if (!Number.isSafeInteger(total) || usage.totalTokens !== total) {
+    context.addIssue({
+      code: 'custom',
+      path: ['totalTokens'],
+      message: 'Token total must equal input plus output',
+    })
+  }
+})
+
+export const tokenUsagePeriodSchema = z.object({
+  ...tokenUsageShape,
+  models: z.array(modelTokenUsageSchema),
+}).strict().superRefine((usage, context) => {
+  const ids = new Set<string>()
+  let inputTokens = 0
+  let outputTokens = 0
+  for (const model of usage.models) {
+    if (ids.has(model.model)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['models'],
+        message: 'Token usage models must be unique',
+      })
+    }
+    ids.add(model.model)
+    inputTokens += model.inputTokens
+    outputTokens += model.outputTokens
+  }
+  const totalTokens = inputTokens + outputTokens
+  if (!Number.isSafeInteger(inputTokens)
+    || !Number.isSafeInteger(outputTokens)
+    || !Number.isSafeInteger(totalTokens)
+    || usage.inputTokens !== inputTokens
+    || usage.outputTokens !== outputTokens
+    || usage.totalTokens !== totalTokens) {
+    context.addIssue({ code: 'custom', message: 'Period totals must equal model totals' })
+  }
+})
+
+export const tokenUsageSnapshotSchema = z.object({
+  monthStartedAt: timestampSchema,
+  month: tokenUsagePeriodSchema,
+  allTime: tokenUsagePeriodSchema,
+}).strict()
+
+export type ModelTokenUsage = z.infer<typeof modelTokenUsageSchema>
+export type TokenUsagePeriod = z.infer<typeof tokenUsagePeriodSchema>
+export type TokenUsageSnapshot = z.infer<typeof tokenUsageSnapshotSchema>
+
 export const appInfoSchema = z.object({
   version: nonEmptyStringSchema,
   platform: z.enum(['darwin', 'win32']),
@@ -467,6 +528,7 @@ export const ipcChannels = {
   settingsClearProviderApiKey: 'settings:clear-provider-api-key',
   settingsValidateProviderCredential: 'settings:validate-provider-credential',
   settingsListProviderModels: 'settings:list-provider-models',
+  settingsGetTokenUsage: 'settings:get-token-usage',
   settingsClearLocalData: 'settings:clear-local-data',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
@@ -583,6 +645,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsClearProviderApiKey]: providerRequestSchema,
   [ipcChannels.settingsValidateProviderCredential]: providerRequestSchema,
   [ipcChannels.settingsListProviderModels]: providerRequestSchema,
+  [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
@@ -639,6 +702,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsClearProviderApiKey]: voidResponseSchema,
   [ipcChannels.settingsValidateProviderCredential]: providerCredentialStatusSchema,
   [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
+  [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
@@ -711,6 +775,7 @@ export interface DesktopAPI {
     clearProviderApiKey(provider: ModelProviderId): Promise<void>
     validateProviderCredential(provider: ModelProviderId): Promise<ProviderCredentialStatus>
     listProviderModels(provider: ModelProviderId): Promise<ModelInfo[]>
+    getTokenUsage(): Promise<TokenUsageSnapshot>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
   }
   system: {

@@ -52,6 +52,7 @@ describe('preload desktop bridge', () => {
     const app = harness()
     await app.api.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
     await app.api.settings.listProviderModels('openrouter')
+    await app.api.settings.getTokenUsage()
 
     expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(
       ipcChannels.settingsSaveProviderApiKey,
@@ -60,6 +61,10 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(
       ipcChannels.settingsListProviderModels,
       { provider: 'openrouter' },
+    )
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(
+      ipcChannels.settingsGetTokenUsage,
+      undefined,
     )
     expect(app.api).not.toHaveProperty('invoke')
   })

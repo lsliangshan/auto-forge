@@ -70,6 +70,11 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         provider, configured: false, validation: 'unchecked',
       })),
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
+      getTokenUsage: vi.fn().mockResolvedValue({
+        monthStartedAt: '2026-08-01T00:00:00.000Z',
+        month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+        allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+      }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,

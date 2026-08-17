@@ -59,6 +59,11 @@ function services(): DesktopIpcServices {
       clearProviderApiKey: vi.fn(),
       validateProviderCredential: vi.fn(async (provider) => ({ provider, configured: false, validation: 'unchecked' as const })),
       listProviderModels: vi.fn(async () => []),
+      getTokenUsage: vi.fn().mockResolvedValue({
+        monthStartedAt: '2026-08-01T00:00:00.000Z',
+        month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+        allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+      }),
       clearLocalData: vi.fn(),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
@@ -202,6 +207,29 @@ describe('registerDesktopIpc', () => {
       provider: 'custom',
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.settings.listProviderModels).not.toHaveBeenCalled()
+  })
+
+  it('returns authenticated token usage through the fixed settings channel', async () => {
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.settingsGetTokenUsage)).resolves.toMatchObject({
+      month: { totalTokens: 0 },
+      allTime: { totalTokens: 0 },
+    })
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalled()
+    expect(app.dependencies.settings.getTokenUsage).toHaveBeenCalled()
+  })
+
+  it('rejects invalid token usage service output', async () => {
+    const app = harness()
+    vi.mocked(app.dependencies.settings.getTokenUsage).mockResolvedValueOnce({
+      monthStartedAt: '2026-08-01T00:00:00.000Z',
+      month: { inputTokens: 0, outputTokens: 0, totalTokens: 1, models: [] },
+      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
+    } as never)
+
+    await expect(app.invoke(ipcChannels.settingsGetTokenUsage))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
   })
 
   it('rejects a request from an untrusted sender frame', async () => {

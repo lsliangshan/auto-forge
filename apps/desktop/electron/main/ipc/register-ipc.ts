@@ -183,6 +183,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsClearProviderApiKey, (input) => options.services.settings.clearProviderApiKey(input.provider))
   register(ipcChannels.settingsValidateProviderCredential, (input) => options.services.settings.validateProviderCredential(input.provider))
   register(ipcChannels.settingsListProviderModels, (input) => options.services.settings.listProviderModels(input.provider))
+  register(ipcChannels.settingsGetTokenUsage, () => options.services.settings.getTokenUsage())
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
