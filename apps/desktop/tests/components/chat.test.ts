@@ -2054,6 +2054,51 @@ describe('chat interactions', () => {
     expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('会话 B 新草稿')
   })
 
+  it('keeps the selected video model after adding an incompatible attachment', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+    store.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'video',
+      models: { video: 'openai/sora-2-pro' },
+    })
+    const happyHorse = modelInfo('alibaba/happyhorse-1.1', ['video'])
+    const sora = modelInfo('openai/sora-2-pro', ['video'])
+    sora.inputModalities = ['text']
+    const wrapper = mount(ChatComposer, {
+      props: {
+        disabled: false,
+        running: false,
+        models: [happyHorse, sora],
+        defaultModel: 'alibaba/happyhorse-1.1',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('textarea').setValue('生成视频')
+    expect(wrapper.get('[data-testid="model-select"]').element).toHaveProperty(
+      'value',
+      'openai/sora-2-pro',
+    )
+
+    store.draftsByConversation.conversation_1 = [mediaAsset('reference')]
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('[data-testid="model-select"]').element).toHaveProperty(
+      'value',
+      'openai/sora-2-pro',
+    )
+    expect(wrapper.get('[data-testid="model-attachment-incompatible"]').text())
+      .toContain('当前模型不支持已添加的附件')
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined()
+
+    await wrapper.get('[data-testid="model-select"]').setValue('alibaba/happyhorse-1.1')
+    await vi.waitFor(() => expect(store.preferences.models.video).toBe('alibaba/happyhorse-1.1'))
+    expect(wrapper.find('[data-testid="model-attachment-incompatible"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeUndefined()
+  })
+
   it('disables unsupported outputs and cannot send without a compatible model', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

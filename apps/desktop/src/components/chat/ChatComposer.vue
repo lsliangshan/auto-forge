@@ -92,6 +92,14 @@
     >
       当前供应商没有兼容此输出类型的模型。
     </div>
+    <div
+      v-else-if="!selectedModelSupportsRequest"
+      class="choice-required"
+      data-testid="model-attachment-incompatible"
+      role="alert"
+    >
+      当前模型不支持已添加的附件。
+    </div>
 
     <div
       v-if="chat.preferences.outputType === 'image'"
@@ -371,9 +379,13 @@ const awaitingAcceptance = computed(() =>
   pendingByConversation.value[chat.selectedConversationId] !== undefined)
 
 function modelSupportsOutput(model: ModelInfo, output: ConcreteOutput): boolean {
-  if (!model.outputModalities.includes(output)
-    || !model.inputModalities.includes('text')
-    || (output !== 'text' && !model.generation[output])) return false
+  return model.outputModalities.includes(output)
+    && model.inputModalities.includes('text')
+    && (output === 'text' || Boolean(model.generation[output]))
+}
+
+function modelSupportsRequest(model: ModelInfo, output: ConcreteOutput): boolean {
+  if (!modelSupportsOutput(model, output)) return false
   if ((output === 'image' || output === 'video')
     && chat.drafts.some(({ kind }) => kind !== 'image')) return false
   return chat.drafts.every(({ kind }) => model.inputModalities.includes(kind))
@@ -388,7 +400,9 @@ function modelsForOutput(output: OutputType, models = props.models): ModelInfo[]
 }
 
 function outputSupported(output: OutputType): boolean {
-  return modelsForOutput(output).length > 0
+  return modelsForOutput(output).some((model) => output === 'auto'
+    ? model.outputModalities.some((candidate) => modelSupportsRequest(model, candidate))
+    : modelSupportsRequest(model, output))
 }
 
 const compatibleModels = computed(() => modelsForOutput(chat.preferences.outputType))
@@ -410,10 +424,18 @@ const selectedModelId = computed(() => modelIdFor(chat.preferences.outputType, c
 const selectedModel = computed(() => compatibleModels.value
   .find(({ id }) => id === selectedModelId.value))
 
+const selectedModelSupportsRequest = computed(() => {
+  if (!selectedModel.value) return false
+  const output = chat.preferences.outputType
+  if (output !== 'auto') return modelSupportsRequest(selectedModel.value, output)
+  return selectedModel.value.outputModalities
+    .some((candidate) => modelSupportsRequest(selectedModel.value!, candidate))
+})
+
 const autoChoiceRequired = computed(() => {
   if (chat.preferences.outputType !== 'auto' || !selectedModel.value) return false
   const supported = selectedModel.value.outputModalities
-    .filter((output) => modelSupportsOutput(selectedModel.value!, output))
+    .filter((output) => modelSupportsRequest(selectedModel.value!, output))
   return new Set(supported).size > 1
 })
 
@@ -423,7 +445,8 @@ const canSubmit = computed(() => {
     || props.modelsLoading
     || awaitingAcceptance.value
     || autoChoiceRequired.value
-    || !selectedModel.value) return false
+    || !selectedModel.value
+    || !selectedModelSupportsRequest.value) return false
   if (content.value.trim()) return true
   return chat.drafts.length > 0 && chat.preferences.outputType === 'text'
 })
