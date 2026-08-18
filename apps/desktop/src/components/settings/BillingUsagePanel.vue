@@ -6,7 +6,7 @@
   >
     <header class="billing-header">
       <div>
-        <h2>Token 账单</h2>
+        <h2>用量与消费</h2>
         <p>统计来自本机当前保留的模型调用记录。</p>
       </div>
       <el-button
@@ -96,6 +96,22 @@
               {{ formatTokens(activeUsage.totalTokens) }}
             </dd>
           </div>
+          <div
+            data-testid="billing-summary-cost"
+          >
+            <dt>OpenRouter 消费</dt>
+            <dd>{{ formatUsd(activeUsage.openRouterCostUsd) }}</dd>
+            <p data-testid="billing-summary-known">
+              已确认 {{ formatTokens(activeUsage.openRouterKnownCostCount) }} 笔
+            </p>
+            <p
+              v-if="activeUsage.openRouterUnknownCostCount > 0"
+              data-testid="billing-cost-warning"
+              class="billing-cost-warning"
+            >
+              有 {{ formatTokens(activeUsage.openRouterUnknownCostCount) }} 笔费用待确认
+            </p>
+          </div>
         </dl>
         <template v-if="hasUsage">
           <section
@@ -122,10 +138,13 @@
           <div class="billing-table-wrap">
             <table
               class="billing-table"
-              aria-label="模型 Token 精确用量"
+              aria-label="模型用量与 OpenRouter 消费"
             >
               <thead>
                 <tr>
+                  <th scope="col">
+                    Provider
+                  </th>
                   <th scope="col">
                     模型
                   </th>
@@ -138,17 +157,30 @@
                   <th scope="col">
                     总 Token
                   </th>
+                  <th scope="col">
+                    OpenRouter 消费
+                  </th>
+                  <th scope="col">
+                    已确认
+                  </th>
+                  <th scope="col">
+                    待确认
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 <tr
                   v-for="model in activeUsage.models"
-                  :key="model.model"
+                  :key="`${model.provider}:${model.model}`"
                 >
+                  <td>{{ providerLabels[model.provider] }}</td>
                   <td>{{ model.model }}</td>
                   <td>{{ formatTokens(model.inputTokens) }}</td>
                   <td>{{ formatTokens(model.outputTokens) }}</td>
                   <td>{{ formatTokens(model.totalTokens) }}</td>
+                  <td>{{ model.provider === 'openrouter' ? formatUsd(model.openRouterCostUsd) : '—' }}</td>
+                  <td>{{ formatTokens(model.openRouterKnownCostCount) }}</td>
+                  <td>{{ formatTokens(model.openRouterUnknownCostCount) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -194,11 +226,18 @@ const emptyPeriod: TokenUsagePeriod = {
   inputTokens: 0,
   outputTokens: 0,
   totalTokens: 0,
+  openRouterCostUsd: '0',
+  openRouterKnownCostCount: 0,
+  openRouterUnknownCostCount: 0,
   models: [],
   trend: [],
 }
 const activeUsage = computed(() => props.usage?.[activePeriod.value] ?? emptyPeriod)
-const hasUsage = computed(() => activeUsage.value.totalTokens > 0)
+const hasUsage = computed(() => activeUsage.value.totalTokens > 0 || activeUsage.value.models.length > 0)
+const providerLabels = {
+  openrouter: 'OpenRouter',
+  deepseek: 'DeepSeek',
+} as const
 const tokenFormatter = new Intl.NumberFormat('zh-CN')
 const rangeFormatter = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -208,6 +247,11 @@ const rangeFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
 })
 const formatTokens = (value: number) => tokenFormatter.format(value)
+const formatUsd = (decimal: string) => {
+  const [integer, fraction] = decimal.split('.')
+  const grouped = integer!.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `$${fraction === undefined ? grouped : `${grouped}.${fraction}`}`
+}
 const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   if (key === 'allTime' && usage.totalTokens === 0 && usage.models.length === 0) {
     return '暂无保留记录'
@@ -311,6 +355,16 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   font-weight: 700;
 }
 
+.billing-summary p {
+  margin: 6px 0 0;
+  color: var(--af-text-muted);
+  font-size: 12px;
+}
+
+.billing-summary .billing-cost-warning {
+  color: var(--af-danger);
+}
+
 .billing-chart-section {
   margin: 0 0 16px;
   padding: 14px;
@@ -331,7 +385,7 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 
 .billing-table {
   width: 100%;
-  min-width: 620px;
+  min-width: 960px;
   border-collapse: collapse;
 }
 
@@ -343,7 +397,9 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 }
 
 .billing-table th:first-child,
-.billing-table td:first-child {
+.billing-table td:first-child,
+.billing-table th:nth-child(2),
+.billing-table td:nth-child(2) {
   max-width: 320px;
   overflow-wrap: anywhere;
   text-align: left;

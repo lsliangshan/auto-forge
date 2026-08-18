@@ -48,9 +48,21 @@ function usagePeriod(
     inputTokens: totalTokens,
     outputTokens: 0,
     totalTokens,
+    openRouterCostUsd: '0',
+    openRouterKnownCostCount: 0,
+    openRouterUnknownCostCount: 0,
     models: totalTokens === 0
       ? []
-      : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
+      : [{
+          provider: 'openrouter' as const,
+          model,
+          inputTokens: totalTokens,
+          outputTokens: 0,
+          totalTokens,
+          openRouterCostUsd: '0',
+          openRouterKnownCostCount: 0,
+          openRouterUnknownCostCount: 0,
+        }],
     trend: totalTokens === 0
       ? []
       : [{ startedAt, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
@@ -948,7 +960,16 @@ describe('workbench', () => {
       inputTokens: 1_200,
       outputTokens: 34,
       totalTokens: 1_234,
-      models: [{ model: 'precise/model', inputTokens: 1_200, outputTokens: 34, totalTokens: 1_234 }],
+      models: [{
+        provider: 'openrouter',
+        model: 'precise/model',
+        inputTokens: 1_200,
+        outputTokens: 34,
+        totalTokens: 1_234,
+        openRouterCostUsd: '0',
+        openRouterKnownCostCount: 0,
+        openRouterUnknownCostCount: 0,
+      }],
       trend: [{
         startedAt: usage.yesterday.startedAt,
         inputTokens: 1_200,
@@ -989,14 +1010,14 @@ describe('workbench', () => {
     })).toEqual(['Token 趋势', '模型用量'])
 
     const table = wrapper.get('.billing-table')
-    expect(table.attributes('aria-label')).toBe('模型 Token 精确用量')
+    expect(table.attributes('aria-label')).toBe('模型用量与 OpenRouter 消费')
     const headers = table.findAll('th')
-    expect(headers).toHaveLength(4)
+    expect(headers).toHaveLength(8)
     expect(headers.map((cell) => cell.text()))
-      .toEqual(['模型', '输入 Token', '输出 Token', '总 Token'])
-    expect(headers.map((cell) => cell.attributes('scope'))).toEqual(['col', 'col', 'col', 'col'])
+      .toEqual(['Provider', '模型', '输入 Token', '输出 Token', '总 Token', 'OpenRouter 消费', '已确认', '待确认'])
+    expect(headers.map((cell) => cell.attributes('scope'))).toEqual(Array(8).fill('col'))
     expect(table.get('tbody tr').findAll('td').map((cell) => cell.text()))
-      .toEqual(['precise/model', '1,200', '34', '1,234'])
+      .toEqual(['OpenRouter', 'precise/model', '1,200', '34', '1,234', '$0', '0', '0'])
 
     await wrapper.get('#tab-month').trigger('click')
     expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain('2026')
@@ -1026,6 +1047,7 @@ describe('workbench', () => {
     const { wrapper } = await mountApp('/settings', api)
     await vi.waitFor(() => expect(wrapper.text()).toContain('暂无 Token 用量记录'))
     expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('0')
+    expect(wrapper.get('[data-testid="billing-summary-cost"]').text()).toContain('$0')
     expect(wrapper.findAll('.billing-empty').filter((item) => item.text() === '暂无 Token 用量记录')).toHaveLength(1)
     expect(wrapper.find('[data-testid="token-usage-line-chart"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="token-usage-bar-chart"]').exists()).toBe(false)
@@ -1033,6 +1055,102 @@ describe('workbench', () => {
 
     await wrapper.get('#tab-allTime').trigger('click')
     expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain('暂无保留记录')
+  })
+
+  it('shows exact OpenRouter spend, confirmation state and provider-scoped model rows', async () => {
+    const api = createApi()
+    const usage = usageSnapshot(10, 'openai/gpt-exact')
+    usage.today = {
+      ...usage.today,
+      openRouterCostUsd: '0.0000001',
+      openRouterKnownCostCount: 1,
+      openRouterUnknownCostCount: 2,
+      models: [
+        {
+          provider: 'openrouter',
+          model: 'openai/gpt-exact',
+          inputTokens: 10,
+          outputTokens: 0,
+          totalTokens: 10,
+          openRouterCostUsd: '0.0000001',
+          openRouterKnownCostCount: 1,
+          openRouterUnknownCostCount: 2,
+        },
+        {
+          provider: 'deepseek',
+          model: 'openai/gpt-exact',
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          openRouterCostUsd: '0',
+          openRouterKnownCostCount: 0,
+          openRouterUnknownCostCount: 0,
+        },
+      ],
+    }
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usage)
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-cost"]').text())
+      .toContain('$0.0000001'))
+
+    expect(wrapper.get('[data-testid="billing-panel"] h2').text()).toBe('用量与消费')
+    expect(wrapper.get('[data-testid="billing-summary-known"]').text()).toContain('已确认 1 笔')
+    expect(wrapper.get('[data-testid="billing-cost-warning"]').text()).toBe('有 2 笔费用待确认')
+    const rows = wrapper.get('.billing-table').findAll('tbody tr')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.findAll('td').map((cell) => cell.text()))
+      .toEqual(['OpenRouter', 'openai/gpt-exact', '10', '0', '10', '$0.0000001', '1', '2'])
+    expect(rows[1]?.findAll('td').map((cell) => cell.text()))
+      .toEqual(['DeepSeek', 'openai/gpt-exact', '0', '0', '0', '—', '0', '0'])
+
+    await wrapper.get('#tab-yesterday').trigger('click')
+    expect(wrapper.find('[data-testid="billing-cost-warning"]').exists()).toBe(false)
+  })
+
+  it('formats large OpenRouter costs as exact decimal strings without scientific notation', async () => {
+    const api = createApi()
+    const usage = usageSnapshot(1)
+    const largeCost = '123456789012345678901234567890.0000001'
+    usage.today.openRouterCostUsd = largeCost
+    usage.today.openRouterKnownCostCount = 1
+    usage.today.models[0]!.openRouterCostUsd = largeCost
+    usage.today.models[0]!.openRouterKnownCostCount = 1
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usage)
+
+    const { wrapper } = await mountApp('/settings', api)
+    const exactDisplay = '$123,456,789,012,345,678,901,234,567,890.0000001'
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-cost"]').text())
+      .toContain(exactDisplay))
+    expect(wrapper.get('.billing-table').text()).toContain(exactDisplay)
+    expect(wrapper.get('[data-testid="billing-panel"]').text()).not.toMatch(/e\+?\d/i)
+  })
+
+  it('keeps cost-only model rows visible when an operation reports no tokens', async () => {
+    const api = createApi()
+    const usage = usageSnapshot(0)
+    usage.today = {
+      ...usage.today,
+      openRouterCostUsd: '0.25',
+      openRouterKnownCostCount: 1,
+      models: [{
+        provider: 'openrouter',
+        model: 'media/cost-only',
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        openRouterCostUsd: '0.25',
+        openRouterKnownCostCount: 1,
+        openRouterUnknownCostCount: 0,
+      }],
+    }
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usage)
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-cost"]').text())
+      .toContain('$0.25'))
+    expect(wrapper.get('.billing-table').text()).toContain('media/cost-only')
+    expect(wrapper.text()).not.toContain('暂无 Token 用量记录')
   })
 
   it('shows token usage empty and isolated error states', async () => {
@@ -1062,7 +1180,7 @@ describe('workbench', () => {
     expect(menuLabels).toEqual([
       '大模型供应商',
       '默认模型',
-      'Token 账单',
+      '用量与消费',
       'VPN 代理',
       '外观与行为',
       '本地数据',

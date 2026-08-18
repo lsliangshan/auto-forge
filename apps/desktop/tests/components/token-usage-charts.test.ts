@@ -67,7 +67,19 @@ const period = {
   inputTokens: 7,
   outputTokens: 3,
   totalTokens: 10,
-  models: [{ model: 'alpha/model', inputTokens: 7, outputTokens: 3, totalTokens: 10 }],
+  openRouterCostUsd: '0.0000001',
+  openRouterKnownCostCount: 1,
+  openRouterUnknownCostCount: 0,
+  models: [{
+    provider: 'openrouter' as const,
+    model: 'alpha/model',
+    inputTokens: 7,
+    outputTokens: 3,
+    totalTokens: 10,
+    openRouterCostUsd: '0.0000001',
+    openRouterKnownCostCount: 1,
+    openRouterUnknownCostCount: 0,
+  }],
   trend: [
     { startedAt: '2026-08-16T16:00:00.000Z', inputTokens: 2, outputTokens: 1, totalTokens: 3 },
     { startedAt: '2026-08-16T17:00:00.000Z', inputTokens: 5, outputTokens: 2, totalTokens: 7 },
@@ -82,6 +94,9 @@ describe('token usage chart options', () => {
       { name: '输出 Token', type: 'line', data: [1, 2] },
       { name: '总 Token', type: 'line', data: [3, 7] },
     ])
+    expect((option.series as Array<{ name?: string }>).map(({ name }) => name))
+      .toEqual(['输入 Token', '输出 Token', '总 Token'])
+    expect(JSON.stringify(option.series)).not.toContain('0.0000001')
     expect(option.legend).toMatchObject({ top: 8 })
     expect((option.xAxis as { data: string[] }).data.every((label) => !label.includes('UTC')))
       .toBe(true)
@@ -153,16 +168,22 @@ describe('token usage chart options', () => {
 
   it('builds stacked model bars and enables zoom after eight models', () => {
     const models = Array.from({ length: 9 }, (_, index) => ({
+      provider: 'openrouter' as const,
       model: index === 0 ? 'provider/very-long-model-identifier' : `model/${index}`,
       inputTokens: index + 1,
       outputTokens: index,
       totalTokens: index * 2 + 1,
+      openRouterCostUsd: '0',
+      openRouterKnownCostCount: 0,
+      openRouterUnknownCostCount: 0,
     }))
     const option = barChartOption(models)
     expect(option.series).toMatchObject([
       { name: '输入 Token', type: 'bar', stack: 'tokens' },
       { name: '输出 Token', type: 'bar', stack: 'tokens' },
     ])
+    expect((option.series as Array<{ name?: string }>).map(({ name }) => name))
+      .toEqual(['输入 Token', '输出 Token'])
     expect(option.legend).toMatchObject({ top: 8 })
     expect(option.dataZoom).toHaveLength(2)
     expect(barChartOption(models.slice(0, 8)).dataZoom).toHaveLength(0)
@@ -186,7 +207,16 @@ describe('token usage chart options', () => {
 
     const unsafeModel = '{input|literal-model}\r\nnext}'
     const unsafeOption = barChartOption([
-      { model: unsafeModel, inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      {
+        provider: 'openrouter',
+        model: unsafeModel,
+        inputTokens: 1,
+        outputTokens: 2,
+        totalTokens: 3,
+        openRouterCostUsd: '0',
+        openRouterKnownCostCount: 0,
+        openRouterUnknownCostCount: 0,
+      },
     ])
     const unsafeFormatter = (
       unsafeOption.tooltip as { formatter: (value: unknown) => string }
@@ -218,7 +248,19 @@ describe('token usage chart options', () => {
         inputTokens: 3,
         outputTokens: 3,
         totalTokens: 6,
-        models: [{ model: 'model/dst', inputTokens: 3, outputTokens: 3, totalTokens: 6 }],
+        openRouterCostUsd: '0',
+        openRouterKnownCostCount: 0,
+        openRouterUnknownCostCount: 0,
+        models: [{
+          provider: 'openrouter' as const,
+          model: 'model/dst',
+          inputTokens: 3,
+          outputTokens: 3,
+          totalTokens: 6,
+          openRouterCostUsd: '0',
+          openRouterKnownCostCount: 0,
+          openRouterUnknownCostCount: 0,
+        }],
         trend: [
           { startedAt: '2026-11-01T05:00:00.000Z', inputTokens: 1, outputTokens: 1, totalTokens: 2 },
           { startedAt: '2026-11-01T06:00:00.000Z', inputTokens: 2, outputTokens: 2, totalTokens: 4 },
