@@ -275,18 +275,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }),
   })
   const openRouterUsageProvider = providerRegistry.get('openrouter')
-  const providerUsageReconciler = new ProviderUsageReconciler({
-    providerUsage: database.providerUsage,
-    provider: {
-      getGenerationUsage: (generationId, signal) => {
-        if (!openRouterUsageProvider.getGenerationUsage) {
-          return Promise.reject(failure('MODEL_PROVIDER_REQUEST_FAILED'))
-        }
-        return openRouterUsageProvider.getGenerationUsage(generationId, signal)
-      },
-    },
-    credential: { get: () => secretStore.get(credentialKeyForProvider('openrouter')) },
-  })
+  const getGenerationUsage = openRouterUsageProvider.getGenerationUsage
+  const providerUsageReconciler = typeof getGenerationUsage === 'function'
+    ? new ProviderUsageReconciler({
+        providerUsage: database.providerUsage,
+        provider: { getGenerationUsage: getGenerationUsage.bind(openRouterUsageProvider) },
+        credential: { get: () => secretStore.get(credentialKeyForProvider('openrouter')) },
+      })
+    : undefined
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
   const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
@@ -368,7 +364,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     promise: Promise<void>
   }>()
   let acceptingWork = true
-  let reconciliationClosed = false
+  let reconciliationStopped = false
   let reconciliationTail = Promise.resolve()
   const reconciliationTimers = new Set<ReturnType<typeof setTimeout>>()
   const reportReconciliationFailure = (error: unknown): void => {
@@ -382,15 +378,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return reconciliationTail
   }
   const scheduleReconciliationRounds = (): void => {
-    if (reconciliationClosed) return
-    for (const delayMs of [1_000, 6_000, 36_000]) {
+    if (!providerUsageReconciler) return
+    const scheduleRound = (round: number): void => {
+      const delayMs = [1_000, 5_000, 30_000][round]
+      if (reconciliationStopped || delayMs === undefined) return
       const handle = setTimeout(() => {
         reconciliationTimers.delete(handle)
-        if (reconciliationClosed) return
+        if (reconciliationStopped) return
         void enqueueReconciliation(() => providerUsageReconciler.reconcileDue())
+          .then(() => scheduleRound(round + 1))
       }, delayMs)
       reconciliationTimers.add(handle)
     }
+    scheduleRound(0)
   }
   const emitExecution = (event: ExecutionEvent) => {
     if (event.type === 'status') {
@@ -952,15 +952,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await options.networkProxy.initialize(settings.get().proxy)
       await mediaLifecycle.recover()
       database.recoverInterrupted()
-      void enqueueReconciliation(() => providerUsageReconciler.recoverInterrupted())
-        .then(scheduleReconciliationRounds)
+      if (providerUsageReconciler) {
+        void enqueueReconciliation(() => providerUsageReconciler.recoverInterrupted())
+          .then(scheduleReconciliationRounds)
+      } else {
+        database.providerUsage.recoverPending(Date.now())
+      }
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
       await projects.recoverRemovalJournals()
       await videoJobs.recover()
     },
     close: async () => {
       acceptingWork = false
-      reconciliationClosed = true
+      reconciliationStopped = true
       for (const handle of reconciliationTimers) clearTimeout(handle)
       reconciliationTimers.clear()
       const admittedStarts = maintenance.stopAndDrain()

@@ -442,6 +442,75 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('recovers pending usage locally without consuming retries when OpenRouter lacks generation usage capability', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-capability-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const database = openAppDatabase(databasePath)
+    database.localAuth.createUserAndSession({
+      id: 'user_capability', account: 'Capability', accountNormalized: 'capability',
+      passwordDigest: 'digest-capability', createdAt: 1, updatedAt: 1,
+    }, 1)
+    const usage = (id: string, startedAt: number) => ({
+      id,
+      operationKey: `operation_${id}`,
+      userId: 'user_capability',
+      provider: 'openrouter' as const,
+      apiKeyFingerprint: '9990f372dd37cc8754019a4215e0dedc4ec55fd78e0b7e38ad73c7e152a9986c',
+      requestId: `request_${id}`,
+      model: 'openrouter/model',
+      modality: 'text' as const,
+      startedAt,
+    })
+    database.providerUsage.start(usage('unknown', 100))
+    database.providerUsage.bindIdentity('operation_unknown', { generationId: 'generation_unknown' })
+    database.providerUsage.markUnknown('operation_unknown', 100)
+    database.providerUsage.start(usage('pending', 200))
+    database.providerUsage.bindIdentity('operation_pending', { generationId: 'generation_pending' })
+    database.close()
+
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const runtime = createApplicationRuntime(options(root, {
+      openRouter: {
+        listModels: async () => [],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      },
+    }))
+    try {
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-capability')
+      await runtime.recover()
+      await vi.advanceTimersByTimeAsync(100_000)
+      await runtime.close()
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const sqlite = new Database(databasePath, { readonly: true })
+    try {
+      expect(sqlite.prepare(`
+        SELECT operation_key AS operationKey, status, reconcile_attempts AS reconcileAttempts,
+               next_reconcile_at AS nextReconcileAt, ended_at AS endedAt
+        FROM provider_usage_events
+        ORDER BY operation_key
+      `).all()).toEqual([
+        {
+          operationKey: 'operation_pending', status: 'unknown', reconcileAttempts: 0,
+          nextReconcileAt: 11_000, endedAt: 10_000,
+        },
+        {
+          operationKey: 'operation_unknown', status: 'unknown', reconcileAttempts: 0,
+          nextReconcileAt: 1_100, endedAt: 100,
+        },
+      ])
+    } finally {
+      sqlite.close()
+    }
+  })
+
   it('schedules exactly three due reconciliations at 1, 6, and 36 seconds after a terminal chat event', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-schedule-'))
     directories.push(root)
@@ -456,6 +525,7 @@ describe('createApplicationRuntime', () => {
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
+        getGenerationUsage: async (generationId) => ({ generationId }),
       },
       emitChat,
     }))
@@ -499,25 +569,13 @@ describe('createApplicationRuntime', () => {
     }
   })
 
-  it('serializes due reconciliations when all three scheduled rounds become ready', async () => {
+  it('starts each finite reconciliation delay only after the previous slow round settles', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-serial-'))
     directories.push(root)
     const first = deferred<void>()
-    let active = 0
-    let maximumActive = 0
     const reconcileDue = vi.spyOn(ProviderUsageReconciler.prototype, 'reconcileDue')
-      .mockImplementationOnce(async () => {
-        active += 1
-        maximumActive = Math.max(maximumActive, active)
-        await first.promise
-        active -= 1
-      })
-      .mockImplementation(async () => {
-        active += 1
-        maximumActive = Math.max(maximumActive, active)
-        await Promise.resolve()
-        active -= 1
-      })
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(undefined)
     const runtime = createApplicationRuntime(options(root, {
       openRouter: {
         listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
@@ -525,6 +583,7 @@ describe('createApplicationRuntime', () => {
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
+        getGenerationUsage: async (generationId) => ({ generationId }),
       },
     }))
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
@@ -534,12 +593,23 @@ describe('createApplicationRuntime', () => {
     try {
       const conversation = await runtime.services.chat.createConversation()
       await runtime.services.chat.send(chatInput(conversation.id, 'serialize reconciliation'))
-      await vi.advanceTimersByTimeAsync(36_000)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(9_000)
       expect(reconcileDue).toHaveBeenCalledTimes(1)
       first.resolve()
       await vi.advanceTimersByTimeAsync(0)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reconcileDue).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(29_999)
+      expect(reconcileDue).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1)
       expect(reconcileDue).toHaveBeenCalledTimes(3)
-      expect(maximumActive).toBe(1)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(3)
       await runtime.close()
     } finally {
       vi.useRealTimers()
@@ -560,6 +630,7 @@ describe('createApplicationRuntime', () => {
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
+        getGenerationUsage: async (generationId) => ({ generationId }),
       },
     }))
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
@@ -1547,12 +1618,14 @@ describe('createApplicationRuntime', () => {
       browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
     const conversation = await runtime.services.chat.createConversation()
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'missing key')))
       .rejects.toMatchObject({ code: 'CREDENTIAL_UNAVAILABLE' })
     expect(validateCredential).not.toHaveBeenCalled()
     expect(stream).not.toHaveBeenCalled()
 
+    await runtime.services.settings.update({ activeProvider: 'deepseek' })
     await runtime.services.settings.saveProviderApiKey('deepseek', 'invalid')
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'invalid key')))
       .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
