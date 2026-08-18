@@ -450,6 +450,7 @@ describe('OpenRouterProvider', () => {
       prompt: 'slow camera move',
       options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
       references: [],
+      frameImages: [],
     })).resolves.toEqual({ providerJobId: 'abc123', status: 'pending' })
     await expect(provider.pollVideo('abc123')).resolves.toEqual({
       status: 'completed',
@@ -487,6 +488,7 @@ describe('OpenRouterProvider', () => {
       prompt: 'animate',
       options: { durationSeconds: 10, resolution: '1080p', aspectRatio: '9:16', generateAudio: true },
       references: [{ mimeType: 'image/webp', dataBase64: 'AQID' }],
+      frameImages: ['first_frame', 'last_frame'],
     })).resolves.toEqual({ providerJobId: 'job_1', status: 'in_progress' })
 
     const expected = {
@@ -499,7 +501,7 @@ describe('OpenRouterProvider', () => {
       frame_images: [{
         type: 'image_url',
         image_url: { url: 'data:image/webp;base64,AQID' },
-        frame_type: 'first_frame',
+        frame_type: 'last_frame',
       }],
     }
     expect(fetch).toHaveBeenCalledTimes(1)
@@ -522,6 +524,7 @@ describe('OpenRouterProvider', () => {
         { mimeType: 'image/png', dataBase64: 'AQID' },
         { mimeType: 'image/jpeg', dataBase64: 'BAUG' },
       ],
+      frameImages: ['first_frame', 'last_frame'],
     })).resolves.toEqual({ providerJobId: 'job_1', status: 'pending' })
 
     expect(JSON.parse(bodies[0]!)).toMatchObject({
@@ -553,9 +556,36 @@ describe('OpenRouterProvider', () => {
         { length: 3 },
         () => ({ mimeType: 'image/png' as const, dataBase64: 'AQID' }),
       ),
+      frameImages: ['first_frame', 'last_frame'],
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(localCredential.get).not.toHaveBeenCalled()
     expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [['first_frame'] as const, 'first_frame'],
+    [['last_frame'] as const, 'last_frame'],
+  ])('uses the only supported %s capability for one video image', async (frameImages, expectedType) => {
+    const bodies: string[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(String(init?.body))
+        return Response.json({ id: 'job_1', status: 'pending' }, { status: 202 })
+      }),
+    })
+
+    await provider.submitVideo({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 8, resolution: '1080p', aspectRatio: '16:9', generateAudio: false },
+      references: [{ mimeType: 'image/png', dataBase64: 'AQID' }],
+      frameImages: [...frameImages],
+    })
+
+    expect(JSON.parse(bodies[0]!)).toMatchObject({
+      frame_images: [{ frame_type: expectedType }],
+    })
   })
 
   it.each([
@@ -720,6 +750,7 @@ describe('OpenRouterProvider', () => {
       prompt: 'animate',
       options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
       references: [],
+      frameImages: [],
     })).rejects.toMatchObject({
       code: 'MODEL_PROVIDER_REQUEST_FAILED',
       message: 'The model provider request failed.',

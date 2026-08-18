@@ -48,6 +48,7 @@ const route: ResolvedChatRoute & { outputType: 'video' } = {
   outputType: 'video',
   assets: [],
   generation,
+  videoFrameImages: ['first_frame', 'last_frame'],
 }
 
 const submitInput = {
@@ -645,6 +646,7 @@ describe('VideoJobRunner', () => {
 
     expect(harness.provider.submitVideo).toHaveBeenCalledWith(expect.objectContaining({
       references: [{ mimeType: 'image/png', dataBase64: 'iVBORw0KGgo=' }],
+      frameImages: ['first_frame', 'last_frame'],
     }))
     expect(harness.database.mediaAssets.get('reference_image')?.messageId).toBe('user_message_1')
     expect(harness.database.messages.get('user_message_1')?.blocks).toEqual(userBlocks)

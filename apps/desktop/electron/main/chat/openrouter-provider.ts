@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { toSafeAppError, type AppError } from '@autoforge/shared'
+import { toSafeAppError, type AppError, type VideoFrameType } from '@autoforge/shared'
 import {
   mergeOpenRouterModels,
   OpenAiCompatibleProvider,
@@ -116,6 +116,7 @@ const videoRequestSchema = z.object({
     generateAudio: z.boolean(),
   }).strict(),
   references: z.array(imageReferenceSchema).max(2),
+  frameImages: z.array(z.enum(['first_frame', 'last_frame'])).max(2),
   signal: abortSignalSchema.optional(),
 }).strict()
 const providerJobIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/)
@@ -227,10 +228,21 @@ function wireReferences(references: Array<{ mimeType: string; dataBase64: string
   }))
 }
 
-function wireFrameImages(references: Array<{ mimeType: string; dataBase64: string }>) {
+function wireFrameImages(
+  references: Array<{ mimeType: string; dataBase64: string }>,
+  frameImages: VideoFrameType[],
+) {
+  if (references.length === 0) return []
+  if (references.length > frameImages.length) throw failure('MODEL_MODALITY_UNSUPPORTED')
+  const types: VideoFrameType[] = references.length === 1
+    ? [frameImages.includes('last_frame') ? 'last_frame' : frameImages[0]!]
+    : ['first_frame', 'last_frame']
+  if (types.some((type) => !frameImages.includes(type))) {
+    throw failure('MODEL_MODALITY_UNSUPPORTED')
+  }
   return wireReferences(references).map((reference, index) => ({
     ...reference,
-    frame_type: index === 0 ? 'first_frame' : 'last_frame',
+    frame_type: types[index]!,
   }))
 }
 
@@ -343,7 +355,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       'video',
       parsedRequest.signal,
       () => {
-        const frameImages = wireFrameImages(parsedRequest.references)
+        const frameImages = wireFrameImages(parsedRequest.references, parsedRequest.frameImages)
         return {
           method: 'POST',
           headers: { 'content-type': 'application/json' },

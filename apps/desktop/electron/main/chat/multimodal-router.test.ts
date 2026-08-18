@@ -288,6 +288,43 @@ describe('resolveChatRoute', () => {
     expect(route.assets).not.toBe(assets)
   })
 
+  it('carries exact video frame capabilities and rejects excess frame images', () => {
+    const bothFrames = model({
+      id: 'video/both-frames',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['video'],
+      generation: {
+        video: {
+          resolutions: ['1080p'],
+          aspectRatios: ['16:9'],
+          durations: [8],
+          supportsAudio: false,
+          frameImages: ['first_frame', 'last_frame'],
+        },
+      },
+    })
+    const frames = [asset('image', { id: 'first' }), asset('image', { id: 'last' })]
+
+    expect(resolveChatRoute(input({
+      requestedModel: bothFrames.id,
+      requestedOutput: 'video',
+      models: [bothFrames],
+      assets: frames,
+    }))).toMatchObject({ videoFrameImages: ['first_frame', 'last_frame'] })
+
+    const firstFrameOnly = model({
+      ...bothFrames,
+      id: 'video/first-frame-only',
+      generation: { video: { ...bothFrames.generation.video!, frameImages: ['first_frame'] } },
+    })
+    expect(() => resolveChatRoute(input({
+      requestedModel: firstFrameOnly.id,
+      requestedOutput: 'video',
+      models: [firstFrameOnly],
+      assets: frames,
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
   it('fails locally when selected-output capability metadata cannot support a generation option', () => {
     expect(() => resolveChatRoute(input({
       requestedModel: 'image/model',

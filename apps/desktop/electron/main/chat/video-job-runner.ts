@@ -334,6 +334,7 @@ export class VideoJobRunner {
         prompt: input.prompt,
         options: input.route.generation.video,
         references: inputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
+        frameImages: input.route.videoFrameImages ?? [],
         signal: controller.signal,
       })
       if (

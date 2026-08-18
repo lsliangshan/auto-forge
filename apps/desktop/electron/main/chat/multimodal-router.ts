@@ -7,6 +7,7 @@ import {
   type ModelProviderId,
   type OutputType,
   type ProviderDefaultModels,
+  type VideoFrameType,
 } from '@autoforge/shared'
 import type { ResolvedMediaAsset } from '../media/media-asset-service.js'
 import type { ModelImageParameterSupport } from './model-provider.js'
@@ -37,6 +38,7 @@ export interface ResolvedChatRoute {
   assets: ResolvedMediaAsset[]
   generation: GenerationOptions
   imageParameterSupport?: ModelImageParameterSupport
+  videoFrameImages?: VideoFrameType[]
 }
 
 export interface OutputSelectionRequired {
@@ -111,6 +113,8 @@ function isModel(model: unknown): model is ModelInfo {
       && isStringArray(video.aspectRatios)
       && isNumberArray(video.durations)
       && typeof video.supportsAudio === 'boolean'
+      && Array.isArray(video.frameImages)
+      && video.frameImages.every((frame) => frame === 'first_frame' || frame === 'last_frame')
     ))
 }
 
@@ -166,6 +170,7 @@ function supportsRequest(model: ModelInfo, output: ConcreteOutput, assets: reado
     || !supportsGeneration(model, output)
   ) return false
   if ((output === 'image' || output === 'video') && assets.some((asset) => asset.kind !== 'image')) return false
+  if (output === 'video' && assets.length > (model.generation.video?.frameImages.length ?? 0)) return false
   return assets.every((asset) => model.inputModalities.includes(asset.kind))
 }
 
@@ -319,6 +324,9 @@ function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteO
         aspectRatio: imageCapability.aspectRatios.length > 0,
         outputFormat: imageCapability.formats.length > 0,
       },
+    } : {}),
+    ...(output === 'video' ? {
+      videoFrameImages: model.generation.video!.frameImages.slice(),
     } : {}),
   }
 }
