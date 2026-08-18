@@ -69,7 +69,11 @@ const allImageParameters = {
 
 describe('OpenRouterProvider', () => {
   it('serializes an end user only in OpenRouter chat requests', async () => {
-    const fetch = vi.fn(async () => sseResponse(['data: [DONE]\n\n']))
+    const bodies: unknown[] = []
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)))
+      return sseResponse(['data: [DONE]\n\n'])
+    })
     const provider = new OpenRouterProvider({ credential, fetch })
 
     await collect(provider.stream({
@@ -82,10 +86,10 @@ describe('OpenRouterProvider', () => {
       messages: [{ role: 'user', content: 'hello' }],
     }))
 
-    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toMatchObject({
+    expect(bodies[0]).toMatchObject({
       user: 'autoforge:user-1',
     })
-    expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).not.toHaveProperty('user')
+    expect(bodies[1]).not.toHaveProperty('user')
   })
 
   it('does not serialize a chat end user into image or video bodies', async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { DeepSeekProvider } from './deepseek-provider.js'
-import type { ModelStreamEvent } from './model-provider.js'
+import type { ModelProvider, ModelStreamEvent } from './model-provider.js'
 import { NetworkProxyService } from '../network/network-proxy-service.js'
 
 function sseResponse(chunks: string[]): Response {
@@ -21,8 +21,12 @@ async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelSt
 
 describe('DeepSeekProvider', () => {
   it('does not serialize an end user into DeepSeek chat requests', async () => {
-    const fetch = vi.fn(async () => sseResponse(['data: [DONE]\n\n']))
-    const provider = new DeepSeekProvider({
+    let body: unknown
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body))
+      return sseResponse(['data: [DONE]\n\n'])
+    })
+    const provider: ModelProvider = new DeepSeekProvider({
       credential: { get: vi.fn(async () => 'sk-deepseek-private') },
       fetch,
     })
@@ -33,7 +37,7 @@ describe('DeepSeekProvider', () => {
       endUserId: 'user-1',
     } as never))
 
-    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).not.toHaveProperty('user')
+    expect(body).not.toHaveProperty('user')
     expect(provider.getGenerationUsage).toBeUndefined()
   })
 
