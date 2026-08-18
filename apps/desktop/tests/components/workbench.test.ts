@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils'
+import { mount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
@@ -6,11 +6,14 @@ import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
 import type { AppSettings, DesktopAPI, ModelInfo, TokenUsageSnapshot } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
+import { tokenColors } from '../../src/components/settings/token-usage-chart-options'
 import { routes } from '../../src/router/index'
 import { useExecutionStore } from '../../src/stores/execution'
 import { useChatStore } from '../../src/stores/chat'
 import { useSettingsStore } from '../../src/stores/settings'
 import { useWorkflowStore } from '../../src/stores/workflow'
+
+const mountedAppWrappers: VueWrapper[] = []
 
 function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']): ModelInfo {
   return {
@@ -33,26 +36,47 @@ function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']
   }
 }
 
-function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSnapshot {
+function usagePeriod(
+  startedAt: string,
+  endedAt: string,
+  totalTokens: number,
+  model = 'alpha/model',
+) {
   return {
-    monthStartedAt: '2026-08-01T00:00:00.000Z',
-    month: {
-      inputTokens: totalTokens,
-      outputTokens: 0,
-      totalTokens,
-      models: totalTokens === 0
-        ? []
-        : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
-    },
-    allTime: {
-      inputTokens: totalTokens,
-      outputTokens: 0,
-      totalTokens,
-      models: totalTokens === 0
-        ? []
-        : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
-    },
+    startedAt,
+    endedAt,
+    inputTokens: totalTokens,
+    outputTokens: 0,
+    totalTokens,
+    models: totalTokens === 0
+      ? []
+      : [{ model, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
+    trend: totalTokens === 0
+      ? []
+      : [{ startedAt, inputTokens: totalTokens, outputTokens: 0, totalTokens }],
   }
+}
+
+function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSnapshot {
+  const generatedAt = '2026-08-17T04:00:00.000Z'
+  const todayStartedAt = '2026-08-16T16:00:00.000Z'
+  return {
+    generatedAt,
+    today: usagePeriod(todayStartedAt, generatedAt, totalTokens, model),
+    yesterday: usagePeriod('2026-08-15T16:00:00.000Z', todayStartedAt, totalTokens, model),
+    week: usagePeriod(todayStartedAt, generatedAt, totalTokens, model),
+    month: usagePeriod('2026-07-31T16:00:00.000Z', generatedAt, totalTokens, model),
+    allTime: usagePeriod('2026-07-01T00:00:00.000Z', generatedAt, totalTokens, model),
+  }
+}
+
+function computedColor(value: string) {
+  const probe = document.createElement('span')
+  probe.style.color = value
+  document.body.append(probe)
+  const color = getComputedStyle(probe).color
+  probe.remove()
+  return color
 }
 
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
@@ -92,11 +116,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
         provider, configured: false, validation: 'unchecked',
       })),
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
-      getTokenUsage: vi.fn().mockResolvedValue({
-        monthStartedAt: '2026-08-01T00:00:00.000Z',
-        month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-        allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [] },
-      }),
+      getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
@@ -127,7 +147,16 @@ async function mountApp(path = '/chat', api = createApi()) {
   setActivePinia(pinia)
   await router.push(path)
   await router.isReady()
-  const wrapper = mount(App, { global: { plugins: [pinia, router, ElementPlus] } })
+  const wrapper = mount(App, {
+    global: {
+      plugins: [pinia, router, ElementPlus],
+      stubs: {
+        TokenUsageLineChart: { template: '<div data-testid="token-usage-line-chart" />' },
+        TokenUsageBarChart: { template: '<div data-testid="token-usage-bar-chart" />' },
+      },
+    },
+  })
+  mountedAppWrappers.push(wrapper)
   await Promise.resolve()
   return { wrapper, router, api, pinia }
 }
@@ -137,7 +166,12 @@ describe('workbench', () => {
     vi.clearAllMocks()
     setActivePinia(createPinia())
   })
-  afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+  afterEach(() => {
+    for (const wrapper of mountedAppWrappers.splice(0)) {
+      if (wrapper.exists()) wrapper.unmount()
+    }
+    Reflect.deleteProperty(window, 'autoForge')
+  })
 
   it('renders exactly the five confirmed navigation items', async () => {
     const { wrapper } = await mountApp()
@@ -860,36 +894,145 @@ describe('workbench', () => {
     expect(api.settings.getTokenUsage).not.toHaveBeenCalled()
   })
 
-  it('renders monthly and all-time token usage and refreshes it from settings', async () => {
+  it('defaults to today and switches all token usage periods without refetching', async () => {
     const api = createApi()
-    vi.mocked(api.settings.getTokenUsage).mockResolvedValue({
-      monthStartedAt: '2026-08-01T00:00:00.000Z',
-      month: {
+    const usage = usageSnapshot(10, 'today/model')
+    usage.yesterday = usagePeriod(
+      '2026-08-15T16:00:00.000Z',
+      '2026-08-16T16:00:00.000Z',
+      20,
+      'yesterday/model',
+    )
+    usage.week = usagePeriod(usage.week.startedAt, usage.week.endedAt, 30, 'week/model')
+    usage.month = usagePeriod(usage.month.startedAt, usage.month.endedAt, 40, 'month/model')
+    usage.allTime = usagePeriod(usage.allTime.startedAt, usage.allTime.endedAt, 50, 'all/model')
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usage)
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10'))
+    expect(wrapper.findAll('[data-testid="billing-tabs"] .el-tabs__item').map((tab) => tab.text()))
+      .toEqual(['今日', '昨日', '本周', '本月', '累计'])
+    expect(wrapper.get('#tab-today').attributes('aria-selected')).toBe('true')
+    expect(wrapper.text()).toContain('today/model')
+    document.body.append(wrapper.element)
+    try {
+      for (const [testId, markerColor] of [
+        ['billing-summary-input', tokenColors.input],
+        ['billing-summary-output', tokenColors.output],
+        ['billing-summary-total', tokenColors.total],
+      ] as const) {
+        const card = wrapper.get(`[data-testid="${testId}"]`)
+        const marker = card.get('.billing-summary-marker')
+        expect(marker.attributes('aria-hidden')).toBe('true')
+        expect(getComputedStyle(marker.element).backgroundColor).toBe(computedColor(markerColor))
+        expect(getComputedStyle(card.get('dd').element).color).toBe(computedColor(tokenColors.total))
+      }
+    } finally {
+      wrapper.element.remove()
+    }
+
+    for (const [key, expected] of [
+      ['yesterday', '20'], ['week', '30'], ['month', '40'], ['allTime', '50'],
+    ] as const) {
+      await wrapper.get(`#tab-${key}`).trigger('click')
+      expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain(expected)
+    }
+    expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the selected range, both charts and keeps the period while refreshing', async () => {
+    const api = createApi()
+    const usage = usageSnapshot(10)
+    usage.yesterday = {
+      ...usage.yesterday,
+      inputTokens: 1_200,
+      outputTokens: 34,
+      totalTokens: 1_234,
+      models: [{ model: 'precise/model', inputTokens: 1_200, outputTokens: 34, totalTokens: 1_234 }],
+      trend: [{
+        startedAt: usage.yesterday.startedAt,
         inputTokens: 1_200,
         outputTokens: 34,
         totalTokens: 1_234,
-        models: [{ model: 'month/model', inputTokens: 1_200, outputTokens: 34, totalTokens: 1_234 }],
-      },
-      allTime: {
-        inputTokens: 50_000,
-        outputTokens: 6_789,
-        totalTokens: 56_789,
-        models: [{ model: 'all/model', inputTokens: 50_000, outputTokens: 6_789, totalTokens: 56_789 }],
-      },
-    })
-
+      }],
+    }
+    const refreshedUsage = usageSnapshot(99, 'refreshed/model')
+    let resolveRefresh!: (value: TokenUsageSnapshot) => void
+    const refreshResponse = new Promise<TokenUsageSnapshot>((resolve) => { resolveRefresh = resolve })
+    vi.mocked(api.settings.getTokenUsage)
+      .mockResolvedValueOnce(usage)
+      .mockReturnValueOnce(refreshResponse)
     const { wrapper } = await mountApp('/settings', api)
-    await vi.waitFor(() => expect(wrapper.find('[data-testid="billing-summary-total"]').exists()).toBe(true))
-    expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(1)
-    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('1,234')
-    expect(wrapper.text()).toContain('month/model')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10'))
+
+    await wrapper.get('#tab-yesterday').trigger('click')
+    const expectedYesterdayEnd = new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    }).format(new Date(Date.parse('2026-08-16T16:00:00.000Z') - 1))
+    expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain(expectedYesterdayEnd)
+
+    const contentOrder = wrapper.findAll('.billing-chart-section, .billing-table-wrap')
+    expect(contentOrder.map((item) => {
+      if (item.find('[data-testid="token-usage-line-chart"]').exists()) return 'line'
+      if (item.find('[data-testid="token-usage-bar-chart"]').exists()) return 'bar'
+      if (item.find('.billing-table').exists()) return 'table'
+      return 'unknown'
+    })).toEqual(['line', 'bar', 'table'])
+
+    const chartSections = wrapper.findAll('.billing-chart-section')
+    expect(chartSections).toHaveLength(2)
+    expect(chartSections.map((section) => {
+      const labelledBy = section.attributes('aria-labelledby')
+      const heading = section.get(`#${labelledBy}`)
+      expect(heading.element.tagName).toBe('H3')
+      return heading.text()
+    })).toEqual(['Token 趋势', '模型用量'])
+
+    const table = wrapper.get('.billing-table')
+    expect(table.attributes('aria-label')).toBe('模型 Token 精确用量')
+    const headers = table.findAll('th')
+    expect(headers).toHaveLength(4)
+    expect(headers.map((cell) => cell.text()))
+      .toEqual(['模型', '输入 Token', '输出 Token', '总 Token'])
+    expect(headers.map((cell) => cell.attributes('scope'))).toEqual(['col', 'col', 'col', 'col'])
+    expect(table.get('tbody tr').findAll('td').map((cell) => cell.text()))
+      .toEqual(['precise/model', '1,200', '34', '1,234'])
+
+    await wrapper.get('#tab-month').trigger('click')
+    expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain('2026')
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10')
+
+    const refreshClick = wrapper.get('[data-testid="billing-refresh"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(2))
+    expect(wrapper.get('#tab-month').attributes('aria-selected')).toBe('true')
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('10')
+
+    resolveRefresh(refreshedUsage)
+    await refreshClick
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('99'))
+    expect(wrapper.get('#tab-month').attributes('aria-selected')).toBe('true')
+  })
+
+  it('shows zero cards and one empty state instead of charts and table', async () => {
+    const api = createApi()
+    const usage = usageSnapshot(0)
+    usage.today.trend = [{
+      startedAt: usage.today.startedAt,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    }]
+    vi.mocked(api.settings.getTokenUsage).mockResolvedValue(usage)
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('暂无 Token 用量记录'))
+    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('0')
+    expect(wrapper.findAll('.billing-empty').filter((item) => item.text() === '暂无 Token 用量记录')).toHaveLength(1)
+    expect(wrapper.find('[data-testid="token-usage-line-chart"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="token-usage-bar-chart"]').exists()).toBe(false)
+    expect(wrapper.find('.billing-table').exists()).toBe(false)
 
     await wrapper.get('#tab-allTime').trigger('click')
-    expect(wrapper.get('[data-testid="billing-summary-total"]').text()).toContain('56,789')
-    expect(wrapper.text()).toContain('all/model')
-
-    await wrapper.get('[data-testid="billing-refresh"]').trigger('click')
-    await vi.waitFor(() => expect(api.settings.getTokenUsage).toHaveBeenCalledTimes(2))
+    expect(wrapper.get('[data-testid="billing-period-range"]').text()).toContain('暂无保留记录')
   })
 
   it('shows token usage empty and isolated error states', async () => {

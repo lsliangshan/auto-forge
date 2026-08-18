@@ -203,7 +203,7 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
-  it('returns a local-calendar-month token usage snapshot', async () => {
+  it('returns a token usage snapshot across five local-calendar periods', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-token-usage-'))
     directories.push(root)
     const databasePath = join(root, 'autoforge.sqlite')
@@ -215,7 +215,7 @@ describe('createApplicationRuntime', () => {
       requestId: 'usage_request',
       model: 'alpha/model',
       status: 'failed',
-      startedAt: new Date(2026, 7, 1).getTime(),
+      startedAt: new Date(2026, 7, 17, 10).getTime(),
       inputTokens: 4,
       outputTokens: 6,
     })
@@ -225,21 +225,21 @@ describe('createApplicationRuntime', () => {
     vi.setSystemTime(new Date(2026, 7, 17, 12))
     const runtime = createApplicationRuntime(options(root))
     try {
-      await expect(runtime.services.settings.getTokenUsage()).resolves.toEqual({
-        monthStartedAt: new Date(2026, 7, 1).toISOString(),
-        month: {
-          inputTokens: 4,
-          outputTokens: 6,
-          totalTokens: 10,
-          models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
-        },
-        allTime: {
-          inputTokens: 4,
-          outputTokens: 6,
-          totalTokens: 10,
-          models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
-        },
+      const usage = await runtime.services.settings.getTokenUsage()
+
+      expect(usage.generatedAt).toBe(new Date(2026, 7, 17, 12).toISOString())
+      expect(usage.today).toMatchObject({
+        startedAt: new Date(2026, 7, 17).toISOString(),
+        inputTokens: 4,
+        outputTokens: 6,
+        totalTokens: 10,
+        models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
       })
+      expect(usage.today.trend.reduce((sum, point) => sum + point.totalTokens, 0)).toBe(10)
+      expect(usage.yesterday.totalTokens).toBe(0)
+      expect(usage.week.totalTokens).toBe(10)
+      expect(usage.month.totalTokens).toBe(10)
+      expect(usage.allTime.totalTokens).toBe(10)
     } finally {
       await runtime.close()
       vi.useRealTimers()

@@ -402,51 +402,127 @@ describe('cross-process contracts', () => {
   })
 
   it('requires internally consistent token usage snapshots', () => {
+    const period = (
+      startedAt: string,
+      endedAt: string,
+      inputTokens: number,
+      outputTokens: number,
+      model = 'alpha/model',
+    ) => ({
+      startedAt,
+      endedAt,
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      models: inputTokens + outputTokens === 0
+        ? []
+        : [{ model, inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }],
+      trend: inputTokens + outputTokens === 0
+        ? []
+        : [{ startedAt, inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }],
+    })
+
     const snapshot = {
-      monthStartedAt: '2026-08-01T00:00:00.000Z',
-      month: {
-        inputTokens: 7,
-        outputTokens: 3,
-        totalTokens: 10,
-        models: [{ model: 'alpha/model', inputTokens: 7, outputTokens: 3, totalTokens: 10 }],
-      },
-      allTime: {
-        inputTokens: 9,
-        outputTokens: 6,
-        totalTokens: 15,
-        models: [
-          { model: 'alpha/model', inputTokens: 7, outputTokens: 3, totalTokens: 10 },
-          { model: 'beta/model', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
-        ],
-      },
+      generatedAt: '2026-08-17T04:30:00.000Z',
+      today: period('2026-08-16T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 7, 3),
+      yesterday: period('2026-08-15T16:00:00.000Z', '2026-08-16T16:00:00.000Z', 2, 1),
+      week: period('2026-08-16T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 7, 3),
+      month: period('2026-07-31T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 9, 4),
+      allTime: period('2026-07-01T01:00:00.000Z', '2026-08-17T04:30:00.000Z', 12, 6),
+    }
+    const withTodayTokenCounts = (inputTokens: number, outputTokens: number) => {
+      const totalTokens = inputTokens + outputTokens
+      return {
+        ...snapshot,
+        today: {
+          ...snapshot.today,
+          inputTokens,
+          outputTokens,
+          totalTokens,
+          models: [{ ...snapshot.today.models[0], inputTokens, outputTokens, totalTokens }],
+          trend: [{ ...snapshot.today.trend[0], inputTokens, outputTokens, totalTokens }],
+        },
+      }
+    }
+    const expectTimestampFailure = (value: unknown, path: Array<string | number>) => {
+      const result = tokenUsageSnapshotSchema.safeParse(value)
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path, code: 'invalid_format', format: 'datetime' }),
+      ]))
     }
 
     expect(tokenUsageSnapshotSchema.parse(snapshot)).toEqual(snapshot)
+    for (const [description, inputTokens, outputTokens] of [
+      ['negative token count', -1, 3],
+      ['fractional token count', 1.5, 3],
+      ['unsafe token count', Number.MAX_SAFE_INTEGER + 1, 0],
+    ] as const) {
+      expect(() => tokenUsageSnapshotSchema.parse(withTodayTokenCounts(inputTokens, outputTokens)), description)
+        .toThrow()
+    }
+    expectTimestampFailure({
+      ...snapshot,
+      generatedAt: 'not-a-timestamp',
+    }, ['generatedAt'])
+    expectTimestampFailure({
+      ...snapshot,
+      today: { ...snapshot.today, startedAt: 'not-a-timestamp' },
+    }, ['today', 'startedAt'])
+    expectTimestampFailure({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        trend: [{ ...snapshot.today.trend[0], startedAt: 'not-a-timestamp' }],
+      },
+    }, ['today', 'trend', 0, 'startedAt'])
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
-      month: { ...snapshot.month, totalTokens: 9 },
+      today: { ...snapshot.today, startedAt: '2026-08-18T00:00:00.000Z' },
     })).toThrow()
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
-      allTime: {
-        ...snapshot.allTime,
-        models: [...snapshot.allTime.models, snapshot.allTime.models[0]],
+      today: {
+        ...snapshot.today,
+        trend: [
+          { startedAt: '2026-08-17T03:00:00.000Z', inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+          { startedAt: '2026-08-17T02:00:00.000Z', inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+        ],
       },
     })).toThrow()
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
-      month: { ...snapshot.month, inputTokens: Number.MAX_SAFE_INTEGER + 1 },
+      today: {
+        ...snapshot.today,
+        trend: [{ ...snapshot.today.trend[0], totalTokens: 9 }],
+      },
     })).toThrow()
     expect(() => tokenUsageSnapshotSchema.parse({
       ...snapshot,
-      monthStartedAt: 'not-a-timestamp',
+      today: { ...snapshot.today, inputTokens: 8, totalTokens: 11 },
     })).toThrow()
-    for (const inputTokens of [-1, 1.5]) {
-      expect(() => tokenUsageSnapshotSchema.parse({
-        ...snapshot,
-        month: { ...snapshot.month, inputTokens },
-      })).toThrow()
-    }
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        models: [
+          ...snapshot.today.models,
+          { model: 'alpha/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        ],
+      },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        trend: [{ ...snapshot.today.trend[0], startedAt: snapshot.today.endedAt }],
+      },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      yesterday: { ...snapshot.yesterday, endedAt: '2026-08-16T15:59:59.999Z' },
+    })).toThrow()
     expect(ipcChannels.settingsGetTokenUsage).toBe('settings:get-token-usage')
     expect(ipcRequestSchemas[ipcChannels.settingsGetTokenUsage].parse(undefined)).toBeUndefined()
     expect(ipcResponseSchemas[ipcChannels.settingsGetTokenUsage].parse(snapshot)).toEqual(snapshot)

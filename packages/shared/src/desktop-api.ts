@@ -433,43 +433,105 @@ export const modelTokenUsageSchema = z.object({
   }
 })
 
+export const tokenUsagePeriodKeys = ['today', 'yesterday', 'week', 'month', 'allTime'] as const
+export type TokenUsagePeriodKey = (typeof tokenUsagePeriodKeys)[number]
+
+export const tokenUsageTrendPointSchema = z.object({
+  startedAt: timestampSchema,
+  ...tokenUsageShape,
+}).strict().superRefine((point, context) => {
+  const total = point.inputTokens + point.outputTokens
+  if (!Number.isSafeInteger(total) || point.totalTokens !== total) {
+    context.addIssue({
+      code: 'custom',
+      path: ['totalTokens'],
+      message: 'Trend total must equal input plus output',
+    })
+  }
+})
+
 export const tokenUsagePeriodSchema = z.object({
+  startedAt: timestampSchema,
+  endedAt: timestampSchema,
   ...tokenUsageShape,
   models: z.array(modelTokenUsageSchema),
+  trend: z.array(tokenUsageTrendPointSchema),
 }).strict().superRefine((usage, context) => {
-  const ids = new Set<string>()
-  let inputTokens = 0
-  let outputTokens = 0
+  const startedAt = Date.parse(usage.startedAt)
+  const endedAt = Date.parse(usage.endedAt)
+  if (startedAt > endedAt) {
+    context.addIssue({ code: 'custom', path: ['endedAt'], message: 'Period end must not precede start' })
+  }
+
+  const modelIds = new Set<string>()
+  let modelInput = 0
+  let modelOutput = 0
   for (const model of usage.models) {
-    if (ids.has(model.model)) {
+    if (modelIds.has(model.model)) {
+      context.addIssue({ code: 'custom', path: ['models'], message: 'Token usage models must be unique' })
+    }
+    modelIds.add(model.model)
+    modelInput += model.inputTokens
+    modelOutput += model.outputTokens
+  }
+
+  let trendInput = 0
+  let trendOutput = 0
+  let previousStartedAt = -1
+  for (const point of usage.trend) {
+    const pointStartedAt = Date.parse(point.startedAt)
+    if (pointStartedAt < startedAt || pointStartedAt >= endedAt || pointStartedAt <= previousStartedAt) {
       context.addIssue({
         code: 'custom',
-        path: ['models'],
-        message: 'Token usage models must be unique',
+        path: ['trend'],
+        message: 'Trend points must be unique, ordered and inside the period',
       })
     }
-    ids.add(model.model)
-    inputTokens += model.inputTokens
-    outputTokens += model.outputTokens
+    previousStartedAt = pointStartedAt
+    trendInput += point.inputTokens
+    trendOutput += point.outputTokens
   }
-  const totalTokens = inputTokens + outputTokens
-  if (!Number.isSafeInteger(inputTokens)
-    || !Number.isSafeInteger(outputTokens)
-    || !Number.isSafeInteger(totalTokens)
-    || usage.inputTokens !== inputTokens
-    || usage.outputTokens !== outputTokens
-    || usage.totalTokens !== totalTokens) {
-    context.addIssue({ code: 'custom', message: 'Period totals must equal model totals' })
+
+  const totals = [
+    modelInput,
+    modelOutput,
+    modelInput + modelOutput,
+    trendInput,
+    trendOutput,
+    trendInput + trendOutput,
+  ]
+  if (totals.some((value) => !Number.isSafeInteger(value))
+    || usage.inputTokens !== modelInput
+    || usage.outputTokens !== modelOutput
+    || usage.totalTokens !== modelInput + modelOutput
+    || usage.inputTokens !== trendInput
+    || usage.outputTokens !== trendOutput
+    || usage.totalTokens !== trendInput + trendOutput) {
+    context.addIssue({ code: 'custom', message: 'Period, model and trend totals must match' })
   }
 })
 
 export const tokenUsageSnapshotSchema = z.object({
-  monthStartedAt: timestampSchema,
+  generatedAt: timestampSchema,
+  today: tokenUsagePeriodSchema,
+  yesterday: tokenUsagePeriodSchema,
+  week: tokenUsagePeriodSchema,
   month: tokenUsagePeriodSchema,
   allTime: tokenUsagePeriodSchema,
-}).strict()
+}).strict().superRefine((snapshot, context) => {
+  const generatedAt = Date.parse(snapshot.generatedAt)
+  for (const key of ['today', 'week', 'month', 'allTime'] as const) {
+    if (Date.parse(snapshot[key].endedAt) !== generatedAt) {
+      context.addIssue({ code: 'custom', path: [key, 'endedAt'], message: 'Active period must end at generation time' })
+    }
+  }
+  if (Date.parse(snapshot.yesterday.endedAt) !== Date.parse(snapshot.today.startedAt)) {
+    context.addIssue({ code: 'custom', path: ['yesterday', 'endedAt'], message: 'Yesterday must end when today starts' })
+  }
+})
 
 export type ModelTokenUsage = z.infer<typeof modelTokenUsageSchema>
+export type TokenUsageTrendPoint = z.infer<typeof tokenUsageTrendPointSchema>
 export type TokenUsagePeriod = z.infer<typeof tokenUsagePeriodSchema>
 export type TokenUsageSnapshot = z.infer<typeof tokenUsageSnapshotSchema>
 

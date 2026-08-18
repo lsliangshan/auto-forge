@@ -38,74 +38,128 @@
           data-testid="billing-tabs"
         >
           <el-tab-pane
-            label="本月"
-            name="month"
-          />
-          <el-tab-pane
-            label="累计"
-            name="allTime"
+            v-for="option in periodOptions"
+            :key="option.key"
+            :label="option.label"
+            :name="option.key"
           />
         </el-tabs>
         <p
-          v-if="activePeriod === 'month'"
+          data-testid="billing-period-range"
           class="billing-period"
         >
-          统计自 {{ formatMonthStart(usage.monthStartedAt) }}
+          {{ formatRange(activeUsage, activePeriod) }}
         </p>
         <dl class="billing-summary">
-          <div>
-            <dt>输入 Token</dt>
-            <dd>{{ formatTokens(activeUsage.inputTokens) }}</dd>
+          <div
+            data-testid="billing-summary-input"
+          >
+            <dt>
+              <span
+                class="billing-summary-marker"
+                aria-hidden="true"
+                :style="{ backgroundColor: tokenColors.input }"
+              />
+              输入 Token
+            </dt>
+            <dd :style="{ color: tokenColors.total }">
+              {{ formatTokens(activeUsage.inputTokens) }}
+            </dd>
           </div>
-          <div>
-            <dt>输出 Token</dt>
-            <dd>{{ formatTokens(activeUsage.outputTokens) }}</dd>
+          <div
+            data-testid="billing-summary-output"
+          >
+            <dt>
+              <span
+                class="billing-summary-marker"
+                aria-hidden="true"
+                :style="{ backgroundColor: tokenColors.output }"
+              />
+              输出 Token
+            </dt>
+            <dd :style="{ color: tokenColors.total }">
+              {{ formatTokens(activeUsage.outputTokens) }}
+            </dd>
           </div>
-          <div data-testid="billing-summary-total">
-            <dt>总 Token</dt>
-            <dd>{{ formatTokens(activeUsage.totalTokens) }}</dd>
+          <div
+            data-testid="billing-summary-total"
+          >
+            <dt>
+              <span
+                class="billing-summary-marker"
+                aria-hidden="true"
+                :style="{ backgroundColor: tokenColors.total }"
+              />
+              总 Token
+            </dt>
+            <dd :style="{ color: tokenColors.total }">
+              {{ formatTokens(activeUsage.totalTokens) }}
+            </dd>
           </div>
         </dl>
+        <template v-if="hasUsage">
+          <section
+            class="billing-chart-section"
+            aria-labelledby="token-trend-title"
+          >
+            <h3 id="token-trend-title">
+              Token 趋势
+            </h3>
+            <TokenUsageLineChart
+              :period="activeUsage"
+              :period-key="activePeriod"
+            />
+          </section>
+          <section
+            class="billing-chart-section"
+            aria-labelledby="token-model-title"
+          >
+            <h3 id="token-model-title">
+              模型用量
+            </h3>
+            <TokenUsageBarChart :models="activeUsage.models" />
+          </section>
+          <div class="billing-table-wrap">
+            <table
+              class="billing-table"
+              aria-label="模型 Token 精确用量"
+            >
+              <thead>
+                <tr>
+                  <th scope="col">
+                    模型
+                  </th>
+                  <th scope="col">
+                    输入 Token
+                  </th>
+                  <th scope="col">
+                    输出 Token
+                  </th>
+                  <th scope="col">
+                    总 Token
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="model in activeUsage.models"
+                  :key="model.model"
+                >
+                  <td>{{ model.model }}</td>
+                  <td>{{ formatTokens(model.inputTokens) }}</td>
+                  <td>{{ formatTokens(model.outputTokens) }}</td>
+                  <td>{{ formatTokens(model.totalTokens) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
         <p
-          v-if="!activeUsage.models.length"
+          v-else
           class="billing-empty"
         >
           暂无 Token 用量记录
         </p>
-        <div
-          v-else
-          class="billing-table-wrap"
-        >
-          <table class="billing-table">
-            <thead>
-              <tr>
-                <th scope="col">
-                  模型
-                </th>
-                <th scope="col">
-                  输入 Token
-                </th>
-                <th scope="col">
-                  输出 Token
-                </th>
-                <th scope="col">
-                  总 Token
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="model in activeUsage.models"
-                :key="model.model"
-              >
-                <td>{{ model.model }}</td>
-                <td>{{ formatTokens(model.inputTokens) }}</td>
-                <td>{{ formatTokens(model.outputTokens) }}</td>
-                <td>{{ formatTokens(model.totalTokens) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
       </template>
     </div>
   </section>
@@ -113,8 +167,11 @@
 
 <script setup lang="ts">
 import { Refresh } from '@element-plus/icons-vue'
-import type { TokenUsagePeriod, TokenUsageSnapshot } from '@autoforge/shared'
+import type { TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '@autoforge/shared'
 import { computed, ref } from 'vue'
+import TokenUsageBarChart from './TokenUsageBarChart.vue'
+import TokenUsageLineChart from './TokenUsageLineChart.vue'
+import { tokenColors } from './token-usage-chart-options'
 
 const props = defineProps<{
   usage?: TokenUsageSnapshot
@@ -123,22 +180,43 @@ const props = defineProps<{
 }>()
 defineEmits<{ refresh: [] }>()
 
-const activePeriod = ref<'month' | 'allTime'>('month')
+const periodOptions: Array<{ key: TokenUsagePeriodKey; label: string }> = [
+  { key: 'today', label: '今日' },
+  { key: 'yesterday', label: '昨日' },
+  { key: 'week', label: '本周' },
+  { key: 'month', label: '本月' },
+  { key: 'allTime', label: '累计' },
+]
+const activePeriod = ref<TokenUsagePeriodKey>('today')
 const emptyPeriod: TokenUsagePeriod = {
+  startedAt: new Date(0).toISOString(),
+  endedAt: new Date(0).toISOString(),
   inputTokens: 0,
   outputTokens: 0,
   totalTokens: 0,
   models: [],
+  trend: [],
 }
 const activeUsage = computed(() => props.usage?.[activePeriod.value] ?? emptyPeriod)
+const hasUsage = computed(() => activeUsage.value.totalTokens > 0)
 const tokenFormatter = new Intl.NumberFormat('zh-CN')
-const monthFormatter = new Intl.DateTimeFormat('zh-CN', {
+const rangeFormatter = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
-  month: 'long',
+  month: 'numeric',
   day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
 })
 const formatTokens = (value: number) => tokenFormatter.format(value)
-const formatMonthStart = (value: string) => monthFormatter.format(new Date(value))
+const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
+  if (key === 'allTime' && usage.totalTokens === 0 && usage.models.length === 0) {
+    return '暂无保留记录'
+  }
+  const start = rangeFormatter.format(new Date(usage.startedAt))
+  const rawEnd = Date.parse(usage.endedAt)
+  const end = rangeFormatter.format(new Date(key === 'yesterday' ? rawEnd - 1 : rawEnd))
+  return `${start} — ${end}`
+}
 </script>
 
 <style scoped>
@@ -213,14 +291,38 @@ const formatMonthStart = (value: string) => monthFormatter.format(new Date(value
 }
 
 .billing-summary dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--af-text-muted);
   font-size: 12px;
+}
+
+.billing-summary-marker {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
 }
 
 .billing-summary dd {
   margin: 6px 0 0;
   font-size: 20px;
   font-weight: 700;
+}
+
+.billing-chart-section {
+  margin: 0 0 16px;
+  padding: 14px;
+  border: 1px solid var(--af-border);
+  border-radius: 10px;
+  background: var(--af-surface-muted);
+}
+
+.billing-chart-section h3 {
+  margin: 0 0 8px;
+  color: var(--af-graphite);
+  font-size: 14px;
 }
 
 .billing-table-wrap {
@@ -255,6 +357,10 @@ const formatMonthStart = (value: string) => monthFormatter.format(new Date(value
 
   .billing-summary {
     grid-template-columns: 1fr;
+  }
+
+  .billing-chart-section {
+    padding: 10px;
   }
 }
 </style>

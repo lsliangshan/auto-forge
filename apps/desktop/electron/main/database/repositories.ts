@@ -64,14 +64,36 @@ export interface ModelTokenUsageRecord {
   totalTokens: number
 }
 
+export type TokenUsageGranularityRecord = 'hour' | 'day' | 'month'
+
+export interface TokenUsageQueryRecord {
+  yesterdayStartedAt: number
+  todayStartedAt: number
+  weekStartedAt: number
+  monthStartedAt: number
+  endedAt: number
+}
+
+export interface TokenUsageTrendRecord {
+  bucket: string
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+}
+
 export interface TokenUsagePeriodRecord {
   inputTokens: number
   outputTokens: number
   totalTokens: number
   models: ModelTokenUsageRecord[]
+  trend: TokenUsageTrendRecord[]
 }
 
 export interface TokenUsageSnapshotRecord {
+  allTimeStartedAt?: number
+  today: TokenUsagePeriodRecord
+  yesterday: TokenUsagePeriodRecord
+  week: TokenUsagePeriodRecord
   month: TokenUsagePeriodRecord
   allTime: TokenUsagePeriodRecord
 }
@@ -420,7 +442,7 @@ export interface AppRepositories {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
     startMediaGeneration(value: MediaGenerationTurnInput): void
     get(id: string): ChatRun | undefined
-    summarizeTokenUsage(monthStartedAt: number): TokenUsageSnapshotRecord
+    summarizeTokenUsage(input: TokenUsageQueryRecord): TokenUsageSnapshotRecord
     update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
     finalizeWithMessage(
       id: string,
@@ -458,11 +480,14 @@ const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS wor
 
 interface TokenUsageRow {
   model: string
-  allTimeInputTokens: number
-  allTimeOutputTokens: number
-  monthInputTokens: number
-  monthOutputTokens: number
-  monthRows: number
+  inputTokens: number
+  outputTokens: number
+}
+
+interface SparseTokenUsageRow {
+  bucket: string | number
+  inputTokens: number
+  outputTokens: number
 }
 
 function safeTokenCount(value: unknown): number {
@@ -472,31 +497,85 @@ function safeTokenCount(value: unknown): number {
   return value
 }
 
-function tokenUsagePeriod(
-  rows: TokenUsageRow[],
-  period: 'month' | 'allTime',
+function trendBucketSql(granularity: TokenUsageGranularityRecord): string {
+  if (granularity === 'hour') {
+    return 'CAST((started_at - @startedAt) / 3600000 AS INTEGER)'
+  }
+  if (granularity === 'day') {
+    return "strftime('%Y-%m-%d', started_at / 1000, 'unixepoch', 'localtime')"
+  }
+  return "strftime('%Y-%m', started_at / 1000, 'unixepoch', 'localtime')"
+}
+
+function summarizeTokenUsagePeriod(
+  database: SqliteDatabase,
+  startedAt: number,
+  endedAt: number,
+  granularity: TokenUsageGranularityRecord,
 ): TokenUsagePeriodRecord {
-  const models = rows
-    .filter((row) => period === 'allTime' || safeTokenCount(row.monthRows) > 0)
-    .map((row): ModelTokenUsageRecord => {
-      const inputTokens = safeTokenCount(
-        period === 'month' ? row.monthInputTokens : row.allTimeInputTokens,
-      )
-      const outputTokens = safeTokenCount(
-        period === 'month' ? row.monthOutputTokens : row.allTimeOutputTokens,
-      )
-      const totalTokens = safeTokenCount(inputTokens + outputTokens)
-      return { model: row.model, inputTokens, outputTokens, totalTokens }
-    })
+  const parameters = {
+    startedAt: safeTokenCount(startedAt),
+    endedAt: safeTokenCount(endedAt),
+  }
+  const models = many<TokenUsageRow>(database, `
+    SELECT
+      model,
+      SUM(COALESCE(input_tokens, 0)) AS inputTokens,
+      SUM(COALESCE(output_tokens, 0)) AS outputTokens
+    FROM chat_runs
+    WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+      AND started_at >= @startedAt
+      AND started_at < @endedAt
+    GROUP BY model
+  `, parameters).map((row): ModelTokenUsageRecord => {
+    const inputTokens = safeTokenCount(row.inputTokens)
+    const outputTokens = safeTokenCount(row.outputTokens)
+    return {
+      model: row.model,
+      inputTokens,
+      outputTokens,
+      totalTokens: safeTokenCount(inputTokens + outputTokens),
+    }
+  })
     .sort((left, right) => right.totalTokens - left.totalTokens
       || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0))
+
+  const bucket = trendBucketSql(granularity)
+  const trend = many<SparseTokenUsageRow>(database, `
+    SELECT
+      ${bucket} AS bucket,
+      SUM(COALESCE(input_tokens, 0)) AS inputTokens,
+      SUM(COALESCE(output_tokens, 0)) AS outputTokens
+    FROM chat_runs
+    WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+      AND started_at >= @startedAt
+      AND started_at < @endedAt
+    GROUP BY ${bucket}
+    ORDER BY MIN(started_at)
+  `, parameters).map((row): TokenUsageTrendRecord => {
+    const inputTokens = safeTokenCount(row.inputTokens)
+    const outputTokens = safeTokenCount(row.outputTokens)
+    return {
+      bucket: String(row.bucket),
+      inputTokens,
+      outputTokens,
+      totalTokens: safeTokenCount(inputTokens + outputTokens),
+    }
+  })
+
   const inputTokens = safeTokenCount(models.reduce((sum, model) => sum + model.inputTokens, 0))
   const outputTokens = safeTokenCount(models.reduce((sum, model) => sum + model.outputTokens, 0))
+  const trendInput = safeTokenCount(trend.reduce((sum, point) => sum + point.inputTokens, 0))
+  const trendOutput = safeTokenCount(trend.reduce((sum, point) => sum + point.outputTokens, 0))
+  if (inputTokens !== trendInput || outputTokens !== trendOutput) {
+    throw new Error('Token usage aggregates are inconsistent')
+  }
   return {
     inputTokens,
     outputTokens,
     totalTokens: safeTokenCount(inputTokens + outputTokens),
     models,
+    trend,
   }
 }
 
@@ -1517,24 +1596,34 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         })
       },
       get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),
-      summarizeTokenUsage(monthStartedAt) {
-        const start = safeTokenCount(monthStartedAt)
-        const rows = many<TokenUsageRow>(database, `
-          SELECT
-            model,
-            SUM(COALESCE(input_tokens, 0)) AS allTimeInputTokens,
-            SUM(COALESCE(output_tokens, 0)) AS allTimeOutputTokens,
-            SUM(CASE WHEN started_at >= @monthStartedAt THEN COALESCE(input_tokens, 0) ELSE 0 END) AS monthInputTokens,
-            SUM(CASE WHEN started_at >= @monthStartedAt THEN COALESCE(output_tokens, 0) ELSE 0 END) AS monthOutputTokens,
-            SUM(CASE WHEN started_at >= @monthStartedAt THEN 1 ELSE 0 END) AS monthRows
-          FROM chat_runs
-          WHERE input_tokens IS NOT NULL OR output_tokens IS NOT NULL
-          GROUP BY model
-        `, { monthStartedAt: start })
-        return {
-          month: tokenUsagePeriod(rows, 'month'),
-          allTime: tokenUsagePeriod(rows, 'allTime'),
+      summarizeTokenUsage(input) {
+        const query = {
+          yesterdayStartedAt: safeTokenCount(input.yesterdayStartedAt),
+          todayStartedAt: safeTokenCount(input.todayStartedAt),
+          weekStartedAt: safeTokenCount(input.weekStartedAt),
+          monthStartedAt: safeTokenCount(input.monthStartedAt),
+          endedAt: safeTokenCount(input.endedAt),
         }
+        return database.transaction((): TokenUsageSnapshotRecord => {
+          const first = one<{ startedAt: number | null }>(database, `
+            SELECT MIN(started_at) AS startedAt
+            FROM chat_runs
+            WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+              AND started_at < @endedAt
+          `, { endedAt: query.endedAt })
+          const allTimeStartedAt = first?.startedAt === null || first?.startedAt === undefined
+            ? undefined
+            : safeTokenCount(first.startedAt)
+          const allTimeStart = allTimeStartedAt ?? query.endedAt
+          return {
+            ...(allTimeStartedAt === undefined ? {} : { allTimeStartedAt }),
+            today: summarizeTokenUsagePeriod(database, query.todayStartedAt, query.endedAt, 'hour'),
+            yesterday: summarizeTokenUsagePeriod(database, query.yesterdayStartedAt, query.todayStartedAt, 'hour'),
+            week: summarizeTokenUsagePeriod(database, query.weekStartedAt, query.endedAt, 'day'),
+            month: summarizeTokenUsagePeriod(database, query.monthStartedAt, query.endedAt, 'day'),
+            allTime: summarizeTokenUsagePeriod(database, allTimeStart, query.endedAt, 'month'),
+          }
+        })()
       },
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE chat_runs SET status = COALESCE(@status, status), generation_id = COALESCE(@generationId, generation_id), input_tokens = COALESCE(@inputTokens, input_tokens), output_tokens = COALESCE(@outputTokens, output_tokens), cost_usd = COALESCE(@costUsd, cost_usd), error_code = COALESCE(@errorCode, error_code), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
