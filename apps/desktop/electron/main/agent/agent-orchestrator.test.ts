@@ -10,6 +10,7 @@ import {
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
+import type { ModelProviderSnapshot } from '../chat/model-provider.js'
 import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
@@ -159,6 +160,113 @@ function textRunInput(
 }
 
 describe('AgentOrchestrator', () => {
+  it('uses one supplied credential snapshot for context compression and every normal turn', async () => {
+    const dependencies = harness([])
+    const stream = vi.fn(() => events([
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]))
+    const snapshot: ModelProviderSnapshot = {
+      providerId: 'openrouter',
+      apiKeyFingerprint: 'snapshot_fingerprint',
+      provider: {
+        listModels: async () => [],
+        validateCredential: async () => ({ valid: true }),
+        stream,
+      },
+    }
+
+    const result = await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'conversation_snapshot', content: '回答', provider: 'openrouter',
+        model: 'openrouter/model', requestId: 'request_snapshot',
+      }),
+      providerSnapshot: snapshot,
+    })
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.registry.get).not.toHaveBeenCalled()
+    expect(dependencies.history.prepare).toHaveBeenCalledWith(expect.objectContaining({
+      providerSnapshot: snapshot,
+      callIdentity: expect.objectContaining({
+        requestId: 'request_snapshot', userId: 'user_1', chatRunId: expect.any(String),
+      }),
+    }))
+    expect(stream).toHaveBeenCalledTimes(1)
+    expect(stream).toHaveBeenCalledWith(expect.objectContaining({ endUserId: 'user_1' }))
+    expect(dependencies.providerUsage.start).toHaveBeenCalledWith(expect.objectContaining({
+      apiKeyFingerprint: 'snapshot_fingerprint',
+    }))
+  })
+
+  it('propagates a context compression usage consistency error after terminalizing the durable run', async () => {
+    const dependencies = harness([])
+    const error = new ProviderUsageConsistencyError()
+    dependencies.history.prepare = vi.fn<ConversationHistoryPort['prepare']>(async () => {
+      throw error
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_summary_consistency', content: '回答', provider: 'openrouter',
+      model: 'openrouter/model', requestId: 'request_summary_consistency',
+    }))).rejects.toBe(error)
+    expect(dependencies.records.terminal).toHaveLength(1)
+  })
+
+  it('accumulates compatibility costs with exact decimal addition including large, tiny, zero, and undefined values', async () => {
+    const dependencies = harness([
+      [
+        { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '9007199254740992.000000000001' },
+        ...toolTurn,
+      ],
+      [
+        { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '0.000000000009' },
+        ...toolTurn,
+      ],
+      [
+        { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '0' },
+        ...toolTurn,
+      ],
+      [
+        { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_exact_cost', content: '连续调用', provider: 'openrouter',
+      model: 'openrouter/model', requestId: 'request_exact_cost',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      inputTokens: 4,
+      outputTokens: 4,
+      costUsd: '9007199254740992.00000000001',
+    })
+  })
+
+  it.each([
+    ['zero', '0', '0'],
+    ['undefined', undefined, undefined],
+  ] as const)('preserves %s compatibility cost semantics', async (_name, costUsd, expected) => {
+    const dependencies = harness([[
+      {
+        type: 'usage', inputTokens: 1, outputTokens: 2, totalTokens: 3,
+        ...(costUsd === undefined ? {} : { costUsd }),
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: `conversation_${_name}`, content: '回答', provider: 'openrouter', model: 'm',
+    }))
+
+    const terminal = dependencies.records.terminal.at(-1) as { costUsd?: string }
+    if (expected === undefined) expect(terminal).not.toHaveProperty('costUsd')
+    else expect(terminal.costUsd).toBe(expected)
+  })
+
   it('records each OpenRouter turn before streaming and reports only that turn cost immediately', async () => {
     const dependencies = harness([])
     const firstTurn = [
@@ -345,7 +453,12 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.history.prepare).toHaveBeenCalledWith({
       conversationId: 'c1',
       beforeOrdinal: 1,
-      provider: dependencies.providerInstances.openrouter,
+      providerSnapshot: {
+        providerId: 'openrouter',
+        provider: dependencies.providerInstances.openrouter,
+        apiKeyFingerprint: 'fingerprint_1',
+      },
+      callIdentity: { requestId: 'id_1', chatRunId: 'id_3', userId: 'user_1' },
       model: 'model',
       contextLength: 4_096,
       currentMessage: { role: 'user', content: '我的代号是什么？' },

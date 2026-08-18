@@ -141,6 +141,7 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
   })
   await secretStore.set('openrouter_api_key', 'sk-integration')
   const provider = new OpenRouterProvider({ credential: secretStore, fetch: options.fetch })
+  const providerSnapshot = await provider.acquireSnapshot()
   const policy = new PolicyEngine(database.permissionGrants)
   const workers = new IntegrationWorkerFactory()
   const executionEvents: ExecutionEvent[] = []
@@ -163,7 +164,7 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
     providerUsage: database.providerUsage,
     emit: () => undefined,
   })
-  return { directory, workflow, database, workers, executionEvents, orchestrator, registry }
+  return { directory, workflow, database, workers, executionEvents, orchestrator, registry, providerSnapshot }
 }
 
 describe('agent workflow integration', () => {
@@ -196,7 +197,7 @@ describe('agent workflow integration', () => {
       userId: 'user_1',
       userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
       modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
-      model: 'local-test-model', requestId: 'request_1',
+      model: 'local-test-model', requestId: 'request_1', providerSnapshot: app.providerSnapshot,
     })
     expect(app.database.messages.listForConversation('conversation_1').find((message) => message.role === 'assistant')?.blocks).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'workflow_proposal' }),
@@ -227,6 +228,19 @@ describe('agent workflow integration', () => {
     expect(app.database.chatRuns.get(execution!.chatRunId!)).toMatchObject({
       status: 'completed', generationId: 'generation_final', inputTokens: 4, outputTokens: 2, costUsd: '0.01',
     })
+    expect(app.database.providerUsage.summarize({
+      userId: 'user_1', yesterdayStartedAt: 0, todayStartedAt: 0,
+      weekStartedAt: 0, monthStartedAt: 0, endedAt: Number.MAX_SAFE_INTEGER,
+    }).allTime).toMatchObject({
+      openRouterCostUsd: '0.01', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 1,
+    })
+    expect(app.database.providerUsage.listReconcilable(Number.MAX_SAFE_INTEGER)).toEqual([
+      expect.objectContaining({
+        operationKey: 'agent:request_1:turn:0',
+        generationId: 'generation_tool',
+        apiKeyFingerprint: app.providerSnapshot.apiKeyFingerprint,
+      }),
+    ])
     expect(app.database.permissionGrants.get(app.workflow.id, app.workflow.version, permission.capability, scopeHash(permission.scope))).toMatchObject({
       workflowId: app.workflow.id,
       workflowVersion: app.workflow.version,
@@ -262,7 +276,7 @@ describe('agent workflow integration', () => {
       userId: 'user_1',
       userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
       modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
-      model: 'local-test-model', requestId: 'cancel_request',
+      model: 'local-test-model', requestId: 'cancel_request', providerSnapshot: app.providerSnapshot,
     })
     const resuming = app.orchestrator.resumeApproval({
       executionId: pending.executionId!, permissionIndex: 0, scopeHash: scopeHash(permission.scope), decision: 'once',

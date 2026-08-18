@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
+import { openAppDatabase } from '../database/client.js'
+import { DeepSeekProvider } from './deepseek-provider.js'
 import type {
   ConversationContextAdvanceInput,
   ConversationContextRecord,
   Message,
 } from '../database/repositories.js'
-import type { ModelStreamEvent } from './model-provider.js'
+import { ProviderUsageConsistencyError } from '../database/repositories.js'
+import type { ModelProviderSnapshot, ModelStreamEvent } from './model-provider.js'
 import {
   createConversationContextManager,
   currentMediaTokenReserve,
@@ -150,21 +153,34 @@ const user = (ordinal: number, text: string) => historical('user', ordinal, text
 const assistant = (ordinal: number, text: string) => historical('assistant', ordinal, text)
 
 function prepareInput(
-  overrides: Partial<PrepareConversationContextInput> = {},
+  overrides: Partial<PrepareConversationContextInput> & { provider?: ConversationContextProviderPort } = {},
 ): PrepareConversationContextInput {
+  const provider = overrides.provider ?? {
+    stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {}),
+  }
+  const { provider: _legacyProvider, ...inputOverrides } = overrides
   return {
     conversationId: 'c1',
     beforeOrdinal: 11,
-    provider: overrides.provider ?? {
-      stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {}),
-    },
     model: 'tiny-model',
     contextLength: 2_000,
     currentMessage: { role: 'user', content: 'current' },
     tools: [],
     currentMedia: [],
     signal: new AbortController().signal,
-    ...overrides,
+    providerSnapshot: overrides.providerSnapshot ?? {
+      providerId: 'openrouter',
+      apiKeyFingerprint: 'fingerprint_1',
+      provider: {
+        listModels: async () => [],
+        validateCredential: async () => ({ valid: true }),
+        stream: provider.stream,
+      },
+    },
+    callIdentity: overrides.callIdentity ?? {
+      requestId: 'request_1', chatRunId: 'run_1', userId: 'user_1',
+    },
+    ...inputOverrides,
   }
 }
 
@@ -208,6 +224,12 @@ function contextHarness(options: {
       get: vi.fn(() => context),
       advance,
     },
+    providerUsage: {
+      start: vi.fn((value) => value as never),
+      bindIdentity: vi.fn((_key, value) => value as never),
+      report: vi.fn((_key, value) => value as never),
+      markUnknown: vi.fn((key) => key as never),
+    },
   }
   return {
     manager: createConversationContextManager(repositories),
@@ -222,12 +244,12 @@ describe('conversation context manager', () => {
       messages: [user(1, '我的代号是青山'), assistant(2, '已记住')],
     })
 
-    await expect(manager.prepare({
+    await expect(manager.prepare(prepareInput({
       conversationId: 'c1', beforeOrdinal: 3,
       provider, model: 'model', contextLength: 32_000,
       currentMessage: { role: 'user', content: '我的代号是什么？' },
       tools: [], currentMedia: [], signal: new AbortController().signal,
-    })).resolves.toEqual([
+    }))).resolves.toEqual([
       { role: 'user', content: '我的代号是青山' },
       { role: 'assistant', content: '已记住' },
     ])
@@ -490,5 +512,212 @@ describe('conversation context manager', () => {
       signal: controller.signal,
     }))).rejects.toMatchObject({ code: 'CANCELLED' })
     expect(store.advance).not.toHaveBeenCalled()
+  })
+})
+
+function sqliteContextHarness(eventsForRound: (round: number) => ModelStreamEvent[]) {
+  const database = openAppDatabase(':memory:')
+  database.localAuth.createUserAndSession({
+    id: 'user_1', account: 'Alice', accountNormalized: 'alice',
+    passwordDigest: 'digest', createdAt: 1, updatedAt: 1,
+  }, 1)
+  database.conversations.insert({ id: 'c1', title: 'Context billing' })
+  for (let index = 0; index < 10; index += 1) {
+    database.messages.insert({
+      id: `message_${index + 1}`,
+      conversationId: 'c1',
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      blocks: [{ type: 'text', text: `history-${index + 1} ${'很长的历史内容'.repeat(20)}` }],
+      createdAt: index + 1,
+    })
+  }
+  let round = 0
+  const requests: Parameters<ConversationContextProviderPort['stream']>[0][] = []
+  const provider = {
+    listModels: async () => [],
+    validateCredential: async () => ({ valid: true }),
+    stream: vi.fn<ConversationContextProviderPort['stream']>(async function* (request) {
+      requests.push(request)
+      for (const event of eventsForRound(round++)) yield event
+    }),
+  }
+  const snapshot: ModelProviderSnapshot = {
+    providerId: 'openrouter',
+    provider,
+    apiKeyFingerprint: 'fingerprint_1',
+  }
+  const start = vi.spyOn(database.providerUsage, 'start')
+  const bindIdentity = vi.spyOn(database.providerUsage, 'bindIdentity')
+  const report = vi.spyOn(database.providerUsage, 'report')
+  const markUnknown = vi.spyOn(database.providerUsage, 'markUnknown')
+  const manager = createConversationContextManager(database)
+  const input = prepareInput({
+    provider,
+    providerSnapshot: snapshot,
+    callIdentity: { requestId: 'request_summary', chatRunId: 'run_summary', userId: 'user_1' },
+  })
+  return {
+    database, manager, input, requests,
+    usage: { start, bindIdentity, report, markUnknown },
+  }
+}
+
+function providerCostQuery() {
+  return {
+    userId: 'user_1', yesterdayStartedAt: 0, todayStartedAt: 0,
+    weekStartedAt: 0, monthStartedAt: 0, endedAt: Number.MAX_SAFE_INTEGER,
+  }
+}
+
+describe('conversation context compression billing', () => {
+  it('persists every real SQLite compression round under stable distinct operation keys', async () => {
+    const test = sqliteContextHarness((round) => [
+      { type: 'generation', id: `summary_generation_${round}` },
+      { type: 'usage', inputTokens: round + 1, outputTokens: 2, totalTokens: round + 3, costUsd: `0.0${round + 1}` },
+      { type: 'text_delta', choiceIndex: 0, text: `summary-${round}` },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ])
+    try {
+      await test.manager.prepare(test.input)
+
+      expect(test.usage.start.mock.calls.length).toBeGreaterThan(1)
+      const starts = test.usage.start.mock.calls.map(([value]) => value)
+      const operationKeys = starts.map((value) => value.operationKey)
+      expect(new Set(operationKeys).size).toBe(operationKeys.length)
+      expect(operationKeys).toEqual(starts.map((value, index) => {
+        const expectedThroughOrdinal = index === 0
+          ? 0
+          : Number(operationKeys[index - 1]!.split(':').at(-1))
+        const throughOrdinal = Number(value.operationKey.split(':').at(-1))
+        return `conversation-summary:request_summary:${expectedThroughOrdinal}:${throughOrdinal}`
+      }))
+      expect(starts).toEqual(starts.map((value) => expect.objectContaining({
+        operationKey: value.operationKey,
+        userId: 'user_1', requestId: 'request_summary', chatRunId: 'run_summary',
+        provider: 'openrouter', apiKeyFingerprint: 'fingerprint_1',
+        model: 'tiny-model', modality: 'text',
+      })))
+      expect(test.requests).toHaveLength(starts.length)
+      expect(test.requests.every((request) => request.endUserId === 'user_1')).toBe(true)
+      expect(test.usage.bindIdentity).toHaveBeenCalledTimes(starts.length)
+      expect(test.usage.report).toHaveBeenCalledTimes(starts.length)
+      expect(test.usage.markUnknown).not.toHaveBeenCalled()
+      expect(test.database.providerUsage.summarize(providerCostQuery()).allTime)
+        .toMatchObject({ openRouterKnownCostCount: starts.length, openRouterUnknownCostCount: 0 })
+    } finally {
+      test.database.close()
+    }
+  })
+
+  it('persists a reported compression cost before a later context advance failure', async () => {
+    const test = sqliteContextHarness(() => [
+      { type: 'generation', id: 'summary_generation_paid' },
+      { type: 'usage', inputTokens: 3, outputTokens: 4, totalTokens: 7, costUsd: '0.07' },
+      { type: 'text_delta', choiceIndex: 0, text: 'summary-paid' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ])
+    vi.spyOn(test.database.conversationContexts, 'advance').mockImplementation(() => {
+      throw new Error('checkpoint changed')
+    })
+    try {
+      await expect(test.manager.prepare(test.input)).rejects.toMatchObject({ code: 'CONFLICT' })
+      expect(test.database.providerUsage.summarize(providerCostQuery()).allTime).toMatchObject({
+        openRouterCostUsd: '0.07', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 0,
+      })
+    } finally {
+      test.database.close()
+    }
+  })
+
+  it('keeps cancellation generation and reported cost without advancing context', async () => {
+    const controller = new AbortController()
+    const test = sqliteContextHarness(() => [
+      { type: 'generation', id: 'summary_generation_cancelled' },
+      { type: 'usage', inputTokens: 2, outputTokens: 2, totalTokens: 4, costUsd: '0.04' },
+      { type: 'text_delta', choiceIndex: 0, text: 'never advanced' },
+    ])
+    test.input.signal = controller.signal
+    vi.mocked(test.input.providerSnapshot.provider.stream).mockImplementation(async function* (request) {
+      yield { type: 'generation', id: 'summary_generation_cancelled' }
+      yield { type: 'usage', inputTokens: 2, outputTokens: 2, totalTokens: 4, costUsd: '0.04' }
+      controller.abort()
+      yield { type: 'text_delta', choiceIndex: 0, text: 'never advanced' }
+    })
+    try {
+      await expect(test.manager.prepare(test.input)).rejects.toMatchObject({ code: 'CANCELLED' })
+      expect(test.database.conversationContexts.get('c1')).toBeUndefined()
+      expect(test.usage.bindIdentity).toHaveBeenCalledWith(
+        expect.any(String), { generationId: 'summary_generation_cancelled' },
+      )
+      expect(test.database.providerUsage.summarize(providerCostQuery()).allTime).toMatchObject({
+        openRouterCostUsd: '0.04', openRouterKnownCostCount: 1,
+      })
+    } finally {
+      test.database.close()
+    }
+  })
+
+  it('persists a completed compression generation as unknown when cost is absent', async () => {
+    const test = sqliteContextHarness((round) => [
+      { type: 'generation', id: `summary_generation_unknown_${round}` },
+      { type: 'usage', inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+      { type: 'text_delta', choiceIndex: 0, text: 'summary-unknown' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ])
+    try {
+      await test.manager.prepare(test.input)
+      expect(test.database.providerUsage.summarize(providerCostQuery()).allTime).toMatchObject({
+        openRouterCostUsd: '0', openRouterKnownCostCount: 0,
+        openRouterUnknownCostCount: test.usage.start.mock.calls.length,
+      })
+      expect(test.database.providerUsage.listReconcilable(Number.MAX_SAFE_INTEGER))
+        .toEqual(expect.arrayContaining([
+          expect.objectContaining({ generationId: 'summary_generation_unknown_0', status: 'unknown' }),
+        ]))
+    } finally {
+      test.database.close()
+    }
+  })
+
+  it('does not write a provider usage event for DeepSeek compression', async () => {
+    const test = sqliteContextHarness(() => [])
+    const bodies: unknown[] = []
+    const provider = new DeepSeekProvider({
+      credential: { get: async () => 'deepseek-key' },
+      fetch: async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        return new Response([
+          'data: {"choices":[{"index":0,"delta":{"content":"deepseek-summary"},"finish_reason":"stop"}]}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join('\n'), { headers: { 'content-type': 'text/event-stream' } })
+      },
+    })
+    test.input.providerSnapshot = await provider.acquireSnapshot()
+    try {
+      await test.manager.prepare(test.input)
+      expect(test.usage.start).not.toHaveBeenCalled()
+      expect(bodies.length).toBeGreaterThan(0)
+      expect(bodies.every((body) => !Object.hasOwn(body as object, 'user'))).toBe(true)
+      expect(test.database.providerUsage.summarize(providerCostQuery()).allTime).toMatchObject({
+        openRouterKnownCostCount: 0, openRouterUnknownCostCount: 0,
+      })
+    } finally {
+      test.database.close()
+    }
+  })
+
+  it('propagates provider usage consistency errors without converting them to context failures', async () => {
+    const test = sqliteContextHarness(() => [
+      { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '0.01' },
+    ])
+    const error = new ProviderUsageConsistencyError()
+    test.usage.report.mockImplementation(() => { throw error })
+    try {
+      await expect(test.manager.prepare(test.input)).rejects.toBe(error)
+    } finally {
+      test.database.close()
+    }
   })
 })

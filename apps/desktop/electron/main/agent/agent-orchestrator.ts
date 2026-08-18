@@ -13,6 +13,8 @@ import {
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
 import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
 import { retrieveWorkflows } from '../workflows/retriever.js'
+import { addUsd } from '../billing/decimal-usd.js'
+import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
@@ -21,6 +23,8 @@ import {
 import type {
   ModelContentPart,
   ModelMessage,
+  ModelProvider,
+  ModelProviderSnapshot,
   ModelStreamEvent,
   ModelStreamRequest,
   ModelTool,
@@ -238,6 +242,7 @@ export interface AgentRunInput extends UsageAttribution {
   provider: ModelProviderId
   model: string
   requestId?: string
+  providerSnapshot?: ModelProviderSnapshot
 }
 
 export interface AgentRunResult {
@@ -263,10 +268,8 @@ interface ActiveAgentRun {
   runId: string
   messageId: string
   conversationId: string
-  provider: AgentProviderPort
-  providerId: ModelProviderId
+  providerSnapshot: ModelProviderSnapshot
   userId: string
-  apiKeyFingerprint?: string
   model: string
   blocks: ChatBlock[]
   messages: ModelMessage[]
@@ -328,6 +331,9 @@ export class AgentOrchestrator {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
+    if (input.providerSnapshot && input.providerSnapshot.providerId !== input.provider) {
+      throw appFailure('CONFLICT')
+    }
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
       const error = appFailure('CONFLICT')
       this.safeEmit({
@@ -370,19 +376,21 @@ export class AgentOrchestrator {
         initialBlocks: [],
         createdAt: startedAt,
       })
-      const provider = this.dependencies.providers.get(input.provider)
+      const providerSnapshot = input.providerSnapshot ?? {
+        providerId: input.provider,
+        provider: this.dependencies.providers.get(input.provider) as ModelProvider,
+        ...(input.apiKeyFingerprint === undefined
+          ? {}
+          : { apiKeyFingerprint: input.apiKeyFingerprint }),
+      }
 
       active = {
         requestId,
         runId,
         messageId,
         conversationId: input.conversationId,
-        provider,
-        providerId: input.provider,
+        providerSnapshot,
         userId: input.userId,
-        ...(input.apiKeyFingerprint === undefined
-          ? {}
-          : { apiKeyFingerprint: input.apiKeyFingerprint }),
         model: input.model,
         blocks: [],
         messages: [],
@@ -406,7 +414,8 @@ export class AgentOrchestrator {
       const historyMessages = await this.dependencies.history.prepare({
         conversationId: input.conversationId,
         beforeOrdinal: userPosition.ordinal,
-        provider,
+        providerSnapshot,
+        callIdentity: { requestId, chatRunId: runId, userId: input.userId },
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         currentMessage: { role: 'user', content: input.modelContent },
@@ -418,8 +427,15 @@ export class AgentOrchestrator {
         ...historyMessages,
         { role: 'user', content: input.modelContent },
       ]
-      return this.driveExclusive(active)
+      return await this.driveExclusive(active)
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) {
+        if (active && !active.terminal) this.finish(active, 'failed', appFailure('INTERNAL_ERROR'))
+        else if (this.activeByConversation.get(input.conversationId) === requestId) {
+          this.activeByConversation.delete(input.conversationId)
+        }
+        throw error
+      }
       if (active) return this.finish(active, 'failed', asAppError(error))
       if (this.activeByConversation.get(input.conversationId) === requestId) {
         this.activeByConversation.delete(input.conversationId)
@@ -514,90 +530,61 @@ export class AgentOrchestrator {
     while (active.modelTurns < MAX_MODEL_TURNS) {
       active.modelTurns += 1
       const operationKey = `agent:${active.requestId}:turn:${active.modelTurns - 1}`
-      const recordsProviderUsage = active.providerId === 'openrouter'
-      let costReported = false
-      let turnGenerationId: string | undefined
       const toolCalls: Array<Extract<ModelStreamEvent, { type: 'tool_call' }>> = []
       let finishReason: string | undefined
       let assistantContent = ''
       let turnUsage: Extract<ModelStreamEvent, { type: 'usage' }> | undefined
-      if (recordsProviderUsage) {
-        this.dependencies.providerUsage.start({
-          id: this.id(),
-          operationKey,
+      for await (const event of trackProviderStream({
+        operationKey,
+        attribution: {
           userId: active.userId,
-          provider: active.providerId,
-          ...(active.apiKeyFingerprint === undefined
-            ? {}
-            : { apiKeyFingerprint: active.apiKeyFingerprint }),
           requestId: active.requestId,
           chatRunId: active.runId,
           model: active.model,
           modality: 'text',
-          startedAt: this.now(),
-        })
-      }
-      try {
-        for await (const event of active.provider.stream({
+        },
+        request: {
           model: active.model,
           messages: active.messages,
           ...(active.tools.length ? { tools: active.tools } : {}),
           signal: active.controller.signal,
           endUserId: active.userId,
-        })) {
-          if (active.cancelled && event.type !== 'generation' && event.type !== 'usage') {
-            return this.finish(active, 'cancelled', appFailure('CANCELLED'))
-          }
-          if ('choiceIndex' in event && event.choiceIndex !== 0) continue
-          switch (event.type) {
-            case 'text_delta':
-              assistantContent += event.text
-              this.appendText(active, event.text)
-              break
-            case 'tool_call':
-              toolCalls.push(event)
-              if (toolCalls.length > 1) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-              break
-            case 'finish':
-              finishReason = event.reason
-              break
-            case 'generation':
-              active.generationId = event.id
-              turnGenerationId = event.id
-              if (recordsProviderUsage) {
-                this.dependencies.providerUsage.bindIdentity(operationKey, {
-                  generationId: event.id,
-                })
-              }
-              break
-            case 'usage':
-              turnUsage = event
-              if (recordsProviderUsage && event.costUsd !== undefined && !costReported) {
-                this.dependencies.providerUsage.report(operationKey, {
-                  ...(turnGenerationId === undefined
-                    ? {}
-                    : { generationId: turnGenerationId }),
-                  inputTokens: event.inputTokens,
-                  outputTokens: event.outputTokens,
-                  costUsd: event.costUsd,
-                  endedAt: this.now(),
-                })
-                costReported = true
-              }
-              break
-          }
-          if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+        },
+        provider: active.providerSnapshot,
+        providerUsage: this.dependencies.providerUsage,
+        id: this.id,
+        now: this.now,
+      })) {
+        if (active.cancelled && event.type !== 'generation' && event.type !== 'usage') {
+          return this.finish(active, 'cancelled', appFailure('CANCELLED'))
         }
-      } finally {
-        if (recordsProviderUsage && !costReported) {
-          this.dependencies.providerUsage.markUnknown(operationKey, this.now())
+        if ('choiceIndex' in event && event.choiceIndex !== 0) continue
+        switch (event.type) {
+          case 'text_delta':
+            assistantContent += event.text
+            this.appendText(active, event.text)
+            break
+          case 'tool_call':
+            toolCalls.push(event)
+            if (toolCalls.length > 1) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+            break
+          case 'finish':
+            finishReason = event.reason
+            break
+          case 'generation':
+            active.generationId = event.id
+            break
+          case 'usage':
+            turnUsage = event
+            break
         }
+        if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       }
       if (turnUsage) {
         active.inputTokens = (active.inputTokens ?? 0) + turnUsage.inputTokens
         active.outputTokens = (active.outputTokens ?? 0) + turnUsage.outputTokens
         if (turnUsage.costUsd !== undefined) {
-          active.costUsd = String((Number(active.costUsd ?? 0) + Number(turnUsage.costUsd)).toFixed(12)).replace(/\.?0+$/, '')
+          active.costUsd = addUsd([active.costUsd ?? '0', turnUsage.costUsd])
         }
       }
 
