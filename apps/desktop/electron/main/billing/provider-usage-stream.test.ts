@@ -126,18 +126,24 @@ describe('trackProviderStream', () => {
       name: 'reports the actual cost once when usage is present',
       usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost: '0.29' },
       expectedCost: '0.29',
+      errorCode: 429,
+      errorType: 'rate_limit',
     },
     {
       name: 'keeps the event unknown when usage is absent',
       usage: undefined,
       expectedCost: undefined,
+      errorCode: 503,
+      errorType: 'upstream_error',
     },
-  ])('$name before propagating a real OpenRouter error frame', async ({ usage, expectedCost }) => {
+  ])('$name before propagating a real OpenRouter error frame', async ({
+    usage, expectedCost, errorCode, errorType,
+  }) => {
     const payload = {
       id: 'generation_error_frame',
       choices: [],
       ...(usage === undefined ? {} : { usage }),
-      error: { code: 403, message: 'provider detail must not escape', metadata: { error_type: 'permission' } },
+      error: { code: errorCode, message: 'provider detail must not escape', metadata: { error_type: errorType } },
     }
     const fetch = vi.fn(async () => new Response(
       `data: ${JSON.stringify(payload)}\n\n`,
@@ -168,7 +174,7 @@ describe('trackProviderStream', () => {
       now: () => 200,
     })
 
-    await expect(collect(tracked)).rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
+    await expect(collect(tracked)).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
     expect(test.providerUsage.bindIdentity).toHaveBeenCalledWith(
       'operation_error_frame', { generationId: 'generation_error_frame' },
     )
@@ -185,6 +191,71 @@ describe('trackProviderStream', () => {
       expect(test.providerUsage.markUnknown).not.toHaveBeenCalled()
       expect(test.order).toEqual(['start', 'bind', 'report'])
     }
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('ignores choice delta and finish while billing choice-level error usage before failing once', async () => {
+    const payload = {
+      id: 'generation_choice_error',
+      choices: [{
+        index: 0,
+        delta: { content: 'must not be emitted' },
+        finish_reason: 'error',
+        error: { code: 429, message: 'choice failed', metadata: { error_type: 'rate_limit' } },
+      }],
+      usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4, cost: '0.41' },
+    }
+    const fetch = vi.fn(async () => new Response(
+      `data: ${JSON.stringify(payload)}\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const sleep = vi.fn(async () => undefined)
+    const openRouter = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => 'sk-choice-error') },
+      fetch,
+      sleep,
+    })
+    const test = harness([])
+    const tracked = trackProviderStream({
+      operationKey: 'operation_choice_error',
+      attribution: {
+        userId: 'user_1', requestId: 'request_choice_error', chatRunId: 'run_choice_error',
+        model: 'openrouter/model', modality: 'text',
+      },
+      request: { model: 'openrouter/model', messages: [] },
+      provider: {
+        providerId: 'openrouter',
+        apiKeyFingerprint: 'fingerprint_choice_error',
+        provider: openRouter,
+      },
+      providerUsage: test.providerUsage,
+      id: () => 'usage_choice_error',
+      now: () => 300,
+    })
+    const events: ModelStreamEvent[] = []
+    let streamFailure: unknown
+
+    try {
+      for await (const event of tracked) events.push(event)
+    } catch (error) {
+      streamFailure = error
+    }
+
+    expect(events).toEqual([
+      { type: 'generation', id: 'generation_choice_error' },
+      { type: 'usage', inputTokens: 3, outputTokens: 1, totalTokens: 4, costUsd: '0.41' },
+    ])
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    expect(test.providerUsage.bindIdentity).toHaveBeenCalledWith(
+      'operation_choice_error', { generationId: 'generation_choice_error' },
+    )
+    expect(test.providerUsage.report).toHaveBeenCalledOnce()
+    expect(test.providerUsage.report).toHaveBeenCalledWith('operation_choice_error', {
+      generationId: 'generation_choice_error', inputTokens: 3, outputTokens: 1,
+      costUsd: '0.41', endedAt: 300,
+    })
+    expect(test.providerUsage.markUnknown).not.toHaveBeenCalled()
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).not.toHaveBeenCalled()
   })

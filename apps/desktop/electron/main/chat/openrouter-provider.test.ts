@@ -2207,7 +2207,7 @@ describe('OpenRouterProvider', () => {
     expect(sleep).toHaveBeenCalledTimes(1)
   })
 
-  it('retries a streamed 429 error after partial text without duplicating text or usage', async () => {
+  it('does not retry a streamed 429 error after usage evidence', async () => {
     let attempt = 0
     const fetch = vi.fn(async () => {
       attempt += 1
@@ -2215,23 +2215,51 @@ describe('OpenRouterProvider', () => {
         'data: {"choices":[{"index":0,"delta":{"content":"A"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.1}}\n\n',
         'data: {"error":{"code":429,"message":"prompt must never leak","metadata":{"error_type":"rate_limit"}}}\n\n',
       ])
-      return sseResponse([
-        'data: {"choices":[{"index":0,"delta":{"content":"AB"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.1}}\n\n',
-        'data: [DONE]\n\n',
-      ])
+      return sseResponse(['data: [DONE]\n\n'])
     })
     const diagnostic = vi.fn()
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep: async () => undefined })
 
-    const result = await collect(provider.stream({ model: 'm', messages: [{ role: 'user', content: 'prompt must never leak' }] }))
+    const result: OpenRouterStreamEvent[] = []
+    let streamFailure: unknown
+    try {
+      for await (const event of provider.stream({
+        model: 'm', messages: [{ role: 'user', content: 'prompt must never leak' }],
+      })) result.push(event)
+    } catch (error) {
+      streamFailure = error
+    }
 
     expect(result.filter((event) => event.type === 'text_delta')).toEqual([
       { type: 'text_delta', choiceIndex: 0, text: 'A' },
-      { type: 'text_delta', choiceIndex: 0, text: 'B' },
     ])
     expect(result.filter((event) => event.type === 'usage')).toHaveLength(1)
-    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('prompt must never leak')
+  })
+
+  it('still retries a streamed 429 before generation or usage evidence', async () => {
+    let attempt = 0
+    const fetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) return sseResponse([
+        'data: {"error":{"code":429,"message":"retry safely","metadata":{"error_type":"rate_limit"}}}\n\n',
+      ])
+      return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep, random: () => 0 })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] }))).resolves.toEqual([
+      { type: 'text_delta', choiceIndex: 0, text: 'OK' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ])
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(sleep).toHaveBeenCalledTimes(1)
   })
 
   it('maps a streamed 403 error to access denied without claiming the credential is invalid', async () => {
@@ -2267,6 +2295,48 @@ describe('OpenRouterProvider', () => {
       { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.17' },
     ])
     expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: '429 with actual usage cost',
+      error: { code: 429, message: 'rate limited', metadata: { error_type: 'rate_limit' } },
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, cost: 0.31 },
+      expectedEvents: [
+        { type: 'generation', id: 'generation_retryable_error' },
+        { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.31' },
+      ],
+    },
+    {
+      name: '503 without usage',
+      error: { code: 503, message: 'upstream unavailable', metadata: { error_type: 'upstream_error' } },
+      usage: undefined,
+      expectedEvents: [
+        { type: 'generation', id: 'generation_retryable_error' },
+      ],
+    },
+  ])('does not retry $name after observing billing identity', async ({ error, usage, expectedEvents }) => {
+    const fetch = vi.fn(async () => sseResponse([
+      `data: ${JSON.stringify({
+        id: 'generation_retryable_error', choices: [],
+        ...(usage === undefined ? {} : { usage }), error,
+      })}\n\n`,
+    ]))
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+    const events: OpenRouterStreamEvent[] = []
+    let streamFailure: unknown
+
+    try {
+      for await (const event of provider.stream({ model: 'm', messages: [] })) events.push(event)
+    } catch (caught) {
+      streamFailure = caught
+    }
+
+    expect(events).toEqual(expectedEvents)
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).not.toHaveBeenCalled()
   })

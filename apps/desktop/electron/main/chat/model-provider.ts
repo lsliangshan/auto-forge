@@ -933,6 +933,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         }
       } catch (error) {
+        if (
+          error instanceof RetryableFailure
+          && (replay.generations.size > 0 || replay.usages.size > 0)
+        ) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         if (!(error instanceof RetryableFailure) || attempt === maxAttempts - 1) {
           if (error instanceof RetryableFailure) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
           throw error
@@ -1105,15 +1109,20 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         if (data === '[DONE]') { done = true; return }
         let chunk: z.infer<typeof streamChunkSchema>
         try { chunk = streamChunkSchema.parse(JSON.parse(data)) } catch (error) { parserError = error; return }
-        if (chunk.error) {
-          this.reportStreamDiagnostic(chunk.error)
-          parserError = streamedFailure(chunk.error)
+        const failedChoice = chunk.choices.find((choice) => (
+          choice.finish_reason === 'error' || choice.error !== undefined
+        ))
+        const hasFrameError = chunk.error !== undefined || failedChoice !== undefined
+        if (hasFrameError) {
+          const frameError = chunk.error ?? failedChoice?.error
+          this.reportStreamDiagnostic(frameError)
+          parserError = streamedFailure(frameError)
         }
         if (chunk.id && !replay.generations.has(chunk.id)) {
           replay.generations.add(chunk.id)
           pending.push({ type: 'generation', id: chunk.id })
         }
-        for (const choice of chunk.error === undefined ? chunk.choices : []) {
+        for (const choice of hasFrameError ? [] : chunk.choices) {
           const content = choice.delta.content ?? ''
           if (content) {
             const cumulative = `${attemptText.get(choice.index) ?? ''}${content}`
@@ -1159,11 +1168,6 @@ export class OpenAiCompatibleProvider implements ModelProvider {
             tools.set(key, accumulated)
           }
           if (choice.finish_reason) {
-            if (choice.finish_reason === 'error' || choice.error) {
-              this.reportStreamDiagnostic(choice.error)
-              parserError = streamedFailure(choice.error)
-              return
-            }
             if (choice.index === 0) explicitTerminal = true
             if (choice.finish_reason === 'tool_calls') {
               for (const [key, tool] of tools) {
