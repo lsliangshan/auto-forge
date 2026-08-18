@@ -474,7 +474,7 @@ describe('OpenRouterProvider', () => {
     })
   })
 
-  it('submits verified video references with explicit aspect ratio', async () => {
+  it('submits verified video frames with explicit aspect ratio', async () => {
     const bodies: string[] = []
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       bodies.push(String(init?.body))
@@ -496,13 +496,66 @@ describe('OpenRouterProvider', () => {
       resolution: '1080p',
       aspect_ratio: '9:16',
       generate_audio: true,
-      input_references: [{
+      frame_images: [{
         type: 'image_url',
         image_url: { url: 'data:image/webp;base64,AQID' },
+        frame_type: 'first_frame',
       }],
     }
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(bodies.map((body) => JSON.parse(body))).toEqual([expected])
+  })
+
+  it('orders two video frames as first and last frames', async () => {
+    const bodies: string[] = []
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(String(init?.body))
+      return Response.json({ id: 'job_1', status: 'pending' }, { status: 202 })
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.submitVideo({
+      model: 'video/model',
+      prompt: 'transition',
+      options: { durationSeconds: 8, resolution: '1080p', aspectRatio: '16:9', generateAudio: false },
+      references: [
+        { mimeType: 'image/png', dataBase64: 'AQID' },
+        { mimeType: 'image/jpeg', dataBase64: 'BAUG' },
+      ],
+    })).resolves.toEqual({ providerJobId: 'job_1', status: 'pending' })
+
+    expect(JSON.parse(bodies[0]!)).toMatchObject({
+      frame_images: [
+        {
+          type: 'image_url',
+          image_url: { url: 'data:image/png;base64,AQID' },
+          frame_type: 'first_frame',
+        },
+        {
+          type: 'image_url',
+          image_url: { url: 'data:image/jpeg;base64,BAUG' },
+          frame_type: 'last_frame',
+        },
+      ],
+    })
+  })
+
+  it('rejects more than two video frames before credential access or fetch', async () => {
+    const localCredential = { get: vi.fn(async () => 'sk-private') }
+    const fetch = vi.fn(async () => Response.json({ id: 'job_1', status: 'pending' }, { status: 202 }))
+    const provider = new OpenRouterProvider({ credential: localCredential, fetch })
+
+    await expect(provider.submitVideo({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 8, resolution: '1080p', aspectRatio: '16:9', generateAudio: false },
+      references: Array.from(
+        { length: 3 },
+        () => ({ mimeType: 'image/png' as const, dataBase64: 'AQID' }),
+      ),
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(localCredential.get).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
   })
 
   it.each([
