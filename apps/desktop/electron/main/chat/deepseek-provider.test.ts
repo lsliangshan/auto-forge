@@ -37,6 +37,7 @@ describe('DeepSeekProvider', () => {
       endUserId: 'user-1',
     } as never))
 
+    expect(fetch).toHaveBeenCalledTimes(1)
     expect(body).not.toHaveProperty('user')
     expect(provider.getGenerationUsage).toBeUndefined()
   })
