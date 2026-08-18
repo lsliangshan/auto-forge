@@ -39,6 +39,7 @@ export interface ResolvedChatRoute {
   generation: GenerationOptions
   imageParameterSupport?: ModelImageParameterSupport
   videoFrameImages?: VideoFrameType[]
+  videoUsesInputReferences?: boolean
 }
 
 export interface OutputSelectionRequired {
@@ -115,7 +116,21 @@ function isModel(model: unknown): model is ModelInfo {
       && typeof video.supportsAudio === 'boolean'
       && Array.isArray(video.frameImages)
       && video.frameImages.every((frame) => frame === 'first_frame' || frame === 'last_frame')
+      && (
+        video.maxReferenceImages === undefined
+        || (
+          typeof video.maxReferenceImages === 'number'
+          && Number.isSafeInteger(video.maxReferenceImages)
+          && video.maxReferenceImages > 0
+        )
+      )
     ))
+}
+
+function videoImageCapacity(model: ModelInfo): number {
+  const video = model.generation.video
+  if (!video) return 0
+  return Math.max(video.frameImages.length, video.maxReferenceImages ?? 0)
 }
 
 function assertCatalog(provider: ModelProviderId, models: readonly ModelInfo[]): void {
@@ -170,7 +185,7 @@ function supportsRequest(model: ModelInfo, output: ConcreteOutput, assets: reado
     || !supportsGeneration(model, output)
   ) return false
   if ((output === 'image' || output === 'video') && assets.some((asset) => asset.kind !== 'image')) return false
-  if (output === 'video' && assets.length > (model.generation.video?.frameImages.length ?? 0)) return false
+  if (output === 'video' && assets.length > videoImageCapacity(model)) return false
   return assets.every((asset) => model.inputModalities.includes(asset.kind))
 }
 
@@ -327,6 +342,9 @@ function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteO
     } : {}),
     ...(output === 'video' ? {
       videoFrameImages: model.generation.video!.frameImages.slice(),
+      ...(input.assets.length > model.generation.video!.frameImages.length
+        ? { videoUsesInputReferences: true }
+        : {}),
     } : {}),
   }
 }

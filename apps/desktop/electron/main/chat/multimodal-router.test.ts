@@ -325,6 +325,42 @@ describe('resolveChatRoute', () => {
     }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
   })
 
+  it('routes one reference image for Sora and rejects excess references', () => {
+    const sora = model({
+      id: 'openai/sora-2-pro',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['video'],
+      generation: {
+        video: {
+          resolutions: ['1080p'],
+          aspectRatios: ['16:9'],
+          durations: [8],
+          supportsAudio: true,
+          frameImages: [],
+          maxReferenceImages: 1,
+        },
+      },
+    })
+
+    expect(resolveChatRoute(input({
+      requestedModel: sora.id,
+      requestedOutput: 'video',
+      models: [sora],
+      assets: [asset('image')],
+    }))).toMatchObject({
+      model: 'openai/sora-2-pro',
+      videoFrameImages: [],
+      videoUsesInputReferences: true,
+    })
+
+    expect(() => resolveChatRoute(input({
+      requestedModel: sora.id,
+      requestedOutput: 'video',
+      models: [sora],
+      assets: [asset('image', { id: 'first' }), asset('image', { id: 'second' })],
+    }))).toThrow(expect.objectContaining({ code: 'MODEL_MODALITY_UNSUPPORTED' }))
+  })
+
   it('fails locally when selected-output capability metadata cannot support a generation option', () => {
     expect(() => resolveChatRoute(input({
       requestedModel: 'image/model',
