@@ -25,13 +25,31 @@
       <span>{{ item.label }}</span>
     </RouterLink>
     <div class="rail-account">
-      <span
+      <RouterLink
+        to="/profile"
+        data-testid="profile-entry"
+        class="rail-profile-entry"
+        aria-label="个人资料"
+      >
+        <img
+          v-if="profile.profile?.avatarUrl"
+          class="rail-avatar"
+          :src="profile.profile.avatarUrl"
+          alt=""
+        >
+        <span
+          v-else
+          data-testid="profile-avatar-fallback"
+          class="rail-avatar rail-avatar-fallback"
+        >{{ accountInitial }}</span>
+        <span
         data-testid="current-account"
         class="rail-account-name"
-        :title="auth.session?.user.account"
+          :title="accountLabel"
       >
-        {{ auth.session?.user.account }}
-      </span>
+          {{ accountLabel }}
+        </span>
+      </RouterLink>
       <button
         type="button"
         aria-label="退出登录"
@@ -51,11 +69,16 @@
 
 <script setup lang="ts">
 import { ChatDotRound, Clock, Operation, Setting, SwitchButton, Tools } from '@element-plus/icons-vue'
+import { computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import { useProfileStore } from '../stores/profile'
 
 const auth = useAuthStore()
+const profile = useProfileStore()
 const router = useRouter()
+const accountLabel = computed(() => profile.profile?.displayName ?? auth.session?.user.account ?? '')
+const accountInitial = computed(() => (auth.session?.user.account ?? '?').charAt(0).toUpperCase())
 
 const items = [
   { to: '/chat', label: '聊天', icon: ChatDotRound },
@@ -66,8 +89,19 @@ const items = [
 ]
 
 async function logout() {
-  if (await auth.logout()) await router.replace('/login')
+  if (await auth.logout()) {
+    profile.reset()
+    await router.replace('/login')
+  }
 }
+
+onMounted(() => {
+  if (auth.session) void profile.load(auth.session.user.id)
+})
+watch(() => auth.session?.user.id, (userId) => {
+  if (userId) void profile.load(userId)
+  else profile.reset()
+})
 </script>
 
 <style scoped>
@@ -77,6 +111,9 @@ async function logout() {
 .rail-item:hover { color: white; background: #2c333d; }
 .rail-item.router-link-active { color: white; background: #33445f; box-shadow: inset 2px 0 var(--af-cobalt); }
 .rail-account { position: relative; display: grid; width: 44px; margin-top: auto; justify-items: center; gap: 5px; }
+.rail-profile-entry { display: grid; width: 44px; justify-items: center; gap: 4px; color: inherit; text-decoration: none; }
+.rail-avatar { display: grid; width: 32px; height: 32px; place-items: center; border: 1px solid #526073; border-radius: 50%; object-fit: cover; }
+.rail-avatar-fallback { color: white; background: #33445f; font-size: 12px; font-weight: 750; }
 .rail-account-name { width: 44px; overflow: hidden; color: #dce3ed; font-size: 9px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .rail-account button { display: grid; width: 34px; height: 34px; place-items: center; border: 0; border-radius: 6px; color: #c8d0dc; background: transparent; cursor: pointer; }
 .rail-account button:hover:not(:disabled) { color: white; background: #2c333d; }

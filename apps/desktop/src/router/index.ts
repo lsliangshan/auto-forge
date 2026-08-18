@@ -5,6 +5,7 @@ import ChatView from '../views/ChatView.vue'
 import DeveloperView from '../views/DeveloperView.vue'
 import ExecutionsView from '../views/ExecutionsView.vue'
 import LoginView from '../views/LoginView.vue'
+import ProfileView from '../views/ProfileView.vue'
 import RegisterView from '../views/RegisterView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import WorkflowsView from '../views/WorkflowsView.vue'
@@ -43,6 +44,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'developer', name: 'developer', component: DeveloperView, meta: { title: '开发', inspector: true } },
       { path: 'executions', name: 'executions', component: ExecutionsView, meta: { title: '执行记录', inspector: true } },
       { path: 'settings', name: 'settings', component: SettingsView, meta: { title: '设置', inspector: false } },
+      { path: 'profile', name: 'profile', component: ProfileView, meta: { title: '个人资料', inspector: false } },
     ],
   },
   { path: '/:pathMatch(.*)*', redirect: '/chat' },

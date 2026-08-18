@@ -80,6 +80,11 @@ function createEventApi() {
       getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
       logout: vi.fn().mockResolvedValue(undefined),
     },
+    profile: {
+      get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
+      update: vi.fn(),
+      pickAndUploadAvatar: vi.fn().mockResolvedValue(null),
+    },
     chat: {
       listConversations: vi.fn().mockResolvedValue([]), createConversation: vi.fn(),
       listMessages: vi.fn().mockResolvedValue([]),

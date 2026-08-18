@@ -87,6 +87,11 @@ function createApi() {
       getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
       logout: vi.fn().mockResolvedValue(undefined),
     },
+    profile: {
+      get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
+      update: vi.fn(),
+      pickAndUploadAvatar: vi.fn().mockResolvedValue(null),
+    },
     chat: {}, workflows: {}, permissions: {}, settings: {}, system: {},
     developer: {
       listProjects: vi.fn().mockResolvedValue([project]), createProject: vi.fn(), registerProject: vi.fn(),
