@@ -401,6 +401,40 @@ describe('openAppDatabase', () => {
     })
   })
 
+  it('replays reports without identity after identity was bound separately', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_prebound_report', 'Prebound Report')
+    const start = usageStart('prebound_report', 'user_prebound_report')
+    database.providerUsage.start(start)
+    database.providerUsage.bindIdentity(start.operationKey, {
+      generationId: 'generation_prebound_report',
+      providerJobId: 'job_prebound_report',
+    })
+    const report = { inputTokens: 3, outputTokens: 4, costUsd: '0.25', endedAt: 600 }
+
+    const first = database.providerUsage.report(start.operationKey, report)
+    const replayed = database.providerUsage.report(start.operationKey, report)
+
+    expect(first).toMatchObject({
+      status: 'reported',
+      generationId: 'generation_prebound_report',
+      providerJobId: 'job_prebound_report',
+      inputTokens: 3,
+      outputTokens: 4,
+      costUsd: '0.25',
+      endedAt: 600,
+    })
+    expect(replayed).toEqual(first)
+    expect(() => database.providerUsage.report(start.operationKey, {
+      ...report,
+      generationId: 'generation_conflict',
+    })).toThrow('Provider usage consistency error')
+    expect(() => database.providerUsage.report(start.operationKey, {
+      ...report,
+      providerJobId: 'job_conflict',
+    })).toThrow('Provider usage consistency error')
+  })
+
   it('marks and recovers pending usage as unknown without changing reported rows', () => {
     const database = openTestDatabase()
     insertLocalUser(database, 'user_unknown', 'Unknown')

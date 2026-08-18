@@ -1962,8 +1962,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const stored = getProviderUsage(database, operationKey)
           if (stored.status === 'reported') {
             if (
-              stored.generationId !== report.generationId
-              || stored.providerJobId !== report.providerJobId
+              (report.generationId !== undefined && stored.generationId !== report.generationId)
+              || (report.providerJobId !== undefined && stored.providerJobId !== report.providerJobId)
               || stored.inputTokens !== report.inputTokens
               || stored.outputTokens !== report.outputTokens
               || stored.costUsd !== costUsd
