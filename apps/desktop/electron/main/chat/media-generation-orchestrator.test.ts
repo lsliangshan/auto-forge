@@ -364,6 +364,41 @@ describe('MediaGenerationOrchestrator', () => {
     expect(orchestrator.hasActiveRuns()).toBe(false)
   })
 
+  it('terminalizes a snapshot provider mismatch before rethrowing a consistency error', async () => {
+    const harness = createHarness()
+    harness.providers.acquire.mockResolvedValue({
+      providerId: 'deepseek',
+      provider: harness.provider,
+    })
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+
+    await expect(orchestrator.runImage({ ...input, route: imageRoute }))
+      .rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+
+    expect(harness.finalizations).toEqual([expect.objectContaining({
+      status: 'failed',
+      errorCode: 'INTERNAL_ERROR',
+    })])
+    expect(orchestrator.hasActiveRuns()).toBe(false)
+  })
+
+  it('continues consistency terminalization when writer abort throws synchronously', async () => {
+    const harness = createHarness()
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.mocked(harness.providerUsage.report).mockImplementation(() => { throw consistencyError })
+    vi.mocked(harness.writer.abort).mockImplementation(() => { throw new Error('sync abort failure') })
+
+    await expect(new MediaGenerationOrchestrator(harness.dependencies)
+      .runAudio({ ...input, route: audioRoute }))
+      .rejects.toBe(consistencyError)
+
+    expect(harness.persistence.finalize).toHaveBeenCalledTimes(1)
+    expect(harness.finalizations[0]).toMatchObject({
+      status: 'failed',
+      errorCode: 'INTERNAL_ERROR',
+    })
+  })
+
   it.each([
     {
       name: 'generation identity',

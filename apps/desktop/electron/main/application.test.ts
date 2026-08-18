@@ -99,55 +99,53 @@ function serializedProxyHarness() {
 
 let networkProxy = createNetworkProxy()
 type RuntimeOptions = Parameters<typeof createApplicationRuntime>[0]
-type LooseRuntimeOptions = Omit<RuntimeOptions, 'openRouter' | 'modelProviders'> & {
-  openRouter?: ModelProvider
-  modelProviders?: Partial<Record<'openrouter' | 'deepseek', ModelProvider>>
-}
-type TestRuntimeOverrides = Omit<Partial<RuntimeOptions>, 'openRouter' | 'modelProviders'> & {
-  openRouter?: ModelProvider
-  modelProviders?: Partial<Record<'openrouter' | 'deepseek', ModelProvider>>
-}
 
 function snapshotProvider(
   providerId: 'openrouter' | 'deepseek',
   provider: ModelProvider,
 ): CredentialBoundModelProvider {
-  if ('acquireSnapshot' in provider && typeof provider.acquireSnapshot === 'function') {
-    return provider as CredentialBoundModelProvider
+  const bound: CredentialBoundModelProvider = {
+    listModels: (signal) => provider.listModels(signal),
+    validateCredential: (signal) => provider.validateCredential(signal),
+    stream: (request) => provider.stream(request),
+    ...(provider.generateImage === undefined ? {} : {
+      generateImage: (request) => provider.generateImage!(request),
+    }),
+    ...(provider.submitVideo === undefined ? {} : {
+      submitVideo: (request) => provider.submitVideo!(request),
+    }),
+    ...(provider.pollVideo === undefined ? {} : {
+      pollVideo: (providerJobId, signal) => provider.pollVideo!(providerJobId, signal),
+    }),
+    ...(provider.downloadVideo === undefined ? {} : {
+      downloadVideo: (providerJobId, signal) => provider.downloadVideo!(providerJobId, signal),
+    }),
+    ...(provider.getGenerationUsage === undefined ? {} : {
+      getGenerationUsage: (generationId, signal) => provider.getGenerationUsage!(generationId, signal),
+    }),
+    acquireSnapshot: vi.fn(async (): Promise<ModelProviderSnapshot> => ({
+      providerId,
+      provider: bound,
+      ...(providerId === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_test' } : {}),
+    })),
   }
-  const bound = provider as CredentialBoundModelProvider
-  bound.acquireSnapshot = vi.fn(async (): Promise<ModelProviderSnapshot> => ({
-    providerId,
-    provider: bound,
-    ...(providerId === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_test' } : {}),
-  }))
   return bound
 }
 
-function testRuntimeOptions(input: LooseRuntimeOptions): RuntimeOptions {
-  const { openRouter, modelProviders, ...runtimeOptions } = input
-  const injectedProviders = modelProviders === undefined
-    ? undefined
-    : Object.fromEntries(Object.entries(modelProviders).map(([providerId, provider]) => [
-        providerId,
-        snapshotProvider(providerId as 'openrouter' | 'deepseek', provider),
-      ])) as RuntimeOptions['modelProviders']
-  return {
-    ...runtimeOptions,
-    ...(openRouter === undefined ? {} : { openRouter: snapshotProvider('openrouter', openRouter) }),
-    ...(injectedProviders === undefined ? {} : { modelProviders: injectedProviders }),
-  }
-}
-
-function createTestApplicationRuntime(input: LooseRuntimeOptions) {
-  return createApplicationRuntime(testRuntimeOptions(input))
+function snapshotProviders(
+  providers: Partial<Record<'openrouter' | 'deepseek', ModelProvider>>,
+): NonNullable<RuntimeOptions['modelProviders']> {
+  return Object.fromEntries(Object.entries(providers).map(([providerId, provider]) => [
+    providerId,
+    snapshotProvider(providerId as 'openrouter' | 'deepseek', provider),
+  ]))
 }
 
 function options(
   root: string,
-  overrides: TestRuntimeOverrides = {},
+  overrides: Partial<RuntimeOptions> = {},
 ): RuntimeOptions {
-  return testRuntimeOptions({
+  return {
     paths: {
       database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
       projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -169,7 +167,7 @@ function options(
     networkProxy,
     browserRuntime: { packaged: false },
     ...overrides,
-  })
+  }
 }
 
 function chatInput(conversationId: string, content: string): ChatSendInput {
@@ -188,6 +186,30 @@ function chatInput(conversationId: string, content: string): ChatSendInput {
 
 async function authenticate(runtime: ReturnType<typeof createApplicationRuntime>) {
   return runtime.services.auth.register({ account: 'TestUser', password: 'password' })
+}
+
+async function installApprovalWorkflow(
+  runtime: ReturnType<typeof createApplicationRuntime>,
+  activation = 'approval workflow',
+) {
+  const project = await runtime.services.developer.createProject('Approval Workflow')
+  const manifest = JSON.parse(
+    await runtime.services.developer.readFile(project.id, 'workflow.json'),
+  ) as Record<string, unknown>
+  Object.assign(manifest, {
+    id: 'local.autoforge.approval-workflow',
+    version: '1.0.0',
+    permissions: [{ capability: 'browser.open', scope: { origins: ['https://example.com'] } }],
+    activationExamples: [activation],
+    inputSchema: { type: 'object', additionalProperties: false },
+  })
+  await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+  await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+    "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+    'export default defineWorkflow({ async run() { return { ok: true } } })',
+  ].join('\n'))
+  await runtime.services.developer.build(project.id)
+  return runtime.services.workflows.installProject(project.id)
 }
 
 function modelInfo(id: string, name: string): ModelInfo {
@@ -388,13 +410,13 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const emitChat = vi.fn()
     const runtime = createApplicationRuntime(options(root, {
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
-      },
+      } }),
       emitChat,
     }))
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -455,13 +477,19 @@ describe('createApplicationRuntime', () => {
     }
     const getSecret = vi.spyOn(SecretStore.prototype, 'get')
     const runtime = createApplicationRuntime(options(root, {
-      modelProviders: { openrouter, deepseek },
+      modelProviders: snapshotProviders({ openrouter, deepseek }),
       emitChat,
     }))
     const alice = await runtime.services.auth.register({ account: 'Alice', password: 'password' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-user-a')
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek-user-b')
-    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
+    })
     const openRouterConversation = await runtime.services.chat.createConversation()
 
     const sending = runtime.services.chat.send(chatInput(openRouterConversation.id, 'owned by Alice'))
@@ -550,7 +578,13 @@ describe('createApplicationRuntime', () => {
     const runtime = createApplicationRuntime(options(root, { networkProxy: proxy, emitChat }))
     const session = await runtime.services.auth.register({ account: 'SnapshotUser', password: 'password' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-a')
-    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
+    })
 
     const firstConversation = await runtime.services.chat.createConversation()
     const first = await runtime.services.chat.send(chatInput(firstConversation.id, 'first'))
@@ -643,6 +677,125 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.close()).rejects.toBe(consistencyError)
   })
 
+  it('latches a real preflight snapshot provider mismatch before model work starts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-preflight-consistency-'))
+    directories.push(root)
+    const bound = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openrouter/text', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const mismatched: CredentialBoundModelProvider = {
+      ...bound,
+      acquireSnapshot: vi.fn(async () => ({ providerId: 'deepseek' as const, provider: bound })),
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: mismatched },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+
+    let consistencyError: unknown
+    try {
+      await runtime.services.chat.send(chatInput(conversation.id, 'mismatch'))
+    } catch (error) {
+      consistencyError = error
+    }
+    expect(consistencyError).toBeInstanceOf(ProviderUsageConsistencyError)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('latches and rethrows a video submit consistency rejection', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-submit-consistency-'))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.spyOn(VideoJobRunner.prototype, 'submit').mockRejectedValueOnce(consistencyError)
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      submitVideo: vi.fn(async () => ({ providerJobId: 'provider_video', status: 'pending' as const })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { video: 'openrouter/video' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+
+    await expect(runtime.services.chat.send({
+      ...chatInput(conversation.id, 'video'),
+      outputType: 'video',
+    })).rejects.toBe(consistencyError)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('latches a real timer-started video consistency failure before shutdown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-background-consistency-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      submitVideo: vi.fn(async () => ({ providerJobId: 'provider_video', status: 'pending' as const })),
+      pollVideo: vi.fn(async () => ({ status: 'in_progress' as const })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { video: 'openrouter/video' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    vi.useFakeTimers()
+    try {
+      const { requestId } = await runtime.services.chat.send({
+        ...chatInput(conversation.id, 'video'),
+        outputType: 'video',
+      })
+      const tamper = new Database(databasePath)
+      try {
+        expect(tamper.prepare('DELETE FROM provider_usage_events WHERE operation_key = ?')
+          .run(`video:${requestId}`).changes).toBe(1)
+      } finally {
+        tamper.close()
+      }
+
+      await vi.advanceTimersByTimeAsync(2_000)
+      await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      await expect(runtime.close()).rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not latch an orchestrator business-failure result', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-business-failure-'))
     directories.push(root)
@@ -669,12 +822,132 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.close()).resolves.toBeUndefined()
   })
 
+  it('keeps an awaiting approval request active so close cancels and terminalizes it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-close-'))
+    directories.push(root)
+    const chatEvents: ChatEvent[] = []
+    let workflowId = ''
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/tools', 'Tools'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_approval',
+          name: workflowId,
+          arguments: {},
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    workflowId = (await installApprovalWorkflow(runtime)).id
+    const conversation = await runtime.services.chat.createConversation()
+
+    const { requestId } = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block',
+      block: expect.objectContaining({ type: 'approval' }),
+    })))
+
+    await runtime.close()
+
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    try {
+      expect(database.chatRuns.getByRequestId(requestId)).toMatchObject({
+        status: 'cancelled',
+        errorCode: 'CANCELLED',
+        endedAt: expect.any(Number),
+      })
+    } finally {
+      database.close()
+    }
+  })
+
+  it('latches and rethrows the exact consistency failure from approval resume', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-resume-'))
+    directories.push(root)
+    const chatEvents: ChatEvent[] = []
+    let workflowId = ''
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/tools', 'Tools'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_approval',
+          name: workflowId,
+          arguments: {},
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    workflowId = (await installApprovalWorkflow(runtime)).id
+    const conversation = await runtime.services.chat.createConversation()
+
+    await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'approval' }),
+    })))
+    const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+      event.type === 'block' && event.block.type === 'approval'
+    ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.spyOn(AgentOrchestrator.prototype, 'resumeApproval').mockRejectedValueOnce(consistencyError)
+
+    await expect(runtime.services.executions.decide({
+      executionId: approval.executionId,
+      permissionIndex: approval.permissionIndex,
+      scopeHash: approval.scopeHash,
+      decision: 'once',
+    })).rejects.toBe(consistencyError)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
   it('gives a latched consistency error priority over later shutdown failures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-consistency-priority-'))
     directories.push(root)
     const consistencyError = new ProviderUsageConsistencyError()
+    const laterConsistencyError = new ProviderUsageConsistencyError()
     vi.spyOn(AgentOrchestrator.prototype, 'run').mockRejectedValueOnce(consistencyError)
-    vi.spyOn(VideoJobRunner.prototype, 'stop').mockRejectedValueOnce(new Error('video stop'))
+    vi.spyOn(VideoJobRunner.prototype, 'stop').mockRejectedValueOnce(laterConsistencyError)
     vi.spyOn(ExecutionService.prototype, 'shutdown').mockRejectedValueOnce(new Error('execution shutdown'))
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [modelInfo('openai/gpt-4.1-mini', 'Text')]),
@@ -690,6 +963,68 @@ describe('createApplicationRuntime', () => {
     await new Promise<void>((resolve) => { setImmediate(resolve) })
 
     await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('continues cleanup after synchronous cancellation throws and applies stable failure priority', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-sync-cancel-'))
+    directories.push(root)
+    const agentError = new Error('agent cancel synchronously failed')
+    const mediaError = new Error('media cancel synchronously failed')
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockResolvedValueOnce({
+      requestId: 'awaiting',
+      status: 'awaiting_approval',
+      executionId: 'execution_awaiting',
+    })
+    const agentCancel = vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockImplementation(() => {
+      throw agentError
+    })
+    const mediaCancel = vi.spyOn(MediaGenerationOrchestrator.prototype, 'cancel').mockImplementation(() => {
+      throw mediaError
+    })
+    const executionShutdown = vi.spyOn(ExecutionService.prototype, 'shutdown')
+    const databaseClose = vi.spyOn(Database.prototype, 'close')
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openrouter/text', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/text' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'await approval'))
+    await vi.waitFor(() => expect(AgentOrchestrator.prototype.run).toHaveBeenCalled())
+
+    await expect(runtime.close()).rejects.toBe(agentError)
+    expect(agentCancel).toHaveBeenCalledTimes(1)
+    expect(mediaCancel).toHaveBeenCalledTimes(1)
+    expect(executionShutdown).toHaveBeenCalledTimes(1)
+    expect(databaseClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('memoizes close and rejects recover after shutdown starts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-close-memo-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    const first = runtime.close()
+    const second = runtime.close()
+
+    expect(second).toBe(first)
+    await expect(first).resolves.toBeUndefined()
+    expect(runtime.close()).toBe(first)
+    await expect(runtime.recover()).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
   it('runs interrupted usage recovery without blocking startup and preserves the failure for close', async () => {
@@ -737,13 +1072,13 @@ describe('createApplicationRuntime', () => {
     vi.useFakeTimers()
     vi.setSystemTime(10_000)
     const runtime = createApplicationRuntime(options(root, {
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
-      },
+      } }),
     }))
     try {
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-capability')
@@ -784,14 +1119,14 @@ describe('createApplicationRuntime', () => {
       .mockRejectedValue(reconciliationError)
     const emitChat = vi.fn()
     const runtime = createApplicationRuntime(options(root, {
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
         getGenerationUsage: async (generationId) => ({ generationId }),
-      },
+      } }),
       emitChat,
     }))
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
@@ -838,14 +1173,14 @@ describe('createApplicationRuntime', () => {
       .mockImplementationOnce(() => first.promise)
       .mockResolvedValue(undefined)
     const runtime = createApplicationRuntime(options(root, {
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
         getGenerationUsage: async (generationId) => ({ generationId }),
-      },
+      } }),
     }))
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -885,14 +1220,14 @@ describe('createApplicationRuntime', () => {
       .mockImplementationOnce(() => first.promise)
       .mockResolvedValue(undefined)
     const runtime = createApplicationRuntime(options(root, {
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
         getGenerationUsage: async (generationId) => ({ generationId }),
-      },
+      } }),
     }))
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -1272,7 +1607,7 @@ describe('createApplicationRuntime', () => {
     const chooseMediaFiles = vi.fn<(remainingSlots: number) => Promise<string[]>>(async () => [])
     const chooseMediaSavePath = vi.fn(async () => copied)
     const revealPath = vi.fn()
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1339,7 +1674,7 @@ describe('createApplicationRuntime', () => {
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       }),
     }
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1350,7 +1685,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: { openrouter, deepseek },
+      modelProviders: snapshotProviders({ openrouter, deepseek }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1438,7 +1773,7 @@ describe('createApplicationRuntime', () => {
       }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1449,13 +1784,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context model'), contextLength: 128_000 }]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1600,7 +1935,7 @@ describe('createApplicationRuntime', () => {
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const chatEvents: ChatEvent[] = []
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1611,13 +1946,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [modelInfo('openrouter/context', 'Context model')]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1681,7 +2016,7 @@ describe('createApplicationRuntime', () => {
       if (captured.length === 1) yield { type: 'text_delta' as const, choiceIndex: 0, text: '我看到了图片' }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1692,13 +2027,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [{ ...visionTextModelInfo('openrouter/vision-context'), contextLength: 128_000 }]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [source],
       readClipboardImage: () => undefined,
@@ -1772,7 +2107,7 @@ describe('createApplicationRuntime', () => {
     const stream = vi.fn(async function* () {
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1783,14 +2118,14 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [imageModelInfo('openrouter/image')]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
           generateImage,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1871,7 +2206,7 @@ describe('createApplicationRuntime', () => {
       }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1882,7 +2217,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [
             visionTextModelInfo('openrouter/text'),
@@ -1896,7 +2231,7 @@ describe('createApplicationRuntime', () => {
           generateImage,
           submitVideo,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [source],
       readClipboardImage: () => undefined,
@@ -2042,7 +2377,7 @@ describe('createApplicationRuntime', () => {
     })
     const validateCredential = vi.fn(async () => ({ valid: false }))
     const listModels = vi.fn(async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')])
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2053,13 +2388,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         deepseek: {
           listModels,
           validateCredential,
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [source],
       readClipboardImage: () => undefined,
@@ -2122,7 +2457,7 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const source = join(root, 'source.png')
     await writeFile(source, Buffer.from('89504e470d0a1a0a', 'hex'))
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2250,7 +2585,7 @@ describe('createApplicationRuntime', () => {
         signal?.addEventListener('abort', () => reject({ code: 'CANCELLED' }), { once: true })
       })
     ))
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2261,7 +2596,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [imageModelInfo('openrouter/image')]),
           validateCredential: vi.fn(async () => ({ valid: true })),
@@ -2270,7 +2605,7 @@ describe('createApplicationRuntime', () => {
           }),
           generateImage,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2311,7 +2646,7 @@ describe('createApplicationRuntime', () => {
     const validateCredential = vi.fn(() => new Promise<{ valid: boolean }>((resolve) => {
       finishValidation = resolve
     }))
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2322,7 +2657,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         deepseek: {
           listModels: vi.fn(async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')]),
           validateCredential,
@@ -2330,7 +2665,7 @@ describe('createApplicationRuntime', () => {
             yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
           }),
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2365,7 +2700,7 @@ describe('createApplicationRuntime', () => {
       const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-stop-'))
       directories.push(root)
       const pollVideo = vi.fn(async () => ({ status: 'pending' as const }))
-      const runtime = createTestApplicationRuntime({
+      const runtime = createApplicationRuntime({
         paths: {
           database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
           projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2376,7 +2711,7 @@ describe('createApplicationRuntime', () => {
           encrypt: async (value) => Buffer.from(value),
           decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
         },
-        modelProviders: {
+        modelProviders: snapshotProviders({
           openrouter: {
             listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
             validateCredential: vi.fn(async () => ({ valid: true })),
@@ -2389,7 +2724,7 @@ describe('createApplicationRuntime', () => {
             })),
             pollVideo,
           },
-        },
+        }),
         chooseProjectDirectory: async () => undefined,
         chooseMediaFiles: async () => [],
         readClipboardImage: () => undefined,
@@ -2529,7 +2864,7 @@ describe('createApplicationRuntime', () => {
     })
     database.close()
 
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: databasePath, data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2644,7 +2979,7 @@ describe('createApplicationRuntime', () => {
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       }),
     }
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2658,7 +2993,7 @@ describe('createApplicationRuntime', () => {
           shouldReEncrypt: false,
         }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         deepseek,
         openrouter: {
           listModels: vi.fn(async () => []),
@@ -2667,7 +3002,7 @@ describe('createApplicationRuntime', () => {
             yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
           }),
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2697,7 +3032,7 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const openExternal = vi.fn().mockResolvedValue(undefined)
     const chatEvents: Array<{ type: string; status?: string }> = []
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2708,11 +3043,11 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2772,7 +3107,7 @@ describe('createApplicationRuntime', () => {
     }
     await runtime.close()
 
-    const restarted = createTestApplicationRuntime({
+    const restarted = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2783,10 +3118,10 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')], validateCredential: async () => ({ valid: true }),
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2810,7 +3145,7 @@ describe('createApplicationRuntime', () => {
     let finishStream!: () => void
     const streamFinished = new Promise<void>((resolve) => { finishStream = resolve })
     const chatEvents: Array<{ type: string; status?: string }> = []
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2821,13 +3156,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')], validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           await streamFinished
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2927,7 +3262,7 @@ describe('createApplicationRuntime', () => {
     let finishCleanup!: () => void
     const cleanupStarted = new Promise<void>((resolve) => { markCleanupStarted = resolve })
     const cleanupFinished = new Promise<void>((resolve) => { finishCleanup = resolve })
-    const runtime = createTestApplicationRuntime({
+    const runtime = createApplicationRuntime({
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2938,10 +3273,10 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [], validateCredential: async () => ({ valid: true }),
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,

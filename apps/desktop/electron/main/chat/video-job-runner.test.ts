@@ -228,6 +228,7 @@ function createHarness(
     },
     media,
     emit: (event) => events.push(event),
+    onBackgroundFailure: vi.fn(),
     id: (() => {
       const ids = ['user_message_1', 'run_video_1', 'assistant_video_1', 'block_video_1']
       return () => ids.shift() ?? 'unexpected_id'
@@ -760,7 +761,9 @@ describe('VideoJobRunner', () => {
 
     await runner.recover()
     await flush()
-    await expect(runner.stop()).rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+    const backgroundFailure = vi.mocked(harness.dependencies.onBackgroundFailure).mock.calls[0]?.[0]
+    expect(backgroundFailure).toBeInstanceOf(ProviderUsageConsistencyError)
+    await expect(runner.stop()).rejects.toBe(backgroundFailure)
 
     expect(harness.provider.pollVideo).not.toHaveBeenCalled()
     expect(harness.database.mediaGenerationJobs.get('request_owned_missing_usage')?.pollAttempts).toBe(0)

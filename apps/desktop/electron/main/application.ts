@@ -23,7 +23,11 @@ import {
 } from '@autoforge/shared'
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import Ajv, { type AnySchema } from 'ajv'
-import { AgentOrchestrator, createAgentPersistence } from './agent/agent-orchestrator.js'
+import {
+  AgentOrchestrator,
+  createAgentPersistence,
+  type AgentRunResult,
+} from './agent/agent-orchestrator.js'
 import { LocalAuthService } from './auth/local-auth-service.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
@@ -78,14 +82,12 @@ export interface ApplicationPaths {
 }
 
 export type ApplicationModelProviderPort = CredentialBoundModelProvider
-export type ApplicationOpenRouterPort = ApplicationModelProviderPort
 
 export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
   networkProxy: NetworkProxyPort
   mediaTransport?: PinnedMediaTransportPort
-  openRouter?: ApplicationOpenRouterPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
   chooseProjectDirectory(): Promise<string | undefined>
   chooseMediaFiles(remainingSlots: number): Promise<string[]>
@@ -274,7 +276,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     proxy: { enabled: false, bypassDomains: [] },
   })
   const providerRegistry = new ModelProviderRegistry({
-    openrouter: options.modelProviders?.openrouter ?? options.openRouter ?? new OpenRouterProvider({
+    openrouter: options.modelProviders?.openrouter ?? new OpenRouterProvider({
       credential: secretStore,
       fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
     }),
@@ -388,22 +390,61 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     promise: Promise<void>
   }>()
   let acceptingWork = true
-  const backgroundFailures: unknown[] = []
-  const latchFailure = (error: unknown): void => {
-    backgroundFailures.push(error)
+  type FailureSource =
+    | 'background-chat'
+    | 'preflight'
+    | 'video-submit'
+    | 'video-background'
+    | 'reconciliation-stop'
+    | 'video-stop'
+    | 'admission-drain'
+    | 'agent-cancel'
+    | 'media-cancel'
+    | 'chat-drain'
+    | 'execution-shutdown'
+    | 'database-close'
+  interface FailureRecord {
+    error: unknown
+    sequence: number
+    rank: number
+  }
+  const failureRank: Record<FailureSource, number> = {
+    'background-chat': 0,
+    preflight: 1,
+    'video-submit': 2,
+    'video-background': 3,
+    'reconciliation-stop': 10,
+    'video-stop': 20,
+    'admission-drain': 30,
+    'agent-cancel': 40,
+    'media-cancel': 50,
+    'chat-drain': 60,
+    'execution-shutdown': 70,
+    'database-close': 80,
+  }
+  const failureRecords: FailureRecord[] = []
+  let failureSequence = 0
+  const recordFailure = (error: unknown, source: FailureSource): void => {
+    failureRecords.push({ error, sequence: failureSequence++, rank: failureRank[source] })
     if (error instanceof ProviderUsageConsistencyError) acceptingWork = false
   }
   const trackChatWork = (
     requestId: string,
     conversationId: string,
-    operation: () => Promise<unknown>,
+    operation: () => Promise<AgentRunResult>,
   ): void => {
     activeRequests.add(requestId)
     const promise = Promise.resolve()
       .then(operation)
-      .then(() => undefined, latchFailure)
-      .finally(() => {
+      .then((result) => {
+        if (['completed', 'cancelled', 'failed'].includes(result.status)) {
+          activeRequests.delete(requestId)
+        }
+      }, (error: unknown) => {
+        recordFailure(error, 'background-chat')
         activeRequests.delete(requestId)
+      })
+      .finally(() => {
         activeChatWork.delete(requestId)
       })
     activeChatWork.set(requestId, { conversationId, promise })
@@ -479,6 +520,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providers: providerRegistry,
     media,
     emit: emitChat,
+    onBackgroundFailure: (error) => { recordFailure(error, 'video-background') },
   })
 
   const requireValidCredential = async (snapshot: ModelProviderSnapshot): Promise<void> => {
@@ -603,7 +645,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const credentialEpoch = providerCredentialEpoch.get(snapshot.activeProvider) ?? 0
           const providerSnapshot = await providerRegistry.acquire(snapshot.activeProvider)
           if (providerSnapshot.providerId !== snapshot.activeProvider) {
-            throw new ProviderUsageConsistencyError()
+            const error = new ProviderUsageConsistencyError()
+            recordFailure(error, 'preflight')
+            throw error
           }
           await requireValidCredential(providerSnapshot)
           const resolved = await resolvedInput(input.conversationId, input.assetIds)
@@ -653,7 +697,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                   })),
                 ]
             trackChatWork(requestId, input.conversationId, async () => {
-              await agent.run({
+              return agent.run({
                 conversationId: input.conversationId,
                 content: input.content,
                 userBlocks,
@@ -674,17 +718,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             })
           } else if (route.outputType === 'image') {
             trackChatWork(requestId, input.conversationId, async () => {
-              await mediaGeneration.runImage(generationInput)
+              return mediaGeneration.runImage(generationInput)
             })
           } else if (route.outputType === 'audio') {
             trackChatWork(requestId, input.conversationId, async () => {
-              await mediaGeneration.runAudio(generationInput)
+              return mediaGeneration.runAudio(generationInput)
             })
           } else {
-            await videoJobs.submit({
-              ...generationInput,
-              route: { ...route, outputType: 'video' },
-            })
+            try {
+              await videoJobs.submit({
+                ...generationInput,
+                route: { ...route, outputType: 'video' },
+              })
+            } catch (error) {
+              if (error instanceof ProviderUsageConsistencyError) {
+                recordFailure(error, 'video-submit')
+              }
+              throw error
+            }
           }
           return { requestId }
         } finally {
@@ -847,7 +898,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return result
       },
       decide: async (decision) => {
-        const result = await agent.resumeApproval(decision)
+        let result
+        try {
+          result = await agent.resumeApproval(decision)
+        } catch (error) {
+          recordFailure(error, 'background-chat')
+          throw error
+        }
         if (result.error?.code === 'CONFLICT') await executions.decide(decision)
       },
       cancel: async (executionId) => {
@@ -944,12 +1001,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
   }
 
+  let closePromise: Promise<void> | undefined
   return {
     services,
     mediaAssets: {
       resolveReadyAsset: media.resolveReadyAsset,
     },
     recover: async () => {
+      if (closePromise) throw failure('CONFLICT')
       await options.networkProxy.initialize(settings.get().proxy)
       await mediaLifecycle.recover()
       database.recoverInterrupted()
@@ -958,38 +1017,49 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await projects.recoverRemovalJournals()
       await videoJobs.recover()
     },
-    close: async () => {
-      acceptingWork = false
-      const failures = [...backgroundFailures]
-      const observedBackgroundFailures = backgroundFailures.length
-      const capture = async (operation: () => void | Promise<void>): Promise<void> => {
-        try { await operation() } catch (error) { failures.push(error) }
-      }
-      const admittedStarts = maintenance.stopAndDrain()
-      const reconciliationStopped = providerUsageReconciliationLoop.stop().then(
-        () => undefined,
-        (error: unknown) => { failures.push(error) },
-      )
-      await capture(() => videoJobs.stop())
-      await capture(() => admittedStarts)
-      await capture(async () => {
-        const results = await Promise.allSettled([...activeRequests].flatMap((requestId) => [
-          agent.cancel(requestId),
-          mediaGeneration.cancel(requestId),
-        ]))
-        for (const result of results) if (result.status === 'rejected') failures.push(result.reason)
-      })
-      await capture(async () => {
-        const results = await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
-        for (const result of results) if (result.status === 'rejected') failures.push(result.reason)
-      })
-      await capture(() => executions.shutdown())
-      await reconciliationStopped
-      await capture(() => { database.close() })
-      failures.push(...backgroundFailures.slice(observedBackgroundFailures))
-      const terminalFailure = failures.find((error) => error instanceof ProviderUsageConsistencyError)
-        ?? failures[0]
-      if (terminalFailure !== undefined) throw terminalFailure
+    close: () => {
+      if (closePromise) return closePromise
+      closePromise = (async () => {
+        acceptingWork = false
+        const capture = async (
+          source: FailureSource,
+          operation: () => void | Promise<void>,
+        ): Promise<void> => {
+          try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
+        }
+        const admittedStarts = Promise.resolve().then(() => maintenance.stopAndDrain())
+        const reconciliationStopped = Promise.resolve()
+          .then(() => providerUsageReconciliationLoop.stop())
+          .catch((error: unknown) => { recordFailure(error, 'reconciliation-stop') })
+        await capture('video-stop', () => videoJobs.stop())
+        await capture('admission-drain', () => admittedStarts)
+        const cancellations = [...activeRequests].flatMap((requestId) => [
+          { source: 'agent-cancel' as const, operation: () => agent.cancel(requestId) },
+          { source: 'media-cancel' as const, operation: () => mediaGeneration.cancel(requestId) },
+        ])
+        const cancellationResults = await Promise.allSettled(cancellations.map(({ operation }) => (
+          Promise.resolve().then(operation)
+        )))
+        cancellationResults.forEach((result, index) => {
+          if (result.status === 'rejected') recordFailure(result.reason, cancellations[index]!.source)
+        })
+        await capture('chat-drain', async () => {
+          const results = await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
+          for (const result of results) if (result.status === 'rejected') {
+            recordFailure(result.reason, 'chat-drain')
+          }
+        })
+        await capture('execution-shutdown', () => executions.shutdown())
+        await reconciliationStopped
+        await capture('database-close', () => { database.close() })
+        const consistencyFailure = failureRecords
+          .filter(({ error }) => error instanceof ProviderUsageConsistencyError)
+          .sort((left, right) => left.sequence - right.sequence)[0]
+        const terminalFailure = consistencyFailure ?? [...failureRecords]
+          .sort((left, right) => left.rank - right.rank || left.sequence - right.sequence)[0]
+        if (terminalFailure !== undefined) throw terminalFailure.error
+      })()
+      return closePromise
     },
   }
 }

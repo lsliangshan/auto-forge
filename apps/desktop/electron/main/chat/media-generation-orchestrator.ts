@@ -172,7 +172,7 @@ export class MediaGenerationOrchestrator {
 
       const providerSnapshot = await this.dependencies.providers.acquire(input.route.provider)
       if (providerSnapshot.providerId !== input.route.provider) {
-        throw toSafeAppError({ code: 'CONFLICT' })
+        throw new ProviderUsageConsistencyError()
       }
 
       return kind === 'image'
@@ -538,7 +538,7 @@ export class MediaGenerationOrchestrator {
     error: unknown,
     failureCode?: AppError['code'],
   ): Promise<AgentRunResult> {
-    await active.writer?.abort().catch(() => undefined)
+    await Promise.resolve().then(() => active.writer?.abort()).catch(() => undefined)
     const failure = failureCode === undefined
       ? safeError(error, active.controller.signal)
       : toSafeAppError({ code: failureCode })

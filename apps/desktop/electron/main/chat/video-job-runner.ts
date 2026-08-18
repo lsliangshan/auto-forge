@@ -70,6 +70,7 @@ export interface VideoJobRunnerDependencies {
     'modelInput' | 'commitGeneratedStream' | 'resolveReadyAsset' | 'removeDraft'
   >
   emit: (event: ChatEvent) => void
+  onBackgroundFailure: (error: unknown) => void
   id?: () => string
   now?: () => number
   timers?: {
@@ -252,6 +253,11 @@ export class VideoJobRunner {
       set: (callback, delayMs) => setTimeout(callback, delayMs),
       clear: (handle) => clearTimeout(handle),
     }
+  }
+
+  private recordBackgroundFailure(error: unknown): void {
+    this.backgroundFailures.push(error)
+    try { this.dependencies.onBackgroundFailure(error) } catch { /* Failure reporting is observational. */ }
   }
 
   async submit(input: SubmitVideoInput): Promise<SubmittedVideoJob> {
@@ -643,7 +649,7 @@ export class VideoJobRunner {
     const handle = this.timersApi.set(() => {
       this.timers.delete(job.id)
       void this.wake(job.id).catch((error: unknown) => {
-        this.backgroundFailures.push(error)
+        this.recordBackgroundFailure(error)
       })
     }, Math.max(0, target - this.now()))
     this.timers.set(job.id, handle)
@@ -659,7 +665,7 @@ export class VideoJobRunner {
     const handle = this.timersApi.set(() => {
       this.timers.delete(job.id)
       void this.wake(job.id).catch((error: unknown) => {
-        this.backgroundFailures.push(error)
+        this.recordBackgroundFailure(error)
       })
     }, Math.max(0, target - this.now()))
     this.timers.set(job.id, handle)
