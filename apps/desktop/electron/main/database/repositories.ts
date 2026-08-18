@@ -57,6 +57,8 @@ export interface ChatRun {
   errorCode?: string
   startedAt: number
   endedAt?: number
+  userId?: string
+  provider?: ModelProviderId
 }
 
 export type ProviderUsageStatus = 'pending' | 'reported' | 'unknown'
@@ -144,6 +146,7 @@ export interface ProviderUsageRepository {
 }
 
 export interface ModelTokenUsageRecord {
+  provider: ModelProviderId
   model: string
   inputTokens: number
   outputTokens: number
@@ -153,6 +156,7 @@ export interface ModelTokenUsageRecord {
 export type TokenUsageGranularityRecord = 'hour' | 'day' | 'month'
 
 export interface TokenUsageQueryRecord {
+  userId: string
   yesterdayStartedAt: number
   todayStartedAt: number
   weekStartedAt: number
@@ -529,7 +533,7 @@ export interface AppRepositories {
     startMediaGeneration(value: MediaGenerationTurnInput): void
     get(id: string): ChatRun | undefined
     summarizeTokenUsage(input: TokenUsageQueryRecord): TokenUsageSnapshotRecord
-    update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
+    update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt' | 'userId' | 'provider'>>): ChatRun | undefined
     finalizeWithMessage(
       id: string,
       messageId: string,
@@ -560,13 +564,14 @@ const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json
 const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
 const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
-const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt'
+const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt, user_id AS userId, provider'
 const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS userId, provider, api_key_fingerprint AS apiKeyFingerprint, request_id AS requestId, chat_run_id AS chatRunId, generation_id AS generationId, provider_job_id AS providerJobId, model, modality, status, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, reconcile_attempts AS reconcileAttempts, next_reconcile_at AS nextReconcileAt, started_at AS startedAt, ended_at AS endedAt'
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
 
 interface TokenUsageRow {
+  provider: ModelProviderId
   model: string
   inputTokens: number
   outputTokens: number
@@ -687,28 +692,34 @@ function trendBucketSql(granularity: TokenUsageGranularityRecord): string {
 
 function summarizeTokenUsagePeriod(
   database: SqliteDatabase,
+  userId: string,
   startedAt: number,
   endedAt: number,
   granularity: TokenUsageGranularityRecord,
 ): TokenUsagePeriodRecord {
   const parameters = {
+    userId,
     startedAt: safeTokenCount(startedAt),
     endedAt: safeTokenCount(endedAt),
   }
   const models = many<TokenUsageRow>(database, `
     SELECT
+      provider,
       model,
       SUM(COALESCE(input_tokens, 0)) AS inputTokens,
       SUM(COALESCE(output_tokens, 0)) AS outputTokens
     FROM chat_runs
-    WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+    WHERE user_id = @userId
+      AND provider IS NOT NULL
+      AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
       AND started_at >= @startedAt
       AND started_at < @endedAt
-    GROUP BY model
+    GROUP BY provider, model
   `, parameters).map((row): ModelTokenUsageRecord => {
     const inputTokens = safeTokenCount(row.inputTokens)
     const outputTokens = safeTokenCount(row.outputTokens)
     return {
+      provider: row.provider,
       model: row.model,
       inputTokens,
       outputTokens,
@@ -716,7 +727,8 @@ function summarizeTokenUsagePeriod(
     }
   })
     .sort((left, right) => right.totalTokens - left.totalTokens
-      || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0))
+      || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0)
+      || (left.provider < right.provider ? -1 : left.provider > right.provider ? 1 : 0))
 
   const bucket = trendBucketSql(granularity)
   const trend = many<SparseTokenUsageRow>(database, `
@@ -725,7 +737,9 @@ function summarizeTokenUsagePeriod(
       SUM(COALESCE(input_tokens, 0)) AS inputTokens,
       SUM(COALESCE(output_tokens, 0)) AS outputTokens
     FROM chat_runs
-    WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+    WHERE user_id = @userId
+      AND provider IS NOT NULL
+      AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
       AND started_at >= @startedAt
       AND started_at < @endedAt
     GROUP BY ${bucket}
@@ -788,6 +802,38 @@ function conversationFromRow(row: Query): Conversation {
 
 function optional<T>(value: unknown): T | undefined {
   return value === null || value === undefined ? undefined : value as T
+}
+
+function chatRunFromRow(row: Query): ChatRun {
+  return {
+    id: row.id as string,
+    conversationId: row.conversationId as string,
+    requestId: row.requestId as string,
+    model: row.model as string,
+    status: row.status as string,
+    generationId: optional<string>(row.generationId),
+    inputTokens: optional<number>(row.inputTokens),
+    outputTokens: optional<number>(row.outputTokens),
+    costUsd: optional<string>(row.costUsd),
+    errorCode: optional<string>(row.errorCode),
+    startedAt: row.startedAt as number,
+    endedAt: optional<number>(row.endedAt),
+    userId: optional<string>(row.userId),
+    provider: optional<ModelProviderId>(row.provider),
+  }
+}
+
+function chatRunOwnership(value: Pick<ChatRun, 'userId' | 'provider'>): {
+  userId: string | null
+  provider: ModelProviderId | null
+} {
+  if (value.userId !== undefined && value.provider === undefined) {
+    throw new Error('Owned chat run requires a provider')
+  }
+  return {
+    userId: value.userId ?? null,
+    provider: value.provider ?? null,
+  }
 }
 
 function mediaAssetFromRow(row: Query): MediaAssetRecord {
@@ -1147,11 +1193,12 @@ function updateVideoBlock(
 }
 
 function videoRun(database: SqliteDatabase, job: MediaGenerationJob): ChatRun {
-  const run = one<ChatRun>(
+  const row = one<Query>(
     database,
     `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`,
     { requestId: job.id },
   )
+  const run = row === undefined ? undefined : chatRunFromRow(row)
   if (
     !run
     || run.conversationId !== job.conversationId
@@ -1175,11 +1222,12 @@ function resumableVideoAssociation(
     || isVideoSubmissionIntent(job)
     || !['pending', 'in_progress', 'downloading', 'paused'].includes(job.status)
   ) return undefined
-  const run = one<ChatRun>(
+  const runRow = one<Query>(
     database,
     `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`,
     { requestId: job.id },
   )
+  const run = runRow === undefined ? undefined : chatRunFromRow(runRow)
   if (
     !run
     || run.conversationId !== job.conversationId
@@ -1468,7 +1516,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => {
           const assistantBlocks = validateVideoGenerationTurn(database, value)
           insertMessageWithAssets(database, userMessage, userAssetIds)
-          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run({ ...run, ...chatRunOwnership(run) })
           insertMessage(database, assistantMessage, assistantBlocks)
           database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, NULL, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
             ...job,
@@ -1546,7 +1594,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             job.providerJobId,
           )
           insertMessageWithAssets(database, userMessage, userAssetIds)
-          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run({ ...run, ...chatRunOwnership(run) })
           insertMessage(database, assistantMessage, assistantBlocks)
           database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, @nextPollAt, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
             ...job,
@@ -1759,8 +1807,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     },
     chatRuns: {
       insert(value) {
-        transaction(database, () => database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, @generationId, @inputTokens, @outputTokens, @costUsd, @errorCode, @startedAt, @endedAt)').run({
-          generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
+        transaction(database, () => database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, @generationId, @inputTokens, @outputTokens, @costUsd, @errorCode, @startedAt, @endedAt)').run({
+          generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value, ...chatRunOwnership(value),
         }))
         return value
       },
@@ -1769,13 +1817,17 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => {
           const assistantBlocks = validateMediaGenerationTurn(database, value)
           insertMessageWithAssets(database, userMessage, userAssetIds)
-          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run({ ...run, ...chatRunOwnership(run) })
           insertMessage(database, assistantMessage, assistantBlocks)
         })
       },
-      get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),
+      get: (id) => {
+        const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        return row === undefined ? undefined : chatRunFromRow(row)
+      },
       summarizeTokenUsage(input) {
         const query = {
+          userId: input.userId,
           yesterdayStartedAt: safeTokenCount(input.yesterdayStartedAt),
           todayStartedAt: safeTokenCount(input.todayStartedAt),
           weekStartedAt: safeTokenCount(input.weekStartedAt),
@@ -1786,20 +1838,22 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const first = one<{ startedAt: number | null }>(database, `
             SELECT MIN(started_at) AS startedAt
             FROM chat_runs
-            WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+            WHERE user_id = @userId
+              AND provider IS NOT NULL
+              AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
               AND started_at < @endedAt
-          `, { endedAt: query.endedAt })
+          `, { userId: query.userId, endedAt: query.endedAt })
           const allTimeStartedAt = first?.startedAt === null || first?.startedAt === undefined
             ? undefined
             : safeTokenCount(first.startedAt)
           const allTimeStart = allTimeStartedAt ?? query.endedAt
           return {
             ...(allTimeStartedAt === undefined ? {} : { allTimeStartedAt }),
-            today: summarizeTokenUsagePeriod(database, query.todayStartedAt, query.endedAt, 'hour'),
-            yesterday: summarizeTokenUsagePeriod(database, query.yesterdayStartedAt, query.todayStartedAt, 'hour'),
-            week: summarizeTokenUsagePeriod(database, query.weekStartedAt, query.endedAt, 'day'),
-            month: summarizeTokenUsagePeriod(database, query.monthStartedAt, query.endedAt, 'day'),
-            allTime: summarizeTokenUsagePeriod(database, allTimeStart, query.endedAt, 'month'),
+            today: summarizeTokenUsagePeriod(database, query.userId, query.todayStartedAt, query.endedAt, 'hour'),
+            yesterday: summarizeTokenUsagePeriod(database, query.userId, query.yesterdayStartedAt, query.todayStartedAt, 'hour'),
+            week: summarizeTokenUsagePeriod(database, query.userId, query.weekStartedAt, query.endedAt, 'day'),
+            month: summarizeTokenUsagePeriod(database, query.userId, query.monthStartedAt, query.endedAt, 'day'),
+            allTime: summarizeTokenUsagePeriod(database, query.userId, allTimeStart, query.endedAt, 'month'),
           }
         })()
       },
@@ -1807,7 +1861,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => database.prepare('UPDATE chat_runs SET status = COALESCE(@status, status), generation_id = COALESCE(@generationId, generation_id), input_tokens = COALESCE(@inputTokens, input_tokens), output_tokens = COALESCE(@outputTokens, output_tokens), cost_usd = COALESCE(@costUsd, cost_usd), error_code = COALESCE(@errorCode, error_code), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
           id, status: null, generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
         }))
-        return one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        return row === undefined ? undefined : chatRunFromRow(row)
       },
       finalizeWithMessage(id, messageId, requestId, value) {
         const blocks = chatBlockSchema.array().parse(value.blocks)
@@ -1817,12 +1872,13 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             id: messageId,
           })
           if (!messageRow || messageRow.role !== 'assistant') throw new Error('Assistant message not found')
-          const runRow = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          const runRow = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          const chatRun = runRow === undefined ? undefined : chatRunFromRow(runRow)
           if (
-            !runRow
-            || runRow.conversationId !== messageRow.conversationId
-            || runRow.requestId !== requestId
-            || runRow.status !== 'running'
+            !chatRun
+            || chatRun.conversationId !== messageRow.conversationId
+            || chatRun.requestId !== requestId
+            || chatRun.status !== 'running'
           ) {
             throw new Error('Chat run does not belong to the assistant conversation')
           }
@@ -1876,7 +1932,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               messageRow.conversationId as string,
               previous,
               block,
-              { requestId, model: runRow.model },
+              { requestId, model: chatRun.model },
             )
           }
           const message = database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @messageId').run({
@@ -1895,9 +1951,9 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             endedAt: value.endedAt,
           })
           if (run.changes !== 1) throw new Error('Chat run not found')
-          const stored = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
-          if (!stored) throw new Error('Chat run not found')
-          return stored
+          const storedRow = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          if (!storedRow) throw new Error('Chat run not found')
+          return chatRunFromRow(storedRow)
         })
       },
     },

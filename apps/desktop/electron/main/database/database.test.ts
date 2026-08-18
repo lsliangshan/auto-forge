@@ -1231,8 +1231,72 @@ describe('openAppDatabase', () => {
     expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
   })
 
+  it('persists chat-run ownership and isolates token usage by user and provider', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'alice', 'alice@example.com')
+    insertLocalUser(database, 'bob', 'bob@example.com')
+    database.conversations.insert({ id: 'conversation_usage_ownership', title: 'Usage ownership' })
+    const insert = (
+      id: string,
+      userId: string | undefined,
+      provider: 'deepseek' | 'openrouter' | undefined,
+      status: 'completed' | 'failed',
+      startedAt: number,
+      inputTokens?: number,
+      outputTokens?: number,
+    ) => database.chatRuns.insert({
+      id,
+      conversationId: 'conversation_usage_ownership',
+      requestId: `request_${id}`,
+      model: 'shared/model',
+      status,
+      startedAt,
+      ...(userId === undefined ? {} : { userId }),
+      ...(provider === undefined ? {} : { provider }),
+      ...(inputTokens === undefined ? {} : { inputTokens }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+    })
+    const query = (userId: string) => ({
+      userId,
+      yesterdayStartedAt: 100,
+      todayStartedAt: 200,
+      weekStartedAt: 100,
+      monthStartedAt: 100,
+      endedAt: 300,
+    })
+
+    insert('alice_openrouter', 'alice', 'openrouter', 'completed', 200, 3, 4)
+    insert('alice_deepseek', 'alice', 'deepseek', 'failed', 201, 2, 1)
+    insert('bob_openrouter', 'bob', 'openrouter', 'completed', 202, 11)
+    insert('historical', undefined, undefined, 'completed', 203, 99)
+
+    expect(database.chatRuns.get('alice_openrouter')).toMatchObject({
+      userId: 'alice', provider: 'openrouter',
+    })
+    expect(database.chatRuns.summarizeTokenUsage(query('alice')).today).toMatchObject({
+      inputTokens: 5,
+      outputTokens: 5,
+      totalTokens: 10,
+      models: [
+        { provider: 'openrouter', model: 'shared/model', inputTokens: 3, outputTokens: 4, totalTokens: 7 },
+        { provider: 'deepseek', model: 'shared/model', inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      ],
+      trend: [{ bucket: '0', inputTokens: 5, outputTokens: 5, totalTokens: 10 }],
+    })
+    expect(database.chatRuns.summarizeTokenUsage(query('bob')).today).toMatchObject({
+      inputTokens: 11,
+      outputTokens: 0,
+      totalTokens: 11,
+      models: [{ provider: 'openrouter', model: 'shared/model', inputTokens: 11, outputTokens: 0, totalTokens: 11 }],
+      trend: [{ bucket: '0', inputTokens: 11, outputTokens: 0, totalTokens: 11 }],
+    })
+    expect(() => insert('alice_without_provider', 'alice', undefined, 'completed', 204, 1))
+      .toThrow('Owned chat run requires a provider')
+  })
+
   it('summarizes retained token usage by model across five periods', () => {
     const database = openTestDatabase()
+    insertLocalUser(database, 'usage_user', 'usage@example.com')
     database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
     const insert = (
       id: string,
@@ -1248,11 +1312,14 @@ describe('openAppDatabase', () => {
       model,
       status,
       startedAt,
+      userId: 'usage_user',
+      provider: 'openrouter',
       ...(inputTokens === undefined ? {} : { inputTokens }),
       ...(outputTokens === undefined ? {} : { outputTokens }),
     })
 
     const query = {
+      userId: 'usage_user',
       yesterdayStartedAt: 100,
       todayStartedAt: 200,
       weekStartedAt: 180,
@@ -1270,20 +1337,20 @@ describe('openAppDatabase', () => {
     const usage = database.chatRuns.summarizeTokenUsage(query)
     expect(usage.allTimeStartedAt).toBe(49)
     expect(usage.today.models).toEqual([
-      { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
-      { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      { provider: 'openrouter', model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+      { provider: 'openrouter', model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     ])
     expect(usage.yesterday.models).toEqual([
-      { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      { provider: 'openrouter', model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
     ])
     expect(usage.week.models).toEqual(usage.today.models)
     expect(usage.month.models).toEqual([
-      { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
-      { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
-      { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      { provider: 'openrouter', model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+      { provider: 'openrouter', model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      { provider: 'openrouter', model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     ])
     expect(usage.allTime.models[0]).toEqual({
-      model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22,
+      provider: 'openrouter', model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22,
     })
     expect(usage.allTime.models.some(({ model }) => model === 'ignored/model')).toBe(false)
 
@@ -1299,6 +1366,7 @@ describe('openAppDatabase', () => {
 
   it('groups token usage trends by local calendar boundaries and excludes the query end point', () => {
     const database = openTestDatabase()
+    insertLocalUser(database, 'usage_trends_user', 'trends@example.com')
     database.conversations.insert({ id: 'conversation_usage_trends', title: 'Usage trends' })
     const local = (year: number, month: number, day: number, hour = 0) => (
       new Date(year, month, day, hour).getTime()
@@ -1315,10 +1383,13 @@ describe('openAppDatabase', () => {
       model: 'alpha/model',
       status: 'completed',
       startedAt,
+      userId: 'usage_trends_user',
+      provider: 'openrouter',
       inputTokens,
       outputTokens,
     })
     const query = {
+      userId: 'usage_trends_user',
       yesterdayStartedAt: local(2025, 11, 31),
       todayStartedAt: local(2026, 0, 1),
       weekStartedAt: local(2025, 11, 29),
@@ -1347,8 +1418,10 @@ describe('openAppDatabase', () => {
 
   it('rejects token usage when a SQLite aggregate exceeds the safe integer range', () => {
     const database = openTestDatabase()
+    insertLocalUser(database, 'usage_overflow_user', 'overflow@example.com')
     database.conversations.insert({ id: 'conversation_usage_overflow', title: 'Usage overflow' })
     const query = {
+      userId: 'usage_overflow_user',
       yesterdayStartedAt: 100,
       todayStartedAt: 200,
       weekStartedAt: 100,
@@ -1363,6 +1436,8 @@ describe('openAppDatabase', () => {
       model: 'alpha/model',
       status: 'completed',
       startedAt: 200,
+      userId: 'usage_overflow_user',
+      provider: 'openrouter',
       inputTokens: Number.MAX_SAFE_INTEGER,
     })
     database.chatRuns.insert({
@@ -1372,6 +1447,8 @@ describe('openAppDatabase', () => {
       model: 'alpha/model',
       status: 'completed',
       startedAt: 201,
+      userId: 'usage_overflow_user',
+      provider: 'openrouter',
       inputTokens: 1,
     })
 
@@ -1384,8 +1461,10 @@ describe('openAppDatabase', () => {
     process.env.TZ = 'America/New_York'
     try {
       const database = openTestDatabase()
+      insertLocalUser(database, 'usage_fallback_user', 'fallback@example.com')
       database.conversations.insert({ id: 'conversation_usage_fallback', title: 'Usage fallback' })
       const query = {
+        userId: 'usage_fallback_user',
         yesterdayStartedAt: Date.parse('2026-10-31T00:00:00-04:00'),
         todayStartedAt: Date.parse('2026-11-01T00:00:00-04:00'),
         weekStartedAt: Date.parse('2026-10-26T00:00:00-04:00'),
@@ -1400,6 +1479,8 @@ describe('openAppDatabase', () => {
           model: 'alpha/model',
           status: 'completed',
           startedAt,
+          userId: 'usage_fallback_user',
+          provider: 'openrouter',
           inputTokens,
         })
       )
