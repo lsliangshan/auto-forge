@@ -513,7 +513,10 @@ export class AgentOrchestrator {
     try {
       return await this.drive(active)
     } catch (error) {
-      if (error instanceof ProviderUsageConsistencyError) throw error
+      if (error instanceof ProviderUsageConsistencyError) {
+        if (!active.terminal) this.finish(active, 'failed', appFailure('INTERNAL_ERROR'))
+        throw error
+      }
       if (active.terminal) return active.terminal
       if (active.cancelled || active.controller.signal.aborted) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       return this.finish(active, 'failed', asAppError(error))

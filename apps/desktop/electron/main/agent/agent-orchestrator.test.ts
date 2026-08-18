@@ -1135,6 +1135,49 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 
+  it('terminalizes an approved run when the next model turn hits a usage consistency error', async () => {
+    const dependencies = harness([
+      toolTurn,
+      [
+        { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '0.01' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    const error = new ProviderUsageConsistencyError()
+    vi.mocked(dependencies.providerUsage.report).mockImplementation(() => { throw error })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run(textRunInput({
+      conversationId: 'conversation_resume_consistency',
+      content: '搜索后回答',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_resume_consistency',
+    }))
+
+    await expect(orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      ...approvalIdentity,
+      decision: 'once',
+    })).rejects.toBe(error)
+
+    expect(dependencies.records.terminal).toHaveLength(1)
+    expect(dependencies.records.terminal[0]).toMatchObject({
+      status: 'failed', errorCode: 'INTERNAL_ERROR',
+    })
+    expect(orchestrator.hasActiveRuns()).toBe(false)
+
+    dependencies.providerInstances.openrouter.stream = vi.fn(() => events([
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]))
+    await expect(orchestrator.run(textRunInput({
+      conversationId: 'conversation_resume_consistency',
+      content: '重新回答',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_after_resume_consistency',
+    }))).resolves.toMatchObject({ status: 'completed' })
+  })
+
   it('aborts an in-flight media provider turn and terminalizes cancellation once', async () => {
     const dependencies = harness([])
     let providerSignal: AbortSignal | undefined
