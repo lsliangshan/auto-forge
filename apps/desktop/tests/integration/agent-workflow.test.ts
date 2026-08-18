@@ -155,7 +155,6 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
   })
   const registry = new WorkflowRegistry(database, {} as never)
   const orchestrator = new AgentOrchestrator({
-    providers: { get: () => provider },
     workflows: registry,
     persistence: createAgentPersistence(database),
     history: { prepare: async () => [] },

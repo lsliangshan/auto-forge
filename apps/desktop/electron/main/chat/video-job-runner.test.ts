@@ -55,7 +55,6 @@ const route: ResolvedChatRoute & { outputType: 'video' } = {
 
 const submitInput = {
   userId: 'user_1',
-  apiKeyFingerprint: 'fingerprint_1',
   requestId: 'request_video_1',
   conversationId: 'conversation_video_1',
   prompt: 'make a short harbor video',
@@ -221,7 +220,6 @@ function createHarness(
     database,
     providerUsage: database.providerUsage,
     providers: {
-      get: vi.fn(() => provider as ModelProvider),
       acquire: vi.fn(async (providerId): Promise<ModelProviderSnapshot> => ({
         providerId,
         provider: provider as ModelProvider,
@@ -701,7 +699,13 @@ describe('VideoJobRunner', () => {
     vi.setSystemTime(1_000)
     const database = createLegacyV4VideoDatabase('downloading')
     const harness = createHarness({ database })
-    harness.dependencies.providers = { get: vi.fn(() => harness.provider) }
+    harness.dependencies.providers = {
+      acquire: vi.fn(async (): Promise<ModelProviderSnapshot> => ({
+        providerId: 'openrouter' as const,
+        provider: harness.provider as ModelProvider,
+        apiKeyFingerprint: 'legacy_current_fingerprint',
+      })),
+    }
     const runner = new VideoJobRunner(harness.dependencies)
 
     await runner.recover()
@@ -820,13 +824,13 @@ describe('VideoJobRunner', () => {
     }
     let current = snapshotA
     const acquire = vi.fn(async () => current)
-    harness.dependencies.providers = { acquire, get: vi.fn(() => current.provider) }
+    harness.dependencies.providers = { acquire }
     vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
       status: 'completed', generationId: 'generation_snapshot', costUsd: '0.9',
     })
     const runner = new VideoJobRunner(harness.dependencies)
 
-    await runner.submit({ ...submitInput, apiKeyFingerprint: 'caller_stale_fingerprint' })
+    await runner.submit(submitInput)
     current = snapshotB
     await vi.advanceTimersByTimeAsync(2_000)
     await flush()
@@ -856,7 +860,6 @@ describe('VideoJobRunner', () => {
     }
     harness.dependencies.providers = {
       acquire: vi.fn(async () => snapshotA),
-      get: vi.fn(() => snapshotA.provider),
     }
     const submitting = new VideoJobRunner(harness.dependencies)
     await submitting.submit(submitInput)
@@ -869,7 +872,6 @@ describe('VideoJobRunner', () => {
         if (current === undefined) throw Object.assign(new Error('missing'), { code: 'CREDENTIAL_UNAVAILABLE' })
         return current
       }),
-      get: vi.fn(() => snapshotA.provider),
     }
     const recovered = new VideoJobRunner(harness.dependencies)
     await recovered.recover()
@@ -912,7 +914,6 @@ describe('VideoJobRunner', () => {
         if (!available) throw Object.assign(new Error('missing'), { code: 'CREDENTIAL_UNAVAILABLE' })
         return snapshot
       }),
-      get: vi.fn(() => snapshot.provider),
     }
     vi.mocked(harness.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
     const runner = new VideoJobRunner(harness.dependencies)
@@ -939,7 +940,6 @@ describe('VideoJobRunner', () => {
       acquire: vi.fn(async () => {
         throw Object.assign(new Error('missing'), { code: 'CREDENTIAL_UNAVAILABLE' })
       }),
-      get: vi.fn(() => harness.provider),
     }
     const runner = new VideoJobRunner(harness.dependencies)
 
@@ -975,7 +975,6 @@ describe('VideoJobRunner', () => {
       acquire: vi.fn(async () => new Promise<ModelProviderSnapshot>((resolve) => {
         resolveAcquire = resolve
       })),
-      get: vi.fn(() => snapshot.provider),
     }
     vi.setSystemTime(3_000)
     const recovered = new VideoJobRunner(harness.dependencies)
@@ -1024,7 +1023,6 @@ describe('VideoJobRunner', () => {
       acquire: vi.fn(async () => new Promise<ModelProviderSnapshot>((resolve) => {
         resolveAcquire = resolve
       })),
-      get: vi.fn(() => snapshot.provider),
     }
     vi.setSystemTime(3_000)
     const recovered = new VideoJobRunner(harness.dependencies)

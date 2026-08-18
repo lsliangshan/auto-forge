@@ -23,7 +23,6 @@ import {
 import type {
   ModelContentPart,
   ModelMessage,
-  ModelProvider,
   ModelProviderSnapshot,
   ModelStreamEvent,
   ModelStreamRequest,
@@ -38,10 +37,6 @@ export type ProviderStreamEvent = ModelStreamEvent
 
 export interface AgentProviderPort {
   stream(request: ModelStreamRequest): AsyncIterable<ModelStreamEvent>
-}
-
-export interface AgentProviderRegistryPort {
-  get(provider: ModelProviderId): AgentProviderPort
 }
 
 export interface AgentWorkflowPort {
@@ -211,7 +206,6 @@ export function createAgentPersistence(
 }
 
 export interface AgentOrchestratorDependencies {
-  providers: AgentProviderRegistryPort
   workflows: AgentWorkflowPort
   persistence: AgentPersistencePort
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
@@ -227,7 +221,6 @@ export interface AgentOrchestratorDependencies {
 
 interface UsageAttribution {
   userId: string
-  apiKeyFingerprint?: string
 }
 
 export interface AgentRunInput extends UsageAttribution {
@@ -242,7 +235,7 @@ export interface AgentRunInput extends UsageAttribution {
   provider: ModelProviderId
   model: string
   requestId?: string
-  providerSnapshot?: ModelProviderSnapshot
+  providerSnapshot: ModelProviderSnapshot
 }
 
 export interface AgentRunResult {
@@ -331,7 +324,7 @@ export class AgentOrchestrator {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
-    if (input.providerSnapshot && input.providerSnapshot.providerId !== input.provider) {
+    if (input.providerSnapshot.providerId !== input.provider) {
       throw appFailure('CONFLICT')
     }
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
@@ -376,13 +369,7 @@ export class AgentOrchestrator {
         initialBlocks: [],
         createdAt: startedAt,
       })
-      const providerSnapshot = input.providerSnapshot ?? {
-        providerId: input.provider,
-        provider: this.dependencies.providers.get(input.provider) as ModelProvider,
-        ...(input.apiKeyFingerprint === undefined
-          ? {}
-          : { apiKeyFingerprint: input.apiKeyFingerprint }),
-      }
+      const providerSnapshot = input.providerSnapshot
 
       active = {
         requestId,

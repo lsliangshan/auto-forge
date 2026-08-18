@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ModelInfo } from '@autoforge/shared'
-import type { ModelProvider } from './model-provider.js'
-import { credentialKeyForProvider, ModelProviderRegistry } from './model-provider-registry.js'
+import type { ModelProvider, ModelProviderSnapshot } from './model-provider.js'
+import {
+  credentialKeyForProvider,
+  ModelProviderRegistry,
+  type CredentialBoundModelProvider,
+} from './model-provider-registry.js'
 import { OpenRouterProvider } from './openrouter-provider.js'
 import { DeepSeekProvider } from './deepseek-provider.js'
 import { fingerprintApiKey } from '../billing/provider-usage-reconciler.js'
@@ -12,6 +16,17 @@ function provider(models: ModelInfo[] = []): ModelProvider {
     validateCredential: vi.fn(async () => ({ valid: true })),
     stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
   }
+}
+
+function boundProvider(providerId: 'openrouter' | 'deepseek', models: ModelInfo[] = []) {
+  const instance = provider(models)
+  return Object.assign(instance, {
+    acquireSnapshot: vi.fn(async (): Promise<ModelProviderSnapshot> => ({
+      providerId,
+      provider: instance,
+      ...(providerId === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_test' } : {}),
+    })),
+  })
 }
 
 describe('ModelProviderRegistry', () => {
@@ -33,13 +48,15 @@ describe('ModelProviderRegistry', () => {
 
     const first = await registry.acquire('openrouter')
     apiKey = 'sk-openrouter-b'
-    for await (const _event of first.provider.stream({ model: 'text/model', messages: [] })) {
+    for await (const event of first.provider.stream({ model: 'text/model', messages: [] })) {
       // Drain the bound stream through its retry path.
+      void event
     }
 
     const second = await registry.acquire('openrouter')
-    for await (const _event of second.provider.stream({ model: 'text/model', messages: [] })) {
+    for await (const event of second.provider.stream({ model: 'text/model', messages: [] })) {
       // Drain a newly acquired provider using the updated credential.
+      void event
     }
 
     expect(authorizations).toEqual([
@@ -55,23 +72,22 @@ describe('ModelProviderRegistry', () => {
     expect(JSON.stringify(first)).not.toContain('sk-openrouter-b')
   })
 
-  it('snapshots the provider mapping while preserving optional media operations', async () => {
+  it('exposes only credential-bound acquisition and snapshots the provider mapping', async () => {
     const generateImage = vi.fn(async () => ({ outputs: [] }))
-    const openrouter = { ...provider(), generateImage }
-    const replacement = provider()
-    const providers: Record<'openrouter' | 'deepseek', ModelProvider> = {
+    const openrouter = Object.assign(boundProvider('openrouter'), { generateImage })
+    const replacement = boundProvider('openrouter')
+    const providers: Record<'openrouter' | 'deepseek', CredentialBoundModelProvider> = {
       openrouter,
-      deepseek: provider(),
+      deepseek: boundProvider('deepseek'),
     }
     const registry = new ModelProviderRegistry(providers)
 
     providers.openrouter = replacement
 
-    expect(registry.get('openrouter')).toBe(openrouter)
-    await expect(registry.acquire('openrouter')).rejects.toThrow(
-      'Provider openrouter does not support credential snapshots',
-    )
-    await expect(registry.get('openrouter').generateImage?.({
+    expect('get' in registry).toBe(false)
+    const snapshot = await registry.acquire('openrouter')
+    expect(snapshot.provider).toBe(openrouter)
+    await expect(snapshot.provider.generateImage?.({
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
@@ -92,14 +108,12 @@ describe('ModelProviderRegistry', () => {
         image: { resolutions: [], aspectRatios: [], formats: [], maxCount: 1 },
       },
     }]
-    const openrouter = provider(openRouterModels)
-    const deepseek = provider()
+    const openrouter = boundProvider('openrouter', openRouterModels)
+    const deepseek = boundProvider('deepseek')
     const registry = new ModelProviderRegistry({ openrouter, deepseek })
 
-    expect(registry.get('openrouter')).toBe(openrouter)
-    expect(registry.get('deepseek')).toBe(deepseek)
     expect(credentialKeyForProvider('openrouter')).toBe('openrouter_api_key')
     expect(credentialKeyForProvider('deepseek')).toBe('deepseek_api_key')
-    await expect(registry.get('openrouter').listModels()).resolves.toEqual(openRouterModels)
+    await expect((await registry.acquire('openrouter')).provider.listModels()).resolves.toEqual(openRouterModels)
   })
 })

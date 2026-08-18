@@ -179,7 +179,16 @@ export class MediaGenerationOrchestrator {
         ? await this.generateImage(input, persisted, active, providerSnapshot)
         : await this.generateAudio(input, persisted, active, providerSnapshot)
     } catch (error) {
-      if (error instanceof ProviderUsageConsistencyError) throw error
+      if (error instanceof ProviderUsageConsistencyError) {
+        if (persisted) {
+          try {
+            await this.fail(input, persisted, active, error, 'INTERNAL_ERROR')
+          } catch {
+            // The original ledger consistency failure remains authoritative.
+          }
+        }
+        throw error
+      }
       if (!persisted) {
         const failure = safeError(error, active.controller.signal)
         this.safeEmit({
@@ -527,9 +536,12 @@ export class MediaGenerationOrchestrator {
     persisted: PersistedGeneration,
     active: ActiveGeneration,
     error: unknown,
+    failureCode?: AppError['code'],
   ): Promise<AgentRunResult> {
     await active.writer?.abort().catch(() => undefined)
-    const failure = safeError(error, active.controller.signal)
+    const failure = failureCode === undefined
+      ? safeError(error, active.controller.signal)
+      : toSafeAppError({ code: failureCode })
     const block: PersistedGeneration['pending'] = {
       ...persisted.pending,
       status: 'failed',

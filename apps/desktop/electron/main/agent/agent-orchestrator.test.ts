@@ -10,7 +10,7 @@ import {
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
-import type { ModelProviderSnapshot } from '../chat/model-provider.js'
+import type { ModelProvider, ModelProviderSnapshot } from '../chat/model-provider.js'
 import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
@@ -25,6 +25,8 @@ const workflow: WorkflowDetail = {
   inputSchema: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'], additionalProperties: false },
   outputSchema: { type: 'object' },
 }
+
+let currentProviderInstances: Record<ModelProviderId, AgentProviderPort>
 
 async function* events(values: ProviderStreamEvent[]) {
   for (const value of values) yield value
@@ -43,7 +45,6 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     order: string[]
   }
   providerInstances: Record<ModelProviderId, AgentProviderPort>
-  registry: { get: ReturnType<typeof vi.fn> }
   history: { prepare: ReturnType<typeof vi.fn<ConversationHistoryPort['prepare']>> }
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
 } {
@@ -64,7 +65,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     openrouter: { stream: vi.fn(() => events(turns.shift() ?? [])) },
     deepseek: { stream: vi.fn(() => events(turns.shift() ?? [])) },
   }
-  const registry = { get: vi.fn((provider: ModelProviderId) => providerInstances[provider]) }
+  currentProviderInstances = providerInstances
   const history = { prepare: vi.fn<ConversationHistoryPort['prepare']>(async () => []) }
   const providerUsage = {
     start: vi.fn((...args: unknown[]) => {
@@ -90,9 +91,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
   }
   return {
     records,
-    providers: registry,
     providerInstances,
-    registry,
     workflows: { list: async () => [workflow] },
     retrieve: () => [workflow],
     policy: {
@@ -150,7 +149,11 @@ function textRunInput(
   return {
     ...input,
     userId: 'user_1',
-    apiKeyFingerprint: 'fingerprint_1',
+    providerSnapshot: {
+      providerId: input.provider,
+      provider: currentProviderInstances[input.provider] as ModelProvider,
+      ...(input.provider === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_1' } : {}),
+    },
     userBlocks: [{ type: 'text', text: input.content }],
     modelContent: input.content,
     assetIds: [],
@@ -184,7 +187,6 @@ describe('AgentOrchestrator', () => {
     })
 
     expect(result.status).toBe('completed')
-    expect(dependencies.registry.get).not.toHaveBeenCalled()
     expect(dependencies.history.prepare).toHaveBeenCalledWith(expect.objectContaining({
       providerSnapshot: snapshot,
       callIdentity: expect.objectContaining({
@@ -590,7 +592,10 @@ describe('AgentOrchestrator', () => {
 
     const result = await orchestrator.run({
       userId: 'user_1',
-      apiKeyFingerprint: 'fingerprint_1',
+      providerSnapshot: {
+        providerId: 'openrouter', provider: dependencies.providerInstances.openrouter as ModelProvider,
+        apiKeyFingerprint: 'fingerprint_1',
+      },
       conversationId: 'conversation_media',
       content: '描述图片',
       userBlocks,
@@ -719,7 +724,10 @@ describe('AgentOrchestrator', () => {
 
     const result = await new AgentOrchestrator(dependencies).run({
       userId: 'user_1',
-      apiKeyFingerprint: 'fingerprint_1',
+      providerSnapshot: {
+        providerId: 'openrouter', provider: dependencies.providerInstances.openrouter as ModelProvider,
+        apiKeyFingerprint: 'fingerprint_1',
+      },
       conversationId: 'conversation_1',
       content: '描述图片',
       userBlocks: [{ type: 'text', text: '描述图片' }],
@@ -796,7 +804,10 @@ describe('AgentOrchestrator', () => {
 
     const pending = await orchestrator.run({
       userId: 'user_1',
-      apiKeyFingerprint: 'fingerprint_1',
+      providerSnapshot: {
+        providerId: 'openrouter', provider: dependencies.providerInstances.openrouter as ModelProvider,
+        apiKeyFingerprint: 'fingerprint_1',
+      },
       conversationId: 'conversation_1',
       content: '结合图片搜索',
       userBlocks: [{ type: 'text', text: '结合图片搜索' }],
@@ -821,7 +832,7 @@ describe('AgentOrchestrator', () => {
     ])
   })
 
-  it('resolves a provider once and reuses it after a tool continuation', async () => {
+  it('reuses the supplied provider snapshot after a tool continuation', async () => {
     const dependencies = harness([toolTurn, [
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
@@ -844,7 +855,6 @@ describe('AgentOrchestrator', () => {
 
     expect(original.stream).toHaveBeenCalledTimes(2)
     expect(replacement.stream).not.toHaveBeenCalled()
-    expect(dependencies.registry.get).toHaveBeenCalledTimes(1)
   })
 
   it('binds always approval to the exact manifest permission and deny never starts execution', async () => {
@@ -1194,7 +1204,10 @@ describe('AgentOrchestrator', () => {
     const orchestrator = new AgentOrchestrator(dependencies)
     const running = orchestrator.run({
       userId: 'user_1',
-      apiKeyFingerprint: 'fingerprint_1',
+      providerSnapshot: {
+        providerId: 'openrouter', provider: dependencies.providerInstances.openrouter as ModelProvider,
+        apiKeyFingerprint: 'fingerprint_1',
+      },
       conversationId: 'conversation_1',
       content: '描述图片',
       userBlocks: [{ type: 'text', text: '描述图片' }],

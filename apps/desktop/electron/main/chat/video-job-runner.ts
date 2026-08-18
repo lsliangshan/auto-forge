@@ -43,7 +43,6 @@ const ACTIVE_STATUSES: MediaGenerationJobStatus[] = [
 
 interface UsageAttribution {
   userId: string
-  apiKeyFingerprint?: string
 }
 
 export interface SubmitVideoInput extends UsageAttribution {
@@ -56,11 +55,7 @@ export interface SubmitVideoInput extends UsageAttribution {
 }
 
 export interface VideoJobProviderRegistryPort {
-  acquire?: ModelProviderSnapshotSource['acquire']
-  get?(provider: ResolvedChatRoute['provider']): Pick<
-    ModelProvider,
-    'submitVideo' | 'pollVideo' | 'downloadVideo'
-  >
+  acquire: ModelProviderSnapshotSource['acquire']
 }
 
 export interface VideoJobRunnerDependencies {
@@ -550,9 +545,6 @@ export class VideoJobRunner {
     providerId: ResolvedChatRoute['provider'],
   ): Promise<ModelProviderSnapshot> {
     modelProviderIdSchema.parse(providerId)
-    if (!this.dependencies.providers.acquire) {
-      throw toSafeAppError({ code: 'CREDENTIAL_UNAVAILABLE' })
-    }
     const snapshot = await this.dependencies.providers.acquire(providerId)
     if (snapshot.providerId !== providerId) throw new ProviderUsageConsistencyError()
     return snapshot
@@ -620,21 +612,11 @@ export class VideoJobRunner {
       return persisted
     }
     let snapshot: ModelProviderSnapshot
-    if (this.dependencies.providers.acquire) {
-      try {
-        snapshot = await this.dependencies.providers.acquire(modelProviderIdSchema.parse(job.provider))
-      } catch (error) {
-        if (toSafeAppError(error).code === 'CREDENTIAL_UNAVAILABLE') return undefined
-        throw error
-      }
-    } else {
-      if (usage.kind === 'tracked' || !this.dependencies.providers.get) {
-        throw new ProviderUsageConsistencyError()
-      }
-      snapshot = {
-        providerId: modelProviderIdSchema.parse(job.provider),
-        provider: this.dependencies.providers.get(modelProviderIdSchema.parse(job.provider)) as ModelProvider,
-      }
+    try {
+      snapshot = await this.dependencies.providers.acquire(modelProviderIdSchema.parse(job.provider))
+    } catch (error) {
+      if (toSafeAppError(error).code === 'CREDENTIAL_UNAVAILABLE') return undefined
+      throw error
     }
     if (snapshot.providerId !== job.provider) throw new ProviderUsageConsistencyError()
     if (usage.kind === 'tracked') {

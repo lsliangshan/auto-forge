@@ -336,17 +336,32 @@ describe('MediaGenerationOrchestrator', () => {
     expect(harness.providerUsage.markUnknown).not.toHaveBeenCalled()
   })
 
-  it('rethrows provider usage consistency errors without persisting a business failure', async () => {
+  it.each([
+    ['image', imageRoute],
+    ['audio', audioRoute],
+  ] as const)('terminalizes a persisted %s run before rethrowing the original provider usage consistency error', async (kind, route) => {
     const harness = createHarness()
-    vi.mocked(harness.providerUsage.report).mockImplementation(() => {
-      throw new ProviderUsageConsistencyError()
-    })
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.mocked(harness.providerUsage.report).mockImplementation(() => { throw consistencyError })
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
 
-    await expect(new MediaGenerationOrchestrator(harness.dependencies)
-      .runImage({ ...input, route: imageRoute }))
-      .rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+    const running = kind === 'image'
+      ? orchestrator.runImage({ ...input, route })
+      : orchestrator.runAudio({ ...input, route })
+    await expect(running).rejects.toBe(consistencyError)
 
-    expect(harness.persistence.finalize).not.toHaveBeenCalled()
+    expect(harness.persistence.finalize).toHaveBeenCalledTimes(1)
+    expect(harness.finalizations).toEqual([expect.objectContaining({
+      runId: 'run',
+      status: 'failed',
+      errorCode: 'INTERNAL_ERROR',
+      blocks: [expect.objectContaining({
+        type: 'media_generation',
+        status: 'failed',
+        errorCode: 'INTERNAL_ERROR',
+      })],
+    })])
+    expect(orchestrator.hasActiveRuns()).toBe(false)
   })
 
   it.each([
