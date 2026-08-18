@@ -7,7 +7,7 @@ import {
   type AppError,
   type ProfileAvatarUploadResult,
 } from '@autoforge/shared'
-import * as qiniu from 'qiniu'
+import qiniu from 'qiniu'
 import { detectMediaType } from '../media/media-sniffer.js'
 
 const AVATAR_MAX_BYTES = 5 * 1024 * 1024

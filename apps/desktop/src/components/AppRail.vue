@@ -43,10 +43,10 @@
           class="rail-avatar rail-avatar-fallback"
         >{{ accountInitial }}</span>
         <span
-        data-testid="current-account"
-        class="rail-account-name"
+          data-testid="current-account"
+          class="rail-account-name"
           :title="accountLabel"
-      >
+        >
           {{ accountLabel }}
         </span>
       </RouterLink>
