@@ -58,6 +58,31 @@ describe('ProviderUsageReconciliationLoop', () => {
     await harness.loop.stop()
   })
 
+  it('does not turn recovery completion into a second sequence when a notification timer already elapsed', async () => {
+    const recovery = deferred<void>()
+    const harness = createHarness({
+      recoverInterrupted: vi.fn(() => recovery.promise),
+    })
+
+    harness.loop.start()
+    harness.loop.notifyUsageEnded()
+    harness.loop.notifyUsageEnded()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(harness.reconciler.reconcileDue).not.toHaveBeenCalled()
+
+    recovery.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.reconciler.reconcileDue).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(harness.reconciler.reconcileDue).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(harness.reconciler.reconcileDue).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(100_000)
+    expect(harness.reconciler.reconcileDue).toHaveBeenCalledTimes(3)
+
+    await harness.loop.stop()
+  })
+
   it('starts each of exactly three delays after the preceding slow round settles', async () => {
     const first = deferred<void>()
     const reconcileDue = vi.fn()

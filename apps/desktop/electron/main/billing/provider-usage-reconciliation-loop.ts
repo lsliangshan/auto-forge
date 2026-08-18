@@ -34,7 +34,7 @@ class DefaultProviderUsageReconciliationLoop implements ProviderUsageReconciliat
     if (this.started || this.stopped) return
     this.started = true
     void this.enqueue((options) => this.reconciler.recoverInterrupted(options)).then(() => {
-      this.notifyUsageEnded()
+      if (!this.stopped && !this.sequenceActive && !this.repeatSequence) this.beginSequence()
     })
   }
 
