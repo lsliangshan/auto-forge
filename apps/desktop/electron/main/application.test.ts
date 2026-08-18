@@ -10,7 +10,11 @@ import {
   type ModelInfo,
   type ProxySettings,
 } from '@autoforge/shared'
-import { createApplicationRuntime, MaintenanceGate } from './application.js'
+import {
+  createApplicationFailureRecorder,
+  createApplicationRuntime,
+  MaintenanceGate,
+} from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
@@ -283,6 +287,34 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('records a failure identity once without merging distinct errors with the same message', () => {
+    const latched: unknown[] = []
+    const recorder = createApplicationFailureRecorder((error) => { latched.push(error) })
+    const shared = new Error('same message')
+    const distinct = new Error('same message')
+    const consistency = new ProviderUsageConsistencyError()
+
+    recorder.record(shared, 'database-close')
+    recorder.record(shared, 'background-chat')
+    recorder.record(distinct, 'execution-shutdown')
+    recorder.record(consistency, 'video-background')
+    recorder.record(consistency, 'video-stop')
+
+    expect(recorder.select()).toEqual({ error: consistency })
+    expect(latched).toEqual([consistency])
+
+    const nonConsistency = createApplicationFailureRecorder(() => undefined)
+    nonConsistency.record(shared, 'database-close')
+    nonConsistency.record(shared, 'background-chat')
+    nonConsistency.record(distinct, 'execution-shutdown')
+    expect(nonConsistency.select()).toEqual({ error: distinct })
+
+    const primitive = createApplicationFailureRecorder(() => undefined)
+    primitive.record(undefined, 'database-close')
+    primitive.record(undefined, 'background-chat')
+    expect(primitive.select()).toEqual({ error: undefined })
+  })
+
   it('returns a token usage snapshot across five local-calendar periods', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-token-usage-'))
     directories.push(root)
@@ -751,6 +783,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-background-consistency-'))
     directories.push(root)
     const databasePath = join(root, 'autoforge.sqlite')
+    const videoStop = vi.spyOn(VideoJobRunner.prototype, 'stop')
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
       validateCredential: vi.fn(async () => ({ valid: true })),
@@ -790,7 +823,15 @@ describe('createApplicationRuntime', () => {
       await vi.advanceTimersByTimeAsync(2_000)
       await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
         .rejects.toMatchObject({ code: 'CONFLICT' })
-      await expect(runtime.close()).rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+      let closeError: unknown
+      try {
+        await runtime.close()
+      } catch (error) {
+        closeError = error
+      }
+      expect(closeError).toBeInstanceOf(ProviderUsageConsistencyError)
+      expect(videoStop).toHaveBeenCalledTimes(1)
+      await expect(videoStop.mock.results[0]!.value).rejects.toBe(closeError)
     } finally {
       vi.useRealTimers()
     }

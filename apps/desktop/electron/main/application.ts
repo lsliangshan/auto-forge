@@ -83,6 +83,64 @@ export interface ApplicationPaths {
 
 export type ApplicationModelProviderPort = CredentialBoundModelProvider
 
+type ApplicationFailureSource =
+  | 'background-chat'
+  | 'preflight'
+  | 'video-submit'
+  | 'video-background'
+  | 'reconciliation-stop'
+  | 'video-stop'
+  | 'admission-drain'
+  | 'agent-cancel'
+  | 'media-cancel'
+  | 'chat-drain'
+  | 'execution-shutdown'
+  | 'database-close'
+
+interface ApplicationFailureRecord {
+  error: unknown
+  sequence: number
+  rank: number
+}
+
+const applicationFailureRank: Record<ApplicationFailureSource, number> = {
+  'background-chat': 0,
+  preflight: 1,
+  'video-submit': 2,
+  'video-background': 3,
+  'reconciliation-stop': 10,
+  'video-stop': 20,
+  'admission-drain': 30,
+  'agent-cancel': 40,
+  'media-cancel': 50,
+  'chat-drain': 60,
+  'execution-shutdown': 70,
+  'database-close': 80,
+}
+
+/** @internal Exported only for direct unit coverage of failure identity semantics. */
+export function createApplicationFailureRecorder(
+  onConsistency: (error: ProviderUsageConsistencyError) => void,
+) {
+  const records: ApplicationFailureRecord[] = []
+  const observed = new Set<unknown>()
+  let sequence = 0
+  return {
+    record: (error: unknown, source: ApplicationFailureSource): void => {
+      if (observed.has(error)) return
+      observed.add(error)
+      records.push({ error, sequence: sequence++, rank: applicationFailureRank[source] })
+      if (error instanceof ProviderUsageConsistencyError) onConsistency(error)
+    },
+    select: (): { error: unknown } | undefined => {
+      const consistency = records.find(({ error }) => error instanceof ProviderUsageConsistencyError)
+      const selected = consistency ?? [...records]
+        .sort((left, right) => left.rank - right.rank || left.sequence - right.sequence)[0]
+      return selected === undefined ? undefined : { error: selected.error }
+    },
+  }
+}
+
 export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
@@ -390,44 +448,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     promise: Promise<void>
   }>()
   let acceptingWork = true
-  type FailureSource =
-    | 'background-chat'
-    | 'preflight'
-    | 'video-submit'
-    | 'video-background'
-    | 'reconciliation-stop'
-    | 'video-stop'
-    | 'admission-drain'
-    | 'agent-cancel'
-    | 'media-cancel'
-    | 'chat-drain'
-    | 'execution-shutdown'
-    | 'database-close'
-  interface FailureRecord {
-    error: unknown
-    sequence: number
-    rank: number
-  }
-  const failureRank: Record<FailureSource, number> = {
-    'background-chat': 0,
-    preflight: 1,
-    'video-submit': 2,
-    'video-background': 3,
-    'reconciliation-stop': 10,
-    'video-stop': 20,
-    'admission-drain': 30,
-    'agent-cancel': 40,
-    'media-cancel': 50,
-    'chat-drain': 60,
-    'execution-shutdown': 70,
-    'database-close': 80,
-  }
-  const failureRecords: FailureRecord[] = []
-  let failureSequence = 0
-  const recordFailure = (error: unknown, source: FailureSource): void => {
-    failureRecords.push({ error, sequence: failureSequence++, rank: failureRank[source] })
-    if (error instanceof ProviderUsageConsistencyError) acceptingWork = false
-  }
+  const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
+  const recordFailure = failureRecorder.record
   const trackChatWork = (
     requestId: string,
     conversationId: string,
@@ -1022,7 +1044,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       closePromise = (async () => {
         acceptingWork = false
         const capture = async (
-          source: FailureSource,
+          source: ApplicationFailureSource,
           operation: () => void | Promise<void>,
         ): Promise<void> => {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
@@ -1052,11 +1074,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await capture('execution-shutdown', () => executions.shutdown())
         await reconciliationStopped
         await capture('database-close', () => { database.close() })
-        const consistencyFailure = failureRecords
-          .filter(({ error }) => error instanceof ProviderUsageConsistencyError)
-          .sort((left, right) => left.sequence - right.sequence)[0]
-        const terminalFailure = consistencyFailure ?? [...failureRecords]
-          .sort((left, right) => left.rank - right.rank || left.sequence - right.sequence)[0]
+        const terminalFailure = failureRecorder.select()
         if (terminalFailure !== undefined) throw terminalFailure.error
       })()
       return closePromise
