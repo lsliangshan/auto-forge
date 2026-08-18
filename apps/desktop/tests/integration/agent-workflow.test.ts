@@ -124,6 +124,10 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
   }
   const database = openAppDatabase(join(directory, 'app.sqlite'))
   closeDatabases.push(database.close)
+  database.localAuth.createUserAndSession({
+    id: 'user_1', account: 'Alice', accountNormalized: 'alice',
+    passwordDigest: 'digest', createdAt: 1, updatedAt: 1,
+  }, 1)
   database.conversations.insert({ id: 'conversation_1', title: '集成测试' })
   database.installedWorkflows.insert({
     workflowId: workflow.id, version: workflow.version, name: workflow.name, description: workflow.description,
@@ -156,6 +160,7 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
     history: { prepare: async () => [] },
     policy,
     executions: executionService,
+    providerUsage: database.providerUsage,
     emit: () => undefined,
   })
   return { directory, workflow, database, workers, executionEvents, orchestrator, registry }
@@ -188,6 +193,7 @@ describe('agent workflow integration', () => {
     expect(retrieveWorkflows('使用百度搜索今日天气', listed, 8).map((item) => item.id)).toEqual([app.workflow.id])
     const pending = await app.orchestrator.run({
       conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
+      userId: 'user_1',
       userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
       modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
       model: 'local-test-model', requestId: 'request_1',
@@ -253,6 +259,7 @@ describe('agent workflow integration', () => {
     appDirectory = app.directory
     const pending = await app.orchestrator.run({
       conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
+      userId: 'user_1',
       userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
       modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
       model: 'local-test-model', requestId: 'cancel_request',
