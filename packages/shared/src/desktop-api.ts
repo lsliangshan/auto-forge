@@ -49,6 +49,9 @@ export type AuthSession = z.infer<typeof authSessionSchema>
 export const outputTypeSchema = z.enum(['auto', 'text', 'image', 'audio', 'video'])
 export type OutputType = z.infer<typeof outputTypeSchema>
 
+export const videoFrameTypeSchema = z.enum(['first_frame', 'last_frame'])
+export type VideoFrameType = z.infer<typeof videoFrameTypeSchema>
+
 export const generationOptionsSchema = z.object({
   image: z.object({
     count: z.literal(1),
@@ -406,6 +409,7 @@ export const modelInfoSchema = z.object({
       aspectRatios: z.array(z.string()),
       durations: z.array(z.number().int().positive()),
       supportsAudio: z.boolean(),
+      frameImages: z.array(videoFrameTypeSchema),
     }).strict().optional(),
   }).strict(),
 }).strict()

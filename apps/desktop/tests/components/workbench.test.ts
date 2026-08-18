@@ -30,7 +30,7 @@ function modelInfo(id: string, outputs: ModelInfo['outputModalities'] = ['text']
         audio: { voices: [], formats: ['mp3'] },
       } : {}),
       ...(outputs.includes('video') ? {
-        video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false },
+        video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false, frameImages: [] },
       } : {}),
     },
   }

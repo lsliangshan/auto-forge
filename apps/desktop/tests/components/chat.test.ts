@@ -63,7 +63,7 @@ function modelInfo(id: string, outputs: ModelInfo['outputModalities']): ModelInf
         audio: { voices: ['alloy'], formats: ['mp3'] },
       } : {}),
       ...(outputs.includes('video') ? {
-        video: { resolutions: ['720p'], aspectRatios: ['auto', '16:9'], durations: [5, 10], supportsAudio: true },
+        video: { resolutions: ['720p'], aspectRatios: ['auto', '16:9'], durations: [5, 10], supportsAudio: true, frameImages: ['first_frame', 'last_frame'] },
       } : {}),
     },
   }

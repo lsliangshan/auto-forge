@@ -179,6 +179,7 @@ function videoModelInfo(id: string): ModelInfo {
         aspectRatios: ['auto'],
         durations: [5],
         supportsAudio: false,
+        frameImages: ['first_frame', 'last_frame'],
       },
     },
   }

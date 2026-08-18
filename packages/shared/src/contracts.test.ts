@@ -287,6 +287,25 @@ describe('cross-process contracts', () => {
     })
 
     expect(model.generation.image?.formats).toEqual(['png'])
+
+    const video = modelInfoSchema.parse({
+      id: 'openrouter/video-model',
+      name: 'Video model',
+      inputModalities: ['text', 'image'],
+      outputModalities: ['video'],
+      supportsTools: false,
+      generation: {
+        video: {
+          resolutions: ['1080p'],
+          aspectRatios: ['16:9'],
+          durations: [4, 8],
+          supportsAudio: true,
+          frameImages: ['first_frame', 'last_frame'],
+        },
+      },
+    })
+
+    expect(video.generation.video?.frameImages).toEqual(['first_frame', 'last_frame'])
     expect(() => modelInfoSchema.parse({ ...model, supportsTools: undefined })).toThrow()
   })
 

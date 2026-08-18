@@ -93,7 +93,7 @@ describe('resolveChatRoute', () => {
             id: 'video/model',
             inputModalities: ['text', 'image'],
             outputModalities: ['video'],
-            generation: { video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false } },
+            generation: { video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false, frameImages: ['first_frame'] } },
           }),
         ]
     const defaults: ProviderDefaultModels = {
@@ -170,7 +170,7 @@ describe('resolveChatRoute', () => {
         outputModalities: ['video', 'text', 'image'],
         generation: {
           image: { resolutions: ['1K'], aspectRatios: ['auto'], formats: ['png'], maxCount: 1 },
-          video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false },
+          video: { resolutions: ['720p'], aspectRatios: ['auto'], durations: [5], supportsAudio: false, frameImages: [] },
         },
       })],
     }))).toEqual({ selectionRequired: true, compatibleOutputs: ['text', 'image', 'video'] })
@@ -328,7 +328,7 @@ describe('resolveChatRoute', () => {
     const video = models.find((candidate) => candidate.id === 'video/model')!
 
     expect(audio.generation.audio).toEqual({ voices: [], formats: [] })
-    expect(video.generation.video).toEqual({ resolutions: [], aspectRatios: [], durations: [], supportsAudio: false })
+    expect(video.generation.video).toEqual({ resolutions: [], aspectRatios: [], durations: [], supportsAudio: false, frameImages: [] })
     expect(resolveChatRoute(input({ requestedModel: audio.id, requestedOutput: 'audio', models }))).toMatchObject({
       outputType: 'audio',
       generation: { audio: { format: 'mp3' } },

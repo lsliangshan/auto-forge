@@ -38,7 +38,7 @@ function savedModelOption(id: string, output: ModelOutput): ModelInfo {
         audio: { voices: [], formats: [] },
       } : {}),
       ...(output === 'video' ? {
-        video: { resolutions: [], aspectRatios: [], durations: [], supportsAudio: false },
+        video: { resolutions: [], aspectRatios: [], durations: [], supportsAudio: false, frameImages: [] },
       } : {}),
     },
   }

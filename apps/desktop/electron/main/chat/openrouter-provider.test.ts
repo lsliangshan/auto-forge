@@ -1010,7 +1010,7 @@ describe('OpenRouterProvider', () => {
       supported_resolutions: ['1080p'],
       supported_aspect_ratios: ['16:9'],
       supported_durations: [10],
-      supported_frame_images: null,
+      supported_frame_images: ['last_frame'],
       generate_audio: null,
     }
     const second = {
@@ -1019,7 +1019,7 @@ describe('OpenRouterProvider', () => {
       supported_resolutions: ['720p'],
       supported_aspect_ratios: ['9:16'],
       supported_durations: [5],
-      supported_frame_images: ['first_frame'],
+      supported_frame_images: ['last_frame', 'first_frame', 'unknown_frame', 'first_frame'],
       generate_audio: true,
     }
     const expected = [{
@@ -1034,6 +1034,7 @@ describe('OpenRouterProvider', () => {
           aspectRatios: ['16:9', '9:16'],
           durations: [5, 10],
           supportsAudio: true,
+          frameImages: ['first_frame', 'last_frame'],
         },
       },
     }]
@@ -1058,6 +1059,7 @@ describe('OpenRouterProvider', () => {
           aspectRatios: ['16:9', '1:1', '9:16'],
           durations: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
           supportsAudio: true,
+          frameImages: ['first_frame', 'last_frame'],
         },
       },
     })
@@ -1084,7 +1086,7 @@ describe('OpenRouterProvider', () => {
         supported_resolutions: ['720p', '', '1080p', '720p', 42, 'x'.repeat(129)],
         supported_aspect_ratios: ['9:16', '16:9', '9:16', null],
         supported_durations: [10, 5, 10, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '5'],
-        supported_frame_images: ['', 'first_frame', 'first_frame', 42],
+        supported_frame_images: ['last_frame', '', 'first_frame', 'first_frame', 42, 'unknown_frame'],
         generate_audio: false,
       },
       {
@@ -1106,6 +1108,7 @@ describe('OpenRouterProvider', () => {
           aspectRatios: ['16:9', '9:16'],
           durations: [5, 10],
           supportsAudio: false,
+          frameImages: ['first_frame', 'last_frame'],
         },
       },
     }])
@@ -1662,6 +1665,7 @@ describe('OpenRouterProvider', () => {
             aspectRatios: ['16:9', '9:16'],
             durations: [5, 10],
             supportsAudio: false,
+            frameImages: [],
           },
         },
       },
@@ -1677,6 +1681,7 @@ describe('OpenRouterProvider', () => {
             aspectRatios: [],
             durations: [],
             supportsAudio: false,
+            frameImages: [],
           },
         },
       },
@@ -1739,6 +1744,7 @@ describe('OpenRouterProvider', () => {
             aspectRatios: [],
             durations: [],
             supportsAudio: false,
+            frameImages: [],
           },
         },
       },
@@ -1754,6 +1760,7 @@ describe('OpenRouterProvider', () => {
             aspectRatios: [],
             durations: [],
             supportsAudio: false,
+            frameImages: [],
           },
         },
       },
@@ -1769,6 +1776,7 @@ describe('OpenRouterProvider', () => {
             aspectRatios: [],
             durations: [],
             supportsAudio: false,
+            frameImages: [],
           },
         },
       },

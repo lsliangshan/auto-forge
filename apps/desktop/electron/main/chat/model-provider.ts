@@ -5,6 +5,7 @@ import {
   type AppError,
   type GenerationOptions,
   type ModelInfo,
+  type VideoFrameType,
 } from '@autoforge/shared'
 import type { ModelMediaInput } from '../media/media-asset-service.js'
 
@@ -20,6 +21,7 @@ const MAX_MODEL_ID_LENGTH = 256
 const MAX_MODEL_NAME_LENGTH = 512
 const MAX_CAPABILITY_VALUE_LENGTH = 128
 const MAX_IMAGE_COUNT = 10
+const VIDEO_FRAME_TYPES = ['first_frame', 'last_frame'] as const
 
 export type ModelContentPart =
   | { type: 'text'; text: string }
@@ -445,6 +447,13 @@ function mergeModalities(
   return sortedModalities(values.flat())
 }
 
+function videoFrameTypes(values: readonly unknown[] | undefined): VideoFrameType[] {
+  const present = new Set(values?.filter(
+    (value): value is VideoFrameType => VIDEO_FRAME_TYPES.includes(value as VideoFrameType),
+  ))
+  return VIDEO_FRAME_TYPES.filter((value) => present.has(value))
+}
+
 function generationForOutputs(outputModalities: ModelInfo['outputModalities']): ModelInfo['generation'] {
   return {
     ...(outputModalities.includes('image')
@@ -454,7 +463,7 @@ function generationForOutputs(outputModalities: ModelInfo['outputModalities']): 
       ? { audio: { voices: [], formats: [] } }
       : {}),
     ...(outputModalities.includes('video')
-      ? { video: { resolutions: [], aspectRatios: [], durations: [], supportsAudio: false } }
+      ? { video: { resolutions: [], aspectRatios: [], durations: [], supportsAudio: false, frameImages: [] } }
       : {}),
   }
 }
@@ -588,7 +597,7 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
     const result = videoCapabilityModelSchema.safeParse(entry)
     if (!result.success) continue
     const model = result.data
-    const frameImages = sortedUniqueStrings(model.supported_frame_images ?? undefined)
+    const frameImages = videoFrameTypes(model.supported_frame_images ?? undefined)
     const candidate: ModelInfo = {
       id: model.id,
       name: model.name,
@@ -601,6 +610,7 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
           aspectRatios: sortedUniqueStrings(model.supported_aspect_ratios ?? undefined),
           durations: sortedUniquePositiveIntegers(model.supported_durations),
           supportsAudio: model.generate_audio === true,
+          frameImages,
         },
       },
     }
@@ -622,6 +632,7 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
           aspectRatios: sortedUniqueStrings([...existingVideo.aspectRatios, ...candidateVideo.aspectRatios]),
           durations: sortedUniquePositiveIntegers([...existingVideo.durations, ...candidateVideo.durations]),
           supportsAudio: existingVideo.supportsAudio || candidateVideo.supportsAudio,
+          frameImages: videoFrameTypes([...existingVideo.frameImages, ...candidateVideo.frameImages]),
         },
       },
     })
