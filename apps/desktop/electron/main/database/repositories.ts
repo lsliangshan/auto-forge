@@ -142,6 +142,7 @@ export interface ProviderCostSnapshotRecord {
 }
 
 export interface ProviderUsageRepository {
+  find(operationKey: string): ProviderUsageEvent | undefined
   start(event: ProviderUsageStart): ProviderUsageEvent
   bindIdentity(operationKey: string, identity: ProviderUsageIdentity): ProviderUsageEvent
   report(operationKey: string, report: ProviderUsageReport): ProviderUsageEvent
@@ -539,6 +540,7 @@ export interface AppRepositories {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
     startMediaGeneration(value: MediaGenerationTurnInput): void
     get(id: string): ChatRun | undefined
+    getByRequestId(requestId: string): ChatRun | undefined
     summarizeTokenUsage(input: TokenUsageQueryRecord): TokenUsageSnapshotRecord
     update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt' | 'userId' | 'provider'>>): ChatRun | undefined
     finalizeWithMessage(
@@ -1830,6 +1832,10 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
         return row === undefined ? undefined : chatRunFromRow(row)
       },
+      getByRequestId: (requestId) => {
+        const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`, { requestId })
+        return row === undefined ? undefined : chatRunFromRow(row)
+      },
       summarizeTokenUsage(input) {
         const query = {
           userId: input.userId,
@@ -1963,6 +1969,14 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       },
     },
     providerUsage: {
+      find(operationKey) {
+        const row = one<Query>(database, `
+          SELECT ${providerUsageColumns}
+          FROM provider_usage_events
+          WHERE operation_key = @operationKey
+        `, { operationKey })
+        return row === undefined ? undefined : providerUsageFromRow(row)
+      },
       start(event) {
         return transaction(database, () => {
           const idOwner = one<{ operationKey: string }>(database, `

@@ -276,6 +276,19 @@ describe('openAppDatabase', () => {
     inspection.close()
   })
 
+  it('looks up migrated chat runs by request id without inventing ownership', () => {
+    const { database } = createV4Database()
+
+    expect(database.chatRuns.getByRequestId('request_v4')).toMatchObject({
+      id: 'run_v4',
+      requestId: 'request_v4',
+      model: 'model-v4',
+    })
+    expect(database.chatRuns.getByRequestId('request_v4')?.userId).toBeUndefined()
+    expect(database.chatRuns.getByRequestId('request_v4')?.provider).toBeUndefined()
+    expect(database.chatRuns.getByRequestId('missing_request')).toBeUndefined()
+  })
+
   it('stores local users and one persistent authentication session', () => {
     const database = openTestDatabase()
     const user = {
@@ -361,7 +374,13 @@ describe('openAppDatabase', () => {
     insertLocalUser(database, 'user_identity_other', 'IdentityOther')
     const start = usageStart('identity', 'user_identity')
 
+    expect(database.providerUsage.find(start.operationKey)).toBeUndefined()
     expect(database.providerUsage.start(start)).toMatchObject({ ...start, status: 'pending', reconcileAttempts: 0 })
+    expect(database.providerUsage.find(start.operationKey)).toMatchObject({
+      ...start,
+      status: 'pending',
+      reconcileAttempts: 0,
+    })
     expect(database.providerUsage.start({ ...start })).toMatchObject(start)
     const replay = { ...start, id: 'identity_replay_storage_id', startedAt: 999 }
     expect(database.providerUsage.start(replay)).toMatchObject(start)

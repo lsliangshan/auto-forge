@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import type {
@@ -15,7 +16,7 @@ import type {
   GeneratedStreamInput,
   MediaAssetService,
 } from '../media/media-asset-service.js'
-import type { ModelProvider } from './model-provider.js'
+import type { ModelProvider, ModelProviderSnapshot } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
 import {
   VideoJobRunner,
@@ -82,6 +83,54 @@ function createDatabase(databasePath?: string) {
   }, 1)
   database.conversations.insert({ id: submitInput.conversationId, title: 'Video' })
   return database
+}
+
+function createLegacyV4VideoDatabase(status: 'pending' | 'in_progress' | 'downloading' = 'pending') {
+  const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-v4-'))
+  temporaryDirectories.push(directory)
+  const path = join(directory, 'autoforge.sqlite')
+  const sqlite = new Database(path)
+  for (const [index, fileName] of [
+    '0001_init.sql',
+    '0002_multimodal_media.sql',
+    '0003_conversation_context.sql',
+    '0004_local_auth.sql',
+  ].entries()) {
+    sqlite.exec(readFileSync(fileURLToPath(new URL(`../../../resources/migrations/${fileName}`, import.meta.url)), 'utf8'))
+    sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
+      .run(index + 1, index + 1)
+  }
+  sqlite.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
+    .run(submitInput.conversationId, 'Legacy video', 1, 1)
+  sqlite.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('assistant_video_legacy', submitInput.conversationId, 'assistant', JSON.stringify([{
+      type: 'media_generation',
+      blockId: 'block_video_legacy',
+      jobId: submitInput.requestId,
+      kind: 'video',
+      status,
+    }]), 1, 1)
+  sqlite.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, started_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('run_video_legacy', submitInput.conversationId, submitInput.requestId, route.model, 'running', 1)
+  sqlite.prepare(`
+    INSERT INTO media_generation_jobs (
+      id, conversation_id, assistant_message_id, provider, model, kind,
+      provider_job_id, status, parameters_json, next_poll_at, poll_attempts,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'video', ?, ?, ?, ?, 0, 1, 1)
+  `).run(
+    submitInput.requestId,
+    submitInput.conversationId,
+    'assistant_video_legacy',
+    'openrouter',
+    route.model,
+    'provider_job_legacy',
+    status,
+    JSON.stringify({ version: 1, options: generation.video }),
+    status === 'downloading' ? null : 1,
+  )
+  sqlite.close()
+  return openAppDatabase(path)
 }
 
 function videoAsset(id: string): MediaAsset {
@@ -171,7 +220,14 @@ function createHarness(
   const dependencies: VideoJobRunnerDependencies = {
     database,
     providerUsage: database.providerUsage,
-    providers: { get: vi.fn(() => provider as ModelProvider) },
+    providers: {
+      get: vi.fn(() => provider as ModelProvider),
+      acquire: vi.fn(async (providerId): Promise<ModelProviderSnapshot> => ({
+        providerId,
+        provider: provider as ModelProvider,
+        ...(providerId === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_1' } : {}),
+      })),
+    },
     media,
     emit: (event) => events.push(event),
     id: (() => {
@@ -568,6 +624,285 @@ describe('VideoJobRunner', () => {
     })
     inspection.close()
   })
+
+  it.each([
+    {
+      name: 'completed and downloaded',
+      configure: (harness: ReturnType<typeof createHarness>) => {
+        vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+          status: 'completed',
+          generationId: 'generation_legacy',
+          costUsd: '0.81',
+        })
+      },
+      expectedStatus: 'completed',
+    },
+    {
+      name: 'provider failed',
+      configure: (harness: ReturnType<typeof createHarness>) => {
+        vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+          status: 'failed',
+          errorCode: 'MODEL_PROVIDER_REQUEST_FAILED',
+        })
+      },
+      expectedStatus: 'failed',
+    },
+    {
+      name: 'download failed',
+      configure: (harness: ReturnType<typeof createHarness>) => {
+        vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+          status: 'completed',
+          generationId: 'generation_legacy_download',
+          costUsd: '0.82',
+        })
+        vi.mocked(harness.provider.downloadVideo!).mockRejectedValue({ code: 'MEDIA_DOWNLOAD_FAILED' })
+      },
+      expectedStatus: 'failed',
+    },
+    {
+      name: 'local asset commit failed',
+      configure: (harness: ReturnType<typeof createHarness>) => {
+        vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+          status: 'completed',
+          generationId: 'generation_legacy_local',
+          costUsd: '0.83',
+        })
+        vi.mocked(harness.media.commitGeneratedStream).mockRejectedValue(new Error('disk unavailable'))
+      },
+      expectedStatus: 'failed',
+    },
+  ])('recovers a real v4 legacy OpenRouter video when $name without creating billing', async ({ configure, expectedStatus }) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const database = createLegacyV4VideoDatabase()
+    const harness = createHarness({ database })
+    configure(harness)
+    const start = vi.spyOn(harness.dependencies.providerUsage, 'start')
+    const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
+    const report = vi.spyOn(harness.dependencies.providerUsage, 'report')
+    const markUnknown = vi.spyOn(harness.dependencies.providerUsage, 'markUnknown')
+
+    const recovered = new VideoJobRunner(harness.dependencies)
+    await recovered.recover()
+    await flush()
+
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)?.status).toBe(expectedStatus)
+    expect(database.chatRuns.getByRequestId(submitInput.requestId)?.status)
+      .toBe(expectedStatus === 'completed' ? 'completed' : 'failed')
+    expect(database.providerUsage.find(`video:${submitInput.requestId}`)).toBeUndefined()
+    expect(start).not.toHaveBeenCalled()
+    expect(bindIdentity).not.toHaveBeenCalled()
+    expect(report).not.toHaveBeenCalled()
+    expect(markUnknown).not.toHaveBeenCalled()
+  })
+
+  it('finishes an already-downloading v4 legacy OpenRouter video without billing it', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const database = createLegacyV4VideoDatabase('downloading')
+    const harness = createHarness({ database })
+    harness.dependencies.providers = { get: vi.fn(() => harness.provider) }
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await runner.recover()
+    await flush()
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.provider.downloadVideo).toHaveBeenCalledTimes(1)
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)?.status).toBe('completed')
+    expect(database.providerUsage.find(`video:${submitInput.requestId}`)).toBeUndefined()
+  })
+
+  it('rejects an owned v5 OpenRouter video whose durable usage event is missing', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    harness.database.messages.insert({
+      id: 'assistant_owned_missing_usage',
+      conversationId: submitInput.conversationId,
+      role: 'assistant',
+      blocks: [{
+        type: 'media_generation', blockId: 'block_owned_missing_usage',
+        jobId: 'request_owned_missing_usage', kind: 'video', status: 'pending',
+      }],
+      createdAt: 1,
+    })
+    harness.database.chatRuns.insert({
+      id: 'run_owned_missing_usage',
+      conversationId: submitInput.conversationId,
+      requestId: 'request_owned_missing_usage',
+      userId: 'user_1',
+      provider: 'openrouter',
+      model: route.model,
+      status: 'running',
+      startedAt: 1,
+    })
+    harness.database.mediaGenerationJobs.insert({
+      id: 'request_owned_missing_usage',
+      conversationId: submitInput.conversationId,
+      assistantMessageId: 'assistant_owned_missing_usage',
+      provider: 'openrouter',
+      model: route.model,
+      kind: 'video',
+      providerJobId: 'provider_owned_missing_usage',
+      status: 'pending',
+      parameters: { version: 1, options: generation.video },
+      nextPollAt: 1,
+      pollAttempts: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await runner.recover()
+    await flush()
+    await expect(runner.stop()).rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.database.mediaGenerationJobs.get('request_owned_missing_usage')?.pollAttempts).toBe(0)
+  })
+
+  it('rejects contradictory legacy ownership when an attributed usage event exists', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const database = createLegacyV4VideoDatabase()
+    database.localAuth.createUserAndSession({
+      id: 'user_legacy_conflict',
+      account: 'Legacy Conflict',
+      accountNormalized: 'legacy conflict',
+      passwordDigest: 'digest-legacy-conflict',
+      createdAt: 1,
+      updatedAt: 1,
+    }, 1)
+    database.providerUsage.start({
+      id: 'usage_legacy_conflict',
+      operationKey: `video:${submitInput.requestId}`,
+      userId: 'user_legacy_conflict',
+      provider: 'openrouter',
+      apiKeyFingerprint: 'fingerprint_1',
+      requestId: submitInput.requestId,
+      chatRunId: 'run_video_legacy',
+      model: route.model,
+      modality: 'video',
+      startedAt: 1,
+    })
+    database.providerUsage.bindIdentity(`video:${submitInput.requestId}`, {
+      providerJobId: 'provider_job_legacy',
+    })
+    const harness = createHarness({ database })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect((runner as unknown as { wake(jobId: string): Promise<void> })
+      .wake(submitInput.requestId)).rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(0)
+  })
+
+  it('keeps one acquired provider snapshot for submit, poll and download', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const providerB = {
+      submitVideo: vi.fn(async () => ({ providerJobId: 'provider_job_b', status: 'pending' as const })),
+      pollVideo: vi.fn(async () => ({ status: 'completed' as const, costUsd: '9' })),
+      downloadVideo: vi.fn(async () => new Response()),
+    } satisfies Pick<ModelProvider, 'submitVideo' | 'pollVideo' | 'downloadVideo'>
+    const snapshotA: ModelProviderSnapshot = {
+      providerId: 'openrouter',
+      provider: harness.provider as ModelProvider,
+      apiKeyFingerprint: 'fingerprint_1',
+    }
+    const snapshotB: ModelProviderSnapshot = {
+      providerId: 'openrouter',
+      provider: providerB as unknown as ModelProvider,
+      apiKeyFingerprint: 'fingerprint_2',
+    }
+    let current = snapshotA
+    const acquire = vi.fn(async () => current)
+    harness.dependencies.providers = { acquire, get: vi.fn(() => current.provider) }
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+      status: 'completed', generationId: 'generation_snapshot', costUsd: '0.9',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await runner.submit({ ...submitInput, apiKeyFingerprint: 'caller_stale_fingerprint' })
+    current = snapshotB
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(acquire).toHaveBeenCalledTimes(1)
+    expect(harness.provider.submitVideo).toHaveBeenCalledTimes(1)
+    expect(harness.provider.pollVideo).toHaveBeenCalledTimes(1)
+    expect(harness.provider.downloadVideo).toHaveBeenCalledTimes(1)
+    expect(providerB.submitVideo).not.toHaveBeenCalled()
+    expect(providerB.pollVideo).not.toHaveBeenCalled()
+    expect(providerB.downloadVideo).not.toHaveBeenCalled()
+    expect(harness.database.providerUsage.find(`video:${submitInput.requestId}`)?.apiKeyFingerprint)
+      .toBe('fingerprint_1')
+  })
+
+  it('does not poll or spend attempts after restart until the persisted credential fingerprint matches', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const snapshotA: ModelProviderSnapshot = {
+      providerId: 'openrouter', provider: harness.provider as ModelProvider,
+      apiKeyFingerprint: 'fingerprint_1',
+    }
+    const snapshotB: ModelProviderSnapshot = {
+      providerId: 'openrouter', provider: harness.provider as ModelProvider,
+      apiKeyFingerprint: 'fingerprint_2',
+    }
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => snapshotA),
+      get: vi.fn(() => snapshotA.provider),
+    }
+    const submitting = new VideoJobRunner(harness.dependencies)
+    await submitting.submit(submitInput)
+    await submitting.stop()
+
+    vi.setSystemTime(3_000)
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => Promise.reject({ code: 'CREDENTIAL_UNAVAILABLE' })),
+      get: vi.fn(() => snapshotA.provider),
+    }
+    const unavailable = new VideoJobRunner(harness.dependencies)
+    await unavailable.recover()
+    await flush()
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(0)
+    await unavailable.stop()
+
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => snapshotB),
+      get: vi.fn(() => snapshotB.provider),
+    }
+    const mismatched = new VideoJobRunner(harness.dependencies)
+    await mismatched.recover()
+    await flush()
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(0)
+    expect(harness.database.providerUsage.find(`video:${submitInput.requestId}`)).toMatchObject({
+      reconcileAttempts: 0,
+      apiKeyFingerprint: 'fingerprint_1',
+    })
+    await mismatched.stop()
+
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({ status: 'in_progress' })
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => snapshotA),
+      get: vi.fn(() => snapshotA.provider),
+    }
+    const matched = new VideoJobRunner(harness.dependencies)
+    await matched.recover()
+    await flush()
+
+    expect(harness.provider.pollVideo).toHaveBeenCalledTimes(1)
+    expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(1)
+  })
   it('persists a complete submission intent before the provider request can settle', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -578,6 +913,7 @@ describe('VideoJobRunner', () => {
     const runner = new VideoJobRunner(harness.dependencies)
 
     void runner.submit(submitInput).catch(() => undefined)
+    await Promise.resolve()
     await Promise.resolve()
     await Promise.resolve()
 
@@ -1900,6 +2236,7 @@ describe('VideoJobRunner', () => {
     ))
     const runner = new VideoJobRunner(harness.dependencies)
     const submission = runner.submit(submitInput)
+    await Promise.resolve()
     await Promise.resolve()
     await Promise.resolve()
 
