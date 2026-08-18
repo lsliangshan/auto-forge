@@ -475,6 +475,35 @@ describe('OpenRouterProvider', () => {
     })
   })
 
+  it('submits Sora images as input references instead of frame images', async () => {
+    const bodies: string[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(String(init?.body))
+        return Response.json({ id: 'job_sora', status: 'pending' }, { status: 202 })
+      }),
+    })
+
+    await provider.submitVideo({
+      model: 'openai/sora-2-pro',
+      prompt: 'animate the reference',
+      options: { durationSeconds: 8, resolution: '1080p', aspectRatio: '16:9', generateAudio: true },
+      references: [{ mimeType: 'image/png', dataBase64: 'AQID' }],
+      frameImages: [],
+      useInputReferences: true,
+    })
+
+    expect(JSON.parse(bodies[0]!)).toMatchObject({
+      model: 'openai/sora-2-pro',
+      input_references: [{
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,AQID' },
+      }],
+    })
+    expect(JSON.parse(bodies[0]!)).not.toHaveProperty('frame_images')
+  })
+
   it('submits verified video frames with explicit aspect ratio', async () => {
     const bodies: string[] = []
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {

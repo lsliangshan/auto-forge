@@ -83,6 +83,7 @@ export interface ModelVideoRequest {
   options: GenerationOptions['video']
   references: Array<{ mimeType: string; dataBase64: string }>
   frameImages: VideoFrameType[]
+  useInputReferences?: boolean
   signal?: AbortSignal
 }
 

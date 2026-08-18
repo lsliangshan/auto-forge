@@ -117,6 +117,7 @@ const videoRequestSchema = z.object({
   }).strict(),
   references: z.array(imageReferenceSchema).max(2),
   frameImages: z.array(z.enum(['first_frame', 'last_frame'])).max(2),
+  useInputReferences: z.boolean().optional(),
   signal: abortSignalSchema.optional(),
 }).strict()
 const providerJobIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/)
@@ -355,7 +356,12 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       'video',
       parsedRequest.signal,
       () => {
-        const frameImages = wireFrameImages(parsedRequest.references, parsedRequest.frameImages)
+        const inputReferences = parsedRequest.useInputReferences
+          ? wireReferences(parsedRequest.references)
+          : []
+        const frameImages = parsedRequest.useInputReferences
+          ? []
+          : wireFrameImages(parsedRequest.references, parsedRequest.frameImages)
         return {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -368,6 +374,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
               ? {}
               : { aspect_ratio: parsedRequest.options.aspectRatio }),
             generate_audio: parsedRequest.options.generateAudio,
+            ...(inputReferences.length ? { input_references: inputReferences } : {}),
             ...(frameImages.length ? { frame_images: frameImages } : {}),
           }),
         }

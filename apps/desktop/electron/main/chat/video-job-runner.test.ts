@@ -606,6 +606,8 @@ describe('VideoJobRunner', () => {
     })
     const referencedRoute: typeof route = {
       ...route,
+      videoFrameImages: [],
+      videoUsesInputReferences: true,
       assets: [{
         id: 'reference_image',
         kind: 'image',
@@ -646,7 +648,8 @@ describe('VideoJobRunner', () => {
 
     expect(harness.provider.submitVideo).toHaveBeenCalledWith(expect.objectContaining({
       references: [{ mimeType: 'image/png', dataBase64: 'iVBORw0KGgo=' }],
-      frameImages: ['first_frame', 'last_frame'],
+      frameImages: [],
+      useInputReferences: true,
     }))
     expect(harness.database.mediaAssets.get('reference_image')?.messageId).toBe('user_message_1')
     expect(harness.database.messages.get('user_message_1')?.blocks).toEqual(userBlocks)

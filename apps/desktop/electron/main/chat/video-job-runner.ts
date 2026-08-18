@@ -335,6 +335,7 @@ export class VideoJobRunner {
         options: input.route.generation.video,
         references: inputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
         frameImages: input.route.videoFrameImages ?? [],
+        ...(input.route.videoUsesInputReferences ? { useInputReferences: true } : {}),
         signal: controller.signal,
       })
       if (
