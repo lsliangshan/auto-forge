@@ -47,6 +47,8 @@ import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
+import { QiniuAvatarUploader, readQiniuConfig } from './profile/avatar-uploader.js'
+import { ProfileService } from './profile/profile-service.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
@@ -79,6 +81,8 @@ export interface ApplicationRuntimeOptions {
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
   chooseProjectDirectory(): Promise<string | undefined>
   chooseMediaFiles(remainingSlots: number): Promise<string[]>
+  chooseAvatarFile?: () => Promise<string | undefined>
+  qiniuEnv?: NodeJS.ProcessEnv
   readClipboardImage(): { bytes: Uint8Array; mimeType: 'image/png'; name: string } | undefined
   chooseMediaSavePath(defaultName: string): Promise<string | undefined>
   revealPath(path: string): void
@@ -246,6 +250,11 @@ function executionSummary(execution: Execution): ExecutionSummary {
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
   const auth = new LocalAuthService(database.localAuth)
+  const profiles = new ProfileService(auth, database.userProfiles)
+  const avatarUploader = new QiniuAvatarUploader({
+    chooseAvatar: options.chooseAvatarFile ?? (async () => undefined),
+    config: () => readQiniuConfig(options.qiniuEnv ?? process.env),
+  })
   const maintenance = new MaintenanceGate()
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
   const settings = new SettingsService(database.appSettings, {
@@ -485,6 +494,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       register: (input) => auth.register(input),
       logout: () => auth.logout(),
       requireSession: () => auth.requireSession(),
+    },
+    profile: {
+      get: () => profiles.get(),
+      update: (input) => profiles.update(input),
+      pickAndUploadAvatar: async () => {
+        const session = await auth.requireSession()
+        return avatarUploader.pickAndUpload(session.user.id)
+      },
     },
     chat: {
       listConversations: async () => database.conversations.list().map((conversation) => ({

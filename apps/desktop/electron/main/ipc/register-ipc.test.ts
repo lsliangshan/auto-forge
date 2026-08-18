@@ -54,6 +54,11 @@ function services(): DesktopIpcServices {
       logout: vi.fn().mockResolvedValue(undefined),
       requireSession: vi.fn().mockResolvedValue(authSession),
     },
+    profile: {
+      get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
+      update: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice', displayName: 'Alice' }),
+      pickAndUploadAvatar: vi.fn().mockResolvedValue({ url: 'https://cdn.example.com/avatar.png' }),
+    },
     chat: {
       listConversations: vi.fn().mockResolvedValue([]),
       listMessages: vi.fn().mockResolvedValue([]),
@@ -144,6 +149,21 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.chatListConversations))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(app.dependencies.chat.listConversations).not.toHaveBeenCalled()
+  })
+
+  it('guards and validates every profile operation', async () => {
+    const app = harness()
+
+    await app.invoke(ipcChannels.profileGet)
+    await app.invoke(ipcChannels.profileUpdate, { displayName: 'Alice' })
+    await app.invoke(ipcChannels.profilePickAndUploadAvatar)
+
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(3)
+    expect(app.dependencies.profile.get).toHaveBeenCalledOnce()
+    expect(app.dependencies.profile.update).toHaveBeenCalledWith({ displayName: 'Alice' })
+    expect(app.dependencies.profile.pickAndUploadAvatar).toHaveBeenCalledOnce()
+    await expect(app.invoke(ipcChannels.profileUpdate, { account: 'Mallory' }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
   })
 
   it('validates sender and input before requiring a session', async () => {

@@ -38,6 +38,7 @@ export interface DesktopIpcServices {
   auth: DesktopAPI['auth'] & {
     requireSession(): Promise<AuthSession>
   }
+  profile: DesktopAPI['profile']
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
   media: {
     pickFiles(context: MediaImportContext): Promise<MediaAsset[]>
@@ -141,6 +142,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.authLogin, (input) => options.services.auth.login(input), { anonymous: true })
   register(ipcChannels.authRegister, (input) => options.services.auth.register(input), { anonymous: true })
   register(ipcChannels.authLogout, () => options.services.auth.logout(), { anonymous: true })
+  register(ipcChannels.profileGet, () => options.services.profile.get())
+  register(ipcChannels.profileUpdate, (input) => options.services.profile.update(input))
+  register(ipcChannels.profilePickAndUploadAvatar, () => options.services.profile.pickAndUploadAvatar())
   register(ipcChannels.chatListConversations, () => options.services.chat.listConversations())
   register(ipcChannels.chatListMessages, (input) => options.services.chat.listMessages(input.conversationId))
   register(ipcChannels.chatCreateConversation, () => options.services.chat.createConversation())

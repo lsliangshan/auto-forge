@@ -262,6 +262,28 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('persists the authenticated user profile across runtime restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-profile-'))
+    directories.push(root)
+    const runtimeOptions = options(root, {
+      qiniuEnv: {},
+      chooseAvatarFile: async () => undefined,
+    })
+    const runtime = createApplicationRuntime(runtimeOptions)
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+
+    await expect(runtime.services.profile.update({ displayName: 'Alice Zhang' })).resolves.toMatchObject({
+      userId: expect.any(String), account: 'Alice', displayName: 'Alice Zhang',
+    })
+    await runtime.close()
+
+    const restarted = createApplicationRuntime(runtimeOptions)
+    await expect(restarted.services.profile.get()).resolves.toMatchObject({
+      account: 'Alice', displayName: 'Alice Zhang',
+    })
+    await restarted.close()
+  })
+
   it('forwards chat events only while a local session is authenticated', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-events-'))
     directories.push(root)

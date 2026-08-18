@@ -60,6 +60,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       register: (input) => invoke(ipcRenderer, ipcChannels.authRegister, input),
       logout: () => invoke(ipcRenderer, ipcChannels.authLogout),
     },
+    profile: {
+      get: () => invoke(ipcRenderer, ipcChannels.profileGet),
+      update: (input) => invoke(ipcRenderer, ipcChannels.profileUpdate, input),
+      pickAndUploadAvatar: () => invoke(ipcRenderer, ipcChannels.profilePickAndUploadAvatar),
+    },
     chat: {
       listConversations: () => invoke(ipcRenderer, ipcChannels.chatListConversations),
       listMessages: (conversationId) => invoke(ipcRenderer, ipcChannels.chatListMessages, { conversationId }),

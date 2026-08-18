@@ -59,6 +59,11 @@ function emit(channel: string, value: unknown): void {
 }
 
 async function initialize(): Promise<ApplicationRuntime> {
+  try {
+    process.loadEnvFile(join(app.getAppPath(), '..', '..', '.env'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
   const userData = app.getPath('userData')
   const networkProxy = new NetworkProxyService({
     setProxy: (config) => session.defaultSession.setProxy(config),
@@ -102,6 +107,18 @@ async function initialize(): Promise<ApplicationRuntime> {
         : await dialog.showOpenDialog(dialogOptions)
       return result.canceled ? [] : result.filePaths.slice(0, remainingSlots)
     },
+    chooseAvatarFile: async () => {
+      const dialogOptions: OpenDialogOptions = {
+        title: '选择头像',
+        properties: ['openFile'],
+        filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      }
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+        : await dialog.showOpenDialog(dialogOptions)
+      return result.canceled ? undefined : result.filePaths[0]
+    },
+    qiniuEnv: process.env,
     readClipboardImage: () => {
       const image = clipboard.readImage()
       if (image.isEmpty()) return undefined

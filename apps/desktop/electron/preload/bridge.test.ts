@@ -38,6 +38,20 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.authLogout, undefined)
   })
 
+  it('exposes only the fixed profile operations', async () => {
+    const app = harness()
+    const update = { displayName: 'Alice', email: 'alice@example.com' }
+
+    await app.api.profile.get()
+    await app.api.profile.update(update)
+    await app.api.profile.pickAndUploadAvatar()
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.profileGet, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.profileUpdate, update)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.profilePickAndUploadAvatar, undefined)
+    expect(app.api.profile).not.toHaveProperty('invoke')
+  })
+
   it('uses literal fixed channels without exposing a generic transport', async () => {
     const app = harness()
     await app.api.chat.renameConversation('c1', 'Renamed')
