@@ -41,15 +41,21 @@ const createSnapshot = (
 describe('createTokenUsageSnapshot', () => {
   it('uses one local time snapshot for today, yesterday, Monday week and month', () => {
     const now = new Date(2026, 7, 19, 12, 30)
-    const summarize = vi.fn((_query: Parameters<Parameters<typeof createTokenUsageSnapshot>[2]>[0]) => ({
-      today: zeroRecord(),
-      yesterday: zeroRecord(),
-      week: zeroRecord(),
-      month: zeroRecord(),
-      allTime: zeroRecord(),
-    }))
+    const summarize = vi.fn((query: Parameters<Parameters<typeof createTokenUsageSnapshot>[2]>[0]) => {
+      void query
+      return {
+        today: zeroRecord(),
+        yesterday: zeroRecord(),
+        week: zeroRecord(),
+        month: zeroRecord(),
+        allTime: zeroRecord(),
+      }
+    })
 
-    const summarizeCosts = vi.fn((_query: Parameters<Parameters<typeof createTokenUsageSnapshot>[3]>[0]) => zeroCostSnapshot())
+    const summarizeCosts = vi.fn((query: Parameters<Parameters<typeof createTokenUsageSnapshot>[3]>[0]) => {
+      void query
+      return zeroCostSnapshot()
+    })
     const snapshot = createTokenUsageSnapshot(now, 'user_1', summarize, summarizeCosts)
 
     expect(summarize).toHaveBeenCalledWith({

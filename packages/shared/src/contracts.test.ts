@@ -526,7 +526,11 @@ describe('cross-process contracts', () => {
       ...snapshot,
       today: {
         ...snapshot.today,
-        models: snapshot.today.models.map(({ provider: _provider, ...model }) => model),
+        models: snapshot.today.models.map((model) => {
+          const modelWithoutProvider: Partial<typeof model> = { ...model }
+          delete modelWithoutProvider.provider
+          return modelWithoutProvider
+        }),
       },
     })).toThrow()
     expect(() => tokenUsageSnapshotSchema.parse({
