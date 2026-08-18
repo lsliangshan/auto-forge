@@ -33,6 +33,7 @@ import type {
 import type { ResolvedChatRoute } from './multimodal-router.js'
 
 const VIDEO_TIMEOUT_MS = 60 * 60 * 1_000
+const CREDENTIAL_RETRY_MS = 2_000
 const PROVIDER_JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/
 const ACTIVE_STATUSES: MediaGenerationJobStatus[] = [
   'pending',
@@ -666,6 +667,22 @@ export class VideoJobRunner {
     this.timers.set(job.id, handle)
   }
 
+  private scheduleCredentialRetry(job: MediaGenerationJob): void {
+    if (this.stopped || !ACTIVE_STATUSES.includes(job.status)) return
+    this.clearTimer(job.id)
+    const target = Math.min(
+      this.now() + CREDENTIAL_RETRY_MS,
+      job.createdAt + VIDEO_TIMEOUT_MS,
+    )
+    const handle = this.timersApi.set(() => {
+      this.timers.delete(job.id)
+      void this.wake(job.id).catch((error: unknown) => {
+        this.backgroundFailures.push(error)
+      })
+    }, Math.max(0, target - this.now()))
+    this.timers.set(job.id, handle)
+  }
+
   private clearTimer(jobId: string): void {
     const handle = this.timers.get(jobId)
     if (handle === undefined) return
@@ -712,7 +729,20 @@ export class VideoJobRunner {
       return
     }
     const providerSnapshot = await this.snapshotForJob(job, usage)
-    if (providerSnapshot === undefined) return
+    const current = this.currentActiveJob(job, controller.signal)
+    if (current === undefined) return
+    const currentUsage = this.classifyUsage(current)
+    if (this.now() >= deadline) {
+      if (currentUsage.kind === 'tracked' && current.status !== 'downloading') {
+        this.dependencies.providerUsage.markUnknown(`video:${current.id}`, this.now())
+      }
+      this.fail(current, 'MEDIA_GENERATION_TIMEOUT')
+      return
+    }
+    if (providerSnapshot === undefined) {
+      this.scheduleCredentialRetry(current)
+      return
+    }
     this.clearDeadlineTimer(job.id)
     const deadlineTimer = this.timersApi.set(
       () => controller.abort(),
@@ -720,16 +750,39 @@ export class VideoJobRunner {
     )
     this.deadlineTimers.set(job.id, deadlineTimer)
     try {
-      if (job.status === 'downloading') {
-        await this.download(job, controller.signal, providerSnapshot.provider)
+      if (current.status === 'downloading') {
+        await this.download(current, controller.signal, providerSnapshot.provider)
         return
       }
-      await this.poll(job, controller.signal, usage, providerSnapshot.provider)
+      await this.poll(current, controller.signal, currentUsage, providerSnapshot.provider)
     } finally {
       if (this.deadlineTimers.get(job.id) === deadlineTimer) {
         this.clearDeadlineTimer(job.id)
       }
     }
+  }
+
+  private currentActiveJob(
+    expected: MediaGenerationJob,
+    signal: AbortSignal,
+  ): MediaGenerationJob | undefined {
+    if (this.stopped || signal.aborted) return undefined
+    const current = this.dependencies.database.mediaGenerationJobs.get(expected.id)
+    if (
+      !current
+      || !ACTIVE_STATUSES.includes(current.status)
+      || isVideoSubmissionIntent(current)
+      || current.conversationId !== expected.conversationId
+      || current.assistantMessageId !== expected.assistantMessageId
+      || current.provider !== expected.provider
+      || current.model !== expected.model
+      || current.providerJobId !== expected.providerJobId
+      || current.status !== expected.status
+      || current.pollAttempts !== expected.pollAttempts
+      || current.nextPollAt !== expected.nextPollAt
+      || current.updatedAt !== expected.updatedAt
+    ) return undefined
+    return current
   }
 
   private async poll(

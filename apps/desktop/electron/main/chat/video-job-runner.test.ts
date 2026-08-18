@@ -863,25 +863,22 @@ describe('VideoJobRunner', () => {
     await submitting.stop()
 
     vi.setSystemTime(3_000)
+    let current: ModelProviderSnapshot | undefined
     harness.dependencies.providers = {
-      acquire: vi.fn(async () => Promise.reject({ code: 'CREDENTIAL_UNAVAILABLE' })),
+      acquire: vi.fn(async () => {
+        if (current === undefined) throw Object.assign(new Error('missing'), { code: 'CREDENTIAL_UNAVAILABLE' })
+        return current
+      }),
       get: vi.fn(() => snapshotA.provider),
     }
-    const unavailable = new VideoJobRunner(harness.dependencies)
-    await unavailable.recover()
+    const recovered = new VideoJobRunner(harness.dependencies)
+    await recovered.recover()
     await flush()
 
     expect(harness.provider.pollVideo).not.toHaveBeenCalled()
     expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(0)
-    await unavailable.stop()
-
-    harness.dependencies.providers = {
-      acquire: vi.fn(async () => snapshotB),
-      get: vi.fn(() => snapshotB.provider),
-    }
-    const mismatched = new VideoJobRunner(harness.dependencies)
-    await mismatched.recover()
-    await flush()
+    current = snapshotB
+    await vi.advanceTimersByTimeAsync(2_000)
 
     expect(harness.provider.pollVideo).not.toHaveBeenCalled()
     expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(0)
@@ -889,19 +886,162 @@ describe('VideoJobRunner', () => {
       reconcileAttempts: 0,
       apiKeyFingerprint: 'fingerprint_1',
     })
-    await mismatched.stop()
 
     vi.mocked(harness.provider.pollVideo!).mockResolvedValue({ status: 'in_progress' })
-    harness.dependencies.providers = {
-      acquire: vi.fn(async () => snapshotA),
-      get: vi.fn(() => snapshotA.provider),
-    }
-    const matched = new VideoJobRunner(harness.dependencies)
-    await matched.recover()
-    await flush()
+    current = snapshotA
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
 
     expect(harness.provider.pollVideo).toHaveBeenCalledTimes(1)
     expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(1)
+  })
+
+  it('retries a credential-unavailable legacy job without attributing or spending attempts', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const database = createLegacyV4VideoDatabase()
+    const harness = createHarness({ database })
+    const snapshot: ModelProviderSnapshot = {
+      providerId: 'openrouter', provider: harness.provider as ModelProvider,
+      apiKeyFingerprint: 'current_legacy_fingerprint',
+    }
+    let available = false
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => {
+        if (!available) throw Object.assign(new Error('missing'), { code: 'CREDENTIAL_UNAVAILABLE' })
+        return snapshot
+      }),
+      get: vi.fn(() => snapshot.provider),
+    }
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({ status: 'completed' })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await runner.recover()
+    await flush()
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(0)
+
+    available = true
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    expect(harness.provider.pollVideo).toHaveBeenCalledTimes(1)
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)?.status).toBe('completed')
+    expect(database.providerUsage.find(`video:${submitInput.requestId}`)).toBeUndefined()
+  })
+
+  it('caps credential retry at the original video deadline', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(3_599_000)
+    const database = createLegacyV4VideoDatabase()
+    const harness = createHarness({ database })
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => {
+        throw Object.assign(new Error('missing'), { code: 'CREDENTIAL_UNAVAILABLE' })
+      }),
+      get: vi.fn(() => harness.provider),
+    }
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await runner.recover()
+    await flush()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)?.status).toBe('pending')
+    await vi.advanceTimersByTimeAsync(1)
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(database.mediaGenerationJobs.get(submitInput.requestId)).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_TIMEOUT',
+      endedAt: 3_600_001,
+    })
+    expect(database.providerUsage.find(`video:${submitInput.requestId}`)).toBeUndefined()
+  })
+
+  it('does not poll when a job is paused while credential acquisition is pending', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const snapshot: ModelProviderSnapshot = {
+      providerId: 'openrouter', provider: harness.provider as ModelProvider,
+      apiKeyFingerprint: 'fingerprint_1',
+    }
+    const submitting = new VideoJobRunner(harness.dependencies)
+    await submitting.submit(submitInput)
+    await submitting.stop()
+
+    let resolveAcquire!: (snapshot: ModelProviderSnapshot) => void
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => new Promise<ModelProviderSnapshot>((resolve) => {
+        resolveAcquire = resolve
+      })),
+      get: vi.fn(() => snapshot.provider),
+    }
+    vi.setSystemTime(3_000)
+    const recovered = new VideoJobRunner(harness.dependencies)
+    await recovered.recover()
+    await flush()
+    expect(resolveAcquire).toBeTypeOf('function')
+
+    await recovered.pause(submitInput.requestId)
+    resolveAcquire(snapshot)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.status).toBe('paused')
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.provider.downloadVideo).not.toHaveBeenCalled()
+    await recovered.stop()
+  })
+
+  it('drains a delayed acquisition on stop without downloading after the job becomes stale', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const snapshot: ModelProviderSnapshot = {
+      providerId: 'openrouter', provider: harness.provider as ModelProvider,
+      apiKeyFingerprint: 'fingerprint_1',
+    }
+    const submitting = new VideoJobRunner(harness.dependencies)
+    await submitting.submit(submitInput)
+    await submitting.stop()
+    harness.database.mediaGenerationJobs.transition(submitInput.requestId, ['pending'], {
+      status: 'in_progress',
+      pollAttempts: 0,
+      nextPollAt: null,
+      updatedAt: 2_000,
+    })
+    harness.database.mediaGenerationJobs.transition(submitInput.requestId, ['in_progress'], {
+      status: 'downloading',
+      pollAttempts: 0,
+      nextPollAt: null,
+      updatedAt: 2_000,
+    })
+
+    let resolveAcquire!: (snapshot: ModelProviderSnapshot) => void
+    harness.dependencies.providers = {
+      acquire: vi.fn(async () => new Promise<ModelProviderSnapshot>((resolve) => {
+        resolveAcquire = resolve
+      })),
+      get: vi.fn(() => snapshot.provider),
+    }
+    vi.setSystemTime(3_000)
+    const recovered = new VideoJobRunner(harness.dependencies)
+    await recovered.recover()
+    await flush()
+    expect(resolveAcquire).toBeTypeOf('function')
+
+    let stopped = false
+    const stopping = recovered.stop().then(() => { stopped = true })
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+    resolveAcquire(snapshot)
+    await stopping
+
+    expect(harness.provider.pollVideo).not.toHaveBeenCalled()
+    expect(harness.provider.downloadVideo).not.toHaveBeenCalled()
+    expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.status).toBe('downloading')
   })
   it('persists a complete submission intent before the provider request can settle', async () => {
     vi.useFakeTimers()
