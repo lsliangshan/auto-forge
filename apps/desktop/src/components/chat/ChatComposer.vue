@@ -388,6 +388,14 @@ function modelSupportsRequest(model: ModelInfo, output: ConcreteOutput): boolean
   if (!modelSupportsOutput(model, output)) return false
   if ((output === 'image' || output === 'video')
     && chat.drafts.some(({ kind }) => kind !== 'image')) return false
+  if (output === 'video') {
+    const video = model.generation.video
+    const imageCapacity = Math.max(
+      video?.frameImages.length ?? 0,
+      video?.maxReferenceImages ?? 0,
+    )
+    if (chat.drafts.length > imageCapacity) return false
+  }
   return chat.drafts.every(({ kind }) => model.inputModalities.includes(kind))
 }
 
