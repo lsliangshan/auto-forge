@@ -7,6 +7,7 @@ import type {
   ModelProviderSnapshot,
   ModelStreamEvent,
 } from '../chat/model-provider.js'
+import { OpenRouterProvider } from '../chat/openrouter-provider.js'
 import { trackProviderStream } from './provider-usage-stream.js'
 
 async function* events(values: readonly ModelStreamEvent[]): AsyncIterable<ModelStreamEvent> {
@@ -118,6 +119,74 @@ describe('trackProviderStream', () => {
     await expect(collect(test.tracked)).rejects.toBe(failure)
     expect(test.providerUsage.bindIdentity).toHaveBeenCalledTimes(1)
     expect(test.providerUsage.markUnknown).toHaveBeenCalledWith('operation_1', 100)
+  })
+
+  it.each([
+    {
+      name: 'reports the actual cost once when usage is present',
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost: '0.29' },
+      expectedCost: '0.29',
+    },
+    {
+      name: 'keeps the event unknown when usage is absent',
+      usage: undefined,
+      expectedCost: undefined,
+    },
+  ])('$name before propagating a real OpenRouter error frame', async ({ usage, expectedCost }) => {
+    const payload = {
+      id: 'generation_error_frame',
+      choices: [],
+      ...(usage === undefined ? {} : { usage }),
+      error: { code: 403, message: 'provider detail must not escape', metadata: { error_type: 'permission' } },
+    }
+    const fetch = vi.fn(async () => new Response(
+      `data: ${JSON.stringify(payload)}\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const sleep = vi.fn(async () => undefined)
+    const openRouter = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => 'sk-error-frame') },
+      fetch,
+      sleep,
+    })
+    const test = harness([])
+    const provider: ModelProviderSnapshot = {
+      providerId: 'openrouter',
+      apiKeyFingerprint: 'fingerprint_error_frame',
+      provider: openRouter,
+    }
+    const tracked = trackProviderStream({
+      operationKey: 'operation_error_frame',
+      attribution: {
+        userId: 'user_1', requestId: 'request_error_frame', chatRunId: 'run_error_frame',
+        model: 'openrouter/model', modality: 'text',
+      },
+      request: { model: 'openrouter/model', messages: [] },
+      provider,
+      providerUsage: test.providerUsage,
+      id: () => 'usage_error_frame',
+      now: () => 200,
+    })
+
+    await expect(collect(tracked)).rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
+    expect(test.providerUsage.bindIdentity).toHaveBeenCalledWith(
+      'operation_error_frame', { generationId: 'generation_error_frame' },
+    )
+    if (expectedCost === undefined) {
+      expect(test.providerUsage.report).not.toHaveBeenCalled()
+      expect(test.providerUsage.markUnknown).toHaveBeenCalledWith('operation_error_frame', 200)
+      expect(test.order).toEqual(['start', 'bind', 'unknown'])
+    } else {
+      expect(test.providerUsage.report).toHaveBeenCalledOnce()
+      expect(test.providerUsage.report).toHaveBeenCalledWith('operation_error_frame', {
+        generationId: 'generation_error_frame', inputTokens: 4, outputTokens: 2,
+        costUsd: expectedCost, endedAt: 200,
+      })
+      expect(test.providerUsage.markUnknown).not.toHaveBeenCalled()
+      expect(test.order).toEqual(['start', 'bind', 'report'])
+    }
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
   })
 
   it('marks the operation unknown when a consumer returns early', async () => {

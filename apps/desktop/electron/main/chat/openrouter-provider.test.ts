@@ -2247,6 +2247,30 @@ describe('OpenRouterProvider', () => {
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('user content secret')
   })
 
+  it('yields generation and actual usage from an error frame before preserving the provider failure', async () => {
+    const fetch = vi.fn(async () => sseResponse([
+      'data: {"id":"generation_error_paid","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3,"cost":0.17},"error":{"code":403,"message":"user content secret","metadata":{"error_type":"permission"}}}\n\n',
+    ]))
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+    const events: OpenRouterStreamEvent[] = []
+    let streamFailure: unknown
+
+    try {
+      for await (const event of provider.stream({ model: 'm', messages: [] })) events.push(event)
+    } catch (error) {
+      streamFailure = error
+    }
+
+    expect(events).toEqual([
+      { type: 'generation', id: 'generation_error_paid' },
+      { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.17' },
+    ])
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
   it('rejects a clean EOF without DONE or an explicit non-error finish frame', async () => {
     const fetch = vi.fn(async () => sseResponse([
       'data: {"choices":[{"index":0,"delta":{"content":"truncated"}}]}\n\n',

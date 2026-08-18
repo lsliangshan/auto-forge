@@ -1108,13 +1108,12 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         if (chunk.error) {
           this.reportStreamDiagnostic(chunk.error)
           parserError = streamedFailure(chunk.error)
-          return
         }
         if (chunk.id && !replay.generations.has(chunk.id)) {
           replay.generations.add(chunk.id)
           pending.push({ type: 'generation', id: chunk.id })
         }
-        for (const choice of chunk.choices) {
+        for (const choice of chunk.error === undefined ? chunk.choices : []) {
           const content = choice.delta.content ?? ''
           if (content) {
             const cumulative = `${attemptText.get(choice.index) ?? ''}${content}`
@@ -1210,13 +1209,13 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           break
         }
         parser.feed(decoder.decode(result.value, { stream: true }))
-        if (parserError) throw parserError
         while (pending.length) yield pending.shift()!
+        if (parserError) throw parserError
       }
       parser.feed(decoder.decode())
       parser.reset({ consume: true })
-      if (parserError) throw parserError
       while (pending.length) yield pending.shift()!
+      if (parserError) throw parserError
       if (!done && !explicitTerminal) throw new RetryableFailure()
     } finally {
       if (!physicalEof) await reader.cancel().catch(() => undefined)
