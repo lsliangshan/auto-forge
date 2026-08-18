@@ -41,6 +41,7 @@ import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { createMediaAssetService } from './media/media-asset-service.js'
+import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
@@ -273,6 +274,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
     }),
   })
+  const openRouterUsageProvider = providerRegistry.get('openrouter')
+  const providerUsageReconciler = new ProviderUsageReconciler({
+    providerUsage: database.providerUsage,
+    provider: {
+      getGenerationUsage: (generationId, signal) => {
+        if (!openRouterUsageProvider.getGenerationUsage) {
+          return Promise.reject(failure('MODEL_PROVIDER_REQUEST_FAILED'))
+        }
+        return openRouterUsageProvider.getGenerationUsage(generationId, signal)
+      },
+    },
+    credential: { get: () => secretStore.get(credentialKeyForProvider('openrouter')) },
+  })
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
   const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
@@ -354,6 +368,30 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     promise: Promise<void>
   }>()
   let acceptingWork = true
+  let reconciliationClosed = false
+  let reconciliationTail = Promise.resolve()
+  const reconciliationTimers = new Set<ReturnType<typeof setTimeout>>()
+  const reportReconciliationFailure = (error: unknown): void => {
+    try {
+      process.stderr.write(`[provider-usage-reconciliation] ${toSafeAppError(error).code}\n`)
+    } catch { /* Diagnostics must never affect application lifecycle. */ }
+  }
+  const enqueueReconciliation = (operation: () => Promise<void>): Promise<void> => {
+    const next = reconciliationTail.then(operation)
+    reconciliationTail = next.catch(reportReconciliationFailure)
+    return reconciliationTail
+  }
+  const scheduleReconciliationRounds = (): void => {
+    if (reconciliationClosed) return
+    for (const delayMs of [1_000, 6_000, 36_000]) {
+      const handle = setTimeout(() => {
+        reconciliationTimers.delete(handle)
+        if (reconciliationClosed) return
+        void enqueueReconciliation(() => providerUsageReconciler.reconcileDue())
+      }, delayMs)
+      reconciliationTimers.add(handle)
+    }
+  }
   const emitExecution = (event: ExecutionEvent) => {
     if (event.type === 'status') {
       if (['queued', 'awaiting_approval', 'running'].includes(event.status)) activeExecutions.add(event.executionId)
@@ -377,7 +415,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
   })
   const emitChat = (event: ChatEvent) => {
-    if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) activeRequests.delete(event.requestId)
+    if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
+      activeRequests.delete(event.requestId)
+      scheduleReconciliationRounds()
+    }
     if (event.type === 'block' && event.block.type === 'approval') {
       emitExecution({
         type: 'approval_required',
@@ -401,6 +442,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     history: conversationContext,
     policy,
     executions,
+    providerUsage: database.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
   })
@@ -413,10 +455,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       transport: options.mediaTransport ?? new PinnedMediaTransport(),
       withTransportLease: options.networkProxy.withTransportLease.bind(options.networkProxy),
     }),
+    providerUsage: database.providerUsage,
     emit: emitChat,
   })
   const videoJobs = new VideoJobRunner({
     database,
+    providerUsage: database.providerUsage,
     providers: providerRegistry,
     media,
     emit: emitChat,
@@ -526,6 +570,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         },
       ),
       send: async (input) => {
+        const session = await auth.requireSession()
         const releaseStart = maintenance.beginStart()
         try {
           if (!acceptingWork) throw failure('CONFLICT')
@@ -558,6 +603,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           if ('selectionRequired' in route || 'modelRequired' in route) {
             throw failure('INVALID_INPUT')
           }
+          let apiKeyFingerprint: string | undefined
+          if (route.provider === 'openrouter') {
+            const apiKey = await secretStore.get(credentialKeyForProvider('openrouter'))
+            if (!apiKey) throw failure('CREDENTIAL_UNAVAILABLE')
+            apiKeyFingerprint = fingerprintApiKey(apiKey)
+          }
           const requestId = randomUUID()
           const userBlocks: ChatBlock[] = [
             ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
@@ -570,6 +621,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             userBlocks,
             assetIds: input.assetIds,
             route,
+            userId: session.user.id,
+            ...(apiKeyFingerprint === undefined ? {} : { apiKeyFingerprint }),
           }
           if (route.outputType === 'text') {
             const modelInputs = await media.modelInput(input.conversationId, input.assetIds)
@@ -597,6 +650,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                   ...(durationMs === undefined ? {} : { durationMs }),
                 })),
                 allowTools: route.supportsTools,
+                userId: session.user.id,
+                ...(apiKeyFingerprint === undefined ? {} : { apiKeyFingerprint }),
                 provider: route.provider,
                 model: route.model,
                 ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
@@ -846,10 +901,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       validateProviderCredential: credentialStatus,
       listProviderModels: (provider, refresh = false) => getModelCatalog(provider, refresh),
-      getTokenUsage: async () => createTokenUsageSnapshot(
-        new Date(),
-        (query) => database.chatRuns.summarizeTokenUsage(query),
-      ),
+      getTokenUsage: async () => {
+        const session = await auth.requireSession()
+        const now = new Date()
+        return createTokenUsageSnapshot(
+          now,
+          (query) => database.chatRuns.summarizeTokenUsage({
+            ...query,
+            userId: session.user.id,
+          }),
+        )
+      },
       clearLocalData: async (scope) => {
         await maintenance.runExclusive(
           () => activeRequests.size > 0
@@ -890,12 +952,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await options.networkProxy.initialize(settings.get().proxy)
       await mediaLifecycle.recover()
       database.recoverInterrupted()
+      void enqueueReconciliation(() => providerUsageReconciler.recoverInterrupted())
+        .then(scheduleReconciliationRounds)
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
       await projects.recoverRemovalJournals()
       await videoJobs.recover()
     },
     close: async () => {
       acceptingWork = false
+      reconciliationClosed = true
+      for (const handle of reconciliationTimers) clearTimeout(handle)
+      reconciliationTimers.clear()
       const admittedStarts = maintenance.stopAndDrain()
       await videoJobs.stop()
       await admittedStarts
@@ -905,6 +972,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       ]))
       await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
       await executions.shutdown()
+      await reconciliationTail
       database.close()
     },
   }

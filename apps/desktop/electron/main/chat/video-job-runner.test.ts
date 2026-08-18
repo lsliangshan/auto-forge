@@ -595,6 +595,8 @@ describe('VideoJobRunner', () => {
     }])
     expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
       requestId: 'request_video_1',
+      userId: 'user_1',
+      provider: 'openrouter',
       status: 'running',
     })
     expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({

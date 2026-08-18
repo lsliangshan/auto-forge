@@ -77,6 +77,8 @@ export interface CreateRunInput {
   runId: string
   conversationId: string
   requestId: string
+  userId: string
+  provider: ModelProviderId
   model: string
   startedAt: number
 }
@@ -138,6 +140,8 @@ export function createAgentPersistence(
         id: input.runId,
         conversationId: input.conversationId,
         requestId: input.requestId,
+        userId: input.userId,
+        provider: input.provider,
         model: input.model,
         status: 'running',
         startedAt: input.startedAt,
@@ -166,6 +170,8 @@ export function createAgentPersistence(
           id: input.run.runId,
           conversationId: input.run.conversationId,
           requestId: input.run.requestId,
+          userId: input.run.userId,
+          provider: input.run.provider,
           model: input.run.model,
           status: 'running',
           startedAt: input.run.startedAt,
@@ -353,6 +359,8 @@ export class AgentOrchestrator {
         runId,
         conversationId: input.conversationId,
         requestId,
+        userId: input.userId,
+        provider: input.provider,
         model: input.model,
         startedAt,
       })

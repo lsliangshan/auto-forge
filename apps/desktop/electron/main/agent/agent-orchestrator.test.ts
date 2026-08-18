@@ -32,6 +32,7 @@ async function* events(values: ProviderStreamEvent[]) {
 function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies & {
   records: {
     users: unknown[]
+    runs: unknown[]
     starts: unknown[]
     decisions: unknown[]
     discards: unknown[]
@@ -47,6 +48,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
 } {
   const records = {
     users: [] as unknown[],
+    runs: [] as unknown[],
     starts: [] as unknown[],
     decisions: [] as unknown[],
     discards: [] as unknown[],
@@ -108,7 +110,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     },
     persistence: {
       persistUser(value) { records.users.push(value); return { ordinal: records.users.length } },
-      createRun() {},
+      createRun(value) { records.runs.push(value) },
       createAssistant(value) { messages.set(value.messageId, { blocks: value.initialBlocks }) },
       startMediaGeneration() {},
       updateAssistant(messageId, blocks) { messages.set(messageId, { blocks }); return { blocks } },
@@ -309,6 +311,13 @@ describe('AgentOrchestrator', () => {
 
     expect(dependencies.providerUsage.start).not.toHaveBeenCalled()
     expect(dependencies.providerUsage.report).not.toHaveBeenCalled()
+    expect(dependencies.records.runs).toEqual([
+      expect.objectContaining({
+        userId: 'user_1',
+        provider: 'deepseek',
+        requestId: 'request_deepseek',
+      }),
+    ])
     expect(dependencies.records.terminal.at(-1)).toMatchObject({
       inputTokens: 8,
       outputTokens: 9,
@@ -496,11 +505,12 @@ describe('AgentOrchestrator', () => {
 
   it('claims exact assets when the production persistence adapter inserts a user message', () => {
     const insert = vi.fn()
+    const insertRun = vi.fn()
     const insertWithAssets = vi.fn(() => ({ ordinal: 7 }))
     const replaceBlock = vi.fn()
     const persistence = createAgentPersistence({
       messages: { insert, insertWithAssets, replaceBlock },
-      chatRuns: {},
+      chatRuns: { insert: insertRun },
     } as never)
     const blocks = [{ type: 'text' as const, text: '带附件' }]
 
@@ -520,6 +530,26 @@ describe('AgentOrchestrator', () => {
       createdAt: 10,
     }, ['asset_1'])
     expect(insert).not.toHaveBeenCalled()
+
+    persistence.createRun({
+      runId: 'run_1',
+      conversationId: 'conversation_1',
+      requestId: 'request_1',
+      userId: 'user_1',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      startedAt: 10,
+    })
+    expect(insertRun).toHaveBeenCalledWith({
+      id: 'run_1',
+      conversationId: 'conversation_1',
+      requestId: 'request_1',
+      userId: 'user_1',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      status: 'running',
+      startedAt: 10,
+    })
 
     const pending = {
       type: 'media_generation' as const,

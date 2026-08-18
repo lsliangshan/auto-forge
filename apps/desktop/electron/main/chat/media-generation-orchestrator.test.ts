@@ -384,6 +384,8 @@ describe('MediaGenerationOrchestrator', () => {
       }),
       run: expect.objectContaining({
         requestId: 'request_1',
+        userId: 'user_1',
+        provider: 'openrouter',
         model: 'image-model',
       }),
       assistant: expect.objectContaining({
@@ -928,6 +930,8 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       expect(asset?.messageId).toBe('assistant_audio_real')
       expect(await readFile(join(mediaRoot, asset!.relativePath!))).toEqual(mp3)
       expect(database.chatRuns.get('run_audio_real')).toMatchObject({
+        userId: 'user_audio_real',
+        provider: 'openrouter',
         status: 'completed',
         generationId: 'generation_audio_real',
         inputTokens: 7,

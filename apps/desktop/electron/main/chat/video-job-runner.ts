@@ -309,6 +309,8 @@ export class VideoJobRunner {
           id: runId,
           conversationId: input.conversationId,
           requestId: input.requestId,
+          userId: input.userId,
+          provider: input.route.provider,
           model: input.route.model,
           status: 'running',
           startedAt: preparedAt,

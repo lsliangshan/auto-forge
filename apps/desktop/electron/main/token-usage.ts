@@ -6,7 +6,8 @@ import type {
   TokenUsageSnapshotRecord,
 } from './database/repositories.js'
 
-type Summarize = (input: TokenUsageQueryRecord) => TokenUsageSnapshotRecord
+type TokenUsagePeriodQuery = Omit<TokenUsageQueryRecord, 'userId'>
+type Summarize = (input: TokenUsagePeriodQuery) => TokenUsageSnapshotRecord
 
 const hourMs = 3_600_000
 const pad = (value: number) => String(value).padStart(2, '0')
@@ -113,7 +114,7 @@ export function createTokenUsageSnapshot(now: Date, summarize: Summarize): Token
   const mondayOffset = (today.getDay() + 6) % 7
   const week = new Date(today.getFullYear(), today.getMonth(), today.getDate() - mondayOffset)
   const month = new Date(today.getFullYear(), today.getMonth(), 1)
-  const query: TokenUsageQueryRecord = {
+  const query: TokenUsagePeriodQuery = {
     yesterdayStartedAt: yesterday.getTime(),
     todayStartedAt: today.getTime(),
     weekStartedAt: week.getTime(),
