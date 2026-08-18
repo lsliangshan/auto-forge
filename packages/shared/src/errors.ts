@@ -33,6 +33,7 @@ export const appErrorCodeSchema = z.enum([
   'MEDIA_GENERATION_FAILED',
   'MEDIA_DOWNLOAD_FAILED',
   'MEDIA_GENERATION_TIMEOUT',
+  'PROFILE_AVATAR_UPLOAD_FAILED',
   'NETWORK_PROXY_APPLY_FAILED',
 ])
 
@@ -78,6 +79,7 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   MEDIA_GENERATION_FAILED: 'The media generation failed.',
   MEDIA_DOWNLOAD_FAILED: 'The media download failed.',
   MEDIA_GENERATION_TIMEOUT: 'The media generation timed out.',
+  PROFILE_AVATAR_UPLOAD_FAILED: 'The profile avatar upload failed.',
   NETWORK_PROXY_APPLY_FAILED: 'The network proxy configuration could not be applied.',
 }
 

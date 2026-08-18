@@ -22,6 +22,8 @@ import {
   proxySettingsSchema,
   toSafeAppError,
   tokenUsageSnapshotSchema,
+  userProfileSchema,
+  userProfileUpdateSchema,
   workerMessageSchema,
 } from './index'
 
@@ -49,6 +51,41 @@ describe('cross-process contracts', () => {
     'keeps %s as a safe application error',
     (code) => expect(toSafeAppError({ code })).toMatchObject({ code }),
   )
+
+  it('validates normalized user profiles and rejects identity fields in updates', () => {
+    expect(userProfileSchema.parse({
+      userId: 'user_1',
+      account: 'Alice',
+      avatarUrl: 'https://cdn.example.com/profiles/user_1/avatar.webp',
+      displayName: 'Alice Zhang',
+      gender: 'prefer_not_to_say',
+      birthDate: '2000-02-29',
+      email: 'alice@example.com',
+      phone: '+8613800138000',
+      updatedAt: '2026-08-18T00:00:00.000Z',
+    })).toMatchObject({ userId: 'user_1', account: 'Alice' })
+
+    expect(userProfileUpdateSchema.safeParse({ account: 'Mallory' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ userId: 'user_2' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ displayName: 'A'.repeat(51) }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ avatarUrl: 'http://cdn.example.com/a.png' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ email: 'not-an-email' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ phone: '12345' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({
+      displayName: '', birthDate: '', email: '', phone: '',
+    }).success).toBe(true)
+    expect(userProfileUpdateSchema.safeParse({ phone: '+86 138-0013-8000' }).success).toBe(true)
+  })
+
+  it('maps the profile avatar upload failure without exposing provider details', () => {
+    expect(toSafeAppError({
+      code: 'PROFILE_AVATAR_UPLOAD_FAILED',
+      message: 'qiniu secret response',
+    })).toEqual({
+      code: 'PROFILE_AVATAR_UPLOAD_FAILED',
+      message: 'The profile avatar upload failed.',
+    })
+  })
 
   it('accepts only fixed model providers with independent defaults', () => {
     const settings = appSettingsSchema.parse({

@@ -46,6 +46,59 @@ export const authSessionSchema = z.object({
 }).strict()
 export type AuthSession = z.infer<typeof authSessionSchema>
 
+export const profileGenderSchema = z.enum(['male', 'female', 'other', 'prefer_not_to_say'])
+export type ProfileGender = z.infer<typeof profileGenderSchema>
+
+const canonicalHttpsUrlSchema = z.string().url().superRefine((value, context) => {
+  const parsed = new URL(value)
+  if (parsed.protocol !== 'https:'
+    || parsed.username !== ''
+    || parsed.password !== ''
+    || parsed.port !== ''
+    || parsed.hash !== ''
+    || parsed.href !== value) {
+    context.addIssue({ code: 'custom', message: 'A canonical HTTPS URL is required' })
+  }
+})
+
+const profileDisplayNameSchema = z.string().superRefine((value, context) => {
+  if (Array.from(value).length > 50) {
+    context.addIssue({ code: 'custom', message: 'Display name must contain at most 50 Unicode code points' })
+  }
+})
+const profileBirthDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
+const profileEmailSchema = z.string().email().max(254)
+const profilePhoneSchema = z.string().regex(/^\+?\d{6,20}$/)
+
+const normalizedProfileFieldsSchema = z.object({
+  avatarUrl: canonicalHttpsUrlSchema.optional(),
+  displayName: profileDisplayNameSchema.min(1).optional(),
+  gender: profileGenderSchema.optional(),
+  birthDate: profileBirthDateSchema.optional(),
+  email: profileEmailSchema.optional(),
+  phone: profilePhoneSchema.optional(),
+}).strict()
+
+export const userProfileUpdateSchema = z.object({
+  avatarUrl: canonicalHttpsUrlSchema.optional(),
+  displayName: profileDisplayNameSchema.optional(),
+  gender: profileGenderSchema.optional(),
+  birthDate: z.union([z.literal(''), profileBirthDateSchema]).optional(),
+  email: z.union([z.literal(''), z.string().trim().email().max(254)]).optional(),
+  phone: z.string().trim().regex(/^(?:$|\+?[0-9 -]{6,32})$/).optional(),
+}).strict()
+export type UserProfileUpdate = z.infer<typeof userProfileUpdateSchema>
+
+export const userProfileSchema = normalizedProfileFieldsSchema.extend({
+  userId: identifierSchema,
+  account: authAccountSchema,
+  updatedAt: timestampSchema.optional(),
+}).strict()
+export type UserProfile = z.infer<typeof userProfileSchema>
+
+export const profileAvatarUploadResultSchema = z.object({ url: canonicalHttpsUrlSchema }).strict()
+export type ProfileAvatarUploadResult = z.infer<typeof profileAvatarUploadResultSchema>
+
 export const outputTypeSchema = z.enum(['auto', 'text', 'image', 'audio', 'video'])
 export type OutputType = z.infer<typeof outputTypeSchema>
 
@@ -551,6 +604,9 @@ export const ipcChannels = {
   authLogin: 'auth:login',
   authRegister: 'auth:register',
   authLogout: 'auth:logout',
+  profileGet: 'profile:get',
+  profileUpdate: 'profile:update',
+  profilePickAndUploadAvatar: 'profile:pick-and-upload-avatar',
   chatListConversations: 'chat:list-conversations',
   chatListMessages: 'chat:list-messages',
   chatCreateConversation: 'chat:create-conversation',
@@ -673,6 +729,9 @@ export const ipcRequestSchemas = {
   [ipcChannels.authLogin]: authCredentialsSchema,
   [ipcChannels.authRegister]: authCredentialsSchema,
   [ipcChannels.authLogout]: z.undefined(),
+  [ipcChannels.profileGet]: z.undefined(),
+  [ipcChannels.profileUpdate]: userProfileUpdateSchema,
+  [ipcChannels.profilePickAndUploadAvatar]: z.undefined(),
   [ipcChannels.chatListConversations]: z.undefined(),
   [ipcChannels.chatListMessages]: listMessagesRequestSchema,
   [ipcChannels.chatCreateConversation]: createConversationRequestSchema,
@@ -730,6 +789,9 @@ export const ipcResponseSchemas = {
   [ipcChannels.authLogin]: authSessionSchema,
   [ipcChannels.authRegister]: authSessionSchema,
   [ipcChannels.authLogout]: voidResponseSchema,
+  [ipcChannels.profileGet]: userProfileSchema,
+  [ipcChannels.profileUpdate]: userProfileSchema,
+  [ipcChannels.profilePickAndUploadAvatar]: profileAvatarUploadResultSchema.nullable(),
   [ipcChannels.chatListConversations]: z.array(conversationSummarySchema),
   [ipcChannels.chatListMessages]: z.array(chatMessageSchema),
   [ipcChannels.chatCreateConversation]: conversationSummarySchema,
@@ -784,6 +846,11 @@ export interface DesktopAPI {
     login(input: AuthCredentials): Promise<AuthSession>
     register(input: AuthCredentials): Promise<AuthSession>
     logout(): Promise<void>
+  }
+  profile: {
+    get(): Promise<UserProfile>
+    update(input: UserProfileUpdate): Promise<UserProfile>
+    pickAndUploadAvatar(): Promise<ProfileAvatarUploadResult | null>
   }
   chat: {
     listConversations(): Promise<ConversationSummary[]>
