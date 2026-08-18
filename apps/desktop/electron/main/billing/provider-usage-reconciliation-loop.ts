@@ -28,7 +28,10 @@ class DefaultProviderUsageReconciliationLoop implements ProviderUsageReconciliat
   private firstFailure: unknown
   private hasFailure = false
 
-  constructor(private readonly reconciler: ProviderUsageReconciliationPort) {}
+  constructor(
+    private readonly reconciler: ProviderUsageReconciliationPort,
+    private readonly onBackgroundFailure?: (error: unknown) => void,
+  ) {}
 
   start(): void {
     if (this.started || this.stopped) return
@@ -117,6 +120,7 @@ class DefaultProviderUsageReconciliationLoop implements ProviderUsageReconciliat
         this.hasFailure = true
         this.firstFailure = error
       }
+      this.onBackgroundFailure?.(error)
     })
     return this.tail
   }
@@ -124,6 +128,7 @@ class DefaultProviderUsageReconciliationLoop implements ProviderUsageReconciliat
 
 export function createProviderUsageReconciliationLoop(
   reconciler: ProviderUsageReconciliationPort,
+  onBackgroundFailure?: (error: unknown) => void,
 ): ProviderUsageReconciliationLoop {
-  return new DefaultProviderUsageReconciliationLoop(reconciler)
+  return new DefaultProviderUsageReconciliationLoop(reconciler, onBackgroundFailure)
 }

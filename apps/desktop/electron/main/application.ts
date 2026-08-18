@@ -347,9 +347,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerUsage: database.providerUsage,
     providers: providerRegistry,
   })
-  const providerUsageReconciliationLoop = createProviderUsageReconciliationLoop(
-    providerUsageReconciler,
-  )
   const projects = new WorkflowProjectService(database, options.paths.installations)
   const registry = new WorkflowRegistry(database, projects)
   const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
@@ -450,6 +447,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
   const recordFailure = failureRecorder.record
+  const providerUsageReconciliationLoop = createProviderUsageReconciliationLoop(
+    providerUsageReconciler,
+    (error) => { recordFailure(error, 'reconciliation-stop') },
+  )
   const trackChatWork = (
     requestId: string,
     conversationId: string,

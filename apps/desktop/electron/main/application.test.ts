@@ -1206,6 +1206,44 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('closes admission immediately when background reconciliation finds a consistency failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-reconciliation-consistency-'))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    const videoStopError = new Error('later video cleanup failure')
+    vi.spyOn(ProviderUsageReconciler.prototype, 'reconcileDue').mockRejectedValue(consistencyError)
+    const videoStop = vi.spyOn(VideoJobRunner.prototype, 'stop').mockRejectedValue(videoStopError)
+    const databaseClose = vi.spyOn(Database.prototype, 'close')
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+        getGenerationUsage: async (generationId) => ({ generationId }),
+      } }),
+    }))
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    vi.useFakeTimers()
+    try {
+      const conversation = await runtime.services.chat.createConversation()
+      await runtime.services.chat.send(chatInput(conversation.id, 'trigger reconciliation'))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      await expect(runtime.services.chat.send(chatInput(conversation.id, 'must be rejected')))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      await expect(runtime.close()).rejects.toBe(consistencyError)
+      expect(videoStop).toHaveBeenCalledTimes(1)
+      expect(databaseClose).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('starts each finite reconciliation delay only after the previous slow round settles', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-serial-'))
     directories.push(root)

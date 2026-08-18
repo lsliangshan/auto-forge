@@ -15,7 +15,10 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-function createHarness(overrides: Partial<ProviderUsageReconciliationPort> = {}) {
+function createHarness(
+  overrides: Partial<ProviderUsageReconciliationPort> = {},
+  onBackgroundFailure = vi.fn<(error: unknown) => void>(),
+) {
   const reconciler: ProviderUsageReconciliationPort = {
     recoverInterrupted: vi.fn(async () => undefined),
     reconcileDue: vi.fn(async () => undefined),
@@ -23,7 +26,8 @@ function createHarness(overrides: Partial<ProviderUsageReconciliationPort> = {})
   }
   return {
     reconciler,
-    loop: createProviderUsageReconciliationLoop(reconciler),
+    onBackgroundFailure,
+    loop: createProviderUsageReconciliationLoop(reconciler, onBackgroundFailure),
   }
 }
 
@@ -154,6 +158,22 @@ describe('ProviderUsageReconciliationLoop', () => {
 
     expect(receivedSignal?.aborted).toBe(true)
     expect(reconcileDue).toHaveBeenCalledTimes(1)
+    expect(harness.onBackgroundFailure).not.toHaveBeenCalled()
+  })
+
+  it('reports an unexpected background failure immediately and still rethrows the same object on stop', async () => {
+    const failure = new ProviderUsageConsistencyError()
+    const harness = createHarness({
+      reconcileDue: vi.fn(async () => { throw failure }),
+    })
+
+    harness.loop.notifyUsageEnded()
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(harness.onBackgroundFailure).toHaveBeenCalledOnce()
+    expect(harness.onBackgroundFailure).toHaveBeenCalledWith(failure)
+    await expect(harness.loop.stop()).rejects.toBe(failure)
+    expect(harness.onBackgroundFailure).toHaveBeenCalledOnce()
   })
 
   it('waits for an in-flight tail that observes abort but settles later', async () => {
