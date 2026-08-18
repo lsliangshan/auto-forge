@@ -285,12 +285,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (refresh) modelCatalog.delete(provider)
     let catalog = modelCatalog.get(provider)
     if (!catalog) {
-      let current!: Promise<Awaited<ReturnType<ModelProvider['listModels']>>>
-      current = providerRegistry.get(provider).listModels().catch((error) => {
-        if (modelCatalog.get(provider) === current) modelCatalog.delete(provider)
+      const request = providerRegistry.get(provider).listModels()
+      catalog = request.catch((error) => {
+        if (modelCatalog.get(provider) === catalog) modelCatalog.delete(provider)
         throw error
       })
-      catalog = current
       modelCatalog.set(provider, catalog)
     }
     return catalog

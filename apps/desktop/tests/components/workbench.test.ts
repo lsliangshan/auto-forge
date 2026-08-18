@@ -619,7 +619,7 @@ describe('workbench', () => {
 
     expect(api.settings.update).toHaveBeenCalledWith({ activeProvider: 'deepseek' })
     expect(api.settings.validateProviderCredential).toHaveBeenLastCalledWith('deepseek')
-    expect(api.settings.listProviderModels).toHaveBeenLastCalledWith('deepseek')
+    expect(api.settings.listProviderModels).toHaveBeenLastCalledWith('deepseek', false)
     expect(store.credential?.provider).toBe('deepseek')
     expect(store.models.map(({ id }) => id)).toEqual(['deepseek-v4-flash'])
   })
