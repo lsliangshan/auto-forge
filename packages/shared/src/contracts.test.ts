@@ -495,14 +495,22 @@ describe('cross-process contracts', () => {
 
     expect(tokenUsageSnapshotSchema.parse(snapshot)).toEqual(snapshot)
     for (const invalidCost of ['01', '1.0', '1e-7', '-1', '', 1]) {
-      expect(() => tokenUsageSnapshotSchema.parse({
+      const invalidSnapshot = {
         ...snapshot,
         today: {
           ...snapshot.today,
           openRouterCostUsd: invalidCost,
           models: snapshot.today.models.map((model) => ({ ...model, openRouterCostUsd: invalidCost })),
         },
-      }), `invalid cost ${String(invalidCost)}`).toThrow()
+      }
+      expect(
+        () => tokenUsageSnapshotSchema.safeParse(invalidSnapshot),
+        `safeParse must not throw for invalid cost ${String(invalidCost)}`,
+      ).not.toThrow()
+      expect(
+        tokenUsageSnapshotSchema.safeParse(invalidSnapshot).success,
+        `invalid cost ${String(invalidCost)}`,
+      ).toBe(false)
     }
     for (const invalidCount of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
       expect(() => tokenUsageSnapshotSchema.parse({

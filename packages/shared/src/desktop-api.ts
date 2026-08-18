@@ -417,7 +417,8 @@ export const modelInfoSchema = z.object({
 export type ModelInfo = z.infer<typeof modelInfoSchema>
 
 const safeTokenCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
-const usdDecimalSchema = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/)
+const usdDecimalPattern = /^(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/
+const usdDecimalSchema = z.string().regex(usdDecimalPattern)
 const providerCostShape = {
   openRouterCostUsd: usdDecimalSchema,
   openRouterKnownCostCount: safeTokenCountSchema,
@@ -493,7 +494,9 @@ export const tokenUsagePeriodSchema = z.object({
     modelOutput += model.outputTokens
     modelKnownCosts += model.openRouterKnownCostCount
     modelUnknownCosts += model.openRouterUnknownCostCount
-    const [integer, fraction = ''] = model.openRouterCostUsd.split('.')
+    const modelCost = model.openRouterCostUsd
+    if (typeof modelCost !== 'string' || !usdDecimalPattern.test(modelCost)) continue
+    const [integer, fraction = ''] = modelCost.split('.')
     if (fraction.length > modelCostScale) {
       modelCostDigits *= 10n ** BigInt(fraction.length - modelCostScale)
       modelCostScale = fraction.length
