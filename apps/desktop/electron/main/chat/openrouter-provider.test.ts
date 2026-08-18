@@ -1095,9 +1095,15 @@ describe('OpenRouterProvider', () => {
       },
     })
     expect(models.find(({ id }) => id === 'openai/sora-2-pro')).toMatchObject({
-      inputModalities: ['text'],
+      inputModalities: ['text', 'image'],
       outputModalities: ['video'],
-      generation: { video: { supportsAudio: true } },
+      generation: {
+        video: {
+          supportsAudio: true,
+          frameImages: [],
+          maxReferenceImages: 1,
+        },
+      },
     })
     expect(models.find(({ id }) => id === 'alibaba/happyhorse-1.1')).toMatchObject({
       inputModalities: ['text', 'image'],

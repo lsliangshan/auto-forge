@@ -302,11 +302,19 @@ describe('cross-process contracts', () => {
           durations: [4, 8],
           supportsAudio: true,
           frameImages: ['first_frame', 'last_frame'],
+          maxReferenceImages: 1,
         },
       },
     })
 
     expect(video.generation.video?.frameImages).toEqual(['first_frame', 'last_frame'])
+    expect(video.generation.video?.maxReferenceImages).toBe(1)
+    expect(() => modelInfoSchema.parse({
+      ...video,
+      generation: {
+        video: { ...video.generation.video!, maxReferenceImages: 0 },
+      },
+    })).toThrow()
     expect(() => modelInfoSchema.parse({ ...model, supportsTools: undefined })).toThrow()
   })
 

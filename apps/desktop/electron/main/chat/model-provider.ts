@@ -591,6 +591,10 @@ export function parseOpenRouterImageModels(value: unknown): ModelInfo[] {
   return [...byId.values()].sort((left, right) => compareStrings(left.id, right.id))
 }
 
+const OPENROUTER_VIDEO_REFERENCE_IMAGE_LIMITS = new Map<string, number>([
+  ['openai/sora-2-pro', 1],
+])
+
 export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
   const parsed = modelResponseSchema.parse(value)
   const byId = new Map<string, ModelInfo>()
@@ -599,10 +603,12 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
     if (!result.success) continue
     const model = result.data
     const frameImages = videoFrameTypes(model.supported_frame_images ?? undefined)
+    const maxReferenceImages = OPENROUTER_VIDEO_REFERENCE_IMAGE_LIMITS.get(model.id)
+    const supportsImageInput = frameImages.length > 0 || maxReferenceImages !== undefined
     const candidate: ModelInfo = {
       id: model.id,
       name: model.name,
-      inputModalities: frameImages.length ? ['text', 'image'] : ['text'],
+      inputModalities: supportsImageInput ? ['text', 'image'] : ['text'],
       outputModalities: ['video'],
       supportsTools: false,
       generation: {
@@ -612,6 +618,7 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
           durations: sortedUniquePositiveIntegers(model.supported_durations),
           supportsAudio: model.generate_audio === true,
           frameImages,
+          ...(maxReferenceImages === undefined ? {} : { maxReferenceImages }),
         },
       },
     }
@@ -622,6 +629,10 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
     }
     const existingVideo = existing.generation.video!
     const candidateVideo = candidate.generation.video!
+    const mergedMaxReferenceImages = Math.max(
+      existingVideo.maxReferenceImages ?? 0,
+      candidateVideo.maxReferenceImages ?? 0,
+    )
     byId.set(model.id, {
       ...existing,
       name: compareStrings(existing.name, candidate.name) <= 0 ? existing.name : candidate.name,
@@ -634,6 +645,9 @@ export function parseOpenRouterVideoModels(value: unknown): ModelInfo[] {
           durations: sortedUniquePositiveIntegers([...existingVideo.durations, ...candidateVideo.durations]),
           supportsAudio: existingVideo.supportsAudio || candidateVideo.supportsAudio,
           frameImages: videoFrameTypes([...existingVideo.frameImages, ...candidateVideo.frameImages]),
+          ...(mergedMaxReferenceImages === 0
+            ? {}
+            : { maxReferenceImages: mergedMaxReferenceImages }),
         },
       },
     })

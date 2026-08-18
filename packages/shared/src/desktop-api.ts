@@ -410,6 +410,7 @@ export const modelInfoSchema = z.object({
       durations: z.array(z.number().int().positive()),
       supportsAudio: z.boolean(),
       frameImages: z.array(videoFrameTypeSchema),
+      maxReferenceImages: z.number().int().positive().optional(),
     }).strict().optional(),
   }).strict(),
 }).strict()
