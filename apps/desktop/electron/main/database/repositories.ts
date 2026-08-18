@@ -8,7 +8,9 @@ import {
   type ChatBlock,
   type ConversationGenerationPreferences,
   type MediaKind,
+  type ModelProviderId,
 } from '@autoforge/shared'
+import { addUsd, normalizeUsd } from '../billing/decimal-usd.js'
 import { redact } from '../security/redaction.js'
 
 export interface Conversation {
@@ -55,6 +57,90 @@ export interface ChatRun {
   errorCode?: string
   startedAt: number
   endedAt?: number
+}
+
+export type ProviderUsageStatus = 'pending' | 'reported' | 'unknown'
+export type ProviderUsageModality = 'text' | 'image' | 'audio' | 'video'
+
+export interface ProviderUsageStart {
+  id: string
+  operationKey: string
+  userId: string
+  provider: ModelProviderId
+  apiKeyFingerprint?: string
+  requestId: string
+  chatRunId?: string
+  model: string
+  modality: ProviderUsageModality
+  startedAt: number
+}
+
+export interface ProviderUsageIdentity {
+  generationId?: string
+  providerJobId?: string
+}
+
+export interface ProviderUsageReport extends ProviderUsageIdentity {
+  inputTokens?: number
+  outputTokens?: number
+  costUsd: string | number
+  endedAt: number
+}
+
+export interface ProviderUsageQueryRecord {
+  userId: string
+  yesterdayStartedAt: number
+  todayStartedAt: number
+  weekStartedAt: number
+  monthStartedAt: number
+  endedAt: number
+}
+
+export interface ProviderUsageEvent extends ProviderUsageStart {
+  generationId?: string
+  providerJobId?: string
+  status: ProviderUsageStatus
+  inputTokens?: number
+  outputTokens?: number
+  costUsd?: string
+  reconcileAttempts: number
+  nextReconcileAt?: number
+  endedAt?: number
+}
+
+export interface ProviderCostModelRecord {
+  provider: ModelProviderId
+  model: string
+  openRouterCostUsd: string
+  openRouterKnownCostCount: number
+  openRouterUnknownCostCount: number
+}
+
+export interface ProviderCostPeriodRecord {
+  openRouterCostUsd: string
+  openRouterKnownCostCount: number
+  openRouterUnknownCostCount: number
+  models: ProviderCostModelRecord[]
+}
+
+export interface ProviderCostSnapshotRecord {
+  allTimeStartedAt?: number
+  today: ProviderCostPeriodRecord
+  yesterday: ProviderCostPeriodRecord
+  week: ProviderCostPeriodRecord
+  month: ProviderCostPeriodRecord
+  allTime: ProviderCostPeriodRecord
+}
+
+export interface ProviderUsageRepository {
+  start(event: ProviderUsageStart): ProviderUsageEvent
+  bindIdentity(operationKey: string, identity: ProviderUsageIdentity): ProviderUsageEvent
+  report(operationKey: string, report: ProviderUsageReport): ProviderUsageEvent
+  markUnknown(operationKey: string, endedAt: number): ProviderUsageEvent
+  recoverPending(now: number): number
+  listReconcilable(now: number): ProviderUsageEvent[]
+  recordReconcileFailure(operationKey: string, nextReconcileAt?: number): ProviderUsageEvent
+  summarize(input: ProviderUsageQueryRecord): ProviderCostSnapshotRecord
 }
 
 export interface ModelTokenUsageRecord {
@@ -451,6 +537,7 @@ export interface AppRepositories {
       value: Pick<ChatRun, 'status' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode'>> & { blocks: unknown[] },
     ): ChatRun
   }
+  providerUsage: ProviderUsageRepository
   workflowProjects: { insert(value: WorkflowProject): WorkflowProject; get(id: string): WorkflowProject | undefined; list(): WorkflowProject[]; update(id: string, value: Partial<Omit<WorkflowProject, 'id' | 'createdAt'>>): WorkflowProject | undefined }
   installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void; delete(workflowId: string, version: string): void }
   workflowFiles: { insert(value: WorkflowFile): WorkflowFile; list(workflowId: string, workflowVersion: string): WorkflowFile[] }
@@ -474,6 +561,7 @@ const conversationContextColumns = 'conversation_id AS conversationId, summary_t
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
 const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
 const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt'
+const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS userId, provider, api_key_fingerprint AS apiKeyFingerprint, request_id AS requestId, chat_run_id AS chatRunId, generation_id AS generationId, provider_job_id AS providerJobId, model, modality, status, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, reconcile_attempts AS reconcileAttempts, next_reconcile_at AS nextReconcileAt, started_at AS startedAt, ended_at AS endedAt'
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
@@ -495,6 +583,96 @@ function safeTokenCount(value: unknown): number {
     throw new Error('Token usage exceeded the supported range')
   }
   return value
+}
+
+function providerUsageConsistencyError(): Error {
+  return new Error('Provider usage consistency error')
+}
+
+function providerUsageFromRow(row: Query): ProviderUsageEvent {
+  return {
+    id: row.id as string,
+    operationKey: row.operationKey as string,
+    userId: row.userId as string,
+    provider: row.provider as ModelProviderId,
+    apiKeyFingerprint: row.apiKeyFingerprint === null ? undefined : row.apiKeyFingerprint as string,
+    requestId: row.requestId as string,
+    chatRunId: row.chatRunId === null ? undefined : row.chatRunId as string,
+    generationId: row.generationId === null ? undefined : row.generationId as string,
+    providerJobId: row.providerJobId === null ? undefined : row.providerJobId as string,
+    model: row.model as string,
+    modality: row.modality as ProviderUsageModality,
+    status: row.status as ProviderUsageStatus,
+    inputTokens: row.inputTokens === null ? undefined : row.inputTokens as number,
+    outputTokens: row.outputTokens === null ? undefined : row.outputTokens as number,
+    costUsd: row.costUsd === null ? undefined : row.costUsd as string,
+    reconcileAttempts: row.reconcileAttempts as number,
+    nextReconcileAt: row.nextReconcileAt === null ? undefined : row.nextReconcileAt as number,
+    startedAt: row.startedAt as number,
+    endedAt: row.endedAt === null ? undefined : row.endedAt as number,
+  }
+}
+
+function getProviderUsage(database: SqliteDatabase, operationKey: string): ProviderUsageEvent {
+  const row = one<Query>(database, `
+    SELECT ${providerUsageColumns}
+    FROM provider_usage_events
+    WHERE operation_key = @operationKey
+  `, { operationKey })
+  if (!row) throw providerUsageConsistencyError()
+  return providerUsageFromRow(row)
+}
+
+function sameProviderUsageStart(stored: ProviderUsageEvent, input: ProviderUsageStart): boolean {
+  return stored.id === input.id
+    && stored.operationKey === input.operationKey
+    && stored.userId === input.userId
+    && stored.provider === input.provider
+    && stored.apiKeyFingerprint === input.apiKeyFingerprint
+    && stored.requestId === input.requestId
+    && stored.chatRunId === input.chatRunId
+    && stored.model === input.model
+    && stored.modality === input.modality
+    && stored.startedAt === input.startedAt
+}
+
+interface ProviderCostRow {
+  provider: ModelProviderId
+  model: string
+  status: ProviderUsageStatus
+  costUsd: string | null
+  startedAt: number
+}
+
+function summarizeProviderCostPeriod(
+  rows: ProviderCostRow[],
+  startedAt: number,
+  endedAt: number,
+): ProviderCostPeriodRecord {
+  const periodRows = rows.filter((row) => row.startedAt >= startedAt && row.startedAt < endedAt)
+  const groups = new Map<string, ProviderCostRow[]>()
+  for (const row of periodRows) {
+    const key = `${row.provider}\0${row.model}`
+    const group = groups.get(key)
+    if (group) group.push(row)
+    else groups.set(key, [row])
+  }
+  const summarizeRows = (values: ProviderCostRow[]) => ({
+    openRouterCostUsd: addUsd(values.flatMap((row) => row.status === 'reported' && row.costUsd !== null ? [row.costUsd] : [])),
+    openRouterKnownCostCount: values.filter((row) => row.status === 'reported').length,
+    openRouterUnknownCostCount: values.filter((row) => row.status !== 'reported').length,
+  })
+  const models = Array.from(groups.values(), (values): ProviderCostModelRecord => ({
+    provider: values[0].provider,
+    model: values[0].model,
+    ...summarizeRows(values),
+  })).sort((left, right) => (
+    left.provider < right.provider ? -1
+      : left.provider > right.provider ? 1
+        : left.model < right.model ? -1
+          : left.model > right.model ? 1 : 0
+  ))
+  return { ...summarizeRows(periodRows), models }
 }
 
 function trendBucketSql(granularity: TokenUsageGranularityRecord): string {
@@ -1720,6 +1898,211 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const stored = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
           if (!stored) throw new Error('Chat run not found')
           return stored
+        })
+      },
+    },
+    providerUsage: {
+      start(event) {
+        return transaction(database, () => {
+          database.prepare(`
+            INSERT INTO provider_usage_events (
+              id, operation_key, user_id, provider, api_key_fingerprint, request_id,
+              chat_run_id, model, modality, status, started_at
+            ) VALUES (
+              @id, @operationKey, @userId, @provider, @apiKeyFingerprint, @requestId,
+              @chatRunId, @model, @modality, 'pending', @startedAt
+            )
+            ON CONFLICT(operation_key) DO NOTHING
+          `).run({
+            ...event,
+            apiKeyFingerprint: event.apiKeyFingerprint ?? null,
+            chatRunId: event.chatRunId ?? null,
+          })
+          const stored = getProviderUsage(database, event.operationKey)
+          if (!sameProviderUsageStart(stored, event)) throw providerUsageConsistencyError()
+          return stored
+        })
+      },
+      bindIdentity(operationKey, identity) {
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (
+            identity.generationId !== undefined
+            && stored.generationId !== undefined
+            && stored.generationId !== identity.generationId
+          ) throw providerUsageConsistencyError()
+          if (
+            identity.providerJobId !== undefined
+            && stored.providerJobId !== undefined
+            && stored.providerJobId !== identity.providerJobId
+          ) throw providerUsageConsistencyError()
+          if (identity.generationId !== undefined && stored.generationId === undefined) {
+            const owner = one<{ operationKey: string }>(database, `
+              SELECT operation_key AS operationKey
+              FROM provider_usage_events
+              WHERE generation_id = @generationId
+            `, { generationId: identity.generationId })
+            if (owner && owner.operationKey !== operationKey) throw providerUsageConsistencyError()
+          }
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET generation_id = @generationId, provider_job_id = @providerJobId
+            WHERE operation_key = @operationKey
+          `).run({
+            operationKey,
+            generationId: identity.generationId ?? stored.generationId ?? null,
+            providerJobId: identity.providerJobId ?? stored.providerJobId ?? null,
+          })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      report(operationKey, report) {
+        const costUsd = normalizeUsd(report.costUsd)
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (stored.status === 'reported') {
+            if (
+              stored.generationId !== report.generationId
+              || stored.providerJobId !== report.providerJobId
+              || stored.inputTokens !== report.inputTokens
+              || stored.outputTokens !== report.outputTokens
+              || stored.costUsd !== costUsd
+              || stored.endedAt !== report.endedAt
+            ) throw providerUsageConsistencyError()
+            return stored
+          }
+          if (
+            report.generationId !== undefined
+            && stored.generationId !== undefined
+            && stored.generationId !== report.generationId
+          ) throw providerUsageConsistencyError()
+          if (
+            report.providerJobId !== undefined
+            && stored.providerJobId !== undefined
+            && stored.providerJobId !== report.providerJobId
+          ) throw providerUsageConsistencyError()
+          if (report.generationId !== undefined && stored.generationId === undefined) {
+            const owner = one<{ operationKey: string }>(database, `
+              SELECT operation_key AS operationKey
+              FROM provider_usage_events
+              WHERE generation_id = @generationId
+            `, { generationId: report.generationId })
+            if (owner && owner.operationKey !== operationKey) throw providerUsageConsistencyError()
+          }
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET generation_id = @generationId,
+                provider_job_id = @providerJobId,
+                status = 'reported',
+                input_tokens = @inputTokens,
+                output_tokens = @outputTokens,
+                cost_usd = @costUsd,
+                next_reconcile_at = NULL,
+                ended_at = @endedAt
+            WHERE operation_key = @operationKey
+          `).run({
+            operationKey,
+            generationId: report.generationId ?? stored.generationId ?? null,
+            providerJobId: report.providerJobId ?? stored.providerJobId ?? null,
+            inputTokens: report.inputTokens ?? null,
+            outputTokens: report.outputTokens ?? null,
+            costUsd,
+            endedAt: report.endedAt,
+          })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      markUnknown(operationKey, endedAt) {
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (stored.status === 'reported') return stored
+          if (stored.status === 'unknown') {
+            if (stored.endedAt !== endedAt) throw providerUsageConsistencyError()
+            return stored
+          }
+          const terminalAt = stored.endedAt ?? endedAt
+          const nextReconcileAt = stored.provider === 'openrouter' && stored.generationId !== undefined
+            ? terminalAt + 1_000
+            : null
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET status = 'unknown', ended_at = @endedAt, next_reconcile_at = @nextReconcileAt
+            WHERE operation_key = @operationKey AND status = 'pending'
+          `).run({ operationKey, endedAt: terminalAt, nextReconcileAt })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      recoverPending(recoveredAt) {
+        return transaction(database, () => database.prepare(`
+          UPDATE provider_usage_events
+          SET status = 'unknown',
+              ended_at = COALESCE(ended_at, @recoveredAt),
+              next_reconcile_at = CASE
+                WHEN provider = 'openrouter' AND generation_id IS NOT NULL THEN @nextReconcileAt
+                ELSE NULL
+              END
+          WHERE status = 'pending'
+        `).run({ recoveredAt, nextReconcileAt: recoveredAt + 1_000 }).changes)
+      },
+      listReconcilable(reconcileAt) {
+        return many<Query>(database, `
+          SELECT ${providerUsageColumns}
+          FROM provider_usage_events
+          WHERE provider = 'openrouter'
+            AND status = 'unknown'
+            AND generation_id IS NOT NULL
+            AND reconcile_attempts < 3
+            AND next_reconcile_at IS NOT NULL
+            AND next_reconcile_at <= @reconcileAt
+          ORDER BY next_reconcile_at, started_at, id
+        `, { reconcileAt }).map(providerUsageFromRow)
+      },
+      recordReconcileFailure(operationKey, nextReconcileAt) {
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (stored.status !== 'unknown') throw providerUsageConsistencyError()
+          const reconcileAttempts = stored.reconcileAttempts + 1
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET reconcile_attempts = @reconcileAttempts,
+                next_reconcile_at = @nextReconcileAt
+            WHERE operation_key = @operationKey AND status = 'unknown'
+          `).run({
+            operationKey,
+            reconcileAttempts,
+            nextReconcileAt: reconcileAttempts >= 3 ? null : nextReconcileAt ?? null,
+          })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      summarize(input) {
+        const query = {
+          userId: input.userId,
+          yesterdayStartedAt: safeTokenCount(input.yesterdayStartedAt),
+          todayStartedAt: safeTokenCount(input.todayStartedAt),
+          weekStartedAt: safeTokenCount(input.weekStartedAt),
+          monthStartedAt: safeTokenCount(input.monthStartedAt),
+          endedAt: safeTokenCount(input.endedAt),
+        }
+        return transaction(database, (): ProviderCostSnapshotRecord => {
+          const rows = many<ProviderCostRow>(database, `
+            SELECT provider, model, status, cost_usd AS costUsd, started_at AS startedAt
+            FROM provider_usage_events
+            WHERE user_id = @userId
+              AND provider = 'openrouter'
+              AND started_at < @endedAt
+            ORDER BY started_at, id
+          `, { userId: query.userId, endedAt: query.endedAt })
+          const allTimeStartedAt = rows[0]?.startedAt
+          const allTimeStart = allTimeStartedAt ?? query.endedAt
+          return {
+            ...(allTimeStartedAt === undefined ? {} : { allTimeStartedAt }),
+            today: summarizeProviderCostPeriod(rows, query.todayStartedAt, query.endedAt),
+            yesterday: summarizeProviderCostPeriod(rows, query.yesterdayStartedAt, query.todayStartedAt),
+            week: summarizeProviderCostPeriod(rows, query.weekStartedAt, query.endedAt),
+            month: summarizeProviderCostPeriod(rows, query.monthStartedAt, query.endedAt),
+            allTime: summarizeProviderCostPeriod(rows, allTimeStart, query.endedAt),
+          }
         })
       },
     },
