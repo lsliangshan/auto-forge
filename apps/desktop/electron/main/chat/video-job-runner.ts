@@ -14,6 +14,7 @@ import {
   type AppRepositories,
   type MediaGenerationJob,
   type MediaGenerationJobStatus,
+  type ProviderUsageRepository,
   type VideoGenerationSubmissionIntentInput,
   type VideoGenerationTransition,
 } from '../database/repositories.js'
@@ -32,7 +33,12 @@ const ACTIVE_STATUSES: MediaGenerationJobStatus[] = [
   'downloading',
 ]
 
-export interface SubmitVideoInput {
+interface UsageAttribution {
+  userId: string
+  apiKeyFingerprint?: string
+}
+
+export interface SubmitVideoInput extends UsageAttribution {
   requestId: string
   conversationId: string
   prompt: string
@@ -53,6 +59,7 @@ export interface VideoJobRunnerDependencies {
     AppRepositories,
     'conversations' | 'mediaGenerationJobs' | 'mediaAssets' | 'messages' | 'chatRuns'
   >
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   providers: VideoJobProviderRegistryPort
   media: Pick<
     MediaAssetService,
@@ -247,6 +254,12 @@ export class VideoJobRunner {
   }
 
   private async submitInternal(input: SubmitVideoInput): Promise<SubmittedVideoJob> {
+    const usageAttribution = {
+      userId: input.userId,
+      ...(input.apiKeyFingerprint === undefined
+        ? {}
+        : { apiKeyFingerprint: input.apiKeyFingerprint }),
+    }
     this.assertSubmit(input)
     if (
       this.stopped
@@ -259,6 +272,8 @@ export class VideoJobRunner {
 
     let controller: AbortController | undefined
     let intent: MediaGenerationJob | undefined
+    let usageStarted = false
+    let usageContinues = false
     try {
       const preparedAt = this.now()
       const userMessageId = this.id()
@@ -329,6 +344,21 @@ export class VideoJobRunner {
           asset.assetId !== input.assetIds[index] || asset.kind !== 'image'
         ))
       ) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+      const operationKey = `video:${input.requestId}`
+      if (input.route.provider === 'openrouter') {
+        this.dependencies.providerUsage.start({
+          id: this.id(),
+          operationKey,
+          ...usageAttribution,
+          provider: input.route.provider,
+          requestId: input.requestId,
+          chatRunId: runId,
+          model: input.route.model,
+          modality: 'video',
+          startedAt: this.now(),
+        })
+        usageStarted = true
+      }
       const submitted = await provider.submitVideo({
         model: input.route.model,
         prompt: input.prompt,
@@ -347,6 +377,11 @@ export class VideoJobRunner {
           ? toSafeAppError({ code: 'CANCELLED' })
           : toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
       }
+      if (input.route.provider === 'openrouter') {
+        this.dependencies.providerUsage.bindIdentity(operationKey, {
+          providerJobId: submitted.providerJobId,
+        })
+      }
 
       const createdAt = this.now()
       const block: Extract<ChatBlock, { type: 'media_generation' }> = {
@@ -364,6 +399,7 @@ export class VideoJobRunner {
         },
       )
       if (!bound) throw toSafeAppError({ code: 'CONFLICT' })
+      usageContinues = true
       const { job } = bound
       this.safeEmit({
         type: 'block_update',
@@ -385,6 +421,9 @@ export class VideoJobRunner {
         status: submitted.status,
       }
     } catch (error) {
+      if (usageStarted && !usageContinues) {
+        this.dependencies.providerUsage.markUnknown(`video:${input.requestId}`, this.now())
+      }
       const safe = (
         this.stopped
         || controller?.signal.aborted
@@ -545,6 +584,9 @@ export class VideoJobRunner {
     }
     const deadline = job.createdAt + VIDEO_TIMEOUT_MS
     if (this.now() >= deadline) {
+      if (job.provider === 'openrouter' && job.status !== 'downloading') {
+        this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
+      }
       this.fail(job, 'MEDIA_GENERATION_TIMEOUT')
       return
     }
@@ -572,16 +614,46 @@ export class VideoJobRunner {
       this.fail(job, 'MEDIA_GENERATION_FAILED')
       return
     }
-    const provider = this.provider(modelProviderIdSchema.parse(job.provider))
-    if (!provider.pollVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
-    const result = await provider.pollVideo(job.providerJobId, signal)
+    let result: Awaited<ReturnType<NonNullable<ModelProvider['pollVideo']>>>
+    try {
+      const provider = this.provider(modelProviderIdSchema.parse(job.provider))
+      if (!provider.pollVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+      result = await provider.pollVideo(job.providerJobId, signal)
+    } catch (error) {
+      if (job.provider === 'openrouter') {
+        this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
+      }
+      throw error
+    }
     if (this.stopped || signal.aborted) return
     const attempts = (job.pollAttempts ?? 0) + 1
     if (result.status === 'failed') {
+      if (job.provider === 'openrouter') {
+        this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
+      }
       this.fail(job, appErrorCodeSchema.parse(result.errorCode))
       return
     }
     if (result.status === 'completed') {
+      if (job.provider === 'openrouter') {
+        const operationKey = `video:${job.id}`
+        if (result.generationId !== undefined) {
+          this.dependencies.providerUsage.bindIdentity(operationKey, {
+            generationId: result.generationId,
+          })
+        }
+        if (result.costUsd === undefined) {
+          this.dependencies.providerUsage.markUnknown(operationKey, this.now())
+        } else {
+          this.dependencies.providerUsage.report(operationKey, {
+            ...(result.generationId === undefined
+              ? {}
+              : { generationId: result.generationId }),
+            costUsd: result.costUsd,
+            endedAt: this.now(),
+          })
+        }
+      }
       let current = job
       if (current.status === 'pending') {
         const progress = this.dependencies.database.mediaGenerationJobs.transition(

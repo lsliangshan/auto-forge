@@ -15,6 +15,7 @@ import {
   type AgentPersistencePort,
 } from '../agent/agent-orchestrator.js'
 import { openAppDatabase } from '../database/client.js'
+import type { ProviderUsageRepository } from '../database/repositories.js'
 import type {
   GeneratedAssetWriter,
   MediaAssetService,
@@ -131,14 +132,35 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
         usage: { inputTokens: 2, outputTokens: 3, costUsd: '0.01' },
       }
     })
-  const stream = vi.fn<ModelProvider['stream']>(() => streamEvents([
+  const stream = vi.fn<ModelProvider['stream']>(() => {
+    calls.push('provider.stream')
+    return streamEvents([
       { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AQI=', transcript: '你' },
       { type: 'audio_delta', choiceIndex: 0, dataBase64: 'AwQ=', transcript: '好' },
       { type: 'generation', id: 'generation_audio' },
       { type: 'usage', inputTokens: 5, outputTokens: 6, totalTokens: 11, costUsd: '0.02' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ]))
+    ])
+  })
   const provider = { generateImage, stream }
+  const providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'> = {
+    start: vi.fn((event) => {
+      calls.push('providerUsage.start')
+      return event as never
+    }),
+    bindIdentity: vi.fn((_operationKey, identity) => {
+      calls.push('providerUsage.bindIdentity')
+      return identity as never
+    }),
+    report: vi.fn((_operationKey, report) => {
+      calls.push('providerUsage.report')
+      return report as never
+    }),
+    markUnknown: vi.fn((operationKey) => {
+      calls.push('providerUsage.markUnknown')
+      return operationKey as never
+    }),
+  }
   const dependencies: MediaGenerationOrchestratorDependencies = {
     providers: { get: vi.fn(() => provider) },
     persistence,
@@ -150,6 +172,7 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
       }),
     },
     emit: (event) => { events.push(event) },
+    providerUsage,
     id: (() => {
       const ids = ['user_message', 'run', 'assistant_message', 'generation_block']
       return () => ids.shift() ?? 'unexpected_id'
@@ -165,11 +188,14 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     media,
     persistence,
     provider,
+    providerUsage,
     writer,
   }
 }
 
 const input = {
+  userId: 'user_1',
+  apiKeyFingerprint: 'fingerprint_1',
   requestId: 'request_1',
   conversationId: 'conversation_1',
   prompt: 'paint a harbor',
@@ -178,6 +204,112 @@ const input = {
 }
 
 describe('MediaGenerationOrchestrator', () => {
+  it('reports image cost before local asset persistence and keeps it when persistence fails', async () => {
+    const harness = createHarness()
+    vi.mocked(harness.media.commitGeneratedBase64).mockImplementation(async () => {
+      harness.calls.push('local.image.commit')
+      throw Object.assign(new Error('disk full'), { code: 'MEDIA_STORAGE_FULL' })
+    })
+
+    const result = await new MediaGenerationOrchestrator(harness.dependencies)
+      .runImage({ ...input, route: imageRoute })
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'MEDIA_STORAGE_FULL' } })
+    expect(harness.calls.indexOf('providerUsage.start')).toBeLessThan(
+      harness.calls.indexOf('generateImage'),
+    )
+    expect(harness.calls.indexOf('providerUsage.report')).toBeLessThan(
+      harness.calls.indexOf('local.image.commit'),
+    )
+    expect(harness.providerUsage.start).toHaveBeenCalledWith(expect.objectContaining({
+      id: expect.any(String),
+      operationKey: 'image:request_1',
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
+      provider: 'openrouter',
+      requestId: 'request_1',
+      chatRunId: 'run',
+      model: 'image-model',
+      modality: 'image',
+      startedAt: 100,
+    }))
+    expect(harness.providerUsage.report).toHaveBeenCalledWith('image:request_1', {
+      inputTokens: 2,
+      outputTokens: 3,
+      costUsd: '0.01',
+      endedAt: 100,
+    })
+    expect(harness.providerUsage.markUnknown).not.toHaveBeenCalled()
+    const request = harness.provider.generateImage.mock.calls[0]?.[0] as unknown as Record<string, unknown>
+    expect(request).not.toHaveProperty('endUserId')
+  })
+
+  it('reports chat audio cost before local commit and sends only the supported end-user field', async () => {
+    const harness = createHarness()
+    vi.mocked(harness.writer.commit).mockImplementation(async () => {
+      harness.calls.push('local.audio.commit')
+      throw Object.assign(new Error('disk full'), { code: 'MEDIA_STORAGE_FULL' })
+    })
+
+    const result = await new MediaGenerationOrchestrator(harness.dependencies)
+      .runAudio({ ...input, route: audioRoute })
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'MEDIA_STORAGE_FULL' } })
+    expect(harness.calls.indexOf('providerUsage.start')).toBeLessThan(
+      harness.calls.indexOf('provider.stream'),
+    )
+    expect(harness.calls.indexOf('providerUsage.bindIdentity')).toBeLessThan(
+      harness.calls.indexOf('providerUsage.report'),
+    )
+    expect(harness.calls.indexOf('providerUsage.report')).toBeLessThan(
+      harness.calls.indexOf('local.audio.commit'),
+    )
+    expect(harness.providerUsage.start).toHaveBeenCalledWith(expect.objectContaining({
+      operationKey: 'audio:request_1',
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
+      provider: 'openrouter',
+      requestId: 'request_1',
+      chatRunId: 'run',
+      model: 'audio-model',
+      modality: 'audio',
+      startedAt: 100,
+    }))
+    expect(harness.providerUsage.bindIdentity).toHaveBeenCalledWith(
+      'audio:request_1',
+      { generationId: 'generation_audio' },
+    )
+    expect(harness.providerUsage.report).toHaveBeenCalledWith('audio:request_1', {
+      generationId: 'generation_audio',
+      inputTokens: 5,
+      outputTokens: 6,
+      costUsd: '0.02',
+      endedAt: 100,
+    })
+    expect(harness.provider.stream).toHaveBeenCalledWith(expect.objectContaining({
+      endUserId: 'user_1',
+    }))
+    expect(harness.providerUsage.markUnknown).not.toHaveBeenCalled()
+  })
+
+  it('binds costless chat audio generation identity before marking the event unknown', async () => {
+    const harness = createHarness()
+    harness.provider.stream.mockImplementation(() => streamEvents([
+      { type: 'generation', id: 'generation_costless' },
+      { type: 'usage', inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]))
+
+    await new MediaGenerationOrchestrator(harness.dependencies)
+      .runAudio({ ...input, route: audioRoute })
+
+    expect(harness.providerUsage.bindIdentity).toHaveBeenCalledWith(
+      'audio:request_1',
+      { generationId: 'generation_costless' },
+    )
+    expect(harness.providerUsage.markUnknown).toHaveBeenCalledWith('audio:request_1', 100)
+    expect(harness.providerUsage.report).not.toHaveBeenCalled()
+  })
   it('persists the user and stable pending block before generating and atomically claims a Base64 image', async () => {
     const harness = createHarness()
     const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
@@ -591,6 +723,8 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
         ? orchestrator.runImage.bind(orchestrator)
         : orchestrator.runAudio.bind(orchestrator)
       const result = await run({
+        userId: 'user_atomic',
+        apiKeyFingerprint: 'fingerprint_atomic',
         requestId: 'request_atomic',
         conversationId: 'conversation_atomic',
         prompt: 'paint atomically',
@@ -666,6 +800,14 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
     const first = mp3.subarray(0, 11).toString('base64')
     const second = mp3.subarray(11).toString('base64')
     try {
+      database.localAuth.createUserAndSession({
+        id: 'user_audio_real',
+        account: 'Audio User',
+        accountNormalized: 'audio user',
+        passwordDigest: 'digest-audio-user',
+        createdAt: 1,
+        updatedAt: 1,
+      }, 1)
       database.conversations.insert({ id: 'conversation_audio_real', title: 'Audio real' })
       const media = createMediaAssetService({
         database,
@@ -692,6 +834,7 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
         persistence: createAgentPersistence(database),
         media,
         downloader: { download: vi.fn() },
+        providerUsage: database.providerUsage,
         emit: () => undefined,
         id: (() => {
           const ids = ['user_audio_real', 'run_audio_real', 'assistant_audio_real', 'block_audio_real']
@@ -701,6 +844,8 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       })
 
       await expect(orchestrator.runAudio({
+        userId: 'user_audio_real',
+        apiKeyFingerprint: 'fingerprint_audio_real',
         requestId: 'request_audio_real',
         conversationId: 'conversation_audio_real',
         prompt: 'say hello',

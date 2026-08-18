@@ -52,6 +52,8 @@ const route: ResolvedChatRoute & { outputType: 'video' } = {
 }
 
 const submitInput = {
+  userId: 'user_1',
+  apiKeyFingerprint: 'fingerprint_1',
   requestId: 'request_video_1',
   conversationId: 'conversation_video_1',
   prompt: 'make a short harbor video',
@@ -69,6 +71,14 @@ function createDatabase(databasePath?: string) {
     return join(directory, 'autoforge.sqlite')
   })()
   const database = openAppDatabase(path)
+  database.localAuth.createUserAndSession({
+    id: 'user_1',
+    account: 'User One',
+    accountNormalized: 'user one',
+    passwordDigest: 'digest-user-1',
+    createdAt: 1,
+    updatedAt: 1,
+  }, 1)
   database.conversations.insert({ id: submitInput.conversationId, title: 'Video' })
   return database
 }
@@ -84,7 +94,9 @@ function videoAsset(id: string): MediaAsset {
 }
 
 function createHarness(
-  overrides: Partial<VideoJobRunnerDependencies> = {},
+  overrides: Omit<Partial<VideoJobRunnerDependencies>, 'database'> & {
+    database?: ReturnType<typeof createDatabase>
+  } = {},
 ) {
   const database = overrides.database ?? createDatabase()
   const events: ChatEvent[] = []
@@ -157,6 +169,7 @@ function createHarness(
   }
   const dependencies: VideoJobRunnerDependencies = {
     database,
+    providerUsage: database.providerUsage,
     providers: { get: vi.fn(() => provider as ModelProvider) },
     media,
     emit: (event) => events.push(event),
@@ -175,6 +188,205 @@ async function flush(): Promise<void> {
 }
 
 describe('VideoJobRunner', () => {
+  it('starts the durable OpenRouter usage event before submission and immediately binds the provider job', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const start = vi.spyOn(harness.dependencies.providerUsage, 'start')
+    const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
+
+    await new VideoJobRunner(harness.dependencies).submit(submitInput)
+
+    expect(start).toHaveBeenCalledWith(expect.objectContaining({
+      id: expect.any(String),
+      operationKey: 'video:request_video_1',
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
+      provider: 'openrouter',
+      requestId: 'request_video_1',
+      chatRunId: 'run_video_1',
+      model: 'video-model',
+      modality: 'video',
+      startedAt: 1_000,
+    }))
+    expect(start.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(harness.provider.submitVideo!).mock.invocationCallOrder[0]!,
+    )
+    expect(bindIdentity).toHaveBeenCalledWith(
+      'video:request_video_1',
+      { providerJobId: 'provider_job_1' },
+    )
+    expect(vi.mocked(harness.provider.submitVideo!).mock.invocationCallOrder[0]).toBeLessThan(
+      bindIdentity.mock.invocationCallOrder[0]!,
+    )
+    const request = vi.mocked(harness.provider.submitVideo!).mock.calls[0]?.[0] as unknown as Record<string, unknown>
+    expect(request).not.toHaveProperty('endUserId')
+  })
+
+  it('binds and reports completed video cost before download and keeps it when download fails', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
+    const report = vi.spyOn(harness.dependencies.providerUsage, 'report')
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+      status: 'completed',
+      generationId: 'generation_paid',
+      costUsd: '0.42',
+    })
+    vi.mocked(harness.provider.downloadVideo!).mockRejectedValue({ code: 'MEDIA_DOWNLOAD_FAILED' })
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(bindIdentity).toHaveBeenCalledWith(
+      'video:request_video_1',
+      { generationId: 'generation_paid' },
+    )
+    expect(report).toHaveBeenCalledWith('video:request_video_1', {
+      generationId: 'generation_paid',
+      costUsd: '0.42',
+      endedAt: 3_000,
+    })
+    expect(bindIdentity.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      report.mock.invocationCallOrder[0]!,
+    )
+    expect(report.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(harness.provider.downloadVideo!).mock.invocationCallOrder[0]!,
+    )
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')?.status).toBe('failed')
+    expect(harness.database.providerUsage.summarize({
+      userId: 'user_1',
+      yesterdayStartedAt: 0,
+      todayStartedAt: 0,
+      weekStartedAt: 0,
+      monthStartedAt: 0,
+      endedAt: 10_000,
+    }).allTime).toMatchObject({
+      openRouterCostUsd: '0.42',
+      openRouterKnownCostCount: 1,
+      openRouterUnknownCostCount: 0,
+    })
+  })
+
+  it.each([
+    { name: 'with generation identity', generationId: 'generation_costless' },
+    { name: 'without generation identity', generationId: undefined },
+  ])('marks a completed costless video unknown $name', async ({ generationId }) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
+    const markUnknown = vi.spyOn(harness.dependencies.providerUsage, 'markUnknown')
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+      status: 'completed',
+      ...(generationId === undefined ? {} : { generationId }),
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    if (generationId === undefined) {
+      expect(bindIdentity).toHaveBeenCalledTimes(1)
+    } else {
+      expect(bindIdentity).toHaveBeenLastCalledWith(
+        'video:request_video_1',
+        { generationId },
+      )
+    }
+    expect(markUnknown).toHaveBeenCalledWith('video:request_video_1', 3_000)
+    expect(markUnknown.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(harness.provider.downloadVideo!).mock.invocationCallOrder[0]!,
+    )
+    expect(harness.database.providerUsage.summarize({
+      userId: 'user_1',
+      yesterdayStartedAt: 0,
+      todayStartedAt: 0,
+      weekStartedAt: 0,
+      monthStartedAt: 0,
+      endedAt: 10_000,
+    }).allTime).toMatchObject({
+      openRouterKnownCostCount: 0,
+      openRouterUnknownCostCount: 1,
+    })
+  })
+
+  it('reports a recovered video to its persisted submitter attribution after restart', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-usage-restart-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = createDatabase(path)
+    const submittingHarness = createHarness({ database })
+    const submitting = new VideoJobRunner(submittingHarness.dependencies)
+    await submitting.submit(submitInput)
+    await submitting.stop()
+    database.close()
+
+    const reopened = openAppDatabase(path)
+    reopened.localAuth.createUserAndSession({
+      id: 'user_2',
+      account: 'User Two',
+      accountNormalized: 'user two',
+      passwordDigest: 'digest-user-2',
+      createdAt: 1_500,
+      updatedAt: 1_500,
+    }, 1_500)
+    expect(reopened.localAuth.getCurrentSession()?.user.id).toBe('user_2')
+    reopened.providerUsage.recoverPending(1_500)
+    const recoveredHarness = createHarness({ database: reopened })
+    vi.mocked(recoveredHarness.provider.pollVideo!).mockResolvedValue({
+      status: 'completed',
+      generationId: 'generation_recovered',
+      costUsd: '0.75',
+    })
+    vi.setSystemTime(3_000)
+    const recovered = new VideoJobRunner(recoveredHarness.dependencies)
+    await recovered.recover()
+    await flush()
+
+    expect(recoveredHarness.database.providerUsage.summarize({
+      userId: 'user_1',
+      yesterdayStartedAt: 0,
+      todayStartedAt: 0,
+      weekStartedAt: 0,
+      monthStartedAt: 0,
+      endedAt: 10_000,
+    }).allTime).toMatchObject({
+      openRouterCostUsd: '0.75',
+      openRouterKnownCostCount: 1,
+      openRouterUnknownCostCount: 0,
+    })
+    expect(recoveredHarness.database.providerUsage.summarize({
+      userId: 'user_2',
+      yesterdayStartedAt: 0,
+      todayStartedAt: 0,
+      weekStartedAt: 0,
+      monthStartedAt: 0,
+      endedAt: 10_000,
+    }).allTime).toMatchObject({
+      openRouterCostUsd: '0',
+      openRouterKnownCostCount: 0,
+      openRouterUnknownCostCount: 0,
+    })
+    reopened.close()
+    const inspection = new Database(path, { readonly: true })
+    expect(inspection.prepare(`
+      SELECT user_id AS userId, api_key_fingerprint AS apiKeyFingerprint, status
+      FROM provider_usage_events
+      WHERE operation_key = ?
+    `).get('video:request_video_1')).toEqual({
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
+      status: 'reported',
+    })
+    inspection.close()
+  })
   it('persists a complete submission intent before the provider request can settle', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)

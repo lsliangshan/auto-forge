@@ -10,6 +10,7 @@ import {
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
+import type { ProviderUsageRepository } from '../database/repositories.js'
 
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
@@ -26,12 +27,31 @@ async function* events(values: ProviderStreamEvent[]) {
 }
 
 function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies & {
-  records: { users: unknown[]; starts: unknown[]; decisions: unknown[]; discards: unknown[]; events: unknown[]; terminal: unknown[] }
+  records: {
+    users: unknown[]
+    starts: unknown[]
+    decisions: unknown[]
+    discards: unknown[]
+    events: unknown[]
+    terminal: unknown[]
+    usage: Array<{ method: string; args: unknown[] }>
+    order: string[]
+  }
   providerInstances: Record<ModelProviderId, AgentProviderPort>
   registry: { get: ReturnType<typeof vi.fn> }
   history: { prepare: ReturnType<typeof vi.fn<ConversationHistoryPort['prepare']>> }
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
 } {
-  const records = { users: [] as unknown[], starts: [] as unknown[], decisions: [] as unknown[], discards: [] as unknown[], events: [] as unknown[], terminal: [] as unknown[] }
+  const records = {
+    users: [] as unknown[],
+    starts: [] as unknown[],
+    decisions: [] as unknown[],
+    discards: [] as unknown[],
+    events: [] as unknown[],
+    terminal: [] as unknown[],
+    usage: [] as Array<{ method: string; args: unknown[] }>,
+    order: [] as string[],
+  }
   const messages = new Map<string, { blocks: unknown[] }>()
   let reservation = 0
   const providerInstances = {
@@ -40,6 +60,28 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
   }
   const registry = { get: vi.fn((provider: ModelProviderId) => providerInstances[provider]) }
   const history = { prepare: vi.fn<ConversationHistoryPort['prepare']>(async () => []) }
+  const providerUsage = {
+    start: vi.fn((...args: unknown[]) => {
+      records.order.push('usage.start')
+      records.usage.push({ method: 'start', args })
+      return args[0] as never
+    }),
+    bindIdentity: vi.fn((...args: unknown[]) => {
+      records.order.push('usage.bindIdentity')
+      records.usage.push({ method: 'bindIdentity', args })
+      return args[1] as never
+    }),
+    report: vi.fn((...args: unknown[]) => {
+      records.order.push('usage.report')
+      records.usage.push({ method: 'report', args })
+      return args[1] as never
+    }),
+    markUnknown: vi.fn((...args: unknown[]) => {
+      records.order.push('usage.markUnknown')
+      records.usage.push({ method: 'markUnknown', args })
+      return args[0] as never
+    }),
+  }
   return {
     records,
     providers: registry,
@@ -84,6 +126,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     },
     emit: (event) => { records.events.push(event) },
     history,
+    providerUsage,
     id: (() => { let value = 0; return () => `id_${++value}` })(),
     now: () => 100,
   }
@@ -100,6 +143,8 @@ function textRunInput(
 ): AgentRunInput {
   return {
     ...input,
+    userId: 'user_1',
+    apiKeyFingerprint: 'fingerprint_1',
     userBlocks: [{ type: 'text', text: input.content }],
     modelContent: input.content,
     assetIds: [],
@@ -109,6 +154,164 @@ function textRunInput(
 }
 
 describe('AgentOrchestrator', () => {
+  it('records each OpenRouter turn before streaming and reports only that turn cost immediately', async () => {
+    const dependencies = harness([])
+    const firstTurn = [
+      { type: 'generation', id: 'generation_1' },
+      { type: 'usage', inputTokens: 2, outputTokens: 3, totalTokens: 5, costUsd: '0.01' },
+      ...toolTurn,
+    ] satisfies ProviderStreamEvent[]
+    const secondTurn = [
+      { type: 'generation', id: 'generation_2' },
+      { type: 'usage', inputTokens: 5, outputTokens: 7, totalTokens: 12, costUsd: '0.02' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ] satisfies ProviderStreamEvent[]
+    let turn = 0
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      dependencies.records.order.push(`provider.stream:${turn}`)
+      expect(request.endUserId).toBe('user_1')
+      return events(turn++ === 0 ? firstTurn : secondTurn)
+    })
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_usage',
+      content: '搜索后回答',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_usage',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.order).toEqual([
+      'usage.start',
+      'provider.stream:0',
+      'usage.bindIdentity',
+      'usage.report',
+      'usage.start',
+      'provider.stream:1',
+      'usage.bindIdentity',
+      'usage.report',
+    ])
+    expect(dependencies.providerUsage.start).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      id: expect.any(String),
+      operationKey: 'agent:request_usage:turn:0',
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
+      provider: 'openrouter',
+      requestId: 'request_usage',
+      chatRunId: expect.any(String),
+      model: 'openrouter/model',
+      modality: 'text',
+      startedAt: 100,
+    }))
+    expect(dependencies.providerUsage.start).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      operationKey: 'agent:request_usage:turn:1',
+    }))
+    expect(dependencies.providerUsage.report).toHaveBeenNthCalledWith(1,
+      'agent:request_usage:turn:0',
+      {
+        generationId: 'generation_1',
+        inputTokens: 2,
+        outputTokens: 3,
+        costUsd: '0.01',
+        endedAt: 100,
+      },
+    )
+    expect(dependencies.providerUsage.report).toHaveBeenNthCalledWith(2,
+      'agent:request_usage:turn:1',
+      {
+        generationId: 'generation_2',
+        inputTokens: 5,
+        outputTokens: 7,
+        costUsd: '0.02',
+        endedAt: 100,
+      },
+    )
+    expect(dependencies.providerUsage.markUnknown).not.toHaveBeenCalled()
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      inputTokens: 7,
+      outputTokens: 10,
+      costUsd: '0.03',
+    })
+  })
+
+  it('keeps a reported OpenRouter charge when later local tool execution fails', async () => {
+    const dependencies = harness([[
+      { type: 'generation', id: 'generation_paid' },
+      { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.04' },
+      ...toolTurn,
+    ]])
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+    dependencies.executions.startReserved = async (reservation) => ({
+      id: reservation.executionId,
+      finished: Promise.resolve({ id: reservation.executionId, status: 'failed', errorCode: 'INTERNAL_ERROR' }),
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_local_failure',
+      content: '搜索',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_local_failure',
+    }))
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } })
+    expect(dependencies.providerUsage.report).toHaveBeenCalledWith(
+      'agent:request_local_failure:turn:0',
+      expect.objectContaining({ costUsd: '0.04', generationId: 'generation_paid' }),
+    )
+    expect(dependencies.providerUsage.markUnknown).not.toHaveBeenCalled()
+  })
+
+  it('marks a costless OpenRouter turn unknown after binding its generation identity', async () => {
+    const dependencies = harness([[
+      { type: 'generation', id: 'generation_unknown' },
+      { type: 'usage', inputTokens: 3, outputTokens: 4, totalTokens: 7 },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_unknown',
+      content: '回答',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_unknown',
+    }))
+
+    expect(dependencies.providerUsage.bindIdentity).toHaveBeenCalledWith(
+      'agent:request_unknown:turn:0',
+      { generationId: 'generation_unknown' },
+    )
+    expect(dependencies.providerUsage.markUnknown).toHaveBeenCalledWith(
+      'agent:request_unknown:turn:0',
+      100,
+    )
+    expect(dependencies.providerUsage.report).not.toHaveBeenCalled()
+  })
+
+  it('keeps DeepSeek token compatibility without creating an OpenRouter usage event', async () => {
+    const dependencies = harness([[
+      { type: 'usage', inputTokens: 8, outputTokens: 9, totalTokens: 17, costUsd: '0.05' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_deepseek',
+      content: '回答',
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+      requestId: 'request_deepseek',
+    }))
+
+    expect(dependencies.providerUsage.start).not.toHaveBeenCalled()
+    expect(dependencies.providerUsage.report).not.toHaveBeenCalled()
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      inputTokens: 8,
+      outputTokens: 9,
+      costUsd: '0.05',
+    })
+  })
   it('prepends prepared history before the current user message', async () => {
     const dependencies = harness([[
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
@@ -261,6 +464,8 @@ describe('AgentOrchestrator', () => {
     const orchestrator = new AgentOrchestrator(dependencies)
 
     const result = await orchestrator.run({
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
       conversationId: 'conversation_media',
       content: '描述图片',
       userBlocks,
@@ -367,6 +572,8 @@ describe('AgentOrchestrator', () => {
     dependencies.retrieve = vi.fn(() => { throw new Error('must not retrieve workflows') })
 
     const result = await new AgentOrchestrator(dependencies).run({
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
       conversationId: 'conversation_1',
       content: '描述图片',
       userBlocks: [{ type: 'text', text: '描述图片' }],
@@ -442,6 +649,8 @@ describe('AgentOrchestrator', () => {
     const orchestrator = new AgentOrchestrator(dependencies)
 
     const pending = await orchestrator.run({
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
       conversationId: 'conversation_1',
       content: '结合图片搜索',
       userBlocks: [{ type: 'text', text: '结合图片搜索' }],
@@ -713,6 +922,8 @@ describe('AgentOrchestrator', () => {
     })
     const orchestrator = new AgentOrchestrator(dependencies)
     const running = orchestrator.run({
+      userId: 'user_1',
+      apiKeyFingerprint: 'fingerprint_1',
       conversationId: 'conversation_1',
       content: '描述图片',
       userBlocks: [{ type: 'text', text: '描述图片' }],

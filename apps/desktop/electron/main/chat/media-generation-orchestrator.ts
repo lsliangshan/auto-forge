@@ -17,7 +17,8 @@ import {
   type MediaAssetService,
 } from '../media/media-asset-service.js'
 import type { SafeMediaDownloader } from '../media/safe-download.js'
-import type { ModelProvider } from './model-provider.js'
+import type { ProviderUsageRepository } from '../database/repositories.js'
+import type { ModelImageResult, ModelProvider } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
 
 export interface MediaGenerationProviderRegistryPort {
@@ -29,12 +30,18 @@ export interface MediaGenerationOrchestratorDependencies {
   persistence: AgentPersistencePort
   media: MediaAssetService
   downloader: Pick<SafeMediaDownloader, 'download'>
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
   id?: () => string
   now?: () => number
 }
 
-export interface MediaGenerationRunInput {
+interface UsageAttribution {
+  userId: string
+  apiKeyFingerprint?: string
+}
+
+export interface MediaGenerationRunInput extends UsageAttribution {
   requestId: string
   conversationId: string
   prompt: string
@@ -45,6 +52,8 @@ export interface MediaGenerationRunInput {
 
 interface ActiveGeneration {
   controller: AbortController
+  userId: string
+  apiKeyFingerprint?: string
   writer?: GeneratedAssetWriter
 }
 
@@ -140,7 +149,13 @@ export class MediaGenerationOrchestrator {
       }
     }
 
-    const active: ActiveGeneration = { controller: new AbortController() }
+    const active: ActiveGeneration = {
+      controller: new AbortController(),
+      userId: input.userId,
+      ...(input.apiKeyFingerprint === undefined
+        ? {}
+        : { apiKeyFingerprint: input.apiKeyFingerprint }),
+    }
     this.active.set(input.requestId, active)
     let persisted: PersistedGeneration | undefined
     try {
@@ -244,14 +259,53 @@ export class MediaGenerationOrchestrator {
     if (modelInputs.some((asset) => asset.kind !== 'image')) {
       throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     }
-    const result = await provider.generateImage({
-      model: input.route.model,
-      prompt: input.prompt,
-      options: input.route.generation.image,
-      parameterSupport: input.route.imageParameterSupport,
-      references: modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
-      signal: active.controller.signal,
-    })
+    const operationKey = `image:${input.requestId}`
+    const recordsProviderUsage = input.route.provider === 'openrouter'
+    let costReported = false
+    let result: ModelImageResult
+    if (recordsProviderUsage) {
+      this.dependencies.providerUsage.start({
+        id: this.id(),
+        operationKey,
+        userId: active.userId,
+        provider: input.route.provider,
+        ...(active.apiKeyFingerprint === undefined
+          ? {}
+          : { apiKeyFingerprint: active.apiKeyFingerprint }),
+        requestId: input.requestId,
+        chatRunId: persisted.runId,
+        model: input.route.model,
+        modality: 'image',
+        startedAt: this.now(),
+      })
+    }
+    try {
+      result = await provider.generateImage({
+        model: input.route.model,
+        prompt: input.prompt,
+        options: input.route.generation.image,
+        parameterSupport: input.route.imageParameterSupport,
+        references: modelInputs.map(({ mimeType, dataBase64 }) => ({ mimeType, dataBase64 })),
+        signal: active.controller.signal,
+      })
+      if (recordsProviderUsage && result.usage?.costUsd !== undefined) {
+        this.dependencies.providerUsage.report(operationKey, {
+          ...(result.usage.inputTokens === undefined
+            ? {}
+            : { inputTokens: result.usage.inputTokens }),
+          ...(result.usage.outputTokens === undefined
+            ? {}
+            : { outputTokens: result.usage.outputTokens }),
+          costUsd: result.usage.costUsd,
+          endedAt: this.now(),
+        })
+        costReported = true
+      }
+    } finally {
+      if (recordsProviderUsage && !costReported) {
+        this.dependencies.providerUsage.markUnknown(operationKey, this.now())
+      }
+    }
     if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
     if (result.outputs.length !== 1) throw toSafeAppError({ code: 'MEDIA_GENERATION_FAILED' })
 
@@ -352,33 +406,73 @@ export class MediaGenerationOrchestrator {
         dataBase64,
       })),
     ]
-
-    for await (const event of provider.stream({
-      model: input.route.model,
-      messages: [{ role: 'user', content }],
-      output: {
-        type: 'audio',
-        ...input.route.generation.audio,
-      },
-      signal: active.controller.signal,
-    })) {
-      if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
-      if ('choiceIndex' in event && event.choiceIndex !== 0) continue
-      if (event.type === 'audio_delta') {
-        await writer.appendBase64Chunk(event.dataBase64)
-        if (event.transcript) transcript += event.transcript
-      } else if (event.type === 'finish') {
-        finishReason = event.reason
-      } else if (event.type === 'generation') {
-        generationId = event.id
-      } else if (event.type === 'usage') {
-        usage = {
-          inputTokens: event.inputTokens,
-          outputTokens: event.outputTokens,
-          ...(event.costUsd === undefined ? {} : { costUsd: event.costUsd }),
+    const operationKey = `audio:${input.requestId}`
+    const recordsProviderUsage = input.route.provider === 'openrouter'
+    let costReported = false
+    if (recordsProviderUsage) {
+      this.dependencies.providerUsage.start({
+        id: this.id(),
+        operationKey,
+        userId: active.userId,
+        provider: input.route.provider,
+        ...(active.apiKeyFingerprint === undefined
+          ? {}
+          : { apiKeyFingerprint: active.apiKeyFingerprint }),
+        requestId: input.requestId,
+        chatRunId: persisted.runId,
+        model: input.route.model,
+        modality: 'audio',
+        startedAt: this.now(),
+      })
+    }
+    try {
+      for await (const event of provider.stream({
+        model: input.route.model,
+        messages: [{ role: 'user', content }],
+        output: {
+          type: 'audio',
+          ...input.route.generation.audio,
+        },
+        signal: active.controller.signal,
+        endUserId: active.userId,
+      })) {
+        if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
+        if ('choiceIndex' in event && event.choiceIndex !== 0) continue
+        if (event.type === 'audio_delta') {
+          await writer.appendBase64Chunk(event.dataBase64)
+          if (event.transcript) transcript += event.transcript
+        } else if (event.type === 'finish') {
+          finishReason = event.reason
+        } else if (event.type === 'generation') {
+          generationId = event.id
+          if (recordsProviderUsage) {
+            this.dependencies.providerUsage.bindIdentity(operationKey, {
+              generationId: event.id,
+            })
+          }
+        } else if (event.type === 'usage') {
+          usage = {
+            inputTokens: event.inputTokens,
+            outputTokens: event.outputTokens,
+            ...(event.costUsd === undefined ? {} : { costUsd: event.costUsd }),
+          }
+          if (recordsProviderUsage && event.costUsd !== undefined && !costReported) {
+            this.dependencies.providerUsage.report(operationKey, {
+              ...(generationId === undefined ? {} : { generationId }),
+              inputTokens: event.inputTokens,
+              outputTokens: event.outputTokens,
+              costUsd: event.costUsd,
+              endedAt: this.now(),
+            })
+            costReported = true
+          }
+        } else if (event.type === 'tool_call') {
+          throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
         }
-      } else if (event.type === 'tool_call') {
-        throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+      }
+    } finally {
+      if (recordsProviderUsage && !costReported) {
+        this.dependencies.providerUsage.markUnknown(operationKey, this.now())
       }
     }
     if (finishReason !== 'stop') throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })

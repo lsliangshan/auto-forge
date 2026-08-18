@@ -13,7 +13,7 @@ import {
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
 import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
 import { retrieveWorkflows } from '../workflows/retriever.js'
-import type { AppRepositories } from '../database/repositories.js'
+import type { AppRepositories, ProviderUsageRepository } from '../database/repositories.js'
 import type {
   ModelContentPart,
   ModelMessage,
@@ -203,6 +203,7 @@ export interface AgentOrchestratorDependencies {
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
   executions: AgentExecutionPort
   history: ConversationHistoryPort
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
   retrieve?: typeof retrieveWorkflows
   id?: () => string
@@ -210,7 +211,12 @@ export interface AgentOrchestratorDependencies {
   developerMode?: () => boolean
 }
 
-export interface AgentRunInput {
+interface UsageAttribution {
+  userId: string
+  apiKeyFingerprint?: string
+}
+
+export interface AgentRunInput extends UsageAttribution {
   conversationId: string
   content: string
   userBlocks: ChatBlock[]
@@ -248,6 +254,9 @@ interface ActiveAgentRun {
   messageId: string
   conversationId: string
   provider: AgentProviderPort
+  providerId: ModelProviderId
+  userId: string
+  apiKeyFingerprint?: string
   model: string
   blocks: ChatBlock[]
   messages: ModelMessage[]
@@ -357,6 +366,11 @@ export class AgentOrchestrator {
         messageId,
         conversationId: input.conversationId,
         provider,
+        providerId: input.provider,
+        userId: input.userId,
+        ...(input.apiKeyFingerprint === undefined
+          ? {}
+          : { apiKeyFingerprint: input.apiKeyFingerprint }),
         model: input.model,
         blocks: [],
         messages: [],
@@ -486,36 +500,81 @@ export class AgentOrchestrator {
 
     while (active.modelTurns < MAX_MODEL_TURNS) {
       active.modelTurns += 1
+      const operationKey = `agent:${active.requestId}:turn:${active.modelTurns - 1}`
+      const recordsProviderUsage = active.providerId === 'openrouter'
+      let costReported = false
+      let turnGenerationId: string | undefined
       const toolCalls: Array<Extract<ModelStreamEvent, { type: 'tool_call' }>> = []
       let finishReason: string | undefined
       let assistantContent = ''
       let turnUsage: Extract<ModelStreamEvent, { type: 'usage' }> | undefined
-      for await (const event of active.provider.stream({
-        model: active.model,
-        messages: active.messages,
-        ...(active.tools.length ? { tools: active.tools } : {}),
-        signal: active.controller.signal,
-      })) {
-        if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
-        if ('choiceIndex' in event && event.choiceIndex !== 0) continue
-        switch (event.type) {
-          case 'text_delta':
-            assistantContent += event.text
-            this.appendText(active, event.text)
-            break
-          case 'tool_call':
-            toolCalls.push(event)
-            if (toolCalls.length > 1) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-            break
-          case 'finish':
-            finishReason = event.reason
-            break
-          case 'generation':
-            active.generationId = event.id
-            break
-          case 'usage':
-            turnUsage = event
-            break
+      if (recordsProviderUsage) {
+        this.dependencies.providerUsage.start({
+          id: this.id(),
+          operationKey,
+          userId: active.userId,
+          provider: active.providerId,
+          ...(active.apiKeyFingerprint === undefined
+            ? {}
+            : { apiKeyFingerprint: active.apiKeyFingerprint }),
+          requestId: active.requestId,
+          chatRunId: active.runId,
+          model: active.model,
+          modality: 'text',
+          startedAt: this.now(),
+        })
+      }
+      try {
+        for await (const event of active.provider.stream({
+          model: active.model,
+          messages: active.messages,
+          ...(active.tools.length ? { tools: active.tools } : {}),
+          signal: active.controller.signal,
+          endUserId: active.userId,
+        })) {
+          if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+          if ('choiceIndex' in event && event.choiceIndex !== 0) continue
+          switch (event.type) {
+            case 'text_delta':
+              assistantContent += event.text
+              this.appendText(active, event.text)
+              break
+            case 'tool_call':
+              toolCalls.push(event)
+              if (toolCalls.length > 1) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+              break
+            case 'finish':
+              finishReason = event.reason
+              break
+            case 'generation':
+              active.generationId = event.id
+              turnGenerationId = event.id
+              if (recordsProviderUsage) {
+                this.dependencies.providerUsage.bindIdentity(operationKey, {
+                  generationId: event.id,
+                })
+              }
+              break
+            case 'usage':
+              turnUsage = event
+              if (recordsProviderUsage && event.costUsd !== undefined && !costReported) {
+                this.dependencies.providerUsage.report(operationKey, {
+                  ...(turnGenerationId === undefined
+                    ? {}
+                    : { generationId: turnGenerationId }),
+                  inputTokens: event.inputTokens,
+                  outputTokens: event.outputTokens,
+                  costUsd: event.costUsd,
+                  endedAt: this.now(),
+                })
+                costReported = true
+              }
+              break
+          }
+        }
+      } finally {
+        if (recordsProviderUsage && !costReported) {
+          this.dependencies.providerUsage.markUnknown(operationKey, this.now())
         }
       }
       if (turnUsage) {
