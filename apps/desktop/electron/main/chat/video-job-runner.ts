@@ -795,33 +795,13 @@ export class VideoJobRunner {
     }
     const attempts = (job.pollAttempts ?? 0) + 1
     if (result.status === 'failed') {
-      if (usage.kind === 'tracked') {
-        this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
-      }
+      this.recordTerminalProviderUsage(job.id, usage, result)
       if (this.stopped || signal.aborted) return
       this.fail(job, appErrorCodeSchema.parse(result.errorCode))
       return
     }
     if (result.status === 'completed') {
-      if (usage.kind === 'tracked') {
-        const operationKey = `video:${job.id}`
-        if (result.generationId !== undefined) {
-          this.dependencies.providerUsage.bindIdentity(operationKey, {
-            generationId: result.generationId,
-          })
-        }
-        if (result.costUsd === undefined) {
-          this.dependencies.providerUsage.markUnknown(operationKey, this.now())
-        } else {
-          this.dependencies.providerUsage.report(operationKey, {
-            ...(result.generationId === undefined
-              ? {}
-              : { generationId: result.generationId }),
-            costUsd: result.costUsd,
-            endedAt: this.now(),
-          })
-        }
-      }
+      this.recordTerminalProviderUsage(job.id, usage, result)
       if (this.stopped || signal.aborted) return
       let current = job
       if (current.status === 'pending') {
@@ -886,6 +866,31 @@ export class VideoJobRunner {
     if (!transition) return
     this.emitTransition(transition)
     this.schedule(transition.job)
+  }
+
+  private recordTerminalProviderUsage(
+    jobId: string,
+    usage: VideoUsageClassification,
+    result: { generationId?: string; costUsd?: string },
+  ): void {
+    if (usage.kind !== 'tracked') return
+    const operationKey = `video:${jobId}`
+    if (result.generationId !== undefined) {
+      this.dependencies.providerUsage.bindIdentity(operationKey, {
+        generationId: result.generationId,
+      })
+    }
+    if (result.costUsd === undefined) {
+      this.dependencies.providerUsage.markUnknown(operationKey, this.now())
+      return
+    }
+    this.dependencies.providerUsage.report(operationKey, {
+      ...(result.generationId === undefined
+        ? {}
+        : { generationId: result.generationId }),
+      costUsd: result.costUsd,
+      endedAt: this.now(),
+    })
   }
 
   private async download(

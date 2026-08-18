@@ -91,7 +91,7 @@ export interface ModelVideoRequest {
 export type ModelVideoStatus =
   | { status: 'pending' | 'in_progress' }
   | { status: 'completed'; generationId?: string; costUsd?: string }
-  | { status: 'failed'; errorCode: AppError['code'] }
+  | { status: 'failed'; errorCode: AppError['code']; generationId?: string; costUsd?: string }
 
 export interface ModelGenerationUsage {
   generationId: string

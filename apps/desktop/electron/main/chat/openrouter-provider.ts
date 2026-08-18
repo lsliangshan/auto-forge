@@ -474,7 +474,16 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
             : { costUsd: String(parsed.data.usage.cost) }),
         }
       case 'failed':
-        return { status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' }
+        return {
+          status: 'failed',
+          errorCode: 'MEDIA_GENERATION_FAILED',
+          ...(parsed.data.generation_id == null
+            ? {}
+            : { generationId: parsed.data.generation_id }),
+          ...(parsed.data.usage?.cost === undefined
+            ? {}
+            : { costUsd: String(parsed.data.usage.cost) }),
+        }
       default:
         throw failure('MODEL_PROVIDER_REQUEST_FAILED')
     }

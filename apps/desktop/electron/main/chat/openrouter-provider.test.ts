@@ -797,6 +797,35 @@ describe('OpenRouterProvider', () => {
   })
 
   it.each([
+    {
+      name: 'generation and usage cost',
+      payload: { generation_id: 'generation-failed-paid', usage: { cost: '0.19' } },
+      expected: { generationId: 'generation-failed-paid', costUsd: '0.19' },
+    },
+    {
+      name: 'generation without usage cost',
+      payload: { generation_id: 'generation-failed-unknown' },
+      expected: { generationId: 'generation-failed-unknown' },
+    },
+  ])('preserves failed video $name for billing', async ({ payload, expected }) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({
+        id: 'job-1',
+        status: 'failed',
+        ...payload,
+        error: 'RAW_PROVIDER_ERROR_MUST_NOT_ESCAPE',
+      })),
+    })
+
+    await expect(provider.pollVideo('job-1')).resolves.toEqual({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+      ...expected,
+    })
+  })
+
+  it.each([
     ['pending', { status: 'pending' }],
     ['in_progress', { status: 'in_progress' }],
     ['failed', { status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' }],

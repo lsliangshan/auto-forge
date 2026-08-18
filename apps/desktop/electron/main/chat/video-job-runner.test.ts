@@ -551,6 +551,101 @@ describe('VideoJobRunner', () => {
     })
   })
 
+  it('records failed video generation cost once before preserving the business failure terminal', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
+    const report = vi.spyOn(harness.dependencies.providerUsage, 'report')
+    const markUnknown = vi.spyOn(harness.dependencies.providerUsage, 'markUnknown')
+    const failJob = vi.spyOn(harness.dependencies.database.mediaGenerationJobs, 'fail')
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+      generationId: 'generation_failed_paid',
+      costUsd: '0.23',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(bindIdentity).toHaveBeenLastCalledWith(
+      'video:request_video_1',
+      { generationId: 'generation_failed_paid' },
+    )
+    expect(report).toHaveBeenCalledOnce()
+    expect(report).toHaveBeenCalledWith('video:request_video_1', {
+      generationId: 'generation_failed_paid',
+      costUsd: '0.23',
+      endedAt: 3_000,
+    })
+    expect(markUnknown).not.toHaveBeenCalled()
+    expect(bindIdentity.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      report.mock.invocationCallOrder[0]!,
+    )
+    expect(report.mock.invocationCallOrder[0]).toBeLessThan(
+      failJob.mock.invocationCallOrder[0]!,
+    )
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.database.providerUsage.find('video:request_video_1')).toMatchObject({
+      status: 'reported',
+      generationId: 'generation_failed_paid',
+      costUsd: '0.23',
+    })
+  })
+
+  it('binds a costless failed video generation before making it reconcilable and terminally failed', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
+    const markUnknown = vi.spyOn(harness.dependencies.providerUsage, 'markUnknown')
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+      generationId: 'generation_failed_unknown',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(bindIdentity).toHaveBeenLastCalledWith(
+      'video:request_video_1',
+      { generationId: 'generation_failed_unknown' },
+    )
+    expect(markUnknown).toHaveBeenCalledWith('video:request_video_1', 3_000)
+    expect(bindIdentity.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      markUnknown.mock.invocationCallOrder[0]!,
+    )
+    expect(harness.database.providerUsage.listReconcilable(4_000)).toEqual([
+      expect.objectContaining({
+        operationKey: 'video:request_video_1',
+        status: 'unknown',
+        generationId: 'generation_failed_unknown',
+        costUsd: undefined,
+      }),
+    ])
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+    expect(harness.database.chatRuns.get('run_video_1')).toMatchObject({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+    })
+  })
+
   it('reports a recovered video to its persisted submitter attribution after restart', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
