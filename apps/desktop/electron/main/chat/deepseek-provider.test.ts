@@ -20,6 +20,23 @@ async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelSt
 }
 
 describe('DeepSeekProvider', () => {
+  it('does not serialize an end user into DeepSeek chat requests', async () => {
+    const fetch = vi.fn(async () => sseResponse(['data: [DONE]\n\n']))
+    const provider = new DeepSeekProvider({
+      credential: { get: vi.fn(async () => 'sk-deepseek-private') },
+      fetch,
+    })
+
+    await collect(provider.stream({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'hello' }],
+      endUserId: 'user-1',
+    } as never))
+
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).not.toHaveProperty('user')
+    expect(provider.getGenerationUsage).toBeUndefined()
+  })
+
   it('releases a managed 401 response before returning an invalid credential result', async () => {
     const networkProxy = new NetworkProxyService({
       setProxy: vi.fn(async () => undefined),

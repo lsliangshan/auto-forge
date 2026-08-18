@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { toSafeAppError, type AppError, type VideoFrameType } from '@autoforge/shared'
+import { normalizeUsd } from '../billing/decimal-usd.js'
 import {
   mergeOpenRouterModels,
   OpenAiCompatibleProvider,
@@ -8,6 +9,7 @@ import {
   parseOpenRouterVideoModels,
   type ModelImageRequest,
   type ModelImageResult,
+  type ModelGenerationUsage,
   type ModelMessage,
   type ModelStreamEvent,
   type ModelStreamRequest,
@@ -23,6 +25,7 @@ const IMAGE_MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/images/models'
 const VIDEO_MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/videos/models'
 const IMAGE_ENDPOINT = 'https://openrouter.ai/api/v1/images'
 const VIDEO_ENDPOINT = 'https://openrouter.ai/api/v1/videos'
+const GENERATION_ENDPOINT = 'https://openrouter.ai/api/v1/generation'
 const MAX_MEDIA_JSON_BODY = 32 * 1024 * 1024
 const MAX_REFERENCE_COUNT = 5
 const MAX_IMAGE_BASE64_LENGTH = Math.ceil((20 * 1024 * 1024) / 3) * 4
@@ -159,6 +162,12 @@ const videoJobSchema = z.object({
   usage: z.object({ cost: costSchema.optional() }).passthrough().optional(),
   error: z.unknown().optional(),
 }).passthrough()
+const generationUsageSchema = z.object({
+  data: z.object({
+    id: z.string().min(1),
+    total_cost: z.union([z.string(), z.number()]).nullish(),
+  }),
+})
 
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
@@ -221,6 +230,12 @@ function parsedJobId(providerJobId: string): string {
   return parsed.data
 }
 
+function parsedGenerationId(generationId: string): string {
+  const parsed = generationIdSchema.safeParse(generationId)
+  if (!parsed.success) throw failure('INVALID_INPUT')
+  return parsed.data
+}
+
 function wireReferences(references: Array<{ mimeType: string; dataBase64: string }>) {
   return references.map(({ mimeType, dataBase64 }) => ({
     type: 'image_url',
@@ -274,11 +289,37 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       includeUsageStreamOption: true,
       supportsMediaInput: true,
       supportsAudioOutput: true,
+      serializeEndUser: (id) => `autoforge:${id}`,
     }, {
       ...dependencies,
       fetch,
       credential: { get: () => dependencies.credential.get('openrouter_api_key') },
     })
+  }
+
+  async getGenerationUsage(generationId: string, signal?: AbortSignal): Promise<ModelGenerationUsage> {
+    const id = parsedGenerationId(generationId)
+    const response = await this.authenticatedFetch(
+      `${GENERATION_ENDPOINT}?id=${encodeURIComponent(id)}`,
+      'generation',
+      signal,
+      () => ({ method: 'GET' }),
+      { retry: 'idempotent' },
+    )
+    const parsed = generationUsageSchema.safeParse(
+      await this.boundedJson(response, MAX_MEDIA_JSON_BODY, signal),
+    )
+    if (!parsed.success || parsed.data.data.id !== id) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+    try {
+      return {
+        generationId: id,
+        ...(parsed.data.data.total_cost == null
+          ? {}
+          : { costUsd: normalizeUsd(parsed.data.data.total_cost) }),
+      }
+    } catch {
+      throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+    }
   }
 
   async generateImage(request: ModelImageRequest): Promise<ModelImageResult> {

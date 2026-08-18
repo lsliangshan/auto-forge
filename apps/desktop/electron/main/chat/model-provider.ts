@@ -44,6 +44,7 @@ export interface ModelStreamRequest {
   output?: { type: 'text' } | { type: 'audio'; voice?: string; format: string }
   maxOutputTokens?: number
   signal?: AbortSignal
+  endUserId?: string
 }
 
 export type ModelStreamEvent =
@@ -91,6 +92,15 @@ export type ModelVideoStatus =
   | { status: 'completed'; generationId?: string; costUsd?: string }
   | { status: 'failed'; errorCode: AppError['code'] }
 
+export interface ModelGenerationUsage {
+  generationId: string
+  costUsd?: string
+}
+
+export interface GenerationUsageProviderPort {
+  getGenerationUsage(generationId: string, signal?: AbortSignal): Promise<ModelGenerationUsage>
+}
+
 export interface ModelProvider {
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>
   validateCredential(signal?: AbortSignal): Promise<{ valid: boolean }>
@@ -99,6 +109,7 @@ export interface ModelProvider {
   submitVideo?(request: ModelVideoRequest): Promise<{ providerJobId: string; status: 'pending' | 'in_progress' }>
   pollVideo?(providerJobId: string, signal?: AbortSignal): Promise<ModelVideoStatus>
   downloadVideo?(providerJobId: string, signal?: AbortSignal): Promise<Response>
+  getGenerationUsage?: GenerationUsageProviderPort['getGenerationUsage']
 }
 
 export interface ModelCredentialPort {
@@ -120,6 +131,7 @@ export interface OpenAiCompatibleProviderConfig {
   includeUsageStreamOption: boolean
   supportsMediaInput: boolean
   supportsAudioOutput: boolean
+  serializeEndUser?: (id: string) => string
 }
 
 export interface OpenAiCompatibleProviderDependencies {
@@ -135,7 +147,7 @@ export interface OpenAiCompatibleProviderDependencies {
   }) => void
 }
 
-export type ProviderOperation = 'models' | 'chat' | 'image' | 'video'
+export type ProviderOperation = 'models' | 'chat' | 'image' | 'video' | 'generation'
 type RetryPolicy = 'never' | 'idempotent'
 interface AuthenticatedFetchOptions {
   retry: RetryPolicy
@@ -846,6 +858,9 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           body = JSON.stringify({
             model: request.model,
             messages,
+            ...(request.endUserId === undefined || this.config.serializeEndUser === undefined
+              ? {}
+              : { user: this.config.serializeEndUser(request.endUserId) }),
             ...(request.tools?.length ? { tools: request.tools } : {}),
             ...(request.maxOutputTokens === undefined ? {} : { max_tokens: request.maxOutputTokens }),
             stream: true,

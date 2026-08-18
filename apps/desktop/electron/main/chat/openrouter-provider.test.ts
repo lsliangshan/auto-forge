@@ -68,6 +68,122 @@ const allImageParameters = {
 } as const
 
 describe('OpenRouterProvider', () => {
+  it('serializes an end user only in OpenRouter chat requests', async () => {
+    const fetch = vi.fn(async () => sseResponse(['data: [DONE]\n\n']))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await collect(provider.stream({
+      model: 'model',
+      messages: [{ role: 'user', content: 'hello' }],
+      endUserId: 'user-1',
+    } as never))
+    await collect(provider.stream({
+      model: 'model',
+      messages: [{ role: 'user', content: 'hello' }],
+    }))
+
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toMatchObject({
+      user: 'autoforge:user-1',
+    })
+    expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).not.toHaveProperty('user')
+  })
+
+  it('does not serialize a chat end user into image or video bodies', async () => {
+    const bodies: unknown[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (input, init) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        if (String(input).endsWith('/videos')) {
+          return Response.json({ id: 'job_1', status: 'pending' })
+        }
+        return Response.json({
+          data: [{ b64_json: 'AQID', media_type: 'image/png' }],
+        })
+      }),
+    })
+
+    await provider.generateImage({
+      model: 'image-model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    })
+    await provider.submitVideo({
+      model: 'video-model',
+      prompt: 'draw',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+      frameImages: [],
+    })
+
+    expect(bodies[0]).not.toHaveProperty('user')
+    expect(bodies[1]).not.toHaveProperty('user')
+  })
+
+  it('gets normalized generation usage through the fixed endpoint', async () => {
+    const fetch = vi.fn(async () => Response.json({ data: { id: 'gen/a b', total_cost: 1.20e-3 } }))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.getGenerationUsage('gen/a b')).resolves.toEqual({
+      generationId: 'gen/a b',
+      costUsd: '0.0012',
+    })
+    expect(fetch).toHaveBeenCalledWith(
+      'https://openrouter.ai/api/v1/generation?id=gen%2Fa%20b',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({ authorization: 'Bearer sk-private' }),
+      }),
+    )
+  })
+
+  it.each([
+    ['a zero cost', { data: { id: 'gen_1', total_cost: 0 } }, { generationId: 'gen_1', costUsd: '0' }],
+    ['a null cost', { data: { id: 'gen_1', total_cost: null } }, { generationId: 'gen_1' }],
+    ['a mismatched generation ID', { data: { id: 'other', total_cost: 0 } }, undefined],
+    ['an invalid cost', { data: { id: 'gen_1', total_cost: '-1' } }, undefined],
+    ['a malformed response', { data: { id: '', total_cost: 0 } }, undefined],
+  ])('handles %s safely', async (_description, payload, expected) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json(payload)),
+    })
+
+    if (expected) {
+      await expect(provider.getGenerationUsage('gen_1')).resolves.toEqual(expected)
+    } else {
+      await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+        code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      })
+    }
+  })
+
+  it.each([401, 403, 500])('maps generation HTTP %s responses to existing AppError codes', async (status) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => new Response('failed', { status })),
+    })
+
+    await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+      code: status === 401
+        ? 'CREDENTIAL_INVALID'
+        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+  })
+
+  it('rejects invalid generation JSON with the existing safe AppError', async () => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => new Response('{')),
+    })
+
+    await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+  })
+
   it('releases a managed 401 response before returning an invalid credential result', async () => {
     const networkProxy = new NetworkProxyService({
       setProxy: vi.fn(async () => undefined),
