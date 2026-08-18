@@ -231,6 +231,42 @@ describe('VideoJobRunner', () => {
     expect(harness.database.chatRuns.get('run_video_1')?.status).toBe('running')
   })
 
+  it('surfaces a timer-started provider usage consistency error through stop', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness()
+    let pollStarted!: () => void
+    let releasePoll!: () => void
+    const started = new Promise<void>((resolve) => { pollStarted = resolve })
+    vi.mocked(harness.provider.pollVideo!).mockImplementation(async () => {
+      pollStarted()
+      return new Promise((resolve) => {
+        releasePoll = () => resolve({
+          status: 'completed',
+          generationId: 'generation_shutdown_consistency',
+          costUsd: '0.34',
+        })
+      })
+    })
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.spyOn(harness.dependencies.providerUsage, 'report').mockImplementation(() => {
+      throw consistencyError
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+    await runner.submit(submitInput)
+
+    const timer = vi.advanceTimersByTimeAsync(2_000)
+    await started
+    const stopping = runner.stop()
+    const stoppedWithConsistencyError = expect(stopping).rejects.toBe(consistencyError)
+    releasePoll()
+    await timer
+
+    await stoppedWithConsistencyError
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')?.status).toBe('pending')
+    expect(harness.database.chatRuns.get('run_video_1')?.status).toBe('running')
+  })
+
   it('records a completed poll returned after pause before respecting its abort signal', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)

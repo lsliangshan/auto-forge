@@ -233,6 +233,7 @@ export class VideoJobRunner {
   private readonly controllers = new Map<string, AbortController>()
   private readonly work = new Map<string, Promise<void>>()
   private readonly submissions = new Set<Promise<SubmittedVideoJob>>()
+  private readonly backgroundFailures: unknown[] = []
   private stopped = false
 
   constructor(private readonly dependencies: VideoJobRunnerDependencies) {
@@ -505,10 +506,15 @@ export class VideoJobRunner {
     for (const jobId of [...this.timers.keys()]) this.clearTimer(jobId)
     for (const jobId of [...this.deadlineTimers.keys()]) this.clearDeadlineTimer(jobId)
     for (const controller of this.controllers.values()) controller.abort()
-    await Promise.allSettled([
+    const results = await Promise.allSettled([
       ...this.work.values(),
       ...this.submissions,
     ])
+    const consistencyFailure = [
+      ...results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []),
+      ...this.backgroundFailures,
+    ].find((error) => error instanceof ProviderUsageConsistencyError)
+    if (consistencyFailure) throw consistencyFailure
   }
 
   private assertSubmit(input: SubmitVideoInput): void {
@@ -542,7 +548,9 @@ export class VideoJobRunner {
       : Math.min(job.nextPollAt ?? this.now(), deadline)
     const handle = this.timersApi.set(() => {
       this.timers.delete(job.id)
-      void this.wake(job.id)
+      void this.wake(job.id).catch((error: unknown) => {
+        this.backgroundFailures.push(error)
+      })
     }, Math.max(0, target - this.now()))
     this.timers.set(job.id, handle)
   }
