@@ -119,7 +119,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       saveProviderApiKey: (provider, apiKey) => invoke(ipcRenderer, ipcChannels.settingsSaveProviderApiKey, { provider, apiKey }),
       clearProviderApiKey: (provider) => invoke(ipcRenderer, ipcChannels.settingsClearProviderApiKey, { provider }),
       validateProviderCredential: (provider) => invoke(ipcRenderer, ipcChannels.settingsValidateProviderCredential, { provider }),
-      listProviderModels: (provider) => invoke(ipcRenderer, ipcChannels.settingsListProviderModels, { provider }),
+      listProviderModels: (provider, refresh = false) => invoke(
+        ipcRenderer,
+        ipcChannels.settingsListProviderModels,
+        { provider, ...(refresh ? { refresh: true } : {}) },
+      ),
       getTokenUsage: () => invoke(ipcRenderer, ipcChannels.settingsGetTokenUsage),
       clearLocalData: (scope) => invoke(ipcRenderer, ipcChannels.settingsClearLocalData, { scope }),
     },

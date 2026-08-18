@@ -644,6 +644,9 @@ export const settingsGetRequestSchema = z.undefined()
 export const settingsUpdateRequestSchema = appSettingsPatchSchema
 export const providerRequestSchema = z.object({ provider: modelProviderIdSchema }).strict()
 export const saveProviderApiKeyRequestSchema = providerRequestSchema.extend({ apiKey: nonEmptyStringSchema }).strict()
+export const listProviderModelsRequestSchema = providerRequestSchema.extend({
+  refresh: z.boolean().optional().default(false),
+}).strict()
 export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
 }).strict()
@@ -710,7 +713,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsSaveProviderApiKey]: saveProviderApiKeyRequestSchema,
   [ipcChannels.settingsClearProviderApiKey]: providerRequestSchema,
   [ipcChannels.settingsValidateProviderCredential]: providerRequestSchema,
-  [ipcChannels.settingsListProviderModels]: providerRequestSchema,
+  [ipcChannels.settingsListProviderModels]: listProviderModelsRequestSchema,
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
@@ -840,7 +843,7 @@ export interface DesktopAPI {
     saveProviderApiKey(provider: ModelProviderId, apiKey: string): Promise<ProviderCredentialStatus>
     clearProviderApiKey(provider: ModelProviderId): Promise<void>
     validateProviderCredential(provider: ModelProviderId): Promise<ProviderCredentialStatus>
-    listProviderModels(provider: ModelProviderId): Promise<ModelInfo[]>
+    listProviderModels(provider: ModelProviderId, refresh?: boolean): Promise<ModelInfo[]>
     getTokenUsage(): Promise<TokenUsageSnapshot>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
   }

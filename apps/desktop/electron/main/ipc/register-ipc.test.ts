@@ -226,6 +226,12 @@ describe('registerDesktopIpc', () => {
       provider: 'custom',
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.settings.listProviderModels).not.toHaveBeenCalled()
+
+    await app.invoke(ipcChannels.settingsListProviderModels, {
+      provider: 'openrouter',
+      refresh: true,
+    })
+    expect(app.dependencies.settings.listProviderModels).toHaveBeenCalledWith('openrouter', true)
   })
 
   it('returns authenticated token usage through the fixed settings channel', async () => {

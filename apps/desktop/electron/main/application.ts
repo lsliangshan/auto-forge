@@ -281,14 +281,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     mediaRoot: join(options.paths.data, 'media'),
   })
   const modelCatalog = new Map<ModelProviderId, Promise<Awaited<ReturnType<ModelProvider['listModels']>>>>()
-  const getModelCatalog = (provider: ModelProviderId) => {
+  const getModelCatalog = (provider: ModelProviderId, refresh = false) => {
+    if (refresh) modelCatalog.delete(provider)
     let catalog = modelCatalog.get(provider)
     if (!catalog) {
-      catalog = providerRegistry.get(provider).listModels()
-        .catch((error) => {
-          modelCatalog.delete(provider)
-          throw error
-        })
+      let current!: Promise<Awaited<ReturnType<ModelProvider['listModels']>>>
+      current = providerRegistry.get(provider).listModels().catch((error) => {
+        if (modelCatalog.get(provider) === current) modelCatalog.delete(provider)
+        throw error
+      })
+      catalog = current
       modelCatalog.set(provider, catalog)
     }
     return catalog
@@ -844,7 +846,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         modelCatalog.delete(provider)
       },
       validateProviderCredential: credentialStatus,
-      listProviderModels: (provider) => getModelCatalog(provider),
+      listProviderModels: (provider, refresh = false) => getModelCatalog(provider, refresh),
       getTokenUsage: async () => createTokenUsageSnapshot(
         new Date(),
         (query) => database.chatRuns.summarizeTokenUsage(query),

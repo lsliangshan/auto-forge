@@ -12,6 +12,7 @@ import {
   ipcRequestSchemas,
   ipcResponseSchemas,
   ipcChannels,
+  listProviderModelsRequestSchema,
   mediaAssetSchema,
   mediaBlockSchema,
   modelInfoSchema,
@@ -418,6 +419,11 @@ describe('cross-process contracts', () => {
     expect(appErrorCodeSchema.parse('MODEL_PROVIDER_ACCESS_DENIED')).toBe('MODEL_PROVIDER_ACCESS_DENIED')
     expect(appErrorCodeSchema.parse('MODEL_PROVIDER_REQUEST_FAILED')).toBe('MODEL_PROVIDER_REQUEST_FAILED')
     expect(appErrorCodeSchema.parse('OPENROUTER_REQUEST_FAILED')).toBe('OPENROUTER_REQUEST_FAILED')
+    expect(listProviderModelsRequestSchema.parse({ provider: 'openrouter' }))
+      .toEqual({ provider: 'openrouter', refresh: false })
+    expect(listProviderModelsRequestSchema.parse({ provider: 'openrouter', refresh: true }))
+      .toEqual({ provider: 'openrouter', refresh: true })
+    expect(() => listProviderModelsRequestSchema.parse({ provider: 'openrouter', refresh: 'yes' })).toThrow()
   })
 
   it('requires internally consistent token usage snapshots', () => {

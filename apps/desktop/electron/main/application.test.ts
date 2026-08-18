@@ -661,6 +661,17 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.settings.listProviderModels('deepseek')).resolves.toEqual([
       modelInfo('deepseek-v4-flash', 'deepseek-v4-flash'),
     ])
+    await expect(runtime.services.settings.listProviderModels('deepseek')).resolves.toEqual([
+      modelInfo('deepseek-v4-flash', 'deepseek-v4-flash'),
+    ])
+    expect(deepseek.listModels).toHaveBeenCalledTimes(1)
+    deepseek.listModels.mockResolvedValueOnce([
+      modelInfo('deepseek-v4-flash', 'DeepSeek refreshed'),
+    ])
+    await expect(runtime.services.settings.listProviderModels('deepseek', true)).resolves.toEqual([
+      modelInfo('deepseek-v4-flash', 'DeepSeek refreshed'),
+    ])
+    expect(deepseek.listModels).toHaveBeenCalledTimes(2)
 
     const conversation = await runtime.services.chat.createConversation()
     await runtime.services.chat.send(chatInput(conversation.id, 'hello'))
