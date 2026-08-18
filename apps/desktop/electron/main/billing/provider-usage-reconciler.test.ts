@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { GenerationUsageProviderPort } from '../chat/model-provider.js'
+import type {
+  GenerationUsageProviderPort,
+  ModelProviderSnapshot,
+  ModelProviderSnapshotSource,
+} from '../chat/model-provider.js'
 import type {
   ProviderUsageEvent,
   ProviderUsageReport,
@@ -85,34 +89,55 @@ class FakeProviderUsageRepository {
   }
 }
 
+function providerSnapshot(options: {
+  fingerprint?: string
+  includeCapability?: boolean
+  getGenerationUsage?: GenerationUsageProviderPort['getGenerationUsage']
+} = {}): ModelProviderSnapshot {
+  const getGenerationUsage = options.getGenerationUsage
+    ?? vi.fn(async (generationId: string) => ({ generationId, costUsd: '0.25' }))
+  return {
+    providerId: 'openrouter',
+    ...(options.fingerprint === undefined
+      ? { apiKeyFingerprint: fingerprintApiKey('key_1') }
+      : options.fingerprint === '' ? {} : { apiKeyFingerprint: options.fingerprint }),
+    provider: {
+      listModels: async () => [],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* () {},
+      ...(options.includeCapability === false ? {} : { getGenerationUsage }),
+    },
+  }
+}
+
 function createHarness(options: {
   events?: ProviderUsageEvent[]
-  credential?: string
   now?: number
-  getGenerationUsage?: GenerationUsageProviderPort['getGenerationUsage']
+  snapshot?: ModelProviderSnapshot
+  acquire?: ModelProviderSnapshotSource['acquire']
 } = {}) {
   let currentNow = options.now ?? 1_000
   const repository = new FakeProviderUsageRepository(options.events ?? [event()])
-  const provider: GenerationUsageProviderPort = {
-    getGenerationUsage: options.getGenerationUsage ?? vi.fn(async (generationId) => ({
-      generationId,
-      costUsd: '0.25',
-    })),
+  const snapshot = options.snapshot ?? providerSnapshot()
+  const providers: ModelProviderSnapshotSource = {
+    acquire: options.acquire ?? vi.fn(async () => snapshot),
   }
-  const credential = { get: vi.fn(async () => ('credential' in options ? options.credential : 'key_1')) }
   const reconciler = new ProviderUsageReconciler({
     providerUsage: repository,
-    provider,
-    credential,
+    providers,
     now: () => currentNow,
   })
   return {
     repository,
-    provider,
-    credential,
+    snapshot,
+    providers,
     reconciler,
     setNow(now: number) { currentNow = now },
   }
+}
+
+function signal(): AbortSignal {
+  return new AbortController().signal
 }
 
 describe('fingerprintApiKey', () => {
@@ -127,91 +152,134 @@ describe('fingerprintApiKey', () => {
 })
 
 describe('ProviderUsageReconciler', () => {
+  it('rejects an already-aborted round before recovery or snapshot acquisition', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const harness = createHarness()
+
+    await expect(harness.reconciler.recoverInterrupted({ signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'AbortError' })
+
+    expect(harness.repository.recoverPending).not.toHaveBeenCalled()
+    expect(harness.providers.acquire).not.toHaveBeenCalled()
+    expect(harness.repository.failures).toEqual([])
+  })
+
   it('recovers pending usage, then reconciles only events due before the new 1s delay', async () => {
     const due = event({ id: 'due', operationKey: 'due', nextReconcileAt: 1_000 })
-    const pending = event({
-      id: 'pending',
-      operationKey: 'pending',
-      status: 'pending',
-      nextReconcileAt: undefined,
-    })
+    const pending = event({ id: 'pending', operationKey: 'pending', status: 'pending', nextReconcileAt: undefined })
     const harness = createHarness({ events: [due, pending] })
 
-    await harness.reconciler.recoverInterrupted()
+    await harness.reconciler.recoverInterrupted({ signal: signal() })
 
     expect(harness.repository.recoverPending).toHaveBeenCalledWith(1_000)
-    expect(harness.provider.getGenerationUsage).toHaveBeenCalledTimes(1)
-    expect(harness.provider.getGenerationUsage).toHaveBeenCalledWith('generation_1')
+    expect(harness.snapshot.provider.getGenerationUsage).toHaveBeenCalledTimes(1)
     expect(pending).toMatchObject({ status: 'unknown', endedAt: 20, nextReconcileAt: 2_000 })
   })
 
-  it('reports a zero generation cost and does not query reported usage twice', async () => {
-    const usage = event({ nextReconcileAt: 1_000 })
+  it('acquires one credential-bound snapshot for fingerprint comparison and every lookup in a round', async () => {
+    const lookup = vi.fn(async (generationId: string, requestSignal?: AbortSignal) => ({
+      generationId,
+      costUsd: '0.25',
+      requestSignal,
+    }))
+    const snapshot = providerSnapshot({ getGenerationUsage: lookup })
     const harness = createHarness({
-      events: [usage],
-      getGenerationUsage: vi.fn(async (generationId) => ({ generationId, costUsd: '0' })),
+      events: [event({ operationKey: 'one' }), event({ id: 'two', operationKey: 'two', generationId: 'generation_2' })],
+      snapshot,
+    })
+    const roundSignal = signal()
+
+    await harness.reconciler.reconcileDue({ signal: roundSignal })
+
+    expect(harness.providers.acquire).toHaveBeenCalledTimes(1)
+    expect(harness.providers.acquire).toHaveBeenCalledWith('openrouter')
+    expect(lookup).toHaveBeenNthCalledWith(1, 'generation_1', roundSignal)
+    expect(lookup).toHaveBeenNthCalledWith(2, 'generation_2', roundSignal)
+  })
+
+  it('does not consume an attempt when cancellation aborts an in-flight lookup', async () => {
+    const controller = new AbortController()
+    const lookup = vi.fn((_generationId: string, requestSignal?: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      requestSignal?.addEventListener('abort', () => reject(requestSignal.reason), { once: true })
+    }))
+    const harness = createHarness({ snapshot: providerSnapshot({ getGenerationUsage: lookup }) })
+    const running = harness.reconciler.reconcileDue({ signal: controller.signal })
+    await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(1))
+
+    controller.abort()
+
+    await expect(running).rejects.toMatchObject({ name: 'AbortError' })
+    expect(harness.repository.failures).toEqual([])
+    expect(harness.repository.events[0]?.reconcileAttempts).toBe(0)
+  })
+
+  it.each([
+    ['missing credentials', async () => { throw { code: 'CREDENTIAL_UNAVAILABLE' } }, providerSnapshot()],
+    ['missing capability', undefined, providerSnapshot({ includeCapability: false })],
+    ['missing fingerprint', undefined, providerSnapshot({ fingerprint: '' })],
+    ['a different fingerprint', undefined, providerSnapshot({ fingerprint: fingerprintApiKey('key_2') })],
+  ])('does not consume an attempt for %s', async (_description, acquire, snapshot) => {
+    const harness = createHarness({
+      snapshot,
+      ...(acquire === undefined ? {} : { acquire }),
     })
 
-    await harness.reconciler.reconcileDue()
-    await harness.reconciler.reconcileDue()
+    await harness.reconciler.reconcileDue({ signal: signal() })
+
+    expect(harness.repository.failures).toEqual([])
+    expect(harness.repository.events[0]?.reconcileAttempts).toBe(0)
+    if (snapshot.provider.getGenerationUsage === undefined) {
+      expect(snapshot.provider.getGenerationUsage).toBeUndefined()
+    } else {
+      expect(snapshot.provider.getGenerationUsage).not.toHaveBeenCalled()
+    }
+  })
+
+  it('reports a zero generation cost and does not query reported usage twice', async () => {
+    const lookup = vi.fn(async (generationId: string) => ({ generationId, costUsd: '0' }))
+    const harness = createHarness({ snapshot: providerSnapshot({ getGenerationUsage: lookup }) })
+
+    await harness.reconciler.reconcileDue({ signal: signal() })
+    await harness.reconciler.reconcileDue({ signal: signal() })
 
     expect(harness.repository.reports).toEqual([{
       operationKey: 'operation_1',
       report: { costUsd: '0', endedAt: 1_000 },
     }])
-    expect(harness.provider.getGenerationUsage).toHaveBeenCalledTimes(1)
-  })
-
-  it('does not query events for another API key, absent credentials, or absent generations', async () => {
-    const differentKey = event({ id: 'different', operationKey: 'different', apiKeyFingerprint: fingerprintApiKey('key_2') })
-    const noGeneration = event({ id: 'no_generation', operationKey: 'no_generation', generationId: undefined })
-    const matching = event({ id: 'matching', operationKey: 'matching' })
-    const differentKeyHarness = createHarness({ events: [differentKey, noGeneration] })
-    const noCredentialHarness = createHarness({ events: [matching], credential: undefined })
-
-    await differentKeyHarness.reconciler.reconcileDue()
-    await noCredentialHarness.reconciler.reconcileDue()
-
-    expect(differentKeyHarness.provider.getGenerationUsage).not.toHaveBeenCalled()
-    expect(differentKeyHarness.repository.failures).toEqual([])
-    expect(noCredentialHarness.provider.getGenerationUsage).not.toHaveBeenCalled()
-    expect(noCredentialHarness.repository.failures).toEqual([])
+    expect(lookup).toHaveBeenCalledTimes(1)
   })
 
   it('schedules missing costs and retryable errors at 5s then 30s, then terminates after three queries', async () => {
-    const getGenerationUsage = vi.fn<GenerationUsageProviderPort['getGenerationUsage']>()
+    const lookup = vi.fn<GenerationUsageProviderPort['getGenerationUsage']>()
       .mockResolvedValueOnce({ generationId: 'generation_1' })
       .mockRejectedValueOnce({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
       .mockRejectedValueOnce({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
-    const harness = createHarness({ getGenerationUsage })
+    const harness = createHarness({ snapshot: providerSnapshot({ getGenerationUsage: lookup }) })
 
-    await harness.reconciler.reconcileDue()
+    await harness.reconciler.reconcileDue({ signal: signal() })
     harness.setNow(6_000)
-    await harness.reconciler.reconcileDue()
+    await harness.reconciler.reconcileDue({ signal: signal() })
     harness.setNow(36_000)
-    await harness.reconciler.reconcileDue()
+    await harness.reconciler.reconcileDue({ signal: signal() })
     harness.setNow(100_000)
-    await harness.reconciler.reconcileDue()
+    await harness.reconciler.reconcileDue({ signal: signal() })
 
     expect(harness.repository.failures).toEqual([
       { operationKey: 'operation_1', nextReconcileAt: 6_000 },
       { operationKey: 'operation_1', nextReconcileAt: 36_000 },
       { operationKey: 'operation_1', nextReconcileAt: undefined },
     ])
-    expect(harness.provider.getGenerationUsage).toHaveBeenCalledTimes(3)
-    expect(harness.repository.events[0]).toMatchObject({
-      status: 'unknown', reconcileAttempts: 3, nextReconcileAt: undefined,
-    })
+    expect(lookup).toHaveBeenCalledTimes(3)
   })
 
   it.each(['CREDENTIAL_INVALID', 'MODEL_PROVIDER_ACCESS_DENIED'] as const)(
     'terminates immediately for %s',
     async (code) => {
-      const harness = createHarness({
-        getGenerationUsage: vi.fn(async () => { throw { code } }),
-      })
+      const lookup = vi.fn(async () => { throw { code } })
+      const harness = createHarness({ snapshot: providerSnapshot({ getGenerationUsage: lookup }) })
 
-      await harness.reconciler.reconcileDue()
+      await harness.reconciler.reconcileDue({ signal: signal() })
 
       expect(harness.repository.failures).toEqual([
         { operationKey: 'operation_1', nextReconcileAt: undefined },

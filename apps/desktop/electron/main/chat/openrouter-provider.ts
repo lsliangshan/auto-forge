@@ -324,7 +324,7 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       'generation',
       signal,
       () => ({ method: 'GET' }),
-      { retry: 'idempotent' },
+      { retry: 'never' },
     )
     const parsed = generationUsageSchema.safeParse(
       await this.boundedJson(response, MAX_MEDIA_JSON_BODY, signal),

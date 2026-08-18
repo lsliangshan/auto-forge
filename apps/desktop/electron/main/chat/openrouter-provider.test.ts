@@ -250,6 +250,21 @@ describe('OpenRouterProvider', () => {
     })
   })
 
+  it.each([
+    ['a network failure', () => { throw new TypeError('socket closed') }],
+    ['a server failure', () => new Response('failed', { status: 503 })],
+  ])('leaves generation lookup retries to the billing ledger after %s', async (_description, response) => {
+    const fetch = vi.fn(async () => response())
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+
+    await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
   it('rejects invalid generation JSON with the existing safe AppError', async () => {
     const provider = new OpenRouterProvider({
       credential,
