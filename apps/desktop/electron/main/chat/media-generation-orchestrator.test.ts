@@ -19,12 +19,14 @@ import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
+import { fingerprintApiKey } from '../billing/provider-usage-reconciler.js'
 import type {
   GeneratedAssetWriter,
   MediaAssetService,
 } from '../media/media-asset-service.js'
 import { createMediaAssetService } from '../media/media-asset-service.js'
 import type { ModelProvider } from './model-provider.js'
+import { OpenRouterProvider } from './openrouter-provider.js'
 import {
   MediaGenerationOrchestrator,
   type MediaGenerationOrchestratorDependencies,
@@ -145,7 +147,19 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ])
   })
-  const provider = { generateImage, stream }
+  const provider = {
+    listModels: vi.fn(async () => []),
+    validateCredential: vi.fn(async () => ({ valid: true })),
+    generateImage,
+    stream,
+  } satisfies ModelProvider
+  const providers = {
+    acquire: vi.fn(async (providerId: ResolvedChatRoute['provider']) => ({
+      providerId,
+      provider,
+      ...(providerId === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_1' } : {}),
+    })),
+  }
   const providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'> = {
     start: vi.fn((event) => {
       calls.push('providerUsage.start')
@@ -165,7 +179,7 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     }),
   }
   const dependencies: MediaGenerationOrchestratorDependencies = {
-    providers: { get: vi.fn(() => provider) },
+    providers,
     persistence,
     media,
     downloader: {
@@ -191,6 +205,7 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
     media,
     persistence,
     provider,
+    providers,
     providerUsage,
     writer,
   }
@@ -198,7 +213,6 @@ function createHarness(overrides: Partial<MediaGenerationOrchestratorDependencie
 
 const input = {
   userId: 'user_1',
-  apiKeyFingerprint: 'fingerprint_1',
   requestId: 'request_1',
   conversationId: 'conversation_1',
   prompt: 'paint a harbor',
@@ -207,6 +221,121 @@ const input = {
 }
 
 describe('MediaGenerationOrchestrator', () => {
+  it('keeps image wire credentials and ledger attribution on one snapshot across a key switch', async () => {
+    let apiKey = 'sk-image-a'
+    const authorizations: string[] = []
+    const source = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => apiKey) },
+      fetch: vi.fn(async (_url, init) => {
+        authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Response.json({
+          data: [{ b64_json: 'iVBORw0KGgo=', media_type: 'image/png' }],
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5, cost: '0.01' },
+        })
+      }),
+    })
+    const providers = {
+      get: vi.fn(() => {
+        apiKey = 'sk-image-b'
+        return source
+      }),
+      acquire: vi.fn(async () => {
+        const snapshot = await source.acquireSnapshot()
+        apiKey = 'sk-image-b'
+        return snapshot
+      }),
+    }
+    const harness = createHarness({ providers })
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+
+    await expect(orchestrator.runImage({ ...input, requestId: 'image_a', route: imageRoute }))
+      .resolves.toMatchObject({ status: 'completed' })
+    await expect(orchestrator.runImage({ ...input, requestId: 'image_b', route: imageRoute }))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(providers.acquire).toHaveBeenCalledTimes(2)
+    expect(providers.get).not.toHaveBeenCalled()
+    expect(authorizations).toEqual(['Bearer sk-image-a', 'Bearer sk-image-b'])
+    expect(harness.providerUsage.start).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      operationKey: 'image:image_a',
+      apiKeyFingerprint: fingerprintApiKey('sk-image-a'),
+    }))
+    expect(harness.providerUsage.start).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      operationKey: 'image:image_b',
+      apiKeyFingerprint: fingerprintApiKey('sk-image-b'),
+    }))
+  })
+
+  it('keeps audio wire credentials and ledger attribution on one snapshot across a key switch', async () => {
+    let apiKey = 'sk-audio-a'
+    let responseIndex = 0
+    const authorizations: string[] = []
+    const source = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => apiKey) },
+      fetch: vi.fn(async (_url, init) => {
+        authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+        responseIndex += 1
+        const generationId = `generation_audio_${responseIndex}`
+        const payload = [
+          `data: {"id":"${generationId}","choices":[{"index":0,"delta":{"audio":{"data":"AQI="}}}]}`,
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11,"cost":"0.02"}}',
+          'data: [DONE]',
+        ].join('\n\n') + '\n\n'
+        return new Response(payload, { headers: { 'content-type': 'text/event-stream' } })
+      }),
+    })
+    const providers = {
+      get: vi.fn(() => {
+        apiKey = 'sk-audio-b'
+        return source
+      }),
+      acquire: vi.fn(async () => {
+        const snapshot = await source.acquireSnapshot()
+        apiKey = 'sk-audio-b'
+        return snapshot
+      }),
+    }
+    const harness = createHarness({ providers })
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+
+    await expect(orchestrator.runAudio({ ...input, requestId: 'audio_a', route: audioRoute }))
+      .resolves.toMatchObject({ status: 'completed' })
+    await expect(orchestrator.runAudio({ ...input, requestId: 'audio_b', route: audioRoute }))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(providers.acquire).toHaveBeenCalledTimes(2)
+    expect(providers.get).not.toHaveBeenCalled()
+    expect(authorizations).toEqual(['Bearer sk-audio-a', 'Bearer sk-audio-b'])
+    expect(harness.providerUsage.start).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      operationKey: 'audio:audio_a',
+      apiKeyFingerprint: fingerprintApiKey('sk-audio-a'),
+    }))
+    expect(harness.providerUsage.start).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      operationKey: 'audio:audio_b',
+      apiKeyFingerprint: fingerprintApiKey('sk-audio-b'),
+    }))
+  })
+
+  it.each([
+    ['image', imageRoute],
+    ['audio', audioRoute],
+  ] as const)('does not create an OpenRouter ledger event for DeepSeek %s operations', async (kind, route) => {
+    const harness = createHarness()
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+    const deepSeekRoute = { ...route, provider: 'deepseek' as const }
+
+    const result = kind === 'image'
+      ? await orchestrator.runImage({ ...input, route: deepSeekRoute })
+      : await orchestrator.runAudio({ ...input, route: deepSeekRoute })
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(harness.providers.acquire).toHaveBeenCalledTimes(1)
+    expect(harness.providerUsage.start).not.toHaveBeenCalled()
+    expect(harness.providerUsage.bindIdentity).not.toHaveBeenCalled()
+    expect(harness.providerUsage.report).not.toHaveBeenCalled()
+    expect(harness.providerUsage.markUnknown).not.toHaveBeenCalled()
+  })
+
   it('rethrows provider usage consistency errors without persisting a business failure', async () => {
     const harness = createHarness()
     vi.mocked(harness.providerUsage.report).mockImplementation(() => {
@@ -752,9 +881,11 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
     const database = openAppDatabase(join(root, 'database.sqlite'))
     const events: ChatEvent[] = []
     const provider = {
+      listModels: vi.fn(async () => []),
+      validateCredential: vi.fn(async () => ({ valid: true })),
       stream: vi.fn<ModelProvider['stream']>(),
       generateImage: vi.fn<NonNullable<ModelProvider['generateImage']>>(),
-    }
+    } satisfies ModelProvider
     const asset = {
       id: 'asset_atomic',
       conversationId: 'conversation_atomic',
@@ -774,7 +905,9 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
       database.mediaAssets.insert(asset)
       arrange(database)
       const harness = createHarness({
-        providers: { get: () => provider },
+        providers: {
+          acquire: async (providerId) => ({ providerId, provider }),
+        },
         persistence: createAgentPersistence(database),
         emit: (event) => { events.push(event) },
         id: () => ids.shift() ?? 'unexpected_id',
@@ -785,7 +918,6 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
         : orchestrator.runAudio.bind(orchestrator)
       const result = await run({
         userId: 'user_atomic',
-        apiKeyFingerprint: 'fingerprint_atomic',
         requestId: 'request_atomic',
         conversationId: 'conversation_atomic',
         prompt: 'paint atomically',
@@ -875,7 +1007,9 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
         mediaRoot,
         id: () => 'asset_audio_real',
       })
-      const provider: Pick<ModelProvider, 'stream' | 'generateImage'> = {
+      const provider: ModelProvider = {
+        listModels: vi.fn(async () => []),
+        validateCredential: vi.fn(async () => ({ valid: true })),
         stream: () => streamEvents([
           { type: 'generation', id: 'generation_audio_real' },
           { type: 'audio_delta', choiceIndex: 0, dataBase64: first, transcript: '你' },
@@ -891,7 +1025,13 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
         ]),
       }
       const orchestrator = new MediaGenerationOrchestrator({
-        providers: { get: () => provider },
+        providers: {
+          acquire: async () => ({
+            providerId: 'openrouter',
+            provider,
+            apiKeyFingerprint: 'fingerprint_audio_real',
+          }),
+        },
         persistence: createAgentPersistence(database),
         media,
         downloader: { download: vi.fn() },
@@ -906,7 +1046,6 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
 
       await expect(orchestrator.runAudio({
         userId: 'user_audio_real',
-        apiKeyFingerprint: 'fingerprint_audio_real',
         requestId: 'request_audio_real',
         conversationId: 'conversation_audio_real',
         prompt: 'say hello',

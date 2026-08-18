@@ -21,15 +21,16 @@ import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
-import type { ModelImageResult, ModelProvider } from './model-provider.js'
+import { trackProviderStream } from '../billing/provider-usage-stream.js'
+import type {
+  ModelImageResult,
+  ModelProviderSnapshot,
+  ModelProviderSnapshotSource,
+} from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
 
-export interface MediaGenerationProviderRegistryPort {
-  get(provider: ResolvedChatRoute['provider']): Pick<ModelProvider, 'stream' | 'generateImage'>
-}
-
 export interface MediaGenerationOrchestratorDependencies {
-  providers: MediaGenerationProviderRegistryPort
+  providers: ModelProviderSnapshotSource
   persistence: AgentPersistencePort
   media: MediaAssetService
   downloader: Pick<SafeMediaDownloader, 'download'>
@@ -41,7 +42,6 @@ export interface MediaGenerationOrchestratorDependencies {
 
 interface UsageAttribution {
   userId: string
-  apiKeyFingerprint?: string
 }
 
 export interface MediaGenerationRunInput extends UsageAttribution {
@@ -55,8 +55,6 @@ export interface MediaGenerationRunInput extends UsageAttribution {
 
 interface ActiveGeneration {
   controller: AbortController
-  userId: string
-  apiKeyFingerprint?: string
   writer?: GeneratedAssetWriter
 }
 
@@ -154,10 +152,6 @@ export class MediaGenerationOrchestrator {
 
     const active: ActiveGeneration = {
       controller: new AbortController(),
-      userId: input.userId,
-      ...(input.apiKeyFingerprint === undefined
-        ? {}
-        : { apiKeyFingerprint: input.apiKeyFingerprint }),
     }
     this.active.set(input.requestId, active)
     let persisted: PersistedGeneration | undefined
@@ -176,9 +170,14 @@ export class MediaGenerationOrchestrator {
         status: 'running',
       })
 
+      const providerSnapshot = await this.dependencies.providers.acquire(input.route.provider)
+      if (providerSnapshot.providerId !== input.route.provider) {
+        throw toSafeAppError({ code: 'CONFLICT' })
+      }
+
       return kind === 'image'
-        ? await this.generateImage(input, persisted, active)
-        : await this.generateAudio(input, persisted, active)
+        ? await this.generateImage(input, persisted, active, providerSnapshot)
+        : await this.generateAudio(input, persisted, active, providerSnapshot)
     } catch (error) {
       if (error instanceof ProviderUsageConsistencyError) throw error
       if (!persisted) {
@@ -254,8 +253,9 @@ export class MediaGenerationOrchestrator {
     input: MediaGenerationRunInput,
     persisted: PersistedGeneration,
     active: ActiveGeneration,
+    providerSnapshot: ModelProviderSnapshot,
   ): Promise<AgentRunResult> {
-    const provider = this.dependencies.providers.get(input.route.provider)
+    const provider = providerSnapshot.provider
     if (!provider.generateImage) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     if (!input.route.imageParameterSupport) throw toSafeAppError({ code: 'INVALID_INPUT' })
     const modelInputs = await this.dependencies.media.modelInput(
@@ -266,18 +266,18 @@ export class MediaGenerationOrchestrator {
       throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
     }
     const operationKey = `image:${input.requestId}`
-    const recordsProviderUsage = input.route.provider === 'openrouter'
+    const recordsProviderUsage = providerSnapshot.providerId === 'openrouter'
     let costReported = false
     let result: ModelImageResult
     if (recordsProviderUsage) {
       this.dependencies.providerUsage.start({
         id: this.id(),
         operationKey,
-        userId: active.userId,
-        provider: input.route.provider,
-        ...(active.apiKeyFingerprint === undefined
+        userId: input.userId,
+        provider: providerSnapshot.providerId,
+        ...(providerSnapshot.apiKeyFingerprint === undefined
           ? {}
-          : { apiKeyFingerprint: active.apiKeyFingerprint }),
+          : { apiKeyFingerprint: providerSnapshot.apiKeyFingerprint }),
         requestId: input.requestId,
         chatRunId: persisted.runId,
         model: input.route.model,
@@ -383,8 +383,8 @@ export class MediaGenerationOrchestrator {
     input: MediaGenerationRunInput,
     persisted: PersistedGeneration,
     active: ActiveGeneration,
+    providerSnapshot: ModelProviderSnapshot,
   ): Promise<AgentRunResult> {
-    const provider = this.dependencies.providers.get(input.route.provider)
     const modelInputs = await this.dependencies.media.modelInput(
       input.conversationId,
       input.route.assets.map((asset) => asset.id),
@@ -413,26 +413,16 @@ export class MediaGenerationOrchestrator {
       })),
     ]
     const operationKey = `audio:${input.requestId}`
-    const recordsProviderUsage = input.route.provider === 'openrouter'
-    let costReported = false
-    if (recordsProviderUsage) {
-      this.dependencies.providerUsage.start({
-        id: this.id(),
-        operationKey,
-        userId: active.userId,
-        provider: input.route.provider,
-        ...(active.apiKeyFingerprint === undefined
-          ? {}
-          : { apiKeyFingerprint: active.apiKeyFingerprint }),
+    for await (const event of trackProviderStream({
+      operationKey,
+      attribution: {
+        userId: input.userId,
         requestId: input.requestId,
         chatRunId: persisted.runId,
         model: input.route.model,
         modality: 'audio',
-        startedAt: this.now(),
-      })
-    }
-    try {
-      for await (const event of provider.stream({
+      },
+      request: {
         model: input.route.model,
         messages: [{ role: 'user', content }],
         output: {
@@ -440,51 +430,36 @@ export class MediaGenerationOrchestrator {
           ...input.route.generation.audio,
         },
         signal: active.controller.signal,
-        endUserId: active.userId,
-      })) {
-        if (
-          active.controller.signal.aborted
-          && event.type !== 'generation'
-          && event.type !== 'usage'
-        ) throw toSafeAppError({ code: 'CANCELLED' })
-        if ('choiceIndex' in event && event.choiceIndex !== 0) continue
-        if (event.type === 'audio_delta') {
-          await writer.appendBase64Chunk(event.dataBase64)
-          if (event.transcript) transcript += event.transcript
-        } else if (event.type === 'finish') {
-          finishReason = event.reason
-        } else if (event.type === 'generation') {
-          generationId = event.id
-          if (recordsProviderUsage) {
-            this.dependencies.providerUsage.bindIdentity(operationKey, {
-              generationId: event.id,
-            })
-          }
-        } else if (event.type === 'usage') {
-          usage = {
-            inputTokens: event.inputTokens,
-            outputTokens: event.outputTokens,
-            ...(event.costUsd === undefined ? {} : { costUsd: event.costUsd }),
-          }
-          if (recordsProviderUsage && event.costUsd !== undefined && !costReported) {
-            this.dependencies.providerUsage.report(operationKey, {
-              ...(generationId === undefined ? {} : { generationId }),
-              inputTokens: event.inputTokens,
-              outputTokens: event.outputTokens,
-              costUsd: event.costUsd,
-              endedAt: this.now(),
-            })
-            costReported = true
-          }
-        } else if (event.type === 'tool_call') {
-          throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+        endUserId: input.userId,
+      },
+      provider: providerSnapshot,
+      providerUsage: this.dependencies.providerUsage,
+      id: this.id,
+      now: this.now,
+    })) {
+      if (
+        active.controller.signal.aborted
+        && event.type !== 'generation'
+        && event.type !== 'usage'
+      ) throw toSafeAppError({ code: 'CANCELLED' })
+      if ('choiceIndex' in event && event.choiceIndex !== 0) continue
+      if (event.type === 'audio_delta') {
+        await writer.appendBase64Chunk(event.dataBase64)
+        if (event.transcript) transcript += event.transcript
+      } else if (event.type === 'finish') {
+        finishReason = event.reason
+      } else if (event.type === 'generation') {
+        generationId = event.id
+      } else if (event.type === 'usage') {
+        usage = {
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+          ...(event.costUsd === undefined ? {} : { costUsd: event.costUsd }),
         }
-        if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
+      } else if (event.type === 'tool_call') {
+        throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
       }
-    } finally {
-      if (recordsProviderUsage && !costReported) {
-        this.dependencies.providerUsage.markUnknown(operationKey, this.now())
-      }
+      if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
     }
     if (finishReason !== 'stop') throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
     if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
