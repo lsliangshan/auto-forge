@@ -28,6 +28,9 @@ const emptyUsagePeriod = (startedAt: string, endedAt: string) => ({
   inputTokens: 0,
   outputTokens: 0,
   totalTokens: 0,
+  openRouterCostUsd: '0',
+  openRouterKnownCostCount: 0,
+  openRouterUnknownCostCount: 0,
   models: [],
   trend: [],
 })
