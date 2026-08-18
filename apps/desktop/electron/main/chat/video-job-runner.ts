@@ -11,6 +11,7 @@ import {
 } from '@autoforge/shared'
 import {
   isVideoSubmissionIntent,
+  ProviderUsageConsistencyError,
   type AppRepositories,
   type MediaGenerationJob,
   type MediaGenerationJobStatus,
@@ -368,19 +369,18 @@ export class VideoJobRunner {
         signal: controller.signal,
       })
       if (
-        this.stopped
-        || controller.signal.aborted
-        || !PROVIDER_JOB_ID_PATTERN.test(submitted.providerJobId)
+        !PROVIDER_JOB_ID_PATTERN.test(submitted.providerJobId)
         || (submitted.status !== 'pending' && submitted.status !== 'in_progress')
       ) {
-        throw controller.signal.aborted
-          ? toSafeAppError({ code: 'CANCELLED' })
-          : toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+        throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
       }
       if (input.route.provider === 'openrouter') {
         this.dependencies.providerUsage.bindIdentity(operationKey, {
           providerJobId: submitted.providerJobId,
         })
+      }
+      if (this.stopped || controller.signal.aborted) {
+        throw toSafeAppError({ code: 'CANCELLED' })
       }
 
       const createdAt = this.now()
@@ -421,6 +421,7 @@ export class VideoJobRunner {
         status: submitted.status,
       }
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) throw error
       if (usageStarted && !usageContinues) {
         this.dependencies.providerUsage.markUnknown(`video:${input.requestId}`, this.now())
       }
@@ -625,12 +626,12 @@ export class VideoJobRunner {
       }
       throw error
     }
-    if (this.stopped || signal.aborted) return
     const attempts = (job.pollAttempts ?? 0) + 1
     if (result.status === 'failed') {
       if (job.provider === 'openrouter') {
         this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
       }
+      if (this.stopped || signal.aborted) return
       this.fail(job, appErrorCodeSchema.parse(result.errorCode))
       return
     }
@@ -654,6 +655,7 @@ export class VideoJobRunner {
           })
         }
       }
+      if (this.stopped || signal.aborted) return
       let current = job
       if (current.status === 'pending') {
         const progress = this.dependencies.database.mediaGenerationJobs.transition(
@@ -697,6 +699,8 @@ export class VideoJobRunner {
       })
       return
     }
+
+    if (this.stopped || signal.aborted) return
 
     const desired = job.status === 'pending' && result.status === 'in_progress'
       ? 'in_progress'
@@ -840,6 +844,7 @@ export class VideoJobRunner {
     controller: AbortController,
     error: unknown,
   ): Promise<void> {
+    if (error instanceof ProviderUsageConsistencyError) throw error
     if (this.stopped) return
     const job = this.dependencies.database.mediaGenerationJobs.get(jobId)
     if (!job || !ACTIVE_STATUSES.includes(job.status)) return

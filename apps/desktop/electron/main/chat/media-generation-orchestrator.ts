@@ -17,7 +17,10 @@ import {
   type MediaAssetService,
 } from '../media/media-asset-service.js'
 import type { SafeMediaDownloader } from '../media/safe-download.js'
-import type { ProviderUsageRepository } from '../database/repositories.js'
+import {
+  ProviderUsageConsistencyError,
+  type ProviderUsageRepository,
+} from '../database/repositories.js'
 import type { ModelImageResult, ModelProvider } from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
 
@@ -177,6 +180,7 @@ export class MediaGenerationOrchestrator {
         ? await this.generateImage(input, persisted, active)
         : await this.generateAudio(input, persisted, active)
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) throw error
       if (!persisted) {
         const failure = safeError(error, active.controller.signal)
         this.safeEmit({
@@ -436,7 +440,11 @@ export class MediaGenerationOrchestrator {
         signal: active.controller.signal,
         endUserId: active.userId,
       })) {
-        if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
+        if (
+          active.controller.signal.aborted
+          && event.type !== 'generation'
+          && event.type !== 'usage'
+        ) throw toSafeAppError({ code: 'CANCELLED' })
         if ('choiceIndex' in event && event.choiceIndex !== 0) continue
         if (event.type === 'audio_delta') {
           await writer.appendBase64Chunk(event.dataBase64)
@@ -469,6 +477,7 @@ export class MediaGenerationOrchestrator {
         } else if (event.type === 'tool_call') {
           throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
         }
+        if (active.controller.signal.aborted) throw toSafeAppError({ code: 'CANCELLED' })
       }
     } finally {
       if (recordsProviderUsage && !costReported) {

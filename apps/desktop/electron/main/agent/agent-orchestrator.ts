@@ -13,7 +13,11 @@ import {
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
 import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
 import { retrieveWorkflows } from '../workflows/retriever.js'
-import type { AppRepositories, ProviderUsageRepository } from '../database/repositories.js'
+import {
+  ProviderUsageConsistencyError,
+  type AppRepositories,
+  type ProviderUsageRepository,
+} from '../database/repositories.js'
 import type {
   ModelContentPart,
   ModelMessage,
@@ -485,6 +489,7 @@ export class AgentOrchestrator {
     try {
       return await this.drive(active)
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) throw error
       if (active.terminal) return active.terminal
       if (active.cancelled || active.controller.signal.aborted) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       return this.finish(active, 'failed', asAppError(error))
@@ -532,7 +537,9 @@ export class AgentOrchestrator {
           signal: active.controller.signal,
           endUserId: active.userId,
         })) {
-          if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+          if (active.cancelled && event.type !== 'generation' && event.type !== 'usage') {
+            return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+          }
           if ('choiceIndex' in event && event.choiceIndex !== 0) continue
           switch (event.type) {
             case 'text_delta':
@@ -571,6 +578,7 @@ export class AgentOrchestrator {
               }
               break
           }
+          if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
         }
       } finally {
         if (recordsProviderUsage && !costReported) {

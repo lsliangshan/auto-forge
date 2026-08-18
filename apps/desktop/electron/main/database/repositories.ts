@@ -64,6 +64,13 @@ export interface ChatRun {
 export type ProviderUsageStatus = 'pending' | 'reported' | 'unknown'
 export type ProviderUsageModality = 'text' | 'image' | 'audio' | 'video'
 
+export class ProviderUsageConsistencyError extends Error {
+  constructor() {
+    super('Provider usage consistency error')
+    this.name = 'ProviderUsageConsistencyError'
+  }
+}
+
 export interface ProviderUsageStart {
   id: string
   operationKey: string
@@ -590,8 +597,8 @@ function safeTokenCount(value: unknown): number {
   return value
 }
 
-function providerUsageConsistencyError(): Error {
-  return new Error('Provider usage consistency error')
+function providerUsageConsistencyError(): ProviderUsageConsistencyError {
+  return new ProviderUsageConsistencyError()
 }
 
 function providerUsageFromRow(row: Query): ProviderUsageEvent {
@@ -1960,6 +1967,14 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     providerUsage: {
       start(event) {
         return transaction(database, () => {
+          const idOwner = one<{ operationKey: string }>(database, `
+            SELECT operation_key AS operationKey
+            FROM provider_usage_events
+            WHERE id = @id
+          `, { id: event.id })
+          if (idOwner && idOwner.operationKey !== event.operationKey) {
+            throw providerUsageConsistencyError()
+          }
           database.prepare(`
             INSERT INTO provider_usage_events (
               id, operation_key, user_id, provider, api_key_fingerprint, request_id,
@@ -2018,12 +2033,11 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const stored = getProviderUsage(database, operationKey)
           if (stored.status === 'reported') {
             if (
-              (report.generationId !== undefined && stored.generationId !== report.generationId)
-              || (report.providerJobId !== undefined && stored.providerJobId !== report.providerJobId)
+              (report.generationId !== undefined && report.generationId !== stored.generationId)
+              || (report.providerJobId !== undefined && report.providerJobId !== stored.providerJobId)
               || stored.inputTokens !== report.inputTokens
               || stored.outputTokens !== report.outputTokens
               || stored.costUsd !== costUsd
-              || stored.endedAt !== report.endedAt
             ) throw providerUsageConsistencyError()
             return stored
           }
@@ -2072,10 +2086,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return transaction(database, () => {
           const stored = getProviderUsage(database, operationKey)
           if (stored.status === 'reported') return stored
-          if (stored.status === 'unknown') {
-            if (stored.endedAt !== endedAt) throw providerUsageConsistencyError()
-            return stored
-          }
+          if (stored.status === 'unknown') return stored
           const terminalAt = stored.endedAt ?? endedAt
           const nextReconcileAt = stored.provider === 'openrouter' && stored.generationId !== undefined
             ? terminalAt + 1_000

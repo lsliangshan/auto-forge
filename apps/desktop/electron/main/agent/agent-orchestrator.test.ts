@@ -10,7 +10,10 @@ import {
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
-import type { ProviderUsageRepository } from '../database/repositories.js'
+import {
+  ProviderUsageConsistencyError,
+  type ProviderUsageRepository,
+} from '../database/repositories.js'
 
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
@@ -904,6 +907,88 @@ describe('AgentOrchestrator', () => {
     await orchestrator.cancel('request_1')
     await expect(running).resolves.toMatchObject({ status: 'cancelled' })
     expect(cancelled).toBe(true)
+    expect(dependencies.records.terminal).toHaveLength(1)
+  })
+
+  it.each([
+    {
+      name: 'generation identity',
+      event: { type: 'generation', id: 'generation_after_cancel' } as ProviderStreamEvent,
+      assertRecorded(dependencies: ReturnType<typeof harness>) {
+        expect(dependencies.providerUsage.bindIdentity).toHaveBeenCalledWith(
+          'agent:request_after_cancel:turn:0',
+          { generationId: 'generation_after_cancel' },
+        )
+      },
+    },
+    {
+      name: 'reported cost',
+      event: {
+        type: 'usage', inputTokens: 4, outputTokens: 5, totalTokens: 9, costUsd: '0.09',
+      } as ProviderStreamEvent,
+      assertRecorded(dependencies: ReturnType<typeof harness>) {
+        expect(dependencies.providerUsage.report).toHaveBeenCalledWith(
+          'agent:request_after_cancel:turn:0',
+          { inputTokens: 4, outputTokens: 5, costUsd: '0.09', endedAt: 100 },
+        )
+      },
+    },
+  ])('records a delivered $name before respecting cancellation', async ({ event, assertRecorded }) => {
+    const dependencies = harness([])
+    let providerStarted!: () => void
+    let releaseProvider!: () => void
+    const started = new Promise<void>((resolve) => { providerStarted = resolve })
+    const released = new Promise<void>((resolve) => { releaseProvider = resolve })
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
+      providerStarted()
+      await released
+      yield event
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'conversation_after_cancel',
+      content: '回答',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_after_cancel',
+    }))
+    await started
+
+    await orchestrator.cancel('request_after_cancel')
+    releaseProvider()
+
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+    assertRecorded(dependencies)
+  })
+
+  it('rethrows provider usage consistency errors even after cancellation terminalized the run', async () => {
+    const dependencies = harness([])
+    let providerStarted!: () => void
+    let releaseProvider!: () => void
+    const started = new Promise<void>((resolve) => { providerStarted = resolve })
+    const released = new Promise<void>((resolve) => { releaseProvider = resolve })
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
+      providerStarted()
+      await released
+      yield { type: 'usage' as const, inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '0.01' }
+    })
+    vi.mocked(dependencies.providerUsage.report).mockImplementation(() => {
+      throw new ProviderUsageConsistencyError()
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'conversation_consistency_error',
+      content: '回答',
+      provider: 'openrouter',
+      model: 'openrouter/model',
+      requestId: 'request_consistency_error',
+    }))
+    await started
+
+    await orchestrator.cancel('request_consistency_error')
+    releaseProvider()
+
+    await expect(running).rejects.toBeInstanceOf(ProviderUsageConsistencyError)
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 

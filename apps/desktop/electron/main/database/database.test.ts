@@ -7,6 +7,7 @@ import Database from 'better-sqlite3'
 import { type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
+import { ProviderUsageConsistencyError } from './repositories.js'
 
 const temporaryDirectories: string[] = []
 
@@ -99,6 +100,20 @@ function usageStart(id: string, userId: string, overrides: Record<string, unknow
     startedAt: 200,
     ...overrides,
   }
+}
+
+function expectProviderUsageConsistencyError(operation: () => unknown): void {
+  let thrown: unknown
+  try {
+    operation()
+  } catch (error) {
+    thrown = error
+  }
+  expect(thrown).toBeInstanceOf(ProviderUsageConsistencyError)
+  expect(thrown).toMatchObject({
+    name: 'ProviderUsageConsistencyError',
+    message: 'Provider usage consistency error',
+  })
 }
 
 const defaultConversationGenerationPreferences: ConversationGenerationPreferences = {
@@ -347,18 +362,27 @@ describe('openAppDatabase', () => {
 
     expect(database.providerUsage.start(start)).toMatchObject({ ...start, status: 'pending', reconcileAttempts: 0 })
     expect(database.providerUsage.start({ ...start })).toMatchObject(start)
-    expect(() => database.providerUsage.start({ ...start, requestId: 'request_conflict' }))
-      .toThrow('Provider usage consistency error')
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.start({ ...start, requestId: 'request_conflict' })
+    ))
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.start({
+        ...usageStart('identity_other_operation', 'user_identity'),
+        id: start.id,
+      })
+    ))
     expect(database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_identity' }))
       .toMatchObject({ generationId: 'generation_identity' })
     expect(database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_identity', providerJobId: 'job_identity' }))
       .toMatchObject({ generationId: 'generation_identity', providerJobId: 'job_identity' })
     expect(database.providerUsage.bindIdentity(start.operationKey, {}))
       .toMatchObject({ generationId: 'generation_identity', providerJobId: 'job_identity' })
-    expect(() => database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_conflict' }))
-      .toThrow('Provider usage consistency error')
-    expect(() => database.providerUsage.bindIdentity('operation_missing', { generationId: 'generation_missing' }))
-      .toThrow('Provider usage consistency error')
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_conflict' })
+    ))
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.bindIdentity('operation_missing', { generationId: 'generation_missing' })
+    ))
     expect(database.providerUsage.bindIdentity(start.operationKey, {}))
       .toMatchObject({ requestId: start.requestId, generationId: 'generation_identity' })
   })
@@ -383,19 +407,20 @@ describe('openAppDatabase', () => {
     })
     expect(database.providerUsage.report(start.operationKey, { ...report, costUsd: '0.00000010' }))
       .toMatchObject({ costUsd: '0.0000001' })
+    expect(database.providerUsage.report(start.operationKey, { ...report, endedAt: 501 }))
+      .toMatchObject({ costUsd: '0.0000001', endedAt: 500 })
     for (const conflict of [
       { ...report, generationId: 'generation_other' },
       { ...report, providerJobId: 'job_other' },
       { ...report, inputTokens: 1 },
       { ...report, outputTokens: 8 },
       { ...report, costUsd: '0.0000002' },
-      { ...report, endedAt: 501 },
     ]) {
-      expect(() => database.providerUsage.report(start.operationKey, conflict))
-        .toThrow('Provider usage consistency error')
+      expectProviderUsageConsistencyError(() => (
+        database.providerUsage.report(start.operationKey, conflict)
+      ))
     }
-    expect(() => database.providerUsage.report('operation_missing', report))
-      .toThrow('Provider usage consistency error')
+    expectProviderUsageConsistencyError(() => database.providerUsage.report('operation_missing', report))
     expect(database.providerUsage.markUnknown(start.operationKey, 999)).toMatchObject({
       status: 'reported', costUsd: '0.0000001', endedAt: 500,
     })
@@ -453,16 +478,15 @@ describe('openAppDatabase', () => {
       status: 'unknown', endedAt: 400, nextReconcileAt: 1_400,
     })
     expect(database.providerUsage.markUnknown(scheduled.operationKey, 400)).toMatchObject({ endedAt: 400 })
-    expect(() => database.providerUsage.markUnknown(scheduled.operationKey, 401))
-      .toThrow('Provider usage consistency error')
+    expect(database.providerUsage.markUnknown(scheduled.operationKey, 401))
+      .toMatchObject({ status: 'unknown', endedAt: 400, nextReconcileAt: 1_400 })
     expect(database.providerUsage.markUnknown(unscheduled.operationKey, 401)).toMatchObject({
       status: 'unknown', endedAt: 401, nextReconcileAt: undefined,
     })
     expect(database.providerUsage.markUnknown(deepseek.operationKey, 402)).toMatchObject({
       status: 'unknown', nextReconcileAt: undefined,
     })
-    expect(() => database.providerUsage.markUnknown('operation_missing', 1))
-      .toThrow('Provider usage consistency error')
+    expectProviderUsageConsistencyError(() => database.providerUsage.markUnknown('operation_missing', 1))
 
     expect(database.providerUsage.recoverPending(500)).toBe(1)
     expect(database.providerUsage.markUnknown(recovered.operationKey, 500)).toMatchObject({

@@ -15,7 +15,10 @@ import {
   type AgentPersistencePort,
 } from '../agent/agent-orchestrator.js'
 import { openAppDatabase } from '../database/client.js'
-import type { ProviderUsageRepository } from '../database/repositories.js'
+import {
+  ProviderUsageConsistencyError,
+  type ProviderUsageRepository,
+} from '../database/repositories.js'
 import type {
   GeneratedAssetWriter,
   MediaAssetService,
@@ -204,6 +207,62 @@ const input = {
 }
 
 describe('MediaGenerationOrchestrator', () => {
+  it('rethrows provider usage consistency errors without persisting a business failure', async () => {
+    const harness = createHarness()
+    vi.mocked(harness.providerUsage.report).mockImplementation(() => {
+      throw new ProviderUsageConsistencyError()
+    })
+
+    await expect(new MediaGenerationOrchestrator(harness.dependencies)
+      .runImage({ ...input, route: imageRoute }))
+      .rejects.toBeInstanceOf(ProviderUsageConsistencyError)
+
+    expect(harness.persistence.finalize).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: 'generation identity',
+      event: { type: 'generation', id: 'generation_audio_after_cancel' },
+      assertRecorded(harness: ReturnType<typeof createHarness>) {
+        expect(harness.providerUsage.bindIdentity).toHaveBeenCalledWith(
+          'audio:request_1',
+          { generationId: 'generation_audio_after_cancel' },
+        )
+      },
+    },
+    {
+      name: 'reported cost',
+      event: { type: 'usage', inputTokens: 6, outputTokens: 7, totalTokens: 13, costUsd: '0.13' },
+      assertRecorded(harness: ReturnType<typeof createHarness>) {
+        expect(harness.providerUsage.report).toHaveBeenCalledWith(
+          'audio:request_1',
+          { inputTokens: 6, outputTokens: 7, costUsd: '0.13', endedAt: 100 },
+        )
+      },
+    },
+  ])('records delivered audio $name before respecting cancellation', async ({ event, assertRecorded }) => {
+    const harness = createHarness()
+    let providerStarted!: () => void
+    let releaseProvider!: () => void
+    const started = new Promise<void>((resolve) => { providerStarted = resolve })
+    const released = new Promise<void>((resolve) => { releaseProvider = resolve })
+    harness.provider.stream.mockImplementation(() => (async function* () {
+      providerStarted()
+      await released
+      yield event as never
+    })())
+    const orchestrator = new MediaGenerationOrchestrator(harness.dependencies)
+    const running = orchestrator.runAudio({ ...input, route: audioRoute })
+    await started
+
+    await orchestrator.cancel('request_1')
+    releaseProvider()
+
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+    assertRecorded(harness)
+  })
+
   it('reports image cost before local asset persistence and keeps it when persistence fails', async () => {
     const harness = createHarness()
     vi.mocked(harness.media.commitGeneratedBase64).mockImplementation(async () => {
