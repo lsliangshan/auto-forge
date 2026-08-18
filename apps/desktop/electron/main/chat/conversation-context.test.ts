@@ -159,6 +159,7 @@ function prepareInput(
     stream: vi.fn<ConversationContextProviderPort['stream']>(async function* () {}),
   }
   const { provider: _legacyProvider, ...inputOverrides } = overrides
+  void _legacyProvider
   return {
     conversationId: 'c1',
     beforeOrdinal: 11,
@@ -638,6 +639,7 @@ describe('conversation context compression billing', () => {
     ])
     test.input.signal = controller.signal
     vi.mocked(test.input.providerSnapshot.provider.stream).mockImplementation(async function* (request) {
+      void request
       yield { type: 'generation', id: 'summary_generation_cancelled' }
       yield { type: 'usage', inputTokens: 2, outputTokens: 2, totalTokens: 4, costUsd: '0.04' }
       controller.abort()
