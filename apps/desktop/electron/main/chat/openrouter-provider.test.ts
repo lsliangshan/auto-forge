@@ -68,6 +68,79 @@ const allImageParameters = {
 } as const
 
 describe('OpenRouterProvider', () => {
+  it('keeps every operation on the credential captured by its snapshot', async () => {
+    let apiKey = 'sk-openrouter-snapshot-a'
+    const localCredential = { get: vi.fn(async () => apiKey) }
+    const authorizations: string[] = []
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      if (url.endsWith('/images/models') || url.endsWith('/videos/models') || url.endsWith('/models')) {
+        return Response.json({ data: [] })
+      }
+      if (url.endsWith('/chat/completions')) return sseResponse(['data: [DONE]\n\n'])
+      if (url.endsWith('/images')) {
+        return Response.json({ data: [{ b64_json: 'AQID', media_type: 'image/png' }] })
+      }
+      if (url.endsWith('/videos')) return Response.json({ id: 'job_1', status: 'pending' })
+      if (url.endsWith('/videos/job_1')) {
+        return Response.json({ id: 'job_1', status: 'completed', generation_id: 'gen_1' })
+      }
+      if (url.includes('/videos/job_1/content')) return new Response('video')
+      if (url.includes('/generation?id=gen_1')) {
+        return Response.json({ data: { id: 'gen_1', total_cost: '0.25' } })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    const source = new OpenRouterProvider({ credential: localCredential, fetch })
+    const snapshot = await source.acquireSnapshot()
+    apiKey = 'sk-openrouter-snapshot-b'
+
+    await expect(snapshot.provider.listModels()).resolves.toEqual([])
+    await expect(snapshot.provider.validateCredential()).resolves.toEqual({ valid: true })
+    await expect(collect(snapshot.provider.stream({ model: 'text/model', messages: [] }))).resolves.toEqual([])
+    await expect(snapshot.provider.generateImage?.({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    })).resolves.toMatchObject({ outputs: [{ type: 'base64', dataBase64: 'AQID' }] })
+    await expect(snapshot.provider.submitVideo?.({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+      frameImages: [],
+    })).resolves.toEqual({ providerJobId: 'job_1', status: 'pending' })
+    await expect(snapshot.provider.pollVideo?.('job_1')).resolves.toEqual({
+      status: 'completed',
+      generationId: 'gen_1',
+    })
+    await expect(snapshot.provider.downloadVideo?.('job_1')).resolves.toBeInstanceOf(Response)
+    await expect(snapshot.provider.getGenerationUsage?.('gen_1')).resolves.toEqual({
+      generationId: 'gen_1',
+      costUsd: '0.25',
+    })
+
+    expect(localCredential.get).toHaveBeenCalledTimes(1)
+    expect(authorizations.length).toBeGreaterThan(0)
+    expect(authorizations.every((value) => value === 'Bearer sk-openrouter-snapshot-a')).toBe(true)
+    expect(JSON.stringify(snapshot)).not.toContain('sk-openrouter-snapshot-a')
+    expect(JSON.stringify(snapshot)).not.toContain('sk-openrouter-snapshot-b')
+  })
+
+  it('uses the existing credential-unavailable error when snapshot acquisition has no key', async () => {
+    const provider = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => undefined) },
+      fetch: vi.fn(),
+    })
+
+    await expect(provider.acquireSnapshot()).rejects.toMatchObject({
+      code: 'CREDENTIAL_UNAVAILABLE',
+    })
+  })
+
   it('serializes an end user only in OpenRouter chat requests', async () => {
     const bodies: unknown[] = []
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {

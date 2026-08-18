@@ -5,6 +5,7 @@ import {
   type AppError,
   type GenerationOptions,
   type ModelInfo,
+  type ModelProviderId,
   type VideoFrameType,
 } from '@autoforge/shared'
 import type { ModelMediaInput } from '../media/media-asset-service.js'
@@ -110,6 +111,16 @@ export interface ModelProvider {
   pollVideo?(providerJobId: string, signal?: AbortSignal): Promise<ModelVideoStatus>
   downloadVideo?(providerJobId: string, signal?: AbortSignal): Promise<Response>
   getGenerationUsage?: GenerationUsageProviderPort['getGenerationUsage']
+}
+
+export interface ModelProviderSnapshot {
+  providerId: ModelProviderId
+  provider: ModelProvider
+  apiKeyFingerprint?: string
+}
+
+export interface ModelProviderSnapshotSource {
+  acquire(providerId: ModelProviderId): Promise<ModelProviderSnapshot>
 }
 
 export interface ModelCredentialPort {
@@ -276,6 +287,19 @@ class RetryableFailure extends Error {
 
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
+}
+
+export async function readCredentialSnapshot(
+  read: () => Promise<string | undefined>,
+): Promise<string> {
+  try {
+    const value = await read()
+    if (!value) throw failure('CREDENTIAL_UNAVAILABLE')
+    return value
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error) throw error
+    throw failure('CREDENTIAL_UNAVAILABLE')
+  }
 }
 
 function isAbort(error: unknown, signal?: AbortSignal): boolean {

@@ -1,12 +1,15 @@
 import { z } from 'zod'
 import { toSafeAppError, type AppError, type VideoFrameType } from '@autoforge/shared'
 import { normalizeUsd } from '../billing/decimal-usd.js'
+import { fingerprintApiKey } from '../billing/provider-usage-reconciler.js'
 import {
   mergeOpenRouterModels,
   OpenAiCompatibleProvider,
   parseOpenRouterImageModels,
   parseOpenRouterModels,
   parseOpenRouterVideoModels,
+  readCredentialSnapshot,
+  type ModelProviderSnapshot,
   type ModelImageRequest,
   type ModelImageResult,
   type ModelGenerationUsage,
@@ -275,6 +278,8 @@ export interface OpenRouterProviderDependencies extends Omit<OpenAiCompatiblePro
 }
 
 export class OpenRouterProvider extends OpenAiCompatibleProvider {
+  private readonly snapshotDependencies: OpenRouterProviderDependencies
+
   constructor(dependencies: OpenRouterProviderDependencies) {
     const fetch = releaseUnauthorizedResponse(dependencies.fetch ?? globalThis.fetch)
     super({
@@ -295,6 +300,21 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
       fetch,
       credential: { get: () => dependencies.credential.get('openrouter_api_key') },
     })
+    this.snapshotDependencies = dependencies
+  }
+
+  async acquireSnapshot(): Promise<ModelProviderSnapshot> {
+    const apiKey = await readCredentialSnapshot(
+      () => this.snapshotDependencies.credential.get('openrouter_api_key'),
+    )
+    return {
+      providerId: 'openrouter',
+      provider: new OpenRouterProvider({
+        ...this.snapshotDependencies,
+        credential: { get: async () => apiKey },
+      }),
+      apiKeyFingerprint: fingerprintApiKey(apiKey),
+    }
   }
 
   async getGenerationUsage(generationId: string, signal?: AbortSignal): Promise<ModelGenerationUsage> {
