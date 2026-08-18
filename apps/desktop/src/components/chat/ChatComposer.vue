@@ -60,7 +60,7 @@
         <span>模型</span>
         <select
           data-testid="model-select"
-          :disabled="disabled || running || chat.preferences.outputType === 'auto' || compatibleModels.length === 0"
+          :disabled="disabled || running || modelsLoading || chat.preferences.outputType === 'auto' || compatibleModels.length === 0"
           :title="chat.preferences.outputType === 'auto' ? '自动模式使用供应商默认模型' : undefined"
           :value="selectedModelId"
           @change="changeModel"
@@ -103,7 +103,7 @@
         v-if="selectedModel?.generation.image?.resolutions.length"
         data-testid="image-resolution"
         :value="chat.preferences.generation.image.resolution"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="图片分辨率"
         @change="changeImageOption('resolution', $event)"
       >
@@ -119,7 +119,7 @@
         v-if="selectedModel?.generation.image?.aspectRatios.length"
         data-testid="image-aspect-ratio"
         :value="chat.preferences.generation.image.aspectRatio"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="图片画幅"
         @change="changeImageOption('aspectRatio', $event)"
       >
@@ -135,7 +135,7 @@
         v-if="selectedModel?.generation.image?.formats.length"
         data-testid="image-format"
         :value="chat.preferences.generation.image.format"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="图片格式"
         @change="changeImageOption('format', $event)"
       >
@@ -158,7 +158,7 @@
         v-if="selectedModel?.generation.audio?.voices.length"
         data-testid="audio-voice"
         :value="chat.preferences.generation.audio.voice ?? ''"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="音色"
         @change="changeAudioOption('voice', $event)"
       >
@@ -177,7 +177,7 @@
         v-if="selectedModel?.generation.audio?.formats.length"
         data-testid="audio-format"
         :value="chat.preferences.generation.audio.format"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="音频格式"
         @change="changeAudioOption('format', $event)"
       >
@@ -200,7 +200,7 @@
         v-if="selectedModel?.generation.video?.durations.length"
         data-testid="video-duration"
         :value="chat.preferences.generation.video.durationSeconds"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="视频时长"
         @change="changeVideoNumberOption('durationSeconds', $event)"
       >
@@ -216,7 +216,7 @@
         v-if="selectedModel?.generation.video?.resolutions.length"
         data-testid="video-resolution"
         :value="chat.preferences.generation.video.resolution"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="视频分辨率"
         @change="changeVideoOption('resolution', $event)"
       >
@@ -232,7 +232,7 @@
         v-if="selectedModel?.generation.video?.aspectRatios.length"
         data-testid="video-aspect-ratio"
         :value="chat.preferences.generation.video.aspectRatio"
-        :disabled="disabled || running"
+        :disabled="disabled || running || modelsLoading"
         aria-label="视频画幅"
         @change="changeVideoOption('aspectRatio', $event)"
       >
@@ -249,7 +249,7 @@
           type="checkbox"
           data-testid="video-generate-audio"
           :checked="chat.preferences.generation.video.generateAudio"
-          :disabled="disabled || running"
+          :disabled="disabled || running || modelsLoading"
           @change="changeVideoAudio"
         >
         生成伴随音频
@@ -337,10 +337,14 @@ const props = withDefaults(defineProps<{
   models?: ModelInfo[]
   defaultModel?: string
   defaultModels?: Partial<Record<ConcreteOutput, string>>
+  modelsLoading?: boolean
+  refreshModels?: () => Promise<ModelInfo[] | undefined>
 }>(), {
   models: () => [],
   defaultModel: '',
   defaultModels: () => ({}),
+  modelsLoading: false,
+  refreshModels: undefined,
 })
 const emit = defineEmits<{
   submit: [
@@ -375,12 +379,12 @@ function modelSupportsOutput(model: ModelInfo, output: ConcreteOutput): boolean 
   return chat.drafts.every(({ kind }) => model.inputModalities.includes(kind))
 }
 
-function modelsForOutput(output: OutputType): ModelInfo[] {
+function modelsForOutput(output: OutputType, models = props.models): ModelInfo[] {
   if (output === 'auto') {
-    return props.models.filter((model) =>
+    return models.filter((model) =>
       model.outputModalities.some((candidate) => modelSupportsOutput(model, candidate)))
   }
-  return props.models.filter((model) => modelSupportsOutput(model, output))
+  return models.filter((model) => modelSupportsOutput(model, output))
 }
 
 function outputSupported(output: OutputType): boolean {
@@ -416,6 +420,7 @@ const autoChoiceRequired = computed(() => {
 const canSubmit = computed(() => {
   if (props.disabled
     || props.running
+    || props.modelsLoading
     || awaitingAcceptance.value
     || autoChoiceRequired.value
     || !selectedModel.value) return false
@@ -446,16 +451,19 @@ function changeOutputType(event: unknown) {
   })
 }
 
-function changeModel(event: unknown) {
-  if (props.disabled || props.running) return
-  const model = eventValue(event)
+async function changeModel(event: unknown) {
+  if (props.disabled || props.running || props.modelsLoading) return
+  const requested = eventValue(event)
   const output = chat.preferences.outputType
-  if (!model || output === 'auto') return
-  const selected = modelsForOutput(output).find(({ id }) => id === model)
+  if (!requested || output === 'auto' || requested === selectedModelId.value) return
+  const refreshed = props.refreshModels ? await props.refreshModels() : undefined
+  if (chat.preferences.outputType !== output) return
+  const candidates = modelsForOutput(output, refreshed ?? props.models)
+  const selected = candidates.find(({ id }) => id === requested) ?? candidates[0]
   if (!selected) return
   savePreferences({
     ...chat.preferences,
-    models: { ...chat.preferences.models, [output]: model },
+    models: { ...chat.preferences.models, [output]: selected.id },
     generation: normalizeGeneration(chat.preferences.generation, selected, output),
   })
 }

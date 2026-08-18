@@ -1601,6 +1601,97 @@ describe('chat interactions', () => {
     })
   })
 
+  it('refreshes OpenRouter video capabilities after changing models', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.conversations = [{
+      id: 'conversation_1', title: 'Video',
+      createdAt: '2026-08-18T00:00:00.000Z', updatedAt: '2026-08-18T00:00:00.000Z',
+    }]
+    chat.selectedConversationId = 'conversation_1'
+    chat.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'video',
+      models: { video: 'video/model-one' },
+    })
+    const settings = useSettingsStore()
+    settings.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: { deepseek: { text: 'deepseek-chat' }, openrouter: { video: 'video/model-one' } },
+      showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
+    }
+    const first = modelInfo('video/model-one', ['video'])
+    const refreshed = {
+      ...modelInfo('video/model-two', ['video']),
+      generation: {
+        video: {
+          resolutions: ['4K'],
+          aspectRatios: ['9:16'],
+          durations: [4, 8],
+          supportsAudio: false,
+          frameImages: ['first_frame', 'last_frame'] as const,
+        },
+      },
+    } satisfies ModelInfo
+    settings.providerModels.openrouter = [first, modelInfo('video/model-two', ['video'])]
+    vi.mocked(api.settings.listProviderModels).mockResolvedValue([first, refreshed])
+    const wrapper = mount(ChatView, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="model-select"]').setValue('video/model-two')
+    await vi.waitFor(() => {
+      expect(api.settings.listProviderModels).toHaveBeenCalledWith('openrouter', true)
+      expect(chat.preferences.models.video).toBe('video/model-two')
+    })
+
+    expect(wrapper.findAll('[data-testid="video-duration"] option').map((option) => option.text()))
+      .toEqual(['4 秒', '8 秒'])
+    expect(wrapper.findAll('[data-testid="video-resolution"] option').map((option) => option.text()))
+      .toEqual(['4K'])
+    expect(wrapper.findAll('[data-testid="video-aspect-ratio"] option').map((option) => option.text()))
+      .toEqual(['9:16'])
+    expect(wrapper.find('[data-testid="video-generate-audio"]').exists()).toBe(false)
+  })
+
+  it('keeps cached video capabilities and shows an error when refresh fails', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.conversations = [{
+      id: 'conversation_1', title: 'Video',
+      createdAt: '2026-08-18T00:00:00.000Z', updatedAt: '2026-08-18T00:00:00.000Z',
+    }]
+    chat.selectedConversationId = 'conversation_1'
+    chat.preferencesByConversation.conversation_1 = generationPreferences({
+      outputType: 'video',
+      models: { video: 'video/model-one' },
+    })
+    const settings = useSettingsStore()
+    settings.settings = {
+      theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
+      activeProvider: 'openrouter',
+      defaultModels: { deepseek: { text: 'deepseek-chat' }, openrouter: { video: 'video/model-one' } },
+      showCosts: false, developerMode: false, permissionDefault: 'ask',
+      proxy: { enabled: false, bypassDomains: [] },
+    }
+    const cached = [modelInfo('video/model-one', ['video']), modelInfo('video/model-two', ['video'])]
+    settings.providerModels.openrouter = cached
+    vi.mocked(api.settings.listProviderModels).mockRejectedValue(new Error('raw provider body'))
+    const wrapper = mount(ChatView, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="model-select"]').setValue('video/model-two')
+    await vi.waitFor(() => {
+      expect(api.settings.listProviderModels).toHaveBeenCalledWith('openrouter', true)
+      expect(chat.preferences.models.video).toBe('video/model-two')
+      expect(wrapper.get('[role="alert"]').text()).toContain('模型列表加载失败')
+    })
+
+    expect(settings.providerModels.openrouter).toEqual(cached)
+    expect(wrapper.findAll('[data-testid="video-duration"] option').map((option) => option.text()))
+      .toEqual(['5 秒', '10 秒'])
+  })
+
   it('requires an explicit output choice for a first-use automatic multi-output model', () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

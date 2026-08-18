@@ -231,18 +231,21 @@ export const useSettingsStore = defineStore('settings', {
         this.saving = false
       }
     },
-    async loadModels(provider?: ModelProviderId) {
+    async loadModels(provider?: ModelProviderId, refresh = false): Promise<ModelInfo[] | undefined> {
       const target = provider ?? this.activeProvider
       const version = ++this._modelVersions[target]
       this.modelsLoading = target === this.activeProvider
       this.error = ''
       try {
-        const models = await getDesktopApi().settings.listProviderModels(target)
-        if (version === this._modelVersions[target]) this.providerModels[target] = models
+        const models = await getDesktopApi().settings.listProviderModels(target, refresh)
+        if (version !== this._modelVersions[target]) return undefined
+        this.providerModels[target] = models
+        return models
       } catch (error) {
         if (version === this._modelVersions[target] && target === this.activeProvider) {
           this.error = displayError(error, '模型列表加载失败')
         }
+        return undefined
       } finally {
         if (version === this._modelVersions[target] && target === this.activeProvider) this.modelsLoading = false
       }

@@ -38,6 +38,13 @@
           {{ chat.error }}
         </div>
         <div
+          v-if="settings.error"
+          class="af-error"
+          role="alert"
+        >
+          {{ settings.error }}
+        </div>
+        <div
           v-if="!chat.messages.length && !chat.isAwaitingResponse"
           class="chat-empty"
         >
@@ -80,6 +87,8 @@
         :disabled="false"
         :running="chat.isRunning"
         :models="settings.models"
+        :models-loading="settings.modelsLoading"
+        :refresh-models="refreshModels"
         :default-model="defaultModel"
         :default-models="defaultModels"
         @submit="submit"
@@ -156,6 +165,10 @@ const defaultModel = computed(() => {
     || providerDefaultFor('audio')
     || providerDefaultFor('video')
 })
+async function refreshModels() {
+  if (settings.activeProvider !== 'openrouter') return settings.models
+  return settings.loadModels('openrouter', true)
+}
 async function submit(
   input: Omit<ChatSendInput, 'conversationId'>,
   acknowledge: ChatSendAcknowledgement,
