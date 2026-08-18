@@ -636,8 +636,7 @@ function getProviderUsage(database: SqliteDatabase, operationKey: string): Provi
 }
 
 function sameProviderUsageStart(stored: ProviderUsageEvent, input: ProviderUsageStart): boolean {
-  return stored.id === input.id
-    && stored.operationKey === input.operationKey
+  return stored.operationKey === input.operationKey
     && stored.userId === input.userId
     && stored.provider === input.provider
     && stored.apiKeyFingerprint === input.apiKeyFingerprint
@@ -645,7 +644,6 @@ function sameProviderUsageStart(stored: ProviderUsageEvent, input: ProviderUsage
     && stored.chatRunId === input.chatRunId
     && stored.model === input.model
     && stored.modality === input.modality
-    && stored.startedAt === input.startedAt
 }
 
 interface ProviderCostRow {

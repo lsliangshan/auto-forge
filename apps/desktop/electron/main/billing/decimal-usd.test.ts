@@ -16,6 +16,21 @@ describe('normalizeUsd', () => {
   it.each(['', ' 1', '+1', '-1', 'NaN', 'Infinity', '1.2.3'])('rejects %p', (input) => {
     expect(() => normalizeUsd(input)).toThrow()
   })
+
+  it.each([
+    ['an exponent outside the bounded range', '1e1000000000'],
+    ['more than 1,024 digits', '1'.repeat(1_025)],
+    ['a resulting scale above 1,024 places', '0.1e-1024'],
+    ['a source above 4,096 characters', `0.${'0'.repeat(4_095)}`],
+  ])('quickly rejects %s', (_description, input) => {
+    const startedAt = performance.now()
+    expect(() => normalizeUsd(input)).toThrow(TypeError)
+    expect(performance.now() - startedAt).toBeLessThan(100)
+  })
+
+  it('accepts ordinary scientific notation within the bounded range', () => {
+    expect(normalizeUsd('1e-7')).toBe('0.0000001')
+  })
 })
 
 it('adds without binary floating-point loss', () => {

@@ -3,20 +3,37 @@ interface FixedDecimal {
   scale: number
 }
 
+const MAX_USD_SOURCE_LENGTH = 4_096
+const MAX_USD_DIGITS = 1_024
+const MAX_USD_EXPONENT_MAGNITUDE = 1_024
+const MAX_USD_RESULT_SCALE = 1_024
+
 function parseFixed(value: string | number): FixedDecimal {
   if (typeof value === 'number' && (!Number.isFinite(value) || value < 0)) {
     throw new TypeError('USD cost must be a non-negative finite decimal')
   }
 
   const source = typeof value === 'number' ? String(value) : value
+  if (source.length > MAX_USD_SOURCE_LENGTH) {
+    throw new TypeError('USD decimal source is too long')
+  }
   const match = /^(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(source)
   if (!match) throw new TypeError('USD cost must be a non-negative finite decimal')
 
   const fraction = match[2] ?? ''
+  if (match[1].length + fraction.length > MAX_USD_DIGITS) {
+    throw new TypeError('USD decimal has too many digits')
+  }
   const exponent = Number(match[3] ?? '0')
-  if (!Number.isSafeInteger(exponent)) throw new TypeError('USD exponent is out of range')
+  if (
+    !Number.isSafeInteger(exponent)
+    || Math.abs(exponent) > MAX_USD_EXPONENT_MAGNITUDE
+  ) throw new TypeError('USD exponent is out of range')
 
   const scale = fraction.length - exponent
+  if (scale > MAX_USD_RESULT_SCALE) {
+    throw new TypeError('USD decimal scale is out of range')
+  }
   const rawDigits = BigInt(`${match[1]}${fraction}`)
   return scale < 0
     ? { digits: rawDigits * 10n ** BigInt(-scale), scale: 0 }

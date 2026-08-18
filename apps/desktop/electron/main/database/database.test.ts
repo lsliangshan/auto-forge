@@ -358,13 +358,28 @@ describe('openAppDatabase', () => {
   it('keeps provider usage starts and identity binding idempotent without overwriting conflicts', () => {
     const database = openTestDatabase()
     insertLocalUser(database, 'user_identity', 'Identity')
+    insertLocalUser(database, 'user_identity_other', 'IdentityOther')
     const start = usageStart('identity', 'user_identity')
 
     expect(database.providerUsage.start(start)).toMatchObject({ ...start, status: 'pending', reconcileAttempts: 0 })
     expect(database.providerUsage.start({ ...start })).toMatchObject(start)
-    expectProviderUsageConsistencyError(() => (
-      database.providerUsage.start({ ...start, requestId: 'request_conflict' })
-    ))
+    const replay = { ...start, id: 'identity_replay_storage_id', startedAt: 999 }
+    expect(database.providerUsage.start(replay)).toMatchObject(start)
+    for (const conflict of [
+      { ...replay, userId: 'user_identity_other' },
+      { ...replay, provider: 'deepseek' as const },
+      { ...replay, apiKeyFingerprint: 'other-fingerprint' },
+      { ...replay, requestId: 'request_conflict' },
+      { ...replay, chatRunId: 'chat_run_conflict' },
+      { ...replay, model: 'other/model' },
+      { ...replay, modality: 'image' as const },
+    ]) {
+      expectProviderUsageConsistencyError(() => database.providerUsage.start(conflict))
+    }
+    expect(database.providerUsage.start({
+      ...usageStart('identity_replay_storage_id', 'user_identity'),
+      operationKey: 'operation_identity_replay_storage_id_owner',
+    })).toMatchObject({ operationKey: 'operation_identity_replay_storage_id_owner' })
     expectProviderUsageConsistencyError(() => (
       database.providerUsage.start({
         ...usageStart('identity_other_operation', 'user_identity'),
