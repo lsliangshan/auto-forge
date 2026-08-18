@@ -250,6 +250,34 @@ describe('createApplicationRuntime', () => {
       inputTokens: 40,
       outputTokens: 60,
     })
+    database.providerUsage.start({
+      id: 'usage_cost',
+      operationKey: 'usage_cost',
+      userId: 'user_usage',
+      provider: 'openrouter',
+      requestId: 'usage_request',
+      model: 'alpha/model',
+      modality: 'text',
+      startedAt: new Date(2026, 7, 17, 10).getTime(),
+    })
+    database.providerUsage.report('usage_cost', {
+      costUsd: '0.25',
+      endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
+    })
+    database.providerUsage.start({
+      id: 'other_usage_cost',
+      operationKey: 'other_usage_cost',
+      userId: 'user_other',
+      provider: 'openrouter',
+      requestId: 'other_usage_request',
+      model: 'other/model',
+      modality: 'text',
+      startedAt: new Date(2026, 7, 17, 10).getTime(),
+    })
+    database.providerUsage.report('other_usage_cost', {
+      costUsd: '9',
+      endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
+    })
     database.close()
 
     vi.useFakeTimers()
@@ -264,7 +292,19 @@ describe('createApplicationRuntime', () => {
         inputTokens: 4,
         outputTokens: 6,
         totalTokens: 10,
-        models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
+        openRouterCostUsd: '0.25',
+        openRouterKnownCostCount: 1,
+        openRouterUnknownCostCount: 0,
+        models: [{
+          provider: 'openrouter',
+          model: 'alpha/model',
+          inputTokens: 4,
+          outputTokens: 6,
+          totalTokens: 10,
+          openRouterCostUsd: '0.25',
+          openRouterKnownCostCount: 1,
+          openRouterUnknownCostCount: 0,
+        }],
       })
       expect(usage.today.trend.reduce((sum, point) => sum + point.totalTokens, 0)).toBe(10)
       expect(usage.yesterday.totalTokens).toBe(0)

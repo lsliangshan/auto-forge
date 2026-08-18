@@ -9,10 +9,39 @@ const zeroRecord = () => ({
   trend: [],
 })
 
+const zeroCostRecord = () => ({
+  openRouterCostUsd: '0',
+  openRouterKnownCostCount: 0,
+  openRouterUnknownCostCount: 0,
+  models: [],
+})
+
+const zeroCostSnapshot = () => ({
+  today: zeroCostRecord(),
+  yesterday: zeroCostRecord(),
+  week: zeroCostRecord(),
+  month: zeroCostRecord(),
+  allTime: zeroCostRecord(),
+})
+
+const zeroTokenSnapshot = () => ({
+  today: zeroRecord(),
+  yesterday: zeroRecord(),
+  week: zeroRecord(),
+  month: zeroRecord(),
+  allTime: zeroRecord(),
+})
+
+const createSnapshot = (
+  now: Date,
+  summarizeTokens: Parameters<typeof createTokenUsageSnapshot>[2],
+  summarizeCosts: Parameters<typeof createTokenUsageSnapshot>[3] = () => zeroCostSnapshot(),
+) => createTokenUsageSnapshot(now, 'user_1', summarizeTokens, summarizeCosts)
+
 describe('createTokenUsageSnapshot', () => {
   it('uses one local time snapshot for today, yesterday, Monday week and month', () => {
     const now = new Date(2026, 7, 19, 12, 30)
-    const summarize = vi.fn(() => ({
+    const summarize = vi.fn((_query: Parameters<Parameters<typeof createTokenUsageSnapshot>[2]>[0]) => ({
       today: zeroRecord(),
       yesterday: zeroRecord(),
       week: zeroRecord(),
@@ -20,9 +49,11 @@ describe('createTokenUsageSnapshot', () => {
       allTime: zeroRecord(),
     }))
 
-    const snapshot = createTokenUsageSnapshot(now, summarize)
+    const summarizeCosts = vi.fn((_query: Parameters<Parameters<typeof createTokenUsageSnapshot>[3]>[0]) => zeroCostSnapshot())
+    const snapshot = createTokenUsageSnapshot(now, 'user_1', summarize, summarizeCosts)
 
     expect(summarize).toHaveBeenCalledWith({
+      userId: 'user_1',
       yesterdayStartedAt: new Date(2026, 7, 18).getTime(),
       todayStartedAt: new Date(2026, 7, 19).getTime(),
       weekStartedAt: new Date(2026, 7, 17).getTime(),
@@ -30,6 +61,8 @@ describe('createTokenUsageSnapshot', () => {
       endedAt: now.getTime(),
     })
     expect(summarize).toHaveBeenCalledTimes(1)
+    expect(summarizeCosts).toHaveBeenCalledWith(summarize.mock.calls[0]![0])
+    expect(summarizeCosts).toHaveBeenCalledTimes(1)
     expect(snapshot.generatedAt).toBe(now.toISOString())
     expect(snapshot.yesterday.endedAt).toBe(new Date(2026, 7, 19).toISOString())
     expect(snapshot.today.endedAt).toBe(snapshot.generatedAt)
@@ -40,20 +73,183 @@ describe('createTokenUsageSnapshot', () => {
     expect(snapshot.today.trend.length).toBeGreaterThan(0)
     expect(snapshot.today.trend.every(({ totalTokens }) => totalTokens === 0)).toBe(true)
     expect(snapshot.allTime.trend).toEqual([])
+    expect(snapshot.today).toMatchObject({
+      openRouterCostUsd: '0',
+      openRouterKnownCostCount: 0,
+      openRouterUnknownCostCount: 0,
+    })
+  })
+
+  it('merges token and cost models by provider plus model and preserves sparse rows', () => {
+    const now = new Date(2026, 7, 17, 2)
+    const tokenPeriod = {
+      inputTokens: 3,
+      outputTokens: 3,
+      totalTokens: 6,
+      models: [
+        { provider: 'openrouter' as const, model: 'shared/model', inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        { provider: 'deepseek' as const, model: 'shared/model', inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+        { provider: 'openrouter' as const, model: 'token-only', inputTokens: 0, outputTokens: 1, totalTokens: 1 },
+      ],
+      trend: [{ bucket: '0', inputTokens: 3, outputTokens: 3, totalTokens: 6 }],
+    }
+    const costPeriod = {
+      openRouterCostUsd: '0.3',
+      openRouterKnownCostCount: 2,
+      openRouterUnknownCostCount: 1,
+      models: [
+        {
+          provider: 'openrouter' as const,
+          model: 'shared/model',
+          openRouterCostUsd: '0.1',
+          openRouterKnownCostCount: 1,
+          openRouterUnknownCostCount: 0,
+        },
+        {
+          provider: 'openrouter' as const,
+          model: 'cost-only',
+          openRouterCostUsd: '0.2',
+          openRouterKnownCostCount: 1,
+          openRouterUnknownCostCount: 1,
+        },
+      ],
+    }
+
+    const snapshot = createSnapshot(
+      now,
+      () => ({
+        today: tokenPeriod,
+        yesterday: zeroRecord(),
+        week: zeroRecord(),
+        month: zeroRecord(),
+        allTime: zeroRecord(),
+      }),
+      () => ({
+        today: costPeriod,
+        yesterday: zeroCostRecord(),
+        week: zeroCostRecord(),
+        month: zeroCostRecord(),
+        allTime: zeroCostRecord(),
+      }),
+    )
+
+    expect(snapshot.today).toMatchObject({
+      openRouterCostUsd: '0.3',
+      openRouterKnownCostCount: 2,
+      openRouterUnknownCostCount: 1,
+    })
+    expect(snapshot.today.models).toEqual([
+      {
+        provider: 'openrouter', model: 'shared/model',
+        inputTokens: 1, outputTokens: 1, totalTokens: 2,
+        openRouterCostUsd: '0.1', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 0,
+      },
+      {
+        provider: 'deepseek', model: 'shared/model',
+        inputTokens: 2, outputTokens: 1, totalTokens: 3,
+        openRouterCostUsd: '0', openRouterKnownCostCount: 0, openRouterUnknownCostCount: 0,
+      },
+      {
+        provider: 'openrouter', model: 'token-only',
+        inputTokens: 0, outputTokens: 1, totalTokens: 1,
+        openRouterCostUsd: '0', openRouterKnownCostCount: 0, openRouterUnknownCostCount: 0,
+      },
+      {
+        provider: 'openrouter', model: 'cost-only',
+        inputTokens: 0, outputTokens: 0, totalTokens: 0,
+        openRouterCostUsd: '0.2', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 1,
+      },
+    ])
+  })
+
+  it('starts all-time at the earliest token or provider cost event', () => {
+    const now = new Date(2026, 7, 17, 2)
+    const tokenStartedAt = new Date(2026, 6, 10).getTime()
+    const costStartedAt = new Date(2026, 5, 20).getTime()
+
+    const snapshot = createSnapshot(
+      now,
+      () => ({ ...zeroTokenSnapshot(), allTimeStartedAt: tokenStartedAt }),
+      () => ({ ...zeroCostSnapshot(), allTimeStartedAt: costStartedAt }),
+    )
+
+    expect(snapshot.allTime.startedAt).toBe(new Date(costStartedAt).toISOString())
+  })
+
+  it('rejects duplicate provider cost model keys', () => {
+    const duplicate = {
+      provider: 'openrouter' as const,
+      model: 'alpha/model',
+      openRouterCostUsd: '0.1',
+      openRouterKnownCostCount: 1,
+      openRouterUnknownCostCount: 0,
+    }
+
+    expect(() => createSnapshot(
+      new Date(2026, 7, 17, 2),
+      () => ({
+        today: zeroRecord(), yesterday: zeroRecord(), week: zeroRecord(), month: zeroRecord(), allTime: zeroRecord(),
+      }),
+      () => ({
+        today: {
+          openRouterCostUsd: '0.2', openRouterKnownCostCount: 2, openRouterUnknownCostCount: 0,
+          models: [duplicate, duplicate],
+        },
+        yesterday: zeroCostRecord(), week: zeroCostRecord(), month: zeroCostRecord(), allTime: zeroCostRecord(),
+      }),
+    )).toThrowError('Duplicate provider cost model: openrouter\u0000alpha/model')
+  })
+
+  it('rejects provider cost model totals that do not match the period', () => {
+    expect(() => createSnapshot(
+      new Date(2026, 7, 17, 2),
+      () => ({
+        today: zeroRecord(), yesterday: zeroRecord(), week: zeroRecord(), month: zeroRecord(), allTime: zeroRecord(),
+      }),
+      () => ({
+        today: {
+          openRouterCostUsd: '0.2', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 0,
+          models: [{
+            provider: 'openrouter' as const, model: 'alpha/model', openRouterCostUsd: '0.1',
+            openRouterKnownCostCount: 1, openRouterUnknownCostCount: 0,
+          }],
+        },
+        yesterday: zeroCostRecord(), week: zeroCostRecord(), month: zeroCostRecord(), allTime: zeroCostRecord(),
+      }),
+    )).toThrowError('Provider cost model totals do not match the period')
+  })
+
+  it('rejects token model totals that do not match the period', () => {
+    expect(() => createSnapshot(new Date(2026, 7, 17, 2), () => ({
+      today: {
+        inputTokens: 2,
+        outputTokens: 0,
+        totalTokens: 2,
+        models: [{
+          provider: 'openrouter' as const,
+          model: 'alpha/model',
+          inputTokens: 1,
+          outputTokens: 0,
+          totalTokens: 1,
+        }],
+        trend: [{ bucket: '0', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
+      },
+      yesterday: zeroRecord(), week: zeroRecord(), month: zeroRecord(), allTime: zeroRecord(),
+    }))).toThrowError('Token usage model totals do not match the period')
   })
 
   it('fills missing hour buckets and keeps the all-time first point inside its range', () => {
     const now = new Date(2026, 7, 17, 2, 30)
     const todayStartedAt = new Date(2026, 7, 17).getTime()
     const allTimeStartedAt = new Date(2026, 6, 15, 8).getTime()
-    const snapshot = createTokenUsageSnapshot(now, () => ({
+    const snapshot = createSnapshot(now, () => ({
       allTimeStartedAt,
       today: {
         inputTokens: 2,
         outputTokens: 3,
         totalTokens: 5,
         models: [
-          { model: 'alpha/model', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+          { provider: 'openrouter' as const, model: 'alpha/model', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
         ],
         trend: [{ bucket: '1', inputTokens: 2, outputTokens: 3, totalTokens: 5 }],
       },
@@ -65,7 +261,7 @@ describe('createTokenUsageSnapshot', () => {
         outputTokens: 3,
         totalTokens: 5,
         models: [
-          { model: 'alpha/model', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+          { provider: 'openrouter' as const, model: 'alpha/model', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
         ],
         trend: [{ bucket: '2026-07', inputTokens: 2, outputTokens: 3, totalTokens: 5 }],
       },
@@ -109,7 +305,7 @@ describe('createTokenUsageSnapshot', () => {
     process.env.TZ = 'America/New_York'
     try {
       const endedAt = new Date(2026, 2, 9).getTime()
-      const snapshot = createTokenUsageSnapshot(new Date(endedAt), () => ({
+      const snapshot = createSnapshot(new Date(endedAt), () => ({
         today: zeroRecord(),
         yesterday: zeroRecord(),
         week: zeroRecord(),
@@ -130,14 +326,14 @@ describe('createTokenUsageSnapshot', () => {
     try {
       const yesterdayStartedAt = new Date(2026, 10, 1).getTime()
       const endedAt = new Date(2026, 10, 2).getTime()
-      const snapshot = createTokenUsageSnapshot(new Date(endedAt), () => ({
+      const snapshot = createSnapshot(new Date(endedAt), () => ({
         today: zeroRecord(),
         yesterday: {
           inputTokens: 9,
           outputTokens: 14,
           totalTokens: 23,
           models: [
-            { model: 'alpha/model', inputTokens: 9, outputTokens: 14, totalTokens: 23 },
+            { provider: 'openrouter' as const, model: 'alpha/model', inputTokens: 9, outputTokens: 14, totalTokens: 23 },
           ],
           trend: [
             { bucket: '1', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
@@ -181,7 +377,7 @@ describe('createTokenUsageSnapshot', () => {
   it('excludes the bucket beginning exactly at the period end', () => {
     const now = new Date(2026, 7, 17, 2)
     const todayStartedAt = new Date(2026, 7, 17).getTime()
-    const snapshot = createTokenUsageSnapshot(now, () => ({
+    const snapshot = createSnapshot(now, () => ({
       today: zeroRecord(),
       yesterday: zeroRecord(),
       week: zeroRecord(),
@@ -198,12 +394,12 @@ describe('createTokenUsageSnapshot', () => {
   it('rejects a sparse bucket outside the period', () => {
     const now = new Date(2026, 7, 17, 2)
 
-    expect(() => createTokenUsageSnapshot(now, () => ({
+    expect(() => createSnapshot(now, () => ({
       today: {
         inputTokens: 1,
         outputTokens: 0,
         totalTokens: 1,
-        models: [{ model: 'alpha/model', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
+        models: [{ provider: 'openrouter' as const, model: 'alpha/model', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
         trend: [{ bucket: '2', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
       },
       yesterday: zeroRecord(),
@@ -216,12 +412,12 @@ describe('createTokenUsageSnapshot', () => {
   it('rejects duplicate sparse buckets', () => {
     const now = new Date(2026, 7, 17, 2)
 
-    expect(() => createTokenUsageSnapshot(now, () => ({
+    expect(() => createSnapshot(now, () => ({
       today: {
         inputTokens: 2,
         outputTokens: 0,
         totalTokens: 2,
-        models: [{ model: 'alpha/model', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
+        models: [{ provider: 'openrouter' as const, model: 'alpha/model', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
         trend: [
           { bucket: '0', inputTokens: 1, outputTokens: 0, totalTokens: 1 },
           { bucket: '0', inputTokens: 1, outputTokens: 0, totalTokens: 1 },
@@ -237,12 +433,12 @@ describe('createTokenUsageSnapshot', () => {
   it('rejects dense trend totals that do not match the period', () => {
     const now = new Date(2026, 7, 17, 2)
 
-    expect(() => createTokenUsageSnapshot(now, () => ({
+    expect(() => createSnapshot(now, () => ({
       today: {
         inputTokens: 2,
         outputTokens: 0,
         totalTokens: 2,
-        models: [{ model: 'alpha/model', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
+        models: [{ provider: 'openrouter' as const, model: 'alpha/model', inputTokens: 2, outputTokens: 0, totalTokens: 2 }],
         trend: [{ bucket: '0', inputTokens: 1, outputTokens: 0, totalTokens: 1 }],
       },
       yesterday: zeroRecord(),

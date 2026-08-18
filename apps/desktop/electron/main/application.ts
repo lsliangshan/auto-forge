@@ -906,10 +906,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const now = new Date()
         return createTokenUsageSnapshot(
           now,
-          (query) => database.chatRuns.summarizeTokenUsage({
-            ...query,
-            userId: session.user.id,
-          }),
+          session.user.id,
+          (query) => database.chatRuns.summarizeTokenUsage(query),
+          (query) => database.providerUsage.summarize(query),
         )
       },
       clearLocalData: async (scope) => {
