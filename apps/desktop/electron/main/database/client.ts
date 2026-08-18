@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { runMigrations } from './migrations.js'
 import { createLocalAuthRepository } from './local-auth-repository.js'
+import { createUserProfileRepository } from './user-profile-repository.js'
 import { createRepositories } from './repositories.js'
 import * as schema from './schema.js'
 
@@ -13,6 +14,7 @@ export function openAppDatabase(path: string) {
   const db = drizzle(sqlite, { schema })
   const repositories = createRepositories(sqlite)
   const localAuth = createLocalAuthRepository(sqlite)
+  const userProfiles = createUserProfileRepository(sqlite)
 
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
@@ -52,6 +54,7 @@ export function openAppDatabase(path: string) {
   return {
     db,
     localAuth,
+    userProfiles,
     close: () => sqlite.close(),
     schemaVersion: () => (sqlite.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null }).version ?? 0,
     markInterruptedExecutions: () => repositories.executions.markInterrupted(),

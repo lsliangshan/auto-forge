@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
+import { sql } from 'drizzle-orm'
 import { type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
@@ -47,6 +48,29 @@ function createV3Database() {
     .run('conversation_v3', 'Persisted v3', 1, 1)
   sqlite.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run('message_v3', 'conversation_v3', 'user', JSON.stringify([{ type: 'text', text: 'before auth' }]), 1, 1)
+  sqlite.close()
+  return openAppDatabase(path)
+}
+
+function createV4Database() {
+  const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-v4-'))
+  temporaryDirectories.push(directory)
+  const path = join(directory, 'autoforge.sqlite')
+  const sqlite = new Database(path)
+  for (const [index, fileName] of [
+    '0001_init.sql',
+    '0002_multimodal_media.sql',
+    '0003_conversation_context.sql',
+    '0004_local_auth.sql',
+  ].entries()) {
+    sqlite.exec(readFileSync(fileURLToPath(new URL(`../../../resources/migrations/${fileName}`, import.meta.url)), 'utf8'))
+    sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
+      .run(index + 1, index + 1)
+  }
+  sqlite.prepare(`
+    INSERT INTO local_users (id, account, account_normalized, password_digest, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run('user_v4', 'Legacy', 'legacy', 'digest', 1, 1)
   sqlite.close()
   return openAppDatabase(path)
 }
@@ -171,7 +195,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(4)
+    expect(database.schemaVersion()).toBe(5)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -179,7 +203,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(4)
+    expect(database.schemaVersion()).toBe(5)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
@@ -190,12 +214,22 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(4)
+    expect(database.schemaVersion()).toBe(5)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
       ordinal: 1,
     })
+  })
+
+  it('upgrades a populated v4 database without losing local users', () => {
+    const database = createV4Database()
+
+    expect(database.schemaVersion()).toBe(5)
+    expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
+      id: 'user_v4', account: 'Legacy',
+    })
+    expect(database.userProfiles.findByUserId('user_v4')).toBeUndefined()
   })
 
   it('stores local users and one persistent authentication session', () => {
@@ -227,6 +261,49 @@ describe('openAppDatabase', () => {
       passwordDigest: 'digest-2', createdAt: 12, updatedAt: 12,
     }, 13)).toBeUndefined()
     expect(database.localAuth.getCurrentSession()?.user.id).toBe('user_1')
+  })
+
+  it('stores isolated profiles and updates the current user profile', () => {
+    const database = openTestDatabase()
+    database.localAuth.createUserAndSession({
+      id: 'user_1', account: 'Alice', accountNormalized: 'alice',
+      passwordDigest: 'digest', createdAt: 10, updatedAt: 10,
+    }, 12)
+    database.localAuth.createUserAndSession({
+      id: 'user_2', account: 'Bob', accountNormalized: 'bob',
+      passwordDigest: 'digest', createdAt: 11, updatedAt: 11,
+    }, 13)
+
+    expect(database.userProfiles.findByUserId('user_1')).toBeUndefined()
+    database.userProfiles.upsert({
+      userId: 'user_1', avatarUrl: null, displayName: 'Alice Zhang', gender: null,
+      birthDate: null, email: 'alice@example.com', phone: null, updatedAt: 20,
+    })
+    database.userProfiles.upsert({
+      userId: 'user_1', avatarUrl: 'https://cdn.example.com/a.png', displayName: 'Alice Chen', gender: 'female',
+      birthDate: '2000-01-01', email: null, phone: '+8613800138000', updatedAt: 30,
+    })
+
+    expect(database.userProfiles.findByUserId('user_1')).toMatchObject({
+      displayName: 'Alice Chen', gender: 'female', updatedAt: 30,
+    })
+    expect(database.userProfiles.findByUserId('user_2')).toBeUndefined()
+  })
+
+  it('cascades profile deletion with its local user', () => {
+    const database = openTestDatabase()
+    database.localAuth.createUserAndSession({
+      id: 'user_1', account: 'Alice', accountNormalized: 'alice',
+      passwordDigest: 'digest', createdAt: 10, updatedAt: 10,
+    }, 11)
+    database.userProfiles.upsert({
+      userId: 'user_1', avatarUrl: null, displayName: 'Alice', gender: null,
+      birthDate: null, email: null, phone: null, updatedAt: 20,
+    })
+
+    database.db.run(sql`DELETE FROM local_users WHERE id = 'user_1'`)
+
+    expect(database.userProfiles.findByUserId('user_1')).toBeUndefined()
   })
 
   it('backfills insertion order and allocates independent conversation ordinals', () => {

@@ -207,6 +207,17 @@ export const localUsers = sqliteTable('local_users', {
   updatedAt: integer('updated_at').notNull(),
 }, (table) => [uniqueIndex('local_users_account_normalized_unique').on(table.accountNormalized)])
 
+export const localUserProfiles = sqliteTable('local_user_profiles', {
+  userId: text('user_id').primaryKey().references(() => localUsers.id, { onDelete: 'cascade' }),
+  avatarUrl: text('avatar_url'),
+  displayName: text('display_name'),
+  gender: text('gender'),
+  birthDate: text('birth_date'),
+  email: text('email'),
+  phone: text('phone'),
+  updatedAt: integer('updated_at').notNull(),
+})
+
 export const localAuthSession = sqliteTable('local_auth_session', {
   id: integer('id').primaryKey(),
   userId: text('user_id').notNull().references(() => localUsers.id, { onDelete: 'cascade' }),
