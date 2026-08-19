@@ -13,8 +13,21 @@ export async function completeApplicationShutdown({
 }: ApplicationShutdownCompletionOptions): Promise<void> {
   try {
     await shutdown()
-  } finally {
-    if (packaged) quit()
-    else defer(quit)
+  } catch (error) {
+    if (packaged) {
+      quit()
+      throw error
+    }
+
+    await new Promise<void>((resolve) => {
+      defer(() => {
+        quit()
+        resolve()
+      })
+    })
+    throw error
   }
+
+  if (packaged) quit()
+  else defer(quit)
 }
