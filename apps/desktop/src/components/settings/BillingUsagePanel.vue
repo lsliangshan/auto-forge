@@ -110,6 +110,21 @@
               class="billing-cost-warning"
             >
               有 {{ formatTokens(activeUsage.openRouterUnknownCostCount) }} 笔费用待确认
+              <el-tooltip
+                :content="pendingCostExplanation"
+                :trigger="['hover', 'focus']"
+                placement="top"
+              >
+                <el-icon
+                  class="billing-cost-help"
+                  data-testid="billing-cost-help"
+                  tabindex="0"
+                  role="img"
+                  aria-label="查看待确认费用说明"
+                >
+                  <QuestionFilled />
+                </el-icon>
+              </el-tooltip>
             </p>
           </div>
         </dl>
@@ -198,7 +213,7 @@
 </template>
 
 <script setup lang="ts">
-import { Refresh } from '@element-plus/icons-vue'
+import { QuestionFilled, Refresh } from '@element-plus/icons-vue'
 import type { TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '@autoforge/shared'
 import { computed, ref } from 'vue'
 import TokenUsageBarChart from './TokenUsageBarChart.vue'
@@ -238,6 +253,7 @@ const providerLabels = {
   openrouter: 'OpenRouter',
   deepseek: 'DeepSeek',
 } as const
+const pendingCostExplanation = '这表示部分 OpenRouter 调用暂未取得准确费用。当前显示的消费金额不包含这些费用，无需手动确认，系统会自动尝试查询。'
 const tokenFormatter = new Intl.NumberFormat('zh-CN')
 const rangeFormatter = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -362,7 +378,16 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
 }
 
 .billing-summary .billing-cost-warning {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   color: var(--af-danger);
+}
+
+.billing-cost-help {
+  flex: 0 0 auto;
+  cursor: help;
+  outline-offset: 2px;
 }
 
 .billing-chart-section {
