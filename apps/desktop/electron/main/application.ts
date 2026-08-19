@@ -33,6 +33,7 @@ import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type Browse
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
+import { ProviderDiagnosticLog } from './chat/provider-diagnostic-log.js'
 import {
   credentialKeyForProvider,
   ModelProviderRegistry,
@@ -331,6 +332,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const maintenance = new MaintenanceGate()
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
+  const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
     language: 'zh-CN',
@@ -350,10 +352,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     openrouter: options.modelProviders?.openrouter ?? new OpenRouterProvider({
       credential: secretStore,
       fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
+      diagnostic: providerDiagnostics.forProvider('openrouter'),
     }),
     deepseek: options.modelProviders?.deepseek ?? new DeepSeekProvider({
       credential: secretStore,
       fetch: options.networkProxy.fetch.bind(options.networkProxy) as typeof globalThis.fetch,
+      diagnostic: providerDiagnostics.forProvider('deepseek'),
     }),
   })
   const providerUsageReconciler = new ProviderUsageReconciler({

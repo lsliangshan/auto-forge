@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -1503,6 +1503,40 @@ describe('createApplicationRuntime', () => {
       'https://api.deepseek.com/models',
       expect.objectContaining({ headers: { authorization: 'Bearer sk-deepseek' } }),
     )
+    await runtime.close()
+  })
+
+  it('writes only safe diagnostics for default model providers', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-provider-diagnostic-'))
+    directories.push(root)
+    networkProxy.fetch.mockImplementation(async (input) => {
+      const provider = String(input).includes('openrouter.ai') ? 'openrouter' : 'deepseek'
+      return Response.json({
+        error: {
+          code: 400,
+          message: `RAW_${provider}_MESSAGE`,
+          metadata: { error_type: 'invalid_request', raw: `RAW_${provider}_METADATA` },
+        },
+      }, { status: 400 })
+    })
+    const runtime = createApplicationRuntime(options(root, { networkProxy }))
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
+
+    await expect(runtime.services.settings.validateProviderCredential('openrouter'))
+      .resolves.toMatchObject({ validation: 'unavailable' })
+    await expect(runtime.services.settings.validateProviderCredential('deepseek'))
+      .resolves.toMatchObject({ validation: 'unavailable' })
+
+    const path = join(root, 'logs', 'model-provider.jsonl')
+    await vi.waitFor(async () => {
+      const records = (await readFile(path, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      expect(records).toEqual(expect.arrayContaining([
+        expect.objectContaining({ provider: 'openrouter', operation: 'models', status: 400 }),
+        expect.objectContaining({ provider: 'deepseek', operation: 'models', status: 400 }),
+      ]))
+      expect(JSON.stringify(records)).not.toContain('RAW_')
+    })
     await runtime.close()
   })
 
