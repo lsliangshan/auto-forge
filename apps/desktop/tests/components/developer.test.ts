@@ -84,7 +84,8 @@ function createApi() {
   let executionListener: ((event: ExecutionEvent) => void) | undefined
   const api = {
     auth: {
-      getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
+      getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
+      cancelOtp: vi.fn().mockResolvedValue(undefined), loginWithPassword: vi.fn(),
       logout: vi.fn().mockResolvedValue(undefined),
     },
     profile: {

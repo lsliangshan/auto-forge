@@ -94,7 +94,8 @@ function computedColor(value: string) {
 function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
   return {
     auth: {
-      getSession: vi.fn().mockResolvedValue(null), login: vi.fn(), register: vi.fn(),
+      getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
+      cancelOtp: vi.fn().mockResolvedValue(undefined), loginWithPassword: vi.fn(),
       logout: vi.fn().mockResolvedValue(undefined),
     },
     profile: {

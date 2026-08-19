@@ -35,8 +35,10 @@ function createApi(profile: UserProfile = savedProfile): DesktopAPI {
   return {
     auth: {
       getSession: vi.fn().mockResolvedValue(authSession),
-      login: vi.fn(),
-      register: vi.fn(),
+      sendOtp: vi.fn(),
+      verifyOtp: vi.fn(),
+      cancelOtp: vi.fn().mockResolvedValue(undefined),
+      loginWithPassword: vi.fn(),
       logout: vi.fn().mockResolvedValue(undefined),
     },
     profile: {

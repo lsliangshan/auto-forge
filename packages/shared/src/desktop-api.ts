@@ -21,7 +21,10 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 
 const modalitySchema = z.enum(['text', 'image', 'audio', 'video'])
 
-export const authAccountSchema = z.string().trim().regex(/^[A-Za-z0-9_]{3,32}$/)
+export const authAccountSchema = z.string().trim().regex(/^[A-Za-z0-9_]{5,24}$/)
+export const authPhoneSchema = z.string().trim().regex(/^1[3-9]\d{9}$/)
+export const authEmailSchema = z.string().trim().toLowerCase().email().max(254)
+export const authOtpCodeSchema = z.string().trim().regex(/^\d{6}$/)
 export const authPasswordSchema = z.string().superRefine((value, context) => {
   const length = Array.from(value).length
   if (length < 8 || length > 72) {
@@ -34,9 +37,50 @@ export const authCredentialsSchema = z.object({
 }).strict()
 export type AuthCredentials = z.infer<typeof authCredentialsSchema>
 
+export const authOtpChannelSchema = z.enum(['phone', 'email'])
+export type AuthOtpChannel = z.infer<typeof authOtpChannelSchema>
+
+const authOtpLoginRequestSchema = z.discriminatedUnion('channel', [
+  z.object({ intent: z.literal('login'), channel: z.literal('phone'), target: authPhoneSchema }).strict(),
+  z.object({ intent: z.literal('login'), channel: z.literal('email'), target: authEmailSchema }).strict(),
+])
+const authOtpRegisterRequestSchema = z.discriminatedUnion('channel', [
+  z.object({
+    intent: z.literal('register'),
+    channel: z.literal('phone'),
+    target: authPhoneSchema,
+    account: authAccountSchema,
+    password: authPasswordSchema,
+  }).strict(),
+  z.object({
+    intent: z.literal('register'),
+    channel: z.literal('email'),
+    target: authEmailSchema,
+    account: authAccountSchema,
+    password: authPasswordSchema,
+  }).strict(),
+])
+export const authOtpRequestSchema = z.union([
+  authOtpLoginRequestSchema,
+  authOtpRegisterRequestSchema,
+])
+export type AuthOtpRequest = z.infer<typeof authOtpRequestSchema>
+
+export const authOtpChallengeSchema = z.object({
+  challengeId: identifierSchema,
+  expiresIn: z.number().int().positive().max(300),
+}).strict()
+export type AuthOtpChallenge = z.infer<typeof authOtpChallengeSchema>
+
+export const authOtpVerificationSchema = z.object({
+  challengeId: identifierSchema,
+  code: authOtpCodeSchema,
+}).strict()
+export type AuthOtpVerification = z.infer<typeof authOtpVerificationSchema>
+
 export const authUserSchema = z.object({
   id: identifierSchema,
-  account: authAccountSchema,
+  account: z.string().trim().min(1).max(64),
 }).strict()
 export type AuthUser = z.infer<typeof authUserSchema>
 
@@ -641,8 +685,10 @@ export type AppInfo = z.infer<typeof appInfoSchema>
 
 export const ipcChannels = {
   authGetSession: 'auth:get-session',
-  authLogin: 'auth:login',
-  authRegister: 'auth:register',
+  authSendOtp: 'auth:send-otp',
+  authVerifyOtp: 'auth:verify-otp',
+  authCancelOtp: 'auth:cancel-otp',
+  authLoginWithPassword: 'auth:login-with-password',
   authLogout: 'auth:logout',
   profileGet: 'profile:get',
   profileUpdate: 'profile:update',
@@ -766,8 +812,10 @@ export const openExternalRequestSchema = z.object({
 
 export const ipcRequestSchemas = {
   [ipcChannels.authGetSession]: z.undefined(),
-  [ipcChannels.authLogin]: authCredentialsSchema,
-  [ipcChannels.authRegister]: authCredentialsSchema,
+  [ipcChannels.authSendOtp]: authOtpRequestSchema,
+  [ipcChannels.authVerifyOtp]: authOtpVerificationSchema,
+  [ipcChannels.authCancelOtp]: z.object({ challengeId: identifierSchema }).strict(),
+  [ipcChannels.authLoginWithPassword]: authCredentialsSchema,
   [ipcChannels.authLogout]: z.undefined(),
   [ipcChannels.profileGet]: z.undefined(),
   [ipcChannels.profileUpdate]: userProfileUpdateSchema,
@@ -826,8 +874,10 @@ const executionIdResponseSchema = z.object({ executionId: identifierSchema }).st
 
 export const ipcResponseSchemas = {
   [ipcChannels.authGetSession]: authSessionSchema.nullable(),
-  [ipcChannels.authLogin]: authSessionSchema,
-  [ipcChannels.authRegister]: authSessionSchema,
+  [ipcChannels.authSendOtp]: authOtpChallengeSchema,
+  [ipcChannels.authVerifyOtp]: authSessionSchema,
+  [ipcChannels.authCancelOtp]: voidResponseSchema,
+  [ipcChannels.authLoginWithPassword]: authSessionSchema,
   [ipcChannels.authLogout]: voidResponseSchema,
   [ipcChannels.profileGet]: userProfileSchema,
   [ipcChannels.profileUpdate]: userProfileSchema,
@@ -883,8 +933,10 @@ export const ipcResponseSchemas = {
 export interface DesktopAPI {
   auth: {
     getSession(): Promise<AuthSession | null>
-    login(input: AuthCredentials): Promise<AuthSession>
-    register(input: AuthCredentials): Promise<AuthSession>
+    sendOtp(input: AuthOtpRequest): Promise<AuthOtpChallenge>
+    verifyOtp(input: AuthOtpVerification): Promise<AuthSession>
+    cancelOtp(challengeId: string): Promise<void>
+    loginWithPassword(input: AuthCredentials): Promise<AuthSession>
     logout(): Promise<void>
   }
   profile: {

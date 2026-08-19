@@ -4,6 +4,8 @@ import {
   appSettingsSchema,
   approvalDecisionSchema,
   authCredentialsSchema,
+  authOtpRequestSchema,
+  authOtpVerificationSchema,
   chatBlockSchema,
   chatEventSchema,
   chatSendInputSchema,
@@ -28,26 +30,56 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
-  it('validates local authentication credentials by normalized account and code-point password length', () => {
+  it('validates CloudBase username, password, phone, email, and OTP inputs', () => {
     expect(authCredentialsSchema.parse({ account: '  Alice_1  ', password: '密码密码密码密码' }))
       .toEqual({ account: 'Alice_1', password: '密码密码密码密码' })
-    expect(() => authCredentialsSchema.parse({ account: 'a b', password: 'password' })).toThrow()
-    expect(() => authCredentialsSchema.parse({ account: 'alice', password: 'short' })).toThrow()
-    expect(() => authCredentialsSchema.parse({ account: 'alice', password: 'x'.repeat(73) })).toThrow()
+    expect(authOtpRequestSchema.parse({
+      intent: 'login', channel: 'phone', target: ' 18311032722 ',
+    })).toEqual({ intent: 'login', channel: 'phone', target: '18311032722' })
+    expect(authOtpRequestSchema.parse({
+      intent: 'register',
+      channel: 'email',
+      target: ' User@Example.com ',
+      account: ' Alice_1 ',
+      password: 'password',
+    })).toEqual({
+      intent: 'register',
+      channel: 'email',
+      target: 'user@example.com',
+      account: 'Alice_1',
+      password: 'password',
+    })
+    expect(authOtpVerificationSchema.parse({ challengeId: 'challenge_1', code: '123456' }))
+      .toEqual({ challengeId: 'challenge_1', code: '123456' })
+    expect(() => authOtpRequestSchema.parse({
+      intent: 'login', channel: 'phone', target: '123',
+    })).toThrow()
+    expect(() => authOtpVerificationSchema.parse({
+      challengeId: 'challenge_1', code: '12345',
+    })).toThrow()
   })
 
-  it('exposes fixed authentication IPC contracts', () => {
-    expect(ipcChannels.authGetSession).toBe('auth:get-session')
-    expect(ipcRequestSchemas[ipcChannels.authLogin].parse({ account: 'alice', password: 'password' }))
-      .toEqual({ account: 'alice', password: 'password' })
-    expect(ipcResponseSchemas[ipcChannels.authGetSession].parse(null)).toBeNull()
-    expect(ipcResponseSchemas[ipcChannels.authRegister].parse({
-      user: { id: 'user_1', account: 'Alice' },
-      authenticatedAt: '2026-08-07T00:00:00.000Z',
-    })).toMatchObject({ user: { account: 'Alice' } })
+  it('exposes the CloudBase authentication IPC contract', () => {
+    expect(ipcChannels.authSendOtp).toBe('auth:send-otp')
+    expect(ipcChannels.authVerifyOtp).toBe('auth:verify-otp')
+    expect(ipcChannels.authCancelOtp).toBe('auth:cancel-otp')
+    expect(ipcChannels.authLoginWithPassword).toBe('auth:login-with-password')
+    expect(ipcRequestSchemas[ipcChannels.authCancelOtp].parse({ challengeId: 'challenge_1' }))
+      .toEqual({ challengeId: 'challenge_1' })
+    expect(ipcResponseSchemas[ipcChannels.authSendOtp].parse({
+      challengeId: 'challenge_1', expiresIn: 300,
+    })).toEqual({ challengeId: 'challenge_1', expiresIn: 300 })
   })
 
-  it.each(['AUTH_REQUIRED', 'AUTH_INVALID_CREDENTIALS', 'AUTH_ACCOUNT_EXISTS'] as const)(
+  it.each([
+    'AUTH_REQUIRED',
+    'AUTH_INVALID_CREDENTIALS',
+    'AUTH_ACCOUNT_EXISTS',
+    'AUTH_INVALID_OTP',
+    'AUTH_OTP_EXPIRED',
+    'AUTH_OTP_RATE_LIMITED',
+    'AUTH_ACCOUNT_NOT_FOUND',
+  ] as const)(
     'keeps %s as a safe application error',
     (code) => expect(toSafeAppError({ code })).toMatchObject({ code }),
   )
