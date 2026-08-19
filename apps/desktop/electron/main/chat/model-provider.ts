@@ -131,6 +131,15 @@ export interface ModelCredentialPort {
 type FetchPort = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
 type SleepPort = (milliseconds: number, signal: AbortSignal | undefined) => Promise<void>
 
+export type ProviderOperation = 'models' | 'chat' | 'image' | 'video' | 'generation'
+
+export interface ProviderDiagnostic {
+  operation: ProviderOperation
+  status?: number
+  code?: string | number
+  error_type?: string
+}
+
 export interface OpenAiCompatibleProviderConfig {
   chatEndpoint: string
   modelsEndpoint: string
@@ -151,15 +160,9 @@ export interface OpenAiCompatibleProviderDependencies {
   fetch?: FetchPort
   sleep?: SleepPort
   random?: () => number
-  diagnostic?: (diagnostic: {
-    operation: ProviderOperation
-    status?: number
-    code?: string | number
-    error_type?: string
-  }) => void
+  diagnostic?: (diagnostic: ProviderDiagnostic) => void
 }
 
-export type ProviderOperation = 'models' | 'chat' | 'image' | 'video' | 'generation'
 type RetryPolicy = 'never' | 'idempotent'
 interface AuthenticatedFetchOptions {
   retry: RetryPolicy
