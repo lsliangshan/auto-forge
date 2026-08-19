@@ -16,6 +16,7 @@ import {
 } from 'electron'
 import { chatEventSchema, executionEventSchema, ipcChannels } from '@autoforge/shared'
 import { createApplicationRuntime } from './application.js'
+import { completeApplicationShutdown } from './application-shutdown-completion.js'
 import { registerDesktopIpc, type RendererTarget } from './ipc/register-ipc.js'
 import { startDesktopApplication } from './startup.js'
 import {
@@ -222,6 +223,10 @@ if (!app.requestSingleInstanceLock()) {
     quitting = true
     disposeDevelopmentParentWatchdog?.()
     disposeDevelopmentParentWatchdog = undefined
-    void shutdown().finally(() => app.quit())
+    void completeApplicationShutdown({
+      packaged: app.isPackaged,
+      shutdown,
+      quit: () => app.quit(),
+    })
   })
 }
