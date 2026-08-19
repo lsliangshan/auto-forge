@@ -326,7 +326,7 @@ describe('OpenRouterProvider', () => {
     await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
       code: status === 401
         ? 'CREDENTIAL_INVALID'
-        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_REQUEST_FAILED',
+        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_UNAVAILABLE',
     })
   })
 
@@ -339,7 +339,9 @@ describe('OpenRouterProvider', () => {
     const provider = new OpenRouterProvider({ credential, fetch, sleep })
 
     await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
-      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      code: _description === 'a server failure'
+        ? 'MODEL_PROVIDER_UNAVAILABLE'
+        : 'MODEL_PROVIDER_REQUEST_FAILED',
     })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).not.toHaveBeenCalled()
@@ -1004,12 +1006,17 @@ describe('OpenRouterProvider', () => {
   })
 
   it.each([
-    [401, 'CREDENTIAL_INVALID', 1],
-    [403, 'MODEL_PROVIDER_ACCESS_DENIED', 1],
-    [402, 'MODEL_PROVIDER_REQUEST_FAILED', 1],
-    [429, 'MODEL_PROVIDER_REQUEST_FAILED', 1],
-    [503, 'MODEL_PROVIDER_REQUEST_FAILED', 1],
-  ] as const)('maps media HTTP %s safely with bounded diagnostics', async (status, code, attempts) => {
+    [400, 'MODEL_PROVIDER_INVALID_REQUEST'],
+    [401, 'CREDENTIAL_INVALID'],
+    [402, 'MODEL_PROVIDER_PAYMENT_REQUIRED'],
+    [403, 'MODEL_PROVIDER_ACCESS_DENIED'],
+    [408, 'MODEL_PROVIDER_TIMEOUT'],
+    [429, 'MODEL_PROVIDER_RATE_LIMITED'],
+    [500, 'MODEL_PROVIDER_UNAVAILABLE'],
+    [502, 'MODEL_PROVIDER_UNAVAILABLE'],
+    [503, 'MODEL_PROVIDER_UNAVAILABLE'],
+    [504, 'MODEL_PROVIDER_TIMEOUT'],
+  ] as const)('maps media HTTP %s safely with bounded diagnostics', async (status, code) => {
     const diagnostic = vi.fn()
     const fetch = vi.fn(async () => new Response(JSON.stringify({
       error: {
@@ -1032,9 +1039,40 @@ describe('OpenRouterProvider', () => {
       parameterSupport: allImageParameters,
       references: [],
     })).rejects.toMatchObject({ code })
-    expect(fetch).toHaveBeenCalledTimes(attempts)
+    expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it.each([
+    ['payment_required', 'MODEL_PROVIDER_PAYMENT_REQUIRED'],
+    ['rate_limit_exceeded', 'MODEL_PROVIDER_RATE_LIMITED'],
+    ['timeout', 'MODEL_PROVIDER_TIMEOUT'],
+    ['provider_overloaded', 'MODEL_PROVIDER_UNAVAILABLE'],
+    ['content_policy_violation', 'MODEL_PROVIDER_ACCESS_DENIED'],
+    ['invalid_request', 'MODEL_PROVIDER_INVALID_REQUEST'],
+  ] as const)('prefers provider error type %s for media failures', async (errorType, code) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({
+        error: {
+          code: 400,
+          message: 'RAW_PROVIDER_MESSAGE',
+          metadata: { error_type: errorType },
+        },
+      }, { status: 400 })),
+    })
+
+    const error = await provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    }).then(() => undefined, (error: unknown) => error)
+
+    expect(error).toMatchObject({ code })
+    expect(JSON.stringify(error)).not.toContain('RAW_PROVIDER_MESSAGE')
   })
 
   it.each([
@@ -1056,16 +1094,19 @@ describe('OpenRouterProvider', () => {
     const sleep = vi.fn(async () => undefined)
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep })
 
+    const expectedCode = failure === 'network'
+      ? 'MODEL_PROVIDER_REQUEST_FAILED'
+      : failure === 429
+        ? 'MODEL_PROVIDER_RATE_LIMITED'
+        : 'MODEL_PROVIDER_UNAVAILABLE'
+
     await expect(provider.generateImage({
       model: 'image/model',
       prompt: 'draw',
       options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
       parameterSupport: allImageParameters,
       references: [],
-    })).rejects.toMatchObject({
-      code: 'MODEL_PROVIDER_REQUEST_FAILED',
-      message: 'The model provider request failed.',
-    })
+    })).rejects.toMatchObject({ code: expectedCode })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).not.toHaveBeenCalled()
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
@@ -1091,16 +1132,19 @@ describe('OpenRouterProvider', () => {
     const sleep = vi.fn(async () => undefined)
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep })
 
+    const expectedCode = failure === 'network'
+      ? 'MODEL_PROVIDER_REQUEST_FAILED'
+      : failure === 429
+        ? 'MODEL_PROVIDER_RATE_LIMITED'
+        : 'MODEL_PROVIDER_UNAVAILABLE'
+
     await expect(provider.submitVideo({
       model: 'video/model',
       prompt: 'animate',
       options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
       references: [],
       frameImages: [],
-    })).rejects.toMatchObject({
-      code: 'MODEL_PROVIDER_REQUEST_FAILED',
-      message: 'The model provider request failed.',
-    })
+    })).rejects.toMatchObject({ code: expectedCode })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).not.toHaveBeenCalled()
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
@@ -2284,7 +2328,7 @@ describe('OpenRouterProvider', () => {
     await expect(collect(provider.stream({ model: 'm', messages: [] }))).rejects.toMatchObject({
       code: status === 401
         ? 'CREDENTIAL_INVALID'
-        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_REQUEST_FAILED',
+        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_INVALID_REQUEST',
     })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('sk-private')

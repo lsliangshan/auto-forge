@@ -427,6 +427,59 @@ function providerErrorMetadata(error: ProviderError | undefined): { code?: strin
   }
 }
 
+type ProviderErrorMetadata = ReturnType<typeof providerErrorMetadata>
+
+const INVALID_PROVIDER_ERROR_TYPES = new Set([
+  'context_length_exceeded',
+  'max_tokens_exceeded',
+  'token_limit_exceeded',
+  'string_too_long',
+  'invalid_request',
+  'invalid_prompt',
+  'not_found',
+  'precondition_failed',
+  'payload_too_large',
+  'unprocessable',
+  'invalid_image',
+  'image_too_large',
+  'image_too_small',
+  'unsupported_image_format',
+  'image_not_found',
+  'image_download_failed',
+])
+
+function classifiedProviderFailure(status: number, metadata: ProviderErrorMetadata): AppError {
+  const errorType = metadata.error_type?.toLowerCase()
+  if (errorType === 'authentication') return failure('CREDENTIAL_INVALID')
+  if (errorType === 'permission_denied'
+    || errorType === 'content_policy_violation'
+    || errorType === 'refusal') return failure('MODEL_PROVIDER_ACCESS_DENIED')
+  if (errorType === 'payment_required') return failure('MODEL_PROVIDER_PAYMENT_REQUIRED')
+  if (errorType === 'rate_limit_exceeded') return failure('MODEL_PROVIDER_RATE_LIMITED')
+  if (errorType === 'timeout') return failure('MODEL_PROVIDER_TIMEOUT')
+  if (errorType === 'provider_overloaded'
+    || errorType === 'provider_unavailable'
+    || errorType === 'server'
+    || errorType === 'unmapped') return failure('MODEL_PROVIDER_UNAVAILABLE')
+  if (errorType && INVALID_PROVIDER_ERROR_TYPES.has(errorType)) {
+    return failure('MODEL_PROVIDER_INVALID_REQUEST')
+  }
+
+  const code = numericProviderCode(metadata.code) ?? status
+  if ([400, 404, 409, 412, 413, 422].includes(code)) {
+    return failure('MODEL_PROVIDER_INVALID_REQUEST')
+  }
+  if (code === 401) return failure('CREDENTIAL_INVALID')
+  if (code === 402) return failure('MODEL_PROVIDER_PAYMENT_REQUIRED')
+  if (code === 403) return failure('MODEL_PROVIDER_ACCESS_DENIED')
+  if (code === 408 || code === 504) return failure('MODEL_PROVIDER_TIMEOUT')
+  if (code === 429) return failure('MODEL_PROVIDER_RATE_LIMITED')
+  if (code === 500 || code === 502 || code === 503) {
+    return failure('MODEL_PROVIDER_UNAVAILABLE')
+  }
+  return failure('MODEL_PROVIDER_REQUEST_FAILED')
+}
+
 function numericProviderCode(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isInteger(value)) return value
   if (typeof value === 'string' && /^\d{3}$/.test(value)) return Number(value)
@@ -1039,8 +1092,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         if (!response.ok) await this.throwHttpFailure(operation, response, signal)
         return response
       }
-      await this.readDiagnostic(operation, response, signal)
-      if (attempt === maxAttempts - 1) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+      const metadata = await this.readDiagnostic(operation, response, signal)
+      if (attempt === maxAttempts - 1) {
+        throw classifiedProviderFailure(response.status, metadata)
+      }
       await this.retryDelay(attempt, retryAfter(response), signal)
     }
     throw failure('MODEL_PROVIDER_REQUEST_FAILED')
@@ -1075,19 +1130,17 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     response: Response,
     signal?: AbortSignal,
   ): Promise<never> {
-    await this.readDiagnostic(operation, response, signal)
+    const metadata = await this.readDiagnostic(operation, response, signal)
     if (signal?.aborted) throw failure('CANCELLED')
-    if (response.status === 401) throw failure('CREDENTIAL_INVALID')
-    if (response.status === 403) throw failure('MODEL_PROVIDER_ACCESS_DENIED')
-    throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+    throw classifiedProviderFailure(response.status, metadata)
   }
 
   private async readDiagnostic(
     operation: ProviderOperation,
     response: Response,
     signal?: AbortSignal,
-  ): Promise<void> {
-    let metadata: { code?: string | number; error_type?: string } = {}
+  ): Promise<ProviderErrorMetadata> {
+    let metadata: ProviderErrorMetadata = {}
     try {
       const parsed = JSON.parse(await boundedResponseText(response, signal)) as unknown
       const envelope = z.object({ error: providerErrorSchema.optional() }).strict().safeParse(parsed)
@@ -1097,10 +1150,13 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         : direct.success ? direct.data : undefined)
     } catch (error) {
       if (isAbort(error, signal)) throw failure('CANCELLED')
-      // The body is deliberately drained but never forwarded to diagnostics.
     }
-    if (!this.dependencies.diagnostic) return
-    try { this.dependencies.diagnostic({ operation, status: response.status, ...metadata }) } catch { /* diagnostics are observational */ }
+    if (this.dependencies.diagnostic) {
+      try {
+        this.dependencies.diagnostic({ operation, status: response.status, ...metadata })
+      } catch { /* diagnostics are observational */ }
+    }
+    return metadata
   }
 
   private reportModelDiscoveryFailure(): void {
