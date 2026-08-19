@@ -1045,8 +1045,10 @@ describe('OpenRouterProvider', () => {
   })
 
   it.each([
-    ['uses a valid provider code before HTTP status', 400, 429, 'MODEL_PROVIDER_RATE_LIMITED'],
+    ['uses a supported provider code before HTTP status', 400, 429, 'MODEL_PROVIDER_RATE_LIMITED'],
     ['falls back to HTTP status for an invalid provider code', 503, 'not-a-number', 'MODEL_PROVIDER_UNAVAILABLE'],
+    ['falls back to HTTP status for an unsupported three-digit provider code', 503, 599, 'MODEL_PROVIDER_UNAVAILABLE'],
+    ['falls back to HTTP status for an unsupported small provider code', 503, 1, 'MODEL_PROVIDER_UNAVAILABLE'],
   ] as const)('%s', async (_description, status, providerCode, code) => {
     const fetch = vi.fn(async () => Response.json({
       error: {
@@ -1137,6 +1139,31 @@ describe('OpenRouterProvider', () => {
     expect(sleep).not.toHaveBeenCalled()
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it('returns CANCELLED when a paid image diagnostic aborts after HTTP 503', async () => {
+    const controller = new AbortController()
+    const diagnostic = vi.fn(() => controller.abort())
+    const fetch = vi.fn(async () => Response.json({
+      error: {
+        code: 503,
+        message: 'RAW_PROVIDER_MESSAGE',
+        metadata: { error_type: 'upstream_error' },
+      },
+    }, { status: 503 }))
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep })
+
+    await expect(provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+      signal: controller.signal,
+    })).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
   })
 
   it.each([

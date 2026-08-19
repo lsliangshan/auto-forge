@@ -465,7 +465,15 @@ function classifiedProviderFailure(status: number, metadata: ProviderErrorMetada
     return failure('MODEL_PROVIDER_INVALID_REQUEST')
   }
 
-  const code = numericProviderCode(metadata.code) ?? status
+  const providerCode = numericProviderCode(metadata.code)
+  const providerFailure = providerCode === undefined
+    ? undefined
+    : classifiedNumericProviderFailure(providerCode)
+  if (providerFailure) return providerFailure
+  return classifiedNumericProviderFailure(status) ?? failure('MODEL_PROVIDER_REQUEST_FAILED')
+}
+
+function classifiedNumericProviderFailure(code: number): AppError | undefined {
   if ([400, 404, 409, 412, 413, 422].includes(code)) {
     return failure('MODEL_PROVIDER_INVALID_REQUEST')
   }
@@ -477,7 +485,7 @@ function classifiedProviderFailure(status: number, metadata: ProviderErrorMetada
   if (code === 500 || code === 502 || code === 503) {
     return failure('MODEL_PROVIDER_UNAVAILABLE')
   }
-  return failure('MODEL_PROVIDER_REQUEST_FAILED')
+  return undefined
 }
 
 function numericProviderCode(value: unknown): number | undefined {
@@ -1093,6 +1101,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         return response
       }
       const metadata = await this.readDiagnostic(operation, response, signal)
+      if (signal?.aborted) throw failure('CANCELLED')
       if (attempt === maxAttempts - 1) {
         throw classifiedProviderFailure(response.status, metadata)
       }
