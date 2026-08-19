@@ -374,6 +374,17 @@ describe('cross-process contracts', () => {
     expect(() => appErrorCodeSchema.parse('MEDIA_UNKNOWN')).toThrow()
   })
 
+  it.each([
+    ['MODEL_PROVIDER_INVALID_REQUEST', 'The model provider rejected the request.'],
+    ['MODEL_PROVIDER_PAYMENT_REQUIRED', 'The model provider account has insufficient credit.'],
+    ['MODEL_PROVIDER_RATE_LIMITED', 'The model provider rate limited the request.'],
+    ['MODEL_PROVIDER_TIMEOUT', 'The model provider request timed out.'],
+    ['MODEL_PROVIDER_UNAVAILABLE', 'The model provider is unavailable.'],
+  ] as const)('keeps %s as a fixed safe provider error', (code, message) => {
+    expect(appErrorCodeSchema.parse(code)).toBe(code)
+    expect(toSafeAppError({ code, message: 'RAW_PROVIDER_MESSAGE' })).toEqual({ code, message })
+  })
+
   it('recognizes the safe context-limit error code', () => {
     expect(appErrorCodeSchema.parse('CONTEXT_LIMIT_EXCEEDED'))
       .toBe('CONTEXT_LIMIT_EXCEEDED')
