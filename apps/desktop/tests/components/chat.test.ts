@@ -775,7 +775,7 @@ describe('chat interactions', () => {
     ['MEDIA_DOWNLOAD_FAILED', '媒体下载失败'],
     ['MEDIA_GENERATION_TIMEOUT', '视频生成超时'],
     ['CONTEXT_LIMIT_EXCEEDED', '当前输入和会话上下文超出模型限制，请缩短输入或新建会话'],
-    ['MODEL_PROVIDER_INVALID_REQUEST', '供应商不接受当前模型参数，请刷新模型列表或调整生成设置'],
+    ['MODEL_PROVIDER_INVALID_REQUEST', '供应商拒绝了当前请求，请调整生成设置或稍后重试'],
     ['MODEL_PROVIDER_PAYMENT_REQUIRED', '供应商账户或 API Key 额度不足，请充值或检查限额'],
     ['MODEL_PROVIDER_RATE_LIMITED', '供应商请求过于频繁，请稍后重试'],
     ['MODEL_PROVIDER_TIMEOUT', '供应商响应超时，请稍后重试'],
