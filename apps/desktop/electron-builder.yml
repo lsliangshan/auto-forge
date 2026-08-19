@@ -2,6 +2,10 @@ appId: com.autoforge.desktop
 productName: AutoForge
 directories:
   output: dist
+mac:
+  icon: resources/branding/autoforge-logo.icns
+win:
+  icon: resources/branding/autoforge-logo.ico
 files:
   - out/**
 extraResources:

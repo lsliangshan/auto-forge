@@ -7,7 +7,11 @@
       class="app-mark"
       aria-label="AutoForge"
     >
-      AF
+      <img
+        :src="logoUrl"
+        alt=""
+        data-testid="app-brand-logo"
+      >
     </div>
     <RouterLink
       v-for="item in items"
@@ -73,6 +77,7 @@ import { computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useProfileStore } from '../stores/profile'
+import logoUrl from '../../resources/branding/autoforge-logo.png'
 
 const auth = useAuthStore()
 const profile = useProfileStore()
@@ -106,7 +111,8 @@ watch(() => auth.session?.user.id, (userId) => {
 
 <style scoped>
 .app-rail { z-index: 30; display: flex; width: 52px; min-width: 52px; height: 100%; flex-direction: column; align-items: center; gap: 4px; padding: 8px 4px; color: #c8d0dc; background: var(--af-graphite); }
-.app-mark { display: grid; width: 34px; height: 34px; margin-bottom: 10px; place-items: center; border: 1px solid #526073; border-radius: 8px; color: white; font-size: 11px; font-weight: 800; letter-spacing: .08em; }
+.app-mark { display: grid; width: 34px; height: 34px; margin-bottom: 10px; place-items: center; }
+.app-mark img { display: block; width: 32px; height: 32px; object-fit: contain; }
 .rail-item { display: flex; width: 44px; min-height: 62px; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border-radius: 6px; color: inherit; font-size: 9px; line-height: 1.15; text-align: center; text-decoration: none; }
 .rail-item:hover { color: white; background: #2c333d; }
 .rail-item.router-link-active { color: white; background: #33445f; box-shadow: inset 2px 0 var(--af-cobalt); }

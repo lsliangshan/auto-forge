@@ -3,6 +3,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -16,6 +17,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 const temporaryDirectories: string[] = []
 const verifierSource = fileURLToPath(new URL('../../../scripts/verify-packaged-native.mjs', import.meta.url))
+const builderConfig = fileURLToPath(new URL('../../../electron-builder.yml', import.meta.url))
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -155,4 +157,13 @@ describe('verify-packaged-native', () => {
     expect(result.stderr).toContain('resolves outside the desktop dist directory')
   })
 
+})
+
+describe('desktop package branding', () => {
+  it('uses the approved logo for macOS and Windows packages', () => {
+    const config = readFileSync(builderConfig, 'utf8')
+
+    expect(config).toContain('mac:\n  icon: resources/branding/autoforge-logo.icns')
+    expect(config).toContain('win:\n  icon: resources/branding/autoforge-logo.ico')
+  })
 })

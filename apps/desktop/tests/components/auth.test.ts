@@ -152,6 +152,15 @@ describe('authentication navigation', () => {
 })
 
 describe('authentication pages', () => {
+  it('renders the approved logo in the authentication brand', async () => {
+    const { wrapper } = await mountAuthApp('/login')
+
+    const logo = wrapper.get('[data-testid="auth-brand-logo"]')
+    expect(logo.element.tagName).toBe('IMG')
+    expect(logo.attributes('alt')).toBe('')
+    expect(logo.attributes('src')).toContain('autoforge-logo.png')
+  })
+
   it('logs in with normalized credentials and returns to a safe target', async () => {
     const { api, router, wrapper } = await mountAuthApp('/login?redirect=/settings')
 
@@ -223,6 +232,27 @@ describe('authentication pages', () => {
 })
 
 describe('workbench authentication entry', () => {
+  it('renders the approved logo in the application rail', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const auth = useAuthStore(pinia)
+    auth.session = authSession
+    auth.initialized = true
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [{ path: '/chat', component: { template: '<div />' } }],
+    })
+    await router.push('/chat')
+    const wrapper = mount(AppRail, { global: { plugins: [pinia, router, ElementPlus] } })
+
+    const logo = wrapper.get('[data-testid="app-brand-logo"]')
+    expect(logo.element.tagName).toBe('IMG')
+    expect(logo.attributes('alt')).toBe('')
+    expect(logo.attributes('src')).toContain('autoforge-logo.png')
+  })
+
   it('keeps the account visible on failed logout and navigates only after success', async () => {
     const api = createApi()
     vi.mocked(api.auth.logout).mockRejectedValueOnce(toSafeAppError({ code: 'INTERNAL_ERROR' }))
