@@ -18,6 +18,10 @@ import { chatEventSchema, executionEventSchema, ipcChannels } from '@autoforge/s
 import { createApplicationRuntime } from './application.js'
 import { registerDesktopIpc, type RendererTarget } from './ipc/register-ipc.js'
 import { startDesktopApplication } from './startup.js'
+import {
+  isProcessAlive,
+  startDevelopmentParentWatchdog,
+} from './development-parent-watchdog.js'
 import { createMediaProtocolHandler } from './media/media-protocol.js'
 import { NetworkProxyService } from './network/network-proxy-service.js'
 import { createSecureWindow } from './window.js'
@@ -27,6 +31,7 @@ type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
 let mainWindow: BrowserWindow | null = null
 let runtime: ApplicationRuntime | undefined
 let disposeIpc: (() => void) | undefined
+let disposeDevelopmentParentWatchdog: (() => void) | undefined
 let quitting = false
 let mediaProtocolRegistered = false
 
@@ -182,6 +187,13 @@ async function shutdown(): Promise<void> {
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
+  disposeDevelopmentParentWatchdog = startDevelopmentParentWatchdog({
+    packaged: app.isPackaged,
+    parentPid: process.ppid,
+    isParentAlive: isProcessAlive,
+    quit: () => app.quit(),
+  })
+
   app.on('second-instance', () => {
     if (!mainWindow) return
     if (mainWindow.isMinimized()) mainWindow.restore()
@@ -208,6 +220,8 @@ if (!app.requestSingleInstanceLock()) {
     if (quitting) return
     event.preventDefault()
     quitting = true
+    disposeDevelopmentParentWatchdog?.()
+    disposeDevelopmentParentWatchdog = undefined
     void shutdown().finally(() => app.quit())
   })
 }
