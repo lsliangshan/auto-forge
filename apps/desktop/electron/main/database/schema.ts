@@ -1,4 +1,5 @@
-import { foreignKey, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
+import { sql } from 'drizzle-orm'
+import { check, foreignKey, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 
 export const schemaMigrations = sqliteTable('schema_migrations', {
   version: integer('version').primaryKey(),
@@ -68,6 +69,8 @@ export const mediaGenerationJobs = sqliteTable('media_generation_jobs', {
 export const chatRuns = sqliteTable('chat_runs', {
   id: text('id').primaryKey(),
   conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+  userId: text('user_id').references(() => localUsers.id),
+  provider: text('provider'),
   requestId: text('request_id').notNull().unique(),
   model: text('model').notNull(),
   status: text('status').notNull(),
@@ -81,6 +84,8 @@ export const chatRuns = sqliteTable('chat_runs', {
 }, (table) => [
   index('chat_runs_conversation_started_at_idx').on(table.conversationId, table.startedAt),
   index('chat_runs_status_idx').on(table.status, table.startedAt),
+  index('idx_chat_runs_user_started_at').on(table.userId, table.startedAt),
+  check('chat_runs_provider_check', sql`${table.provider} IS NULL OR ${table.provider} IN ('deepseek', 'openrouter')`),
 ])
 
 export const workflowProjects = sqliteTable('workflow_projects', {
@@ -217,6 +222,44 @@ export const localUserProfiles = sqliteTable('local_user_profiles', {
   phone: text('phone'),
   updatedAt: integer('updated_at').notNull(),
 })
+
+export const providerUsageEvents = sqliteTable('provider_usage_events', {
+  id: text('id').primaryKey(),
+  operationKey: text('operation_key').notNull().unique(),
+  userId: text('user_id').notNull().references(() => localUsers.id),
+  provider: text('provider').notNull(),
+  apiKeyFingerprint: text('api_key_fingerprint'),
+  requestId: text('request_id').notNull(),
+  chatRunId: text('chat_run_id'),
+  generationId: text('generation_id'),
+  providerJobId: text('provider_job_id'),
+  model: text('model').notNull(),
+  modality: text('modality').notNull(),
+  status: text('status').notNull(),
+  inputTokens: integer('input_tokens'),
+  outputTokens: integer('output_tokens'),
+  costUsd: text('cost_usd'),
+  reconcileAttempts: integer('reconcile_attempts').notNull().default(0),
+  nextReconcileAt: integer('next_reconcile_at'),
+  startedAt: integer('started_at').notNull(),
+  endedAt: integer('ended_at'),
+}, (table) => [
+  uniqueIndex('idx_provider_usage_generation_unique')
+    .on(table.generationId)
+    .where(sql`${table.generationId} IS NOT NULL`),
+  index('idx_provider_usage_user_provider_started').on(table.userId, table.provider, table.startedAt),
+  index('idx_provider_usage_reconcile').on(table.status, table.nextReconcileAt),
+  check('provider_usage_provider_check', sql`${table.provider} IN ('deepseek', 'openrouter')`),
+  check('provider_usage_modality_check', sql`${table.modality} IN ('text', 'image', 'audio', 'video')`),
+  check('provider_usage_status_check', sql`${table.status} IN ('pending', 'reported', 'unknown')`),
+  check('provider_usage_input_tokens_check', sql`${table.inputTokens} IS NULL OR ${table.inputTokens} >= 0`),
+  check('provider_usage_output_tokens_check', sql`${table.outputTokens} IS NULL OR ${table.outputTokens} >= 0`),
+  check('provider_usage_reconcile_attempts_check', sql`${table.reconcileAttempts} >= 0`),
+  check('provider_usage_cost_status_check', sql`
+    (${table.status} = 'reported' AND ${table.costUsd} IS NOT NULL)
+    OR (${table.status} IN ('pending', 'unknown') AND ${table.costUsd} IS NULL)
+  `),
+])
 
 export const localAuthSession = sqliteTable('local_auth_session', {
   id: integer('id').primaryKey(),

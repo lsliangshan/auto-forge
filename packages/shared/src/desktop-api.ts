@@ -471,6 +471,13 @@ export const modelInfoSchema = z.object({
 export type ModelInfo = z.infer<typeof modelInfoSchema>
 
 const safeTokenCountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+const usdDecimalPattern = /^(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/
+const usdDecimalSchema = z.string().regex(usdDecimalPattern)
+const providerCostShape = {
+  openRouterCostUsd: usdDecimalSchema,
+  openRouterKnownCostCount: safeTokenCountSchema,
+  openRouterUnknownCostCount: safeTokenCountSchema,
+}
 const tokenUsageShape = {
   inputTokens: safeTokenCountSchema,
   outputTokens: safeTokenCountSchema,
@@ -478,8 +485,10 @@ const tokenUsageShape = {
 }
 
 export const modelTokenUsageSchema = z.object({
+  provider: modelProviderIdSchema,
   model: nonEmptyStringSchema,
   ...tokenUsageShape,
+  ...providerCostShape,
 }).strict().superRefine((usage, context) => {
   const total = usage.inputTokens + usage.outputTokens
   if (!Number.isSafeInteger(total) || usage.totalTokens !== total) {
@@ -512,6 +521,7 @@ export const tokenUsagePeriodSchema = z.object({
   startedAt: timestampSchema,
   endedAt: timestampSchema,
   ...tokenUsageShape,
+  ...providerCostShape,
   models: z.array(modelTokenUsageSchema),
   trend: z.array(tokenUsageTrendPointSchema),
 }).strict().superRefine((usage, context) => {
@@ -524,14 +534,37 @@ export const tokenUsagePeriodSchema = z.object({
   const modelIds = new Set<string>()
   let modelInput = 0
   let modelOutput = 0
+  let modelKnownCosts = 0
+  let modelUnknownCosts = 0
+  let modelCostScale = 0
+  let modelCostDigits = 0n
   for (const model of usage.models) {
-    if (modelIds.has(model.model)) {
+    const modelId = `${model.provider}\u0000${model.model}`
+    if (modelIds.has(modelId)) {
       context.addIssue({ code: 'custom', path: ['models'], message: 'Token usage models must be unique' })
     }
-    modelIds.add(model.model)
+    modelIds.add(modelId)
     modelInput += model.inputTokens
     modelOutput += model.outputTokens
+    modelKnownCosts += model.openRouterKnownCostCount
+    modelUnknownCosts += model.openRouterUnknownCostCount
+    const modelCost = model.openRouterCostUsd
+    if (typeof modelCost !== 'string' || !usdDecimalPattern.test(modelCost)) continue
+    const [integer, fraction = ''] = modelCost.split('.')
+    if (fraction.length > modelCostScale) {
+      modelCostDigits *= 10n ** BigInt(fraction.length - modelCostScale)
+      modelCostScale = fraction.length
+    }
+    modelCostDigits += BigInt(`${integer}${fraction}`)
+      * 10n ** BigInt(modelCostScale - fraction.length)
   }
+
+  const costDigits = modelCostDigits.toString().padStart(modelCostScale + 1, '0')
+  const modelCost = modelCostScale === 0
+    ? costDigits
+    : `${costDigits.slice(0, -modelCostScale)}.${costDigits.slice(-modelCostScale)}`
+        .replace(/0+$/, '')
+        .replace(/\.$/, '')
 
   let trendInput = 0
   let trendOutput = 0
@@ -566,6 +599,13 @@ export const tokenUsagePeriodSchema = z.object({
     || usage.outputTokens !== trendOutput
     || usage.totalTokens !== trendInput + trendOutput) {
     context.addIssue({ code: 'custom', message: 'Period, model and trend totals must match' })
+  }
+  if (!Number.isSafeInteger(modelKnownCosts)
+    || !Number.isSafeInteger(modelUnknownCosts)
+    || usage.openRouterCostUsd !== modelCost
+    || usage.openRouterKnownCostCount !== modelKnownCosts
+    || usage.openRouterUnknownCostCount !== modelUnknownCosts) {
+    context.addIssue({ code: 'custom', message: 'Period and model provider cost totals must match' })
   }
 })
 

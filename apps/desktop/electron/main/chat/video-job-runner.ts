@@ -11,9 +11,13 @@ import {
 } from '@autoforge/shared'
 import {
   isVideoSubmissionIntent,
+  ProviderUsageConsistencyError,
   type AppRepositories,
+  type ChatRun,
   type MediaGenerationJob,
   type MediaGenerationJobStatus,
+  type ProviderUsageEvent,
+  type ProviderUsageRepository,
   type VideoGenerationSubmissionIntentInput,
   type VideoGenerationTransition,
 } from '../database/repositories.js'
@@ -21,10 +25,15 @@ import {
   MEDIA_LIMITS,
   type MediaAssetService,
 } from '../media/media-asset-service.js'
-import type { ModelProvider } from './model-provider.js'
+import type {
+  ModelProvider,
+  ModelProviderSnapshot,
+  ModelProviderSnapshotSource,
+} from './model-provider.js'
 import type { ResolvedChatRoute } from './multimodal-router.js'
 
 const VIDEO_TIMEOUT_MS = 60 * 60 * 1_000
+const CREDENTIAL_RETRY_MS = 2_000
 const PROVIDER_JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/
 const ACTIVE_STATUSES: MediaGenerationJobStatus[] = [
   'pending',
@@ -32,7 +41,11 @@ const ACTIVE_STATUSES: MediaGenerationJobStatus[] = [
   'downloading',
 ]
 
-export interface SubmitVideoInput {
+interface UsageAttribution {
+  userId: string
+}
+
+export interface SubmitVideoInput extends UsageAttribution {
   requestId: string
   conversationId: string
   prompt: string
@@ -42,10 +55,7 @@ export interface SubmitVideoInput {
 }
 
 export interface VideoJobProviderRegistryPort {
-  get(provider: ResolvedChatRoute['provider']): Pick<
-    ModelProvider,
-    'submitVideo' | 'pollVideo' | 'downloadVideo'
-  >
+  acquire: ModelProviderSnapshotSource['acquire']
 }
 
 export interface VideoJobRunnerDependencies {
@@ -53,12 +63,14 @@ export interface VideoJobRunnerDependencies {
     AppRepositories,
     'conversations' | 'mediaGenerationJobs' | 'mediaAssets' | 'messages' | 'chatRuns'
   >
+  providerUsage: Pick<ProviderUsageRepository, 'find' | 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   providers: VideoJobProviderRegistryPort
   media: Pick<
     MediaAssetService,
     'modelInput' | 'commitGeneratedStream' | 'resolveReadyAsset' | 'removeDraft'
   >
   emit: (event: ChatEvent) => void
+  onBackgroundFailure: (error: unknown) => void
   id?: () => string
   now?: () => number
   timers?: {
@@ -94,6 +106,11 @@ interface VideoTerminalMetadata {
   generationId?: string
   costUsd?: string
 }
+
+type VideoUsageClassification =
+  | { kind: 'untracked' }
+  | { kind: 'legacy-unattributed' }
+  | { kind: 'tracked'; event: ProviderUsageEvent }
 
 function persistedParameters(
   options: SubmitVideoInput['route']['generation']['video'],
@@ -225,6 +242,8 @@ export class VideoJobRunner {
   private readonly controllers = new Map<string, AbortController>()
   private readonly work = new Map<string, Promise<void>>()
   private readonly submissions = new Set<Promise<SubmittedVideoJob>>()
+  private readonly providerSnapshots = new Map<string, ModelProviderSnapshot>()
+  private readonly backgroundFailures: unknown[] = []
   private stopped = false
 
   constructor(private readonly dependencies: VideoJobRunnerDependencies) {
@@ -234,6 +253,11 @@ export class VideoJobRunner {
       set: (callback, delayMs) => setTimeout(callback, delayMs),
       clear: (handle) => clearTimeout(handle),
     }
+  }
+
+  private recordBackgroundFailure(error: unknown): void {
+    this.backgroundFailures.push(error)
+    try { this.dependencies.onBackgroundFailure(error) } catch { /* Failure reporting is observational. */ }
   }
 
   async submit(input: SubmitVideoInput): Promise<SubmittedVideoJob> {
@@ -259,6 +283,8 @@ export class VideoJobRunner {
 
     let controller: AbortController | undefined
     let intent: MediaGenerationJob | undefined
+    let usageStarted = false
+    let usageContinues = false
     try {
       const preparedAt = this.now()
       const userMessageId = this.id()
@@ -292,6 +318,8 @@ export class VideoJobRunner {
           id: runId,
           conversationId: input.conversationId,
           requestId: input.requestId,
+          userId: input.userId,
+          provider: input.route.provider,
           model: input.route.model,
           status: 'running',
           startedAt: preparedAt,
@@ -314,7 +342,9 @@ export class VideoJobRunner {
 
       controller = new AbortController()
       this.controllers.set(input.requestId, controller)
-      const provider = this.provider(input.route.provider)
+      const providerSnapshot = await this.acquireSubmitSnapshot(input.route.provider)
+      this.providerSnapshots.set(input.requestId, providerSnapshot)
+      const provider = providerSnapshot.provider
       if (!provider.submitVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
       const inputs = await this.dependencies.media.modelInput(
         input.conversationId,
@@ -329,6 +359,25 @@ export class VideoJobRunner {
           asset.assetId !== input.assetIds[index] || asset.kind !== 'image'
         ))
       ) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+      const operationKey = `video:${input.requestId}`
+      if (input.route.provider === 'openrouter') {
+        if (providerSnapshot.apiKeyFingerprint === undefined) {
+          throw toSafeAppError({ code: 'CREDENTIAL_UNAVAILABLE' })
+        }
+        this.dependencies.providerUsage.start({
+          id: this.id(),
+          operationKey,
+          userId: input.userId,
+          apiKeyFingerprint: providerSnapshot.apiKeyFingerprint,
+          provider: input.route.provider,
+          requestId: input.requestId,
+          chatRunId: runId,
+          model: input.route.model,
+          modality: 'video',
+          startedAt: this.now(),
+        })
+        usageStarted = true
+      }
       const submitted = await provider.submitVideo({
         model: input.route.model,
         prompt: input.prompt,
@@ -339,14 +388,18 @@ export class VideoJobRunner {
         signal: controller.signal,
       })
       if (
-        this.stopped
-        || controller.signal.aborted
-        || !PROVIDER_JOB_ID_PATTERN.test(submitted.providerJobId)
+        !PROVIDER_JOB_ID_PATTERN.test(submitted.providerJobId)
         || (submitted.status !== 'pending' && submitted.status !== 'in_progress')
       ) {
-        throw controller.signal.aborted
-          ? toSafeAppError({ code: 'CANCELLED' })
-          : toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+        throw toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+      }
+      if (input.route.provider === 'openrouter') {
+        this.dependencies.providerUsage.bindIdentity(operationKey, {
+          providerJobId: submitted.providerJobId,
+        })
+      }
+      if (this.stopped || controller.signal.aborted) {
+        throw toSafeAppError({ code: 'CANCELLED' })
       }
 
       const createdAt = this.now()
@@ -365,6 +418,7 @@ export class VideoJobRunner {
         },
       )
       if (!bound) throw toSafeAppError({ code: 'CONFLICT' })
+      usageContinues = true
       const { job } = bound
       this.safeEmit({
         type: 'block_update',
@@ -386,6 +440,10 @@ export class VideoJobRunner {
         status: submitted.status,
       }
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) throw error
+      if (usageStarted && !usageContinues) {
+        this.dependencies.providerUsage.markUnknown(`video:${input.requestId}`, this.now())
+      }
       const safe = (
         this.stopped
         || controller?.signal.aborted
@@ -466,10 +524,15 @@ export class VideoJobRunner {
     for (const jobId of [...this.timers.keys()]) this.clearTimer(jobId)
     for (const jobId of [...this.deadlineTimers.keys()]) this.clearDeadlineTimer(jobId)
     for (const controller of this.controllers.values()) controller.abort()
-    await Promise.allSettled([
+    const results = await Promise.allSettled([
       ...this.work.values(),
       ...this.submissions,
     ])
+    const consistencyFailure = [
+      ...results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []),
+      ...this.backgroundFailures,
+    ].find((error) => error instanceof ProviderUsageConsistencyError)
+    if (consistencyFailure) throw consistencyFailure
   }
 
   private assertSubmit(input: SubmitVideoInput): void {
@@ -485,9 +548,92 @@ export class VideoJobRunner {
     ) throw toSafeAppError({ code: 'INVALID_INPUT' })
   }
 
-  private provider(provider: ResolvedChatRoute['provider']) {
-    modelProviderIdSchema.parse(provider)
-    return this.dependencies.providers.get(provider)
+  private async acquireSubmitSnapshot(
+    providerId: ResolvedChatRoute['provider'],
+  ): Promise<ModelProviderSnapshot> {
+    modelProviderIdSchema.parse(providerId)
+    const snapshot = await this.dependencies.providers.acquire(providerId)
+    if (snapshot.providerId !== providerId) throw new ProviderUsageConsistencyError()
+    return snapshot
+  }
+
+  private classifyUsage(job: MediaGenerationJob): VideoUsageClassification {
+    const run = this.dependencies.database.chatRuns.getByRequestId(job.id)
+    if (
+      !run
+      || run.conversationId !== job.conversationId
+      || run.model !== job.model
+      || run.requestId !== job.id
+      || run.status !== 'running'
+    ) throw new ProviderUsageConsistencyError()
+    const event = this.dependencies.providerUsage.find(`video:${job.id}`)
+    if (job.provider !== 'openrouter') {
+      if (
+        event !== undefined
+        || (run.userId === undefined) !== (run.provider === undefined)
+        || (run.provider !== undefined && run.provider !== job.provider)
+      ) throw new ProviderUsageConsistencyError()
+      return { kind: 'untracked' }
+    }
+    if (run.userId === undefined && run.provider === undefined) {
+      if (event !== undefined) throw new ProviderUsageConsistencyError()
+      return { kind: 'legacy-unattributed' }
+    }
+    if (run.userId === undefined || run.provider !== 'openrouter' || event === undefined) {
+      throw new ProviderUsageConsistencyError()
+    }
+    this.assertTrackedUsage(job, run, event)
+    return { kind: 'tracked', event }
+  }
+
+  private assertTrackedUsage(
+    job: MediaGenerationJob,
+    run: ChatRun,
+    event: ProviderUsageEvent,
+  ): void {
+    if (
+      event.userId !== run.userId
+      || event.provider !== 'openrouter'
+      || event.requestId !== job.id
+      || event.chatRunId !== run.id
+      || event.model !== job.model
+      || event.modality !== 'video'
+      || event.providerJobId !== job.providerJobId
+    ) throw new ProviderUsageConsistencyError()
+  }
+
+  private async snapshotForJob(
+    job: MediaGenerationJob,
+    usage: VideoUsageClassification,
+  ): Promise<ModelProviderSnapshot | undefined> {
+    const persisted = this.providerSnapshots.get(job.id)
+    if (persisted !== undefined) {
+      if (persisted.providerId !== job.provider) throw new ProviderUsageConsistencyError()
+      if (
+        usage.kind === 'tracked'
+        && (
+          usage.event.apiKeyFingerprint === undefined
+          || persisted.apiKeyFingerprint !== usage.event.apiKeyFingerprint
+        )
+      ) throw new ProviderUsageConsistencyError()
+      return persisted
+    }
+    let snapshot: ModelProviderSnapshot
+    try {
+      snapshot = await this.dependencies.providers.acquire(modelProviderIdSchema.parse(job.provider))
+    } catch (error) {
+      if (toSafeAppError(error).code === 'CREDENTIAL_UNAVAILABLE') return undefined
+      throw error
+    }
+    if (snapshot.providerId !== job.provider) throw new ProviderUsageConsistencyError()
+    if (usage.kind === 'tracked') {
+      if (usage.event.apiKeyFingerprint === undefined) {
+        throw new ProviderUsageConsistencyError()
+      }
+      if (snapshot.apiKeyFingerprint !== usage.event.apiKeyFingerprint) return undefined
+    }
+    this.providerSnapshots.set(job.id, snapshot)
+    return snapshot
   }
 
   private schedule(job: MediaGenerationJob): void {
@@ -503,7 +649,25 @@ export class VideoJobRunner {
       : Math.min(job.nextPollAt ?? this.now(), deadline)
     const handle = this.timersApi.set(() => {
       this.timers.delete(job.id)
-      void this.wake(job.id)
+      void this.wake(job.id).catch((error: unknown) => {
+        this.recordBackgroundFailure(error)
+      })
+    }, Math.max(0, target - this.now()))
+    this.timers.set(job.id, handle)
+  }
+
+  private scheduleCredentialRetry(job: MediaGenerationJob): void {
+    if (this.stopped || !ACTIVE_STATUSES.includes(job.status)) return
+    this.clearTimer(job.id)
+    const target = Math.min(
+      this.now() + CREDENTIAL_RETRY_MS,
+      job.createdAt + VIDEO_TIMEOUT_MS,
+    )
+    const handle = this.timersApi.set(() => {
+      this.timers.delete(job.id)
+      void this.wake(job.id).catch((error: unknown) => {
+        this.recordBackgroundFailure(error)
+      })
     }, Math.max(0, target - this.now()))
     this.timers.set(job.id, handle)
   }
@@ -544,9 +708,28 @@ export class VideoJobRunner {
       this.fail(job, 'MEDIA_GENERATION_FAILED')
       return
     }
+    const usage = this.classifyUsage(job)
     const deadline = job.createdAt + VIDEO_TIMEOUT_MS
     if (this.now() >= deadline) {
+      if (usage.kind === 'tracked' && job.status !== 'downloading') {
+        this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
+      }
       this.fail(job, 'MEDIA_GENERATION_TIMEOUT')
+      return
+    }
+    const providerSnapshot = await this.snapshotForJob(job, usage)
+    const current = this.currentActiveJob(job, controller.signal)
+    if (current === undefined) return
+    const currentUsage = this.classifyUsage(current)
+    if (this.now() >= deadline) {
+      if (currentUsage.kind === 'tracked' && current.status !== 'downloading') {
+        this.dependencies.providerUsage.markUnknown(`video:${current.id}`, this.now())
+      }
+      this.fail(current, 'MEDIA_GENERATION_TIMEOUT')
+      return
+    }
+    if (providerSnapshot === undefined) {
+      this.scheduleCredentialRetry(current)
       return
     }
     this.clearDeadlineTimer(job.id)
@@ -556,11 +739,11 @@ export class VideoJobRunner {
     )
     this.deadlineTimers.set(job.id, deadlineTimer)
     try {
-      if (job.status === 'downloading') {
-        await this.download(job, controller.signal)
+      if (current.status === 'downloading') {
+        await this.download(current, controller.signal, providerSnapshot.provider)
         return
       }
-      await this.poll(job, controller.signal)
+      await this.poll(current, controller.signal, currentUsage, providerSnapshot.provider)
     } finally {
       if (this.deadlineTimers.get(job.id) === deadlineTimer) {
         this.clearDeadlineTimer(job.id)
@@ -568,21 +751,59 @@ export class VideoJobRunner {
     }
   }
 
-  private async poll(job: MediaGenerationJob, signal: AbortSignal): Promise<void> {
+  private currentActiveJob(
+    expected: MediaGenerationJob,
+    signal: AbortSignal,
+  ): MediaGenerationJob | undefined {
+    if (this.stopped || signal.aborted) return undefined
+    const current = this.dependencies.database.mediaGenerationJobs.get(expected.id)
+    if (
+      !current
+      || !ACTIVE_STATUSES.includes(current.status)
+      || isVideoSubmissionIntent(current)
+      || current.conversationId !== expected.conversationId
+      || current.assistantMessageId !== expected.assistantMessageId
+      || current.provider !== expected.provider
+      || current.model !== expected.model
+      || current.providerJobId !== expected.providerJobId
+      || current.status !== expected.status
+      || current.pollAttempts !== expected.pollAttempts
+      || current.nextPollAt !== expected.nextPollAt
+      || current.updatedAt !== expected.updatedAt
+    ) return undefined
+    return current
+  }
+
+  private async poll(
+    job: MediaGenerationJob,
+    signal: AbortSignal,
+    usage: VideoUsageClassification,
+    provider: ModelProvider,
+  ): Promise<void> {
     if (isVideoSubmissionIntent(job)) {
       this.fail(job, 'MEDIA_GENERATION_FAILED')
       return
     }
-    const provider = this.provider(modelProviderIdSchema.parse(job.provider))
-    if (!provider.pollVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
-    const result = await provider.pollVideo(job.providerJobId, signal)
-    if (this.stopped || signal.aborted) return
+    let result: Awaited<ReturnType<NonNullable<ModelProvider['pollVideo']>>>
+    try {
+      if (!provider.pollVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
+      result = await provider.pollVideo(job.providerJobId, signal)
+    } catch (error) {
+      if (usage.kind === 'tracked') {
+        this.dependencies.providerUsage.markUnknown(`video:${job.id}`, this.now())
+      }
+      throw error
+    }
     const attempts = (job.pollAttempts ?? 0) + 1
     if (result.status === 'failed') {
+      this.recordTerminalProviderUsage(job.id, usage, result)
+      if (this.stopped || signal.aborted) return
       this.fail(job, appErrorCodeSchema.parse(result.errorCode))
       return
     }
     if (result.status === 'completed') {
+      this.recordTerminalProviderUsage(job.id, usage, result)
+      if (this.stopped || signal.aborted) return
       let current = job
       if (current.status === 'pending') {
         const progress = this.dependencies.database.mediaGenerationJobs.transition(
@@ -620,12 +841,14 @@ export class VideoJobRunner {
       )
       if (!downloading) return
       this.emitTransition(downloading)
-      await this.download(downloading.job, signal, {
+      await this.download(downloading.job, signal, provider, {
         generationId: result.generationId,
         costUsd: result.costUsd,
       })
       return
     }
+
+    if (this.stopped || signal.aborted) return
 
     const desired = job.status === 'pending' && result.status === 'in_progress'
       ? 'in_progress'
@@ -646,9 +869,35 @@ export class VideoJobRunner {
     this.schedule(transition.job)
   }
 
+  private recordTerminalProviderUsage(
+    jobId: string,
+    usage: VideoUsageClassification,
+    result: { generationId?: string; costUsd?: string },
+  ): void {
+    if (usage.kind !== 'tracked') return
+    const operationKey = `video:${jobId}`
+    if (result.generationId !== undefined) {
+      this.dependencies.providerUsage.bindIdentity(operationKey, {
+        generationId: result.generationId,
+      })
+    }
+    if (result.costUsd === undefined) {
+      this.dependencies.providerUsage.markUnknown(operationKey, this.now())
+      return
+    }
+    this.dependencies.providerUsage.report(operationKey, {
+      ...(result.generationId === undefined
+        ? {}
+        : { generationId: result.generationId }),
+      costUsd: result.costUsd,
+      endedAt: this.now(),
+    })
+  }
+
   private async download(
     job: MediaGenerationJob,
     signal: AbortSignal,
+    provider: ModelProvider,
     terminal?: VideoTerminalMetadata,
   ): Promise<void> {
     if (isVideoSubmissionIntent(job)) {
@@ -683,7 +932,6 @@ export class VideoJobRunner {
       await this.dependencies.media.removeDraft(assetId, job.conversationId)
     }
     if (!asset) {
-      const provider = this.provider(modelProviderIdSchema.parse(job.provider))
       if (!provider.downloadVideo) throw toSafeAppError({ code: 'MODEL_MODALITY_UNSUPPORTED' })
       const response = await provider.downloadVideo(job.providerJobId, signal)
       let length: number | undefined
@@ -762,6 +1010,7 @@ export class VideoJobRunner {
       requestId: job.id,
       status: 'completed',
     })
+    this.providerSnapshots.delete(job.id)
   }
 
   private async handleOperationFailure(
@@ -769,6 +1018,7 @@ export class VideoJobRunner {
     controller: AbortController,
     error: unknown,
   ): Promise<void> {
+    if (error instanceof ProviderUsageConsistencyError) throw error
     if (this.stopped) return
     const job = this.dependencies.database.mediaGenerationJobs.get(jobId)
     if (!job || !ACTIVE_STATUSES.includes(job.status)) return
@@ -787,6 +1037,7 @@ export class VideoJobRunner {
       this.now(),
     )
     if (!failed) return
+    this.providerSnapshots.delete(job.id)
     this.emitTransition(failed)
     this.safeEmit({
       type: 'status',

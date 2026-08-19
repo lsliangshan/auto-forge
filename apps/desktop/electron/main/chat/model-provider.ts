@@ -5,6 +5,7 @@ import {
   type AppError,
   type GenerationOptions,
   type ModelInfo,
+  type ModelProviderId,
   type VideoFrameType,
 } from '@autoforge/shared'
 import type { ModelMediaInput } from '../media/media-asset-service.js'
@@ -44,6 +45,7 @@ export interface ModelStreamRequest {
   output?: { type: 'text' } | { type: 'audio'; voice?: string; format: string }
   maxOutputTokens?: number
   signal?: AbortSignal
+  endUserId?: string
 }
 
 export type ModelStreamEvent =
@@ -90,7 +92,16 @@ export interface ModelVideoRequest {
 export type ModelVideoStatus =
   | { status: 'pending' | 'in_progress' }
   | { status: 'completed'; generationId?: string; costUsd?: string }
-  | { status: 'failed'; errorCode: AppError['code'] }
+  | { status: 'failed'; errorCode: AppError['code']; generationId?: string; costUsd?: string }
+
+export interface ModelGenerationUsage {
+  generationId: string
+  costUsd?: string
+}
+
+export interface GenerationUsageProviderPort {
+  getGenerationUsage(generationId: string, signal?: AbortSignal): Promise<ModelGenerationUsage>
+}
 
 export interface ModelProvider {
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>
@@ -100,6 +111,17 @@ export interface ModelProvider {
   submitVideo?(request: ModelVideoRequest): Promise<{ providerJobId: string; status: 'pending' | 'in_progress' }>
   pollVideo?(providerJobId: string, signal?: AbortSignal): Promise<ModelVideoStatus>
   downloadVideo?(providerJobId: string, signal?: AbortSignal): Promise<Response>
+  getGenerationUsage?: GenerationUsageProviderPort['getGenerationUsage']
+}
+
+export interface ModelProviderSnapshot {
+  providerId: ModelProviderId
+  provider: ModelProvider
+  apiKeyFingerprint?: string
+}
+
+export interface ModelProviderSnapshotSource {
+  acquire(providerId: ModelProviderId): Promise<ModelProviderSnapshot>
 }
 
 export interface ModelCredentialPort {
@@ -121,6 +143,7 @@ export interface OpenAiCompatibleProviderConfig {
   includeUsageStreamOption: boolean
   supportsMediaInput: boolean
   supportsAudioOutput: boolean
+  serializeEndUser?: (id: string) => string
 }
 
 export interface OpenAiCompatibleProviderDependencies {
@@ -136,7 +159,7 @@ export interface OpenAiCompatibleProviderDependencies {
   }) => void
 }
 
-export type ProviderOperation = 'models' | 'chat' | 'image' | 'video'
+export type ProviderOperation = 'models' | 'chat' | 'image' | 'video' | 'generation'
 type RetryPolicy = 'never' | 'idempotent'
 interface AuthenticatedFetchOptions {
   retry: RetryPolicy
@@ -265,6 +288,19 @@ class RetryableFailure extends Error {
 
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
+}
+
+export async function readCredentialSnapshot(
+  read: () => Promise<string | undefined>,
+): Promise<string> {
+  try {
+    const value = await read()
+    if (!value) throw failure('CREDENTIAL_UNAVAILABLE')
+    return value
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error) throw error
+    throw failure('CREDENTIAL_UNAVAILABLE')
+  }
 }
 
 function isAbort(error: unknown, signal?: AbortSignal): boolean {
@@ -861,6 +897,9 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           body = JSON.stringify({
             model: request.model,
             messages,
+            ...(request.endUserId === undefined || this.config.serializeEndUser === undefined
+              ? {}
+              : { user: this.config.serializeEndUser(request.endUserId) }),
             ...(request.tools?.length ? { tools: request.tools } : {}),
             ...(request.maxOutputTokens === undefined ? {} : { max_tokens: request.maxOutputTokens }),
             stream: true,
@@ -909,6 +948,10 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         }
       } catch (error) {
+        if (
+          error instanceof RetryableFailure
+          && (replay.generations.size > 0 || replay.usages.size > 0)
+        ) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
         if (!(error instanceof RetryableFailure) || attempt === maxAttempts - 1) {
           if (error instanceof RetryableFailure) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
           throw error
@@ -1081,16 +1124,20 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         if (data === '[DONE]') { done = true; return }
         let chunk: z.infer<typeof streamChunkSchema>
         try { chunk = streamChunkSchema.parse(JSON.parse(data)) } catch (error) { parserError = error; return }
-        if (chunk.error) {
-          this.reportStreamDiagnostic(chunk.error)
-          parserError = streamedFailure(chunk.error)
-          return
+        const failedChoice = chunk.choices.find((choice) => (
+          choice.finish_reason === 'error' || choice.error !== undefined
+        ))
+        const hasFrameError = chunk.error !== undefined || failedChoice !== undefined
+        if (hasFrameError) {
+          const frameError = chunk.error ?? failedChoice?.error
+          this.reportStreamDiagnostic(frameError)
+          parserError = streamedFailure(frameError)
         }
         if (chunk.id && !replay.generations.has(chunk.id)) {
           replay.generations.add(chunk.id)
           pending.push({ type: 'generation', id: chunk.id })
         }
-        for (const choice of chunk.choices) {
+        for (const choice of hasFrameError ? [] : chunk.choices) {
           const content = choice.delta.content ?? ''
           if (content) {
             const cumulative = `${attemptText.get(choice.index) ?? ''}${content}`
@@ -1136,11 +1183,6 @@ export class OpenAiCompatibleProvider implements ModelProvider {
             tools.set(key, accumulated)
           }
           if (choice.finish_reason) {
-            if (choice.finish_reason === 'error' || choice.error) {
-              this.reportStreamDiagnostic(choice.error)
-              parserError = streamedFailure(choice.error)
-              return
-            }
             if (choice.index === 0) explicitTerminal = true
             if (choice.finish_reason === 'tool_calls') {
               for (const [key, tool] of tools) {
@@ -1186,13 +1228,13 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           break
         }
         parser.feed(decoder.decode(result.value, { stream: true }))
-        if (parserError) throw parserError
         while (pending.length) yield pending.shift()!
+        if (parserError) throw parserError
       }
       parser.feed(decoder.decode())
       parser.reset({ consume: true })
-      if (parserError) throw parserError
       while (pending.length) yield pending.shift()!
+      if (parserError) throw parserError
       if (!done && !explicitTerminal) throw new RetryableFailure()
     } finally {
       if (!physicalEof) await reader.cancel().catch(() => undefined)

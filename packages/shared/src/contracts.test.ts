@@ -478,15 +478,30 @@ describe('cross-process contracts', () => {
       inputTokens: number,
       outputTokens: number,
       model = 'alpha/model',
+      openRouterCostUsd = '0',
+      openRouterKnownCostCount = 0,
+      openRouterUnknownCostCount = 0,
     ) => ({
       startedAt,
       endedAt,
       inputTokens,
       outputTokens,
       totalTokens: inputTokens + outputTokens,
+      openRouterCostUsd,
+      openRouterKnownCostCount,
+      openRouterUnknownCostCount,
       models: inputTokens + outputTokens === 0
         ? []
-        : [{ model, inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }],
+        : [{
+            provider: 'openrouter' as const,
+            model,
+            inputTokens,
+            outputTokens,
+            totalTokens: inputTokens + outputTokens,
+            openRouterCostUsd,
+            openRouterKnownCostCount,
+            openRouterUnknownCostCount,
+          }],
       trend: inputTokens + outputTokens === 0
         ? []
         : [{ startedAt, inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }],
@@ -494,10 +509,10 @@ describe('cross-process contracts', () => {
 
     const snapshot = {
       generatedAt: '2026-08-17T04:30:00.000Z',
-      today: period('2026-08-16T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 7, 3),
+      today: period('2026-08-16T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 7, 3, 'alpha/model', '0.0000001', 1),
       yesterday: period('2026-08-15T16:00:00.000Z', '2026-08-16T16:00:00.000Z', 2, 1),
       week: period('2026-08-16T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 7, 3),
-      month: period('2026-07-31T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 9, 4),
+      month: period('2026-07-31T16:00:00.000Z', '2026-08-17T04:30:00.000Z', 9, 4, 'alpha/model', '123456789.123', 2, 1),
       allTime: period('2026-07-01T01:00:00.000Z', '2026-08-17T04:30:00.000Z', 12, 6),
     }
     const withTodayTokenCounts = (inputTokens: number, outputTokens: number) => {
@@ -524,6 +539,52 @@ describe('cross-process contracts', () => {
     }
 
     expect(tokenUsageSnapshotSchema.parse(snapshot)).toEqual(snapshot)
+    for (const invalidCost of ['01', '1.0', '1e-7', '-1', '', 1]) {
+      const invalidSnapshot = {
+        ...snapshot,
+        today: {
+          ...snapshot.today,
+          openRouterCostUsd: invalidCost,
+          models: snapshot.today.models.map((model) => ({ ...model, openRouterCostUsd: invalidCost })),
+        },
+      }
+      expect(
+        () => tokenUsageSnapshotSchema.safeParse(invalidSnapshot),
+        `safeParse must not throw for invalid cost ${String(invalidCost)}`,
+      ).not.toThrow()
+      expect(
+        tokenUsageSnapshotSchema.safeParse(invalidSnapshot).success,
+        `invalid cost ${String(invalidCost)}`,
+      ).toBe(false)
+    }
+    for (const invalidCount of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => tokenUsageSnapshotSchema.parse({
+        ...snapshot,
+        today: {
+          ...snapshot.today,
+          openRouterKnownCostCount: invalidCount,
+          models: snapshot.today.models.map((model) => ({ ...model, openRouterKnownCostCount: invalidCount })),
+        },
+      }), `invalid count ${invalidCount}`).toThrow()
+    }
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        models: snapshot.today.models.map((model) => {
+          const modelWithoutProvider: Partial<typeof model> = { ...model }
+          delete modelWithoutProvider.provider
+          return modelWithoutProvider
+        }),
+      },
+    })).toThrow()
+    expect(() => tokenUsageSnapshotSchema.parse({
+      ...snapshot,
+      today: {
+        ...snapshot.today,
+        openRouterCostUsd: '0',
+      },
+    })).toThrow()
     for (const [description, inputTokens, outputTokens] of [
       ['negative token count', -1, 3],
       ['fractional token count', 1.5, 3],

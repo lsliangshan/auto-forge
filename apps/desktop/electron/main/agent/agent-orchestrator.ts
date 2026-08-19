@@ -13,10 +13,17 @@ import {
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
 import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
 import { retrieveWorkflows } from '../workflows/retriever.js'
-import type { AppRepositories } from '../database/repositories.js'
+import { addUsd } from '../billing/decimal-usd.js'
+import { trackProviderStream } from '../billing/provider-usage-stream.js'
+import {
+  ProviderUsageConsistencyError,
+  type AppRepositories,
+  type ProviderUsageRepository,
+} from '../database/repositories.js'
 import type {
   ModelContentPart,
   ModelMessage,
+  ModelProviderSnapshot,
   ModelStreamEvent,
   ModelStreamRequest,
   ModelTool,
@@ -30,10 +37,6 @@ export type ProviderStreamEvent = ModelStreamEvent
 
 export interface AgentProviderPort {
   stream(request: ModelStreamRequest): AsyncIterable<ModelStreamEvent>
-}
-
-export interface AgentProviderRegistryPort {
-  get(provider: ModelProviderId): AgentProviderPort
 }
 
 export interface AgentWorkflowPort {
@@ -73,6 +76,8 @@ export interface CreateRunInput {
   runId: string
   conversationId: string
   requestId: string
+  userId: string
+  provider: ModelProviderId
   model: string
   startedAt: number
 }
@@ -134,6 +139,8 @@ export function createAgentPersistence(
         id: input.runId,
         conversationId: input.conversationId,
         requestId: input.requestId,
+        userId: input.userId,
+        provider: input.provider,
         model: input.model,
         status: 'running',
         startedAt: input.startedAt,
@@ -162,6 +169,8 @@ export function createAgentPersistence(
           id: input.run.runId,
           conversationId: input.run.conversationId,
           requestId: input.run.requestId,
+          userId: input.run.userId,
+          provider: input.run.provider,
           model: input.run.model,
           status: 'running',
           startedAt: input.run.startedAt,
@@ -197,12 +206,12 @@ export function createAgentPersistence(
 }
 
 export interface AgentOrchestratorDependencies {
-  providers: AgentProviderRegistryPort
   workflows: AgentWorkflowPort
   persistence: AgentPersistencePort
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
   executions: AgentExecutionPort
   history: ConversationHistoryPort
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
   retrieve?: typeof retrieveWorkflows
   id?: () => string
@@ -210,7 +219,11 @@ export interface AgentOrchestratorDependencies {
   developerMode?: () => boolean
 }
 
-export interface AgentRunInput {
+interface UsageAttribution {
+  userId: string
+}
+
+export interface AgentRunInput extends UsageAttribution {
   conversationId: string
   content: string
   userBlocks: ChatBlock[]
@@ -222,6 +235,7 @@ export interface AgentRunInput {
   provider: ModelProviderId
   model: string
   requestId?: string
+  providerSnapshot: ModelProviderSnapshot
 }
 
 export interface AgentRunResult {
@@ -247,7 +261,8 @@ interface ActiveAgentRun {
   runId: string
   messageId: string
   conversationId: string
-  provider: AgentProviderPort
+  providerSnapshot: ModelProviderSnapshot
+  userId: string
   model: string
   blocks: ChatBlock[]
   messages: ModelMessage[]
@@ -309,6 +324,9 @@ export class AgentOrchestrator {
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const requestId = input.requestId ?? this.id()
+    if (input.providerSnapshot.providerId !== input.provider) {
+      throw appFailure('CONFLICT')
+    }
     if (this.activeByRequest.has(requestId) || this.activeByConversation.has(input.conversationId)) {
       const error = appFailure('CONFLICT')
       this.safeEmit({
@@ -340,6 +358,8 @@ export class AgentOrchestrator {
         runId,
         conversationId: input.conversationId,
         requestId,
+        userId: input.userId,
+        provider: input.provider,
         model: input.model,
         startedAt,
       })
@@ -349,14 +369,15 @@ export class AgentOrchestrator {
         initialBlocks: [],
         createdAt: startedAt,
       })
-      const provider = this.dependencies.providers.get(input.provider)
+      const providerSnapshot = input.providerSnapshot
 
       active = {
         requestId,
         runId,
         messageId,
         conversationId: input.conversationId,
-        provider,
+        providerSnapshot,
+        userId: input.userId,
         model: input.model,
         blocks: [],
         messages: [],
@@ -380,7 +401,8 @@ export class AgentOrchestrator {
       const historyMessages = await this.dependencies.history.prepare({
         conversationId: input.conversationId,
         beforeOrdinal: userPosition.ordinal,
-        provider,
+        providerSnapshot,
+        callIdentity: { requestId, chatRunId: runId, userId: input.userId },
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         currentMessage: { role: 'user', content: input.modelContent },
@@ -392,8 +414,15 @@ export class AgentOrchestrator {
         ...historyMessages,
         { role: 'user', content: input.modelContent },
       ]
-      return this.driveExclusive(active)
+      return await this.driveExclusive(active)
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) {
+        if (active && !active.terminal) this.finish(active, 'failed', appFailure('INTERNAL_ERROR'))
+        else if (this.activeByConversation.get(input.conversationId) === requestId) {
+          this.activeByConversation.delete(input.conversationId)
+        }
+        throw error
+      }
       if (active) return this.finish(active, 'failed', asAppError(error))
       if (this.activeByConversation.get(input.conversationId) === requestId) {
         this.activeByConversation.delete(input.conversationId)
@@ -471,6 +500,10 @@ export class AgentOrchestrator {
     try {
       return await this.drive(active)
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) {
+        if (!active.terminal) this.finish(active, 'failed', appFailure('INTERNAL_ERROR'))
+        throw error
+      }
       if (active.terminal) return active.terminal
       if (active.cancelled || active.controller.signal.aborted) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       return this.finish(active, 'failed', asAppError(error))
@@ -486,17 +519,35 @@ export class AgentOrchestrator {
 
     while (active.modelTurns < MAX_MODEL_TURNS) {
       active.modelTurns += 1
+      const operationKey = `agent:${active.requestId}:turn:${active.modelTurns - 1}`
       const toolCalls: Array<Extract<ModelStreamEvent, { type: 'tool_call' }>> = []
       let finishReason: string | undefined
       let assistantContent = ''
       let turnUsage: Extract<ModelStreamEvent, { type: 'usage' }> | undefined
-      for await (const event of active.provider.stream({
-        model: active.model,
-        messages: active.messages,
-        ...(active.tools.length ? { tools: active.tools } : {}),
-        signal: active.controller.signal,
+      for await (const event of trackProviderStream({
+        operationKey,
+        attribution: {
+          userId: active.userId,
+          requestId: active.requestId,
+          chatRunId: active.runId,
+          model: active.model,
+          modality: 'text',
+        },
+        request: {
+          model: active.model,
+          messages: active.messages,
+          ...(active.tools.length ? { tools: active.tools } : {}),
+          signal: active.controller.signal,
+          endUserId: active.userId,
+        },
+        provider: active.providerSnapshot,
+        providerUsage: this.dependencies.providerUsage,
+        id: this.id,
+        now: this.now,
       })) {
-        if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+        if (active.cancelled && event.type !== 'generation' && event.type !== 'usage') {
+          return this.finish(active, 'cancelled', appFailure('CANCELLED'))
+        }
         if ('choiceIndex' in event && event.choiceIndex !== 0) continue
         switch (event.type) {
           case 'text_delta':
@@ -517,12 +568,13 @@ export class AgentOrchestrator {
             turnUsage = event
             break
         }
+        if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       }
       if (turnUsage) {
         active.inputTokens = (active.inputTokens ?? 0) + turnUsage.inputTokens
         active.outputTokens = (active.outputTokens ?? 0) + turnUsage.outputTokens
         if (turnUsage.costUsd !== undefined) {
-          active.costUsd = String((Number(active.costUsd ?? 0) + Number(turnUsage.costUsd)).toFixed(12)).replace(/\.?0+$/, '')
+          active.costUsd = addUsd([active.costUsd ?? '0', turnUsage.costUsd])
         }
       }
 

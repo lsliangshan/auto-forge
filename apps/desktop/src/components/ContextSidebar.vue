@@ -258,7 +258,7 @@ const executionStatuses: { label: string; value: ExecutionStatus }[] = [
 const settingsSections = [
   { id: 'provider', label: '大模型供应商' },
   { id: 'model', label: '默认模型' },
-  { id: 'billing', label: 'Token 账单' },
+  { id: 'billing', label: '用量与消费' },
   { id: 'proxy', label: 'VPN 代理' },
   { id: 'appearance', label: '外观与行为' },
   { id: 'data', label: '本地数据' },

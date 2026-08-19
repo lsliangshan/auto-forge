@@ -68,6 +68,214 @@ const allImageParameters = {
 } as const
 
 describe('OpenRouterProvider', () => {
+  it('keeps every operation on the credential captured by its snapshot', async () => {
+    let apiKey = 'sk-openrouter-snapshot-a'
+    const localCredential = { get: vi.fn(async () => apiKey) }
+    const authorizations: string[] = []
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      if (url.endsWith('/images/models') || url.endsWith('/videos/models') || url.endsWith('/models')) {
+        return Response.json({ data: [] })
+      }
+      if (url.endsWith('/chat/completions')) return sseResponse(['data: [DONE]\n\n'])
+      if (url.endsWith('/images')) {
+        return Response.json({ data: [{ b64_json: 'AQID', media_type: 'image/png' }] })
+      }
+      if (url.endsWith('/videos')) return Response.json({ id: 'job_1', status: 'pending' })
+      if (url.endsWith('/videos/job_1')) {
+        return Response.json({ id: 'job_1', status: 'completed', generation_id: 'gen_1' })
+      }
+      if (url.includes('/videos/job_1/content')) return new Response('video')
+      if (url.includes('/generation?id=gen_1')) {
+        return Response.json({ data: { id: 'gen_1', total_cost: '0.25' } })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    const source = new OpenRouterProvider({ credential: localCredential, fetch })
+    const snapshot = await source.acquireSnapshot()
+    apiKey = 'sk-openrouter-snapshot-b'
+
+    await expect(snapshot.provider.listModels()).resolves.toEqual([])
+    await expect(snapshot.provider.validateCredential()).resolves.toEqual({ valid: true })
+    await expect(collect(snapshot.provider.stream({ model: 'text/model', messages: [] }))).resolves.toEqual([])
+    await expect(snapshot.provider.generateImage?.({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    })).resolves.toMatchObject({ outputs: [{ type: 'base64', dataBase64: 'AQID' }] })
+    await expect(snapshot.provider.submitVideo?.({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+      frameImages: [],
+    })).resolves.toEqual({ providerJobId: 'job_1', status: 'pending' })
+    await expect(snapshot.provider.pollVideo?.('job_1')).resolves.toEqual({
+      status: 'completed',
+      generationId: 'gen_1',
+    })
+    await expect(snapshot.provider.downloadVideo?.('job_1')).resolves.toBeInstanceOf(Response)
+    await expect(snapshot.provider.getGenerationUsage?.('gen_1')).resolves.toEqual({
+      generationId: 'gen_1',
+      costUsd: '0.25',
+    })
+
+    expect(localCredential.get).toHaveBeenCalledTimes(1)
+    expect(authorizations.length).toBeGreaterThan(0)
+    expect(authorizations.every((value) => value === 'Bearer sk-openrouter-snapshot-a')).toBe(true)
+    expect(JSON.stringify(snapshot)).not.toContain('sk-openrouter-snapshot-a')
+    expect(JSON.stringify(snapshot)).not.toContain('sk-openrouter-snapshot-b')
+  })
+
+  it('uses the existing credential-unavailable error when snapshot acquisition has no key', async () => {
+    const provider = new OpenRouterProvider({
+      credential: { get: vi.fn(async () => undefined) },
+      fetch: vi.fn(),
+    })
+
+    await expect(provider.acquireSnapshot()).rejects.toMatchObject({
+      code: 'CREDENTIAL_UNAVAILABLE',
+    })
+  })
+
+  it('serializes an end user only in OpenRouter chat requests', async () => {
+    const bodies: unknown[] = []
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)))
+      return sseResponse(['data: [DONE]\n\n'])
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await collect(provider.stream({
+      model: 'model',
+      messages: [{ role: 'user', content: 'hello' }],
+      endUserId: 'user-1',
+    } as never))
+    await collect(provider.stream({
+      model: 'model',
+      messages: [{ role: 'user', content: 'hello' }],
+    }))
+
+    expect(bodies[0]).toMatchObject({
+      user: 'autoforge:user-1',
+    })
+    expect(bodies[1]).not.toHaveProperty('user')
+  })
+
+  it('does not serialize a chat end user into image or video bodies', async () => {
+    const bodies: unknown[] = []
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async (input, init) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        if (String(input).endsWith('/videos')) {
+          return Response.json({ id: 'job_1', status: 'pending' })
+        }
+        return Response.json({
+          data: [{ b64_json: 'AQID', media_type: 'image/png' }],
+        })
+      }),
+    })
+
+    await provider.generateImage({
+      model: 'image-model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    })
+    await provider.submitVideo({
+      model: 'video-model',
+      prompt: 'draw',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+      frameImages: [],
+    })
+
+    expect(bodies[0]).not.toHaveProperty('user')
+    expect(bodies[1]).not.toHaveProperty('user')
+  })
+
+  it('gets normalized generation usage through the fixed endpoint', async () => {
+    const fetch = vi.fn(async () => Response.json({ data: { id: 'gen/a b', total_cost: 1.20e-3 } }))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await expect(provider.getGenerationUsage('gen/a b')).resolves.toEqual({
+      generationId: 'gen/a b',
+      costUsd: '0.0012',
+    })
+    expect(fetch).toHaveBeenCalledWith(
+      'https://openrouter.ai/api/v1/generation?id=gen%2Fa%20b',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({ authorization: 'Bearer sk-private' }),
+      }),
+    )
+  })
+
+  it.each([
+    ['a zero cost', { data: { id: 'gen_1', total_cost: 0 } }, { generationId: 'gen_1', costUsd: '0' }],
+    ['a null cost', { data: { id: 'gen_1', total_cost: null } }, { generationId: 'gen_1' }],
+    ['a mismatched generation ID', { data: { id: 'other', total_cost: 0 } }, undefined],
+    ['an invalid cost', { data: { id: 'gen_1', total_cost: '-1' } }, undefined],
+    ['a malformed response', { data: { id: '', total_cost: 0 } }, undefined],
+  ])('handles %s safely', async (_description, payload, expected) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json(payload)),
+    })
+
+    if (expected) {
+      await expect(provider.getGenerationUsage('gen_1')).resolves.toEqual(expected)
+    } else {
+      await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+        code: 'MODEL_PROVIDER_REQUEST_FAILED',
+      })
+    }
+  })
+
+  it.each([401, 403, 500])('maps generation HTTP %s responses to existing AppError codes', async (status) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => new Response('failed', { status })),
+    })
+
+    await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+      code: status === 401
+        ? 'CREDENTIAL_INVALID'
+        : status === 403 ? 'MODEL_PROVIDER_ACCESS_DENIED' : 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+  })
+
+  it.each([
+    ['a network failure', () => { throw new TypeError('socket closed') }],
+    ['a server failure', () => new Response('failed', { status: 503 })],
+  ])('leaves generation lookup retries to the billing ledger after %s', async (_description, response) => {
+    const fetch = vi.fn(async () => response())
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+
+    await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('rejects invalid generation JSON with the existing safe AppError', async () => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => new Response('{')),
+    })
+
+    await expect(provider.getGenerationUsage('gen_1')).rejects.toMatchObject({
+      code: 'MODEL_PROVIDER_REQUEST_FAILED',
+    })
+  })
+
   it('releases a managed 401 response before returning an invalid credential result', async () => {
     const networkProxy = new NetworkProxyService({
       setProxy: vi.fn(async () => undefined),
@@ -614,6 +822,35 @@ describe('OpenRouterProvider', () => {
 
     expect(JSON.parse(bodies[0]!)).toMatchObject({
       frame_images: [{ frame_type: expectedType }],
+    })
+  })
+
+  it.each([
+    {
+      name: 'generation and usage cost',
+      payload: { generation_id: 'generation-failed-paid', usage: { cost: '0.19' } },
+      expected: { generationId: 'generation-failed-paid', costUsd: '0.19' },
+    },
+    {
+      name: 'generation without usage cost',
+      payload: { generation_id: 'generation-failed-unknown' },
+      expected: { generationId: 'generation-failed-unknown' },
+    },
+  ])('preserves failed video $name for billing', async ({ payload, expected }) => {
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => Response.json({
+        id: 'job-1',
+        status: 'failed',
+        ...payload,
+        error: 'RAW_PROVIDER_ERROR_MUST_NOT_ESCAPE',
+      })),
+    })
+
+    await expect(provider.pollVideo('job-1')).resolves.toEqual({
+      status: 'failed',
+      errorCode: 'MEDIA_GENERATION_FAILED',
+      ...expected,
     })
   })
 
@@ -2005,7 +2242,7 @@ describe('OpenRouterProvider', () => {
     expect(sleep).toHaveBeenCalledTimes(1)
   })
 
-  it('retries a streamed 429 error after partial text without duplicating text or usage', async () => {
+  it('does not retry a streamed 429 error after usage evidence', async () => {
     let attempt = 0
     const fetch = vi.fn(async () => {
       attempt += 1
@@ -2013,23 +2250,51 @@ describe('OpenRouterProvider', () => {
         'data: {"choices":[{"index":0,"delta":{"content":"A"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.1}}\n\n',
         'data: {"error":{"code":429,"message":"prompt must never leak","metadata":{"error_type":"rate_limit"}}}\n\n',
       ])
-      return sseResponse([
-        'data: {"choices":[{"index":0,"delta":{"content":"AB"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.1}}\n\n',
-        'data: [DONE]\n\n',
-      ])
+      return sseResponse(['data: [DONE]\n\n'])
     })
     const diagnostic = vi.fn()
     const provider = new OpenRouterProvider({ credential, fetch, diagnostic, sleep: async () => undefined })
 
-    const result = await collect(provider.stream({ model: 'm', messages: [{ role: 'user', content: 'prompt must never leak' }] }))
+    const result: OpenRouterStreamEvent[] = []
+    let streamFailure: unknown
+    try {
+      for await (const event of provider.stream({
+        model: 'm', messages: [{ role: 'user', content: 'prompt must never leak' }],
+      })) result.push(event)
+    } catch (error) {
+      streamFailure = error
+    }
 
     expect(result.filter((event) => event.type === 'text_delta')).toEqual([
       { type: 'text_delta', choiceIndex: 0, text: 'A' },
-      { type: 'text_delta', choiceIndex: 0, text: 'B' },
     ])
     expect(result.filter((event) => event.type === 'usage')).toHaveLength(1)
-    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('prompt must never leak')
+  })
+
+  it('still retries a streamed 429 before generation or usage evidence', async () => {
+    let attempt = 0
+    const fetch = vi.fn(async () => {
+      attempt += 1
+      if (attempt === 1) return sseResponse([
+        'data: {"error":{"code":429,"message":"retry safely","metadata":{"error_type":"rate_limit"}}}\n\n',
+      ])
+      return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+    })
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep, random: () => 0 })
+
+    await expect(collect(provider.stream({ model: 'm', messages: [] }))).resolves.toEqual([
+      { type: 'text_delta', choiceIndex: 0, text: 'OK' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ])
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(sleep).toHaveBeenCalledTimes(1)
   })
 
   it('maps a streamed 403 error to access denied without claiming the credential is invalid', async () => {
@@ -2043,6 +2308,72 @@ describe('OpenRouterProvider', () => {
       .rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('user content secret')
+  })
+
+  it('yields generation and actual usage from an error frame before preserving the provider failure', async () => {
+    const fetch = vi.fn(async () => sseResponse([
+      'data: {"id":"generation_error_paid","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3,"cost":0.17},"error":{"code":403,"message":"user content secret","metadata":{"error_type":"permission"}}}\n\n',
+    ]))
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+    const events: OpenRouterStreamEvent[] = []
+    let streamFailure: unknown
+
+    try {
+      for await (const event of provider.stream({ model: 'm', messages: [] })) events.push(event)
+    } catch (error) {
+      streamFailure = error
+    }
+
+    expect(events).toEqual([
+      { type: 'generation', id: 'generation_error_paid' },
+      { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.17' },
+    ])
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: '429 with actual usage cost',
+      error: { code: 429, message: 'rate limited', metadata: { error_type: 'rate_limit' } },
+      usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, cost: 0.31 },
+      expectedEvents: [
+        { type: 'generation', id: 'generation_retryable_error' },
+        { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.31' },
+      ],
+    },
+    {
+      name: '503 without usage',
+      error: { code: 503, message: 'upstream unavailable', metadata: { error_type: 'upstream_error' } },
+      usage: undefined,
+      expectedEvents: [
+        { type: 'generation', id: 'generation_retryable_error' },
+      ],
+    },
+  ])('does not retry $name after observing billing identity', async ({ error, usage, expectedEvents }) => {
+    const fetch = vi.fn(async () => sseResponse([
+      `data: ${JSON.stringify({
+        id: 'generation_retryable_error', choices: [],
+        ...(usage === undefined ? {} : { usage }), error,
+      })}\n\n`,
+    ]))
+    const sleep = vi.fn(async () => undefined)
+    const provider = new OpenRouterProvider({ credential, fetch, sleep })
+    const events: OpenRouterStreamEvent[] = []
+    let streamFailure: unknown
+
+    try {
+      for await (const event of provider.stream({ model: 'm', messages: [] })) events.push(event)
+    } catch (caught) {
+      streamFailure = caught
+    }
+
+    expect(events).toEqual(expectedEvents)
+    expect(streamFailure).toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(sleep).not.toHaveBeenCalled()
   })
 
   it('rejects a clean EOF without DONE or an explicit non-error finish frame', async () => {

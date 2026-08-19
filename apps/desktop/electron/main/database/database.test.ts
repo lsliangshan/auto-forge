@@ -8,6 +8,7 @@ import { sql } from 'drizzle-orm'
 import { type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
+import { ProviderUsageConsistencyError } from './repositories.js'
 
 const temporaryDirectories: string[] = []
 
@@ -71,8 +72,53 @@ function createV4Database() {
     INSERT INTO local_users (id, account, account_normalized, password_digest, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run('user_v4', 'Legacy', 'legacy', 'digest', 1, 1)
+  sqlite.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
+    .run('conversation_v4', 'Persisted v4', 1, 1)
+  sqlite.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, started_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('run_v4', 'conversation_v4', 'request_v4', 'model-v4', 'completed', 1)
   sqlite.close()
-  return openAppDatabase(path)
+  return { database: openAppDatabase(path), path }
+}
+
+function insertLocalUser(database: ReturnType<typeof openTestDatabase>, id: string, account: string) {
+  const user = {
+    id,
+    account,
+    accountNormalized: account.toLowerCase(),
+    passwordDigest: `digest-${id}`,
+    createdAt: 1,
+    updatedAt: 1,
+  }
+  expect(database.localAuth.createUserAndSession(user, 1)?.user).toEqual({ id, account })
+}
+
+function usageStart(id: string, userId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    operationKey: `operation_${id}`,
+    userId,
+    provider: 'openrouter' as const,
+    apiKeyFingerprint: 'shared-fingerprint',
+    requestId: `request_${id}`,
+    model: 'openai/gpt-4.1',
+    modality: 'text' as const,
+    startedAt: 200,
+    ...overrides,
+  }
+}
+
+function expectProviderUsageConsistencyError(operation: () => unknown): void {
+  let thrown: unknown
+  try {
+    operation()
+  } catch (error) {
+    thrown = error
+  }
+  expect(thrown).toBeInstanceOf(ProviderUsageConsistencyError)
+  expect(thrown).toMatchObject({
+    name: 'ProviderUsageConsistencyError',
+    message: 'Provider usage consistency error',
+  })
 }
 
 const defaultConversationGenerationPreferences: ConversationGenerationPreferences = {
@@ -195,7 +241,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(5)
+    expect(database.schemaVersion()).toBe(6)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -203,7 +249,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(5)
+    expect(database.schemaVersion()).toBe(6)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
@@ -214,7 +260,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(5)
+    expect(database.schemaVersion()).toBe(6)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -223,13 +269,39 @@ describe('openAppDatabase', () => {
   })
 
   it('upgrades a populated v4 database without losing local users', () => {
-    const database = createV4Database()
+    const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(5)
+    expect(database.schemaVersion()).toBe(6)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
     expect(database.userProfiles.findByUserId('user_v4')).toBeUndefined()
+  })
+
+  it('upgrades a populated v4 database with nullable chat-run ownership', () => {
+    const { database, path } = createV4Database()
+
+    expect(database.schemaVersion()).toBe(6)
+    const inspection = new Database(path)
+    expect(inspection.prepare(`
+      SELECT user_id AS userId, provider
+      FROM chat_runs
+      WHERE id = ?
+    `).get('run_v4')).toEqual({ userId: null, provider: null })
+    inspection.close()
+  })
+
+  it('looks up migrated chat runs by request id without inventing ownership', () => {
+    const { database } = createV4Database()
+
+    expect(database.chatRuns.getByRequestId('request_v4')).toMatchObject({
+      id: 'run_v4',
+      requestId: 'request_v4',
+      model: 'model-v4',
+    })
+    expect(database.chatRuns.getByRequestId('request_v4')?.userId).toBeUndefined()
+    expect(database.chatRuns.getByRequestId('request_v4')?.provider).toBeUndefined()
+    expect(database.chatRuns.getByRequestId('missing_request')).toBeUndefined()
   })
 
   it('stores local users and one persistent authentication session', () => {
@@ -304,6 +376,334 @@ describe('openAppDatabase', () => {
     database.db.run(sql`DELETE FROM local_users WHERE id = 'user_1'`)
 
     expect(database.userProfiles.findByUserId('user_1')).toBeUndefined()
+  })
+
+  it('enforces provider usage identity, state, modality, and token constraints in SQL', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-provider-usage-constraints-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    insertLocalUser(database, 'user_constraints', 'Constraints')
+    const sqlite = new Database(path)
+    sqlite.pragma('foreign_keys = ON')
+    const insert = (overrides: Record<string, unknown> = {}) => sqlite.prepare(`
+      INSERT INTO provider_usage_events (
+        id, operation_key, user_id, provider, request_id, generation_id, model,
+        modality, status, input_tokens, output_tokens, cost_usd, started_at
+      ) VALUES (
+        @id, @operationKey, @userId, @provider, @requestId, @generationId, @model,
+        @modality, @status, @inputTokens, @outputTokens, @costUsd, @startedAt
+      )
+    `).run({
+      id: 'usage_constraint_base',
+      operationKey: 'operation_constraint_base',
+      userId: 'user_constraints',
+      provider: 'openrouter',
+      requestId: 'request_constraint_base',
+      generationId: 'generation_constraint_base',
+      model: 'model',
+      modality: 'text',
+      status: 'pending',
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: null,
+      startedAt: 1,
+      ...overrides,
+    })
+
+    insert()
+    expect(() => insert({ id: 'usage_duplicate_operation', requestId: 'request_duplicate_operation', generationId: null })).toThrow()
+    expect(() => insert({ id: 'usage_duplicate_generation', operationKey: 'operation_duplicate_generation', requestId: 'request_duplicate_generation' })).toThrow()
+    expect(() => insert({ id: 'usage_reported_without_cost', operationKey: 'operation_reported_without_cost', requestId: 'request_reported_without_cost', generationId: null, status: 'reported' })).toThrow()
+    expect(() => insert({ id: 'usage_pending_with_cost', operationKey: 'operation_pending_with_cost', requestId: 'request_pending_with_cost', generationId: null, costUsd: '0' })).toThrow()
+    expect(() => insert({ id: 'usage_unknown_with_cost', operationKey: 'operation_unknown_with_cost', requestId: 'request_unknown_with_cost', generationId: null, status: 'unknown', costUsd: '0.1' })).toThrow()
+    expect(() => insert({ id: 'usage_bad_modality', operationKey: 'operation_bad_modality', requestId: 'request_bad_modality', generationId: null, modality: 'document' })).toThrow()
+    expect(() => insert({ id: 'usage_bad_status', operationKey: 'operation_bad_status', requestId: 'request_bad_status', generationId: null, status: 'complete' })).toThrow()
+    expect(() => insert({ id: 'usage_negative_input', operationKey: 'operation_negative_input', requestId: 'request_negative_input', generationId: null, inputTokens: -1 })).toThrow()
+    expect(() => insert({ id: 'usage_negative_output', operationKey: 'operation_negative_output', requestId: 'request_negative_output', generationId: null, outputTokens: -1 })).toThrow()
+    expect(() => insert({ id: 'usage_missing_user', operationKey: 'operation_missing_user', requestId: 'request_missing_user', generationId: null, userId: 'missing' })).toThrow()
+    expect(() => insert({ id: 'usage_zero_cost', operationKey: 'operation_zero_cost', requestId: 'request_zero_cost', generationId: null, status: 'reported', costUsd: '0' })).not.toThrow()
+    sqlite.close()
+  })
+
+  it('keeps provider usage starts and identity binding idempotent without overwriting conflicts', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_identity', 'Identity')
+    insertLocalUser(database, 'user_identity_other', 'IdentityOther')
+    const start = usageStart('identity', 'user_identity')
+
+    expect(database.providerUsage.find(start.operationKey)).toBeUndefined()
+    expect(database.providerUsage.start(start)).toMatchObject({ ...start, status: 'pending', reconcileAttempts: 0 })
+    expect(database.providerUsage.find(start.operationKey)).toMatchObject({
+      ...start,
+      status: 'pending',
+      reconcileAttempts: 0,
+    })
+    expect(database.providerUsage.start({ ...start })).toMatchObject(start)
+    const replay = { ...start, id: 'identity_replay_storage_id', startedAt: 999 }
+    expect(database.providerUsage.start(replay)).toMatchObject(start)
+    for (const conflict of [
+      { ...replay, userId: 'user_identity_other' },
+      { ...replay, provider: 'deepseek' as const },
+      { ...replay, apiKeyFingerprint: 'other-fingerprint' },
+      { ...replay, requestId: 'request_conflict' },
+      { ...replay, chatRunId: 'chat_run_conflict' },
+      { ...replay, model: 'other/model' },
+      { ...replay, modality: 'image' as const },
+    ]) {
+      expectProviderUsageConsistencyError(() => database.providerUsage.start(conflict))
+    }
+    expect(database.providerUsage.start({
+      ...usageStart('identity_replay_storage_id', 'user_identity'),
+      operationKey: 'operation_identity_replay_storage_id_owner',
+    })).toMatchObject({ operationKey: 'operation_identity_replay_storage_id_owner' })
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.start({
+        ...usageStart('identity_other_operation', 'user_identity'),
+        id: start.id,
+      })
+    ))
+    expect(database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_identity' }))
+      .toMatchObject({ generationId: 'generation_identity' })
+    expect(database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_identity', providerJobId: 'job_identity' }))
+      .toMatchObject({ generationId: 'generation_identity', providerJobId: 'job_identity' })
+    expect(database.providerUsage.bindIdentity(start.operationKey, {}))
+      .toMatchObject({ generationId: 'generation_identity', providerJobId: 'job_identity' })
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.bindIdentity(start.operationKey, { generationId: 'generation_conflict' })
+    ))
+    expectProviderUsageConsistencyError(() => (
+      database.providerUsage.bindIdentity('operation_missing', { generationId: 'generation_missing' })
+    ))
+    expect(database.providerUsage.bindIdentity(start.operationKey, {}))
+      .toMatchObject({ requestId: start.requestId, generationId: 'generation_identity' })
+  })
+
+  it('reports exact costs idempotently and preserves the first terminal values', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_report', 'Report')
+    const start = usageStart('report', 'user_report')
+    database.providerUsage.start(start)
+    const report = {
+      generationId: 'generation_report',
+      providerJobId: 'job_report',
+      inputTokens: 0,
+      outputTokens: 7,
+      costUsd: 1e-7,
+      endedAt: 500,
+    }
+
+    expect(database.providerUsage.report(start.operationKey, report)).toMatchObject({
+      status: 'reported', generationId: 'generation_report', providerJobId: 'job_report',
+      inputTokens: 0, outputTokens: 7, costUsd: '0.0000001', endedAt: 500,
+    })
+    expect(database.providerUsage.report(start.operationKey, { ...report, costUsd: '0.00000010' }))
+      .toMatchObject({ costUsd: '0.0000001' })
+    expect(database.providerUsage.report(start.operationKey, { ...report, endedAt: 501 }))
+      .toMatchObject({ costUsd: '0.0000001', endedAt: 500 })
+    for (const conflict of [
+      { ...report, generationId: 'generation_other' },
+      { ...report, providerJobId: 'job_other' },
+      { ...report, inputTokens: 1 },
+      { ...report, outputTokens: 8 },
+      { ...report, costUsd: '0.0000002' },
+    ]) {
+      expectProviderUsageConsistencyError(() => (
+        database.providerUsage.report(start.operationKey, conflict)
+      ))
+    }
+    expectProviderUsageConsistencyError(() => database.providerUsage.report('operation_missing', report))
+    expect(database.providerUsage.markUnknown(start.operationKey, 999)).toMatchObject({
+      status: 'reported', costUsd: '0.0000001', endedAt: 500,
+    })
+  })
+
+  it('replays reports without identity after identity was bound separately', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_prebound_report', 'Prebound Report')
+    const start = usageStart('prebound_report', 'user_prebound_report')
+    database.providerUsage.start(start)
+    database.providerUsage.bindIdentity(start.operationKey, {
+      generationId: 'generation_prebound_report',
+      providerJobId: 'job_prebound_report',
+    })
+    const report = { inputTokens: 3, outputTokens: 4, costUsd: '0.25', endedAt: 600 }
+
+    const first = database.providerUsage.report(start.operationKey, report)
+    const replayed = database.providerUsage.report(start.operationKey, report)
+
+    expect(first).toMatchObject({
+      status: 'reported',
+      generationId: 'generation_prebound_report',
+      providerJobId: 'job_prebound_report',
+      inputTokens: 3,
+      outputTokens: 4,
+      costUsd: '0.25',
+      endedAt: 600,
+    })
+    expect(replayed).toEqual(first)
+    expect(() => database.providerUsage.report(start.operationKey, {
+      ...report,
+      generationId: 'generation_conflict',
+    })).toThrow('Provider usage consistency error')
+    expect(() => database.providerUsage.report(start.operationKey, {
+      ...report,
+      providerJobId: 'job_conflict',
+    })).toThrow('Provider usage consistency error')
+  })
+
+  it('marks and recovers pending usage as unknown without changing reported rows', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_unknown', 'Unknown')
+    const scheduled = usageStart('scheduled_unknown', 'user_unknown')
+    const unscheduled = usageStart('unscheduled_unknown', 'user_unknown', { startedAt: 201 })
+    const recovered = usageStart('recovered_unknown', 'user_unknown', { startedAt: 202 })
+    const deepseek = usageStart('deepseek_unknown', 'user_unknown', { provider: 'deepseek', startedAt: 203 })
+    const reported = usageStart('reported_recovery', 'user_unknown', { startedAt: 204 })
+    for (const event of [scheduled, unscheduled, recovered, deepseek, reported]) database.providerUsage.start(event)
+    database.providerUsage.bindIdentity(scheduled.operationKey, { generationId: 'generation_scheduled' })
+    database.providerUsage.bindIdentity(recovered.operationKey, { generationId: 'generation_recovered' })
+    database.providerUsage.bindIdentity(deepseek.operationKey, { generationId: 'generation_deepseek' })
+    database.providerUsage.report(reported.operationKey, { costUsd: '0', endedAt: 300 })
+
+    expect(database.providerUsage.markUnknown(scheduled.operationKey, 400)).toMatchObject({
+      status: 'unknown', endedAt: 400, nextReconcileAt: 1_400,
+    })
+    expect(database.providerUsage.markUnknown(scheduled.operationKey, 400)).toMatchObject({ endedAt: 400 })
+    expect(database.providerUsage.markUnknown(scheduled.operationKey, 401))
+      .toMatchObject({ status: 'unknown', endedAt: 400, nextReconcileAt: 1_400 })
+    expect(database.providerUsage.markUnknown(unscheduled.operationKey, 401)).toMatchObject({
+      status: 'unknown', endedAt: 401, nextReconcileAt: undefined,
+    })
+    expect(database.providerUsage.markUnknown(deepseek.operationKey, 402)).toMatchObject({
+      status: 'unknown', nextReconcileAt: undefined,
+    })
+    expectProviderUsageConsistencyError(() => database.providerUsage.markUnknown('operation_missing', 1))
+
+    expect(database.providerUsage.recoverPending(500)).toBe(1)
+    expect(database.providerUsage.markUnknown(recovered.operationKey, 500)).toMatchObject({
+      status: 'unknown', endedAt: 500, nextReconcileAt: 1_500,
+    })
+    expect(database.providerUsage.markUnknown(reported.operationKey, 999)).toMatchObject({
+      status: 'reported', costUsd: '0', endedAt: 300,
+    })
+  })
+
+  it('lists reconcilable usage in stable order and caps failed reconciliation attempts', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_reconcile', 'Reconcile')
+    const first = usageStart('reconcile_first', 'user_reconcile', { startedAt: 10 })
+    const second = usageStart('reconcile_second', 'user_reconcile', { startedAt: 10 })
+    const later = usageStart('reconcile_later', 'user_reconcile', { startedAt: 9 })
+    for (const event of [second, later, first]) {
+      database.providerUsage.start(event)
+      database.providerUsage.bindIdentity(event.operationKey, { generationId: `generation_${event.id}` })
+      database.providerUsage.markUnknown(event.operationKey, event === later ? 101 : 100)
+    }
+
+    expect(database.providerUsage.listReconcilable(1_100).map(({ id }) => id))
+      .toEqual(['reconcile_first', 'reconcile_second'])
+    expect(database.providerUsage.listReconcilable(1_101).map(({ id }) => id))
+      .toEqual(['reconcile_first', 'reconcile_second', 'reconcile_later'])
+    expect(database.providerUsage.recordReconcileFailure(first.operationKey, 2_000)).toMatchObject({
+      reconcileAttempts: 1, nextReconcileAt: 2_000,
+    })
+    expect(database.providerUsage.recordReconcileFailure(first.operationKey, 3_000)).toMatchObject({
+      reconcileAttempts: 2, nextReconcileAt: 3_000,
+    })
+    expect(database.providerUsage.recordReconcileFailure(first.operationKey, 4_000)).toMatchObject({
+      reconcileAttempts: 3, nextReconcileAt: undefined,
+    })
+    expect(database.providerUsage.recordReconcileFailure(second.operationKey)).toMatchObject({
+      reconcileAttempts: 1, nextReconcileAt: undefined,
+    })
+    expect(database.providerUsage.listReconcilable(10_000).map(({ id }) => id)).toEqual(['reconcile_later'])
+    expect(() => database.providerUsage.recordReconcileFailure('operation_missing', 1))
+      .toThrow('Provider usage consistency error')
+
+    const reported = usageStart('reconcile_reported', 'user_reconcile')
+    database.providerUsage.start(reported)
+    database.providerUsage.report(reported.operationKey, { costUsd: '0', endedAt: 1 })
+    expect(() => database.providerUsage.recordReconcileFailure(reported.operationKey, 2))
+      .toThrow('Provider usage consistency error')
+  })
+
+  it('isolates exact OpenRouter cost summaries by user and groups them by model', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'alice', 'Alice')
+    insertLocalUser(database, 'bob', 'Bob')
+    const record = (
+      id: string,
+      userId: string,
+      startedAt: number,
+      model: string,
+      costUsd?: string | number,
+      provider: 'openrouter' | 'deepseek' = 'openrouter',
+    ) => {
+      const start = usageStart(id, userId, { startedAt, model, provider })
+      database.providerUsage.start(start)
+      if (costUsd === undefined) database.providerUsage.markUnknown(start.operationKey, startedAt + 1)
+      else database.providerUsage.report(start.operationKey, { costUsd, endedAt: startedAt + 1 })
+    }
+    record('alice_before_month', 'alice', 49, 'z/model', '0.2')
+    record('alice_yesterday', 'alice', 100, 'a/model', '0.1000000')
+    record('alice_today_tiny', 'alice', 200, 'a/model', 1e-7)
+    record('alice_today_zero', 'alice', 201, 'b/model', '0.00')
+    record('alice_today_unknown', 'alice', 202, 'a/model')
+    record('alice_at_end', 'alice', 300, 'ignored/model', '99')
+    record('alice_deepseek', 'alice', 203, 'ignored/model', '88', 'deepseek')
+    record('bob_same_fingerprint', 'bob', 200, 'a/model', '77')
+
+    const summary = database.providerUsage.summarize({
+      userId: 'alice',
+      yesterdayStartedAt: 100,
+      todayStartedAt: 200,
+      weekStartedAt: 180,
+      monthStartedAt: 50,
+      endedAt: 300,
+    })
+    expect(summary.allTimeStartedAt).toBe(49)
+    expect(summary.today).toEqual({
+      openRouterCostUsd: '0.0000001',
+      openRouterKnownCostCount: 2,
+      openRouterUnknownCostCount: 1,
+      models: [
+        { provider: 'openrouter', model: 'a/model', openRouterCostUsd: '0.0000001', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 1 },
+        { provider: 'openrouter', model: 'b/model', openRouterCostUsd: '0', openRouterKnownCostCount: 1, openRouterUnknownCostCount: 0 },
+      ],
+    })
+    expect(summary.yesterday.openRouterCostUsd).toBe('0.1')
+    expect(summary.week).toEqual(summary.today)
+    expect(summary.month.openRouterCostUsd).toBe('0.1000001')
+    expect(summary.allTime.openRouterCostUsd).toBe('0.3000001')
+    expect(summary.allTime.models.map(({ provider, model }) => `${provider}:${model}`))
+      .toEqual(['openrouter:a/model', 'openrouter:b/model', 'openrouter:z/model'])
+    expect(JSON.stringify(summary)).not.toContain('77')
+    expect(JSON.stringify(summary)).not.toContain('88')
+  })
+
+  it('retains provider usage after conversation deletion and local-data clearing', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_retention', 'Retention')
+    for (const suffix of ['delete', 'clear_conversations', 'clear_all']) {
+      const conversationId = `conversation_usage_${suffix}`
+      const runId = `run_usage_${suffix}`
+      database.conversations.insert({ id: conversationId, title: suffix })
+      database.chatRuns.insert({
+        id: runId, conversationId, requestId: `request_run_${suffix}`,
+        model: 'model', status: 'completed', startedAt: 1,
+      })
+      const start = usageStart(`retained_${suffix}`, 'user_retention', { chatRunId: runId, startedAt: 1 })
+      database.providerUsage.start(start)
+      database.providerUsage.report(start.operationKey, { costUsd: '0', endedAt: 2 })
+    }
+
+    database.conversations.delete('conversation_usage_delete')
+    expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
+    database.clearConversations()
+    expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
+    database.clearLocalData('all')
+    expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
   })
 
   it('backfills insertion order and allocates independent conversation ordinals', () => {
@@ -947,8 +1347,72 @@ describe('openAppDatabase', () => {
     expect(database.messages.get('assistant_terminal')?.blocks).toEqual([{ type: 'text', text: '完整' }])
   })
 
+  it('persists chat-run ownership and isolates token usage by user and provider', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'alice', 'alice@example.com')
+    insertLocalUser(database, 'bob', 'bob@example.com')
+    database.conversations.insert({ id: 'conversation_usage_ownership', title: 'Usage ownership' })
+    const insert = (
+      id: string,
+      userId: string | undefined,
+      provider: 'deepseek' | 'openrouter' | undefined,
+      status: 'completed' | 'failed',
+      startedAt: number,
+      inputTokens?: number,
+      outputTokens?: number,
+    ) => database.chatRuns.insert({
+      id,
+      conversationId: 'conversation_usage_ownership',
+      requestId: `request_${id}`,
+      model: 'shared/model',
+      status,
+      startedAt,
+      ...(userId === undefined ? {} : { userId }),
+      ...(provider === undefined ? {} : { provider }),
+      ...(inputTokens === undefined ? {} : { inputTokens }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+    })
+    const query = (userId: string) => ({
+      userId,
+      yesterdayStartedAt: 100,
+      todayStartedAt: 200,
+      weekStartedAt: 100,
+      monthStartedAt: 100,
+      endedAt: 300,
+    })
+
+    insert('alice_openrouter', 'alice', 'openrouter', 'completed', 200, 3, 4)
+    insert('alice_deepseek', 'alice', 'deepseek', 'failed', 201, 2, 1)
+    insert('bob_openrouter', 'bob', 'openrouter', 'completed', 202, 11)
+    insert('historical', undefined, undefined, 'completed', 203, 99)
+
+    expect(database.chatRuns.get('alice_openrouter')).toMatchObject({
+      userId: 'alice', provider: 'openrouter',
+    })
+    expect(database.chatRuns.summarizeTokenUsage(query('alice')).today).toMatchObject({
+      inputTokens: 5,
+      outputTokens: 5,
+      totalTokens: 10,
+      models: [
+        { provider: 'openrouter', model: 'shared/model', inputTokens: 3, outputTokens: 4, totalTokens: 7 },
+        { provider: 'deepseek', model: 'shared/model', inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      ],
+      trend: [{ bucket: '0', inputTokens: 5, outputTokens: 5, totalTokens: 10 }],
+    })
+    expect(database.chatRuns.summarizeTokenUsage(query('bob')).today).toMatchObject({
+      inputTokens: 11,
+      outputTokens: 0,
+      totalTokens: 11,
+      models: [{ provider: 'openrouter', model: 'shared/model', inputTokens: 11, outputTokens: 0, totalTokens: 11 }],
+      trend: [{ bucket: '0', inputTokens: 11, outputTokens: 0, totalTokens: 11 }],
+    })
+    expect(() => insert('alice_without_provider', 'alice', undefined, 'completed', 204, 1))
+      .toThrow('Owned chat run requires a provider')
+  })
+
   it('summarizes retained token usage by model across five periods', () => {
     const database = openTestDatabase()
+    insertLocalUser(database, 'usage_user', 'usage@example.com')
     database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
     const insert = (
       id: string,
@@ -964,11 +1428,14 @@ describe('openAppDatabase', () => {
       model,
       status,
       startedAt,
+      userId: 'usage_user',
+      provider: 'openrouter',
       ...(inputTokens === undefined ? {} : { inputTokens }),
       ...(outputTokens === undefined ? {} : { outputTokens }),
     })
 
     const query = {
+      userId: 'usage_user',
       yesterdayStartedAt: 100,
       todayStartedAt: 200,
       weekStartedAt: 180,
@@ -986,20 +1453,20 @@ describe('openAppDatabase', () => {
     const usage = database.chatRuns.summarizeTokenUsage(query)
     expect(usage.allTimeStartedAt).toBe(49)
     expect(usage.today.models).toEqual([
-      { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
-      { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      { provider: 'openrouter', model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+      { provider: 'openrouter', model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     ])
     expect(usage.yesterday.models).toEqual([
-      { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      { provider: 'openrouter', model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
     ])
     expect(usage.week.models).toEqual(usage.today.models)
     expect(usage.month.models).toEqual([
-      { model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
-      { model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
-      { model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      { provider: 'openrouter', model: 'beta/model', inputTokens: 0, outputTokens: 9, totalTokens: 9 },
+      { provider: 'openrouter', model: 'alpha/model', inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      { provider: 'openrouter', model: 'zero/model', inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     ])
     expect(usage.allTime.models[0]).toEqual({
-      model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22,
+      provider: 'openrouter', model: 'alpha/model', inputTokens: 17, outputTokens: 5, totalTokens: 22,
     })
     expect(usage.allTime.models.some(({ model }) => model === 'ignored/model')).toBe(false)
 
@@ -1015,6 +1482,7 @@ describe('openAppDatabase', () => {
 
   it('groups token usage trends by local calendar boundaries and excludes the query end point', () => {
     const database = openTestDatabase()
+    insertLocalUser(database, 'usage_trends_user', 'trends@example.com')
     database.conversations.insert({ id: 'conversation_usage_trends', title: 'Usage trends' })
     const local = (year: number, month: number, day: number, hour = 0) => (
       new Date(year, month, day, hour).getTime()
@@ -1031,10 +1499,13 @@ describe('openAppDatabase', () => {
       model: 'alpha/model',
       status: 'completed',
       startedAt,
+      userId: 'usage_trends_user',
+      provider: 'openrouter',
       inputTokens,
       outputTokens,
     })
     const query = {
+      userId: 'usage_trends_user',
       yesterdayStartedAt: local(2025, 11, 31),
       todayStartedAt: local(2026, 0, 1),
       weekStartedAt: local(2025, 11, 29),
@@ -1063,8 +1534,10 @@ describe('openAppDatabase', () => {
 
   it('rejects token usage when a SQLite aggregate exceeds the safe integer range', () => {
     const database = openTestDatabase()
+    insertLocalUser(database, 'usage_overflow_user', 'overflow@example.com')
     database.conversations.insert({ id: 'conversation_usage_overflow', title: 'Usage overflow' })
     const query = {
+      userId: 'usage_overflow_user',
       yesterdayStartedAt: 100,
       todayStartedAt: 200,
       weekStartedAt: 100,
@@ -1079,6 +1552,8 @@ describe('openAppDatabase', () => {
       model: 'alpha/model',
       status: 'completed',
       startedAt: 200,
+      userId: 'usage_overflow_user',
+      provider: 'openrouter',
       inputTokens: Number.MAX_SAFE_INTEGER,
     })
     database.chatRuns.insert({
@@ -1088,6 +1563,8 @@ describe('openAppDatabase', () => {
       model: 'alpha/model',
       status: 'completed',
       startedAt: 201,
+      userId: 'usage_overflow_user',
+      provider: 'openrouter',
       inputTokens: 1,
     })
 
@@ -1100,8 +1577,10 @@ describe('openAppDatabase', () => {
     process.env.TZ = 'America/New_York'
     try {
       const database = openTestDatabase()
+      insertLocalUser(database, 'usage_fallback_user', 'fallback@example.com')
       database.conversations.insert({ id: 'conversation_usage_fallback', title: 'Usage fallback' })
       const query = {
+        userId: 'usage_fallback_user',
         yesterdayStartedAt: Date.parse('2026-10-31T00:00:00-04:00'),
         todayStartedAt: Date.parse('2026-11-01T00:00:00-04:00'),
         weekStartedAt: Date.parse('2026-10-26T00:00:00-04:00'),
@@ -1116,6 +1595,8 @@ describe('openAppDatabase', () => {
           model: 'alpha/model',
           status: 'completed',
           startedAt,
+          userId: 'usage_fallback_user',
+          provider: 'openrouter',
           inputTokens,
         })
       )

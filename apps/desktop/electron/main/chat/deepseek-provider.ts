@@ -2,6 +2,8 @@ import { z } from 'zod'
 import type { ModelInfo } from '@autoforge/shared'
 import {
   OpenAiCompatibleProvider,
+  readCredentialSnapshot,
+  type ModelProviderSnapshot,
   type OpenAiCompatibleProviderDependencies,
 } from './model-provider.js'
 
@@ -65,6 +67,8 @@ export interface DeepSeekProviderDependencies extends Omit<OpenAiCompatibleProvi
 }
 
 export class DeepSeekProvider extends OpenAiCompatibleProvider {
+  private readonly snapshotDependencies: DeepSeekProviderDependencies
+
   constructor(dependencies: DeepSeekProviderDependencies) {
     const fetch = releaseUnauthorizedResponse(dependencies.fetch ?? globalThis.fetch)
     super({
@@ -79,5 +83,19 @@ export class DeepSeekProvider extends OpenAiCompatibleProvider {
       fetch,
       credential: { get: () => dependencies.credential.get('deepseek_api_key') },
     })
+    this.snapshotDependencies = dependencies
+  }
+
+  async acquireSnapshot(): Promise<ModelProviderSnapshot> {
+    const apiKey = await readCredentialSnapshot(
+      () => this.snapshotDependencies.credential.get('deepseek_api_key'),
+    )
+    return {
+      providerId: 'deepseek',
+      provider: new DeepSeekProvider({
+        ...this.snapshotDependencies,
+        credential: { get: async () => apiKey },
+      }),
+    }
   }
 }

@@ -1,12 +1,17 @@
+import { randomUUID } from 'node:crypto'
 import { toSafeAppError, chatBlockSchema, type ChatBlock } from '@autoforge/shared'
-import type {
-  AppRepositories,
-  ConversationContextRecord,
-  Message,
+import {
+  ProviderUsageConsistencyError,
+  type AppRepositories,
+  type ConversationContextRecord,
+  type Message,
+  type ProviderUsageRepository,
 } from '../database/repositories.js'
+import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import type {
   ModelContentPart,
   ModelMessage,
+  ModelProviderSnapshot,
   ModelStreamEvent,
   ModelStreamRequest,
   ModelTool,
@@ -39,7 +44,8 @@ export interface EstimateRequestTokensInput {
 export interface PrepareConversationContextInput {
   conversationId: string
   beforeOrdinal: number
-  provider: ConversationContextProviderPort
+  providerSnapshot: ModelProviderSnapshot
+  callIdentity: { requestId: string; chatRunId: string; userId: string }
   model: string
   contextLength?: number
   currentMessage: { role: 'user'; content: string | ModelContentPart[] }
@@ -58,6 +64,7 @@ export interface ConversationHistoryPort {
 
 type ConversationContextRepositories = Pick<AppRepositories, 'conversationContexts'> & {
   messages: Pick<AppRepositories['messages'], 'listBeforeOrdinal'>
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
 }
 
 interface HistoricalModelMessage {
@@ -184,6 +191,7 @@ function isCancelled(input: PrepareConversationContextInput, error?: unknown): b
 }
 
 function compressionFailure(input: PrepareConversationContextInput, error?: unknown): never {
+  if (error instanceof ProviderUsageConsistencyError) throw error
   throw toSafeAppError({
     code: isCancelled(input, error) ? 'CANCELLED' : 'MODEL_PROVIDER_REQUEST_FAILED',
   })
@@ -270,15 +278,32 @@ async function streamSummary(
   summary: ConversationContextRecord | undefined,
   chunk: readonly HistoricalModelMessage[],
   maxOutputTokens: number,
+  operationKey: string,
+  providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>,
 ): Promise<string> {
   let text = ''
   let finishReason: string | undefined
   try {
-    for await (const event of input.provider.stream({
-      model: input.model,
-      messages: compressionMessages(summary, chunk),
-      maxOutputTokens,
-      signal: input.signal,
+    for await (const event of trackProviderStream({
+      operationKey,
+      attribution: {
+        userId: input.callIdentity.userId,
+        requestId: input.callIdentity.requestId,
+        chatRunId: input.callIdentity.chatRunId,
+        model: input.model,
+        modality: 'text',
+      },
+      request: {
+        model: input.model,
+        messages: compressionMessages(summary, chunk),
+        maxOutputTokens,
+        signal: input.signal,
+        endUserId: input.callIdentity.userId,
+      },
+      provider: input.providerSnapshot,
+      providerUsage,
+      id: randomUUID,
+      now: Date.now,
     })) {
       if (input.signal.aborted) compressionFailure(input)
       if (event.type === 'text_delta' && event.choiceIndex === 0) text += event.text
@@ -354,12 +379,20 @@ export function createConversationContextManager(
         )
         if (chunk.length === 0) throw toSafeAppError({ code: 'CONTEXT_LIMIT_EXCEEDED' })
 
-        const summaryText = await streamSummary(input, summary, chunk, summaryOutputTokens)
+        const expectedThroughOrdinal = summary?.throughOrdinal ?? 0
         const throughOrdinal = chunk.at(-1)!.ordinal
+        const summaryText = await streamSummary(
+          input,
+          summary,
+          chunk,
+          summaryOutputTokens,
+          `conversation-summary:${input.callIdentity.requestId}:${expectedThroughOrdinal}:${throughOrdinal}`,
+          repositories.providerUsage,
+        )
         try {
           summary = repositories.conversationContexts.advance({
             conversationId: input.conversationId,
-            expectedThroughOrdinal: summary?.throughOrdinal ?? 0,
+            expectedThroughOrdinal,
             summaryText,
             throughOrdinal,
             estimatedTokens: estimateTextTokens(summaryText),

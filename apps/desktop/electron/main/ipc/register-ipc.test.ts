@@ -28,6 +28,9 @@ const emptyUsagePeriod = (startedAt: string, endedAt: string) => ({
   inputTokens: 0,
   outputTokens: 0,
   totalTokens: 0,
+  openRouterCostUsd: '0',
+  openRouterKnownCostCount: 0,
+  openRouterUnknownCostCount: 0,
   models: [],
   trend: [],
 })
@@ -265,7 +268,17 @@ describe('registerDesktopIpc', () => {
       allTime: { totalTokens: 0 },
     })
     expect(app.dependencies.auth.requireSession).toHaveBeenCalled()
-    expect(app.dependencies.settings.getTokenUsage).toHaveBeenCalled()
+    expect(app.dependencies.settings.getTokenUsage).toHaveBeenCalledWith()
+  })
+
+  it('rejects token usage before calling the zero-argument settings service when unauthenticated', async () => {
+    const app = harness()
+    vi.mocked(app.dependencies.auth.requireSession)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
+
+    await expect(app.invoke(ipcChannels.settingsGetTokenUsage))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(app.dependencies.settings.getTokenUsage).not.toHaveBeenCalled()
   })
 
   it('rejects invalid token usage service output', async () => {

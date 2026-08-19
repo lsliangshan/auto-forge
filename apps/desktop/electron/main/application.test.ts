@@ -1,6 +1,7 @@
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   toSafeAppError,
@@ -9,9 +10,18 @@ import {
   type ModelInfo,
   type ProxySettings,
 } from '@autoforge/shared'
-import { createApplicationRuntime, MaintenanceGate } from './application.js'
-import type { ModelStreamRequest } from './chat/model-provider.js'
+import {
+  createApplicationFailureRecorder,
+  createApplicationRuntime,
+  MaintenanceGate,
+} from './application.js'
+import { AgentOrchestrator } from './agent/agent-orchestrator.js'
+import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
+import { VideoJobRunner } from './chat/video-job-runner.js'
+import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
+import type { CredentialBoundModelProvider } from './chat/model-provider-registry.js'
 import { openAppDatabase } from './database/client.js'
+import { ProviderUsageConsistencyError } from './database/repositories.js'
 import {
   NetworkProxyService,
   type NetworkProxyPort,
@@ -19,6 +29,8 @@ import {
 } from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
+import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
+import { ExecutionService } from './workflows/execution-service.js'
 
 const directories: string[] = []
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
@@ -55,10 +67,12 @@ function createNetworkProxy() {
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise
+    reject = rejectPromise
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 function serializedProxyHarness() {
@@ -89,6 +103,47 @@ function serializedProxyHarness() {
 
 let networkProxy = createNetworkProxy()
 type RuntimeOptions = Parameters<typeof createApplicationRuntime>[0]
+
+function snapshotProvider(
+  providerId: 'openrouter' | 'deepseek',
+  provider: ModelProvider,
+): CredentialBoundModelProvider {
+  const bound: CredentialBoundModelProvider = {
+    listModels: (signal) => provider.listModels(signal),
+    validateCredential: (signal) => provider.validateCredential(signal),
+    stream: (request) => provider.stream(request),
+    ...(provider.generateImage === undefined ? {} : {
+      generateImage: (request) => provider.generateImage!(request),
+    }),
+    ...(provider.submitVideo === undefined ? {} : {
+      submitVideo: (request) => provider.submitVideo!(request),
+    }),
+    ...(provider.pollVideo === undefined ? {} : {
+      pollVideo: (providerJobId, signal) => provider.pollVideo!(providerJobId, signal),
+    }),
+    ...(provider.downloadVideo === undefined ? {} : {
+      downloadVideo: (providerJobId, signal) => provider.downloadVideo!(providerJobId, signal),
+    }),
+    ...(provider.getGenerationUsage === undefined ? {} : {
+      getGenerationUsage: (generationId, signal) => provider.getGenerationUsage!(generationId, signal),
+    }),
+    acquireSnapshot: vi.fn(async (): Promise<ModelProviderSnapshot> => ({
+      providerId,
+      provider: bound,
+      ...(providerId === 'openrouter' ? { apiKeyFingerprint: 'fingerprint_test' } : {}),
+    })),
+  }
+  return bound
+}
+
+function snapshotProviders(
+  providers: Partial<Record<'openrouter' | 'deepseek', ModelProvider>>,
+): NonNullable<RuntimeOptions['modelProviders']> {
+  return Object.fromEntries(Object.entries(providers).map(([providerId, provider]) => [
+    providerId,
+    snapshotProvider(providerId as 'openrouter' | 'deepseek', provider),
+  ]))
+}
 
 function options(
   root: string,
@@ -131,6 +186,34 @@ function chatInput(conversationId: string, content: string): ChatSendInput {
       video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
     },
   }
+}
+
+async function authenticate(runtime: ReturnType<typeof createApplicationRuntime>) {
+  return runtime.services.auth.register({ account: 'TestUser', password: 'password' })
+}
+
+async function installApprovalWorkflow(
+  runtime: ReturnType<typeof createApplicationRuntime>,
+  activation = 'approval workflow',
+) {
+  const project = await runtime.services.developer.createProject('Approval Workflow')
+  const manifest = JSON.parse(
+    await runtime.services.developer.readFile(project.id, 'workflow.json'),
+  ) as Record<string, unknown>
+  Object.assign(manifest, {
+    id: 'local.autoforge.approval-workflow',
+    version: '1.0.0',
+    permissions: [{ capability: 'browser.open', scope: { origins: ['https://example.com'] } }],
+    activationExamples: [activation],
+    inputSchema: { type: 'object', additionalProperties: false },
+  })
+  await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+  await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+    "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+    'export default defineWorkflow({ async run() { return { ok: true } } })',
+  ].join('\n'))
+  await runtime.services.developer.build(project.id)
+  return runtime.services.workflows.installProject(project.id)
 }
 
 function modelInfo(id: string, name: string): ModelInfo {
@@ -204,21 +287,99 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('records a failure identity once without merging distinct errors with the same message', () => {
+    const latched: unknown[] = []
+    const recorder = createApplicationFailureRecorder((error) => { latched.push(error) })
+    const shared = new Error('same message')
+    const distinct = new Error('same message')
+    const consistency = new ProviderUsageConsistencyError()
+
+    recorder.record(shared, 'database-close')
+    recorder.record(shared, 'background-chat')
+    recorder.record(distinct, 'execution-shutdown')
+    recorder.record(consistency, 'video-background')
+    recorder.record(consistency, 'video-stop')
+
+    expect(recorder.select()).toEqual({ error: consistency })
+    expect(latched).toEqual([consistency])
+
+    const nonConsistency = createApplicationFailureRecorder(() => undefined)
+    nonConsistency.record(shared, 'database-close')
+    nonConsistency.record(shared, 'background-chat')
+    nonConsistency.record(distinct, 'execution-shutdown')
+    expect(nonConsistency.select()).toEqual({ error: distinct })
+
+    const primitive = createApplicationFailureRecorder(() => undefined)
+    primitive.record(undefined, 'database-close')
+    primitive.record(undefined, 'background-chat')
+    expect(primitive.select()).toEqual({ error: undefined })
+  })
+
   it('returns a token usage snapshot across five local-calendar periods', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-token-usage-'))
     directories.push(root)
     const databasePath = join(root, 'autoforge.sqlite')
     const database = openAppDatabase(databasePath)
+    database.localAuth.createUserAndSession({
+      id: 'user_other', account: 'Other', accountNormalized: 'other',
+      passwordDigest: 'digest-other', createdAt: 1, updatedAt: 1,
+    }, 1)
+    database.localAuth.createUserAndSession({
+      id: 'user_usage', account: 'Usage', accountNormalized: 'usage',
+      passwordDigest: 'digest-usage', createdAt: 2, updatedAt: 2,
+    }, 2)
     database.conversations.insert({ id: 'usage_conversation', title: 'Usage' })
     database.chatRuns.insert({
       id: 'usage_run',
       conversationId: 'usage_conversation',
       requestId: 'usage_request',
+      userId: 'user_usage',
+      provider: 'openrouter',
       model: 'alpha/model',
       status: 'failed',
       startedAt: new Date(2026, 7, 17, 10).getTime(),
       inputTokens: 4,
       outputTokens: 6,
+    })
+    database.chatRuns.insert({
+      id: 'other_usage_run',
+      conversationId: 'usage_conversation',
+      requestId: 'other_usage_request',
+      userId: 'user_other',
+      provider: 'deepseek',
+      model: 'other/model',
+      status: 'failed',
+      startedAt: new Date(2026, 7, 17, 10).getTime(),
+      inputTokens: 40,
+      outputTokens: 60,
+    })
+    database.providerUsage.start({
+      id: 'usage_cost',
+      operationKey: 'usage_cost',
+      userId: 'user_usage',
+      provider: 'openrouter',
+      requestId: 'usage_request',
+      model: 'alpha/model',
+      modality: 'text',
+      startedAt: new Date(2026, 7, 17, 10).getTime(),
+    })
+    database.providerUsage.report('usage_cost', {
+      costUsd: '0.25',
+      endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
+    })
+    database.providerUsage.start({
+      id: 'other_usage_cost',
+      operationKey: 'other_usage_cost',
+      userId: 'user_other',
+      provider: 'openrouter',
+      requestId: 'other_usage_request',
+      model: 'other/model',
+      modality: 'text',
+      startedAt: new Date(2026, 7, 17, 10).getTime(),
+    })
+    database.providerUsage.report('other_usage_cost', {
+      costUsd: '9',
+      endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
     })
     database.close()
 
@@ -234,7 +395,19 @@ describe('createApplicationRuntime', () => {
         inputTokens: 4,
         outputTokens: 6,
         totalTokens: 10,
-        models: [{ model: 'alpha/model', inputTokens: 4, outputTokens: 6, totalTokens: 10 }],
+        openRouterCostUsd: '0.25',
+        openRouterKnownCostCount: 1,
+        openRouterUnknownCostCount: 0,
+        models: [{
+          provider: 'openrouter',
+          model: 'alpha/model',
+          inputTokens: 4,
+          outputTokens: 6,
+          totalTokens: 10,
+          openRouterCostUsd: '0.25',
+          openRouterKnownCostCount: 1,
+          openRouterUnknownCostCount: 0,
+        }],
       })
       expect(usage.today.trend.reduce((sum, point) => sum + point.totalTokens, 0)).toBe(10)
       expect(usage.yesterday.totalTokens).toBe(0)
@@ -259,6 +432,8 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.auth.getSession()).resolves.toEqual(registered)
     await runtime.services.auth.logout()
     await expect(runtime.services.auth.getSession()).resolves.toBeNull()
+    await expect(runtime.services.settings.getTokenUsage())
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await runtime.close()
   })
 
@@ -289,13 +464,13 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const emitChat = vi.fn()
     const runtime = createApplicationRuntime(options(root, {
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
-      },
+      } }),
       emitChat,
     }))
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -311,9 +486,9 @@ describe('createApplicationRuntime', () => {
       }
     }
 
-    await runtime.services.chat.send(chatInput(conversation.id, 'anonymous'))
-    await settleEvents()
-    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(2)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'anonymous')))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(0)
     expect(emitChat).not.toHaveBeenCalled()
 
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
@@ -326,11 +501,965 @@ describe('createApplicationRuntime', () => {
 
     await runtime.services.auth.logout()
     const forwardedCount = emitChat.mock.calls.length
-    await runtime.services.chat.send(chatInput(conversation.id, 'logged out'))
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'logged out')))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await settleEvents()
-    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(6)
+    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(2)
     expect(emitChat).toHaveBeenCalledTimes(forwardedCount)
     await runtime.close()
+  })
+
+  it('captures the authenticated user before route resolution and persists only the OpenRouter key fingerprint', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-owner-'))
+    directories.push(root)
+    const catalog = deferred<ModelInfo[]>()
+    const emitChat = vi.fn()
+    const openrouter = {
+      listModels: vi.fn(() => catalog.promise),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        expect(request.endUserId).toBeDefined()
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const deepseek = {
+      listModels: vi.fn(async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    }
+    const getSecret = vi.spyOn(SecretStore.prototype, 'get')
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter, deepseek }),
+      emitChat,
+    }))
+    const alice = await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-user-a')
+    await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek-user-b')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
+    })
+    const openRouterConversation = await runtime.services.chat.createConversation()
+
+    const sending = runtime.services.chat.send(chatInput(openRouterConversation.id, 'owned by Alice'))
+    await vi.waitFor(() => expect(openrouter.listModels).toHaveBeenCalledTimes(1))
+    await runtime.services.auth.logout()
+    const bob = await runtime.services.auth.register({ account: 'Bob', password: 'password' })
+    catalog.resolve([modelInfo('openai/gpt-4.1-mini', 'OpenRouter')])
+    const openRouterRequest = await sending
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'status', requestId: openRouterRequest.requestId, status: 'completed',
+    })))
+
+    await runtime.services.settings.update({ activeProvider: 'deepseek' })
+    const deepSeekConversation = await runtime.services.chat.createConversation()
+    const deepSeekRequest = await runtime.services.chat.send(chatInput(deepSeekConversation.id, 'owned by Bob'))
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'status', requestId: deepSeekRequest.requestId, status: 'completed',
+    })))
+    await runtime.close()
+
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    try {
+      const runs = sqlite.prepare(`
+        SELECT request_id AS requestId, user_id AS userId, provider
+        FROM chat_runs
+      `).all()
+      expect(runs).toHaveLength(2)
+      expect(runs).toEqual(expect.arrayContaining([
+        { requestId: openRouterRequest.requestId, userId: alice.user.id, provider: 'openrouter' },
+        { requestId: deepSeekRequest.requestId, userId: bob.user.id, provider: 'deepseek' },
+      ]))
+      const usage = sqlite.prepare(`
+        SELECT user_id AS userId, api_key_fingerprint AS apiKeyFingerprint
+        FROM provider_usage_events
+      `).get()
+      expect(usage).toEqual({
+        userId: alice.user.id,
+        apiKeyFingerprint: 'fingerprint_test',
+      })
+      expect(JSON.stringify(usage)).not.toContain('sk-openrouter-user-a')
+    } finally {
+      sqlite.close()
+    }
+    expect(getSecret).not.toHaveBeenCalled()
+    expect(openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({ endUserId: alice.user.id }))
+    expect(deepseek.stream).toHaveBeenCalledWith(expect.objectContaining({ endUserId: bob.user.id }))
+  })
+
+  it('keeps one real OpenRouter credential snapshot through validation, catalog, summary, and model usage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-provider-snapshot-'))
+    directories.push(root)
+    const proxy = createNetworkProxy()
+    const requests: Array<{ url: string; authorization: string }> = []
+    let switched = false
+    let chatCalls = 0
+    proxy.fetch.mockImplementation(async (input, init) => {
+      const url = String(input)
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get('authorization') ?? '',
+      })
+      if (!switched) {
+        switched = true
+        await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-b')
+      }
+      if (url.endsWith('/chat/completions')) {
+        chatCalls += 1
+        const cost = chatCalls === 1 ? 0.01 : 0.02
+        return new Response([
+          `data: ${JSON.stringify({ id: `generation_${chatCalls}`, choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, cost } })}`,
+          'data: [DONE]',
+          '',
+        ].join('\n\n'), { headers: { 'content-type': 'text/event-stream' } })
+      }
+      if (url.endsWith('/models')) {
+        return Response.json({ data: [{
+          id: 'openai/gpt-4.1-mini',
+          name: 'OpenRouter text',
+          supported_parameters: [],
+          architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+        }] })
+      }
+      return Response.json({ data: [] })
+    })
+    const emitChat = vi.fn()
+    const runtime = createApplicationRuntime(options(root, { networkProxy: proxy, emitChat }))
+    const session = await runtime.services.auth.register({ account: 'SnapshotUser', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-a')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openai/gpt-4.1-mini' },
+      },
+    })
+
+    const firstConversation = await runtime.services.chat.createConversation()
+    const first = await runtime.services.chat.send(chatInput(firstConversation.id, 'first'))
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'status', requestId: first.requestId, status: 'completed',
+    })))
+    const secondConversation = await runtime.services.chat.createConversation()
+    const second = await runtime.services.chat.send(chatInput(secondConversation.id, 'second'))
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'status', requestId: second.requestId, status: 'completed',
+    })))
+
+    const chatRequests = requests.filter(({ url }) => url.endsWith('/chat/completions'))
+    expect(chatRequests.map(({ authorization }) => authorization)).toEqual([
+      'Bearer sk-openrouter-a',
+      'Bearer sk-openrouter-b',
+    ])
+    const catalogAuthorizations = requests
+      .filter(({ url }) => url.includes('/models'))
+      .map(({ authorization }) => authorization)
+    expect(catalogAuthorizations).toContain('Bearer sk-openrouter-a')
+    expect(catalogAuthorizations).toContain('Bearer sk-openrouter-b')
+    const usage = await runtime.services.settings.getTokenUsage()
+    expect(usage.allTime).toMatchObject({
+      openRouterCostUsd: '0.03',
+      openRouterKnownCostCount: 2,
+      openRouterUnknownCostCount: 0,
+    })
+    expect(usage.allTime.models).toContainEqual(expect.objectContaining({
+      provider: 'openrouter',
+      model: 'openai/gpt-4.1-mini',
+      openRouterCostUsd: '0.03',
+    }))
+    await runtime.close()
+
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    try {
+      expect(sqlite.prepare(`
+        SELECT user_id AS userId, api_key_fingerprint AS apiKeyFingerprint, cost_usd AS costUsd
+        FROM provider_usage_events ORDER BY started_at, operation_key
+      `).all()).toEqual([
+        { userId: session.user.id, apiKeyFingerprint: fingerprintApiKey('sk-openrouter-a'), costUsd: '0.01' },
+        { userId: session.user.id, apiKeyFingerprint: fingerprintApiKey('sk-openrouter-b'), costUsd: '0.02' },
+      ])
+    } finally {
+      sqlite.close()
+    }
+  })
+
+  it.each([
+    ['text', 'run', modelInfo('openai/gpt-4.1-mini', 'Text')],
+    ['image', 'runImage', imageModelInfo('openrouter/image')],
+    ['audio', 'runAudio', audioModelInfo('openrouter/audio')],
+  ] as const)('latches an unexpected %s consistency rejection, refuses new work, and rethrows the original error on close', async (outputType, method, model) => {
+    const root = await mkdtemp(join(tmpdir(), `autoforge-application-${outputType}-latch-`))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    const operationSpy = method === 'run'
+      ? vi.spyOn(AgentOrchestrator.prototype, 'run').mockRejectedValueOnce(consistencyError)
+      : method === 'runImage'
+        ? vi.spyOn(MediaGenerationOrchestrator.prototype, 'runImage').mockRejectedValueOnce(consistencyError)
+        : vi.spyOn(MediaGenerationOrchestrator.prototype, 'runAudio').mockRejectedValueOnce(consistencyError)
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [model]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+      generateImage: vi.fn(async () => ({ outputs: [] })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: outputType === 'text'
+          ? { text: model.id }
+          : outputType === 'image' ? { image: model.id } : { audio: model.id },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+
+    await runtime.services.chat.send({ ...chatInput(conversation.id, 'fail'), outputType })
+    await vi.waitFor(() => expect(operationSpy).toHaveBeenCalled())
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    await expect(runtime.services.chat.send({ ...chatInput(conversation.id, 'refused'), outputType }))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('latches a real preflight snapshot provider mismatch before model work starts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-preflight-consistency-'))
+    directories.push(root)
+    const bound = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openrouter/text', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const mismatched: CredentialBoundModelProvider = {
+      ...bound,
+      acquireSnapshot: vi.fn(async () => ({ providerId: 'deepseek' as const, provider: bound })),
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: mismatched },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+
+    let consistencyError: unknown
+    try {
+      await runtime.services.chat.send(chatInput(conversation.id, 'mismatch'))
+    } catch (error) {
+      consistencyError = error
+    }
+    expect(consistencyError).toBeInstanceOf(ProviderUsageConsistencyError)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('latches and rethrows a video submit consistency rejection', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-submit-consistency-'))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.spyOn(VideoJobRunner.prototype, 'submit').mockRejectedValueOnce(consistencyError)
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      submitVideo: vi.fn(async () => ({ providerJobId: 'provider_video', status: 'pending' as const })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { video: 'openrouter/video' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+
+    await expect(runtime.services.chat.send({
+      ...chatInput(conversation.id, 'video'),
+      outputType: 'video',
+    })).rejects.toBe(consistencyError)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('latches a real timer-started video consistency failure before shutdown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-background-consistency-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const videoStop = vi.spyOn(VideoJobRunner.prototype, 'stop')
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      submitVideo: vi.fn(async () => ({ providerJobId: 'provider_video', status: 'pending' as const })),
+      pollVideo: vi.fn(async () => ({ status: 'in_progress' as const })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { video: 'openrouter/video' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    vi.useFakeTimers()
+    try {
+      const { requestId } = await runtime.services.chat.send({
+        ...chatInput(conversation.id, 'video'),
+        outputType: 'video',
+      })
+      const tamper = new Database(databasePath)
+      try {
+        expect(tamper.prepare('DELETE FROM provider_usage_events WHERE operation_key = ?')
+          .run(`video:${requestId}`).changes).toBe(1)
+      } finally {
+        tamper.close()
+      }
+
+      await vi.advanceTimersByTimeAsync(2_000)
+      await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      let closeError: unknown
+      try {
+        await runtime.close()
+      } catch (error) {
+        closeError = error
+      }
+      expect(closeError).toBeInstanceOf(ProviderUsageConsistencyError)
+      expect(videoStop).toHaveBeenCalledTimes(1)
+      await expect(videoStop.mock.results[0]!.value).rejects.toBe(closeError)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not latch an orchestrator business-failure result', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-business-failure-'))
+    directories.push(root)
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockResolvedValue({
+      requestId: 'business_failure',
+      status: 'failed',
+      error: toSafeAppError({ code: 'MODEL_PROVIDER_REQUEST_FAILED' }),
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openai/gpt-4.1-mini', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const first = await runtime.services.chat.createConversation()
+    const second = await runtime.services.chat.createConversation()
+
+    await expect(runtime.services.chat.send(chatInput(first.id, 'first'))).resolves.toHaveProperty('requestId')
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    await expect(runtime.services.chat.send(chatInput(second.id, 'second'))).resolves.toHaveProperty('requestId')
+    await expect(runtime.close()).resolves.toBeUndefined()
+  })
+
+  it('keeps an awaiting approval request active so close cancels and terminalizes it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-close-'))
+    directories.push(root)
+    const chatEvents: ChatEvent[] = []
+    let workflowId = ''
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/tools', 'Tools'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_approval',
+          name: workflowId,
+          arguments: {},
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    workflowId = (await installApprovalWorkflow(runtime)).id
+    const conversation = await runtime.services.chat.createConversation()
+
+    const { requestId } = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block',
+      block: expect.objectContaining({ type: 'approval' }),
+    })))
+
+    await runtime.close()
+
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    try {
+      expect(database.chatRuns.getByRequestId(requestId)).toMatchObject({
+        status: 'cancelled',
+        errorCode: 'CANCELLED',
+        endedAt: expect.any(Number),
+      })
+    } finally {
+      database.close()
+    }
+  })
+
+  it('latches and rethrows the exact consistency failure from approval resume', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-resume-'))
+    directories.push(root)
+    const chatEvents: ChatEvent[] = []
+    let workflowId = ''
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/tools', 'Tools'),
+        supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_approval',
+          name: workflowId,
+          arguments: {},
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    workflowId = (await installApprovalWorkflow(runtime)).id
+    const conversation = await runtime.services.chat.createConversation()
+
+    await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'approval' }),
+    })))
+    const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+      event.type === 'block' && event.block.type === 'approval'
+    ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.spyOn(AgentOrchestrator.prototype, 'resumeApproval').mockRejectedValueOnce(consistencyError)
+
+    await expect(runtime.services.executions.decide({
+      executionId: approval.executionId,
+      permissionIndex: approval.permissionIndex,
+      scopeHash: approval.scopeHash,
+      decision: 'once',
+    })).rejects.toBe(consistencyError)
+    await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('gives a latched consistency error priority over later shutdown failures', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-consistency-priority-'))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    const laterConsistencyError = new ProviderUsageConsistencyError()
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockRejectedValueOnce(consistencyError)
+    vi.spyOn(VideoJobRunner.prototype, 'stop').mockRejectedValueOnce(laterConsistencyError)
+    vi.spyOn(ExecutionService.prototype, 'shutdown').mockRejectedValueOnce(new Error('execution shutdown'))
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openai/gpt-4.1-mini', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'fail consistently'))
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+
+    await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('continues cleanup after synchronous cancellation throws and applies stable failure priority', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-sync-cancel-'))
+    directories.push(root)
+    const agentError = new Error('agent cancel synchronously failed')
+    const mediaError = new Error('media cancel synchronously failed')
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockResolvedValueOnce({
+      requestId: 'awaiting',
+      status: 'awaiting_approval',
+      executionId: 'execution_awaiting',
+    })
+    const agentCancel = vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockImplementation(() => {
+      throw agentError
+    })
+    const mediaCancel = vi.spyOn(MediaGenerationOrchestrator.prototype, 'cancel').mockImplementation(() => {
+      throw mediaError
+    })
+    const executionShutdown = vi.spyOn(ExecutionService.prototype, 'shutdown')
+    const databaseClose = vi.spyOn(Database.prototype, 'close')
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openrouter/text', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/text' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'await approval'))
+    await vi.waitFor(() => expect(AgentOrchestrator.prototype.run).toHaveBeenCalled())
+
+    await expect(runtime.close()).rejects.toBe(agentError)
+    expect(agentCancel).toHaveBeenCalledTimes(1)
+    expect(mediaCancel).toHaveBeenCalledTimes(1)
+    expect(executionShutdown).toHaveBeenCalledTimes(1)
+    expect(databaseClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('memoizes close and rejects recover after shutdown starts', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-close-memo-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    const first = runtime.close()
+    const second = runtime.close()
+
+    expect(second).toBe(first)
+    await expect(first).resolves.toBeUndefined()
+    expect(runtime.close()).toBe(first)
+    await expect(runtime.recover()).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('runs interrupted usage recovery without blocking startup and preserves the failure for close', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-recovery-'))
+    directories.push(root)
+    const interrupted = deferred<void>()
+    vi.spyOn(ProviderUsageReconciler.prototype, 'recoverInterrupted')
+      .mockImplementationOnce(() => interrupted.promise)
+    const recoveryError = new Error('sk-sensitive-recovery-key')
+    const runtime = createApplicationRuntime(options(root))
+
+    await expect(runtime.recover()).resolves.toBeUndefined()
+    expect(recoveryProbe).toHaveBeenCalledTimes(1)
+    interrupted.reject(recoveryError)
+    await expect(runtime.close()).rejects.toBe(recoveryError)
+  })
+
+  it('recovers pending usage locally without consuming retries when OpenRouter lacks generation usage capability', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-capability-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const database = openAppDatabase(databasePath)
+    database.localAuth.createUserAndSession({
+      id: 'user_capability', account: 'Capability', accountNormalized: 'capability',
+      passwordDigest: 'digest-capability', createdAt: 1, updatedAt: 1,
+    }, 1)
+    const usage = (id: string, startedAt: number) => ({
+      id,
+      operationKey: `operation_${id}`,
+      userId: 'user_capability',
+      provider: 'openrouter' as const,
+      apiKeyFingerprint: '9990f372dd37cc8754019a4215e0dedc4ec55fd78e0b7e38ad73c7e152a9986c',
+      requestId: `request_${id}`,
+      model: 'openrouter/model',
+      modality: 'text' as const,
+      startedAt,
+    })
+    database.providerUsage.start(usage('unknown', 100))
+    database.providerUsage.bindIdentity('operation_unknown', { generationId: 'generation_unknown' })
+    database.providerUsage.markUnknown('operation_unknown', 100)
+    database.providerUsage.start(usage('pending', 200))
+    database.providerUsage.bindIdentity('operation_pending', { generationId: 'generation_pending' })
+    database.close()
+
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      } }),
+    }))
+    try {
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-capability')
+      await runtime.recover()
+      await vi.advanceTimersByTimeAsync(100_000)
+      await runtime.close()
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const sqlite = new Database(databasePath, { readonly: true })
+    try {
+      expect(sqlite.prepare(`
+        SELECT operation_key AS operationKey, status, reconcile_attempts AS reconcileAttempts,
+               next_reconcile_at AS nextReconcileAt, ended_at AS endedAt
+        FROM provider_usage_events
+        ORDER BY operation_key
+      `).all()).toEqual([
+        {
+          operationKey: 'operation_pending', status: 'unknown', reconcileAttempts: 0,
+          nextReconcileAt: 11_000, endedAt: 10_000,
+        },
+        {
+          operationKey: 'operation_unknown', status: 'unknown', reconcileAttempts: 0,
+          nextReconcileAt: 1_100, endedAt: 100,
+        },
+      ])
+    } finally {
+      sqlite.close()
+    }
+  })
+
+  it('schedules exactly three due reconciliations at 1, 6, and 36 seconds after a terminal chat event', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-schedule-'))
+    directories.push(root)
+    const reconciliationError = new Error('sk-sensitive-timer-key')
+    const reconcileDue = vi.spyOn(ProviderUsageReconciler.prototype, 'reconcileDue')
+      .mockRejectedValue(reconciliationError)
+    const emitChat = vi.fn()
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+        getGenerationUsage: async (generationId) => ({ generationId }),
+      } }),
+      emitChat,
+    }))
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    vi.useFakeTimers()
+    try {
+      await runtime.services.settings.get()
+      await vi.advanceTimersByTimeAsync(40_000)
+      expect(reconcileDue).not.toHaveBeenCalled()
+
+      const conversation = await runtime.services.chat.createConversation()
+      const { requestId } = await runtime.services.chat.send(chatInput(conversation.id, 'schedule reconciliation'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'status', requestId, status: 'completed',
+      }))
+
+      await vi.advanceTimersByTimeAsync(999)
+      expect(reconcileDue).toHaveBeenCalledTimes(0)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reconcileDue).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(29_999)
+      expect(reconcileDue).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reconcileDue).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(3)
+    } finally {
+      await expect(runtime.close()).rejects.toBe(reconciliationError)
+      vi.useRealTimers()
+    }
+  })
+
+  it('closes admission immediately when background reconciliation finds a consistency failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-reconciliation-consistency-'))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    const videoStopError = new Error('later video cleanup failure')
+    vi.spyOn(ProviderUsageReconciler.prototype, 'reconcileDue').mockRejectedValue(consistencyError)
+    const videoStop = vi.spyOn(VideoJobRunner.prototype, 'stop').mockRejectedValue(videoStopError)
+    const databaseClose = vi.spyOn(Database.prototype, 'close')
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+        getGenerationUsage: async (generationId) => ({ generationId }),
+      } }),
+    }))
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    vi.useFakeTimers()
+    try {
+      const conversation = await runtime.services.chat.createConversation()
+      await runtime.services.chat.send(chatInput(conversation.id, 'trigger reconciliation'))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      await expect(runtime.services.chat.send(chatInput(conversation.id, 'must be rejected')))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      await expect(runtime.close()).rejects.toBe(consistencyError)
+      expect(videoStop).toHaveBeenCalledTimes(1)
+      expect(databaseClose).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('starts each finite reconciliation delay only after the previous slow round settles', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-serial-'))
+    directories.push(root)
+    const first = deferred<void>()
+    const reconcileDue = vi.spyOn(ProviderUsageReconciler.prototype, 'reconcileDue')
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(undefined)
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+        getGenerationUsage: async (generationId) => ({ generationId }),
+      } }),
+    }))
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    vi.useFakeTimers()
+    try {
+      const conversation = await runtime.services.chat.createConversation()
+      await runtime.services.chat.send(chatInput(conversation.id, 'serialize reconciliation'))
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      first.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reconcileDue).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(29_999)
+      expect(reconcileDue).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(reconcileDue).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(3)
+      await runtime.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('clears pending usage reconciliation timers and waits for an already-started serialized tail on close', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-close-'))
+    directories.push(root)
+    const first = deferred<void>()
+    const reconcileDue = vi.spyOn(ProviderUsageReconciler.prototype, 'reconcileDue')
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue(undefined)
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openai/gpt-4.1-mini', 'OpenRouter')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+        getGenerationUsage: async (generationId) => ({ generationId }),
+      } }),
+    }))
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    vi.useFakeTimers()
+    try {
+      const conversation = await runtime.services.chat.createConversation()
+      await runtime.services.chat.send(chatInput(conversation.id, 'close reconciliation'))
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+
+      let closed = false
+      const closing = runtime.close().then(() => { closed = true })
+      await vi.advanceTimersByTimeAsync(100_000)
+      expect(closed).toBe(false)
+      expect(reconcileDue).toHaveBeenCalledTimes(1)
+      first.resolve()
+      await closing
+      expect(closed).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('aborts a never-returning generation lookup and completes close', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-reconciliation-abort-'))
+    directories.push(root)
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const lookupStarted = deferred<AbortSignal>()
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => []),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+      getGenerationUsage: vi.fn(async (_generationId: string, signal?: AbortSignal): Promise<never> => {
+        lookupStarted.resolve(signal!)
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      }),
+    })
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.localAuth.createUserAndSession({
+      id: 'user_abort', account: 'Abort', accountNormalized: 'abort',
+      passwordDigest: 'digest-abort', createdAt: 1, updatedAt: 1,
+    }, 1)
+    database.providerUsage.start({
+      id: 'usage_abort', operationKey: 'operation_abort', userId: 'user_abort',
+      provider: 'openrouter', apiKeyFingerprint: 'fingerprint_test', requestId: 'request_abort',
+      model: 'openrouter/model', modality: 'text', startedAt: 0,
+    })
+    database.providerUsage.bindIdentity('operation_abort', { generationId: 'generation_abort' })
+    database.providerUsage.markUnknown('operation_abort', 0)
+    database.close()
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    try {
+      await runtime.recover()
+      await vi.advanceTimersByTimeAsync(1_000)
+      const signal = await lookupStarted.promise
+      const closing = runtime.close()
+      await expect(closing).resolves.toBeUndefined()
+      expect(signal.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('runs every shutdown cleanup after video stop fails and throws the earliest cleanup failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cleanup-all-'))
+    directories.push(root)
+    const videoError = new Error('video stop failed')
+    const executionError = new Error('execution shutdown failed')
+    const runFinished = deferred<void>()
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockImplementationOnce(async () => {
+      await runFinished.promise
+      return { requestId: 'tracked', status: 'cancelled' }
+    })
+    const agentCancel = vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockImplementation(async () => {
+      runFinished.resolve()
+    })
+    const mediaCancel = vi.spyOn(MediaGenerationOrchestrator.prototype, 'cancel').mockResolvedValue(undefined)
+    const videoStop = vi.spyOn(VideoJobRunner.prototype, 'stop').mockRejectedValue(videoError)
+    const executionShutdown = vi.spyOn(ExecutionService.prototype, 'shutdown').mockRejectedValue(executionError)
+    const databaseClose = vi.spyOn(Database.prototype, 'close')
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openai/gpt-4.1-mini', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'keep active'))
+    await vi.waitFor(() => expect(AgentOrchestrator.prototype.run).toHaveBeenCalled())
+
+    await expect(runtime.close()).rejects.toBe(videoError)
+    expect(videoStop).toHaveBeenCalledTimes(1)
+    expect(agentCancel).toHaveBeenCalledTimes(1)
+    expect(mediaCancel).toHaveBeenCalledTimes(1)
+    expect(executionShutdown).toHaveBeenCalledTimes(1)
+    expect(databaseClose).toHaveBeenCalled()
+  })
+
+  it('rethrows a consistency failure that is latched while close cancels active chat work', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-close-late-consistency-'))
+    directories.push(root)
+    const consistencyError = new ProviderUsageConsistencyError()
+    const cancelled = deferred<void>()
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockImplementationOnce(async () => {
+      await cancelled.promise
+      throw consistencyError
+    })
+    vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockImplementationOnce(async () => {
+      cancelled.resolve()
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openai/gpt-4.1-mini', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'late failure'))
+    await vi.waitFor(() => expect(AgentOrchestrator.prototype.run).toHaveBeenCalled())
+
+    await expect(runtime.close()).rejects.toBe(consistencyError)
   })
 
   it('initializes the saved proxy before runtime recovery continues', async () => {
@@ -657,7 +1786,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: { openrouter, deepseek },
+      modelProviders: snapshotProviders({ openrouter, deepseek }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -669,6 +1798,8 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+
+    await authenticate(runtime)
 
     await expect(runtime.services.settings.get()).resolves.toMatchObject({
       activeProvider: 'deepseek',
@@ -754,13 +1885,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context model'), contextLength: 128_000 }]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -772,6 +1903,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const settings = await runtime.services.settings.get()
     await runtime.services.settings.update({
@@ -803,6 +1935,90 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('bills real context-summary streams through the Application-supplied provider snapshot', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-summary-billing-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const database = openAppDatabase(databasePath)
+    database.conversations.insert({ id: 'conversation_summary_billing', title: 'Summary billing' })
+    for (let turn = 0; turn < 10; turn += 1) {
+      database.messages.insert({
+        id: `summary_user_${turn}`, conversationId: 'conversation_summary_billing', role: 'user',
+        blocks: [{ type: 'text', text: `问题 ${turn} ${'长内容'.repeat(80)}` }], createdAt: turn * 2 + 1,
+      })
+      database.messages.insert({
+        id: `summary_assistant_${turn}`, conversationId: 'conversation_summary_billing', role: 'assistant',
+        blocks: [{ type: 'text', text: `回答 ${turn} ${'历史'.repeat(80)}` }], createdAt: turn * 2 + 2,
+      })
+    }
+    database.close()
+    let summaryCalls = 0
+    const stream = vi.fn(async function* (request: ModelStreamRequest) {
+      const summary = request.maxOutputTokens !== undefined
+      if (summary) summaryCalls += 1
+      yield { type: 'generation' as const, id: summary ? `generation_summary_${summaryCalls}` : 'generation_answer' }
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: summary ? '压缩后的历史摘要' : '最终回答' }
+      yield {
+        type: 'usage' as const,
+        inputTokens: summary ? 20 : 4,
+        outputTokens: summary ? 5 : 2,
+        totalTokens: summary ? 25 : 6,
+        costUsd: summary ? '0.04' : '0.01',
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const emitChat = vi.fn()
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 1_000 }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream,
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat,
+    }))
+    const session = await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/context' },
+      },
+    })
+
+    const sent = await runtime.services.chat.send(chatInput('conversation_summary_billing', '继续'))
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'status', requestId: sent.requestId, status: 'completed',
+    })))
+    await runtime.close()
+
+    const sqlite = new Database(databasePath, { readonly: true })
+    try {
+      const events = sqlite.prepare(`
+        SELECT operation_key AS operationKey, user_id AS userId, api_key_fingerprint AS apiKeyFingerprint,
+               status, cost_usd AS costUsd
+        FROM provider_usage_events ORDER BY operation_key
+      `).all() as Array<Record<string, unknown>>
+      expect(events).toContainEqual(expect.objectContaining({
+        operationKey: expect.stringMatching(`^conversation-summary:${sent.requestId}:`),
+        userId: session.user.id,
+        apiKeyFingerprint: 'fingerprint_test',
+        status: 'reported',
+        costUsd: '0.04',
+      }))
+      expect(events).toContainEqual(expect.objectContaining({
+        operationKey: `agent:${sent.requestId}:turn:0`,
+        userId: session.user.id,
+        apiKeyFingerprint: 'fingerprint_test',
+        status: 'reported',
+        costUsd: '0.01',
+      }))
+    } finally {
+      sqlite.close()
+    }
+  })
+
   it('emits a terminal conflict for a concurrent same-conversation send without persisting it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-context-conflict-'))
     directories.push(root)
@@ -831,13 +2047,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [modelInfo('openrouter/context', 'Context model')]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -912,13 +2128,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [{ ...visionTextModelInfo('openrouter/vision-context'), contextLength: 128_000 }]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [source],
       readClipboardImage: () => undefined,
@@ -930,6 +2146,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const settings = await runtime.services.settings.get()
     await runtime.services.settings.update({
@@ -1002,14 +2219,14 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [imageModelInfo('openrouter/image')]),
           validateCredential: vi.fn(async () => ({ valid: true })),
           stream,
           generateImage,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1022,6 +2239,7 @@ describe('createApplicationRuntime', () => {
       mediaTransport: { request: mediaRequest },
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
@@ -1100,7 +2318,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [
             visionTextModelInfo('openrouter/text'),
@@ -1114,7 +2332,7 @@ describe('createApplicationRuntime', () => {
           generateImage,
           submitVideo,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [source],
       readClipboardImage: () => undefined,
@@ -1126,6 +2344,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
@@ -1270,13 +2489,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         deepseek: {
           listModels,
           validateCredential,
           stream,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [source],
       readClipboardImage: () => undefined,
@@ -1288,12 +2507,15 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
     const conversation = await runtime.services.chat.createConversation()
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'missing key')))
       .rejects.toMatchObject({ code: 'CREDENTIAL_UNAVAILABLE' })
     expect(validateCredential).not.toHaveBeenCalled()
     expect(stream).not.toHaveBeenCalled()
 
+    await runtime.services.settings.update({ activeProvider: 'deepseek' })
     await runtime.services.settings.saveProviderApiKey('deepseek', 'invalid')
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'invalid key')))
       .rejects.toMatchObject({ code: 'CREDENTIAL_INVALID' })
@@ -1325,6 +2547,10 @@ describe('createApplicationRuntime', () => {
       .rejects.toMatchObject({ code: 'MODEL_PROVIDER_ACCESS_DENIED' })
     expect(stream).not.toHaveBeenCalled()
     await runtime.close()
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM provider_usage_events').get())
+      .toEqual({ count: 0 })
+    sqlite.close()
   })
 
   it('quarantines media for conversation deletion and preserves it for executions-only clear', async () => {
@@ -1471,7 +2697,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         openrouter: {
           listModels: vi.fn(async () => [imageModelInfo('openrouter/image')]),
           validateCredential: vi.fn(async () => ({ valid: true })),
@@ -1480,7 +2706,7 @@ describe('createApplicationRuntime', () => {
           }),
           generateImage,
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1492,6 +2718,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
@@ -1531,7 +2758,7 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         deepseek: {
           listModels: vi.fn(async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')]),
           validateCredential,
@@ -1539,7 +2766,7 @@ describe('createApplicationRuntime', () => {
             yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
           }),
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1551,6 +2778,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
     const conversation = await runtime.services.chat.createConversation()
     const sending = runtime.services.chat.send(chatInput(conversation.id, 'preflight'))
@@ -1584,7 +2812,7 @@ describe('createApplicationRuntime', () => {
           encrypt: async (value) => Buffer.from(value),
           decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
         },
-        modelProviders: {
+        modelProviders: snapshotProviders({
           openrouter: {
             listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
             validateCredential: vi.fn(async () => ({ valid: true })),
@@ -1597,7 +2825,7 @@ describe('createApplicationRuntime', () => {
             })),
             pollVideo,
           },
-        },
+        }),
         chooseProjectDirectory: async () => undefined,
         chooseMediaFiles: async () => [],
         readClipboardImage: () => undefined,
@@ -1609,6 +2837,7 @@ describe('createApplicationRuntime', () => {
         networkProxy,
         browserRuntime: { packaged: false },
       })
+      await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
       await runtime.services.settings.update({
         activeProvider: 'openrouter',
@@ -1666,7 +2895,7 @@ describe('createApplicationRuntime', () => {
           encrypt: async (value) => Buffer.from(value),
           decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
         },
-        modelProviders: { openrouter: provider },
+        modelProviders: { openrouter: snapshotProvider('openrouter', provider) },
         chooseProjectDirectory: async () => undefined,
         chooseMediaFiles: async () => [],
         readClipboardImage: () => undefined,
@@ -1679,6 +2908,7 @@ describe('createApplicationRuntime', () => {
         browserRuntime: { packaged: false },
       }
       const runtime = createApplicationRuntime(options)
+      await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
       await runtime.services.settings.update({
         activeProvider: 'openrouter',
@@ -1805,7 +3035,10 @@ describe('createApplicationRuntime', () => {
           shouldReEncrypt: false,
         }),
       },
-      modelProviders: { openrouter, deepseek },
+      modelProviders: {
+        openrouter: snapshotProvider('openrouter', openrouter),
+        deepseek: snapshotProvider('deepseek', deepseek),
+      },
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1861,7 +3094,7 @@ describe('createApplicationRuntime', () => {
           shouldReEncrypt: false,
         }),
       },
-      modelProviders: {
+      modelProviders: snapshotProviders({
         deepseek,
         openrouter: {
           listModels: vi.fn(async () => []),
@@ -1870,7 +3103,7 @@ describe('createApplicationRuntime', () => {
             yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
           }),
         },
-      },
+      }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1911,11 +3144,11 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
         validateCredential: async () => ({ valid: true }),
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -1928,6 +3161,7 @@ describe('createApplicationRuntime', () => {
       browserRuntime: { packaged: false },
     })
 
+    await authenticate(runtime)
     await runtime.recover()
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -1985,10 +3219,10 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')], validateCredential: async () => ({ valid: true }),
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2023,13 +3257,13 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')], validateCredential: async () => ({ valid: true }),
         stream: async function* () {
           await streamFinished
           yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,
@@ -2041,6 +3275,7 @@ describe('createApplicationRuntime', () => {
       networkProxy,
       browserRuntime: { packaged: false },
     })
+    await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const cleanupSettings = await runtime.services.settings.get()
@@ -2139,10 +3374,10 @@ describe('createApplicationRuntime', () => {
         encrypt: async (value) => Buffer.from(value),
         decrypt: async (value) => ({ value: value.toString(), shouldReEncrypt: false }),
       },
-      openRouter: {
+      modelProviders: snapshotProviders({ openrouter: {
         listModels: async () => [], validateCredential: async () => ({ valid: true }),
         stream: async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } },
-      },
+      } }),
       chooseProjectDirectory: async () => undefined,
       chooseMediaFiles: async () => [],
       readClipboardImage: () => undefined,

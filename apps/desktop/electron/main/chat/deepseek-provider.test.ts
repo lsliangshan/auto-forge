@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { DeepSeekProvider } from './deepseek-provider.js'
-import type { ModelStreamEvent } from './model-provider.js'
+import type { ModelProvider, ModelStreamEvent } from './model-provider.js'
 import { NetworkProxyService } from '../network/network-proxy-service.js'
 
 function sseResponse(chunks: string[]): Response {
@@ -20,6 +20,73 @@ async function collect(stream: AsyncIterable<ModelStreamEvent>): Promise<ModelSt
 }
 
 describe('DeepSeekProvider', () => {
+  it('binds snapshots without exposing an OpenRouter fingerprint or serializing a user', async () => {
+    let apiKey = 'sk-deepseek-a'
+    const credential = { get: vi.fn(async () => apiKey) }
+    const requests: Array<{ authorization: string; body: unknown }> = []
+    const source = new DeepSeekProvider({
+      credential,
+      fetch: vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        requests.push({
+          authorization: new Headers(init?.headers).get('authorization') ?? '',
+          body: JSON.parse(String(init?.body)),
+        })
+        return sseResponse(['data: [DONE]\n\n'])
+      }),
+    })
+    const snapshot = await source.acquireSnapshot()
+    apiKey = 'sk-deepseek-b'
+
+    await collect(snapshot.provider.stream({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'hello' }],
+      endUserId: 'user-1',
+    }))
+
+    expect(snapshot.providerId).toBe('deepseek')
+    expect(snapshot.apiKeyFingerprint).toBeUndefined()
+    expect(credential.get).toHaveBeenCalledTimes(1)
+    expect(requests).toEqual([{
+      authorization: 'Bearer sk-deepseek-a',
+      body: expect.not.objectContaining({ user: expect.anything() }),
+    }])
+    expect(JSON.stringify(snapshot)).not.toContain('sk-deepseek-a')
+    expect(JSON.stringify(snapshot)).not.toContain('sk-deepseek-b')
+  })
+
+  it('uses the existing credential-unavailable error when snapshot acquisition has no key', async () => {
+    const provider = new DeepSeekProvider({
+      credential: { get: vi.fn(async () => undefined) },
+      fetch: vi.fn(),
+    })
+
+    await expect(provider.acquireSnapshot()).rejects.toMatchObject({
+      code: 'CREDENTIAL_UNAVAILABLE',
+    })
+  })
+
+  it('does not serialize an end user into DeepSeek chat requests', async () => {
+    let body: unknown
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body))
+      return sseResponse(['data: [DONE]\n\n'])
+    })
+    const provider: ModelProvider = new DeepSeekProvider({
+      credential: { get: vi.fn(async () => 'sk-deepseek-private') },
+      fetch,
+    })
+
+    await collect(provider.stream({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'hello' }],
+      endUserId: 'user-1',
+    } as never))
+
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(body).not.toHaveProperty('user')
+    expect(provider.getGenerationUsage).toBeUndefined()
+  })
+
   it('releases a managed 401 response before returning an invalid credential result', async () => {
     const networkProxy = new NetworkProxyService({
       setProxy: vi.fn(async () => undefined),

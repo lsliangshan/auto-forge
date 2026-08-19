@@ -8,7 +8,9 @@ import {
   type ChatBlock,
   type ConversationGenerationPreferences,
   type MediaKind,
+  type ModelProviderId,
 } from '@autoforge/shared'
+import { addUsd, normalizeUsd } from '../billing/decimal-usd.js'
 import { redact } from '../security/redaction.js'
 
 export interface Conversation {
@@ -55,9 +57,104 @@ export interface ChatRun {
   errorCode?: string
   startedAt: number
   endedAt?: number
+  userId?: string
+  provider?: ModelProviderId
+}
+
+export type ProviderUsageStatus = 'pending' | 'reported' | 'unknown'
+export type ProviderUsageModality = 'text' | 'image' | 'audio' | 'video'
+
+export class ProviderUsageConsistencyError extends Error {
+  constructor() {
+    super('Provider usage consistency error')
+    this.name = 'ProviderUsageConsistencyError'
+  }
+}
+
+export interface ProviderUsageStart {
+  id: string
+  operationKey: string
+  userId: string
+  provider: ModelProviderId
+  apiKeyFingerprint?: string
+  requestId: string
+  chatRunId?: string
+  model: string
+  modality: ProviderUsageModality
+  startedAt: number
+}
+
+export interface ProviderUsageIdentity {
+  generationId?: string
+  providerJobId?: string
+}
+
+export interface ProviderUsageReport extends ProviderUsageIdentity {
+  inputTokens?: number
+  outputTokens?: number
+  costUsd: string | number
+  endedAt: number
+}
+
+export interface ProviderUsageQueryRecord {
+  userId: string
+  yesterdayStartedAt: number
+  todayStartedAt: number
+  weekStartedAt: number
+  monthStartedAt: number
+  endedAt: number
+}
+
+export interface ProviderUsageEvent extends ProviderUsageStart {
+  generationId?: string
+  providerJobId?: string
+  status: ProviderUsageStatus
+  inputTokens?: number
+  outputTokens?: number
+  costUsd?: string
+  reconcileAttempts: number
+  nextReconcileAt?: number
+  endedAt?: number
+}
+
+export interface ProviderCostModelRecord {
+  provider: ModelProviderId
+  model: string
+  openRouterCostUsd: string
+  openRouterKnownCostCount: number
+  openRouterUnknownCostCount: number
+}
+
+export interface ProviderCostPeriodRecord {
+  openRouterCostUsd: string
+  openRouterKnownCostCount: number
+  openRouterUnknownCostCount: number
+  models: ProviderCostModelRecord[]
+}
+
+export interface ProviderCostSnapshotRecord {
+  allTimeStartedAt?: number
+  today: ProviderCostPeriodRecord
+  yesterday: ProviderCostPeriodRecord
+  week: ProviderCostPeriodRecord
+  month: ProviderCostPeriodRecord
+  allTime: ProviderCostPeriodRecord
+}
+
+export interface ProviderUsageRepository {
+  find(operationKey: string): ProviderUsageEvent | undefined
+  start(event: ProviderUsageStart): ProviderUsageEvent
+  bindIdentity(operationKey: string, identity: ProviderUsageIdentity): ProviderUsageEvent
+  report(operationKey: string, report: ProviderUsageReport): ProviderUsageEvent
+  markUnknown(operationKey: string, endedAt: number): ProviderUsageEvent
+  recoverPending(now: number): number
+  listReconcilable(now: number): ProviderUsageEvent[]
+  recordReconcileFailure(operationKey: string, nextReconcileAt?: number): ProviderUsageEvent
+  summarize(input: ProviderUsageQueryRecord): ProviderCostSnapshotRecord
 }
 
 export interface ModelTokenUsageRecord {
+  provider: ModelProviderId
   model: string
   inputTokens: number
   outputTokens: number
@@ -67,6 +164,7 @@ export interface ModelTokenUsageRecord {
 export type TokenUsageGranularityRecord = 'hour' | 'day' | 'month'
 
 export interface TokenUsageQueryRecord {
+  userId: string
   yesterdayStartedAt: number
   todayStartedAt: number
   weekStartedAt: number
@@ -442,8 +540,9 @@ export interface AppRepositories {
     insert(value: Omit<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode' | 'endedAt'>>): ChatRun
     startMediaGeneration(value: MediaGenerationTurnInput): void
     get(id: string): ChatRun | undefined
+    getByRequestId(requestId: string): ChatRun | undefined
     summarizeTokenUsage(input: TokenUsageQueryRecord): TokenUsageSnapshotRecord
-    update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt'>>): ChatRun | undefined
+    update(id: string, value: Partial<Omit<ChatRun, 'id' | 'conversationId' | 'requestId' | 'model' | 'startedAt' | 'userId' | 'provider'>>): ChatRun | undefined
     finalizeWithMessage(
       id: string,
       messageId: string,
@@ -451,6 +550,7 @@ export interface AppRepositories {
       value: Pick<ChatRun, 'status' | 'endedAt'> & Partial<Pick<ChatRun, 'generationId' | 'inputTokens' | 'outputTokens' | 'costUsd' | 'errorCode'>> & { blocks: unknown[] },
     ): ChatRun
   }
+  providerUsage: ProviderUsageRepository
   workflowProjects: { insert(value: WorkflowProject): WorkflowProject; get(id: string): WorkflowProject | undefined; list(): WorkflowProject[]; update(id: string, value: Partial<Omit<WorkflowProject, 'id' | 'createdAt'>>): WorkflowProject | undefined }
   installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void; delete(workflowId: string, version: string): void }
   workflowFiles: { insert(value: WorkflowFile): WorkflowFile; list(workflowId: string, workflowVersion: string): WorkflowFile[] }
@@ -473,12 +573,14 @@ const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json
 const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
 const mediaGenerationJobColumns = 'id, conversation_id AS conversationId, assistant_message_id AS assistantMessageId, provider, model, kind, provider_job_id AS providerJobId, status, parameters_json AS parametersJson, next_poll_at AS nextPollAt, poll_attempts AS pollAttempts, error_code AS errorCode, asset_id AS assetId, created_at AS createdAt, updated_at AS updatedAt, ended_at AS endedAt'
-const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt'
+const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS requestId, model, status, generation_id AS generationId, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, error_code AS errorCode, started_at AS startedAt, ended_at AS endedAt, user_id AS userId, provider'
+const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS userId, provider, api_key_fingerprint AS apiKeyFingerprint, request_id AS requestId, chat_run_id AS chatRunId, generation_id AS generationId, provider_job_id AS providerJobId, model, modality, status, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, reconcile_attempts AS reconcileAttempts, next_reconcile_at AS nextReconcileAt, started_at AS startedAt, ended_at AS endedAt'
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
 
 interface TokenUsageRow {
+  provider: ModelProviderId
   model: string
   inputTokens: number
   outputTokens: number
@@ -497,6 +599,94 @@ function safeTokenCount(value: unknown): number {
   return value
 }
 
+function providerUsageConsistencyError(): ProviderUsageConsistencyError {
+  return new ProviderUsageConsistencyError()
+}
+
+function providerUsageFromRow(row: Query): ProviderUsageEvent {
+  return {
+    id: row.id as string,
+    operationKey: row.operationKey as string,
+    userId: row.userId as string,
+    provider: row.provider as ModelProviderId,
+    apiKeyFingerprint: row.apiKeyFingerprint === null ? undefined : row.apiKeyFingerprint as string,
+    requestId: row.requestId as string,
+    chatRunId: row.chatRunId === null ? undefined : row.chatRunId as string,
+    generationId: row.generationId === null ? undefined : row.generationId as string,
+    providerJobId: row.providerJobId === null ? undefined : row.providerJobId as string,
+    model: row.model as string,
+    modality: row.modality as ProviderUsageModality,
+    status: row.status as ProviderUsageStatus,
+    inputTokens: row.inputTokens === null ? undefined : row.inputTokens as number,
+    outputTokens: row.outputTokens === null ? undefined : row.outputTokens as number,
+    costUsd: row.costUsd === null ? undefined : row.costUsd as string,
+    reconcileAttempts: row.reconcileAttempts as number,
+    nextReconcileAt: row.nextReconcileAt === null ? undefined : row.nextReconcileAt as number,
+    startedAt: row.startedAt as number,
+    endedAt: row.endedAt === null ? undefined : row.endedAt as number,
+  }
+}
+
+function getProviderUsage(database: SqliteDatabase, operationKey: string): ProviderUsageEvent {
+  const row = one<Query>(database, `
+    SELECT ${providerUsageColumns}
+    FROM provider_usage_events
+    WHERE operation_key = @operationKey
+  `, { operationKey })
+  if (!row) throw providerUsageConsistencyError()
+  return providerUsageFromRow(row)
+}
+
+function sameProviderUsageStart(stored: ProviderUsageEvent, input: ProviderUsageStart): boolean {
+  return stored.operationKey === input.operationKey
+    && stored.userId === input.userId
+    && stored.provider === input.provider
+    && stored.apiKeyFingerprint === input.apiKeyFingerprint
+    && stored.requestId === input.requestId
+    && stored.chatRunId === input.chatRunId
+    && stored.model === input.model
+    && stored.modality === input.modality
+}
+
+interface ProviderCostRow {
+  provider: ModelProviderId
+  model: string
+  status: ProviderUsageStatus
+  costUsd: string | null
+  startedAt: number
+}
+
+function summarizeProviderCostPeriod(
+  rows: ProviderCostRow[],
+  startedAt: number,
+  endedAt: number,
+): ProviderCostPeriodRecord {
+  const periodRows = rows.filter((row) => row.startedAt >= startedAt && row.startedAt < endedAt)
+  const groups = new Map<string, ProviderCostRow[]>()
+  for (const row of periodRows) {
+    const key = `${row.provider}\0${row.model}`
+    const group = groups.get(key)
+    if (group) group.push(row)
+    else groups.set(key, [row])
+  }
+  const summarizeRows = (values: ProviderCostRow[]) => ({
+    openRouterCostUsd: addUsd(values.flatMap((row) => row.status === 'reported' && row.costUsd !== null ? [row.costUsd] : [])),
+    openRouterKnownCostCount: values.filter((row) => row.status === 'reported').length,
+    openRouterUnknownCostCount: values.filter((row) => row.status !== 'reported').length,
+  })
+  const models = Array.from(groups.values(), (values): ProviderCostModelRecord => ({
+    provider: values[0].provider,
+    model: values[0].model,
+    ...summarizeRows(values),
+  })).sort((left, right) => (
+    left.provider < right.provider ? -1
+      : left.provider > right.provider ? 1
+        : left.model < right.model ? -1
+          : left.model > right.model ? 1 : 0
+  ))
+  return { ...summarizeRows(periodRows), models }
+}
+
 function trendBucketSql(granularity: TokenUsageGranularityRecord): string {
   if (granularity === 'hour') {
     return 'CAST((started_at - @startedAt) / 3600000 AS INTEGER)'
@@ -509,28 +699,34 @@ function trendBucketSql(granularity: TokenUsageGranularityRecord): string {
 
 function summarizeTokenUsagePeriod(
   database: SqliteDatabase,
+  userId: string,
   startedAt: number,
   endedAt: number,
   granularity: TokenUsageGranularityRecord,
 ): TokenUsagePeriodRecord {
   const parameters = {
+    userId,
     startedAt: safeTokenCount(startedAt),
     endedAt: safeTokenCount(endedAt),
   }
   const models = many<TokenUsageRow>(database, `
     SELECT
+      provider,
       model,
       SUM(COALESCE(input_tokens, 0)) AS inputTokens,
       SUM(COALESCE(output_tokens, 0)) AS outputTokens
     FROM chat_runs
-    WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+    WHERE user_id = @userId
+      AND provider IS NOT NULL
+      AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
       AND started_at >= @startedAt
       AND started_at < @endedAt
-    GROUP BY model
+    GROUP BY provider, model
   `, parameters).map((row): ModelTokenUsageRecord => {
     const inputTokens = safeTokenCount(row.inputTokens)
     const outputTokens = safeTokenCount(row.outputTokens)
     return {
+      provider: row.provider,
       model: row.model,
       inputTokens,
       outputTokens,
@@ -538,7 +734,8 @@ function summarizeTokenUsagePeriod(
     }
   })
     .sort((left, right) => right.totalTokens - left.totalTokens
-      || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0))
+      || (left.model < right.model ? -1 : left.model > right.model ? 1 : 0)
+      || (left.provider < right.provider ? -1 : left.provider > right.provider ? 1 : 0))
 
   const bucket = trendBucketSql(granularity)
   const trend = many<SparseTokenUsageRow>(database, `
@@ -547,7 +744,9 @@ function summarizeTokenUsagePeriod(
       SUM(COALESCE(input_tokens, 0)) AS inputTokens,
       SUM(COALESCE(output_tokens, 0)) AS outputTokens
     FROM chat_runs
-    WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+    WHERE user_id = @userId
+      AND provider IS NOT NULL
+      AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
       AND started_at >= @startedAt
       AND started_at < @endedAt
     GROUP BY ${bucket}
@@ -610,6 +809,38 @@ function conversationFromRow(row: Query): Conversation {
 
 function optional<T>(value: unknown): T | undefined {
   return value === null || value === undefined ? undefined : value as T
+}
+
+function chatRunFromRow(row: Query): ChatRun {
+  return {
+    id: row.id as string,
+    conversationId: row.conversationId as string,
+    requestId: row.requestId as string,
+    model: row.model as string,
+    status: row.status as string,
+    generationId: optional<string>(row.generationId),
+    inputTokens: optional<number>(row.inputTokens),
+    outputTokens: optional<number>(row.outputTokens),
+    costUsd: optional<string>(row.costUsd),
+    errorCode: optional<string>(row.errorCode),
+    startedAt: row.startedAt as number,
+    endedAt: optional<number>(row.endedAt),
+    userId: optional<string>(row.userId),
+    provider: optional<ModelProviderId>(row.provider),
+  }
+}
+
+function chatRunOwnership(value: Pick<ChatRun, 'userId' | 'provider'>): {
+  userId: string | null
+  provider: ModelProviderId | null
+} {
+  if (value.userId !== undefined && value.provider === undefined) {
+    throw new Error('Owned chat run requires a provider')
+  }
+  return {
+    userId: value.userId ?? null,
+    provider: value.provider ?? null,
+  }
 }
 
 function mediaAssetFromRow(row: Query): MediaAssetRecord {
@@ -969,11 +1200,12 @@ function updateVideoBlock(
 }
 
 function videoRun(database: SqliteDatabase, job: MediaGenerationJob): ChatRun {
-  const run = one<ChatRun>(
+  const row = one<Query>(
     database,
     `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`,
     { requestId: job.id },
   )
+  const run = row === undefined ? undefined : chatRunFromRow(row)
   if (
     !run
     || run.conversationId !== job.conversationId
@@ -997,11 +1229,12 @@ function resumableVideoAssociation(
     || isVideoSubmissionIntent(job)
     || !['pending', 'in_progress', 'downloading', 'paused'].includes(job.status)
   ) return undefined
-  const run = one<ChatRun>(
+  const runRow = one<Query>(
     database,
     `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`,
     { requestId: job.id },
   )
+  const run = runRow === undefined ? undefined : chatRunFromRow(runRow)
   if (
     !run
     || run.conversationId !== job.conversationId
@@ -1290,7 +1523,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => {
           const assistantBlocks = validateVideoGenerationTurn(database, value)
           insertMessageWithAssets(database, userMessage, userAssetIds)
-          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run({ ...run, ...chatRunOwnership(run) })
           insertMessage(database, assistantMessage, assistantBlocks)
           database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, NULL, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
             ...job,
@@ -1368,7 +1601,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             job.providerJobId,
           )
           insertMessageWithAssets(database, userMessage, userAssetIds)
-          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run({ ...run, ...chatRunOwnership(run) })
           insertMessage(database, assistantMessage, assistantBlocks)
           database.prepare('INSERT INTO media_generation_jobs (id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id, status, parameters_json, next_poll_at, poll_attempts, error_code, asset_id, created_at, updated_at, ended_at) VALUES (@id, @conversationId, @assistantMessageId, @provider, @model, @kind, @providerJobId, @status, @parametersJson, @nextPollAt, @pollAttempts, NULL, NULL, @createdAt, @updatedAt, NULL)').run({
             ...job,
@@ -1581,8 +1814,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
     },
     chatRuns: {
       insert(value) {
-        transaction(database, () => database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, @generationId, @inputTokens, @outputTokens, @costUsd, @errorCode, @startedAt, @endedAt)').run({
-          generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
+        transaction(database, () => database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, @generationId, @inputTokens, @outputTokens, @costUsd, @errorCode, @startedAt, @endedAt)').run({
+          generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value, ...chatRunOwnership(value),
         }))
         return value
       },
@@ -1591,13 +1824,21 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => {
           const assistantBlocks = validateMediaGenerationTurn(database, value)
           insertMessageWithAssets(database, userMessage, userAssetIds)
-          database.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run(run)
+          database.prepare('INSERT INTO chat_runs (id, conversation_id, user_id, provider, request_id, model, status, generation_id, input_tokens, output_tokens, cost_usd, error_code, started_at, ended_at) VALUES (@id, @conversationId, @userId, @provider, @requestId, @model, @status, NULL, NULL, NULL, NULL, NULL, @startedAt, NULL)').run({ ...run, ...chatRunOwnership(run) })
           insertMessage(database, assistantMessage, assistantBlocks)
         })
       },
-      get: (id) => one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id }),
+      get: (id) => {
+        const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        return row === undefined ? undefined : chatRunFromRow(row)
+      },
+      getByRequestId: (requestId) => {
+        const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE request_id = @requestId`, { requestId })
+        return row === undefined ? undefined : chatRunFromRow(row)
+      },
       summarizeTokenUsage(input) {
         const query = {
+          userId: input.userId,
           yesterdayStartedAt: safeTokenCount(input.yesterdayStartedAt),
           todayStartedAt: safeTokenCount(input.todayStartedAt),
           weekStartedAt: safeTokenCount(input.weekStartedAt),
@@ -1608,20 +1849,22 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           const first = one<{ startedAt: number | null }>(database, `
             SELECT MIN(started_at) AS startedAt
             FROM chat_runs
-            WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+            WHERE user_id = @userId
+              AND provider IS NOT NULL
+              AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
               AND started_at < @endedAt
-          `, { endedAt: query.endedAt })
+          `, { userId: query.userId, endedAt: query.endedAt })
           const allTimeStartedAt = first?.startedAt === null || first?.startedAt === undefined
             ? undefined
             : safeTokenCount(first.startedAt)
           const allTimeStart = allTimeStartedAt ?? query.endedAt
           return {
             ...(allTimeStartedAt === undefined ? {} : { allTimeStartedAt }),
-            today: summarizeTokenUsagePeriod(database, query.todayStartedAt, query.endedAt, 'hour'),
-            yesterday: summarizeTokenUsagePeriod(database, query.yesterdayStartedAt, query.todayStartedAt, 'hour'),
-            week: summarizeTokenUsagePeriod(database, query.weekStartedAt, query.endedAt, 'day'),
-            month: summarizeTokenUsagePeriod(database, query.monthStartedAt, query.endedAt, 'day'),
-            allTime: summarizeTokenUsagePeriod(database, allTimeStart, query.endedAt, 'month'),
+            today: summarizeTokenUsagePeriod(database, query.userId, query.todayStartedAt, query.endedAt, 'hour'),
+            yesterday: summarizeTokenUsagePeriod(database, query.userId, query.yesterdayStartedAt, query.todayStartedAt, 'hour'),
+            week: summarizeTokenUsagePeriod(database, query.userId, query.weekStartedAt, query.endedAt, 'day'),
+            month: summarizeTokenUsagePeriod(database, query.userId, query.monthStartedAt, query.endedAt, 'day'),
+            allTime: summarizeTokenUsagePeriod(database, query.userId, allTimeStart, query.endedAt, 'month'),
           }
         })()
       },
@@ -1629,7 +1872,8 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         transaction(database, () => database.prepare('UPDATE chat_runs SET status = COALESCE(@status, status), generation_id = COALESCE(@generationId, generation_id), input_tokens = COALESCE(@inputTokens, input_tokens), output_tokens = COALESCE(@outputTokens, output_tokens), cost_usd = COALESCE(@costUsd, cost_usd), error_code = COALESCE(@errorCode, error_code), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
           id, status: null, generationId: null, inputTokens: null, outputTokens: null, costUsd: null, errorCode: null, endedAt: null, ...value,
         }))
-        return one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        const row = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+        return row === undefined ? undefined : chatRunFromRow(row)
       },
       finalizeWithMessage(id, messageId, requestId, value) {
         const blocks = chatBlockSchema.array().parse(value.blocks)
@@ -1639,12 +1883,13 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             id: messageId,
           })
           if (!messageRow || messageRow.role !== 'assistant') throw new Error('Assistant message not found')
-          const runRow = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          const runRow = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          const chatRun = runRow === undefined ? undefined : chatRunFromRow(runRow)
           if (
-            !runRow
-            || runRow.conversationId !== messageRow.conversationId
-            || runRow.requestId !== requestId
-            || runRow.status !== 'running'
+            !chatRun
+            || chatRun.conversationId !== messageRow.conversationId
+            || chatRun.requestId !== requestId
+            || chatRun.status !== 'running'
           ) {
             throw new Error('Chat run does not belong to the assistant conversation')
           }
@@ -1698,7 +1943,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               messageRow.conversationId as string,
               previous,
               block,
-              { requestId, model: runRow.model },
+              { requestId, model: chatRun.model },
             )
           }
           const message = database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @messageId').run({
@@ -1717,9 +1962,226 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             endedAt: value.endedAt,
           })
           if (run.changes !== 1) throw new Error('Chat run not found')
-          const stored = one<ChatRun>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
-          if (!stored) throw new Error('Chat run not found')
+          const storedRow = one<Query>(database, `SELECT ${chatRunColumns} FROM chat_runs WHERE id = @id`, { id })
+          if (!storedRow) throw new Error('Chat run not found')
+          return chatRunFromRow(storedRow)
+        })
+      },
+    },
+    providerUsage: {
+      find(operationKey) {
+        const row = one<Query>(database, `
+          SELECT ${providerUsageColumns}
+          FROM provider_usage_events
+          WHERE operation_key = @operationKey
+        `, { operationKey })
+        return row === undefined ? undefined : providerUsageFromRow(row)
+      },
+      start(event) {
+        return transaction(database, () => {
+          const idOwner = one<{ operationKey: string }>(database, `
+            SELECT operation_key AS operationKey
+            FROM provider_usage_events
+            WHERE id = @id
+          `, { id: event.id })
+          if (idOwner && idOwner.operationKey !== event.operationKey) {
+            throw providerUsageConsistencyError()
+          }
+          database.prepare(`
+            INSERT INTO provider_usage_events (
+              id, operation_key, user_id, provider, api_key_fingerprint, request_id,
+              chat_run_id, model, modality, status, started_at
+            ) VALUES (
+              @id, @operationKey, @userId, @provider, @apiKeyFingerprint, @requestId,
+              @chatRunId, @model, @modality, 'pending', @startedAt
+            )
+            ON CONFLICT(operation_key) DO NOTHING
+          `).run({
+            ...event,
+            apiKeyFingerprint: event.apiKeyFingerprint ?? null,
+            chatRunId: event.chatRunId ?? null,
+          })
+          const stored = getProviderUsage(database, event.operationKey)
+          if (!sameProviderUsageStart(stored, event)) throw providerUsageConsistencyError()
           return stored
+        })
+      },
+      bindIdentity(operationKey, identity) {
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (
+            identity.generationId !== undefined
+            && stored.generationId !== undefined
+            && stored.generationId !== identity.generationId
+          ) throw providerUsageConsistencyError()
+          if (
+            identity.providerJobId !== undefined
+            && stored.providerJobId !== undefined
+            && stored.providerJobId !== identity.providerJobId
+          ) throw providerUsageConsistencyError()
+          if (identity.generationId !== undefined && stored.generationId === undefined) {
+            const owner = one<{ operationKey: string }>(database, `
+              SELECT operation_key AS operationKey
+              FROM provider_usage_events
+              WHERE generation_id = @generationId
+            `, { generationId: identity.generationId })
+            if (owner && owner.operationKey !== operationKey) throw providerUsageConsistencyError()
+          }
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET generation_id = @generationId, provider_job_id = @providerJobId
+            WHERE operation_key = @operationKey
+          `).run({
+            operationKey,
+            generationId: identity.generationId ?? stored.generationId ?? null,
+            providerJobId: identity.providerJobId ?? stored.providerJobId ?? null,
+          })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      report(operationKey, report) {
+        const costUsd = normalizeUsd(report.costUsd)
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (stored.status === 'reported') {
+            if (
+              (report.generationId !== undefined && report.generationId !== stored.generationId)
+              || (report.providerJobId !== undefined && report.providerJobId !== stored.providerJobId)
+              || stored.inputTokens !== report.inputTokens
+              || stored.outputTokens !== report.outputTokens
+              || stored.costUsd !== costUsd
+            ) throw providerUsageConsistencyError()
+            return stored
+          }
+          if (
+            report.generationId !== undefined
+            && stored.generationId !== undefined
+            && stored.generationId !== report.generationId
+          ) throw providerUsageConsistencyError()
+          if (
+            report.providerJobId !== undefined
+            && stored.providerJobId !== undefined
+            && stored.providerJobId !== report.providerJobId
+          ) throw providerUsageConsistencyError()
+          if (report.generationId !== undefined && stored.generationId === undefined) {
+            const owner = one<{ operationKey: string }>(database, `
+              SELECT operation_key AS operationKey
+              FROM provider_usage_events
+              WHERE generation_id = @generationId
+            `, { generationId: report.generationId })
+            if (owner && owner.operationKey !== operationKey) throw providerUsageConsistencyError()
+          }
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET generation_id = @generationId,
+                provider_job_id = @providerJobId,
+                status = 'reported',
+                input_tokens = @inputTokens,
+                output_tokens = @outputTokens,
+                cost_usd = @costUsd,
+                next_reconcile_at = NULL,
+                ended_at = @endedAt
+            WHERE operation_key = @operationKey
+          `).run({
+            operationKey,
+            generationId: report.generationId ?? stored.generationId ?? null,
+            providerJobId: report.providerJobId ?? stored.providerJobId ?? null,
+            inputTokens: report.inputTokens ?? null,
+            outputTokens: report.outputTokens ?? null,
+            costUsd,
+            endedAt: report.endedAt,
+          })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      markUnknown(operationKey, endedAt) {
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (stored.status === 'reported') return stored
+          if (stored.status === 'unknown') return stored
+          const terminalAt = stored.endedAt ?? endedAt
+          const nextReconcileAt = stored.provider === 'openrouter' && stored.generationId !== undefined
+            ? terminalAt + 1_000
+            : null
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET status = 'unknown', ended_at = @endedAt, next_reconcile_at = @nextReconcileAt
+            WHERE operation_key = @operationKey AND status = 'pending'
+          `).run({ operationKey, endedAt: terminalAt, nextReconcileAt })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      recoverPending(recoveredAt) {
+        return transaction(database, () => database.prepare(`
+          UPDATE provider_usage_events
+          SET status = 'unknown',
+              ended_at = COALESCE(ended_at, @recoveredAt),
+              next_reconcile_at = CASE
+                WHEN provider = 'openrouter' AND generation_id IS NOT NULL THEN @nextReconcileAt
+                ELSE NULL
+              END
+          WHERE status = 'pending'
+        `).run({ recoveredAt, nextReconcileAt: recoveredAt + 1_000 }).changes)
+      },
+      listReconcilable(reconcileAt) {
+        return many<Query>(database, `
+          SELECT ${providerUsageColumns}
+          FROM provider_usage_events
+          WHERE provider = 'openrouter'
+            AND status = 'unknown'
+            AND generation_id IS NOT NULL
+            AND reconcile_attempts < 3
+            AND next_reconcile_at IS NOT NULL
+            AND next_reconcile_at <= @reconcileAt
+          ORDER BY next_reconcile_at, started_at, id
+        `, { reconcileAt }).map(providerUsageFromRow)
+      },
+      recordReconcileFailure(operationKey, nextReconcileAt) {
+        return transaction(database, () => {
+          const stored = getProviderUsage(database, operationKey)
+          if (stored.status !== 'unknown') throw providerUsageConsistencyError()
+          const reconcileAttempts = stored.reconcileAttempts + 1
+          database.prepare(`
+            UPDATE provider_usage_events
+            SET reconcile_attempts = @reconcileAttempts,
+                next_reconcile_at = @nextReconcileAt
+            WHERE operation_key = @operationKey AND status = 'unknown'
+          `).run({
+            operationKey,
+            reconcileAttempts,
+            nextReconcileAt: reconcileAttempts >= 3 ? null : nextReconcileAt ?? null,
+          })
+          return getProviderUsage(database, operationKey)
+        })
+      },
+      summarize(input) {
+        const query = {
+          userId: input.userId,
+          yesterdayStartedAt: safeTokenCount(input.yesterdayStartedAt),
+          todayStartedAt: safeTokenCount(input.todayStartedAt),
+          weekStartedAt: safeTokenCount(input.weekStartedAt),
+          monthStartedAt: safeTokenCount(input.monthStartedAt),
+          endedAt: safeTokenCount(input.endedAt),
+        }
+        return transaction(database, (): ProviderCostSnapshotRecord => {
+          const rows = many<ProviderCostRow>(database, `
+            SELECT provider, model, status, cost_usd AS costUsd, started_at AS startedAt
+            FROM provider_usage_events
+            WHERE user_id = @userId
+              AND provider = 'openrouter'
+              AND started_at < @endedAt
+            ORDER BY started_at, id
+          `, { userId: query.userId, endedAt: query.endedAt })
+          const allTimeStartedAt = rows[0]?.startedAt
+          const allTimeStart = allTimeStartedAt ?? query.endedAt
+          return {
+            ...(allTimeStartedAt === undefined ? {} : { allTimeStartedAt }),
+            today: summarizeProviderCostPeriod(rows, query.todayStartedAt, query.endedAt),
+            yesterday: summarizeProviderCostPeriod(rows, query.yesterdayStartedAt, query.todayStartedAt),
+            week: summarizeProviderCostPeriod(rows, query.weekStartedAt, query.endedAt),
+            month: summarizeProviderCostPeriod(rows, query.monthStartedAt, query.endedAt),
+            allTime: summarizeProviderCostPeriod(rows, allTimeStart, query.endedAt),
+          }
         })
       },
     },
