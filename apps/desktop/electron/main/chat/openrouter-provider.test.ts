@@ -45,6 +45,19 @@ function abortingSlowJsonResponse(
   return { response, wasCancelled: () => cancelled }
 }
 
+function abortablePendingFetch() {
+  return vi.fn((_input: string | URL | Request, init?: RequestInit) => (
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal
+      if (signal?.aborted) {
+        reject(signal.reason)
+        return
+      }
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+    })
+  ))
+}
+
 async function collect(stream: AsyncIterable<OpenRouterStreamEvent>) {
   const values: OpenRouterStreamEvent[] = []
   for await (const value of stream) values.push(value)
@@ -1139,6 +1152,57 @@ describe('OpenRouterProvider', () => {
     expect(sleep).not.toHaveBeenCalled()
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('RAW_PROVIDER_BODY')
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
+  })
+
+  it('times out one hanging paid image POST after 120 seconds without retrying', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetch = abortablePendingFetch()
+      const provider = new OpenRouterProvider({ credential, fetch })
+      const result = provider.generateImage({
+        model: 'bytedance-seed/seedream-4.5',
+        prompt: 'draw',
+        options: { count: 1, resolution: '1K', aspectRatio: '16:9', format: 'png' },
+        parameterSupport: { resolution: true, aspectRatio: true, outputFormat: false },
+        references: [],
+      }).then(() => undefined, (error: unknown) => error)
+
+      await vi.advanceTimersByTimeAsync(119_999)
+      expect(fetch).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+
+      await expect(result).resolves.toMatchObject({ code: 'MODEL_PROVIDER_TIMEOUT' })
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps user cancellation authoritative before the image deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const controller = new AbortController()
+      const fetch = abortablePendingFetch()
+      const provider = new OpenRouterProvider({ credential, fetch })
+      const result = provider.generateImage({
+        model: 'bytedance-seed/seedream-4.5',
+        prompt: 'draw',
+        options: { count: 1, resolution: '1K', aspectRatio: '16:9', format: 'png' },
+        parameterSupport: { resolution: true, aspectRatio: true, outputFormat: false },
+        references: [],
+        signal: controller.signal,
+      }).then(() => undefined, (error: unknown) => error)
+
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
+      controller.abort()
+
+      await expect(result).resolves.toMatchObject({ code: 'CANCELLED' })
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('returns CANCELLED when a paid image diagnostic aborts after HTTP 503', async () => {

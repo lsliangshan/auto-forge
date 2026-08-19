@@ -32,6 +32,7 @@ const GENERATION_ENDPOINT = 'https://openrouter.ai/api/v1/generation'
 const APP_REFERER = 'https://autoforge.bjqisi.cn'
 const APP_TITLE = 'AutoForge'
 const MAX_MEDIA_JSON_BODY = 32 * 1024 * 1024
+const IMAGE_REQUEST_TIMEOUT_MS = 120_000
 const MAX_REFERENCE_COUNT = 5
 const MAX_IMAGE_BASE64_LENGTH = Math.ceil((20 * 1024 * 1024) / 3) * 4
 const MAX_PROMPT_LENGTH = 1_000_000
@@ -191,6 +192,26 @@ const generationUsageSchema = z.object({
 
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
+}
+
+async function withImageRequestDeadline<T>(
+  callerSignal: AbortSignal | undefined,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const deadline = new AbortController()
+  const timer = setTimeout(() => deadline.abort(), IMAGE_REQUEST_TIMEOUT_MS)
+  const signal = callerSignal
+    ? AbortSignal.any([callerSignal, deadline.signal])
+    : deadline.signal
+  try {
+    return await operation(signal)
+  } catch (error) {
+    if (callerSignal?.aborted) throw failure('CANCELLED')
+    if (deadline.signal.aborted) throw failure('MODEL_PROVIDER_TIMEOUT')
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function safeTokenCount(value: unknown): number | undefined {
@@ -363,67 +384,69 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
 
   async generateImage(request: ModelImageRequest): Promise<ModelImageResult> {
     const parsedRequest = parsedImageRequest(request)
-    const response = await this.authenticatedFetch(
-      IMAGE_ENDPOINT,
-      'image',
-      parsedRequest.signal,
-      () => {
-        const inputReferences = wireReferences(parsedRequest.references)
-        return {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            model: parsedRequest.model,
-            prompt: parsedRequest.prompt,
-            n: 1,
-            ...(parsedRequest.parameterSupport.resolution
-              ? { resolution: parsedRequest.options.resolution }
-              : {}),
-            ...(parsedRequest.parameterSupport.aspectRatio && parsedRequest.options.aspectRatio !== 'auto'
-              ? { aspect_ratio: parsedRequest.options.aspectRatio }
-              : {}),
-            ...(parsedRequest.parameterSupport.outputFormat
-              ? { output_format: parsedRequest.options.format }
-              : {}),
-            ...(inputReferences.length ? { input_references: inputReferences } : {}),
-          }),
+    return withImageRequestDeadline(parsedRequest.signal, async (signal) => {
+      const response = await this.authenticatedFetch(
+        IMAGE_ENDPOINT,
+        'image',
+        signal,
+        () => {
+          const inputReferences = wireReferences(parsedRequest.references)
+          return {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: parsedRequest.model,
+              prompt: parsedRequest.prompt,
+              n: 1,
+              ...(parsedRequest.parameterSupport.resolution
+                ? { resolution: parsedRequest.options.resolution }
+                : {}),
+              ...(parsedRequest.parameterSupport.aspectRatio && parsedRequest.options.aspectRatio !== 'auto'
+                ? { aspect_ratio: parsedRequest.options.aspectRatio }
+                : {}),
+              ...(parsedRequest.parameterSupport.outputFormat
+                ? { output_format: parsedRequest.options.format }
+                : {}),
+              ...(inputReferences.length ? { input_references: inputReferences } : {}),
+            }),
+          }
+        },
+        { retry: 'never' },
+      )
+      const parsed = imageResponseSchema.safeParse(
+        await this.boundedJson(response, MAX_MEDIA_JSON_BODY, signal),
+      )
+      if (!parsed.success) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
+      const outputs: ModelImageResult['outputs'] = parsed.data.data.map((output) => {
+        if (output.b64_json !== undefined) {
+          return {
+            type: 'base64',
+            dataBase64: output.b64_json,
+            ...(output.media_type === undefined ? {} : { mimeType: output.media_type }),
+          }
         }
-      },
-      { retry: 'never' },
-    )
-    const parsed = imageResponseSchema.safeParse(
-      await this.boundedJson(response, MAX_MEDIA_JSON_BODY, parsedRequest.signal),
-    )
-    if (!parsed.success) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
-    const outputs: ModelImageResult['outputs'] = parsed.data.data.map((output) => {
-      if (output.b64_json !== undefined) {
-        return {
-          type: 'base64',
-          dataBase64: output.b64_json,
-          ...(output.media_type === undefined ? {} : { mimeType: output.media_type }),
-        }
+        return { type: 'url', url: canonicalHttpsUrl(output.url!) }
+      })
+      const inputTokens = safeTokenCount(parsed.data.usage?.prompt_tokens)
+      const outputTokens = safeTokenCount(parsed.data.usage?.completion_tokens)
+      const usage = parsed.data.usage
+        ? {
+            ...(inputTokens === undefined
+              ? {}
+              : { inputTokens }),
+            ...(outputTokens === undefined
+              ? {}
+              : { outputTokens }),
+            ...(parsed.data.usage.cost === undefined
+              ? {}
+              : { costUsd: String(parsed.data.usage.cost) }),
+          }
+        : undefined
+      return {
+        outputs,
+        ...(usage && Object.keys(usage).length ? { usage } : {}),
       }
-      return { type: 'url', url: canonicalHttpsUrl(output.url!) }
     })
-    const inputTokens = safeTokenCount(parsed.data.usage?.prompt_tokens)
-    const outputTokens = safeTokenCount(parsed.data.usage?.completion_tokens)
-    const usage = parsed.data.usage
-      ? {
-          ...(inputTokens === undefined
-            ? {}
-            : { inputTokens }),
-          ...(outputTokens === undefined
-            ? {}
-            : { outputTokens }),
-          ...(parsed.data.usage.cost === undefined
-            ? {}
-            : { costUsd: String(parsed.data.usage.cost) }),
-        }
-      : undefined
-    return {
-      outputs,
-      ...(usage && Object.keys(usage).length ? { usage } : {}),
-    }
   }
 
   async submitVideo(
