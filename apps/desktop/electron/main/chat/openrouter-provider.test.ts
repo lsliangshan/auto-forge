@@ -1045,6 +1045,32 @@ describe('OpenRouterProvider', () => {
   })
 
   it.each([
+    ['uses a valid provider code before HTTP status', 400, 429, 'MODEL_PROVIDER_RATE_LIMITED'],
+    ['falls back to HTTP status for an invalid provider code', 503, 'not-a-number', 'MODEL_PROVIDER_UNAVAILABLE'],
+  ] as const)('%s', async (_description, status, providerCode, code) => {
+    const fetch = vi.fn(async () => Response.json({
+      error: {
+        code: providerCode,
+        message: 'RAW_PROVIDER_MESSAGE',
+        metadata: { error_type: 'upstream_error' },
+      },
+    }, { status }))
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    const error = await provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    }).then(() => undefined, (error: unknown) => error)
+
+    expect(error).toMatchObject({ code })
+    expect(JSON.stringify(error)).not.toContain('RAW_PROVIDER_MESSAGE')
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
     ['payment_required', 'MODEL_PROVIDER_PAYMENT_REQUIRED'],
     ['rate_limit_exceeded', 'MODEL_PROVIDER_RATE_LIMITED'],
     ['timeout', 'MODEL_PROVIDER_TIMEOUT'],
