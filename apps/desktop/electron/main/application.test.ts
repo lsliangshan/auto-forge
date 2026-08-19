@@ -1491,7 +1491,13 @@ describe('createApplicationRuntime', () => {
 
     expect(networkProxy.fetch).toHaveBeenCalledWith(
       'https://openrouter.ai/api/v1/models',
-      expect.objectContaining({ headers: { authorization: 'Bearer sk-openrouter' } }),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          authorization: 'Bearer sk-openrouter',
+          'http-referer': 'https://autoforge.bjqisi.cn',
+          'x-openrouter-title': 'AutoForge',
+        }),
+      }),
     )
     expect(networkProxy.fetch).toHaveBeenCalledWith(
       'https://api.deepseek.com/models',

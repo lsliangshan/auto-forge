@@ -68,6 +68,86 @@ const allImageParameters = {
 } as const
 
 describe('OpenRouterProvider', () => {
+  it('adds app attribution headers to every OpenRouter request', async () => {
+    const requestHeaders: Headers[] = []
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requestHeaders.push(new Headers(init?.headers))
+      if (url.endsWith('/models')) return Response.json({ data: [] })
+      if (url.endsWith('/chat/completions')) return sseResponse(['data: [DONE]\n\n'])
+      if (url.endsWith('/images')) {
+        return Response.json({ data: [{ b64_json: 'AQID', media_type: 'image/png' }] })
+      }
+      if (url.endsWith('/videos')) return Response.json({ id: 'job_1', status: 'pending' })
+      if (url.endsWith('/videos/job_1')) {
+        return Response.json({ id: 'job_1', status: 'completed', generation_id: 'gen_1' })
+      }
+      if (url.endsWith('/videos/job_1/content?index=0')) return new Response('video')
+      if (url.endsWith('/generation?id=gen_1')) {
+        return Response.json({ data: { id: 'gen_1', total_cost: '0.25' } })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+
+    await provider.listModels()
+    await provider.validateCredential()
+    await collect(provider.stream({ model: 'text/model', messages: [] }))
+    await provider.generateImage({
+      model: 'image/model',
+      prompt: 'draw',
+      options: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+      parameterSupport: allImageParameters,
+      references: [],
+    })
+    await provider.submitVideo({
+      model: 'video/model',
+      prompt: 'animate',
+      options: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      references: [],
+      frameImages: [],
+    })
+    await provider.pollVideo('job_1')
+    await provider.downloadVideo('job_1')
+    await provider.getGenerationUsage('gen_1')
+
+    expect(requestHeaders).toHaveLength(10)
+    expect(requestHeaders.every((headers) => (
+      headers.get('HTTP-Referer') === 'https://autoforge.bjqisi.cn'
+      && headers.get('X-OpenRouter-Title') === 'AutoForge'
+    ))).toBe(true)
+  })
+
+  it('preserves headers carried by a Request input while adding app attribution', async () => {
+    class RequestInputProvider extends OpenRouterProvider {
+      request(input: Request): Promise<Response> {
+        return this.fetch(input)
+      }
+    }
+    const sentHeaders: Headers[] = []
+    const provider = new RequestInputProvider({
+      credential,
+      fetch: vi.fn(async (_input, init) => {
+        sentHeaders.push(new Headers(init?.headers))
+        return new Response()
+      }),
+    })
+
+    await provider.request(new Request('https://openrouter.ai/api/v1/models', {
+      headers: {
+        authorization: 'Bearer existing',
+        'content-type': 'application/json',
+      },
+    }))
+
+    expect(Object.fromEntries(sentHeaders[0]!.entries())).toEqual({
+      authorization: 'Bearer existing',
+      'content-type': 'application/json',
+      'http-referer': 'https://autoforge.bjqisi.cn',
+      'x-openrouter-title': 'AutoForge',
+    })
+  })
+
   it('keeps every operation on the credential captured by its snapshot', async () => {
     let apiKey = 'sk-openrouter-snapshot-a'
     const localCredential = { get: vi.fn(async () => apiKey) }

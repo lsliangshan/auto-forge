@@ -29,6 +29,8 @@ const VIDEO_MODELS_ENDPOINT = 'https://openrouter.ai/api/v1/videos/models'
 const IMAGE_ENDPOINT = 'https://openrouter.ai/api/v1/images'
 const VIDEO_ENDPOINT = 'https://openrouter.ai/api/v1/videos'
 const GENERATION_ENDPOINT = 'https://openrouter.ai/api/v1/generation'
+const APP_REFERER = 'https://autoforge.bjqisi.cn'
+const APP_TITLE = 'AutoForge'
 const MAX_MEDIA_JSON_BODY = 32 * 1024 * 1024
 const MAX_REFERENCE_COUNT = 5
 const MAX_IMAGE_BASE64_LENGTH = Math.ceil((20 * 1024 * 1024) / 3) * 4
@@ -36,6 +38,20 @@ const MAX_PROMPT_LENGTH = 1_000_000
 const MAX_OPTION_LENGTH = 128
 
 type ProviderFetch = NonNullable<OpenAiCompatibleProviderDependencies['fetch']>
+
+function withOpenRouterAppAttribution(fetch: ProviderFetch): ProviderFetch {
+  return async (input, init) => {
+    const headers = new Headers(
+      init?.headers ?? (input instanceof Request ? input.headers : undefined),
+    )
+    headers.set('HTTP-Referer', APP_REFERER)
+    headers.set('X-OpenRouter-Title', APP_TITLE)
+    return fetch(input, {
+      ...init,
+      headers: Object.fromEntries(headers.entries()),
+    })
+  }
+}
 
 function releaseUnauthorizedResponse(fetch: ProviderFetch): ProviderFetch {
   return async (input, init) => {
@@ -282,7 +298,9 @@ export class OpenRouterProvider extends OpenAiCompatibleProvider {
   private readonly snapshotDependencies: OpenRouterProviderDependencies
 
   constructor(dependencies: OpenRouterProviderDependencies) {
-    const fetch = releaseUnauthorizedResponse(dependencies.fetch ?? globalThis.fetch)
+    const fetch = releaseUnauthorizedResponse(withOpenRouterAppAttribution(
+      dependencies.fetch ?? globalThis.fetch,
+    ))
     super({
       chatEndpoint: CHAT_ENDPOINT,
       modelsEndpoint: MODELS_ENDPOINT,
