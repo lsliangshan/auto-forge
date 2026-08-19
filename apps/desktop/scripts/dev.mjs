@@ -26,6 +26,7 @@ export async function runElectronViteDev({
       env: environment,
       stdio: 'inherit',
     })
+    let interruptReceived = false
     let interrupted = false
     let settled = false
     const cleanup = () => {
@@ -33,7 +34,8 @@ export async function runElectronViteDev({
       signals.removeListener('SIGTERM', onSigterm)
     }
     const interrupt = (signal) => {
-      if (interrupted || settled) return
+      if (interruptReceived || settled) return
+      interruptReceived = true
       try {
         interrupted = child.kill(platform === 'win32' ? 'SIGTERM' : signal)
       } catch {

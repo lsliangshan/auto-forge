@@ -103,8 +103,11 @@ describe('development supervisor', () => {
     harness.child.kill.mockReturnValue(false)
     const status = supervisor.runElectronViteDev(harness.options)
     harness.signals.emit('SIGINT')
+    harness.signals.emit('SIGTERM')
+    harness.signals.emit('SIGINT')
     harness.child.emit('close', 7, null)
     await expect(status).resolves.toBe(7)
+    expect(harness.child.kill).toHaveBeenCalledTimes(1)
     expect(harness.child.kill).toHaveBeenCalledWith('SIGINT')
   })
 
