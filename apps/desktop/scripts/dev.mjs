@@ -34,8 +34,13 @@ export async function runElectronViteDev({
     }
     const interrupt = (signal) => {
       if (interrupted || settled) return
-      interrupted = true
-      child.kill(platform === 'win32' ? 'SIGTERM' : signal)
+      try {
+        interrupted = child.kill(platform === 'win32' ? 'SIGTERM' : signal)
+      } catch {
+        settled = true
+        cleanup()
+        resolveStatus(1)
+      }
     }
     const onSigint = () => { interrupt('SIGINT') }
     const onSigterm = () => { interrupt('SIGTERM') }

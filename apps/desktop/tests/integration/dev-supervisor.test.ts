@@ -56,6 +56,20 @@ describe('development supervisor', () => {
     expect(harness.signals.listenerCount('SIGTERM')).toBe(0)
   })
 
+  it('forwards one termination signal and reports intentional shutdown as success', async () => {
+    const supervisor = await loadSupervisor()
+    const harness = createHarness()
+    const status = supervisor.runElectronViteDev(harness.options)
+    harness.signals.emit('SIGTERM')
+    harness.signals.emit('SIGTERM')
+    harness.child.emit('close', null, 'SIGTERM')
+    await expect(status).resolves.toBe(0)
+    expect(harness.child.kill).toHaveBeenCalledTimes(1)
+    expect(harness.child.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(harness.signals.listenerCount('SIGINT')).toBe(0)
+    expect(harness.signals.listenerCount('SIGTERM')).toBe(0)
+  })
+
   it('uses supported termination semantics on Windows', async () => {
     const supervisor = await loadSupervisor()
     const harness = createHarness('win32')
@@ -81,6 +95,28 @@ describe('development supervisor', () => {
         stdio: 'inherit',
       },
     )
+  })
+
+  it('preserves a nonzero close after signal forwarding fails', async () => {
+    const supervisor = await loadSupervisor()
+    const harness = createHarness()
+    harness.child.kill.mockReturnValue(false)
+    const status = supervisor.runElectronViteDev(harness.options)
+    harness.signals.emit('SIGINT')
+    harness.child.emit('close', 7, null)
+    await expect(status).resolves.toBe(7)
+    expect(harness.child.kill).toHaveBeenCalledWith('SIGINT')
+  })
+
+  it('reports failure and removes listeners when signal forwarding throws', async () => {
+    const supervisor = await loadSupervisor()
+    const harness = createHarness()
+    harness.child.kill.mockImplementation(() => { throw new Error('kill failed') })
+    const status = supervisor.runElectronViteDev(harness.options)
+    harness.signals.emit('SIGINT')
+    await expect(status).resolves.toBe(1)
+    expect(harness.signals.listenerCount('SIGINT')).toBe(0)
+    expect(harness.signals.listenerCount('SIGTERM')).toBe(0)
   })
 
   it('maps an unexpected signal to failure', async () => {
