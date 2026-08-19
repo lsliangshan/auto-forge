@@ -3,11 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { toSafeAppError } from '@autoforge/shared'
-import {
-  QiniuAvatarUploader,
-  readQiniuConfig,
-  type QiniuUploadPort,
-} from './avatar-uploader.js'
+import type { QiniuFileUploaderPort } from '../upload/qiniu-file-uploader.js'
+import { QiniuAvatarUploader } from './avatar-uploader.js'
 
 const directories: string[] = []
 
@@ -23,21 +20,19 @@ const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 const jpeg = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0])
 
 function harness(path?: string, uploadError?: Error) {
-  const upload: QiniuUploadPort = {
-    putFile: vi.fn(async ({ key }) => {
+  const upload: QiniuFileUploaderPort = {
+    uploadFile: vi.fn(async ({ key }) => {
       if (uploadError) throw uploadError
-      return { key }
+      return {
+        url: `https://cdn.example.com/autoforge/${key}`,
+        key: `autoforge/${key}`,
+        hash: 'hash',
+        bucket: 'bucket',
+      }
     }),
   }
   const uploader = new QiniuAvatarUploader({
     chooseAvatar: vi.fn(async () => path),
-    config: () => ({
-      accessKey: 'access',
-      secretKey: 'secret',
-      bucket: 'bucket',
-      domain: 'https://cdn.example.com',
-      region: 'z0',
-    }),
     upload,
     createId: () => 'avatar-id',
   })
@@ -53,7 +48,7 @@ describe('QiniuAvatarUploader', () => {
     const app = harness()
 
     await expect(app.uploader.pickAndUpload('user_1')).resolves.toBeNull()
-    expect(app.upload.putFile).not.toHaveBeenCalled()
+    expect(app.upload.uploadFile).not.toHaveBeenCalled()
   })
 
   it('uploads a sniffed image under a random user-scoped key', async () => {
@@ -61,15 +56,11 @@ describe('QiniuAvatarUploader', () => {
     const app = harness(path)
 
     await expect(app.uploader.pickAndUpload('user_1')).resolves.toEqual({
-      url: 'https://cdn.example.com/profiles/user_1/avatar-id.png',
+      url: 'https://cdn.example.com/autoforge/profiles/user_1/avatar-id.png',
     })
-    expect(app.upload.putFile).toHaveBeenCalledWith({
-      accessKey: 'access',
-      secretKey: 'secret',
-      bucket: 'bucket',
-      region: 'z0',
+    expect(app.upload.uploadFile).toHaveBeenCalledWith({
       key: 'profiles/user_1/avatar-id.png',
-      path,
+      localPath: path,
       mimeType: 'image/png',
     })
   })
@@ -79,17 +70,6 @@ describe('QiniuAvatarUploader', () => {
       .resolves.toMatchObject({ url: expect.stringMatching(/\.jpg$/) })
     await expect(harness(fixture('avatar.jpeg', jpeg)).uploader.pickAndUpload('user_1'))
       .resolves.toMatchObject({ url: expect.stringMatching(/\.jpg$/) })
-  })
-
-  it('rejects missing or invalid Qiniu configuration', () => {
-    expect(() => readQiniuConfig({})).toThrowError(expect.objectContaining({ code: 'CREDENTIAL_UNAVAILABLE' }))
-    expect(() => readQiniuConfig({
-      QINIU_ACCESS_KEY: 'access',
-      QINIU_SECRET_KEY: 'secret',
-      QINIU_BUCKET: 'bucket',
-      QINIU_DOMAIN: 'http://cdn.example.com',
-      QINIU_REGION: 'z0',
-    })).toThrowError(expect.objectContaining({ code: 'CREDENTIAL_INVALID' }))
   })
 
   it('rejects oversized, unsupported and mismatched image files', async () => {

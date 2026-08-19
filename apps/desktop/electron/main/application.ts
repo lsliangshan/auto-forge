@@ -61,8 +61,9 @@ import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
-import { QiniuAvatarUploader, readQiniuConfig } from './profile/avatar-uploader.js'
+import { QiniuAvatarUploader } from './profile/avatar-uploader.js'
 import { ProfileService } from './profile/profile-service.js'
+import { QiniuFileUploader, readQiniuConfig } from './upload/qiniu-file-uploader.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
@@ -321,9 +322,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
   const auth = new LocalAuthService(database.localAuth)
   const profiles = new ProfileService(auth, database.userProfiles)
+  const qiniuUploader = new QiniuFileUploader({
+    config: () => readQiniuConfig(options.qiniuEnv ?? process.env),
+  })
   const avatarUploader = new QiniuAvatarUploader({
     chooseAvatar: options.chooseAvatarFile ?? (async () => undefined),
-    config: () => readQiniuConfig(options.qiniuEnv ?? process.env),
+    upload: qiniuUploader,
   })
   const maintenance = new MaintenanceGate()
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
