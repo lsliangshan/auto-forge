@@ -6,7 +6,7 @@
   "main": "out/main/index.js",
   "scripts": {
     "predev": "pnpm prepare:native-electron",
-    "dev": "electron-vite dev",
+    "dev": "node scripts/dev.mjs",
     "build": "electron-vite build && tsup electron/workers/workflow-runner.ts --format cjs --platform node --out-dir out/workers --clean false",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
     "pretest": "pnpm prepare:native-electron",
