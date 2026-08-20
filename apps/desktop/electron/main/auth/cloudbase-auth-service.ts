@@ -30,6 +30,7 @@ interface PendingChallenge {
 
 interface CloudBaseUser {
   id: string
+  is_anonymous?: boolean
   user_metadata?: { nickname?: string }
   nickName?: string
   username?: string
@@ -113,6 +114,15 @@ function responseError(response: unknown): unknown | undefined {
   return isRecord(response) && response.error !== null ? response.error : undefined
 }
 
+function isAnonymousSession(response: unknown): boolean {
+  if (!isRecord(response) || !isRecord(response.data) || !isRecord(response.data.session)) {
+    return false
+  }
+  const sessionUser = isRecord(response.data.session.user) ? response.data.session.user : undefined
+  const responseUser = isRecord(response.data.user) ? response.data.user : undefined
+  return sessionUser?.is_anonymous === true || responseUser?.is_anonymous === true
+}
+
 function invalidStoredCredentials(error: unknown): boolean {
   const fields = stableErrorText(error)
   return fields !== undefined
@@ -139,6 +149,7 @@ function cloudBaseSession(response: unknown, allowMissing = false): CloudBaseSes
   if (!isRecord(response)) throw failure('INTERNAL_ERROR')
   if (response.error !== null) throw providerFailure(response.error)
   if (!isRecord(response.data)) throw failure('INTERNAL_ERROR')
+  if (isAnonymousSession(response)) throw failure('INTERNAL_ERROR')
   const { session, user } = response.data
   if (allowMissing && session === null && user === null) return null
   if (!isRecord(session)
@@ -349,6 +360,10 @@ export class CloudBaseAuthService implements AuthService {
       }
       throw providerFailure(currentError)
     }
+    if (isAnonymousSession(currentResponse)) {
+      this.deleteStoredSession()
+      return null
+    }
     const current = cloudBaseSession(currentResponse, true)
     if (current) {
       return this.persist(current, new Date(this.dependencies.now()).toISOString())
@@ -390,6 +405,10 @@ export class CloudBaseAuthService implements AuthService {
         return null
       }
       throw providerFailure(restoreError)
+    }
+    if (isAnonymousSession(restoredResponse)) {
+      this.deleteStoredSession()
+      return null
     }
     const restored = cloudBaseSession(restoredResponse, true)
     if (!restored) {

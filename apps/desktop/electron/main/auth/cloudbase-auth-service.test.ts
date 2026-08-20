@@ -39,6 +39,15 @@ function cloudSessionForUser(user: Record<string, unknown>): FakeCloudSession {
   }
 }
 
+function anonymousCloudSession(account = 'Alice_1'): FakeCloudSession {
+  const session = cloudSession(account, {
+    accessToken: 'provider-secret-access-token',
+    refreshToken: 'provider-secret-refresh-token',
+  })
+  session.user.is_anonymous = true
+  return session
+}
+
 function authResponse(session: FakeCloudSession = cloudSession()) {
   return {
     data: { session, user: session.user },
@@ -226,6 +235,31 @@ describe('CloudBaseAuthService', () => {
     })).rejects.toEqual(toSafeAppError({ code: 'INTERNAL_ERROR' }))
   })
 
+  it('rejects an anonymous password session without persisting provider tokens', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(anonymousCloudSession()))
+
+    await expect(app.service.loginWithPassword({
+      account: 'alice_1', password: 'password',
+    })).rejects.toEqual(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    expect(app.secrets.set).not.toHaveBeenCalled()
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+  })
+
+  it('rejects an anonymous OTP session without persisting provider tokens', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithOtp).mockResolvedValue(otpResponse(app.verifyOtp))
+    app.verifyOtp.mockResolvedValue(authResponse(anonymousCloudSession()))
+    const challenge = await app.service.sendOtp({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })
+
+    await expect(app.service.verifyOtp({ challengeId: challenge.challengeId, code: '123456' }))
+      .rejects.toEqual(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    expect(app.secrets.set).not.toHaveBeenCalled()
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+  })
+
   it('validates every public input before invoking CloudBase', async () => {
     const app = harness()
 
@@ -399,6 +433,19 @@ describe('CloudBaseAuthService', () => {
     })
   })
 
+  it('rejects a current anonymous SDK session without restoring or persisting credentials', async () => {
+    const app = harness()
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession).mockResolvedValue(authResponse(anonymousCloudSession()))
+
+    await expect(app.service.getSession()).resolves.toBeNull()
+    expect(app.secrets.delete).toHaveBeenCalledWith(SESSION_KEY)
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+    expect(app.secrets.set).not.toHaveBeenCalled()
+    expect(app.port.setSession).not.toHaveBeenCalled()
+    expect(app.port.refreshSession).not.toHaveBeenCalled()
+  })
+
   it('restores an encrypted session with setSession and persists rotated tokens', async () => {
     const app = harness()
     app.stored.set(SESSION_KEY, storedSession())
@@ -424,6 +471,34 @@ describe('CloudBaseAuthService', () => {
       authenticatedAt: '2026-08-17T00:00:00.000Z',
     })
   })
+
+  it('deletes encrypted credentials when restoration returns an anonymous session', async () => {
+    const app = harness()
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
+    vi.mocked(app.port.setSession).mockResolvedValue(authResponse(anonymousCloudSession()))
+
+    await expect(app.service.getSession()).resolves.toBeNull()
+    expect(app.secrets.delete).toHaveBeenCalledWith(SESSION_KEY)
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+    expect(app.secrets.set).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, false] as const)(
+    'accepts a restored session when is_anonymous is %s',
+    async (isAnonymous) => {
+      const app = harness()
+      const session = cloudSession('Restored User')
+      if (isAnonymous !== undefined) session.user.is_anonymous = isAnonymous
+      app.stored.set(SESSION_KEY, storedSession())
+      vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
+      vi.mocked(app.port.setSession).mockResolvedValue(authResponse(session))
+
+      await expect(app.service.getSession()).resolves.toMatchObject({
+        user: { id: 'cloud_uid', account: 'Restored User' },
+      })
+    },
+  )
 
   it('refreshes an expired encrypted session and persists its rotated refresh token', async () => {
     const app = harness()
