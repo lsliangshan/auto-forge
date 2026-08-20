@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from 'pinia'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus from 'element-plus'
@@ -86,7 +86,10 @@ async function mountAuthApp(path: string, api = createApi(), session: AuthSessio
 }
 
 beforeEach(() => setActivePinia(createPinia()))
-afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+afterEach(() => {
+  vi.useRealTimers()
+  Reflect.deleteProperty(window, 'autoForge')
+})
 
 describe('authentication store', () => {
   it('deduplicates concurrent session restoration', async () => {
@@ -548,11 +551,289 @@ describe('authentication pages', () => {
     expect(logo.attributes('src')).toContain('autoforge-logo.png')
   })
 
-  it('logs in with normalized credentials and returns to a safe target', async () => {
-    const { api, router, wrapper } = await mountAuthApp('/login?redirect=/settings')
+  it('prioritizes phone OTP, then email OTP, then username password login', async () => {
+    const { wrapper } = await mountAuthApp('/login')
 
-    expect(wrapper.find('[data-testid="login-form"]').exists()).toBe(true)
-    expect(wrapper.text()).toContain('登录 AutoForge')
+    const methods = wrapper.findAll('[data-testid^="login-method-"]')
+    expect(methods.map((item) => item.text())).toEqual(['手机号', '邮箱', '用户名密码'])
+    expect(wrapper.get('[data-testid="login-method-phone"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.find('[data-testid="login-phone"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="login-email"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="login-account"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('使用 AutoForge 云端账号继续。')
+    expect(wrapper.get('.auth-switch').text().replace(/\s+/g, '')).toBe('还没有云端账号？去注册')
+  })
+
+  it('validates phone and email destinations before sending an OTP', async () => {
+    const { api, wrapper } = await mountAuthApp('/login')
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('123')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    expect(api.auth.sendOtp).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toBe('请输入有效的手机号')
+
+    await wrapper.get('[data-testid="login-method-email"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="login-email"]').setValue('not-an-email')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    expect(api.auth.sendOtp).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toBe('请输入有效的邮箱地址')
+  })
+
+  it('sends phone OTP once and runs one 60-second countdown', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_phone', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue(' 18311032722 ')
+    void wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    void wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await flushPromises()
+
+    expect(api.auth.sendOtp).toHaveBeenCalledOnce()
+    expect(api.auth.sendOtp).toHaveBeenCalledWith({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('60 秒后重试')
+    expect(wrapper.get('[data-testid="login-send-code"]').attributes()).toHaveProperty('disabled')
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('59 秒后重试')
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(59_000)
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('发送验证码')
+    expect(wrapper.get('[data-testid="login-send-code"]').attributes()).not.toHaveProperty('disabled')
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('sends a normalized email OTP for the email method', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_email', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-method-email"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="login-email"]').setValue(' Alice@Example.COM ')
+    void wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    void wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledWith({
+      intent: 'login', channel: 'email', target: 'alice@example.com',
+    }))
+    await flushPromises()
+    expect(api.auth.sendOtp).toHaveBeenCalledOnce()
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('60 秒后重试')
+    wrapper.unmount()
+  })
+
+  it('verifies a six-digit OTP once and returns to the safe redirect', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    const { router, wrapper } = await mountAuthApp('/login?redirect=/settings', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+
+    await wrapper.get('[data-testid="login-code"]').setValue('123')
+    await wrapper.get('[data-testid="login-form"]').trigger('submit')
+    expect(api.auth.verifyOtp).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toBe('请输入 6 位验证码')
+
+    await wrapper.get('[data-testid="login-code"]').setValue('123456')
+    void wrapper.get('[data-testid="login-form"]').trigger('submit')
+    void wrapper.get('[data-testid="login-form"]').trigger('submit')
+    await vi.waitFor(() => expect(api.auth.verifyOtp).toHaveBeenCalledOnce())
+    expect(api.auth.verifyOtp).toHaveBeenCalledWith({ challengeId: 'challenge_1', code: '123456' })
+    expect(wrapper.get('[data-testid="login-method-phone"]').attributes()).toHaveProperty('disabled')
+    expect(wrapper.get('[data-testid="login-send-code"]').attributes()).toHaveProperty('disabled')
+
+    pendingVerification.resolve(authSession)
+    await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/settings'))
+  })
+
+  it('allows resending immediately after OTP verification fails', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    vi.mocked(api.auth.verifyOtp).mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_OTP' }))
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="login-code"]').setValue('123456')
+    await wrapper.get('[data-testid="login-form"]').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.get('[role="alert"]').text()).toBe('验证码错误，请重新发送后再试')
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('发送验证码')
+    expect(wrapper.get('[data-testid="login-send-code"]').attributes()).not.toHaveProperty('disabled')
+    wrapper.unmount()
+  })
+
+  it('verifies email OTP once and rejects an external redirect target', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_email', expiresIn: 300 })
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    const { router, wrapper } = await mountAuthApp('/login?redirect=//attacker.invalid', api)
+
+    await wrapper.get('[data-testid="login-method-email"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="login-email"]').setValue('alice@example.com')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+    await wrapper.get('[data-testid="login-code"]').setValue('654321')
+    void wrapper.get('[data-testid="login-form"]').trigger('submit')
+    void wrapper.get('[data-testid="login-form"]').trigger('submit')
+    await vi.waitFor(() => expect(api.auth.verifyOtp).toHaveBeenCalledOnce())
+    expect(api.auth.verifyOtp).toHaveBeenCalledWith({ challengeId: 'challenge_email', code: '654321' })
+
+    pendingVerification.resolve(authSession)
+    await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/chat'))
+  })
+
+  it('cancels and clears the OTP state when switching methods', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="login-code"]').setValue('bad')
+    await wrapper.get('[data-testid="login-form"]').trigger('submit')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="login-method-email"]').trigger('click')
+    await flushPromises()
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+    expect(wrapper.get('[data-testid="login-method-email"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.get('[data-testid="login-email"]').element).toHaveProperty('value', '')
+    expect(wrapper.get('[data-testid="login-code"]').element).toHaveProperty('value', '')
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('发送验证码')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('cancels a current challenge when its destination changes', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="login-code"]').setValue('123456')
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032723')
+    await flushPromises()
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+    expect(wrapper.get('[data-testid="login-code"]').element).toHaveProperty('value', '')
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('发送验证码')
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('cancels an OTP that resolves after its destination becomes stale', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    const pendingOtp = deferred<{ challengeId: string, expiresIn: number }>()
+    vi.mocked(api.auth.sendOtp).mockReturnValue(pendingOtp.promise)
+    const { pinia, wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    void wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032723')
+    pendingOtp.resolve({ challengeId: 'challenge_stale', expiresIn: 300 })
+    await flushPromises()
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_stale')
+    expect(useAuthStore(pinia).challenge).toBeNull()
+    expect(wrapper.get('[data-testid="login-send-code"]').text()).toBe('发送验证码')
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('does not show a stale send error after its destination changes', async () => {
+    const api = createApi()
+    const pendingOtp = deferred<{ challengeId: string, expiresIn: number }>()
+    vi.mocked(api.auth.sendOtp).mockReturnValue(pendingOtp.promise)
+    const { pinia, wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    void wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032723')
+    pendingOtp.reject(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    await flushPromises()
+
+    expect(useAuthStore(pinia).error).toBe('')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('keeps the last method selected while an earlier cancellation is pending', async () => {
+    const api = createApi()
+    const pendingCancellation = deferred<void>()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    vi.mocked(api.auth.cancelOtp)
+      .mockReturnValueOnce(pendingCancellation.promise)
+      .mockResolvedValue(undefined)
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+    void wrapper.get('[data-testid="login-method-email"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1'))
+    await wrapper.get('[data-testid="login-method-password"]').trigger('click')
+    await flushPromises()
+
+    pendingCancellation.resolve()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="login-method-password"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.find('[data-testid="login-email"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="login-account"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('cleans up its countdown and challenge when unmounted', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/login', api)
+
+    await wrapper.get('[data-testid="login-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="login-send-code"]').trigger('click')
+    await flushPromises()
+    expect(vi.getTimerCount()).toBe(1)
+
+    wrapper.unmount()
+    await flushPromises()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+  })
+
+  it('logs in once with normalized account credentials and returns to a safe target', async () => {
+    const api = createApi()
+    const pendingLogin = deferred<AuthSession>()
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(pendingLogin.promise)
+    const { router, wrapper } = await mountAuthApp('/login?redirect=/settings', api)
+
+    await wrapper.get('[data-testid="login-method-password"]').trigger('click')
+    await flushPromises()
     expect(wrapper.get('label[for="login-account"]').text()).toBe('账号')
     expect(wrapper.get('label[for="login-password"]').text()).toBe('密码')
     expect(wrapper.get('[data-testid="login-account"]').attributes('autocomplete')).toBe('username')
@@ -560,31 +841,35 @@ describe('authentication pages', () => {
 
     await wrapper.get('[data-testid="login-account"]').setValue(' Alice ')
     await wrapper.get('[data-testid="login-password"]').setValue('password')
-    await wrapper.get('[data-testid="login-form"]').trigger('submit')
+    void wrapper.get('[data-testid="login-form"]').trigger('submit')
+    void wrapper.get('[data-testid="login-form"]').trigger('submit')
+    await vi.waitFor(() => expect(api.auth.loginWithPassword).toHaveBeenCalledOnce())
+    expect(api.auth.loginWithPassword).toHaveBeenCalledWith({ account: 'Alice', password: 'password' })
 
-    await vi.waitFor(() => expect(api.auth.login).toHaveBeenCalledWith({ account: 'Alice', password: 'password' }))
+    pendingLogin.resolve(authSession)
     await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/settings'))
   })
 
-  it('validates login fields, maps credential errors and suppresses duplicate submission', async () => {
+  it('validates password credentials and shows only the public credential error', async () => {
     const api = createApi()
-    let rejectLogin!: (error: unknown) => void
-    vi.mocked(api.auth.login).mockReturnValue(new Promise((_resolve, reject) => { rejectLogin = reject }))
+    vi.mocked(api.auth.loginWithPassword).mockRejectedValue(
+      toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS', message: 'provider details' }),
+    )
     const { wrapper } = await mountAuthApp('/login', api)
 
+    await wrapper.get('[data-testid="login-method-password"]').trigger('click')
+    await flushPromises()
     await wrapper.get('[data-testid="login-account"]').setValue('bad account')
     await wrapper.get('[data-testid="login-password"]').setValue('short')
     await wrapper.get('[data-testid="login-form"]').trigger('submit')
-    expect(api.auth.login).not.toHaveBeenCalled()
-    expect(wrapper.get('[role="alert"]').text()).toContain('账号')
+    expect(api.auth.loginWithPassword).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toBe('账号需为 5–24 位字母、数字或下划线')
 
     await wrapper.get('[data-testid="login-account"]').setValue('Alice')
     await wrapper.get('[data-testid="login-password"]').setValue('password')
-    void wrapper.get('[data-testid="login-form"]').trigger('submit')
-    void wrapper.get('[data-testid="login-form"]').trigger('submit')
-    await vi.waitFor(() => expect(api.auth.login).toHaveBeenCalledTimes(1))
-    rejectLogin(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
-    await vi.waitFor(() => expect(wrapper.get('[role="alert"]').text()).toContain('账号或密码错误'))
+    await wrapper.get('[data-testid="login-form"]').trigger('submit')
+    await vi.waitFor(() => expect(wrapper.get('[role="alert"]').text()).toBe('账号或密码错误'))
+    expect(wrapper.get('[role="alert"]').text()).not.toContain('provider details')
   })
 
   it('registers after confirmation validation and enters chat', async () => {
