@@ -111,7 +111,6 @@ function createHarness(respond: (method: string, params?: unknown) => unknown = 
     enabled: true,
     proxyRules: 'http=http://127.0.0.1:7890;https=http://127.0.0.1:7890',
     bypassRules: '<local>',
-    playwrightArgs: [],
   }))
   const workspace = new ElectronBrowserWorkspace({
     BaseWindow: WindowConstructor as never,

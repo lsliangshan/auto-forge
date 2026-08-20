@@ -61,7 +61,7 @@ function createNetworkProxy() {
     transition,
     transitionOrFailClosed: transition,
     fetch: vi.fn(globalThis.fetch),
-    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
+    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>' })),
     withTransportLease,
   }
 }

@@ -14,7 +14,6 @@ export interface NetworkProxySnapshot {
   enabled: boolean
   proxyRules?: string
   bypassRules: string
-  playwrightArgs: string[]
 }
 
 export interface NetworkTransportSnapshot {
@@ -44,10 +43,6 @@ interface NetworkProxyConfig {
   settings: ProxySettings
 }
 
-function frozenArgs(args: string[]): string[] {
-  return Object.freeze([...args]) as string[]
-}
-
 function copyProxySettings(settings: ProxySettings): ProxySettings {
   return Object.freeze({
     ...settings,
@@ -59,7 +54,6 @@ export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
   const frozenSettings = copyProxySettings(settings)
   const bypassDomains = [...new Set(settings.bypassDomains)]
   const electronBypass = ['<local>', ...bypassDomains].join(',')
-  const chromiumBypass = ['<local>', ...bypassDomains].join(';')
 
   if (!settings.enabled) {
     return {
@@ -67,7 +61,6 @@ export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
       snapshot: {
         enabled: false,
         bypassRules: electronBypass,
-        playwrightArgs: frozenArgs(['--no-proxy-server']),
       },
       settings: frozenSettings,
     }
@@ -91,20 +84,13 @@ export function proxyConfigFor(settings: ProxySettings): NetworkProxyConfig {
       enabled: true,
       proxyRules: rules,
       bypassRules: electronBypass,
-      playwrightArgs: frozenArgs([
-        `--proxy-server=${rules}`,
-        `--proxy-bypass-list=${chromiumBypass}`,
-      ]),
     },
     settings: frozenSettings,
   }
 }
 
 function copySnapshot(snapshot: NetworkProxySnapshot): NetworkProxySnapshot {
-  return Object.freeze({
-    ...snapshot,
-    playwrightArgs: frozenArgs(snapshot.playwrightArgs),
-  })
+  return Object.freeze({ ...snapshot })
 }
 
 export class NetworkProxyService implements NetworkProxyPort {
