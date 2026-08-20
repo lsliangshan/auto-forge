@@ -52,8 +52,10 @@ function services(): DesktopIpcServices {
   return {
     auth: {
       getSession: vi.fn().mockResolvedValue(null),
-      login: vi.fn().mockResolvedValue(authSession),
-      register: vi.fn().mockResolvedValue(authSession),
+      sendOtp: vi.fn().mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 }),
+      verifyOtp: vi.fn().mockResolvedValue(authSession),
+      cancelOtp: vi.fn().mockResolvedValue(undefined),
+      loginWithPassword: vi.fn().mockResolvedValue(authSession),
       logout: vi.fn().mockResolvedValue(undefined),
       requireSession: vi.fn().mockResolvedValue(authSession),
     },
@@ -134,14 +136,46 @@ describe('registerDesktopIpc', () => {
     const app = harness()
 
     await expect(app.invoke(ipcChannels.authGetSession)).resolves.toBeNull()
-    await expect(app.invoke(ipcChannels.authRegister, {
-      account: 'Alice', password: 'password',
+    await expect(app.invoke(ipcChannels.authSendOtp, {
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })).resolves.toEqual({ challengeId: 'challenge_1', expiresIn: 300 })
+    await expect(app.invoke(ipcChannels.authVerifyOtp, {
+      challengeId: 'challenge_1', code: '123456',
     })).resolves.toEqual(authSession)
-    await expect(app.invoke(ipcChannels.authLogin, {
-      account: 'Alice', password: 'password',
+    await expect(app.invoke(ipcChannels.authCancelOtp, {
+      challengeId: 'challenge_1',
+    })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.authLoginWithPassword, {
+      account: 'Alice_1', password: 'password',
     })).resolves.toEqual(authSession)
     await expect(app.invoke(ipcChannels.authLogout)).resolves.toBeUndefined()
     expect(app.dependencies.auth.requireSession).not.toHaveBeenCalled()
+  })
+
+  it('rejects malformed anonymous authentication inputs before invoking a service', async () => {
+    const app = harness()
+
+    for (const input of [
+      { intent: 'login', channel: 'phone', target: '1831103272' },
+      { intent: 'login', channel: 'email', target: 'not-an-email' },
+    ]) {
+      await expect(app.invoke(ipcChannels.authSendOtp, input))
+        .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    await expect(app.invoke(ipcChannels.authVerifyOtp, {
+      challengeId: 'challenge_1', code: '12345',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(app.invoke(ipcChannels.authCancelOtp, {
+      challengeId: '',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(app.invoke(ipcChannels.authLoginWithPassword, {
+      account: 'Alice_1', password: 'short',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+    expect(app.dependencies.auth.sendOtp).not.toHaveBeenCalled()
+    expect(app.dependencies.auth.verifyOtp).not.toHaveBeenCalled()
+    expect(app.dependencies.auth.cancelOtp).not.toHaveBeenCalled()
+    expect(app.dependencies.auth.loginWithPassword).not.toHaveBeenCalled()
   })
 
   it('rejects business operations without a session', async () => {

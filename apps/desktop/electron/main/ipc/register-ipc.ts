@@ -139,8 +139,10 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   }
 
   register(ipcChannels.authGetSession, () => options.services.auth.getSession(), { anonymous: true })
-  register(ipcChannels.authLogin, (input) => options.services.auth.login(input), { anonymous: true })
-  register(ipcChannels.authRegister, (input) => options.services.auth.register(input), { anonymous: true })
+  register(ipcChannels.authSendOtp, (input) => options.services.auth.sendOtp(input), { anonymous: true })
+  register(ipcChannels.authVerifyOtp, (input) => options.services.auth.verifyOtp(input), { anonymous: true })
+  register(ipcChannels.authCancelOtp, (input) => options.services.auth.cancelOtp(input.challengeId), { anonymous: true })
+  register(ipcChannels.authLoginWithPassword, (input) => options.services.auth.loginWithPassword(input), { anonymous: true })
   register(ipcChannels.authLogout, () => options.services.auth.logout(), { anonymous: true })
   register(ipcChannels.profileGet, () => options.services.profile.get())
   register(ipcChannels.profileUpdate, (input) => options.services.profile.update(input))
