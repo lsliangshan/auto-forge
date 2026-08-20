@@ -157,4 +157,16 @@ describe('BrowserCapabilityService', () => {
     expect(tab.open).not.toHaveBeenCalled()
     expect(workspace.releaseExecution).toHaveBeenCalledWith(context.executionId)
   })
+
+  it('does not let an execution invalidated by an account switch reopen its old user partition', async () => {
+    const { service, workspace } = createHarness()
+    await service.open(context, 'https://www.baidu.com', baiduScope)
+
+    await service.reset()
+
+    await expect(service.open(context, 'https://www.baidu.com', baiduScope))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(workspace.acquire).toHaveBeenCalledOnce()
+    await service.closeExecution(context.executionId)
+  })
 })

@@ -116,6 +116,7 @@ interface TargetTabState {
   automationOrigin?: string
   allowedOrigin?: string
   navigationViolation?: AppError
+  activeOperations: number
   closed: boolean
   handle?: BrowserWorkspaceTab
 }
@@ -224,7 +225,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private readonly tabs = new Map<string, TargetTabState>()
   private readonly executions = new Map<string, TargetTabState>()
   private readonly sessions = new Map<string, SessionPort>()
+  private readonly sessionSetups = new Map<string, Promise<SessionPort>>()
+  private windowCreation: Promise<void> | undefined
   private shuttingDown = false
+  private closingViews = false
 
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
@@ -232,6 +236,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (this.shuttingDown) throw failure('CONFLICT')
     const existing = [...this.tabs.values()].find((tab) => !tab.closed
       && !tab.ownerExecutionId
+      && tab.activeOperations === 0
       && tab.userId === input.userId
       && tab.workflowId === input.workflowId)
     const state = existing ?? await this.createTab(input.userId, input.workflowId)
@@ -247,13 +252,16 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (!state) return
     this.executions.delete(executionId)
     if (state.ownerExecutionId === executionId) state.ownerExecutionId = undefined
-    state.automationOrigin = undefined
-    state.allowedOrigin = undefined
-    state.navigationViolation = undefined
-    await this.renderToolbar()
+    if (state.activeOperations === 0) {
+      state.automationOrigin = undefined
+      state.allowedOrigin = undefined
+      state.navigationViolation = undefined
+    }
+    await this.renderToolbar().catch(() => undefined)
   }
 
   async updateProxy(): Promise<void> {
+    await Promise.all(this.sessionSetups.values())
     const snapshot = await this.options.proxySnapshot()
     await Promise.all([...this.sessions.entries()]
       .filter(([partition]) => partition.startsWith('persist:'))
@@ -282,7 +290,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     const requestedOrigin = originOf(url)
     if (requestedOrigin !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
     await this.restricted(state, allowedOrigin, () => state.view.webContents.loadURL(url))
-    await this.renderToolbar()
+    await this.renderToolbar().catch(() => undefined)
   }
 
   async fill(state: TargetTabState, locator: string, value: string, allowedOrigin: string): Promise<void> {
@@ -340,7 +348,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       })
       await navigation
     })
-    await this.renderToolbar()
+    await this.renderToolbar().catch(() => undefined)
   }
 
   currentUrl(state: TargetTabState): string {
@@ -372,16 +380,20 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       },
     })
     const state: TargetTabState = {
-      id: randomUUID(), userId, workflowId, partition, view, closed: false,
+      id: randomUUID(), userId, workflowId, partition, view, activeOperations: 0, closed: false,
     }
     this.tabs.set(state.id, state)
     const guard = (event: NavigationEvent, url: string) => this.guardNavigation(state, event, url)
     view.webContents.on('will-navigate', guard)
     view.webContents.on('will-redirect', guard)
     view.webContents.on('will-attach-webview', (event: NavigationEvent) => event.preventDefault())
-    view.webContents.on('page-title-updated', () => { void this.renderToolbar() })
-    view.webContents.on('did-navigate', () => { void this.renderToolbar() })
-    view.webContents.on('did-navigate-in-page', () => { void this.renderToolbar() })
+    view.webContents.on('page-title-updated', () => { void this.renderToolbar().catch(() => undefined) })
+    view.webContents.on('did-navigate', () => { void this.renderToolbar().catch(() => undefined) })
+    view.webContents.on('did-navigate-in-page', () => { void this.renderToolbar().catch(() => undefined) })
+    view.webContents.on('render-process-gone', () => {
+      if (!view.webContents.isDestroyed()) view.webContents.close()
+      this.handleDestroyed(state)
+    })
     view.webContents.on('destroyed', () => { this.handleDestroyed(state) })
     view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     await this.attachDebugger(state)
@@ -390,12 +402,23 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
 
   private async ensureWindow(): Promise<void> {
     if (this.window && !this.window.isDestroyed()) return
+    if (this.windowCreation) return this.windowCreation
+    const creation = this.createWindow()
+    this.windowCreation = creation
+    try {
+      await creation
+    } finally {
+      if (this.windowCreation === creation) this.windowCreation = undefined
+    }
+  }
+
+  private async createWindow(): Promise<void> {
+    const toolbarPartition = 'autoforge-browser-toolbar'
+    await this.configureSession(toolbarPartition)
     const window = new this.options.BaseWindow({
       width: 1280, height: 820, minWidth: 900, minHeight: 600,
       show: false, title: 'AutoForge 浏览器', backgroundColor: '#11151c',
     })
-    const toolbarPartition = 'autoforge-browser-toolbar'
-    await this.configureSession(toolbarPartition)
     const toolbar = new this.options.WebContentsView({
       webPreferences: {
         partition: toolbarPartition,
@@ -409,7 +432,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     toolbar.webContents.on('will-navigate', (event: NavigationEvent, url: string) => {
       if (!url.startsWith('autoforge-browser://')) return
       event.preventDefault()
-      void this.handleToolbarCommand(url)
+      void this.handleToolbarCommand(url).catch(() => undefined)
     })
     toolbar.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     window.contentView.addChildView(toolbar)
@@ -425,13 +448,24 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     this.toolbar = toolbar
     this.layout()
     await this.renderToolbar()
+    if (this.window !== window || window.isDestroyed()) throw failure('NOT_FOUND')
     window.show()
   }
 
-  private async configureSession(partition: string): Promise<SessionPort> {
-    let session = this.sessions.get(partition)
-    if (session) return session
-    session = this.options.fromPartition(partition)
+  private configureSession(partition: string): Promise<SessionPort> {
+    const existing = this.sessionSetups.get(partition)
+    if (existing) return existing
+    const setup = this.setupSession(partition).catch((error) => {
+      this.sessionSetups.delete(partition)
+      this.sessions.delete(partition)
+      throw error
+    })
+    this.sessionSetups.set(partition, setup)
+    return setup
+  }
+
+  private async setupSession(partition: string): Promise<SessionPort> {
+    const session = this.options.fromPartition(partition)
     session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
     session.setPermissionCheckHandler?.(() => false)
     session.on?.('will-download', (event) => event.preventDefault())
@@ -456,7 +490,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (current !== state) window.contentView.addChildView(state.view)
     this.activeTabId = state.id
     this.layout()
-    await this.renderToolbar()
+    await this.renderToolbar().catch(() => undefined)
+    if (this.window !== window || window.isDestroyed() || state.closed) throw failure('NOT_FOUND')
     window.show()
     window.focus()
   }
@@ -519,21 +554,31 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private async restricted<T>(state: TargetTabState, allowedOrigin: string, action: () => Promise<T>): Promise<T> {
     this.assertOpen(state)
     if (originOf(allowedOrigin) !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
-    if (!state.ownerExecutionId) throw failure('CANCELLED')
+    const executionId = state.ownerExecutionId
+    if (!executionId) throw failure('CANCELLED')
+    state.activeOperations += 1
     state.allowedOrigin = allowedOrigin
     state.navigationViolation = undefined
-    let result!: T
-    let problem: unknown
-    try { result = await action() } catch (error) { problem = error }
-    const violation = state.navigationViolation
-    state.allowedOrigin = undefined
-    state.navigationViolation = undefined
-    if (violation) throw violation
-    if (problem) throw problem
-    const current = state.view.webContents.getURL()
-    if (current !== 'about:blank' && originOf(current) !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
-    state.automationOrigin = allowedOrigin
-    return result
+    try {
+      let result!: T
+      let problem: unknown
+      try { result = await action() } catch (error) { problem = error }
+      const violation = state.navigationViolation
+      if (violation) throw violation
+      if (problem) throw problem
+      if (state.ownerExecutionId !== executionId) throw failure('CANCELLED')
+      const current = state.view.webContents.getURL()
+      if (current !== 'about:blank' && originOf(current) !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
+      state.automationOrigin = allowedOrigin
+      return result
+    } finally {
+      state.activeOperations -= 1
+      if (state.activeOperations === 0) {
+        state.allowedOrigin = undefined
+        state.navigationViolation = undefined
+        if (!state.ownerExecutionId) state.automationOrigin = undefined
+      }
+    }
   }
 
   private async attachDebugger(state: TargetTabState): Promise<void> {
@@ -556,8 +601,14 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       }
       const nodeId = document.root?.nodeId
       if (!nodeId) throw failure('INVALID_INPUT')
-      const queried = await this.command(state, 'DOM.querySelectorAll', { nodeId, selector: parsed.value }) as {
-        nodeIds?: number[]
+      let queried: { nodeIds?: number[] }
+      try {
+        queried = await this.command(state, 'DOM.querySelectorAll', { nodeId, selector: parsed.value }) as {
+          nodeIds?: number[]
+        }
+      } catch {
+        this.assertOpen(state)
+        throw failure('INVALID_INPUT')
       }
       if (queried.nodeIds?.length !== 1) throw failure('INVALID_INPUT')
       const described = await this.command(state, 'DOM.describeNode', { nodeId: queried.nodeIds[0] }) as {
@@ -598,12 +649,17 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     return new Promise((resolve) => {
       let started = false
       let settled = false
+      let detectionTimer: ReturnType<typeof setTimeout>
+      let maximumTimer: ReturnType<typeof setTimeout>
       const finish = () => {
         if (settled) return
         settled = true
+        clearTimeout(detectionTimer)
+        clearTimeout(maximumTimer)
         contents.removeListener('did-start-navigation', onStart)
         contents.removeListener('did-stop-loading', onStop)
         contents.removeListener('did-fail-load', onStop)
+        contents.removeListener('destroyed', finish)
         resolve()
       }
       const onStart = (...args: unknown[]) => {
@@ -615,7 +671,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       contents.on('did-start-navigation', onStart)
       contents.on('did-stop-loading', onStop)
       contents.on('did-fail-load', onStop)
-      setTimeout(finish, 75)
+      contents.on('destroyed', finish)
+      detectionTimer = setTimeout(() => { if (!started) finish() }, 75)
+      maximumTimer = setTimeout(finish, 30_000)
     })
   }
 
@@ -630,19 +688,26 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (this.activeTabId === state.id) {
       this.activeTabId = undefined
       const next = [...this.tabs.values()].find((tab) => !tab.closed)
-      if (next && this.window && !this.window.isDestroyed()) void this.activate(next)
+      if (!this.closingViews && next && this.window && !this.window.isDestroyed()) {
+        void this.activate(next).catch(() => undefined)
+      }
     }
-    void this.renderToolbar()
+    if (!this.closingViews) void this.renderToolbar().catch(() => undefined)
   }
 
   private destroyViews(): void {
-    for (const state of [...this.tabs.values()]) {
-      if (!state.view.webContents.isDestroyed()) state.view.webContents.close()
+    this.closingViews = true
+    try {
+      for (const state of [...this.tabs.values()]) {
+        if (!state.view.webContents.isDestroyed()) state.view.webContents.close()
+      }
+      if (this.toolbar && !this.toolbar.webContents.isDestroyed()) this.toolbar.webContents.close()
+      this.tabs.clear()
+      this.executions.clear()
+      this.activeTabId = undefined
+    } finally {
+      this.closingViews = false
     }
-    if (this.toolbar && !this.toolbar.webContents.isDestroyed()) this.toolbar.webContents.close()
-    this.tabs.clear()
-    this.executions.clear()
-    this.activeTabId = undefined
   }
 
   private async closeWindow(): Promise<void> {

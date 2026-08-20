@@ -100,6 +100,7 @@ export class PolicyEngineBrowserAuthorization implements BrowserAuthorizationPor
 
 export class BrowserCapabilityService implements CapabilityPort {
   private readonly executions = new Map<string, ExecutionBrowserState>()
+  private readonly invalidatedExecutions = new Set<string>()
   private stopped = false
 
   constructor(private readonly options: BrowserCapabilityServiceOptions) {}
@@ -170,7 +171,9 @@ export class BrowserCapabilityService implements CapabilityPort {
     const tab = this.tab(state)
     await this.authorizeCurrent(state, 'browser.url', declaredScope)
     this.assertActive(state)
-    return tab.url()
+    const value = await tab.url()
+    this.assertActive(state)
+    return value
   }
 
   async close(context: BrowserCapabilityContext, declaredScope?: CapabilityScope): Promise<void> {
@@ -188,7 +191,10 @@ export class BrowserCapabilityService implements CapabilityPort {
 
   async closeExecution(executionId: string): Promise<void> {
     const state = this.executions.get(executionId)
-    if (!state) return
+    if (!state) {
+      this.invalidatedExecutions.delete(executionId)
+      return
+    }
     state.released = true
     this.executions.delete(executionId)
     await this.options.workspace.releaseExecution(executionId)
@@ -201,8 +207,11 @@ export class BrowserCapabilityService implements CapabilityPort {
   async reset(): Promise<void> {
     const states = [...this.executions.values()]
     this.executions.clear()
-    for (const state of states) state.released = true
-    await Promise.all(states.map((state) => this.options.workspace.releaseExecution(state.context.executionId)))
+    for (const state of states) {
+      state.released = true
+      this.invalidatedExecutions.add(state.context.executionId)
+    }
+    for (const state of states) await this.options.workspace.releaseExecution(state.context.executionId)
     await this.options.workspace.reset()
   }
 
@@ -211,10 +220,12 @@ export class BrowserCapabilityService implements CapabilityPort {
     this.stopped = true
     await this.reset()
     await this.options.workspace.shutdown()
+    this.invalidatedExecutions.clear()
   }
 
   private state(context: BrowserCapabilityContext, create: boolean): ExecutionBrowserState {
     if (this.stopped) throw failure('CONFLICT')
+    if (this.invalidatedExecutions.has(context.executionId)) throw failure('CANCELLED')
     const existing = this.executions.get(context.executionId)
     if (existing) {
       if (!sameContext(existing.context, context)) throw failure('CAPABILITY_SCOPE_DENIED')

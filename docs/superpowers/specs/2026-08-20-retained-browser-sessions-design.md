@@ -57,7 +57,7 @@ Invalid locator syntax, zero matches, duplicate matches, and unsupported editabl
 
 ## Security
 
-Every remote target view disables Node integration, enables context isolation and sandboxing, keeps web security enabled, disables webviews and insecure content, disallows drag navigation, and has no preload or IPC bridge. Target sessions deny permission requests/checks by default. Only HTTPS top-level URLs are accepted. New windows are denied during restricted automation unless their exact origin is permitted. Downloads and external protocol launches are denied by default.
+Every remote target view disables Node integration, enables context isolation and sandboxing, keeps web security enabled, disables webviews and insecure content, disallows drag navigation, and has no preload or IPC bridge. Target sessions deny permission requests/checks by default. Only HTTPS top-level URLs are accepted. New-window requests, downloads, and external protocol launches are denied by default; workflows use `browser.open` for top-level targets.
 
 The toolbar is a separate sandboxed view containing application-owned markup. Commands use an internal navigation scheme intercepted entirely in the main process; no Electron or Node API is exposed to toolbar JavaScript.
 
@@ -86,4 +86,3 @@ Remove `playwright-chromium`, `stage:browser`, `browser-runtime.json`, `ms-playw
 - Navigation, popup, permission, and remote-content security guards deny out-of-scope behavior.
 - Proxy changes reach every live persistent browser session.
 - Focused tests, full tests, typecheck, build, and packaged directory verification pass.
-

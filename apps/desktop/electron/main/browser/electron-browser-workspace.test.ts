@@ -130,6 +130,12 @@ async function acquire(
   return workspace.acquire({ executionId, userId, workflowId })
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 describe('ElectronBrowserWorkspace', () => {
   it('uses a stable opaque persistent partition per AutoForge user', () => {
     expect(browserPartition('user_1')).toMatch(/^persist:autoforge-browser-[a-f0-9]{32}$/)
@@ -161,6 +167,34 @@ describe('ElectronBrowserWorkspace', () => {
     expect(windows[0]!.children).toHaveLength(2)
   })
 
+  it('serializes the first concurrent tab acquisitions through one BaseWindow creation', async () => {
+    const { workspace, windows } = createHarness()
+
+    await Promise.all([
+      acquire(workspace, 'exec_1', 'user_1', 'workflow.one'),
+      acquire(workspace, 'exec_2', 'user_1', 'workflow.two'),
+    ])
+
+    expect(windows).toHaveLength(1)
+  })
+
+  it('waits for one shared persistent session setup before creating concurrent target tabs', async () => {
+    const setup = deferred<{ enabled: boolean; proxyRules: string; bypassRules: string }>()
+    const harness = createHarness()
+    harness.proxySnapshot.mockImplementation(() => setup.promise)
+
+    const first = acquire(harness.workspace, 'exec_1', 'user_1', 'workflow.one')
+    const second = acquire(harness.workspace, 'exec_2', 'user_1', 'workflow.two')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(harness.views).toHaveLength(1)
+    setup.resolve({ enabled: true, proxyRules: 'http=http://127.0.0.1:7890', bypassRules: '<local>' })
+    await Promise.all([first, second])
+
+    expect(harness.sessions.get(browserPartition('user_1'))?.setProxy).toHaveBeenCalledOnce()
+  })
+
   it('keeps released tabs alive, closes explicit tabs, and destroys every webContents on window close', async () => {
     const { workspace, views, windows } = createHarness()
     const first = await acquire(workspace, 'exec_1')
@@ -175,6 +209,46 @@ describe('ElectronBrowserWorkspace', () => {
     windows[0]!.close()
     expect(views.every((view) => view.webContents.destroyed)).toBe(true)
     await expect(second.url()).rejects.toMatchObject({ code: 'NOT_FOUND' })
+  })
+
+  it('discards a crashed renderer instead of reusing its tab', async () => {
+    const { workspace, views } = createHarness()
+    const first = await acquire(workspace, 'exec_1')
+    const target = views[1]!.webContents
+
+    target.emit('render-process-gone', {}, { reason: 'crashed' })
+    await workspace.releaseExecution('exec_1')
+    const replacement = await acquire(workspace, 'exec_2')
+
+    expect(target.destroyed).toBe(true)
+    expect(replacement).not.toBe(first)
+    expect(views).toHaveLength(3)
+  })
+
+  it('does not reuse a released tab while its previous execution still has an operation in flight', async () => {
+    const mousePressed = deferred<unknown>()
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '百度一下' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method]
+      ?? (method === 'Input.dispatchMouseEvent' ? mousePressed.promise : {})
+    const { workspace, views } = createHarness(respond)
+    const first = await acquire(workspace, 'exec_1')
+    await first.open('https://www.baidu.com', 'https://www.baidu.com')
+
+    const clicking = first.click('role=button[name="百度一下"]', 'https://www.baidu.com')
+    while (!views[1]!.webContents.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
+      await Promise.resolve()
+    }
+    await workspace.releaseExecution('exec_1')
+    const replacement = await acquire(workspace, 'exec_2')
+
+    expect(replacement).not.toBe(first)
+    mousePressed.resolve({})
+    await expect(clicking).rejects.toMatchObject({ code: 'CANCELLED' })
   })
 
   it('denies remote permissions and applies proxy changes to every live persistent session', async () => {
@@ -200,12 +274,16 @@ describe('ElectronBrowserWorkspace', () => {
   it('closes live tabs on an AutoForge account switch without deleting persistent sessions', async () => {
     const { workspace, sessions, views, windows } = createHarness()
     await acquire(workspace, 'exec_1', 'user_1')
+    await acquire(workspace, 'exec_2', 'user_1', 'workflow.two')
     const partition = browserPartition('user_1')
+    const focusCalls = windows[0]!.focus.mock.calls.length
 
     await workspace.reset()
+    await Promise.resolve()
 
     expect(views.every((view) => view.webContents.destroyed)).toBe(true)
     expect(windows[0]!.destroyed).toBe(true)
+    expect(windows[0]!.focus).toHaveBeenCalledTimes(focusCalls)
     expect(sessions.has(partition)).toBe(true)
     await acquire(workspace, 'exec_2', 'user_1')
     expect(windows).toHaveLength(2)
@@ -260,6 +338,33 @@ describe('ElectronBrowserWorkspace', () => {
     })
   })
 
+  it('waits for a click-triggered main-frame navigation once loading has started', async () => {
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '百度一下' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method] ?? {}
+    const { workspace, views } = createHarness(respond)
+    const tab = await acquire(workspace, 'exec_1')
+    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    const target = views[1]!.webContents
+    let settled = false
+
+    const clicking = tab.click('role=button[name="百度一下"]', 'https://www.baidu.com')
+      .finally(() => { settled = true })
+    while (!target.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
+      await Promise.resolve()
+    }
+    target.emit('did-start-navigation', { isMainFrame: true })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(settled).toBe(false)
+    target.emit('did-stop-loading')
+
+    await clicking
+  })
+
   it('rejects invalid, missing, and duplicate locators', async () => {
     const respond = (method: string) => method === 'DOM.getDocument'
       ? { root: { nodeId: 1 } }
@@ -270,5 +375,19 @@ describe('ElectronBrowserWorkspace', () => {
 
     await expect(tab.click('xpath=//button', 'https://www.baidu.com')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     await expect(tab.click('css=.duplicate', 'https://www.baidu.com')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+  })
+
+  it('maps a malformed CSS selector rejected by CDP to invalid input', async () => {
+    const respond = (method: string) => {
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
+      if (method === 'DOM.querySelectorAll') throw new Error('SyntaxError: invalid selector')
+      return {}
+    }
+    const { workspace } = createHarness(respond)
+    const tab = await acquire(workspace, 'exec_1')
+    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+
+    await expect(tab.fill('css=[', 'value', 'https://www.baidu.com'))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
   })
 })

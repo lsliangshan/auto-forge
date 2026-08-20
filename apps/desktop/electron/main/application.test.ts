@@ -448,6 +448,20 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('closes live browser tabs when the authenticated AutoForge user changes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-user-'))
+    directories.push(root)
+    const browserWorkspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace }))
+
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    expect(browserWorkspace.reset).toHaveBeenCalledOnce()
+    await runtime.services.auth.logout()
+    expect(browserWorkspace.reset).toHaveBeenCalledTimes(2)
+
+    await runtime.close()
+  })
+
   it('returns refreshed file and directory entries after developer mutations', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-entries-'))
     directories.push(root)
