@@ -4,6 +4,7 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  authUserSchema,
   toSafeAppError,
   type AppError,
   type AuthCredentials,
@@ -11,6 +12,7 @@ import {
   type AuthOtpRequest,
   type AuthOtpVerification,
   type AuthSession,
+  type AuthUser,
 } from '@autoforge/shared'
 import type { AuthSecretStore, AuthService } from './auth-service.js'
 import {
@@ -51,6 +53,7 @@ interface StoredCloudBaseSession {
   refreshToken: string
   expiresAt: number
   authenticatedAt: string
+  user: AuthUser
 }
 
 interface CloudBaseAuthDependencies {
@@ -63,6 +66,7 @@ const storedCloudBaseSessionSchema: z.ZodType<StoredCloudBaseSession> = z.object
   refreshToken: z.string().trim().min(1),
   expiresAt: z.number().finite().positive(),
   authenticatedAt: z.string().datetime(),
+  user: authUserSchema,
 }).strict()
 
 function failure(code: AppError['code']): AppError {
@@ -126,7 +130,7 @@ function isAnonymousSession(response: unknown): boolean {
 function invalidStoredCredentials(error: unknown): boolean {
   const fields = stableErrorText(error)
   return fields !== undefined
-    && /(?:invalid grant|invalid refresh token|refresh token not found|credentials not found|token expired|session expired|invalid credentials|user not found)/.test(fields)
+    && /(?:invalid grant|invalid refresh token|refresh token not found|credentials not found|token expired|session expired|invalid credentials|user not found|unauthorized client.*refresh token.*(?:has been refresh|already (?:used|rotated)))/.test(fields)
 }
 
 function alreadySignedOut(error: unknown): boolean {
@@ -145,7 +149,11 @@ function verifyOtpCallback(response: unknown): PendingChallenge['verifyOtp'] {
   return (input) => verifyOtp.call(data, input) as Promise<unknown>
 }
 
-function cloudBaseSession(response: unknown, allowMissing = false): CloudBaseSession | null {
+function cloudBaseSession(
+  response: unknown,
+  allowMissing = false,
+  fallbackUser?: AuthUser,
+): CloudBaseSession | null {
   if (!isRecord(response)) throw failure('INTERNAL_ERROR')
   if (response.error !== null) throw providerFailure(response.error)
   if (!isRecord(response.data)) throw failure('INTERNAL_ERROR')
@@ -160,27 +168,36 @@ function cloudBaseSession(response: unknown, allowMissing = false): CloudBaseSes
     || typeof session.expires_in !== 'number'
     || !Number.isFinite(session.expires_in)
     || !Number.isSafeInteger(session.expires_in)
-    || session.expires_in <= 0
-    || !isRecord(user)
-    || typeof user.id !== 'string'
-    || user.id.trim().length === 0) {
+    || session.expires_in <= 0) {
     throw failure('INTERNAL_ERROR')
   }
-  const metadata = isRecord(user.user_metadata) ? user.user_metadata : undefined
+  const providerUser: (Record<string, unknown> & { id: string }) | undefined =
+    isRecord(user) && typeof user.id === 'string' && user.id.trim().length > 0
+    ? { ...user, id: user.id.trim() }
+    : undefined
+  if (providerUser === undefined && fallbackUser === undefined) {
+    throw failure('INTERNAL_ERROR')
+  }
+  const resolvedUser = providerUser
+    ?? (fallbackUser !== undefined
+      ? { id: fallbackUser.id, user_metadata: { nickname: fallbackUser.account } }
+      : undefined)
+  if (resolvedUser === undefined) throw failure('INTERNAL_ERROR')
+  const metadata = isRecord(resolvedUser.user_metadata) ? resolvedUser.user_metadata : undefined
   return {
     accessToken: session.access_token,
     refreshToken: session.refresh_token,
     expiresIn: session.expires_in,
     user: {
-      id: user.id.trim(),
+      id: resolvedUser.id,
       ...(typeof metadata?.nickname === 'string'
         ? { user_metadata: { nickname: metadata.nickname } }
         : {}),
-      ...(typeof user.nickName === 'string' ? { nickName: user.nickName } : {}),
-      ...(typeof user.username === 'string' ? { username: user.username } : {}),
-      ...(typeof user.name === 'string' ? { name: user.name } : {}),
-      ...(typeof user.phone === 'string' ? { phone: user.phone } : {}),
-      ...(typeof user.email === 'string' ? { email: user.email } : {}),
+      ...(typeof resolvedUser.nickName === 'string' ? { nickName: resolvedUser.nickName } : {}),
+      ...(typeof resolvedUser.username === 'string' ? { username: resolvedUser.username } : {}),
+      ...(typeof resolvedUser.name === 'string' ? { name: resolvedUser.name } : {}),
+      ...(typeof resolvedUser.phone === 'string' ? { phone: resolvedUser.phone } : {}),
+      ...(typeof resolvedUser.email === 'string' ? { email: resolvedUser.email } : {}),
     },
   }
 }
@@ -247,6 +264,7 @@ export class CloudBaseAuthService implements AuthService {
   private readonly challenges = new Map<string, PendingChallenge>()
   private challengeGeneration = 0
   private sessionOperationTail: Promise<void> = Promise.resolve()
+  private sessionUser: AuthUser | undefined
 
   constructor(
     private readonly auth: CloudBaseAuthPort,
@@ -364,7 +382,7 @@ export class CloudBaseAuthService implements AuthService {
       this.deleteStoredSession()
       return null
     }
-    const current = cloudBaseSession(currentResponse, true)
+    const current = cloudBaseSession(currentResponse, true, this.sessionUser)
     if (current) {
       return this.persist(current, new Date(this.dependencies.now()).toISOString())
     }
@@ -410,7 +428,7 @@ export class CloudBaseAuthService implements AuthService {
       this.deleteStoredSession()
       return null
     }
-    const restored = cloudBaseSession(restoredResponse, true)
+    const restored = cloudBaseSession(restoredResponse, true, stored.user)
     if (!restored) {
       this.deleteStoredSession()
       return null
@@ -447,12 +465,14 @@ export class CloudBaseAuthService implements AuthService {
       refreshToken: session.refreshToken,
       expiresAt: this.dependencies.now() + session.expiresIn * 1_000,
       authenticatedAt,
+      user: result.user,
     }
     try {
       await this.secrets.set(SESSION_KEY, JSON.stringify(stored))
     } catch {
       throw failure('INTERNAL_ERROR')
     }
+    this.sessionUser = result.user
     return result
   }
 
@@ -468,5 +488,6 @@ export class CloudBaseAuthService implements AuthService {
     } catch {
       throw failure('INTERNAL_ERROR')
     }
+    this.sessionUser = undefined
   }
 }

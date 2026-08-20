@@ -63,6 +63,29 @@ function noSessionResponse() {
   return { data: { session: null, user: null }, error: null }
 }
 
+function methodUserAuthResponse(session: FakeCloudSession = cloudSession('Ignored Provider User')) {
+  const methodValue = () => 'ignored-provider-value'
+  const user = {
+    ...session.user,
+    id: methodValue,
+    phone: methodValue,
+    email: methodValue,
+    user_metadata: {
+      nickname: methodValue,
+      nickName: methodValue,
+      username: methodValue,
+      name: methodValue,
+    },
+  }
+  return {
+    data: {
+      session: { ...session, sub: methodValue, user },
+      user,
+    },
+    error: null,
+  }
+}
+
 function deferred<T>() {
   let resolvePromise!: (value: T) => void
   const promise = new Promise<T>((resolve) => {
@@ -76,12 +99,14 @@ function storedSession(overrides: Partial<{
   refreshToken: string
   expiresAt: number
   authenticatedAt: string
+  user: { id: string; account: string }
 }> = {}) {
   return JSON.stringify({
     accessToken: 'stored-access-token',
     refreshToken: 'stored-refresh-token',
     expiresAt: NOW + 60_000,
     authenticatedAt: '2026-08-17T00:00:00.000Z',
+    user: { id: 'stored_uid', account: 'Stored User' },
     ...overrides,
   })
 }
@@ -410,6 +435,7 @@ describe('CloudBaseAuthService', () => {
       refreshToken: 'sample-refresh-token',
       expiresAt: NOW + 120_000,
       authenticatedAt: AUTHENTICATED_AT,
+      user: { id: 'cloud_uid', account: 'Alice_1' },
     })
     expect(encryptedBoundaryValue).not.toContain('password')
     expect(encryptedBoundaryValue).not.toContain('123456')
@@ -469,7 +495,69 @@ describe('CloudBaseAuthService', () => {
       refreshToken: 'rotated-refresh-token',
       expiresAt: NOW + 3_600_000,
       authenticatedAt: '2026-08-17T00:00:00.000Z',
+      user: { id: 'cloud_uid', account: 'Restored User' },
     })
+  })
+
+  it('restores with the encrypted public identity when the SDK user fields become functions', async () => {
+    const app = harness()
+    const session = cloudSession('Ignored Provider User', {
+      accessToken: 'rotated-access-token',
+      refreshToken: 'rotated-refresh-token',
+    })
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
+    vi.mocked(app.port.setSession).mockResolvedValue(methodUserAuthResponse(session))
+
+    await expect(app.service.getSession()).resolves.toEqual({
+      user: { id: 'stored_uid', account: 'Stored User' },
+      authenticatedAt: '2026-08-17T00:00:00.000Z',
+    })
+    expect(app.secrets.delete).not.toHaveBeenCalled()
+    expect(JSON.parse(app.stored.get(SESSION_KEY) ?? '')).toMatchObject({
+      accessToken: 'rotated-access-token',
+      refreshToken: 'rotated-refresh-token',
+      user: { id: 'stored_uid', account: 'Stored User' },
+    })
+  })
+
+  it('uses the encrypted public identity when refreshSession returns function-valued user fields', async () => {
+    const app = harness()
+    const response = methodUserAuthResponse(cloudSession('Ignored Provider User', {
+      accessToken: 'refreshed-access-token',
+      refreshToken: 'rotated-refresh-token',
+    }))
+    app.stored.set(SESSION_KEY, storedSession({ expiresAt: NOW - 1 }))
+    vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
+    vi.mocked(app.port.refreshSession).mockResolvedValue(response)
+
+    await expect(app.service.getSession()).resolves.toMatchObject({
+      user: { id: 'stored_uid', account: 'Stored User' },
+    })
+    expect(app.port.refreshSession).toHaveBeenCalledWith('stored-refresh-token')
+    expect(JSON.parse(app.stored.get(SESSION_KEY) ?? '')).toMatchObject({
+      accessToken: 'refreshed-access-token',
+      refreshToken: 'rotated-refresh-token',
+      user: { id: 'stored_uid', account: 'Stored User' },
+    })
+  })
+
+  it('reuses the restored public identity for a later malformed in-memory SDK session', async () => {
+    const app = harness()
+    const restoredResponse = methodUserAuthResponse()
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession)
+      .mockResolvedValueOnce(noSessionResponse())
+      .mockResolvedValueOnce(restoredResponse)
+    vi.mocked(app.port.setSession).mockResolvedValue(restoredResponse)
+
+    await expect(app.service.getSession()).resolves.toMatchObject({
+      user: { id: 'stored_uid', account: 'Stored User' },
+    })
+    await expect(app.service.getSession()).resolves.toMatchObject({
+      user: { id: 'stored_uid', account: 'Stored User' },
+    })
+    expect(app.secrets.get).toHaveBeenCalledOnce()
   })
 
   it('deletes encrypted credentials when restoration returns an anonymous session', async () => {
@@ -570,6 +658,22 @@ describe('CloudBaseAuthService', () => {
     expect(app.port.refreshSession).not.toHaveBeenCalled()
   })
 
+  it('deletes a legacy stored session before CloudBase can rotate its refresh token', async () => {
+    const app = harness()
+    app.stored.set(SESSION_KEY, JSON.stringify({
+      accessToken: 'legacy-access-token',
+      refreshToken: 'legacy-refresh-token',
+      expiresAt: NOW + 60_000,
+      authenticatedAt: '2026-08-17T00:00:00.000Z',
+    }))
+    vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
+
+    await expect(app.service.getSession()).resolves.toBeNull()
+    expect(app.secrets.delete).toHaveBeenCalledWith(SESSION_KEY)
+    expect(app.port.setSession).not.toHaveBeenCalled()
+    expect(app.port.refreshSession).not.toHaveBeenCalled()
+  })
+
   it.each([
     [{ code: 'invalid_grant', message: 'invalid refresh token' }],
     [{ code: 'token_expired', message: 'refresh token expired' }],
@@ -580,6 +684,20 @@ describe('CloudBaseAuthService', () => {
     vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
     vi.mocked(app.port.setSession).mockResolvedValue({
       data: { session: null, user: null }, error: providerError,
+    })
+
+    await expect(app.service.getSession()).resolves.toBeNull()
+    expect(app.secrets.delete).toHaveBeenCalledWith(SESSION_KEY)
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+  })
+
+  it('deletes a stored session after CloudBase reports its refresh token was already rotated', async () => {
+    const app = harness()
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())
+    vi.mocked(app.port.setSession).mockResolvedValue({
+      data: { session: null, user: null },
+      error: { code: 'unauthorized_client', message: 'refresh token has been refresh' },
     })
 
     await expect(app.service.getSession()).resolves.toBeNull()
@@ -637,6 +755,22 @@ describe('CloudBaseAuthService', () => {
     await expect(app.service.logout()).resolves.toBeUndefined()
     expect(app.secrets.delete).toHaveBeenCalledWith(SESSION_KEY)
     expect(app.stored.has(SESSION_KEY)).toBe(false)
+  })
+
+  it('clears the restored public identity cache after logout', async () => {
+    const app = harness()
+    const malformedResponse = methodUserAuthResponse()
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession)
+      .mockResolvedValueOnce(noSessionResponse())
+      .mockResolvedValueOnce(malformedResponse)
+    vi.mocked(app.port.setSession).mockResolvedValue(malformedResponse)
+
+    await expect(app.service.getSession()).resolves.toMatchObject({
+      user: { id: 'stored_uid', account: 'Stored User' },
+    })
+    await expect(app.service.logout()).resolves.toBeUndefined()
+    await expect(app.service.getSession()).rejects.toEqual(toSafeAppError({ code: 'INTERNAL_ERROR' }))
   })
 
   it('deletes encrypted credentials when signOut rejects because there is no session', async () => {
