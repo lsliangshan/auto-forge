@@ -623,9 +623,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const services: DesktopIpcServices = {
     auth: {
       getSession: () => auth.getSession(),
-      login: (input) => auth.login(input),
-      register: (input) => auth.register(input),
-      logout: () => auth.logout(),
+      login: async (input) => {
+        const previous = await auth.getSession()
+        const next = await auth.login(input)
+        if (previous?.user.id !== next.user.id) await browser.reset()
+        return next
+      },
+      register: async (input) => {
+        const previous = await auth.getSession()
+        const next = await auth.register(input)
+        if (previous?.user.id !== next.user.id) await browser.reset()
+        return next
+      },
+      logout: async () => {
+        await auth.logout()
+        await browser.reset()
+      },
       requireSession: () => auth.requireSession(),
     },
     profile: {

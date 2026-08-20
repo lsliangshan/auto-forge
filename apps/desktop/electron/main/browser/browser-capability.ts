@@ -198,10 +198,18 @@ export class BrowserCapabilityService implements CapabilityPort {
     return this.options.workspace.updateProxy()
   }
 
+  async reset(): Promise<void> {
+    const states = [...this.executions.values()]
+    this.executions.clear()
+    for (const state of states) state.released = true
+    await Promise.all(states.map((state) => this.options.workspace.releaseExecution(state.context.executionId)))
+    await this.options.workspace.reset()
+  }
+
   async shutdown(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
-    await Promise.all([...this.executions.keys()].map((executionId) => this.closeExecution(executionId)))
+    await this.reset()
     await this.options.workspace.shutdown()
   }
 

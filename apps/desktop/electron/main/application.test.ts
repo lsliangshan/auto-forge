@@ -71,6 +71,7 @@ function createBrowserWorkspace(): BrowserWorkspacePort {
     acquire: vi.fn(async () => { throw new Error('Unexpected browser acquisition') }),
     releaseExecution: vi.fn(async () => undefined),
     updateProxy: vi.fn(async () => undefined),
+    reset: vi.fn(async () => undefined),
     shutdown: vi.fn(async () => undefined),
   }
 }

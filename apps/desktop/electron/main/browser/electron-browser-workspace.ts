@@ -89,6 +89,7 @@ export interface BrowserWorkspacePort {
   acquire(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab>
   releaseExecution(executionId: string): Promise<void> | void
   updateProxy(): Promise<void>
+  reset(): Promise<void>
   shutdown(): Promise<void>
 }
 
@@ -269,9 +270,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
-    const window = this.window
-    if (window && !window.isDestroyed()) window.close()
-    else this.destroyViews()
+    await this.closeWindow()
+  }
+
+  async reset(): Promise<void> {
+    await this.closeWindow()
   }
 
   async navigate(state: TargetTabState, url: string, allowedOrigin: string): Promise<void> {
@@ -413,8 +416,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     window.on('resize', () => this.layout())
     window.on('closed', () => {
       this.destroyViews()
-      this.window = undefined
-      this.toolbar = undefined
+      if (this.window === window) {
+        this.window = undefined
+        this.toolbar = undefined
+      }
     })
     this.window = window
     this.toolbar = toolbar
@@ -619,9 +624,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     state.closed = true
     this.tabs.delete(state.id)
     if (state.ownerExecutionId) this.executions.delete(state.ownerExecutionId)
-    if (state.view.webContents.debugger.isAttached()) {
-      try { state.view.webContents.debugger.detach() } catch { /* already detached by renderer teardown */ }
-    }
+    try {
+      if (state.view.webContents.debugger.isAttached()) state.view.webContents.debugger.detach()
+    } catch { /* already detached by renderer teardown */ }
     if (this.activeTabId === state.id) {
       this.activeTabId = undefined
       const next = [...this.tabs.values()].find((tab) => !tab.closed)
@@ -638,6 +643,22 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     this.tabs.clear()
     this.executions.clear()
     this.activeTabId = undefined
+  }
+
+  private async closeWindow(): Promise<void> {
+    const window = this.window
+    this.destroyViews()
+    if (!window || window.isDestroyed()) {
+      if (this.window === window) {
+        this.window = undefined
+        this.toolbar = undefined
+      }
+      return
+    }
+    await new Promise<void>((resolve) => {
+      window.on('closed', resolve)
+      window.close()
+    })
   }
 
   private assertOpen(state: TargetTabState): void {

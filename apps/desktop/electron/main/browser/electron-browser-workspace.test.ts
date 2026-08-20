@@ -197,6 +197,20 @@ describe('ElectronBrowserWorkspace', () => {
     }
   })
 
+  it('closes live tabs on an AutoForge account switch without deleting persistent sessions', async () => {
+    const { workspace, sessions, views, windows } = createHarness()
+    await acquire(workspace, 'exec_1', 'user_1')
+    const partition = browserPartition('user_1')
+
+    await workspace.reset()
+
+    expect(views.every((view) => view.webContents.destroyed)).toBe(true)
+    expect(windows[0]!.destroyed).toBe(true)
+    expect(sessions.has(partition)).toBe(true)
+    await acquire(workspace, 'exec_2', 'user_1')
+    expect(windows).toHaveLength(2)
+  })
+
   it('blocks non-HTTPS and out-of-scope navigation while allowing released user navigation', async () => {
     const { workspace, views } = createHarness()
     const tab = await acquire(workspace, 'exec_1')

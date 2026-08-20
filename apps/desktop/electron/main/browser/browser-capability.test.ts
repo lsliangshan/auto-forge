@@ -32,6 +32,7 @@ function createHarness() {
     acquire: vi.fn(async () => tab),
     releaseExecution: vi.fn(async () => undefined),
     updateProxy: vi.fn(async () => undefined),
+    reset: vi.fn(async () => undefined),
     shutdown: vi.fn(async () => undefined),
   }
   const authorize = vi.fn(async () => undefined)
@@ -130,6 +131,7 @@ describe('BrowserCapabilityService', () => {
     await service.shutdown()
 
     expect(workspace.updateProxy).toHaveBeenCalledOnce()
+    expect(workspace.reset).toHaveBeenCalledOnce()
     expect(workspace.releaseExecution).toHaveBeenCalledWith(context.executionId)
     expect(workspace.shutdown).toHaveBeenCalledOnce()
     expect(service.hasActiveContexts()).toBe(false)
@@ -142,7 +144,7 @@ describe('BrowserCapabilityService', () => {
     }
     const workspace: BrowserWorkspacePort = {
       acquire: vi.fn(() => new Promise<BrowserWorkspaceTab>((resolve) => { resolveAcquire = resolve })),
-      releaseExecution: vi.fn(), updateProxy: vi.fn(), shutdown: vi.fn(),
+      releaseExecution: vi.fn(), updateProxy: vi.fn(), reset: vi.fn(), shutdown: vi.fn(),
     }
     const service = new BrowserCapabilityService({ authorization: { authorize: vi.fn() }, workspace })
 
