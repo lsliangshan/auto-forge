@@ -54,6 +54,14 @@ function noSessionResponse() {
   return { data: { session: null, user: null }, error: null }
 }
 
+function deferred<T>() {
+  let resolvePromise!: (value: T) => void
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve
+  })
+  return { promise, resolve: resolvePromise }
+}
+
 function storedSession(overrides: Partial<{
   accessToken: string
   refreshToken: string
@@ -304,6 +312,53 @@ describe('CloudBaseAuthService', () => {
     expect(app.verifyOtp).toHaveBeenCalledTimes(1)
   })
 
+  it('publishes only the latest concurrent out-of-order OTP send', async () => {
+    const app = harness()
+    const firstResponse = deferred<unknown>()
+    const latestResponse = deferred<unknown>()
+    const staleVerify = vi.fn<(input: { token: string }) => Promise<unknown>>()
+    const latestVerify = vi.fn<(input: { token: string }) => Promise<unknown>>()
+    vi.mocked(app.port.signInWithOtp).mockImplementation((input) => (
+      'phone' in input ? firstResponse.promise : latestResponse.promise
+    ))
+
+    const firstSend = app.service.sendOtp({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })
+    const latestSend = app.service.sendOtp({
+      intent: 'login', channel: 'email', target: 'user@example.com',
+    })
+    latestResponse.resolve(otpResponse(latestVerify))
+    const latestChallenge = await latestSend
+    firstResponse.resolve(otpResponse(staleVerify))
+
+    await expect(firstSend).rejects.toEqual(toSafeAppError({ code: 'AUTH_OTP_EXPIRED' }))
+    latestVerify.mockResolvedValue(authResponse())
+    await expect(app.service.verifyOtp({
+      challengeId: latestChallenge.challengeId,
+      code: '123456',
+    })).resolves.toMatchObject({ user: { id: 'cloud_uid' } })
+    expect(staleVerify).not.toHaveBeenCalled()
+  })
+
+  it('does not publish an OTP challenge when its send resolves after logout', async () => {
+    const app = harness()
+    const response = deferred<unknown>()
+    vi.mocked(app.port.signInWithOtp).mockReturnValue(response.promise)
+    vi.mocked(app.port.signOut).mockResolvedValue(undefined)
+
+    const send = app.service.sendOtp({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })
+    await expect(app.service.logout()).resolves.toBeUndefined()
+    response.resolve(otpResponse(app.verifyOtp))
+
+    await expect(send).rejects.toEqual(toSafeAppError({ code: 'AUTH_OTP_EXPIRED' }))
+    await expect(app.service.verifyOtp({ challengeId: 'challenge_1', code: '123456' }))
+      .rejects.toEqual(toSafeAppError({ code: 'AUTH_OTP_EXPIRED' }))
+    expect(app.verifyOtp).not.toHaveBeenCalled()
+  })
+
   it('persists the complete internal session only through AuthSecretStore', async () => {
     const app = harness()
     vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSession('Alice_1', {
@@ -387,6 +442,40 @@ describe('CloudBaseAuthService', () => {
     expect(app.port.setSession).not.toHaveBeenCalled()
     expect(JSON.parse(app.stored.get(SESSION_KEY) ?? '')).toMatchObject({
       accessToken: 'refreshed-access-token',
+      refreshToken: 'rotated-refresh-token',
+    })
+  })
+
+  it('serializes concurrent session restore so rotated credentials cannot be deleted as stale', async () => {
+    const app = harness()
+    const restoreStarted = deferred<void>()
+    const restoreResponse = deferred<unknown>()
+    app.stored.set(SESSION_KEY, storedSession())
+    vi.mocked(app.port.getSession)
+      .mockResolvedValueOnce(noSessionResponse())
+      .mockResolvedValueOnce(authResponse(cloudSession('Rotated User', {
+        accessToken: 'rotated-access-token',
+        refreshToken: 'rotated-refresh-token',
+      })))
+    vi.mocked(app.port.setSession).mockImplementation(() => {
+      restoreStarted.resolve()
+      return restoreResponse.promise
+    })
+
+    const first = app.service.getSession()
+    await restoreStarted.promise
+    const second = app.service.getSession()
+
+    expect(app.port.getSession).toHaveBeenCalledTimes(1)
+    restoreResponse.resolve(authResponse(cloudSession('Rotated User', {
+      accessToken: 'rotated-access-token',
+      refreshToken: 'rotated-refresh-token',
+    })))
+    await expect(first).resolves.toMatchObject({ user: { account: 'Rotated User' } })
+    await expect(second).resolves.toMatchObject({ user: { account: 'Rotated User' } })
+    expect(app.secrets.delete).not.toHaveBeenCalled()
+    expect(JSON.parse(app.stored.get(SESSION_KEY) ?? '')).toMatchObject({
+      accessToken: 'rotated-access-token',
       refreshToken: 'rotated-refresh-token',
     })
   })
@@ -487,6 +576,19 @@ describe('CloudBaseAuthService', () => {
     expect(app.stored.has(SESSION_KEY)).toBe(false)
   })
 
+  it('maps synchronous secret deletion failures to a fixed internal error', async () => {
+    const app = harness()
+    const encryptedValue = storedSession()
+    app.stored.set(SESSION_KEY, encryptedValue)
+    vi.mocked(app.port.signOut).mockResolvedValue(undefined)
+    vi.mocked(app.secrets.delete).mockImplementation(() => {
+      throw new Error('raw secure storage detail')
+    })
+
+    await expect(app.service.logout()).rejects.toEqual(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    expect(app.stored.get(SESSION_KEY)).toBe(encryptedValue)
+  })
+
   it('preserves credentials and consumes pending challenges when logout fails', async () => {
     const app = harness()
     const encryptedValue = storedSession()
@@ -505,6 +607,56 @@ describe('CloudBaseAuthService', () => {
     expect(app.stored.get(SESSION_KEY)).toBe(encryptedValue)
     await expect(app.service.verifyOtp({ challengeId: challenge.challengeId, code: '123456' }))
       .rejects.toEqual(toSafeAppError({ code: 'AUTH_OTP_EXPIRED' }))
+  })
+
+  it('runs logout after an in-flight password login and removes its persisted session', async () => {
+    const app = harness()
+    const started = deferred<void>()
+    const response = deferred<unknown>()
+    vi.mocked(app.port.signInWithPassword).mockImplementation(() => {
+      started.resolve()
+      return response.promise
+    })
+    vi.mocked(app.port.signOut).mockResolvedValue(undefined)
+
+    const login = app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+    await started.promise
+    const logout = app.service.logout()
+
+    expect(app.port.signOut).not.toHaveBeenCalled()
+    response.resolve(authResponse())
+    await expect(login).resolves.toMatchObject({ user: { id: 'cloud_uid' } })
+    await expect(logout).resolves.toBeUndefined()
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+    expect(vi.mocked(app.secrets.set).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(app.port.signOut).mock.invocationCallOrder[0] ?? 0)
+  })
+
+  it('runs logout after an in-flight OTP verification and removes its persisted session', async () => {
+    const app = harness()
+    const started = deferred<void>()
+    const response = deferred<unknown>()
+    vi.mocked(app.port.signInWithOtp).mockResolvedValue(otpResponse(app.verifyOtp))
+    app.verifyOtp.mockImplementation(() => {
+      started.resolve()
+      return response.promise
+    })
+    vi.mocked(app.port.signOut).mockResolvedValue(undefined)
+    const challenge = await app.service.sendOtp({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })
+
+    const verification = app.service.verifyOtp({ challengeId: challenge.challengeId, code: '123456' })
+    await started.promise
+    const logout = app.service.logout()
+
+    expect(app.port.signOut).not.toHaveBeenCalled()
+    response.resolve(authResponse())
+    await expect(verification).resolves.toMatchObject({ user: { id: 'cloud_uid' } })
+    await expect(logout).resolves.toBeUndefined()
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+    expect(vi.mocked(app.secrets.set).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(app.port.signOut).mock.invocationCallOrder[0] ?? 0)
   })
 
   it('requires a real CloudBase session', async () => {

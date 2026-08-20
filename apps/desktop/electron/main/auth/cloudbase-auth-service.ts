@@ -234,6 +234,8 @@ function publicSession(session: CloudBaseSession, authenticatedAt: string): Auth
 
 export class CloudBaseAuthService implements AuthService {
   private readonly challenges = new Map<string, PendingChallenge>()
+  private challengeGeneration = 0
+  private sessionOperationTail: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly auth: CloudBaseAuthPort,
@@ -247,6 +249,7 @@ export class CloudBaseAuthService implements AuthService {
   async sendOtp(input: AuthOtpRequest): Promise<AuthOtpChallenge> {
     const parsed = authOtpRequestSchema.safeParse(input)
     if (!parsed.success) throw failure('INVALID_INPUT')
+    const generation = ++this.challengeGeneration
     this.challenges.clear()
 
     const target = cloudBaseOtpTarget(parsed.data.channel, parsed.data.target)
@@ -261,8 +264,11 @@ export class CloudBaseAuthService implements AuthService {
             nickname: parsed.data.account,
           })
     } catch (error) {
+      if (generation !== this.challengeGeneration) throw failure('AUTH_OTP_EXPIRED')
       throw providerFailure(error)
     }
+
+    if (generation !== this.challengeGeneration) throw failure('AUTH_OTP_EXPIRED')
 
     const challengeId = this.dependencies.createId()
     this.challenges.set(challengeId, {
@@ -283,15 +289,17 @@ export class CloudBaseAuthService implements AuthService {
     }
     this.challenges.delete(parsed.data.challengeId)
 
-    let response: unknown
-    try {
-      response = await challenge.verifyOtp({ token: parsed.data.code })
-    } catch (error) {
-      throw providerFailure(error)
-    }
-    const session = cloudBaseSession(response)
-    if (!session) throw failure('INTERNAL_ERROR')
-    return this.persist(session, new Date(this.dependencies.now()).toISOString())
+    return this.runSessionOperation(async () => {
+      let response: unknown
+      try {
+        response = await challenge.verifyOtp({ token: parsed.data.code })
+      } catch (error) {
+        throw providerFailure(error)
+      }
+      const session = cloudBaseSession(response)
+      if (!session) throw failure('INTERNAL_ERROR')
+      return this.persist(session, new Date(this.dependencies.now()).toISOString())
+    })
   }
 
   async cancelOtp(challengeId: string): Promise<void> {
@@ -303,24 +311,30 @@ export class CloudBaseAuthService implements AuthService {
   async loginWithPassword(input: AuthCredentials): Promise<AuthSession> {
     const parsed = authCredentialsSchema.safeParse(input)
     if (!parsed.success) throw failure('INVALID_INPUT')
-    let response: unknown
-    try {
-      response = await this.auth.signInWithPassword(cloudBasePasswordCredentials(parsed.data))
-    } catch (error) {
-      throw providerFailure(error)
-    }
-    const session = cloudBaseSession(response)
-    if (!session) throw failure('INTERNAL_ERROR')
-    return this.persist(session, new Date(this.dependencies.now()).toISOString())
+    return this.runSessionOperation(async () => {
+      let response: unknown
+      try {
+        response = await this.auth.signInWithPassword(cloudBasePasswordCredentials(parsed.data))
+      } catch (error) {
+        throw providerFailure(error)
+      }
+      const session = cloudBaseSession(response)
+      if (!session) throw failure('INTERNAL_ERROR')
+      return this.persist(session, new Date(this.dependencies.now()).toISOString())
+    })
   }
 
   async getSession(): Promise<AuthSession | null> {
+    return this.runSessionOperation(() => this.getSessionWithoutLock())
+  }
+
+  private async getSessionWithoutLock(): Promise<AuthSession | null> {
     let currentResponse: unknown
     try {
       currentResponse = await this.auth.getSession()
     } catch (error) {
       if (invalidStoredCredentials(error)) {
-        this.secrets.delete(SESSION_KEY)
+        this.deleteStoredSession()
         return null
       }
       throw providerFailure(error)
@@ -329,7 +343,7 @@ export class CloudBaseAuthService implements AuthService {
     const currentError = responseError(currentResponse)
     if (currentError !== undefined) {
       if (invalidStoredCredentials(currentError)) {
-        this.secrets.delete(SESSION_KEY)
+        this.deleteStoredSession()
         return null
       }
       throw providerFailure(currentError)
@@ -348,7 +362,7 @@ export class CloudBaseAuthService implements AuthService {
     if (serialized === undefined) return null
     const stored = parseStoredSession(serialized)
     if (!stored) {
-      this.secrets.delete(SESSION_KEY)
+      this.deleteStoredSession()
       return null
     }
 
@@ -362,7 +376,7 @@ export class CloudBaseAuthService implements AuthService {
           })
     } catch (error) {
       if (invalidStoredCredentials(error)) {
-        this.secrets.delete(SESSION_KEY)
+        this.deleteStoredSession()
         return null
       }
       throw providerFailure(error)
@@ -371,30 +385,33 @@ export class CloudBaseAuthService implements AuthService {
     const restoreError = responseError(restoredResponse)
     if (restoreError !== undefined) {
       if (invalidStoredCredentials(restoreError)) {
-        this.secrets.delete(SESSION_KEY)
+        this.deleteStoredSession()
         return null
       }
       throw providerFailure(restoreError)
     }
     const restored = cloudBaseSession(restoredResponse, true)
     if (!restored) {
-      this.secrets.delete(SESSION_KEY)
+      this.deleteStoredSession()
       return null
     }
     return this.persist(restored, stored.authenticatedAt)
   }
 
   async logout(): Promise<void> {
+    this.challengeGeneration++
     this.challenges.clear()
-    let response: unknown
-    try {
-      response = await this.auth.signOut()
-    } catch (error) {
-      if (!alreadySignedOut(error)) throw failure('INTERNAL_ERROR')
-    }
-    const error = responseError(response)
-    if (error !== undefined && !alreadySignedOut(error)) throw failure('INTERNAL_ERROR')
-    this.secrets.delete(SESSION_KEY)
+    return this.runSessionOperation(async () => {
+      let response: unknown
+      try {
+        response = await this.auth.signOut()
+      } catch (error) {
+        if (!alreadySignedOut(error)) throw failure('INTERNAL_ERROR')
+      }
+      const error = responseError(response)
+      if (error !== undefined && !alreadySignedOut(error)) throw failure('INTERNAL_ERROR')
+      this.deleteStoredSession()
+    })
   }
 
   async requireSession(): Promise<AuthSession> {
@@ -417,5 +434,19 @@ export class CloudBaseAuthService implements AuthService {
       throw failure('INTERNAL_ERROR')
     }
     return result
+  }
+
+  private runSessionOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.sessionOperationTail.then(operation)
+    this.sessionOperationTail = result.then(() => undefined, () => undefined)
+    return result
+  }
+
+  private deleteStoredSession(): void {
+    try {
+      this.secrets.delete(SESSION_KEY)
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
   }
 }
