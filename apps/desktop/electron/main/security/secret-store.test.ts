@@ -42,6 +42,24 @@ describe('SecretStore', () => {
     expect(await store.get('openrouter_api_key')).toBe('sk-or-secret')
   })
 
+  it('never stores CloudBase session tokens as plaintext', async () => {
+    const database = openTestDatabase()
+    const store = new SecretStore(database.encryptedSecrets, fakeSafeStorage())
+    const session = JSON.stringify({
+      accessToken: 'sample-cloudbase-access-token',
+      refreshToken: 'sample-cloudbase-refresh-token',
+      expiresAt: 1_787_014_800_000,
+      authenticatedAt: '2026-08-18T00:00:00.000Z',
+    })
+
+    await store.set('cloudbase_auth_session', session)
+
+    const rawCiphertext = database.encryptedSecrets.raw('cloudbase_auth_session')
+    expect(rawCiphertext).not.toContain('sample-cloudbase-access-token')
+    expect(rawCiphertext).not.toContain('sample-cloudbase-refresh-token')
+    expect(await store.get('cloudbase_auth_session')).toBe(session)
+  })
+
   it('rejects a save when encryption is unavailable', async () => {
     const database = openTestDatabase()
     const store = new SecretStore(database.encryptedSecrets, fakeSafeStorage({ available: false }))

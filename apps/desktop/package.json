@@ -19,6 +19,7 @@
     "@autoforge/shared": "workspace:*",
     "@autoforge/workflow-schema": "workspace:*",
     "@autoforge/workflow-sdk": "workspace:*",
+    "@cloudbase/js-sdk": "3.8.0",
     "@element-plus/icons-vue": "2.3.2",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
@@ -38,6 +39,7 @@
     "socks-proxy-agent": "10.1.0",
     "vue": "3.5.40",
     "vue-router": "5.2.0",
+    "ws": "8.21.1",
     "zod": "4.4.3"
   },
   "devDependencies": {

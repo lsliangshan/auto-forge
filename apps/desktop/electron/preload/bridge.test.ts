@@ -21,21 +21,35 @@ function harness(ports: Partial<DesktopBridgePorts> = {}) {
 }
 
 describe('preload desktop bridge', () => {
-  it('maps the fixed local authentication methods', async () => {
+  it('maps the fixed CloudBase authentication methods', async () => {
     const app = harness()
     await app.api.auth.getSession()
-    await app.api.auth.login({ account: 'Alice', password: 'password' })
-    await app.api.auth.register({ account: 'Bob', password: 'password' })
+    await app.api.auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })
+    await app.api.auth.verifyOtp({ challengeId: 'challenge_1', code: '123456' })
+    await app.api.auth.cancelOtp('challenge_1')
+    await app.api.auth.loginWithPassword({ account: 'Alice_1', password: 'password' })
     await app.api.auth.logout()
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.authGetSession, undefined)
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.authLogin, {
-      account: 'Alice', password: 'password',
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.authSendOtp, {
+      intent: 'login', channel: 'phone', target: '18311032722',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.authRegister, {
-      account: 'Bob', password: 'password',
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.authVerifyOtp, {
+      challengeId: 'challenge_1', code: '123456',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.authLogout, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.authCancelOtp, {
+      challengeId: 'challenge_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.authLoginWithPassword, {
+      account: 'Alice_1', password: 'password',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(6, ipcChannels.authLogout, undefined)
+    expect(Object.keys(app.api.auth)).toEqual([
+      'getSession', 'sendOtp', 'verifyOtp', 'cancelOtp', 'loginWithPassword', 'logout',
+    ])
+    expect(app.api.auth).not.toHaveProperty('invoke')
+    expect(app.api.auth).not.toHaveProperty('login')
+    expect(app.api.auth).not.toHaveProperty('register')
   })
 
   it('exposes only the fixed profile operations', async () => {

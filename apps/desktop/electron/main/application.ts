@@ -7,6 +7,7 @@ import {
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
+  type AuthSession,
   type ChatBlock,
   type ChatEvent,
   type DeveloperProject,
@@ -28,9 +29,10 @@ import {
   createAgentPersistence,
   type AgentRunResult,
 } from './agent/agent-orchestrator.js'
-import { LocalAuthService } from './auth/local-auth-service.js'
-import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
-import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
+import type { AuthService } from './auth/auth-service.js'
+import { createCloudBaseAuthPort, readCloudBaseAuthConfig } from './auth/cloudbase-auth-port.js'
+import { CloudBaseAuthService } from './auth/cloudbase-auth-service.js'
+import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
@@ -51,6 +53,7 @@ import {
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
+import type { LocalAuthRepository } from './database/local-auth-repository.js'
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
@@ -100,7 +103,6 @@ type ApplicationFailureSource =
   | 'media-cancel'
   | 'chat-drain'
   | 'execution-shutdown'
-  | 'browser-shutdown'
   | 'database-close'
 
 interface ApplicationFailureRecord {
@@ -121,7 +123,6 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'media-cancel': 50,
   'chat-drain': 60,
   'execution-shutdown': 70,
-  'browser-shutdown': 75,
   'database-close': 80,
 }
 
@@ -151,6 +152,8 @@ export function createApplicationFailureRecorder(
 export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
+  authService?: AuthService
+  cloudbaseEnv?: NodeJS.ProcessEnv
   networkProxy: NetworkProxyPort
   mediaTransport?: PinnedMediaTransportPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
@@ -164,9 +167,62 @@ export interface ApplicationRuntimeOptions {
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
-  browserWorkspace: BrowserWorkspacePort
+  browserRuntime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
+}
+
+interface ObservedAuthService extends AuthService {
+  isAuthenticated(): boolean
+}
+
+function observeAuthService(
+  delegate: AuthService,
+  identities: Pick<LocalAuthRepository, 'ensureExternalIdentity'>,
+): ObservedAuthService {
+  let authenticated = false
+  const project = (session: AuthSession): AuthSession => {
+    try {
+      identities.ensureExternalIdentity(session.user, Date.now())
+      return session
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+  }
+  return {
+    async getSession() {
+      const session = await delegate.getSession()
+      if (session === null) {
+        authenticated = false
+        return null
+      }
+      const projected = project(session)
+      authenticated = true
+      return projected
+    },
+    sendOtp: (input) => delegate.sendOtp(input),
+    async verifyOtp(input) {
+      const session = project(await delegate.verifyOtp(input))
+      authenticated = true
+      return session
+    },
+    cancelOtp: (challengeId) => delegate.cancelOtp(challengeId),
+    async loginWithPassword(input) {
+      const session = project(await delegate.loginWithPassword(input))
+      authenticated = true
+      return session
+    },
+    async logout() {
+      await delegate.logout()
+      authenticated = false
+    },
+    async requireSession() {
+      const session = project(await delegate.requireSession())
+      authenticated = true
+      return session
+    },
+    isAuthenticated: () => authenticated,
+  }
 }
 
 function failure(code: AppError['code']): AppError {
@@ -255,27 +311,21 @@ function summary(workflow: WorkflowDetail): WorkflowSummary {
   }
 }
 
-function projectEntries(root: string): Promise<{ files: string[]; directories: string[] }> {
+function projectFiles(root: string): Promise<string[]> {
   const ignoredDirectories = new Set(['.git', 'node_modules'])
-  const visit = async (directory: string, prefix = ''): Promise<{ files: string[]; directories: string[] }> => {
+  const visit = async (directory: string, prefix = ''): Promise<string[]> => {
     const entries = await readdir(directory, { withFileTypes: true })
-    const nested = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
+    const files = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
       && !(entry.isDirectory() && ignoredDirectories.has(entry.name))).map(async (entry) => {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name
-      if (!entry.isDirectory()) return { files: [relative], directories: [] }
-      const children = await visit(join(directory, entry.name), relative)
-      return { files: children.files, directories: [relative, ...children.directories] }
+      return entry.isDirectory() ? visit(join(directory, entry.name), relative) : [relative]
     }))
-    return {
-      files: nested.flatMap(({ files }) => files).sort(),
-      directories: nested.flatMap(({ directories }) => directories).sort(),
-    }
+    return files.flat().sort()
   }
   return visit(root)
 }
 
 async function developerProject(project: WorkflowProject): Promise<DeveloperProject> {
-  const entries = await projectEntries(project.rootPath)
   return {
     id: project.id,
     name: project.name,
@@ -283,7 +333,7 @@ async function developerProject(project: WorkflowProject): Promise<DeveloperProj
     status: ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
       ? project.status as DeveloperProject['status']
       : 'error',
-    ...entries,
+    files: await projectFiles(project.rootPath),
     updatedAt: new Date(project.updatedAt).toISOString(),
   }
 }
@@ -330,7 +380,14 @@ function executionSummary(execution: Execution): ExecutionSummary {
 
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
-  const auth = new LocalAuthService(database.localAuth)
+  const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
+  const auth = observeAuthService(
+    options.authService ?? new CloudBaseAuthService(
+      createCloudBaseAuthPort(readCloudBaseAuthConfig(options.cloudbaseEnv ?? process.env)),
+      secretStore,
+    ),
+    database.localAuth,
+  )
   const profiles = new ProfileService(auth, database.userProfiles)
   const qiniuUploader = new QiniuFileUploader({
     config: () => readQiniuConfig(options.qiniuEnv ?? process.env),
@@ -340,7 +397,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     upload: qiniuUploader,
   })
   const maintenance = new MaintenanceGate()
-  const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -420,8 +476,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const policy = new PolicyEngine(database.permissionGrants)
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
-    workspace: options.browserWorkspace,
-    currentUserId: async () => (await auth.getSession())?.user.id,
+    runtime: options.browserRuntime,
+    proxySnapshot: () => options.networkProxy.snapshot(),
+    profileDirectories: {
+      create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-browser-')) },
+      remove: (path) => rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }),
+    },
   })
   const sourceResolver: WorkflowExecutionSourceResolver = {
     async resolve(id, version, selector) {
@@ -624,22 +684,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const services: DesktopIpcServices = {
     auth: {
       getSession: () => auth.getSession(),
-      login: async (input) => {
-        const previous = await auth.getSession()
-        const next = await auth.login(input)
-        if (previous?.user.id !== next.user.id) await browser.reset()
-        return next
-      },
-      register: async (input) => {
-        const previous = await auth.getSession()
-        const next = await auth.register(input)
-        if (previous?.user.id !== next.user.id) await browser.reset()
-        return next
-      },
-      logout: async () => {
-        await auth.logout()
-        await browser.reset()
-      },
+      sendOtp: (input) => auth.sendOtp(input),
+      verifyOtp: (input) => auth.verifyOtp(input),
+      cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
+      loginWithPassword: (input) => auth.loginWithPassword(input),
+      logout: () => auth.logout(),
       requireSession: () => auth.requireSession(),
     },
     profile: {
@@ -902,30 +951,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       readFile: (projectId, relativePath) => projects.readFile(projectId, relativePath),
       writeFile: (projectId, relativePath, content) => projects.write(projectId, relativePath, content),
-      createEntry: async (projectId, parentPath, name, kind) => {
-        await projects.createEntry(projectId, parentPath, name, kind)
-        const project = database.workflowProjects.get(projectId)
-        if (!project) throw failure('NOT_FOUND')
-        return developerProject(project)
-      },
-      renameEntry: async (projectId, relativePath, name) => {
-        await projects.renameEntry(projectId, relativePath, name)
-        const project = database.workflowProjects.get(projectId)
-        if (!project) throw failure('NOT_FOUND')
-        return developerProject(project)
-      },
-      deleteEntry: async (projectId, relativePath) => {
-        await projects.deleteEntry(projectId, relativePath)
-        const project = database.workflowProjects.get(projectId)
-        if (!project) throw failure('NOT_FOUND')
-        return developerProject(project)
-      },
       build: async (projectId) => developerProject(await projects.build(projectId)),
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {
         const releaseStart = maintenance.beginStart()
         try {
-          const session = await auth.requireSession()
           const built = await projects.build(projectId)
           const manifest = built.manifest as WorkflowManifest
           try {
@@ -936,7 +966,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw failure('INVALID_INPUT')
           }
           const started = await executions.start({
-            userId: session.user.id,
             workflowId: manifest.id,
             workflowVersion: manifest.version,
             input,
@@ -1024,11 +1053,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
           await options.networkProxy.transition(candidate.proxy)
           try {
-            await browser.updateProxy()
             return settings.commit(candidate)
           } catch {
             await options.networkProxy.transitionOrFailClosed(previous.proxy)
-            await browser.updateProxy()
             throw failure('INTERNAL_ERROR')
           }
         })
@@ -1138,7 +1165,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
         })
         await capture('execution-shutdown', () => executions.shutdown())
-        await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped
         await capture('database-close', () => { database.close() })
         const terminalFailure = failureRecorder.select()

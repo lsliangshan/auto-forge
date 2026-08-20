@@ -4,7 +4,14 @@ import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  authCredentialsSchema,
+  authOtpRequestSchema,
+  authOtpVerificationSchema,
   toSafeAppError,
+  type AppError,
+  type AuthCredentials,
+  type AuthOtpRequest,
+  type AuthSession,
   type ChatEvent,
   type ChatSendInput,
   type ModelInfo,
@@ -16,6 +23,7 @@ import {
   MaintenanceGate,
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
+import type { AuthService } from './auth/auth-service.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
@@ -31,7 +39,6 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
-import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 
 const directories: string[] = []
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
@@ -61,18 +68,8 @@ function createNetworkProxy() {
     transition,
     transitionOrFailClosed: transition,
     fetch: vi.fn(globalThis.fetch),
-    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>' })),
+    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
     withTransportLease,
-  }
-}
-
-function createBrowserWorkspace(): BrowserWorkspacePort {
-  return {
-    acquire: vi.fn(async () => { throw new Error('Unexpected browser acquisition') }),
-    releaseExecution: vi.fn(async () => undefined),
-    updateProxy: vi.fn(async () => undefined),
-    reset: vi.fn(async () => undefined),
-    shutdown: vi.fn(async () => undefined),
   }
 }
 
@@ -114,6 +111,81 @@ function serializedProxyHarness() {
 
 let networkProxy = createNetworkProxy()
 type RuntimeOptions = Parameters<typeof createApplicationRuntime>[0]
+
+function createTestAuthService(): AuthService {
+  const users = new Map<string, { session: AuthSession; password: string; target: string }>()
+  const challenges = new Map<string, AuthOtpRequest>()
+  let currentSession: AuthSession | null = null
+  let challengeSequence = 0
+
+  const failure = (code: AppError['code']) => toSafeAppError({ code })
+  const sessionFor = (account: string): AuthSession => ({
+    user: { id: `test_user_${account.toLowerCase()}`, account },
+    authenticatedAt: new Date(0).toISOString(),
+  })
+
+  return {
+    async getSession() { return currentSession },
+    async sendOtp(input) {
+      const parsed = authOtpRequestSchema.safeParse(input)
+      if (!parsed.success) throw failure('INVALID_INPUT')
+      if (parsed.data.intent === 'register' && users.has(parsed.data.account.toLowerCase())) {
+        throw failure('AUTH_ACCOUNT_EXISTS')
+      }
+      if (parsed.data.intent === 'login'
+        && ![...users.values()].some((user) => user.target === parsed.data.target)) {
+        throw failure('AUTH_ACCOUNT_NOT_FOUND')
+      }
+      challenges.clear()
+      const challengeId = `test_challenge_${++challengeSequence}`
+      challenges.set(challengeId, parsed.data)
+      return { challengeId, expiresIn: 300 }
+    },
+    async verifyOtp(input) {
+      const parsed = authOtpVerificationSchema.safeParse(input)
+      if (!parsed.success) throw failure('INVALID_INPUT')
+      const challenge = challenges.get(parsed.data.challengeId)
+      challenges.delete(parsed.data.challengeId)
+      if (!challenge) throw failure('AUTH_OTP_EXPIRED')
+      if (parsed.data.code !== '123456') throw failure('AUTH_INVALID_OTP')
+      if (challenge.intent === 'register') {
+        const session = sessionFor(challenge.account)
+        users.set(challenge.account.toLowerCase(), {
+          session,
+          password: challenge.password,
+          target: challenge.target,
+        })
+        currentSession = session
+        return session
+      }
+      const user = [...users.values()].find((candidate) => candidate.target === challenge.target)
+      if (!user) throw failure('AUTH_ACCOUNT_NOT_FOUND')
+      currentSession = user.session
+      return user.session
+    },
+    async cancelOtp(challengeId) {
+      const parsed = authOtpVerificationSchema.shape.challengeId.safeParse(challengeId)
+      if (!parsed.success) throw failure('INVALID_INPUT')
+      challenges.delete(parsed.data)
+    },
+    async loginWithPassword(input: AuthCredentials) {
+      const parsed = authCredentialsSchema.safeParse(input)
+      if (!parsed.success) throw failure('INVALID_INPUT')
+      const user = users.get(parsed.data.account.toLowerCase())
+      if (!user || user.password !== parsed.data.password) throw failure('AUTH_INVALID_CREDENTIALS')
+      currentSession = user.session
+      return user.session
+    },
+    async logout() {
+      challenges.clear()
+      currentSession = null
+    },
+    async requireSession() {
+      if (!currentSession) throw failure('AUTH_REQUIRED')
+      return currentSession
+    },
+  }
+}
 
 function snapshotProvider(
   providerId: 'openrouter' | 'deepseek',
@@ -160,6 +232,7 @@ function options(
   root: string,
   overrides: Partial<RuntimeOptions> = {},
 ): RuntimeOptions {
+  const authService = createTestAuthService()
   return {
     paths: {
       database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
@@ -180,7 +253,8 @@ function options(
     emitChat: vi.fn(),
     emitExecution: vi.fn(),
     networkProxy,
-    browserWorkspace: createBrowserWorkspace(),
+    browserRuntime: { packaged: false },
+    authService,
     ...overrides,
   }
 }
@@ -199,8 +273,21 @@ function chatInput(conversationId: string, content: string): ChatSendInput {
   }
 }
 
-async function authenticate(runtime: ReturnType<typeof createApplicationRuntime>) {
-  return runtime.services.auth.register({ account: 'TestUser', password: 'password' })
+async function authenticate(
+  runtime: ReturnType<typeof createApplicationRuntime>,
+  account = 'TestUser',
+) {
+  const challenge = await runtime.services.auth.sendOtp({
+    intent: 'register',
+    channel: 'email',
+    target: `${account.toLowerCase()}@example.com`,
+    account,
+    password: 'password',
+  })
+  return runtime.services.auth.verifyOtp({
+    challengeId: challenge.challengeId,
+    code: '123456',
+  })
 }
 
 async function installApprovalWorkflow(
@@ -331,20 +418,14 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const databasePath = join(root, 'autoforge.sqlite')
     const database = openAppDatabase(databasePath)
-    database.localAuth.createUserAndSession({
-      id: 'user_other', account: 'Other', accountNormalized: 'other',
-      passwordDigest: 'digest-other', createdAt: 1, updatedAt: 1,
-    }, 1)
-    database.localAuth.createUserAndSession({
-      id: 'user_usage', account: 'Usage', accountNormalized: 'usage',
-      passwordDigest: 'digest-usage', createdAt: 2, updatedAt: 2,
-    }, 2)
+    database.localAuth.ensureExternalIdentity({ id: 'test_user_other', account: 'Other' }, 1)
+    database.localAuth.ensureExternalIdentity({ id: 'test_user_usage', account: 'Usage' }, 2)
     database.conversations.insert({ id: 'usage_conversation', title: 'Usage' })
     database.chatRuns.insert({
       id: 'usage_run',
       conversationId: 'usage_conversation',
       requestId: 'usage_request',
-      userId: 'user_usage',
+      userId: 'test_user_usage',
       provider: 'openrouter',
       model: 'alpha/model',
       status: 'failed',
@@ -356,7 +437,7 @@ describe('createApplicationRuntime', () => {
       id: 'other_usage_run',
       conversationId: 'usage_conversation',
       requestId: 'other_usage_request',
-      userId: 'user_other',
+      userId: 'test_user_other',
       provider: 'deepseek',
       model: 'other/model',
       status: 'failed',
@@ -367,7 +448,7 @@ describe('createApplicationRuntime', () => {
     database.providerUsage.start({
       id: 'usage_cost',
       operationKey: 'usage_cost',
-      userId: 'user_usage',
+      userId: 'test_user_usage',
       provider: 'openrouter',
       requestId: 'usage_request',
       model: 'alpha/model',
@@ -381,7 +462,7 @@ describe('createApplicationRuntime', () => {
     database.providerUsage.start({
       id: 'other_usage_cost',
       operationKey: 'other_usage_cost',
-      userId: 'user_other',
+      userId: 'test_user_other',
       provider: 'openrouter',
       requestId: 'other_usage_request',
       model: 'other/model',
@@ -398,6 +479,7 @@ describe('createApplicationRuntime', () => {
     vi.setSystemTime(new Date(2026, 7, 17, 12))
     const runtime = createApplicationRuntime(options(root))
     try {
+      await authenticate(runtime, 'Usage')
       const usage = await runtime.services.settings.getTokenUsage()
 
       expect(usage.generatedAt).toBe(new Date(2026, 7, 17, 12).toISOString())
@@ -431,54 +513,63 @@ describe('createApplicationRuntime', () => {
     }
   })
 
-  it('exposes persistent local authentication through runtime services', async () => {
+  it('uses the injected auth service and keeps business gates on its session', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-'))
     directories.push(root)
-    const runtime = createApplicationRuntime(options(root))
+    const authService = createTestAuthService()
+    const runtime = createApplicationRuntime(options(root, { authService }))
 
-    await expect(runtime.services.auth.getSession()).resolves.toBeNull()
-    await expect(runtime.services.auth.requireSession()).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
-    const registered = await runtime.services.auth.register({ account: 'Alice', password: 'password' })
-    expect(registered.user.account).toBe('Alice')
-    await expect(runtime.services.auth.getSession()).resolves.toEqual(registered)
+    await expect(runtime.services.auth.requireSession())
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    const session = await authenticate(runtime, 'Alice')
+    expect(session.user.account).toBe('Alice')
+    expect(runtime.services.auth).toMatchObject({
+      getSession: expect.any(Function),
+      sendOtp: expect.any(Function),
+      verifyOtp: expect.any(Function),
+      cancelOtp: expect.any(Function),
+      loginWithPassword: expect.any(Function),
+      logout: expect.any(Function),
+      requireSession: expect.any(Function),
+    })
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(sqlite.prepare(`
+      SELECT id, account, account_normalized AS accountNormalized
+      FROM local_users
+      WHERE id = ?
+    `).get(session.user.id)).toEqual({
+      id: session.user.id,
+      account: 'Alice',
+      accountNormalized: `cloudbase:${session.user.id}`,
+    })
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
+      .toEqual({ count: 0 })
     await runtime.services.auth.logout()
     await expect(runtime.services.auth.getSession()).resolves.toBeNull()
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_users WHERE id = ?')
+      .get(session.user.id)).toEqual({ count: 1 })
+    sqlite.close()
     await expect(runtime.services.settings.getTokenUsage())
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await runtime.close()
   })
 
-  it('closes live browser tabs when the authenticated AutoForge user changes', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-user-'))
+  it('maps an external identity projection failure to a safe application error', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-projection-error-'))
     directories.push(root)
-    const browserWorkspace = createBrowserWorkspace()
-    const runtime = createApplicationRuntime(options(root, { browserWorkspace }))
-
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
-    expect(browserWorkspace.reset).toHaveBeenCalledOnce()
-    await runtime.services.auth.logout()
-    expect(browserWorkspace.reset).toHaveBeenCalledTimes(2)
-
-    await runtime.close()
-  })
-
-  it('returns refreshed file and directory entries after developer mutations', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-entries-'))
-    directories.push(root)
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.localAuth.createUserAndSession({
+      id: 'test_user_alice', account: 'LegacyAlice', accountNormalized: 'legacyalice',
+      passwordDigest: 'legacy-digest', createdAt: 1, updatedAt: 1,
+    }, 1)
+    database.localAuth.clearSession()
+    database.close()
     const runtime = createApplicationRuntime(options(root))
 
-    const created = await runtime.services.developer.createProject('Entry workflow')
-    expect(created.directories).toEqual(['src'])
-    const withDirectory = await runtime.services.developer.createEntry(created.id, '', 'docs', 'directory')
-    const withFile = await runtime.services.developer.createEntry(created.id, 'docs', 'notes.md', 'file')
-    const renamed = await runtime.services.developer.renameEntry(created.id, 'docs/notes.md', 'readme.md')
-    const deleted = await runtime.services.developer.deleteEntry(created.id, 'docs/readme.md')
-
-    expect(withDirectory.directories).toEqual(['docs', 'src'])
-    expect(withFile.files).toContain('docs/notes.md')
-    expect(renamed.files).toContain('docs/readme.md')
-    expect(renamed.files).not.toContain('docs/notes.md')
-    expect(deleted.files).not.toContain('docs/readme.md')
+    await expect(authenticate(runtime, 'Alice'))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    await expect(runtime.services.auth.getSession())
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
     await runtime.close()
   })
 
@@ -490,7 +581,7 @@ describe('createApplicationRuntime', () => {
       chooseAvatarFile: async () => undefined,
     })
     const runtime = createApplicationRuntime(runtimeOptions)
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
 
     await expect(runtime.services.profile.update({ displayName: 'Alice Zhang' })).resolves.toMatchObject({
       userId: expect.any(String), account: 'Alice', displayName: 'Alice Zhang',
@@ -536,7 +627,7 @@ describe('createApplicationRuntime', () => {
     expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(0)
     expect(emitChat).not.toHaveBeenCalled()
 
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
     const authenticated = await runtime.services.chat.send(chatInput(conversation.id, 'authenticated'))
     await vi.waitFor(() => expect(emitChat.mock.calls.some(([event]) => (
       event.type === 'status'
@@ -579,7 +670,7 @@ describe('createApplicationRuntime', () => {
       modelProviders: snapshotProviders({ openrouter, deepseek }),
       emitChat,
     }))
-    const alice = await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    const alice = await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-user-a')
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek-user-b')
     await runtime.services.settings.update({
@@ -594,7 +685,7 @@ describe('createApplicationRuntime', () => {
     const sending = runtime.services.chat.send(chatInput(openRouterConversation.id, 'owned by Alice'))
     await vi.waitFor(() => expect(openrouter.listModels).toHaveBeenCalledTimes(1))
     await runtime.services.auth.logout()
-    const bob = await runtime.services.auth.register({ account: 'Bob', password: 'password' })
+    const bob = await authenticate(runtime, 'Bobby')
     catalog.resolve([modelInfo('openai/gpt-4.1-mini', 'OpenRouter')])
     const openRouterRequest = await sending
     await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
@@ -675,7 +766,7 @@ describe('createApplicationRuntime', () => {
     })
     const emitChat = vi.fn()
     const runtime = createApplicationRuntime(options(root, { networkProxy: proxy, emitChat }))
-    const session = await runtime.services.auth.register({ account: 'SnapshotUser', password: 'password' })
+    const session = await authenticate(runtime, 'SnapshotUser')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter-a')
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
@@ -1237,7 +1328,7 @@ describe('createApplicationRuntime', () => {
       } }),
       emitChat,
     }))
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     vi.useFakeTimers()
@@ -1291,7 +1382,7 @@ describe('createApplicationRuntime', () => {
         getGenerationUsage: async (generationId) => ({ generationId }),
       } }),
     }))
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     vi.useFakeTimers()
@@ -1328,7 +1419,7 @@ describe('createApplicationRuntime', () => {
         getGenerationUsage: async (generationId) => ({ generationId }),
       } }),
     }))
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     vi.useFakeTimers()
@@ -1375,7 +1466,7 @@ describe('createApplicationRuntime', () => {
         getGenerationUsage: async (generationId) => ({ generationId }),
       } }),
     }))
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
     vi.useFakeTimers()
@@ -1794,6 +1885,7 @@ describe('createApplicationRuntime', () => {
     const chooseMediaSavePath = vi.fn(async () => copied)
     const revealPath = vi.fn()
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1812,7 +1904,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
@@ -1861,6 +1953,7 @@ describe('createApplicationRuntime', () => {
       }),
     }
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1881,7 +1974,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
 
     await authenticate(runtime)
@@ -1960,6 +2053,7 @@ describe('createApplicationRuntime', () => {
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -1986,7 +2080,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2122,6 +2216,7 @@ describe('createApplicationRuntime', () => {
     })
     const chatEvents: ChatEvent[] = []
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2148,9 +2243,9 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
-    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const settings = await runtime.services.settings.get()
     await runtime.services.settings.update({
@@ -2203,6 +2298,7 @@ describe('createApplicationRuntime', () => {
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2229,7 +2325,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2294,6 +2390,7 @@ describe('createApplicationRuntime', () => {
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2322,7 +2419,7 @@ describe('createApplicationRuntime', () => {
       emitExecution: vi.fn(),
       networkProxy,
       mediaTransport: { request: mediaRequest },
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2393,6 +2490,7 @@ describe('createApplicationRuntime', () => {
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2427,7 +2525,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2564,6 +2662,7 @@ describe('createApplicationRuntime', () => {
     const validateCredential = vi.fn(async () => ({ valid: false }))
     const listModels = vi.fn(async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')])
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2590,7 +2689,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -2644,6 +2743,7 @@ describe('createApplicationRuntime', () => {
     const source = join(root, 'source.png')
     await writeFile(source, Buffer.from('89504e470d0a1a0a', 'hex'))
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2663,7 +2763,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
 
     const deleted = await runtime.services.chat.createConversation()
@@ -2696,6 +2796,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-preferences-'))
     directories.push(root)
     const options: Parameters<typeof createApplicationRuntime>[0] = {
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2715,7 +2816,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     }
     const runtime = createApplicationRuntime(options)
     const conversation = await runtime.services.chat.createConversation()
@@ -2772,6 +2873,7 @@ describe('createApplicationRuntime', () => {
       })
     ))
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2801,7 +2903,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2833,6 +2935,7 @@ describe('createApplicationRuntime', () => {
       finishValidation = resolve
     }))
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2861,7 +2964,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -2887,6 +2990,7 @@ describe('createApplicationRuntime', () => {
       directories.push(root)
       const pollVideo = vi.fn(async () => ({ status: 'pending' as const }))
       const runtime = createApplicationRuntime({
+        authService: createTestAuthService(),
         paths: {
           database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
           projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2920,7 +3024,7 @@ describe('createApplicationRuntime', () => {
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
         networkProxy,
-        browserWorkspace: createBrowserWorkspace(),
+        browserRuntime: { packaged: false },
       })
       await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2970,6 +3074,7 @@ describe('createApplicationRuntime', () => {
         pollVideo,
       }
       const options: Parameters<typeof createApplicationRuntime>[0] = {
+        authService: createTestAuthService(),
         paths: {
           database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
           projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -2990,7 +3095,7 @@ describe('createApplicationRuntime', () => {
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
         networkProxy,
-        browserWorkspace: createBrowserWorkspace(),
+        browserRuntime: { packaged: false },
       }
       const runtime = createApplicationRuntime(options)
       await authenticate(runtime)
@@ -3051,6 +3156,7 @@ describe('createApplicationRuntime', () => {
     database.close()
 
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: databasePath, data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3070,7 +3176,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await runtime.recover()
     await expect(runtime.services.chat.listMessages('conversation_interrupted_image'))
@@ -3107,6 +3213,7 @@ describe('createApplicationRuntime', () => {
       }),
     }
     const options: Parameters<typeof createApplicationRuntime>[0] = {
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3133,7 +3240,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     }
     const runtime = createApplicationRuntime(options)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -3166,6 +3273,7 @@ describe('createApplicationRuntime', () => {
       }),
     }
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3198,7 +3306,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     let status: Awaited<ReturnType<typeof runtime.services.settings.saveProviderApiKey>> | undefined
     void runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -3219,6 +3327,7 @@ describe('createApplicationRuntime', () => {
     const openExternal = vi.fn().mockResolvedValue(undefined)
     const chatEvents: Array<{ type: string; status?: string }> = []
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3243,7 +3352,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
 
     await authenticate(runtime)
@@ -3294,6 +3403,7 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
 
     const restarted = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3316,7 +3426,7 @@ describe('createApplicationRuntime', () => {
       openExternal,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await restarted.recover()
     expect(await restarted.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
@@ -3332,6 +3442,7 @@ describe('createApplicationRuntime', () => {
     const streamFinished = new Promise<void>((resolve) => { finishStream = resolve })
     const chatEvents: Array<{ type: string; status?: string }> = []
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3358,7 +3469,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
     })
     await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -3449,6 +3560,7 @@ describe('createApplicationRuntime', () => {
     const cleanupStarted = new Promise<void>((resolve) => { markCleanupStarted = resolve })
     const cleanupFinished = new Promise<void>((resolve) => { finishCleanup = resolve })
     const runtime = createApplicationRuntime({
+      authService: createTestAuthService(),
       paths: {
         database: join(root, 'autoforge.sqlite'), data: root, logs: join(root, 'logs'),
         projects: join(root, 'projects'), installations: join(root, 'workflows'),
@@ -3471,14 +3583,13 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserWorkspace: createBrowserWorkspace(),
+      browserRuntime: { packaged: false },
       removeExecutionTemporaryDirectory: async (path: string) => {
         markCleanupStarted()
         await cleanupFinished
         await rm(path, { recursive: true, force: true })
       },
     })
-    await authenticate(runtime)
     const installedProject = await runtime.services.developer.createProject('Installed Debug Source')
     const selectedProject = await runtime.services.developer.createProject('Selected Debug Source')
     for (const [projectId, marker] of [[installedProject.id, 'installed'], [selectedProject.id, 'selected']] as const) {

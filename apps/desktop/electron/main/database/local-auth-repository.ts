@@ -16,6 +16,7 @@ export interface LocalAuthSessionRecord {
 
 export interface LocalAuthRepository {
   findUserByNormalizedAccount(accountNormalized: string): LocalUserRecord | undefined
+  ensureExternalIdentity(user: Pick<LocalUserRecord, 'id' | 'account'>, timestamp: number): LocalUserRecord
   createUserAndSession(user: LocalUserRecord, authenticatedAt: number): LocalAuthSessionRecord | undefined
   replaceSession(userId: string, authenticatedAt: number): LocalAuthSessionRecord
   getCurrentSession(): LocalAuthSessionRecord | undefined
@@ -36,6 +37,18 @@ function sessionFromRow(row: SessionRow): LocalAuthSessionRecord {
 }
 
 export function createLocalAuthRepository(database: Database.Database): LocalAuthRepository {
+  const findUserById = (id: string) => database.prepare(`
+    SELECT
+      id,
+      account,
+      account_normalized AS accountNormalized,
+      password_digest AS passwordDigest,
+      created_at AS createdAt,
+      updated_at AS updatedAt
+    FROM local_users
+    WHERE id = ?
+  `).get(id) as LocalUserRecord | undefined
+
   const findUserByNormalizedAccount = (accountNormalized: string) => database.prepare(`
     SELECT
       id,
@@ -89,8 +102,35 @@ export function createLocalAuthRepository(database: Database.Database): LocalAut
     writeSession(userId, authenticatedAt)
   ))
 
+  const ensureExternalIdentity = database.transaction((
+    user: Pick<LocalUserRecord, 'id' | 'account'>,
+    timestamp: number,
+  ) => {
+    const accountNormalized = `cloudbase:${user.id}`
+    const passwordDigest = `!external-identity:${user.id}`
+    database.prepare(`
+      INSERT INTO local_users
+        (id, account, account_normalized, password_digest, created_at, updated_at)
+      VALUES
+        (@id, @account, @accountNormalized, @passwordDigest, @timestamp, @timestamp)
+      ON CONFLICT(id) DO UPDATE SET
+        account = excluded.account,
+        updated_at = excluded.updated_at
+      WHERE local_users.account_normalized = excluded.account_normalized
+        AND local_users.password_digest = excluded.password_digest
+    `).run({ ...user, accountNormalized, passwordDigest, timestamp })
+    const stored = findUserById(user.id)
+    if (!stored
+      || stored.accountNormalized !== accountNormalized
+      || stored.passwordDigest !== passwordDigest) {
+      throw new Error('External identity projection was not persisted')
+    }
+    return stored
+  })
+
   return {
     findUserByNormalizedAccount,
+    ensureExternalIdentity,
     createUserAndSession,
     replaceSession,
     getCurrentSession() {

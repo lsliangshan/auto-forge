@@ -6,7 +6,7 @@ import {
   type UserProfile,
   type UserProfileUpdate,
 } from '@autoforge/shared'
-import type { AuthService } from '../auth/local-auth-service.js'
+import type { AuthService } from '../auth/auth-service.js'
 import type { UserProfileRecord, UserProfileRepository } from '../database/user-profile-repository.js'
 
 export interface ProfileServiceDependencies {

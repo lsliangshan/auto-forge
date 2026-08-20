@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { access, readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
@@ -23,5 +24,25 @@ describe('workspace', () => {
       '../apps/desktop/scripts/prepare-native-node.mjs',
       import.meta.url,
     ))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('loads the CloudBase SDK without missing runtime dependency warnings', () => {
+    const result = spawnSync(
+      process.execPath,
+      ['--input-type=module', '-e', "await import('@cloudbase/js-sdk')"],
+      {
+        cwd: new URL('../apps/desktop/', import.meta.url),
+        encoding: 'utf8',
+        env: {
+          PATH: process.env.PATH ?? '',
+          ...(process.env.ELECTRON_RUN_AS_NODE
+            ? { ELECTRON_RUN_AS_NODE: process.env.ELECTRON_RUN_AS_NODE }
+            : {}),
+        },
+      },
+    )
+
+    expect(result.status).toBe(0)
+    expect(`${result.stdout}${result.stderr}`).not.toContain('缺少依赖 ws')
   })
 })
