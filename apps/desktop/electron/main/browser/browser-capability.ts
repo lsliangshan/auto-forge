@@ -30,6 +30,7 @@ export interface BrowserAuthorizationPort {
 export interface BrowserCapabilityServiceOptions {
   authorization: BrowserAuthorizationPort
   workspace: BrowserWorkspacePort
+  currentUserId(): Promise<string | undefined> | string | undefined
 }
 
 interface ExecutionBrowserState {
@@ -101,6 +102,7 @@ export class PolicyEngineBrowserAuthorization implements BrowserAuthorizationPor
 export class BrowserCapabilityService implements CapabilityPort {
   private readonly executions = new Map<string, ExecutionBrowserState>()
   private readonly invalidatedExecutions = new Set<string>()
+  private identityEpoch = 0
   private stopped = false
 
   constructor(private readonly options: BrowserCapabilityServiceOptions) {}
@@ -129,7 +131,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     url: string,
     declaredScope?: CapabilityScope,
   ): Promise<void> {
-    const state = this.state(context, true)
+    const state = await this.stateForCurrentUser(context, true)
     const origin = originOf(url)
     await this.authorize(context, 'browser.open', declaredScope, origin)
     this.assertActive(state)
@@ -145,7 +147,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     value: string,
     declaredScope?: CapabilityScope,
   ): Promise<void> {
-    const state = this.state(context, false)
+    const state = await this.stateForCurrentUser(context, false)
     const tab = this.tab(state)
     const origin = await this.authorizeCurrent(state, 'browser.fill', declaredScope)
     this.assertActive(state)
@@ -158,7 +160,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     locator: string,
     declaredScope?: CapabilityScope,
   ): Promise<void> {
-    const state = this.state(context, false)
+    const state = await this.stateForCurrentUser(context, false)
     const tab = this.tab(state)
     const origin = await this.authorizeCurrent(state, 'browser.click', declaredScope)
     this.assertActive(state)
@@ -167,7 +169,7 @@ export class BrowserCapabilityService implements CapabilityPort {
   }
 
   async url(context: BrowserCapabilityContext, declaredScope?: CapabilityScope): Promise<string> {
-    const state = this.state(context, false)
+    const state = await this.stateForCurrentUser(context, false)
     const tab = this.tab(state)
     await this.authorizeCurrent(state, 'browser.url', declaredScope)
     this.assertActive(state)
@@ -177,7 +179,7 @@ export class BrowserCapabilityService implements CapabilityPort {
   }
 
   async close(context: BrowserCapabilityContext, declaredScope?: CapabilityScope): Promise<void> {
-    const state = this.state(context, false)
+    const state = await this.stateForCurrentUser(context, false)
     const tab = this.tab(state)
     await this.authorizeCurrent(state, 'browser.close', declaredScope)
     state.released = true
@@ -205,6 +207,7 @@ export class BrowserCapabilityService implements CapabilityPort {
   }
 
   async reset(): Promise<void> {
+    this.identityEpoch += 1
     const states = [...this.executions.values()]
     this.executions.clear()
     for (const state of states) {
@@ -236,6 +239,16 @@ export class BrowserCapabilityService implements CapabilityPort {
     const state: ExecutionBrowserState = { context: { ...context }, released: false }
     this.executions.set(context.executionId, state)
     return state
+  }
+
+  private async stateForCurrentUser(
+    context: BrowserCapabilityContext,
+    create: boolean,
+  ): Promise<ExecutionBrowserState> {
+    const epoch = this.identityEpoch
+    const currentUserId = await this.options.currentUserId()
+    if (currentUserId !== context.userId || epoch !== this.identityEpoch) throw failure('CANCELLED')
+    return this.state(context, create)
   }
 
   private tab(state: ExecutionBrowserState): BrowserWorkspaceTab {

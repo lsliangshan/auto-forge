@@ -226,23 +226,40 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private readonly executions = new Map<string, TargetTabState>()
   private readonly sessions = new Map<string, SessionPort>()
   private readonly sessionSetups = new Map<string, Promise<SessionPort>>()
+  private readonly acquisitions = new Set<Promise<BrowserWorkspaceTab>>()
   private windowCreation: Promise<void> | undefined
+  private resetOperation: Promise<void> | undefined
+  private lifecycleEpoch = 0
   private shuttingDown = false
   private closingViews = false
 
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
   async acquire(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
+    const acquisition = this.acquireCurrent(input)
+    this.acquisitions.add(acquisition)
+    try {
+      return await acquisition
+    } finally {
+      this.acquisitions.delete(acquisition)
+    }
+  }
+
+  private async acquireCurrent(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
+    if (this.resetOperation) await this.resetOperation
     if (this.shuttingDown) throw failure('CONFLICT')
+    const epoch = this.lifecycleEpoch
     const existing = [...this.tabs.values()].find((tab) => !tab.closed
       && !tab.ownerExecutionId
       && tab.activeOperations === 0
       && tab.userId === input.userId
       && tab.workflowId === input.workflowId)
     const state = existing ?? await this.createTab(input.userId, input.workflowId)
+    if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
     state.ownerExecutionId = input.executionId
     this.executions.set(input.executionId, state)
     await this.activate(state)
+    if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
     state.handle ??= new ElectronBrowserTab(this, state)
     return state.handle
   }
@@ -278,10 +295,25 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
+    this.lifecycleEpoch += 1
+    if (this.resetOperation) await this.resetOperation
+    await Promise.allSettled([...this.acquisitions])
     await this.closeWindow()
   }
 
-  async reset(): Promise<void> {
+  reset(): Promise<void> {
+    if (this.resetOperation) return this.resetOperation
+    const operation = this.performReset()
+    this.resetOperation = operation
+    void operation.finally(() => {
+      if (this.resetOperation === operation) this.resetOperation = undefined
+    }).catch(() => undefined)
+    return operation
+  }
+
+  private async performReset(): Promise<void> {
+    this.lifecycleEpoch += 1
+    await Promise.allSettled([...this.acquisitions])
     await this.closeWindow()
   }
 
@@ -648,6 +680,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private waitForNavigation(contents: WebContentsPort): Promise<void> {
     return new Promise((resolve) => {
       let started = false
+      let sameDocument = false
       let settled = false
       let detectionTimer: ReturnType<typeof setTimeout>
       let maximumTimer: ReturnType<typeof setTimeout>
@@ -659,18 +692,23 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         contents.removeListener('did-start-navigation', onStart)
         contents.removeListener('did-stop-loading', onStop)
         contents.removeListener('did-fail-load', onStop)
+        contents.removeListener('did-navigate-in-page', onInPage)
         contents.removeListener('destroyed', finish)
         resolve()
       }
       const onStart = (...args: unknown[]) => {
-        const details = args[0] as { isMainFrame?: boolean } | undefined
+        const details = args[0] as { isMainFrame?: boolean; isSameDocument?: boolean } | undefined
         const deprecatedIsMainFrame = args[3]
-        if (details?.isMainFrame !== false && deprecatedIsMainFrame !== false) started = true
+        if (details?.isMainFrame === false || deprecatedIsMainFrame === false) return
+        started = true
+        sameDocument = details?.isSameDocument === true || args[2] === true
       }
       const onStop = () => { if (started) finish() }
+      const onInPage = () => { if (started && sameDocument) finish() }
       contents.on('did-start-navigation', onStart)
       contents.on('did-stop-loading', onStop)
       contents.on('did-fail-load', onStop)
+      contents.on('did-navigate-in-page', onInPage)
       contents.on('destroyed', finish)
       detectionTimer = setTimeout(() => { if (!started) finish() }, 75)
       maximumTimer = setTimeout(finish, 30_000)

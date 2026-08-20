@@ -421,6 +421,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
     workspace: options.browserWorkspace,
+    currentUserId: async () => (await auth.getSession())?.user.id,
   })
   const sourceResolver: WorkflowExecutionSourceResolver = {
     async resolve(id, version, selector) {

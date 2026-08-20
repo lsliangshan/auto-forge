@@ -289,6 +289,17 @@ describe('ElectronBrowserWorkspace', () => {
     expect(windows).toHaveLength(2)
   })
 
+  it('invalidates an acquire already creating its first window when reset starts', async () => {
+    const { workspace, views, windows } = createHarness()
+
+    const opening = acquire(workspace, 'exec_1', 'user_1')
+    await workspace.reset()
+
+    await expect(opening).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(windows.every((window) => window.destroyed)).toBe(true)
+    expect(views.every((view) => view.webContents.destroyed)).toBe(true)
+  })
+
   it('blocks non-HTTPS and out-of-scope navigation while allowing released user navigation', async () => {
     const { workspace, views } = createHarness()
     const tab = await acquire(workspace, 'exec_1')
@@ -363,6 +374,35 @@ describe('ElectronBrowserWorkspace', () => {
     target.emit('did-stop-loading')
 
     await clicking
+  })
+
+  it('finishes click navigation when a same-document navigation completes in-page', async () => {
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '目录' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method] ?? {}
+    const { workspace, views } = createHarness(respond)
+    const tab = await acquire(workspace, 'exec_1')
+    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    const target = views[1]!.webContents
+    let settled = false
+
+    const clicking = tab.click('role=button[name="目录"]', 'https://www.baidu.com')
+      .finally(() => { settled = true })
+    while (!target.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
+      await Promise.resolve()
+    }
+    target.emit('did-start-navigation', { isMainFrame: true, isSameDocument: true })
+    target.emit('did-navigate-in-page')
+    for (let index = 0; index < 10; index += 1) await Promise.resolve()
+    const settledAfterInPage = settled
+    target.emit('did-stop-loading')
+    await clicking
+
+    expect(settledAfterInPage).toBe(true)
   })
 
   it('rejects invalid, missing, and duplicate locators', async () => {

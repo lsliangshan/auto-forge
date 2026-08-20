@@ -20,6 +20,7 @@ const context: BrowserCapabilityContext = {
 const baiduScope = { origins: ['https://www.baidu.com'] }
 
 function createHarness() {
+  let currentUserId: string | undefined = context.userId
   let currentUrl = 'about:blank'
   const tab: BrowserWorkspaceTab = {
     open: vi.fn(async (url) => { currentUrl = url }),
@@ -36,8 +37,19 @@ function createHarness() {
     shutdown: vi.fn(async () => undefined),
   }
   const authorize = vi.fn(async () => undefined)
-  const service = new BrowserCapabilityService({ authorization: { authorize }, workspace })
-  return { service, tab, workspace, authorize, setUrl: (value: string) => { currentUrl = value } }
+  const service = new BrowserCapabilityService({
+    authorization: { authorize },
+    workspace,
+    currentUserId: () => currentUserId,
+  })
+  return {
+    service,
+    tab,
+    workspace,
+    authorize,
+    setUrl: (value: string) => { currentUrl = value },
+    setCurrentUser: (value: string | undefined) => { currentUserId = value },
+  }
 }
 
 describe('PolicyEngineBrowserAuthorization', () => {
@@ -146,10 +158,12 @@ describe('BrowserCapabilityService', () => {
       acquire: vi.fn(() => new Promise<BrowserWorkspaceTab>((resolve) => { resolveAcquire = resolve })),
       releaseExecution: vi.fn(), updateProxy: vi.fn(), reset: vi.fn(), shutdown: vi.fn(),
     }
-    const service = new BrowserCapabilityService({ authorization: { authorize: vi.fn() }, workspace })
+    const service = new BrowserCapabilityService({
+      authorization: { authorize: vi.fn() }, workspace, currentUserId: () => context.userId,
+    })
 
     const opening = service.open(context, 'https://www.baidu.com', baiduScope)
-    await Promise.resolve()
+    while (!resolveAcquire) await Promise.resolve()
     await service.closeExecution(context.executionId)
     resolveAcquire(tab)
 
@@ -168,5 +182,16 @@ describe('BrowserCapabilityService', () => {
       .rejects.toMatchObject({ code: 'CANCELLED' })
     expect(workspace.acquire).toHaveBeenCalledOnce()
     await service.closeExecution(context.executionId)
+  })
+
+  it('rejects an old-user execution that first requests a browser after the account switch', async () => {
+    const { service, workspace, setCurrentUser } = createHarness()
+
+    setCurrentUser('user_2')
+    await service.reset()
+
+    await expect(service.open(context, 'https://www.baidu.com', baiduScope))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(workspace.acquire).not.toHaveBeenCalled()
   })
 })
