@@ -889,6 +889,21 @@ describe('authentication pages', () => {
     expect(wrapper.get('.auth-switch').text().replace(/\s+/g, '')).toBe('已有云端账号？返回登录')
   })
 
+  it('keeps the registration page scrollable at the minimum window height', async () => {
+    const originalHeight = window.innerHeight
+    window.innerHeight = 720
+
+    const { wrapper } = await mountAuthApp('/register')
+    try {
+      const shellStyle = (wrapper.get('.auth-shell').element as HTMLElement).style
+      expect(shellStyle.overflowY).toBe('auto')
+      expect(shellStyle.placeItems).toBe('safe center')
+    } finally {
+      wrapper.unmount()
+      window.innerHeight = originalHeight
+    }
+  })
+
   it('rejects mismatched or invalid registration fields before sending an OTP', async () => {
     const { api, wrapper } = await mountAuthApp('/register')
 

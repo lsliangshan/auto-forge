@@ -1,5 +1,5 @@
 <template>
-  <AuthLayout>
+  <AuthLayout style="overflow-y: auto; place-items: safe center;">
     <h1 id="auth-title">
       注册云端账号
     </h1>
