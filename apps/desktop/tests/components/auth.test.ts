@@ -107,6 +107,20 @@ describe('authentication store', () => {
     expect(auth.restoring).toBe(false)
   })
 
+  it('marks the Store initialized when the current session restoration fails', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.getSession).mockRejectedValue(new Error('provider details'))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+
+    await auth.restore()
+
+    expect(auth.session).toBeNull()
+    expect(auth.initialized).toBe(true)
+    expect(auth.restoring).toBe(false)
+    expect(auth.error).toBe('登录状态恢复失败')
+  })
+
   it('stores only the current OTP challenge and authenticates after verification', async () => {
     const api = createApi()
     vi.mocked(api.auth.sendOtp).mockResolvedValue({
@@ -260,6 +274,116 @@ describe('authentication store', () => {
 
     await expect(auth.loginWithPassword({ account: 'Alice', password: 'password' })).resolves.toEqual(authSession)
     expect(auth.session).toEqual(authSession)
+    expect(auth.submitting).toBe(false)
+  })
+
+  it('keeps the Store logged out when a password login resolves after logout', async () => {
+    const api = createApi()
+    const pendingLogin = deferred<AuthSession>()
+    vi.mocked(api.auth.loginWithPassword).mockReturnValue(pendingLogin.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+
+    const loggingIn = auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    const loggingOut = auth.logout()
+    await expect(loggingOut).resolves.toBe(true)
+    expect(auth.submitting).toBe(true)
+
+    pendingLogin.resolve(authSession)
+    await expect(loggingIn).resolves.toBeUndefined()
+
+    expect(auth.session).toBeNull()
+    expect(auth.initialized).toBe(true)
+    expect(auth.submitting).toBe(false)
+  })
+
+  it('does not let a stale restore overwrite a newer password login', async () => {
+    const api = createApi()
+    const pendingSession = deferred<AuthSession | null>()
+    const restoredSession: AuthSession = {
+      user: { id: 'user_restored', account: 'Restored' },
+      authenticatedAt: '2026-08-07T00:01:00.000Z',
+    }
+    vi.mocked(api.auth.getSession).mockReturnValue(pendingSession.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+
+    const restoring = auth.restore()
+    await expect(auth.loginWithPassword({ account: 'Alice', password: 'password' })).resolves.toEqual(authSession)
+    pendingSession.resolve(restoredSession)
+    await restoring
+
+    expect(auth.session).toEqual(authSession)
+    expect(auth.initialized).toBe(true)
+    expect(auth.restoring).toBe(false)
+    expect(auth.submitting).toBe(false)
+  })
+
+  it('does not let a stale OTP cancellation error overwrite a later password login', async () => {
+    const api = createApi()
+    const pendingCancellation = deferred<void>()
+    vi.mocked(api.auth.cancelOtp).mockReturnValue(pendingCancellation.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const cancelling = auth.cancelOtp()
+    await expect(auth.loginWithPassword({ account: 'Alice', password: 'password' })).resolves.toEqual(authSession)
+    pendingCancellation.reject(new Error('provider cancellation details'))
+    await cancelling
+
+    expect(auth.session).toEqual(authSession)
+    expect(auth.error).toBe('')
+  })
+
+  it('retains the verified public session when stale-verification cleanup logout fails', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    vi.mocked(api.auth.logout).mockRejectedValue(new Error('provider logout details'))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const verifying = auth.verifyOtp('123456')
+    await auth.cancelOtp()
+    pendingVerification.resolve(authSession)
+    await expect(verifying).resolves.toBeUndefined()
+
+    expect(auth.session).toEqual(authSession)
+    expect(auth.initialized).toBe(true)
+    expect(auth.error).toBe('退出登录失败')
+    expect(auth.error).not.toContain('provider logout details')
+    expect(auth.submitting).toBe(false)
+  })
+
+  it('does not let verification cleanup overwrite a restore started during compensation', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    const compensationStarted = deferred<void>()
+    const pendingLogout = deferred<void>()
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    vi.mocked(api.auth.logout).mockImplementation(() => {
+      compensationStarted.resolve()
+      return pendingLogout.promise
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const verifying = auth.verifyOtp('123456')
+    await auth.cancelOtp()
+    pendingVerification.resolve(authSession)
+    await compensationStarted.promise
+
+    const restoring = auth.restore()
+    await restoring
+    pendingLogout.resolve()
+    await verifying
+
+    expect(auth.session).toBeNull()
+    expect(auth.initialized).toBe(true)
+    expect(auth.restoring).toBe(false)
     expect(auth.submitting).toBe(false)
   })
 

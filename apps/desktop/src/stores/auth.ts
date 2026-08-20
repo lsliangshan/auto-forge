@@ -4,7 +4,9 @@ import { displayError, getDesktopApi } from '../services/desktop-api'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
+const sessionGenerations = new WeakMap<object, number>()
 const submittingCounts = new WeakMap<object, number>()
+const restoringCounts = new WeakMap<object, number>()
 
 function otpGeneration(store: object): number {
   return otpGenerations.get(store) ?? 0
@@ -13,6 +15,16 @@ function otpGeneration(store: object): number {
 function nextOtpGeneration(store: object): number {
   const generation = otpGeneration(store) + 1
   otpGenerations.set(store, generation)
+  return generation
+}
+
+function sessionGeneration(store: object): number {
+  return sessionGenerations.get(store) ?? 0
+}
+
+function nextSessionGeneration(store: object): number {
+  const generation = sessionGeneration(store) + 1
+  sessionGenerations.set(store, generation)
   return generation
 }
 
@@ -26,6 +38,18 @@ function finishSubmitting(store: { submitting: boolean }): void {
   const count = Math.max((submittingCounts.get(store) ?? 1) - 1, 0)
   submittingCounts.set(store, count)
   store.submitting = count > 0
+}
+
+function startRestoring(store: { restoring: boolean }): void {
+  const count = (restoringCounts.get(store) ?? 0) + 1
+  restoringCounts.set(store, count)
+  store.restoring = true
+}
+
+function finishRestoring(store: { restoring: boolean }): void {
+  const count = Math.max((restoringCounts.get(store) ?? 1) - 1, 0)
+  restoringCounts.set(store, count)
+  store.restoring = count > 0
 }
 
 export const useAuthStore = defineStore('auth', {
@@ -44,17 +68,22 @@ export const useAuthStore = defineStore('auth', {
       const pending = restorePromises.get(this)
       if (pending) return pending
 
-      this.restoring = true
+      const generation = nextSessionGeneration(this)
+      startRestoring(this)
       this.error = ''
       const operation = (async () => {
         try {
-          this.session = await getDesktopApi().auth.getSession()
+          const session = await getDesktopApi().auth.getSession()
+          if (generation !== sessionGeneration(this)) return
+          this.session = session
+          this.initialized = true
         } catch (error) {
+          if (generation !== sessionGeneration(this)) return
           this.session = null
+          this.initialized = true
           this.error = displayError(error, '登录状态恢复失败')
         } finally {
-          this.initialized = true
-          this.restoring = false
+          finishRestoring(this)
           restorePromises.delete(this)
         }
       })()
@@ -107,15 +136,27 @@ export const useAuthStore = defineStore('auth', {
       }
 
       const generation = otpGeneration(this)
+      const sessionOwner = nextSessionGeneration(this)
       startSubmitting(this)
       this.error = ''
       try {
         const session = await getDesktopApi().auth.verifyOtp({ challengeId: challenge.challengeId, code })
-        if (generation !== otpGeneration(this)) {
+        if (generation !== otpGeneration(this) || sessionOwner !== sessionGeneration(this)) {
+          const cleanupOwner = sessionGeneration(this)
           try {
             await getDesktopApi().auth.logout()
           } catch {
-            // A stale verification must not update Renderer state with cleanup errors.
+            if (cleanupOwner === sessionGeneration(this)) {
+              this.session = session
+              this.initialized = true
+              this.error = '退出登录失败'
+            }
+            return undefined
+          }
+          if (cleanupOwner === sessionGeneration(this)) {
+            this.session = null
+            this.initialized = true
+            this.error = ''
           }
           return undefined
         }
@@ -123,7 +164,7 @@ export const useAuthStore = defineStore('auth', {
         this.initialized = true
         return session
       } catch (error) {
-        if (generation === otpGeneration(this)) {
+        if (generation === otpGeneration(this) && sessionOwner === sessionGeneration(this)) {
           this.error = displayError(error, '验证码验证失败')
         }
         return undefined
@@ -137,13 +178,14 @@ export const useAuthStore = defineStore('auth', {
     async cancelOtp(): Promise<void> {
       const challenge = this.challenge
       const generation = nextOtpGeneration(this)
+      const sessionOwner = nextSessionGeneration(this)
       this.challenge = null
       if (!challenge) return
 
       try {
         await getDesktopApi().auth.cancelOtp(challenge.challengeId)
       } catch (error) {
-        if (generation === otpGeneration(this)) {
+        if (generation === otpGeneration(this) && sessionOwner === sessionGeneration(this)) {
           this.error = displayError(error, '取消验证码失败')
         }
       }
@@ -151,15 +193,19 @@ export const useAuthStore = defineStore('auth', {
     async loginWithPassword(credentials: AuthCredentials): Promise<AuthSession | undefined> {
       if (this.sendingOtp || this.submitting) return undefined
 
+      const sessionOwner = nextSessionGeneration(this)
       startSubmitting(this)
       this.error = ''
       try {
         const session = await getDesktopApi().auth.loginWithPassword(credentials)
+        if (sessionOwner !== sessionGeneration(this)) return undefined
         this.session = session
         this.initialized = true
         return session
       } catch (error) {
-        this.error = displayError(error, '登录失败')
+        if (sessionOwner === sessionGeneration(this)) {
+          this.error = displayError(error, '登录失败')
+        }
         return undefined
       } finally {
         finishSubmitting(this)
@@ -168,15 +214,19 @@ export const useAuthStore = defineStore('auth', {
     async logout(): Promise<boolean> {
       startSubmitting(this)
       this.error = ''
+      await this.cancelOtp()
+      const sessionOwner = nextSessionGeneration(this)
       try {
-        await this.cancelOtp()
         await getDesktopApi().auth.logout()
+        if (sessionOwner !== sessionGeneration(this)) return true
         this.session = null
         this.initialized = true
         this.error = ''
         return true
       } catch (error) {
-        this.error = displayError(error, '退出登录失败')
+        if (sessionOwner === sessionGeneration(this)) {
+          this.error = displayError(error, '退出登录失败')
+        }
         return false
       } finally {
         finishSubmitting(this)
