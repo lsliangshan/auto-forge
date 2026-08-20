@@ -524,6 +524,33 @@ describe('developer workbench', () => {
     expect(raw.executions.onEvent).toHaveBeenCalledTimes(1)
   })
 
+  it('sends a structured-cloneable persistent approval decision', async () => {
+    const { api, raw, emit } = createApi()
+    let transferredDecision: unknown
+    raw.executions.decide.mockImplementation(async (input: unknown) => {
+      transferredDecision = structuredClone(input)
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    store.debugInput = { keyword: '今日天气' }
+    await store.runDebug()
+    emit({
+      type: 'approval_required', executionId: 'exec_1', permissionIndex: 0, capability: 'browser.open',
+      scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'b'.repeat(64), occurredAt: '2026-07-19T00:00:01.000Z',
+    })
+
+    await store.decideApproval('always')
+
+    expect(store.debugError).toBe('')
+    expect(transferredDecision).toEqual({
+      executionId: 'exec_1', permissionIndex: 0, scopeHash: 'b'.repeat(64), decision: 'always',
+      workflowId: 'browser.search.baidu', workflowVersion: '1.0.0', capability: 'browser.open',
+      scope: { origins: ['https://www.baidu.com'] },
+    })
+  })
+
   it('shows a safe non-editable state when Main rejects a large or binary file', async () => {
     const { api, raw } = createApi()
     raw.developer.readFile.mockRejectedValue(Object.assign(new Error('redacted'), { code: 'INVALID_INPUT' }))

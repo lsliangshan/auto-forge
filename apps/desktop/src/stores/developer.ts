@@ -531,7 +531,7 @@ export const useDeveloperStore = defineStore('developer', {
         workflowId: manifest.id,
         workflowVersion: manifest.version,
         capability: approval.capability,
-        scope: approval.scope,
+        scope: cloneJson(approval.scope),
       } : {
         executionId: approval.executionId,
         permissionIndex: approval.permissionIndex,
