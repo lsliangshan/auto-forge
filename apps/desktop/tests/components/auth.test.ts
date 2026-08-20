@@ -872,34 +872,236 @@ describe('authentication pages', () => {
     expect(wrapper.get('[role="alert"]').text()).not.toContain('provider details')
   })
 
-  it('registers after confirmation validation and enters chat', async () => {
-    const { api, router, wrapper } = await mountAuthApp('/register')
+  it('prioritizes phone registration before email registration', async () => {
+    const { wrapper } = await mountAuthApp('/register')
 
+    const methods = wrapper.findAll('[data-testid^="register-method-"]')
+    expect(methods.map((item) => item.text())).toEqual(['手机号', '邮箱'])
+    expect(wrapper.get('[data-testid="register-method-phone"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.find('[data-testid="register-phone"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="register-email"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="register-phone"]').attributes('autocomplete')).toBe('tel')
     expect(wrapper.get('[data-testid="register-account"]').attributes('autocomplete')).toBe('username')
     expect(wrapper.get('[data-testid="register-password"]').attributes('autocomplete')).toBe('new-password')
     expect(wrapper.get('[data-testid="register-confirm"]').attributes('autocomplete')).toBe('new-password')
-    await wrapper.get('[data-testid="register-account"]').setValue(' Alice ')
-    await wrapper.get('[data-testid="register-password"]').setValue('password')
-    await wrapper.get('[data-testid="register-confirm"]').setValue('different')
-    await wrapper.get('[data-testid="register-form"]').trigger('submit')
-    expect(api.auth.register).not.toHaveBeenCalled()
-    expect(wrapper.get('[role="alert"]').text()).toContain('两次输入的密码不一致')
-
-    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
-    await wrapper.get('[data-testid="register-form"]').trigger('submit')
-    await vi.waitFor(() => expect(api.auth.register).toHaveBeenCalledWith({ account: 'Alice', password: 'password' }))
-    await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/chat'))
+    expect(wrapper.get('[data-testid="register-code"]').attributes('autocomplete')).toBe('one-time-code')
+    expect(wrapper.text()).toContain('通过手机号或邮箱验证，注册成功后将自动登录。')
+    expect(wrapper.get('.auth-switch').text().replace(/\s+/g, '')).toBe('已有云端账号？返回登录')
   })
 
-  it('shows a duplicate-account error returned by registration', async () => {
+  it('rejects mismatched or invalid registration fields before sending an OTP', async () => {
+    const { api, wrapper } = await mountAuthApp('/register')
+
+    await wrapper.get('[data-testid="register-phone"]').setValue('123')
+    await wrapper.get('[data-testid="register-account"]').setValue('bad')
+    await wrapper.get('[data-testid="register-password"]').setValue('short')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('different')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    expect(wrapper.get('[role="alert"]').text()).toBe('两次输入的密码不一致')
+
+    await wrapper.get('[data-testid="register-confirm"]').setValue('short')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    expect(wrapper.get('[role="alert"]').text()).toBe('用户名需为 5–24 位字母、数字或下划线')
+
+    await wrapper.get('[data-testid="register-account"]').setValue('Alice')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    expect(wrapper.get('[role="alert"]').text()).toBe('密码长度须为 8–72 个字符')
+
+    await wrapper.get('[data-testid="register-password"]').setValue('password')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    expect(wrapper.get('[role="alert"]').text()).toBe('请输入有效的手机号')
+    expect(api.auth.sendOtp).not.toHaveBeenCalled()
+  })
+
+  it('sends normalized phone registration credentials once without retaining secrets', async () => {
+    vi.useFakeTimers()
     const api = createApi()
-    vi.mocked(api.auth.register).mockRejectedValue(toSafeAppError({ code: 'AUTH_ACCOUNT_EXISTS' }))
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_phone', expiresIn: 300 })
+    const { pinia, wrapper } = await mountAuthApp('/register', api)
+    const secret = '  password  '
+
+    await wrapper.get('[data-testid="register-phone"]').setValue(' 18311032722 ')
+    await wrapper.get('[data-testid="register-account"]').setValue(' Alice ')
+    await wrapper.get('[data-testid="register-password"]').setValue(secret)
+    await wrapper.get('[data-testid="register-confirm"]').setValue(secret)
+    void wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    void wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await flushPromises()
+
+    expect(api.auth.sendOtp).toHaveBeenCalledOnce()
+    expect(api.auth.sendOtp).toHaveBeenCalledWith({
+      intent: 'register',
+      channel: 'phone',
+      target: '18311032722',
+      account: 'Alice',
+      password: secret,
+    })
+    expect(wrapper.text()).not.toContain(secret)
+    expect(JSON.stringify(useAuthStore(pinia).$state)).not.toContain(secret)
+    expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('60 秒后重试')
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('发送验证码')
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('sends a lowercased email registration target', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_email', expiresIn: 300 })
     const { wrapper } = await mountAuthApp('/register', api)
+
+    await wrapper.get('[data-testid="register-method-email"]').trigger('click')
+    await wrapper.get('[data-testid="register-email"]').setValue(' Alice@Example.COM ')
+    await wrapper.get('[data-testid="register-account"]').setValue(' Alice ')
+    await wrapper.get('[data-testid="register-password"]').setValue('password')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledWith({
+      intent: 'register',
+      channel: 'email',
+      target: 'alice@example.com',
+      account: 'Alice',
+      password: 'password',
+    }))
+    wrapper.unmount()
+  })
+
+  it('verifies a six-digit registration OTP once and enters chat', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    const { router, wrapper } = await mountAuthApp('/register', api)
+
+    await wrapper.get('[data-testid="register-phone"]').setValue('18311032722')
     await wrapper.get('[data-testid="register-account"]').setValue('Alice')
     await wrapper.get('[data-testid="register-password"]').setValue('password')
     await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+
+    await wrapper.get('[data-testid="register-code"]').setValue('123')
     await wrapper.get('[data-testid="register-form"]').trigger('submit')
-    await vi.waitFor(() => expect(wrapper.get('[role="alert"]').text()).toContain('该账号已存在'))
+    expect(api.auth.verifyOtp).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toBe('请输入 6 位验证码')
+
+    await wrapper.get('[data-testid="register-code"]').setValue('123456')
+    void wrapper.get('[data-testid="register-form"]').trigger('submit')
+    void wrapper.get('[data-testid="register-form"]').trigger('submit')
+    await vi.waitFor(() => expect(api.auth.verifyOtp).toHaveBeenCalledOnce())
+    expect(api.auth.verifyOtp).toHaveBeenCalledWith({ challengeId: 'challenge_1', code: '123456' })
+
+    pendingVerification.resolve(authSession)
+    await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/chat'))
+  })
+
+  it.each([
+    ['target', 'register-phone', '18311032723'],
+    ['account', 'register-account', 'Alice_2'],
+    ['password', 'register-password', 'password2'],
+  ])('cancels the registration challenge when the %s changes', async (_field, testId, nextValue) => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/register', api)
+
+    await wrapper.get('[data-testid="register-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="register-account"]').setValue('Alice')
+    await wrapper.get('[data-testid="register-password"]').setValue('password')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="register-code"]').setValue('123456')
+    await wrapper.get(`[data-testid="${testId}"]`).setValue(nextValue)
+    await flushPromises()
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+    expect(wrapper.get('[data-testid="register-code"]').element).toHaveProperty('value', '')
+    expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('发送验证码')
+    await wrapper.get('[data-testid="register-code"]').setValue('654321')
+    await wrapper.get('[data-testid="register-form"]').trigger('submit')
+    expect(api.auth.verifyOtp).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toBe('请先发送验证码')
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('switches registration methods by clearing challenge state but preserving credentials', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/register', api)
+
+    await wrapper.get('[data-testid="register-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="register-account"]').setValue('Alice')
+    await wrapper.get('[data-testid="register-password"]').setValue('password')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="register-code"]').setValue('bad')
+    await wrapper.get('[data-testid="register-form"]').trigger('submit')
+
+    await wrapper.get('[data-testid="register-method-email"]').trigger('click')
+    await flushPromises()
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+    expect(wrapper.get('[data-testid="register-method-email"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.get('[data-testid="register-email"]').element).toHaveProperty('value', '')
+    expect(wrapper.get('[data-testid="register-account"]').element).toHaveProperty('value', 'Alice')
+    expect(wrapper.get('[data-testid="register-password"]').element).toHaveProperty('value', 'password')
+    expect(wrapper.get('[data-testid="register-confirm"]').element).toHaveProperty('value', 'password')
+    expect(wrapper.get('[data-testid="register-code"]').element).toHaveProperty('value', '')
+    expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('发送验证码')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('cancels a registration OTP that resolves after its credentials become stale', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    const pendingOtp = deferred<{ challengeId: string, expiresIn: number }>()
+    vi.mocked(api.auth.sendOtp).mockReturnValue(pendingOtp.promise)
+    const { pinia, wrapper } = await mountAuthApp('/register', api)
+
+    await wrapper.get('[data-testid="register-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="register-account"]').setValue('Alice')
+    await wrapper.get('[data-testid="register-password"]').setValue('password')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    void wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.sendOtp).toHaveBeenCalledOnce())
+    await wrapper.get('[data-testid="register-account"]').setValue('Alice_2')
+    pendingOtp.resolve({ challengeId: 'challenge_stale', expiresIn: 300 })
+    await flushPromises()
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_stale')
+    expect(useAuthStore(pinia).challenge).toBeNull()
+    expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('发送验证码')
+    expect(vi.getTimerCount()).toBe(0)
+    wrapper.unmount()
+  })
+
+  it('cleans up the registration countdown and challenge when unmounted', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 })
+    const { wrapper } = await mountAuthApp('/register', api)
+
+    await wrapper.get('[data-testid="register-phone"]').setValue('18311032722')
+    await wrapper.get('[data-testid="register-account"]').setValue('Alice')
+    await wrapper.get('[data-testid="register-password"]').setValue('password')
+    await wrapper.get('[data-testid="register-confirm"]').setValue('password')
+    await wrapper.get('[data-testid="register-send-code"]').trigger('click')
+    await flushPromises()
+    expect(vi.getTimerCount()).toBe(1)
+
+    wrapper.unmount()
+    await flushPromises()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
   })
 })
 
