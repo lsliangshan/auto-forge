@@ -300,6 +300,29 @@ describe('ElectronBrowserWorkspace', () => {
     expect(views.every((view) => view.webContents.destroyed)).toBe(true)
   })
 
+  it('closes the visible old-user window before waiting for a stuck tab acquisition', async () => {
+    const debuggerSetup = deferred<unknown>()
+    let blockDebuggerSetup = false
+    const respond = (method: string) => method === 'Accessibility.enable' && blockDebuggerSetup
+      ? debuggerSetup.promise
+      : {}
+    const { workspace, views, windows } = createHarness(respond)
+    await acquire(workspace, 'exec_1', 'user_1')
+    blockDebuggerSetup = true
+    const acquiring = acquire(workspace, 'exec_2', 'user_1', 'workflow.two')
+    while (views.length < 3) await Promise.resolve()
+
+    const resetting = workspace.reset()
+    await Promise.resolve()
+
+    expect(windows[0]!.destroyed).toBe(true)
+    const rejected = expect(acquiring).rejects.toMatchObject({ code: 'CANCELLED' })
+    debuggerSetup.resolve({})
+    await resetting
+    await rejected
+    expect(windows.every((window) => window.destroyed)).toBe(true)
+  })
+
   it('blocks non-HTTPS and out-of-scope navigation while allowing released user navigation', async () => {
     const { workspace, views } = createHarness()
     const tab = await acquire(workspace, 'exec_1')
@@ -374,6 +397,63 @@ describe('ElectronBrowserWorkspace', () => {
     target.emit('did-stop-loading')
 
     await clicking
+  })
+
+  it('detects a click-triggered navigation that starts after a short asynchronous handler', async () => {
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '提交' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method] ?? {}
+    const { workspace, views } = createHarness(respond)
+    const tab = await acquire(workspace, 'exec_1')
+    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    const target = views[1]!.webContents
+    let settled = false
+
+    const clicking = tab.click('role=button[name="提交"]', 'https://www.baidu.com')
+      .finally(() => { settled = true })
+    while (!target.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
+      await Promise.resolve()
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    target.emit('did-start-navigation', { isMainFrame: true })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(settled).toBe(false)
+    target.emit('did-stop-loading')
+
+    await clicking
+  })
+
+  it('reports a timeout when click navigation starts but never finishes loading', async () => {
+    vi.useFakeTimers()
+    try {
+      const respond = (method: string) => ({
+        'DOM.getDocument': { root: { nodeId: 1 } },
+        'Accessibility.queryAXTree': {
+          nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '提交' } }],
+        },
+        'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+      } as Record<string, unknown>)[method] ?? {}
+      const { workspace, views } = createHarness(respond)
+      const tab = await acquire(workspace, 'exec_1')
+      await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+      const target = views[1]!.webContents
+
+      const clicking = tab.click('role=button[name="提交"]', 'https://www.baidu.com')
+      while (!target.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
+        await Promise.resolve()
+      }
+      target.emit('did-start-navigation', { isMainFrame: true })
+      const rejected = expect(clicking).rejects.toMatchObject({ code: 'WORKER_TIMEOUT' })
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      await rejected
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('finishes click navigation when a same-document navigation completes in-page', async () => {

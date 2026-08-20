@@ -122,6 +122,7 @@ interface TargetTabState {
 }
 
 const toolbarHeight = 52
+const navigationDetectionMs = 500
 const roles = new Set([
   'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button', 'caption', 'cell',
   'checkbox', 'code', 'columnheader', 'combobox', 'complementary', 'contentinfo', 'definition',
@@ -254,11 +255,22 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       && tab.activeOperations === 0
       && tab.userId === input.userId
       && tab.workflowId === input.workflowId)
-    const state = existing ?? await this.createTab(input.userId, input.workflowId)
+    let state: TargetTabState
+    try {
+      state = existing ?? await this.createTab(input.userId, input.workflowId)
+    } catch (error) {
+      if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
+      throw error
+    }
     if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
     state.ownerExecutionId = input.executionId
     this.executions.set(input.executionId, state)
-    await this.activate(state)
+    try {
+      await this.activate(state)
+    } catch (error) {
+      if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
+      throw error
+    }
     if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
     state.handle ??= new ElectronBrowserTab(this, state)
     return state.handle
@@ -313,6 +325,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
 
   private async performReset(): Promise<void> {
     this.lifecycleEpoch += 1
+    await this.closeWindow()
     await Promise.allSettled([...this.acquisitions])
     await this.closeWindow()
   }
@@ -678,13 +691,13 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   }
 
   private waitForNavigation(contents: WebContentsPort): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let started = false
       let sameDocument = false
       let settled = false
       let detectionTimer: ReturnType<typeof setTimeout>
       let maximumTimer: ReturnType<typeof setTimeout>
-      const finish = () => {
+      const finish = (error?: AppError) => {
         if (settled) return
         settled = true
         clearTimeout(detectionTimer)
@@ -693,8 +706,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         contents.removeListener('did-stop-loading', onStop)
         contents.removeListener('did-fail-load', onStop)
         contents.removeListener('did-navigate-in-page', onInPage)
-        contents.removeListener('destroyed', finish)
-        resolve()
+        contents.removeListener('destroyed', onDestroyed)
+        if (error) reject(error)
+        else resolve()
       }
       const onStart = (...args: unknown[]) => {
         const details = args[0] as { isMainFrame?: boolean; isSameDocument?: boolean } | undefined
@@ -705,13 +719,14 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       }
       const onStop = () => { if (started) finish() }
       const onInPage = () => { if (started && sameDocument) finish() }
+      const onDestroyed = () => { finish() }
       contents.on('did-start-navigation', onStart)
       contents.on('did-stop-loading', onStop)
       contents.on('did-fail-load', onStop)
       contents.on('did-navigate-in-page', onInPage)
-      contents.on('destroyed', finish)
-      detectionTimer = setTimeout(() => { if (!started) finish() }, 75)
-      maximumTimer = setTimeout(finish, 30_000)
+      contents.on('destroyed', onDestroyed)
+      detectionTimer = setTimeout(() => { if (!started) finish() }, navigationDetectionMs)
+      maximumTimer = setTimeout(() => { finish(failure('WORKER_TIMEOUT')) }, 30_000)
     })
   }
 
