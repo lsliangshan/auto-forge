@@ -300,16 +300,18 @@ describe('ElectronBrowserWorkspace', () => {
     expect(views.every((view) => view.webContents.destroyed)).toBe(true)
   })
 
-  it('lets an acquire wait outside the reset acquisition set without deadlocking reset', async () => {
+  it('cancels an acquire arriving during reset without deadlocking or reopening the old partition', async () => {
     const { workspace, windows } = createHarness()
     await acquire(workspace, 'exec_1', 'user_1')
 
     const resetting = workspace.reset()
     const acquiring = acquire(workspace, 'exec_2', 'user_1')
+    const rejected = expect(acquiring).rejects.toMatchObject({ code: 'CANCELLED' })
 
     await resetting
-    await expect(acquiring).resolves.toBeDefined()
-    expect(windows).toHaveLength(2)
+    await rejected
+    expect(windows).toHaveLength(1)
+    expect(windows[0]!.destroyed).toBe(true)
   })
 
   it('closes the visible old-user window before waiting for a stuck tab acquisition', async () => {

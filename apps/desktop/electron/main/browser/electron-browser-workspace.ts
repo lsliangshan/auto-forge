@@ -237,7 +237,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
   async acquire(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
-    if (this.resetOperation) await this.resetOperation
+    if (this.resetOperation) {
+      await this.resetOperation
+      throw failure('CANCELLED')
+    }
     if (this.shuttingDown) throw failure('CONFLICT')
     const acquisition = this.acquireCurrent(input)
     this.acquisitions.add(acquisition)
