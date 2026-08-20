@@ -659,6 +659,34 @@ describe('CloudBaseAuthService', () => {
       .toBeLessThan(vi.mocked(app.port.signOut).mock.invocationCallOrder[0] ?? 0)
   })
 
+  it('expires an OTP verification while it waits behind an earlier session operation', async () => {
+    const app = harness()
+    const blockerStarted = deferred<void>()
+    const blockerResponse = deferred<unknown>()
+    vi.mocked(app.port.signInWithOtp).mockResolvedValue(otpResponse(app.verifyOtp))
+    vi.mocked(app.port.signInWithPassword).mockImplementation(() => {
+      blockerStarted.resolve()
+      return blockerResponse.promise
+    })
+    app.verifyOtp.mockResolvedValue(authResponse())
+    const challenge = await app.service.sendOtp({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })
+    const blocker = app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+    await blockerStarted.promise
+
+    const verification = app.service.verifyOtp({
+      challengeId: challenge.challengeId,
+      code: '123456',
+    })
+    app.advanceTime(300_000)
+    blockerResponse.resolve(authResponse())
+
+    await expect(blocker).resolves.toMatchObject({ user: { id: 'cloud_uid' } })
+    await expect(verification).rejects.toEqual(toSafeAppError({ code: 'AUTH_OTP_EXPIRED' }))
+    expect(app.verifyOtp).not.toHaveBeenCalled()
+  })
+
   it('requires a real CloudBase session', async () => {
     const app = harness()
     vi.mocked(app.port.getSession).mockResolvedValue(noSessionResponse())

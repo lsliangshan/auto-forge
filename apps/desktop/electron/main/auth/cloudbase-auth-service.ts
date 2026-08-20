@@ -290,6 +290,7 @@ export class CloudBaseAuthService implements AuthService {
     this.challenges.delete(parsed.data.challengeId)
 
     return this.runSessionOperation(async () => {
+      if (this.dependencies.now() >= challenge.expiresAt) throw failure('AUTH_OTP_EXPIRED')
       let response: unknown
       try {
         response = await challenge.verifyOtp({ token: parsed.data.code })
