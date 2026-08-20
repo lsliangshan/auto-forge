@@ -159,9 +159,11 @@ export class NetworkProxyService implements NetworkProxyPort {
 
   async fetch(input: string | Request, init?: RequestInit): Promise<Response> {
     if (this.terminalError) throw this.terminalError
-    const release = await this.acquireLease()
+    const signal = init?.signal ?? undefined
+    const release = await this.acquireLease(signal)
     let response: Response
     try {
+      if (signal?.aborted) throw signal.reason
       response = await this.session.fetch(input, init)
     } catch (error) {
       release()
@@ -232,11 +234,28 @@ export class NetworkProxyService implements NetworkProxyPort {
     }
   }
 
-  private async acquireLease(): Promise<() => void> {
+  private async acquireLease(signal?: AbortSignal): Promise<() => void> {
     while (true) {
       if (this.terminalError) throw this.terminalError
+      if (signal?.aborted) throw signal.reason
       const barrier = this.entryBarrier
-      await barrier
+      let onAbort: (() => void) | undefined
+      try {
+        if (signal) {
+          await Promise.race([
+            barrier,
+            new Promise<never>((_resolve, reject) => {
+              onAbort = () => reject(signal.reason)
+              signal.addEventListener('abort', onAbort, { once: true })
+            }),
+          ])
+        } else {
+          await barrier
+        }
+      } finally {
+        if (onAbort) signal?.removeEventListener('abort', onAbort)
+      }
+      if (signal?.aborted) throw signal.reason
       if (this.terminalError) throw this.terminalError
       if (barrier !== this.entryBarrier || this.releaseEntryBarrier) continue
 

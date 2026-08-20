@@ -198,19 +198,40 @@ async function withImageRequestDeadline<T>(
   callerSignal: AbortSignal | undefined,
   operation: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
+  if (callerSignal?.aborted) throw failure('CANCELLED')
   const deadline = new AbortController()
-  const timer = setTimeout(() => deadline.abort(), IMAGE_REQUEST_TIMEOUT_MS)
   const signal = callerSignal
     ? AbortSignal.any([callerSignal, deadline.signal])
     : deadline.signal
+  let rejectDeadline!: (error: AppError) => void
+  const deadlineResult = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject
+  })
+  const timer = setTimeout(() => {
+    deadline.abort()
+    rejectDeadline(failure('MODEL_PROVIDER_TIMEOUT'))
+  }, IMAGE_REQUEST_TIMEOUT_MS)
+  let onCallerAbort: (() => void) | undefined
+  const callerResult = callerSignal
+    ? new Promise<never>((_resolve, reject) => {
+        onCallerAbort = () => reject(failure('CANCELLED'))
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true })
+      })
+    : undefined
   try {
-    return await operation(signal)
-  } catch (error) {
-    if (callerSignal?.aborted) throw failure('CANCELLED')
-    if (deadline.signal.aborted) throw failure('MODEL_PROVIDER_TIMEOUT')
-    throw error
+    const operationResult = operation(signal).catch((error: unknown) => {
+      if (callerSignal?.aborted) throw failure('CANCELLED')
+      if (deadline.signal.aborted) throw failure('MODEL_PROVIDER_TIMEOUT')
+      throw error
+    })
+    return await Promise.race([
+      operationResult,
+      deadlineResult,
+      ...(callerResult ? [callerResult] : []),
+    ])
   } finally {
     clearTimeout(timer)
+    if (onCallerAbort) callerSignal?.removeEventListener('abort', onCallerAbort)
   }
 }
 

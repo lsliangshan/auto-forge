@@ -238,6 +238,38 @@ describe('NetworkProxyService', () => {
     expect(session.fetch).toHaveBeenCalledTimes(2)
   })
 
+  it('cancels a fetch waiting behind the entry barrier without reaching the session', async () => {
+    const session = fakeSession()
+    const apply = deferred<void>()
+    session.setProxy.mockImplementationOnce(() => apply.promise)
+    const service = new NetworkProxyService(session)
+    const transition = service.transition(proxySettings(7890))
+    const controller = new AbortController()
+    const abortReason = new DOMException('cancelled', 'AbortError')
+    const result = service.fetch('https://cancelled.example', {
+      signal: controller.signal,
+    }).then(() => undefined, (error: unknown) => error)
+    const settled = vi.fn()
+    void result.then(settled)
+
+    try {
+      await flushMicrotasks()
+      expect(session.fetch).not.toHaveBeenCalled()
+
+      controller.abort(abortReason)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+
+      expect(settled).toHaveBeenCalledOnce()
+      await expect(result).resolves.toBe(abortReason)
+    } finally {
+      apply.resolve()
+      await transition
+    }
+
+    await flushMicrotasks()
+    expect(session.fetch).not.toHaveBeenCalled()
+  })
+
   it('releases a fetch lease when the response body is cancelled', async () => {
     const session = fakeSession()
     const cancelled = vi.fn()

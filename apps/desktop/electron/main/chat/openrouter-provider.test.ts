@@ -1154,10 +1154,10 @@ describe('OpenRouterProvider', () => {
     expect(JSON.stringify(diagnostic.mock.calls).length).toBeLessThan(2_000)
   })
 
-  it('times out one hanging paid image POST after 120 seconds without retrying', async () => {
+  it('times out one hanging paid image POST after 120 seconds when fetch ignores abort', async () => {
     vi.useFakeTimers()
     try {
-      const fetch = abortablePendingFetch()
+      const fetch = vi.fn(() => new Promise<Response>(() => undefined))
       const provider = new OpenRouterProvider({ credential, fetch })
       const result = provider.generateImage({
         model: 'bytedance-seed/seedream-4.5',
@@ -1166,11 +1166,15 @@ describe('OpenRouterProvider', () => {
         parameterSupport: { resolution: true, aspectRatio: true, outputFormat: false },
         references: [],
       }).then(() => undefined, (error: unknown) => error)
+      const settled = vi.fn()
+      void result.then(settled)
 
       await vi.advanceTimersByTimeAsync(119_999)
       expect(fetch).toHaveBeenCalledTimes(1)
+      expect(settled).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(1)
 
+      expect(settled).toHaveBeenCalledOnce()
       await expect(result).resolves.toMatchObject({ code: 'MODEL_PROVIDER_TIMEOUT' })
       expect(fetch).toHaveBeenCalledTimes(1)
       expect(vi.getTimerCount()).toBe(0)
@@ -1199,6 +1203,39 @@ describe('OpenRouterProvider', () => {
 
       await expect(result).resolves.toMatchObject({ code: 'CANCELLED' })
       expect(fetch).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps caller cancellation authoritative at the exact image deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const controller = new AbortController()
+      const removeAbortListener = vi.spyOn(controller.signal, 'removeEventListener')
+      setTimeout(() => controller.abort(), 120_000)
+      const fetch = vi.fn(() => new Promise<Response>(() => undefined))
+      const provider = new OpenRouterProvider({ credential, fetch })
+      const result = provider.generateImage({
+        model: 'bytedance-seed/seedream-4.5',
+        prompt: 'draw',
+        options: { count: 1, resolution: '1K', aspectRatio: '16:9', format: 'png' },
+        parameterSupport: { resolution: true, aspectRatio: true, outputFormat: false },
+        references: [],
+        signal: controller.signal,
+      }).then(() => undefined, (error: unknown) => error)
+      const settled = vi.fn()
+      void result.then(settled)
+
+      await vi.advanceTimersByTimeAsync(119_999)
+      expect(settled).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(settled).toHaveBeenCalledOnce()
+      await expect(result).resolves.toMatchObject({ code: 'CANCELLED' })
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(removeAbortListener).toHaveBeenCalledOnce()
       expect(vi.getTimerCount()).toBe(0)
     } finally {
       vi.useRealTimers()
