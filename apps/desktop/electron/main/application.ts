@@ -29,7 +29,8 @@ import {
   type AgentRunResult,
 } from './agent/agent-orchestrator.js'
 import { LocalAuthService } from './auth/local-auth-service.js'
-import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
+import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
+import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
@@ -99,6 +100,7 @@ type ApplicationFailureSource =
   | 'media-cancel'
   | 'chat-drain'
   | 'execution-shutdown'
+  | 'browser-shutdown'
   | 'database-close'
 
 interface ApplicationFailureRecord {
@@ -119,6 +121,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'media-cancel': 50,
   'chat-drain': 60,
   'execution-shutdown': 70,
+  'browser-shutdown': 75,
   'database-close': 80,
 }
 
@@ -161,7 +164,7 @@ export interface ApplicationRuntimeOptions {
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
-  browserRuntime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
+  browserWorkspace: BrowserWorkspacePort
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
 }
@@ -417,12 +420,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const policy = new PolicyEngine(database.permissionGrants)
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
-    runtime: options.browserRuntime,
-    proxySnapshot: () => options.networkProxy.snapshot(),
-    profileDirectories: {
-      create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-browser-')) },
-      remove: (path) => rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }),
-    },
+    workspace: options.browserWorkspace,
   })
   const sourceResolver: WorkflowExecutionSourceResolver = {
     async resolve(id, version, selector) {
@@ -1012,9 +1010,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
           await options.networkProxy.transition(candidate.proxy)
           try {
+            await browser.updateProxy()
             return settings.commit(candidate)
           } catch {
             await options.networkProxy.transitionOrFailClosed(previous.proxy)
+            await browser.updateProxy()
             throw failure('INTERNAL_ERROR')
           }
         })
@@ -1124,6 +1124,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
         })
         await capture('execution-shutdown', () => executions.shutdown())
+        await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped
         await capture('database-close', () => { database.close() })
         const terminalFailure = failureRecorder.select()
