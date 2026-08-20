@@ -287,6 +287,33 @@ describe('developer workbench', () => {
     expect(raw.developer.run).toHaveBeenCalledWith({ projectId: 'project_1', input: { query: 'ok' } })
   })
 
+  it('runs a new project without dynamic code generation in the renderer', async () => {
+    const { api, raw } = createApi()
+    const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
+    manifest.inputSchema = { type: 'object', additionalProperties: true }
+    raw.developer.readFile.mockImplementation(async (_projectId: string, path: string) => path === 'workflow.json'
+      ? JSON.stringify(manifest) : 'export default 1')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const nativeFunction = globalThis.Function
+    Object.defineProperty(globalThis, 'Function', {
+      configurable: true,
+      writable: true,
+      value: function blockedDynamicFunction() { throw new EvalError('Refused by Content Security Policy') },
+    })
+
+    try {
+      await store.runDebug()
+    } finally {
+      Object.defineProperty(globalThis, 'Function', { configurable: true, writable: true, value: nativeFunction })
+    }
+
+    expect(store.debugError).toBe('')
+    expect(raw.developer.run).toHaveBeenCalledWith({ projectId: 'project_1', input: {} })
+  })
+
   it('initializes required booleans and preserves enum values with distinct JSON types', async () => {
     const { api, raw } = createApi()
     const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
