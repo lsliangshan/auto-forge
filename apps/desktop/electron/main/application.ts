@@ -7,6 +7,7 @@ import {
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
+  type AuthSession,
   type ChatBlock,
   type ChatEvent,
   type DeveloperProject,
@@ -28,7 +29,9 @@ import {
   createAgentPersistence,
   type AgentRunResult,
 } from './agent/agent-orchestrator.js'
-import { LocalAuthService } from './auth/local-auth-service.js'
+import type { AuthService } from './auth/auth-service.js'
+import { createCloudBaseAuthPort, readCloudBaseAuthConfig } from './auth/cloudbase-auth-port.js'
+import { CloudBaseAuthService } from './auth/cloudbase-auth-service.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
@@ -50,6 +53,7 @@ import {
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
+import type { LocalAuthRepository } from './database/local-auth-repository.js'
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
@@ -148,6 +152,8 @@ export function createApplicationFailureRecorder(
 export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
+  authService?: AuthService
+  cloudbaseEnv?: NodeJS.ProcessEnv
   networkProxy: NetworkProxyPort
   mediaTransport?: PinnedMediaTransportPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
@@ -164,6 +170,59 @@ export interface ApplicationRuntimeOptions {
   browserRuntime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
+}
+
+interface ObservedAuthService extends AuthService {
+  isAuthenticated(): boolean
+}
+
+function observeAuthService(
+  delegate: AuthService,
+  identities: Pick<LocalAuthRepository, 'ensureExternalIdentity'>,
+): ObservedAuthService {
+  let authenticated = false
+  const project = (session: AuthSession): AuthSession => {
+    try {
+      identities.ensureExternalIdentity(session.user, Date.now())
+      return session
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+  }
+  return {
+    async getSession() {
+      const session = await delegate.getSession()
+      if (session === null) {
+        authenticated = false
+        return null
+      }
+      const projected = project(session)
+      authenticated = true
+      return projected
+    },
+    sendOtp: (input) => delegate.sendOtp(input),
+    async verifyOtp(input) {
+      const session = project(await delegate.verifyOtp(input))
+      authenticated = true
+      return session
+    },
+    cancelOtp: (challengeId) => delegate.cancelOtp(challengeId),
+    async loginWithPassword(input) {
+      const session = project(await delegate.loginWithPassword(input))
+      authenticated = true
+      return session
+    },
+    async logout() {
+      await delegate.logout()
+      authenticated = false
+    },
+    async requireSession() {
+      const session = project(await delegate.requireSession())
+      authenticated = true
+      return session
+    },
+    isAuthenticated: () => authenticated,
+  }
 }
 
 function failure(code: AppError['code']): AppError {
@@ -321,7 +380,14 @@ function executionSummary(execution: Execution): ExecutionSummary {
 
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
-  const auth = new LocalAuthService(database.localAuth)
+  const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
+  const auth = observeAuthService(
+    options.authService ?? new CloudBaseAuthService(
+      createCloudBaseAuthPort(readCloudBaseAuthConfig(options.cloudbaseEnv ?? process.env)),
+      secretStore,
+    ),
+    database.localAuth,
+  )
   const profiles = new ProfileService(auth, database.userProfiles)
   const qiniuUploader = new QiniuFileUploader({
     config: () => readQiniuConfig(options.qiniuEnv ?? process.env),
@@ -331,7 +397,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     upload: qiniuUploader,
   })
   const maintenance = new MaintenanceGate()
-  const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -619,8 +684,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const services: DesktopIpcServices = {
     auth: {
       getSession: () => auth.getSession(),
-      login: (input) => auth.login(input),
-      register: (input) => auth.register(input),
+      sendOtp: (input) => auth.sendOtp(input),
+      verifyOtp: (input) => auth.verifyOtp(input),
+      cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
+      loginWithPassword: (input) => auth.loginWithPassword(input),
       logout: () => auth.logout(),
       requireSession: () => auth.requireSession(),
     },

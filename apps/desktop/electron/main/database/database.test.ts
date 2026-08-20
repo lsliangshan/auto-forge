@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { sql } from 'drizzle-orm'
-import { type ConversationGenerationPreferences } from '@autoforge/shared'
+import { authAccountSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
 import { ProviderUsageConsistencyError } from './repositories.js'
@@ -333,6 +333,54 @@ describe('openAppDatabase', () => {
       passwordDigest: 'digest-2', createdAt: 12, updatedAt: 12,
     }, 13)).toBeUndefined()
     expect(database.localAuth.getCurrentSession()?.user.id).toBe('user_1')
+  })
+
+  it('projects an external identity for business foreign keys without creating a local session', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-external-identity-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.localAuth.createUserAndSession({
+      id: 'legacy_user', account: 'Alice', accountNormalized: 'alice',
+      passwordDigest: 'legacy-digest', createdAt: 1, updatedAt: 1,
+    }, 1)
+    database.localAuth.clearSession()
+
+    database.localAuth.ensureExternalIdentity({ id: 'cloudbase_uid_1', account: 'Alice' }, 10)
+    database.localAuth.ensureExternalIdentity({ id: 'cloudbase_uid_1', account: 'Alice Cloud' }, 20)
+
+    const inspect = new Database(path)
+    expect(inspect.prepare(`
+      SELECT id, account, account_normalized AS accountNormalized,
+             password_digest AS passwordDigest, created_at AS createdAt, updated_at AS updatedAt
+      FROM local_users
+      ORDER BY id
+    `).all()).toEqual([
+      {
+        id: 'cloudbase_uid_1', account: 'Alice Cloud',
+        accountNormalized: expect.stringMatching(/^cloudbase:/),
+        passwordDigest: expect.stringMatching(/^!external-identity:/),
+        createdAt: 10, updatedAt: 20,
+      },
+      {
+        id: 'legacy_user', account: 'Alice', accountNormalized: 'alice',
+        passwordDigest: 'legacy-digest', createdAt: 1, updatedAt: 1,
+      },
+    ])
+    const projected = inspect.prepare(`
+      SELECT account_normalized AS accountNormalized
+      FROM local_users
+      WHERE id = 'cloudbase_uid_1'
+    `).get() as { accountNormalized: string }
+    expect(authAccountSchema.safeParse(projected.accountNormalized).success).toBe(false)
+    expect(inspect.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get()).toEqual({ count: 0 })
+    inspect.close()
+    database.close()
+
+    const restarted = openAppDatabase(path)
+    restarted.localAuth.ensureExternalIdentity({ id: 'cloudbase_uid_1', account: 'Alice Cloud' }, 30)
+    expect(restarted.localAuth.getCurrentSession()).toBeUndefined()
+    restarted.close()
   })
 
   it('stores isolated profiles and updates the current user profile', () => {
