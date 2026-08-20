@@ -153,11 +153,10 @@ export const useAuthStore = defineStore('auth', {
             }
             return undefined
           }
-          if (cleanupOwner === sessionGeneration(this)) {
-            this.session = null
-            this.initialized = true
-            this.error = ''
-          }
+          nextSessionGeneration(this)
+          this.session = null
+          this.initialized = true
+          this.error = ''
           return undefined
         }
         this.session = session

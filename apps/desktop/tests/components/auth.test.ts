@@ -387,6 +387,41 @@ describe('authentication store', () => {
     expect(auth.submitting).toBe(false)
   })
 
+  it('makes successful verification cleanup logout terminal after a restore reads the verified session', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    const compensationStarted = deferred<void>()
+    const pendingLogout = deferred<void>()
+    const pendingRestore = deferred<AuthSession | null>()
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    vi.mocked(api.auth.logout).mockImplementation(() => {
+      compensationStarted.resolve()
+      return pendingLogout.promise
+    })
+    vi.mocked(api.auth.getSession).mockReturnValue(pendingRestore.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const verifying = auth.verifyOtp('123456')
+    await auth.cancelOtp()
+    pendingVerification.resolve(authSession)
+    await compensationStarted.promise
+
+    const restoring = auth.restore()
+    pendingRestore.resolve(authSession)
+    await restoring
+    expect(auth.session).toEqual(authSession)
+
+    pendingLogout.resolve()
+    await verifying
+
+    expect(auth.session).toBeNull()
+    expect(auth.initialized).toBe(true)
+    expect(auth.restoring).toBe(false)
+    expect(auth.submitting).toBe(false)
+  })
+
   it('keeps the current session when logout fails', async () => {
     const api = createApi()
     vi.mocked(api.auth.logout).mockRejectedValue(toSafeAppError({ code: 'INTERNAL_ERROR' }))
