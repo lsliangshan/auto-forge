@@ -51,7 +51,7 @@ The workspace attaches Electron's `webContents.debugger` to target tabs and uses
 - `role=` resolves through the Accessibility tree and must match exactly one element; an optional accessible name is exact.
 - `fill` updates supported editable controls and dispatches input/change events in the target renderer.
 - `click` scrolls the node into view and dispatches real mouse events at its content box.
-- navigation-causing clicks wait for the resulting load to settle before returning.
+- clicks observe a 500 ms association window for navigation; once a main-frame navigation starts, they wait up to 30 seconds for it to settle and fail on load error or timeout.
 
 Invalid locator syntax, zero matches, duplicate matches, and unsupported editable nodes map to `INVALID_INPUT`, preserving existing behavior.
 
