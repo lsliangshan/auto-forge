@@ -1,4 +1,3 @@
-import Ajv, { type AnySchema } from 'ajv'
 import { acceptHMRUpdate, defineStore } from 'pinia'
 import type {
   ApprovalDecision,
@@ -445,23 +444,11 @@ export const useDeveloperStore = defineStore('developer', {
         this.debugError = this.debugDraftError || '调试输入 JSON 无效。'
         return
       }
-      let manifest: WorkflowManifest
       let input: unknown
       try {
-        manifest = cloneJson(this.currentManifest)
         input = cloneJson(this.debugInput)
       } catch {
         this.debugError = '调试输入必须是有效 JSON。'
-        return
-      }
-      try {
-        const validate = new Ajv({ allErrors: true, strict: false }).compile(manifest.inputSchema as AnySchema)
-        if (!validate(input)) {
-          this.debugError = `调试输入无效：${validate.errors?.map(({ instancePath, message }) => `${instancePath || '/'} ${message ?? ''}`).join('；')}`
-          return
-        }
-      } catch {
-        this.debugError = '输入 Schema 无效，请先修复 workflow.json。'
         return
       }
       this.resetDebug()
