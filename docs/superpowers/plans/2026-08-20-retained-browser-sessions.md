@@ -1,122 +1,59 @@
-# Retained Browser Sessions Implementation Plan
+# Electron Browser Workspace Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+**Goal:** Preserve consecutive developer input, replace Playwright Chrome for Testing with one persistent multi-tab Electron browser window, and merge the verified result locally into `v2`.
 
-**Goal:** Preserve developer debug input across equivalent builds, retain successful workflow browser windows for user interaction, and verify the bundled Chromium dependency.
+**Architecture:** `ExecutionService` carries authenticated user attribution into `BrowserCapabilityService`. The capability service preserves permission semantics while an injected `ElectronBrowserWorkspace` owns `BaseWindow`, persistent-session `WebContentsView` tabs, CDP selectors, user controls, and lifecycle.
 
-**Architecture:** `ExecutionService` reports successful terminal browser ownership through a capability lifecycle method. `BrowserCapabilityService` performs an atomic handoff from guarded automation state to an unguarded retained user session keyed by workflow ID, while packaging continues to ship a pinned Chromium runtime and now verifies it can execute.
-
-**Tech Stack:** TypeScript 6, Vue 3, Pinia, Electron 43, Playwright Chromium 1.61, Vitest 4, electron-builder.
+**Tech Stack:** TypeScript 6, Vue 3, Electron 43, Chrome DevTools Protocol, Vitest 4, electron-builder.
 
 **Spec:** `docs/superpowers/specs/2026-08-20-retained-browser-sessions-design.md`
 
-## Global Constraints
+## Task 1: Consecutive Developer Input
 
-- Retain only successful browser executions; all other terminal outcomes close immediately.
-- Keep at most one retained browser per `workflowId`.
-- Do not change workflow SDK, manifest permissions, or database schemas.
-- Bundle Chromium; do not download it at runtime or use a user-installed browser.
-- Preserve all pre-existing user changes in the main `v2` worktree.
+- Add a failing component regression test that runs the same schema-driven input twice without editing.
+- Replace the deep schema watch with a stable project/schema key and control primitive field values.
+- Run focused renderer tests and commit.
 
----
+## Task 2: User-Scoped Capability Context
 
-### Task 1: Preserve Schema-Driven Debug Input
+- Add failing execution and agent tests proving authenticated `userId` reaches capability requests without entering worker messages.
+- Add `userId` to `ExecutionStartInput`, active execution state, and `CapabilityContext`.
+- Pass the current auth user from developer runs and the existing agent user from chat runs.
+- Run execution, agent, and application tests and commit.
 
-**Files:**
-- Modify: `apps/desktop/src/components/developer/DebugPanel.vue`
-- Test: `apps/desktop/tests/components/developer.test.ts`
+## Task 3: Electron Browser Workspace
 
-**Interfaces:**
-- Consumes: `developer.selectedProjectId`, `developer.currentManifest`, `developer.debugInput`.
-- Produces: a stable schema watch key and controlled primitive input values.
+- Define narrow workspace/tab/session/constructor ports and fake-driven tests first.
+- Test one lazy `BaseWindow`, trusted toolbar, multiple switchable tabs, user-scoped persistent partitions, reuse, explicit/user close, resize, shutdown, security preferences, permissions, and proxy refresh.
+- Implement `ElectronBrowserWorkspace` with injected Electron constructors and session factory.
+- Add CDP tests for exact CSS/role resolution, fill, click, load waiting, and invalid matches.
+- Implement CDP automation and run focused tests until green.
+- Commit.
 
-- [ ] Add a component test that enters `今日天气`, completes one run, invokes a second run without editing, and expects both `developer.run` calls to contain `{ keyword: '今日天气' }`.
-- [ ] Run the focused component test and confirm it fails because the second call contains `{}`.
-- [ ] Replace the deep object watch with a selected-project/schema-content key and bind primitive controls to `debugInput`.
-- [ ] Run the component tests and confirm they pass.
-- [ ] Commit the task.
+## Task 4: Browser Capability Adapter
 
-### Task 2: Define Terminal Capability Ownership
+- Replace Playwright-focused tests with workspace-port tests for permission checks, execution binding/release, same-user reuse, concurrency, explicit close, and navigation violations.
+- Rewrite `BrowserCapabilityService` around the workspace port while preserving the SDK/worker contract.
+- Ensure `closeExecution` releases ownership without closing tabs and shutdown closes the workspace.
+- Run browser, execution, and application tests and commit.
 
-**Files:**
-- Modify: `apps/desktop/electron/main/workflows/execution-service.ts`
-- Test: `apps/desktop/electron/main/workflows/execution-service.test.ts`
+## Task 5: Main-Process Wiring and Proxy Lifecycle
 
-**Interfaces:**
-- Produces: `CapabilityPort.retainExecution(executionId: string, workflowId: string): Promise<void> | void`.
-- Preserves: `closeExecution(executionId: string): Promise<void> | void`.
+- Inject Electron `BaseWindow`, `WebContentsView`, and `session.fromPartition` from `index.ts`.
+- Refresh live browser partitions after successful proxy transitions and rollback transitions.
+- Add shutdown ordering and focused application/index-independent tests.
+- Run focused tests and commit.
 
-- [ ] Add tests proving completed executions call `retainExecution`, failed executions call `closeExecution`, and retention failure falls back to close without changing the durable completed result.
-- [ ] Run focused execution-service tests and confirm the missing method/behavior fails.
-- [ ] Add the lifecycle method and minimal terminal branching, retaining before policy release.
-- [ ] Update complete test doubles with the new method.
-- [ ] Run execution-service and application tests.
-- [ ] Commit the task.
+## Task 6: Remove External Browser Runtime
 
-### Task 3: Handoff and Retain Browser Sessions
+- Add failing build/package configuration assertions for the absence of Playwright runtime staging.
+- Remove `playwright-chromium`, stage script invocation, browser runtime resources, and obsolete tests/code.
+- Update the lockfile and packaged verifier assumptions.
+- Run build configuration tests, dependency install, and build; commit.
 
-**Files:**
-- Modify: `apps/desktop/electron/main/browser/browser-capability.ts`
-- Test: `apps/desktop/electron/main/browser/browser-capability.test.ts`
+## Task 7: Integrated Verification and Local Merge
 
-**Interfaces:**
-- Consumes: `retainExecution(executionId, workflowId)` from Task 2.
-- Produces: `BrowserCapabilityService.shutdown(): Promise<void>` and in-memory retained sessions keyed by workflow ID.
-
-- [ ] Add tests for successful handoff, free navigation after handoff, cleanup on user close, same-workflow replacement, different-workflow independence, and shutdown cleanup.
-- [ ] Run the browser tests and confirm the retention tests fail.
-- [ ] Track route handlers and retained state, dispose route/CDP guards during handoff, and serialize retention transitions.
-- [ ] Close a same-workflow retained session before creating the next owner.
-- [ ] Clean profiles when a retained context closes and implement shutdown for active plus retained states.
-- [ ] Run the browser tests until green.
-- [ ] Commit the task.
-
-### Task 4: Application Shutdown and Browser Runtime Error
-
-**Files:**
-- Modify: `packages/shared/src/errors.ts`
-- Modify: `apps/desktop/src/services/desktop-api.ts`
-- Modify: `apps/desktop/electron/main/browser/browser-capability.ts`
-- Modify: `apps/desktop/electron/main/application.ts`
-- Test: `packages/shared/src/contracts.test.ts`
-- Test: `apps/desktop/electron/main/browser/browser-capability.test.ts`
-- Test: `apps/desktop/electron/main/application.test.ts`
-
-**Interfaces:**
-- Produces: `BROWSER_RUNTIME_UNAVAILABLE` safe application error.
-- Consumes: `BrowserCapabilityService.shutdown()` from Task 3.
-
-- [ ] Add failing tests for missing packaged runtime, launch failure, localized renderer copy, and application shutdown cleanup ordering.
-- [ ] Add the error code and map runtime resolution/launch failures to it.
-- [ ] Add browser shutdown to application close after execution shutdown and before database close.
-- [ ] Run shared, browser, renderer, and application tests.
-- [ ] Commit the task.
-
-### Task 5: Verify Packaged Chromium
-
-**Files:**
-- Modify: `apps/desktop/scripts/verify-packaged-native.mjs`
-- Test: packaged `pnpm dist:dir` verification on the supported host target.
-
-**Interfaces:**
-- Consumes: packaged `resources/browser-runtime.json` written by `stage:browser`.
-- Produces: a failing package build when the bundled browser path is unsafe, missing, or cannot execute `--version`.
-
-- [ ] Resolve and validate the packaged browser manifest and executable without allowing resources-directory escape.
-- [ ] Spawn the packaged Chromium executable with `--version` and require exit code zero.
-- [ ] Run focused lint/typecheck and the packaged directory verification.
-- [ ] Commit the task.
-
-### Task 6: Integrated Verification and Local Merge
-
-**Files:**
-- Verify all changed files and docs.
-
-- [ ] Run `pnpm typecheck`.
-- [ ] Run ESLint on all changed TypeScript/Vue files.
-- [ ] Run `pnpm test` and investigate any failure rather than ignoring it.
-- [ ] Run `pnpm build`.
-- [ ] Run `pnpm dist:dir` on the supported host target.
-- [ ] Review `git diff --check`, changed files, and commits against the spec.
-- [ ] Merge the feature branch locally into `v2`, restore the user's pre-existing changes, and re-run focused plus full verification on the merged commit snapshot.
-
+- Run desktop renderer and node tests, workspace typecheck, build, `git diff --check`, and packaged directory verification.
+- Perform a real `百度搜索` workflow smoke test when the GUI runtime is available; otherwise report the exact remaining manual check.
+- Review every changed line against the approved spec.
+- Merge the feature branch locally into `v2` without overwriting the user's dirty changes, then re-run focused verification on the merge result.
