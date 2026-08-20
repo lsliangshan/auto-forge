@@ -218,7 +218,7 @@ export const useAuthStore = defineStore('auth', {
       const sessionOwner = nextSessionGeneration(this)
       try {
         await getDesktopApi().auth.logout()
-        if (sessionOwner !== sessionGeneration(this)) return true
+        nextSessionGeneration(this)
         this.session = null
         this.initialized = true
         this.error = ''

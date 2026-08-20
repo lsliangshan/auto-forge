@@ -400,6 +400,61 @@ describe('authentication store', () => {
     expect(auth.error).toBe('操作失败，请稍后重试')
   })
 
+  it('clears the session after a pending logout succeeds despite a later OTP cancellation', async () => {
+    const api = createApi()
+    const logoutStarted = deferred<void>()
+    const pendingLogout = deferred<void>()
+    vi.mocked(api.auth.logout).mockImplementation(() => {
+      logoutStarted.resolve()
+      return pendingLogout.promise
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.session = authSession
+
+    const loggingOut = auth.logout()
+    await logoutStarted.promise
+    await auth.cancelOtp()
+    pendingLogout.resolve()
+    await expect(loggingOut).resolves.toBe(true)
+
+    expect(auth.session).toBeNull()
+    expect(auth.initialized).toBe(true)
+    expect(auth.error).toBe('')
+    expect(auth.submitting).toBe(false)
+  })
+
+  it('makes logout terminal when a restore starts before remote logout succeeds', async () => {
+    const api = createApi()
+    const logoutStarted = deferred<void>()
+    const pendingLogout = deferred<void>()
+    const pendingRestore = deferred<AuthSession | null>()
+    vi.mocked(api.auth.logout).mockImplementation(() => {
+      logoutStarted.resolve()
+      return pendingLogout.promise
+    })
+    vi.mocked(api.auth.getSession).mockReturnValue(pendingRestore.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.session = authSession
+
+    const loggingOut = auth.logout()
+    await logoutStarted.promise
+    const restoring = auth.restore()
+    expect(auth.restoring).toBe(true)
+
+    pendingLogout.resolve()
+    await expect(loggingOut).resolves.toBe(true)
+    expect(auth.session).toBeNull()
+    expect(auth.initialized).toBe(true)
+    expect(auth.submitting).toBe(false)
+
+    pendingRestore.resolve(authSession)
+    await restoring
+    expect(auth.session).toBeNull()
+    expect(auth.restoring).toBe(false)
+  })
+
   it('still logs out remotely after challenge cancellation fails', async () => {
     const api = createApi()
     vi.mocked(api.auth.cancelOtp).mockRejectedValue(toSafeAppError({ code: 'INTERNAL_ERROR' }))
