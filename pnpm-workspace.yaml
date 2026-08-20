@@ -4,6 +4,7 @@ packages:
   - examples/*
 allowBuilds:
   better-sqlite3: true
+  core-js-pure: false
   electron: true
   electron-winstaller: true
   esbuild: true

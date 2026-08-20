@@ -20,6 +20,7 @@
     "@autoforge/shared": "workspace:*",
     "@autoforge/workflow-schema": "workspace:*",
     "@autoforge/workflow-sdk": "workspace:*",
+    "@cloudbase/js-sdk": "3.8.0",
     "@element-plus/icons-vue": "2.3.2",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
