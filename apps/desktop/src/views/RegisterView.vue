@@ -171,7 +171,7 @@ function selectMethod(next: RegisterMethod) {
   method.value = next
 }
 
-watch([target, account, password], () => {
+watch([target, account, password, confirmation], () => {
   validationError.value = ''
   auth.error = ''
   if (!auth.sendingOtp && !auth.challenge) return

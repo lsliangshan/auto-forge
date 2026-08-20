@@ -1017,6 +1017,7 @@ describe('authentication pages', () => {
     ['target', 'register-phone', '18311032723'],
     ['account', 'register-account', 'Alice_2'],
     ['password', 'register-password', 'password2'],
+    ['confirmation', 'register-confirm', 'password2'],
   ])('cancels the registration challenge when the %s changes', async (_field, testId, nextValue) => {
     vi.useFakeTimers()
     const api = createApi()
