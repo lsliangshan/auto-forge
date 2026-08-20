@@ -2,13 +2,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { build as esbuild } from 'esbuild'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
 import type { AppErrorCode, ValidationResult } from '@autoforge/shared'
 import type { AppRepositories, InstalledWorkflow, WorkflowProject } from '../database/repositories.js'
+import { loadWorkflowCompiler } from './workflow-compiler.js'
 
 const editableFileLimit = 2 * 1024 * 1024
 const textDecoder = new TextDecoder('utf-8', { fatal: true })
+const esbuild = loadWorkflowCompiler()
 
 type ProjectRepositories = Pick<AppRepositories, 'workflowProjects' | 'installedWorkflows' | 'workflowFiles'>
 

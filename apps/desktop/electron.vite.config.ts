@@ -10,6 +10,7 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
+        external: ['esbuild'],
         input: {
           index: new URL('./electron/main/index.ts', import.meta.url).pathname,
         },
