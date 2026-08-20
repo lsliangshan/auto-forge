@@ -3,6 +3,12 @@
     <h1 id="auth-title">注册云端账号</h1>
     <p class="auth-description">通过手机号或邮箱验证，注册成功后将自动登录。</p>
     <div class="register-methods" role="group" aria-label="注册方式">
+      <span
+        class="register-method-indicator"
+        data-testid="register-active-indicator"
+        aria-hidden="true"
+        :style="{ transform: methodIndicatorTransform }"
+      />
       <button
         v-for="item in registerMethods"
         :key="item.value"
@@ -120,6 +126,9 @@ const registerMethods: ReadonlyArray<{ value: RegisterMethod; label: string }> =
 const auth = useAuthStore();
 const router = useRouter();
 const method = ref<RegisterMethod>("phone");
+const methodIndicatorTransform = computed(() =>
+  method.value === "phone" ? "translateX(0px)" : "translateX(calc(100% + 4px))"
+);
 const target = ref("");
 const account = ref("");
 const password = ref("");
@@ -260,16 +269,30 @@ h1 {
   line-height: 1.55;
 }
 .register-methods {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 4px;
   margin-bottom: 18px;
-  border: 1px solid var(--af-border);
+  /* border: 1px solid var(--af-border); */
   border-radius: 10px;
   padding: 4px;
   background: var(--af-canvas);
 }
+.register-method-indicator {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc((100% - 12px) / 2);
+  border-radius: 7px;
+  background: var(--af-surface);
+  pointer-events: none;
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
 .register-methods button {
+  position: relative;
+  z-index: 1;
   border: 0;
   border-radius: 7px;
   padding: 8px 6px;
@@ -280,7 +303,7 @@ h1 {
   cursor: pointer;
 }
 .register-methods button.active {
-  background: var(--af-surface);
+  background: transparent;
   color: var(--af-graphite);
   font-weight: 650;
 }

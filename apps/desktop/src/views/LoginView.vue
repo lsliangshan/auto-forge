@@ -3,6 +3,12 @@
     <h1 id="auth-title">登录 AutoForge</h1>
     <p class="auth-description">使用 AutoForge 云端账号继续。</p>
     <div class="login-methods" role="group" aria-label="登录方式">
+      <span
+        class="login-method-indicator"
+        data-testid="login-active-indicator"
+        aria-hidden="true"
+        :style="{ transform: methodIndicatorTransform }"
+      />
       <button
         v-for="item in loginMethods"
         :key="item.value"
@@ -112,6 +118,12 @@ const auth = useAuthStore();
 const route = useRoute();
 const router = useRouter();
 const method = ref<LoginMethod>("phone");
+const methodIndicatorTransform = computed(() => {
+  const index = loginMethods.findIndex((item) => item.value === method.value);
+  return index === 0
+    ? "translateX(0px)"
+    : `translateX(calc(${index * 100}% + ${index * 4}px))`;
+});
 const target = ref("");
 const code = ref("");
 const account = ref("");
@@ -250,16 +262,30 @@ h1 {
   line-height: 1.55;
 }
 .login-methods {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 4px;
   margin-bottom: 18px;
-  border: 1px solid var(--af-border);
+  /* border: 1px solid var(--af-border); */
   border-radius: 10px;
   padding: 4px;
   background: var(--af-canvas);
 }
+.login-method-indicator {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc((100% - 16px) / 3);
+  border-radius: 7px;
+  background: var(--af-surface);
+  pointer-events: none;
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
 .login-methods button {
+  position: relative;
+  z-index: 1;
   border: 0;
   border-radius: 7px;
   padding: 8px 6px;
@@ -270,7 +296,7 @@ h1 {
   cursor: pointer;
 }
 .login-methods button.active {
-  background: var(--af-surface);
+  background: transparent;
   color: var(--af-graphite);
   font-weight: 650;
 }

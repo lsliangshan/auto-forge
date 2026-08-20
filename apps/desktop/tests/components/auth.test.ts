@@ -564,6 +564,17 @@ describe('authentication pages', () => {
     expect(wrapper.get('.auth-switch').text().replace(/\s+/g, '')).toBe('还没有云端账号？去注册')
   })
 
+  it('moves the login method background through all three selections', async () => {
+    const { wrapper } = await mountAuthApp('/login')
+    const indicator = wrapper.get('[data-testid="login-active-indicator"]').element as HTMLElement
+
+    expect(indicator.style.transform).toBe('translateX(0px)')
+    await wrapper.get('[data-testid="login-method-email"]').trigger('click')
+    expect(indicator.style.transform).toBe('translateX(calc(100% + 4px))')
+    await wrapper.get('[data-testid="login-method-password"]').trigger('click')
+    expect(indicator.style.transform).toBe('translateX(calc(200% + 8px))')
+  })
+
   it('validates phone and email destinations before sending an OTP', async () => {
     const { api, wrapper } = await mountAuthApp('/login')
 
@@ -887,6 +898,15 @@ describe('authentication pages', () => {
     expect(wrapper.get('[data-testid="register-code"]').attributes('autocomplete')).toBe('one-time-code')
     expect(wrapper.text()).toContain('通过手机号或邮箱验证，注册成功后将自动登录。')
     expect(wrapper.get('.auth-switch').text().replace(/\s+/g, '')).toBe('已有云端账号？返回登录')
+  })
+
+  it('moves the registration method background to the selected option', async () => {
+    const { wrapper } = await mountAuthApp('/register')
+    const indicator = wrapper.get('[data-testid="register-active-indicator"]').element as HTMLElement
+
+    expect(indicator.style.transform).toBe('translateX(0px)')
+    await wrapper.get('[data-testid="register-method-email"]').trigger('click')
+    expect(indicator.style.transform).toBe('translateX(calc(100% + 4px))')
   })
 
   it('keeps the registration page scrollable at the minimum window height', async () => {
