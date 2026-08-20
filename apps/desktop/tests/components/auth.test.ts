@@ -14,6 +14,16 @@ const authSession: AuthSession = {
   authenticatedAt: '2026-08-07T00:00:00.000Z',
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 function createApi(): DesktopAPI {
   return {
     auth: {
@@ -150,6 +160,43 @@ describe('authentication store', () => {
     expect(auth.challenge).toEqual({ challengeId: 'challenge_2', expiresIn: 300 })
   })
 
+  it('cancels a challenge returned after an explicit cancellation during OTP sending', async () => {
+    const api = createApi()
+    const pendingOtp = deferred<{ challengeId: string, expiresIn: number }>()
+    vi.mocked(api.auth.sendOtp).mockReturnValue(pendingOtp.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+
+    const sending = auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })
+    expect(api.auth.sendOtp).toHaveBeenCalledOnce()
+    await auth.cancelOtp()
+    expect(auth.challenge).toBeNull()
+
+    pendingOtp.resolve({ challengeId: 'challenge_1', expiresIn: 300 })
+    await expect(sending).resolves.toBeUndefined()
+
+    expect(auth.challenge).toBeNull()
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+  })
+
+  it('does not let a stale OTP send error overwrite a newer local error', async () => {
+    const api = createApi()
+    const pendingOtp = deferred<{ challengeId: string, expiresIn: number }>()
+    vi.mocked(api.auth.sendOtp).mockReturnValue(pendingOtp.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+
+    const sending = auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })
+    await auth.cancelOtp()
+    await auth.verifyOtp('123456')
+    expect(auth.error).toBe('请先发送验证码')
+
+    pendingOtp.reject(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    await expect(sending).resolves.toBeUndefined()
+
+    expect(auth.error).toBe('请先发送验证码')
+  })
+
   it('clears an OTP challenge when verification fails', async () => {
     const api = createApi()
     vi.mocked(api.auth.verifyOtp).mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_OTP' }))
@@ -162,6 +209,48 @@ describe('authentication store', () => {
     expect(auth.challenge).toBeNull()
     expect(auth.session).toBeNull()
     expect(auth.error).toBe('验证码错误，请重新发送后再试')
+  })
+
+  it('does not let a cancelled verification overwrite a newer challenge and reconciles Main', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const verifying = auth.verifyOtp('123456')
+    await auth.cancelOtp()
+    auth.challenge = { challengeId: 'challenge_2', expiresIn: 300 }
+
+    pendingVerification.resolve(authSession)
+    await expect(verifying).resolves.toBeUndefined()
+
+    expect(auth.challenge).toEqual({ challengeId: 'challenge_2', expiresIn: 300 })
+    expect(auth.session).toBeNull()
+    expect(api.auth.logout).toHaveBeenCalledOnce()
+  })
+
+  it('suppresses sends, password login, and duplicate verification while verifying an OTP', async () => {
+    const api = createApi()
+    const pendingVerification = deferred<AuthSession>()
+    vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const verifying = auth.verifyOtp('123456')
+
+    await expect(auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })).resolves.toBeUndefined()
+    await expect(auth.loginWithPassword({ account: 'Alice', password: 'password' })).resolves.toBeUndefined()
+    await expect(auth.verifyOtp('654321')).resolves.toBeUndefined()
+    expect(api.auth.sendOtp).not.toHaveBeenCalled()
+    expect(api.auth.loginWithPassword).not.toHaveBeenCalled()
+    expect(api.auth.verifyOtp).toHaveBeenCalledOnce()
+
+    await auth.cancelOtp()
+    pendingVerification.resolve(authSession)
+    await verifying
   })
 
   it('stores a password login session', async () => {

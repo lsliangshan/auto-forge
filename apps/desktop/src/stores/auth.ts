@@ -3,6 +3,30 @@ import type { AuthCredentials, AuthOtpChallenge, AuthOtpRequest, AuthSession } f
 import { displayError, getDesktopApi } from '../services/desktop-api'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
+const otpGenerations = new WeakMap<object, number>()
+const submittingCounts = new WeakMap<object, number>()
+
+function otpGeneration(store: object): number {
+  return otpGenerations.get(store) ?? 0
+}
+
+function nextOtpGeneration(store: object): number {
+  const generation = otpGeneration(store) + 1
+  otpGenerations.set(store, generation)
+  return generation
+}
+
+function startSubmitting(store: { submitting: boolean }): void {
+  const count = (submittingCounts.get(store) ?? 0) + 1
+  submittingCounts.set(store, count)
+  store.submitting = true
+}
+
+function finishSubmitting(store: { submitting: boolean }): void {
+  const count = Math.max((submittingCounts.get(store) ?? 1) - 1, 0)
+  submittingCounts.set(store, count)
+  store.submitting = count > 0
+}
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -38,8 +62,9 @@ export const useAuthStore = defineStore('auth', {
       return operation
     },
     async sendOtp(request: AuthOtpRequest): Promise<AuthOtpChallenge | undefined> {
-      if (this.sendingOtp) return undefined
+      if (this.sendingOtp || this.submitting) return undefined
 
+      const generation = nextOtpGeneration(this)
       const previousChallenge = this.challenge
       this.challenge = null
       this.sendingOtp = true
@@ -53,50 +78,80 @@ export const useAuthStore = defineStore('auth', {
           }
         }
         const challenge = await getDesktopApi().auth.sendOtp(request)
+        if (generation !== otpGeneration(this)) {
+          try {
+            await getDesktopApi().auth.cancelOtp(challenge.challengeId)
+          } catch {
+            // A stale challenge cannot be made current again by a failed cleanup.
+          }
+          return undefined
+        }
         this.challenge = challenge
         return challenge
       } catch (error) {
-        this.error = displayError(error, '验证码发送失败')
+        if (generation === otpGeneration(this)) {
+          this.error = displayError(error, '验证码发送失败')
+        }
         return undefined
       } finally {
         this.sendingOtp = false
       }
     },
     async verifyOtp(code: string): Promise<AuthSession | undefined> {
+      if (this.submitting) return undefined
+
       const challenge = this.challenge
       if (!challenge) {
         this.error = '请先发送验证码'
         return undefined
       }
 
-      this.submitting = true
+      const generation = otpGeneration(this)
+      startSubmitting(this)
       this.error = ''
       try {
         const session = await getDesktopApi().auth.verifyOtp({ challengeId: challenge.challengeId, code })
+        if (generation !== otpGeneration(this)) {
+          try {
+            await getDesktopApi().auth.logout()
+          } catch {
+            // A stale verification must not update Renderer state with cleanup errors.
+          }
+          return undefined
+        }
         this.session = session
         this.initialized = true
         return session
       } catch (error) {
-        this.error = displayError(error, '验证码验证失败')
+        if (generation === otpGeneration(this)) {
+          this.error = displayError(error, '验证码验证失败')
+        }
         return undefined
       } finally {
-        this.challenge = null
-        this.submitting = false
+        if (generation === otpGeneration(this) && this.challenge?.challengeId === challenge.challengeId) {
+          this.challenge = null
+        }
+        finishSubmitting(this)
       }
     },
     async cancelOtp(): Promise<void> {
       const challenge = this.challenge
+      const generation = nextOtpGeneration(this)
       this.challenge = null
       if (!challenge) return
 
       try {
         await getDesktopApi().auth.cancelOtp(challenge.challengeId)
       } catch (error) {
-        this.error = displayError(error, '取消验证码失败')
+        if (generation === otpGeneration(this)) {
+          this.error = displayError(error, '取消验证码失败')
+        }
       }
     },
     async loginWithPassword(credentials: AuthCredentials): Promise<AuthSession | undefined> {
-      this.submitting = true
+      if (this.sendingOtp || this.submitting) return undefined
+
+      startSubmitting(this)
       this.error = ''
       try {
         const session = await getDesktopApi().auth.loginWithPassword(credentials)
@@ -107,11 +162,11 @@ export const useAuthStore = defineStore('auth', {
         this.error = displayError(error, '登录失败')
         return undefined
       } finally {
-        this.submitting = false
+        finishSubmitting(this)
       }
     },
     async logout(): Promise<boolean> {
-      this.submitting = true
+      startSubmitting(this)
       this.error = ''
       try {
         await this.cancelOtp()
@@ -124,7 +179,7 @@ export const useAuthStore = defineStore('auth', {
         this.error = displayError(error, '退出登录失败')
         return false
       } finally {
-        this.submitting = false
+        finishSubmitting(this)
       }
     },
   },
