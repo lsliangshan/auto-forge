@@ -279,6 +279,7 @@ export const developerProjectSchema = z.object({
   rootPath: nonEmptyStringSchema,
   status: z.enum(['new', 'building', 'ready', 'invalid', 'error']),
   files: z.array(nonEmptyStringSchema),
+  directories: z.array(nonEmptyStringSchema),
   updatedAt: timestampSchema,
 }).strict()
 
@@ -675,6 +676,9 @@ export const ipcChannels = {
   developerRegisterProject: 'developer:register-project',
   developerReadFile: 'developer:read-file',
   developerWriteFile: 'developer:write-file',
+  developerCreateEntry: 'developer:create-entry',
+  developerRenameEntry: 'developer:rename-entry',
+  developerDeleteEntry: 'developer:delete-entry',
   developerBuildProject: 'developer:build-project',
   developerValidate: 'developer:validate',
   developerRun: 'developer:run',
@@ -732,6 +736,25 @@ export const readFileRequestSchema = z.object({
   relativePath: nonEmptyStringSchema,
 }).strict()
 export const writeFileRequestSchema = readFileRequestSchema.extend({ content: z.string() })
+const developerEntryNameSchema = z.string().trim().min(1).refine(
+  (value) => value !== '.' && value !== '..' && !/[\\/\0]/.test(value),
+  'A single file or directory name is required',
+)
+export const createEntryRequestSchema = z.object({
+  projectId: identifierSchema,
+  parentPath: z.string(),
+  name: developerEntryNameSchema,
+  kind: z.enum(['file', 'directory']),
+}).strict()
+export const renameEntryRequestSchema = z.object({
+  projectId: identifierSchema,
+  relativePath: nonEmptyStringSchema,
+  name: developerEntryNameSchema,
+}).strict()
+export const deleteEntryRequestSchema = z.object({
+  projectId: identifierSchema,
+  relativePath: nonEmptyStringSchema,
+}).strict()
 export const validateProjectRequestSchema = z.object({ projectId: identifierSchema }).strict()
 export const executionListRequestSchema = executionQuerySchema.optional()
 export const getExecutionRequestSchema = z.object({ executionId: identifierSchema }).strict()
@@ -799,6 +822,9 @@ export const ipcRequestSchemas = {
   [ipcChannels.developerRegisterProject]: registerProjectRequestSchema,
   [ipcChannels.developerReadFile]: readFileRequestSchema,
   [ipcChannels.developerWriteFile]: writeFileRequestSchema,
+  [ipcChannels.developerCreateEntry]: createEntryRequestSchema,
+  [ipcChannels.developerRenameEntry]: renameEntryRequestSchema,
+  [ipcChannels.developerDeleteEntry]: deleteEntryRequestSchema,
   [ipcChannels.developerBuildProject]: validateProjectRequestSchema,
   [ipcChannels.developerValidate]: validateProjectRequestSchema,
   [ipcChannels.developerRun]: developerRunInputSchema,
@@ -859,6 +885,9 @@ export const ipcResponseSchemas = {
   [ipcChannels.developerRegisterProject]: developerProjectSchema.nullable(),
   [ipcChannels.developerReadFile]: z.string(),
   [ipcChannels.developerWriteFile]: voidResponseSchema,
+  [ipcChannels.developerCreateEntry]: developerProjectSchema,
+  [ipcChannels.developerRenameEntry]: developerProjectSchema,
+  [ipcChannels.developerDeleteEntry]: developerProjectSchema,
   [ipcChannels.developerBuildProject]: developerProjectSchema,
   [ipcChannels.developerValidate]: validationResultSchema,
   [ipcChannels.developerRun]: executionIdResponseSchema,
@@ -930,6 +959,9 @@ export interface DesktopAPI {
     registerProject(): Promise<DeveloperProject | null>
     readFile(projectId: string, relativePath: string): Promise<string>
     writeFile(projectId: string, relativePath: string, content: string): Promise<void>
+    createEntry(projectId: string, parentPath: string, name: string, kind: 'file' | 'directory'): Promise<DeveloperProject>
+    renameEntry(projectId: string, relativePath: string, name: string): Promise<DeveloperProject>
+    deleteEntry(projectId: string, relativePath: string): Promise<DeveloperProject>
     build(projectId: string): Promise<DeveloperProject>
     validate(projectId: string): Promise<ValidationResult>
     run(input: DeveloperRunInput): Promise<{ executionId: string }>

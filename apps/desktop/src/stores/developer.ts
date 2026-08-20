@@ -46,6 +46,19 @@ function bufferKey(projectId: string, path: string): string {
   return `${projectId}\u0000${path}`
 }
 
+function entryContains(entryPath: string, candidatePath: string): boolean {
+  return candidatePath === entryPath || candidatePath.startsWith(`${entryPath}/`)
+}
+
+function renamedPath(path: string, name: string): string {
+  const separator = path.lastIndexOf('/')
+  return separator === -1 ? name : `${path.slice(0, separator + 1)}${name}`
+}
+
+function moveEntryPath(candidatePath: string, sourcePath: string, destinationPath: string): string {
+  return candidatePath === sourcePath ? destinationPath : `${destinationPath}${candidatePath.slice(sourcePath.length)}`
+}
+
 function parseManifest(value: string): WorkflowManifest | undefined {
   try {
     const parsed = JSON.parse(value) as unknown
@@ -66,6 +79,7 @@ export const useDeveloperStore = defineStore('developer', {
     projects: [] as DeveloperProject[],
     selectedProjectId: '',
     selectedPath: '',
+    openPaths: {} as Record<string, string[]>,
     files: {} as Record<string, FileBuffer>,
     manifests: {} as Record<string, WorkflowManifest | undefined>,
     diagnostics: [] as ValidationDiagnostic[],
@@ -92,6 +106,7 @@ export const useDeveloperStore = defineStore('developer', {
       return state.files[bufferKey(state.selectedProjectId, state.selectedPath)]
     },
     currentContent(): string { return this.currentBuffer?.content ?? '' },
+    currentOpenPaths(state): string[] { return state.openPaths[state.selectedProjectId] ?? [] },
     currentManifest(state): WorkflowManifest | undefined { return state.manifests[state.selectedProjectId] },
     saveState(): FileSaveState { return this.currentBuffer?.saveState ?? 'idle' },
     fileUnavailableReason(): string { return this.currentBuffer?.error ?? '' },
@@ -180,8 +195,88 @@ export const useDeveloperStore = defineStore('developer', {
     async selectFile(path: string) {
       const project = this.selectedProject
       if (!project || !project.files.includes(path)) return
+      const openPaths = this.openPaths[project.id] ?? []
+      if (!openPaths.includes(path)) this.openPaths[project.id] = [...openPaths, path]
       this.selectedPath = path
       await this._loadFile(project.id, path)
+    },
+    async closeFile(path: string) {
+      const projectId = this.selectedProjectId
+      const openPaths = this.openPaths[projectId] ?? []
+      const index = openPaths.indexOf(path)
+      if (index === -1) return
+      await this.flushPendingSaves()
+      const remaining = openPaths.filter((openPath) => openPath !== path)
+      this.openPaths[projectId] = remaining
+      if (this.selectedPath !== path) return
+      this.selectedPath = ''
+      const next = remaining[index] ?? remaining[index - 1]
+      if (next) await this.selectFile(next)
+    },
+    async createEntry(parentPath: string, name: string, kind: 'file' | 'directory') {
+      const projectId = this.selectedProjectId
+      if (!projectId) return
+      this.error = ''
+      try {
+        const project = await getDesktopApi().developer.createEntry(projectId, parentPath, name, kind)
+        this._upsertProject(project)
+        if (kind === 'file') {
+          const path = parentPath ? `${parentPath}/${name}` : name
+          await this.selectFile(path)
+        }
+      } catch (error) { this.error = displayError(error, '创建文件或目录失败') }
+    },
+    async renameEntry(path: string, name: string) {
+      const projectId = this.selectedProjectId
+      if (!projectId) return
+      this.error = ''
+      await this._flushEntry(projectId, path)
+      if (Object.values(this.files).some((buffer) => buffer.projectId === projectId
+        && entryContains(path, buffer.path) && buffer.saveState === 'error')) {
+        this.error = '存在未保存文件，请修复保存问题后重试。'
+        return
+      }
+      try {
+        const project = await getDesktopApi().developer.renameEntry(projectId, path, name)
+        const destination = renamedPath(path, name)
+        this._upsertProject(project)
+        for (const [key, buffer] of Object.entries(this.files)) {
+          if (buffer.projectId !== projectId || !entryContains(path, buffer.path)) continue
+          delete this.files[key]
+          buffer.path = moveEntryPath(buffer.path, path, destination)
+          this.files[bufferKey(projectId, buffer.path)] = buffer
+        }
+        this.openPaths[projectId] = (this.openPaths[projectId] ?? [])
+          .map((openPath) => entryContains(path, openPath) ? moveEntryPath(openPath, path, destination) : openPath)
+        if (entryContains(path, this.selectedPath)) this.selectedPath = moveEntryPath(this.selectedPath, path, destination)
+      } catch (error) { this.error = displayError(error, '重命名失败') }
+    },
+    async deleteEntry(path: string) {
+      const projectId = this.selectedProjectId
+      if (!projectId) return
+      this.error = ''
+      await this._flushEntry(projectId, path)
+      if (Object.values(this.files).some((buffer) => buffer.projectId === projectId
+        && entryContains(path, buffer.path) && buffer.saveState === 'error')) {
+        this.error = '存在未保存文件，请修复保存问题后重试。'
+        return
+      }
+      try {
+        const project = await getDesktopApi().developer.deleteEntry(projectId, path)
+        const previousOpenPaths = this.openPaths[projectId] ?? []
+        const selectedIndex = previousOpenPaths.indexOf(this.selectedPath)
+        this._upsertProject(project)
+        for (const [key, buffer] of Object.entries(this.files)) {
+          if (buffer.projectId === projectId && entryContains(path, buffer.path)) delete this.files[key]
+        }
+        const remaining = previousOpenPaths.filter((openPath) => !entryContains(path, openPath) && project.files.includes(openPath))
+        this.openPaths[projectId] = remaining
+        if (!entryContains(path, this.selectedPath)) return
+        this.selectedPath = ''
+        const next = remaining[selectedIndex] ?? remaining[selectedIndex - 1]
+          ?? (project.files.includes('src/index.ts') ? 'src/index.ts' : project.files[0])
+        if (next) await this.selectFile(next)
+      } catch (error) { this.error = displayError(error, '删除失败') }
     },
     async _loadFile(projectId: string, path: string) {
       const key = bufferKey(projectId, path)
@@ -230,6 +325,33 @@ export const useDeveloperStore = defineStore('developer', {
       state.queues.set(key, queued)
       void queued.finally(() => { if (state.queues.get(key) === queued) state.queues.delete(key) })
       return queued
+    },
+    async _flushEntry(projectId: string, path: string) {
+      const state = runtime(this)
+      const pending: Promise<void>[] = []
+      for (const [key, timer] of [...state.timers]) {
+        const buffer = this.files[key]
+        if (!buffer || buffer.projectId !== projectId || !entryContains(path, buffer.path)) continue
+        clearTimeout(timer)
+        state.timers.delete(key)
+        pending.push(this._enqueueSave(key))
+      }
+      for (const [key, queue] of state.queues) {
+        const buffer = this.files[key]
+        if (buffer?.projectId === projectId && entryContains(path, buffer.path)) pending.push(queue)
+      }
+      await Promise.allSettled(pending)
+    },
+    saveCurrent(): Promise<void> {
+      if (!this.selectedProjectId || !this.selectedPath) return Promise.resolve()
+      const key = bufferKey(this.selectedProjectId, this.selectedPath)
+      const state = runtime(this)
+      const timer = state.timers.get(key)
+      if (timer) {
+        clearTimeout(timer)
+        state.timers.delete(key)
+      }
+      return this._enqueueSave(key)
     },
     async _persistSnapshot(key: string, snapshot: { content: string; version: number; projectVersion: number }) {
       const buffer = this.files[key]

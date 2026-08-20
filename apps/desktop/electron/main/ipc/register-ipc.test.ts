@@ -80,6 +80,7 @@ function services(): DesktopIpcServices {
     workflows: { list: vi.fn(), get: vi.fn(), setEnabled: vi.fn(), remove: vi.fn(), installProject: vi.fn() },
     developer: {
       listProjects: vi.fn(), createProject: vi.fn(), registerProject: vi.fn(), readFile: vi.fn(), writeFile: vi.fn(),
+      createEntry: vi.fn(), renameEntry: vi.fn(), deleteEntry: vi.fn(),
       build: vi.fn(), validate: vi.fn(), run: vi.fn(),
     },
     executions: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), cancel: vi.fn() },
@@ -167,6 +168,35 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.profile.pickAndUploadAvatar).toHaveBeenCalledOnce()
     await expect(app.invoke(ipcChannels.profileUpdate, { account: 'Mallory' }))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+  })
+
+  it('guards and validates fixed developer entry operations', async () => {
+    const app = harness()
+    const project = {
+      id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new' as const,
+      files: ['src/index.ts', 'workflow.json'], directories: ['src'], updatedAt: '2026-07-19T00:00:00.000Z',
+    }
+    vi.mocked(app.dependencies.developer.createEntry).mockResolvedValue(project)
+    vi.mocked(app.dependencies.developer.renameEntry).mockResolvedValue(project)
+    vi.mocked(app.dependencies.developer.deleteEntry).mockResolvedValue(project)
+
+    await expect(app.invoke(ipcChannels.developerCreateEntry, {
+      projectId: 'project_1', parentPath: 'src', name: 'helpers.ts', kind: 'file',
+    })).resolves.toEqual(project)
+    await expect(app.invoke(ipcChannels.developerRenameEntry, {
+      projectId: 'project_1', relativePath: 'src/helpers.ts', name: 'format.ts',
+    })).resolves.toEqual(project)
+    await expect(app.invoke(ipcChannels.developerDeleteEntry, {
+      projectId: 'project_1', relativePath: 'src/format.ts',
+    })).resolves.toEqual(project)
+
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(3)
+    expect(app.dependencies.developer.createEntry).toHaveBeenCalledWith('project_1', 'src', 'helpers.ts', 'file')
+    expect(app.dependencies.developer.renameEntry).toHaveBeenCalledWith('project_1', 'src/helpers.ts', 'format.ts')
+    expect(app.dependencies.developer.deleteEntry).toHaveBeenCalledWith('project_1', 'src/format.ts')
+    await expect(app.invoke(ipcChannels.developerCreateEntry, {
+      projectId: 'project_1', parentPath: '', name: '../escape.ts', kind: 'file',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
   })
 
   it('validates sender and input before requiring a session', async () => {

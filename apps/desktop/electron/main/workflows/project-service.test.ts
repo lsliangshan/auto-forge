@@ -319,6 +319,58 @@ describe('WorkflowProjectService', () => {
       .rejects.toMatchObject({ code: 'PATH_OUTSIDE_PROJECT' })
   })
 
+  it('creates editable files and directories inside the registered project', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+
+    await projects.createEntry(project.id, 'src', 'helpers.ts', 'file')
+    await projects.createEntry(project.id, 'src', 'utils', 'directory')
+
+    expect(readFileSync(join(root, 'src/helpers.ts'), 'utf8')).toBe('')
+    expect(readdirSync(join(root, 'src/utils'))).toEqual([])
+  })
+
+  it('renames files and directories without replacing an existing entry', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    writeFileSync(join(root, 'src/helpers.ts'), 'export const helper = true\n')
+    mkdirSync(join(root, 'src/utils'))
+    writeFileSync(join(root, 'src/utils/value.ts'), 'export const value = 1\n')
+    const project = projects.register(root)
+
+    await projects.renameEntry(project.id, 'src/helpers.ts', 'format.ts')
+    await projects.renameEntry(project.id, 'src/utils', 'lib')
+
+    expect(existsSync(join(root, 'src/helpers.ts'))).toBe(false)
+    expect(readFileSync(join(root, 'src/format.ts'), 'utf8')).toContain('helper')
+    expect(readFileSync(join(root, 'src/lib/value.ts'), 'utf8')).toContain('value')
+    await expect(projects.renameEntry(project.id, 'src/format.ts', 'index.ts'))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('deletes ordinary entries but protects the required workflow files', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    mkdirSync(join(root, 'src/lib'))
+    writeFileSync(join(root, 'src/lib/value.ts'), 'export const value = 1\n')
+    writeFileSync(join(root, 'notes.md'), 'notes\n')
+    const project = projects.register(root)
+
+    await projects.deleteEntry(project.id, 'notes.md')
+    await projects.deleteEntry(project.id, 'src/lib')
+
+    expect(existsSync(join(root, 'notes.md'))).toBe(false)
+    expect(existsSync(join(root, 'src/lib'))).toBe(false)
+    await expect(projects.deleteEntry(project.id, 'workflow.json')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(projects.renameEntry(project.id, 'src/index.ts', 'main.ts')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(existsSync(join(root, 'workflow.json'))).toBe(true)
+    expect(existsSync(join(root, 'src/index.ts'))).toBe(true)
+  })
+
   it('rejects an existing symlink that resolves outside the registered project', async () => {
     const { directory, projects } = openTestServices()
     const root = join(directory, 'project')

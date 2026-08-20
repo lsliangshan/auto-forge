@@ -682,6 +682,27 @@ describe('cross-process contracts', () => {
     expect(() => ipcRequestSchemas[ipcChannels.workflowsRemove].parse({ id: 'browser.search.baidu' })).toThrow()
   })
 
+  it('validates fixed developer entry operations and refreshed project responses', () => {
+    const project = {
+      id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new' as const,
+      files: ['src/index.ts', 'workflow.json'], directories: ['src'], updatedAt: '2026-07-19T00:00:00.000Z',
+    }
+
+    expect(ipcRequestSchemas[ipcChannels.developerCreateEntry].parse({
+      projectId: 'project_1', parentPath: 'src', name: 'helpers.ts', kind: 'file',
+    })).toEqual({ projectId: 'project_1', parentPath: 'src', name: 'helpers.ts', kind: 'file' })
+    expect(ipcRequestSchemas[ipcChannels.developerRenameEntry].parse({
+      projectId: 'project_1', relativePath: 'src/helpers.ts', name: 'format.ts',
+    })).toEqual({ projectId: 'project_1', relativePath: 'src/helpers.ts', name: 'format.ts' })
+    expect(ipcRequestSchemas[ipcChannels.developerDeleteEntry].parse({
+      projectId: 'project_1', relativePath: 'src/helpers.ts',
+    })).toEqual({ projectId: 'project_1', relativePath: 'src/helpers.ts' })
+    expect(ipcResponseSchemas[ipcChannels.developerCreateEntry].parse(project)).toEqual(project)
+    expect(() => ipcRequestSchemas[ipcChannels.developerCreateEntry].parse({
+      projectId: 'project_1', parentPath: '', name: '../escape.ts', kind: 'file',
+    })).toThrow()
+  })
+
   it('requires a conversation identity when reading persisted messages', () => {
     expect(ipcRequestSchemas[ipcChannels.chatListMessages].parse({ conversationId: 'conversation_1' }))
       .toEqual({ conversationId: 'conversation_1' })

@@ -437,6 +437,26 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('returns refreshed file and directory entries after developer mutations', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-developer-entries-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    const created = await runtime.services.developer.createProject('Entry workflow')
+    expect(created.directories).toEqual(['src'])
+    const withDirectory = await runtime.services.developer.createEntry(created.id, '', 'docs', 'directory')
+    const withFile = await runtime.services.developer.createEntry(created.id, 'docs', 'notes.md', 'file')
+    const renamed = await runtime.services.developer.renameEntry(created.id, 'docs/notes.md', 'readme.md')
+    const deleted = await runtime.services.developer.deleteEntry(created.id, 'docs/readme.md')
+
+    expect(withDirectory.directories).toEqual(['docs', 'src'])
+    expect(withFile.files).toContain('docs/notes.md')
+    expect(renamed.files).toContain('docs/readme.md')
+    expect(renamed.files).not.toContain('docs/notes.md')
+    expect(deleted.files).not.toContain('docs/readme.md')
+    await runtime.close()
+  })
+
   it('persists the authenticated user profile across runtime restart', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-profile-'))
     directories.push(root)

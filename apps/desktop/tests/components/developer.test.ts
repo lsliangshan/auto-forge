@@ -1,10 +1,11 @@
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessageBox } from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopAPI, DeveloperProject, ExecutionEvent, ValidationResult } from '@autoforge/shared'
 import CodeEditor from '../../src/components/developer/CodeEditor.vue'
 import DebugPanel from '../../src/components/developer/DebugPanel.vue'
+import FileTree from '../../src/components/developer/FileTree.vue'
 import { useDeveloperStore } from '../../src/stores/developer'
 
 const monacoHarness = vi.hoisted(() => {
@@ -21,8 +22,11 @@ const monacoHarness = vi.hoisted(() => {
   const models = new Map<string, Model>()
   let activeModel: Model | null = null
   let changeListener = () => undefined
+  let saveCommand = () => undefined
   const disposeEditor = vi.fn()
   const setModelMarkers = vi.fn()
+  const find = vi.fn()
+  const replace = vi.fn()
   const createModel = (value: string, language: string, uri: { toString(): string }): Model => {
     const model: Model = {
       uri, value, language, disposed: false,
@@ -36,15 +40,25 @@ const monacoHarness = vi.hoisted(() => {
   }
   return {
     models, disposeEditor, setModelMarkers,
-    reset() { models.clear(); activeModel = null; changeListener = () => undefined; disposeEditor.mockClear(); setModelMarkers.mockClear() },
+    reset() {
+      models.clear(); activeModel = null; changeListener = () => undefined; saveCommand = () => undefined
+      disposeEditor.mockClear(); setModelMarkers.mockClear(); find.mockClear(); replace.mockClear()
+    },
     change(value: string) { if (!activeModel) throw new Error('No active Monaco model'); activeModel.value = value; changeListener() },
+    save() { saveCommand() },
+    find,
+    replace,
     api: {
+      KeyMod: { CtrlCmd: 2048 },
+      KeyCode: { KeyS: 49 },
       Uri: { parse: (value: string) => ({ toString: () => value }) },
       editor: {
         create: vi.fn(() => ({
           getModel: () => activeModel,
           setModel: (model: Model) => { activeModel = model },
           onDidChangeModelContent: (listener: () => void) => { changeListener = listener; return { dispose: vi.fn() } },
+          addCommand: (_keybinding: number, handler: () => void) => { saveCommand = handler },
+          getAction: (id: string) => ({ run: id === 'actions.find' ? find : replace }),
           updateOptions: vi.fn(), layout: vi.fn(), dispose: disposeEditor,
         })),
         createModel,
@@ -77,7 +91,7 @@ vi.mock('monaco-editor/esm/vs/language/typescript/ts.worker?worker', () => ({ de
 
 const project: DeveloperProject = {
   id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new',
-  files: ['src/index.ts', 'workflow.json'], updatedAt: '2026-07-19T00:00:00.000Z',
+  files: ['src/index.ts', 'workflow.json'], directories: ['src'], updatedAt: '2026-07-19T00:00:00.000Z',
 }
 
 function createApi() {
@@ -109,7 +123,9 @@ function createApi() {
             }, outputSchema: { type: 'object' },
           })
         : 'export default 1'),
-      writeFile: vi.fn().mockResolvedValue(undefined), build: vi.fn().mockResolvedValue({ ...project, status: 'ready' }),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      createEntry: vi.fn().mockResolvedValue(project), renameEntry: vi.fn().mockResolvedValue(project), deleteEntry: vi.fn().mockResolvedValue(project),
+      build: vi.fn().mockResolvedValue({ ...project, status: 'ready' }),
       validate: vi.fn().mockResolvedValue({ valid: true, diagnostics: [] } satisfies ValidationResult),
       run: vi.fn().mockResolvedValue({ executionId: 'exec_1' }),
     },
@@ -180,6 +196,150 @@ describe('developer workbench', () => {
     wrapper.unmount()
     expect(monacoHarness.disposeEditor).toHaveBeenCalledOnce()
     expect([...monacoHarness.models.values()].every((model) => model.disposed)).toBe(true)
+  })
+
+  it('opens selected files in tabs and selects a neighbor when the active tab closes', async () => {
+    const { api } = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(CodeEditor)
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('[data-testid="editor-tab-src/index.ts"]').text()).toContain('index.ts')
+    expect(wrapper.get('[data-testid="editor-tab-workflow.json"]').classes()).toContain('active')
+    await wrapper.get('[data-testid="close-tab-workflow.json"]').trigger('click')
+    await vi.waitFor(() => {
+      expect(store.selectedPath).toBe('src/index.ts')
+      expect(wrapper.find('[data-testid="editor-tab-workflow.json"]').exists()).toBe(false)
+    })
+  })
+
+  it('saves immediately from the Monaco shortcut and exposes find and replace actions', async () => {
+    const { api, raw } = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(CodeEditor)
+    await wrapper.vm.$nextTick()
+    await Promise.resolve()
+
+    monacoHarness.change('export default 3')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('[data-testid="editor-tab-src/index.ts"]').classes()).toContain('dirty')
+    monacoHarness.save()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(raw.developer.writeFile).toHaveBeenCalledWith('project_1', 'src/index.ts', 'export default 3')
+    await vi.advanceTimersByTimeAsync(399)
+    expect(raw.developer.writeFile).toHaveBeenCalledOnce()
+
+    await wrapper.get('[data-testid="editor-find"]').trigger('click')
+    await wrapper.get('[data-testid="editor-replace"]').trigger('click')
+    expect(monacoHarness.find).toHaveBeenCalledOnce()
+    expect(monacoHarness.replace).toHaveBeenCalledOnce()
+  })
+
+  it('creates a file and opens the refreshed entry from the developer store', async () => {
+    const { api, raw } = createApi()
+    const withDocs = { ...project, directories: ['docs', 'src'] }
+    const withDraft = { ...withDocs, files: ['docs/draft.md', ...project.files] }
+    raw.developer.listProjects.mockResolvedValue([withDocs])
+    raw.developer.createEntry.mockResolvedValue(withDraft)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+
+    await store.createEntry('docs', 'draft.md', 'file')
+
+    expect(raw.developer.createEntry).toHaveBeenCalledWith('project_1', 'docs', 'draft.md', 'file')
+    expect(store.selectedPath).toBe('docs/draft.md')
+    expect(store.currentOpenPaths).toContain('docs/draft.md')
+  })
+
+  it('moves open buffers on rename and removes them after deletion', async () => {
+    const { api, raw } = createApi()
+    const withNotes = {
+      ...project, directories: ['docs', 'src'], files: ['docs/notes.md', ...project.files],
+    }
+    const renamed = { ...withNotes, files: ['docs/readme.md', ...project.files] }
+    const deleted = { ...withNotes, files: [...project.files] }
+    raw.developer.listProjects.mockResolvedValue([withNotes])
+    raw.developer.renameEntry.mockResolvedValue(renamed)
+    raw.developer.deleteEntry.mockResolvedValue(deleted)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('docs/notes.md')
+    store.editCurrent('edited notes')
+
+    await store.renameEntry('docs/notes.md', 'readme.md')
+
+    expect(raw.developer.writeFile).toHaveBeenCalledWith('project_1', 'docs/notes.md', 'edited notes')
+    expect(raw.developer.renameEntry).toHaveBeenCalledWith('project_1', 'docs/notes.md', 'readme.md')
+    expect(store.selectedPath).toBe('docs/readme.md')
+    expect(store.currentContent).toBe('edited notes')
+    expect(store.currentOpenPaths).toContain('docs/readme.md')
+
+    await store.deleteEntry('docs/readme.md')
+
+    expect(raw.developer.deleteEntry).toHaveBeenCalledWith('project_1', 'docs/readme.md')
+    expect(store.currentOpenPaths).not.toContain('docs/readme.md')
+    expect(store.selectedPath).toBe('src/index.ts')
+  })
+
+  it('renders project paths as a collapsible directory tree', async () => {
+    const { api, raw } = createApi()
+    raw.developer.listProjects.mockResolvedValue([{
+      ...project, directories: ['docs', 'src'], files: ['docs/notes.md', ...project.files],
+    }])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(FileTree, { global: { plugins: [ElementPlus] } })
+
+    expect(wrapper.get('[data-testid="tree-entry-src"]').text()).toContain('src')
+    expect(wrapper.get('[data-testid="tree-entry-src/index.ts"]').text()).toContain('index.ts')
+    await wrapper.get('[data-testid="tree-entry-src"]').trigger('click')
+    expect(wrapper.find('[data-testid="tree-entry-src/index.ts"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="tree-entry-src"]').trigger('click')
+    expect(wrapper.find('[data-testid="tree-entry-src/index.ts"]').exists()).toBe(true)
+  })
+
+  it('offers create, rename and confirmed delete actions from the file tree context menu', async () => {
+    const { api, raw } = createApi()
+    const initial = { ...project, directories: ['docs', 'src'], files: ['docs/notes.md', ...project.files] }
+    const withDraft = { ...initial, files: ['docs/draft.md', 'docs/notes.md', ...project.files] }
+    const renamed = { ...initial, files: ['docs/draft.md', 'docs/readme.md', ...project.files] }
+    const deleted = { ...initial, files: ['docs/draft.md', ...project.files] }
+    raw.developer.listProjects.mockResolvedValue([initial])
+    raw.developer.createEntry.mockResolvedValue(withDraft)
+    raw.developer.renameEntry.mockResolvedValue(renamed)
+    raw.developer.deleteEntry.mockResolvedValue(deleted)
+    vi.spyOn(ElMessageBox, 'prompt')
+      .mockResolvedValueOnce({ value: 'draft.md', action: 'confirm' })
+      .mockResolvedValueOnce({ value: 'readme.md', action: 'confirm' })
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(FileTree, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="tree-entry-docs"]').trigger('contextmenu')
+    expect(wrapper.find('[data-action="create-file"]').exists()).toBe(true)
+    await wrapper.get('[data-action="create-file"]').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.createEntry).toHaveBeenCalledWith('project_1', 'docs', 'draft.md', 'file'))
+
+    await wrapper.get('[data-testid="tree-entry-docs/notes.md"]').trigger('contextmenu')
+    await wrapper.get('[data-action="rename"]').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.renameEntry).toHaveBeenCalledWith('project_1', 'docs/notes.md', 'readme.md'))
+
+    await wrapper.get('[data-testid="tree-entry-docs/readme.md"]').trigger('contextmenu')
+    await wrapper.get('[data-action="delete"]').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.deleteEntry).toHaveBeenCalledWith('project_1', 'docs/readme.md'))
+    expect(ElMessageBox.confirm).toHaveBeenCalledOnce()
+    wrapper.unmount()
   })
 
   it('keeps renderer-scoped language workers alive across editor remounts', async () => {

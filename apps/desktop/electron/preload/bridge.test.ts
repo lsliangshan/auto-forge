@@ -117,6 +117,24 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.developerListProjects, undefined)
   })
 
+  it('maps project entry mutations to fixed developer channels', async () => {
+    const app = harness()
+
+    await app.api.developer.createEntry('project_1', 'src', 'helpers.ts', 'file')
+    await app.api.developer.renameEntry('project_1', 'src/helpers.ts', 'format.ts')
+    await app.api.developer.deleteEntry('project_1', 'src/format.ts')
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.developerCreateEntry, {
+      projectId: 'project_1', parentPath: 'src', name: 'helpers.ts', kind: 'file',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.developerRenameEntry, {
+      projectId: 'project_1', relativePath: 'src/helpers.ts', name: 'format.ts',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.developerDeleteEntry, {
+      projectId: 'project_1', relativePath: 'src/format.ts',
+    })
+  })
+
   it('resolves dropped-file paths only in preload, filters blanks, and uses a fixed channel', async () => {
     const getPathForFile = vi.fn()
       .mockReturnValueOnce('/private/photo.png')

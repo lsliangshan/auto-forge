@@ -19,3 +19,5 @@ apps/desktop/resources/ms-playwright/
 logs/
 .env*
 !.env.example
+
+.pnpm-store

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { build as esbuild } from 'esbuild'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
 import type { AppErrorCode, ValidationResult } from '@autoforge/shared'
@@ -135,6 +135,34 @@ export class WorkflowProjectService {
     const filePath = await this.filePath(projectId, path, true)
     await mkdir(dirname(filePath), { recursive: true })
     await writeFile(filePath, contents, 'utf8')
+  }
+
+  async createEntry(projectId: string, parentPath: string, name: string, kind: 'file' | 'directory'): Promise<void> {
+    this.validateEntryName(name)
+    const parent = await this.filePath(projectId, parentPath || '.', false)
+    if (!(await stat(parent)).isDirectory()) throw failure('INVALID_INPUT')
+    const relativePath = parentPath ? `${parentPath}/${name}` : name
+    const destination = await this.filePath(projectId, relativePath, true)
+    if (await pathExists(destination)) throw failure('CONFLICT')
+    if (kind === 'directory') {
+      await mkdir(destination)
+      return
+    }
+    const handle = await open(destination, 'wx')
+    await handle.close()
+  }
+
+  async renameEntry(projectId: string, path: string, name: string): Promise<void> {
+    this.validateEntryName(name)
+    const source = await this.mutableEntryPath(projectId, path)
+    const destination = await this.filePath(projectId, join(dirname(path), name), true)
+    if (await pathExists(destination)) throw failure('CONFLICT')
+    await rename(source, destination)
+  }
+
+  async deleteEntry(projectId: string, path: string): Promise<void> {
+    const target = await this.mutableEntryPath(projectId, path)
+    await rm(target, { recursive: true })
   }
 
   async validate(projectId: string): Promise<ValidationResult> {
@@ -555,6 +583,22 @@ export class WorkflowProjectService {
     }
     if (!inside(root, canonicalParent)) throw failure('PATH_OUTSIDE_PROJECT')
     return candidate
+  }
+
+  private validateEntryName(name: string): void {
+    if (!name || name === '.' || name === '..' || /[\\/\0]/.test(name)) throw failure('INVALID_INPUT')
+  }
+
+  private async mutableEntryPath(projectId: string, requestedPath: string): Promise<string> {
+    const project = this.require(projectId)
+    const root = await realpath(project.rootPath)
+    const target = await this.filePath(projectId, requestedPath, false)
+    const projectPath = relative(root, target).split(sep).join('/')
+    const requiredFiles = ['workflow.json', 'src/index.ts']
+    if (!projectPath || requiredFiles.some((required) => required === projectPath || required.startsWith(`${projectPath}/`))) {
+      throw failure('INVALID_INPUT')
+    }
+    return target
   }
 
   private readManifestSync(root: string): WorkflowManifest {

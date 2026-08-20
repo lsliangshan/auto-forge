@@ -252,21 +252,27 @@ function summary(workflow: WorkflowDetail): WorkflowSummary {
   }
 }
 
-function projectFiles(root: string): Promise<string[]> {
+function projectEntries(root: string): Promise<{ files: string[]; directories: string[] }> {
   const ignoredDirectories = new Set(['.git', 'node_modules'])
-  const visit = async (directory: string, prefix = ''): Promise<string[]> => {
+  const visit = async (directory: string, prefix = ''): Promise<{ files: string[]; directories: string[] }> => {
     const entries = await readdir(directory, { withFileTypes: true })
-    const files = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
+    const nested = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
       && !(entry.isDirectory() && ignoredDirectories.has(entry.name))).map(async (entry) => {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name
-      return entry.isDirectory() ? visit(join(directory, entry.name), relative) : [relative]
+      if (!entry.isDirectory()) return { files: [relative], directories: [] }
+      const children = await visit(join(directory, entry.name), relative)
+      return { files: children.files, directories: [relative, ...children.directories] }
     }))
-    return files.flat().sort()
+    return {
+      files: nested.flatMap(({ files }) => files).sort(),
+      directories: nested.flatMap(({ directories }) => directories).sort(),
+    }
   }
   return visit(root)
 }
 
 async function developerProject(project: WorkflowProject): Promise<DeveloperProject> {
+  const entries = await projectEntries(project.rootPath)
   return {
     id: project.id,
     name: project.name,
@@ -274,7 +280,7 @@ async function developerProject(project: WorkflowProject): Promise<DeveloperProj
     status: ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
       ? project.status as DeveloperProject['status']
       : 'error',
-    files: await projectFiles(project.rootPath),
+    ...entries,
     updatedAt: new Date(project.updatedAt).toISOString(),
   }
 }
@@ -884,6 +890,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       readFile: (projectId, relativePath) => projects.readFile(projectId, relativePath),
       writeFile: (projectId, relativePath, content) => projects.write(projectId, relativePath, content),
+      createEntry: async (projectId, parentPath, name, kind) => {
+        await projects.createEntry(projectId, parentPath, name, kind)
+        const project = database.workflowProjects.get(projectId)
+        if (!project) throw failure('NOT_FOUND')
+        return developerProject(project)
+      },
+      renameEntry: async (projectId, relativePath, name) => {
+        await projects.renameEntry(projectId, relativePath, name)
+        const project = database.workflowProjects.get(projectId)
+        if (!project) throw failure('NOT_FOUND')
+        return developerProject(project)
+      },
+      deleteEntry: async (projectId, relativePath) => {
+        await projects.deleteEntry(projectId, relativePath)
+        const project = database.workflowProjects.get(projectId)
+        if (!project) throw failure('NOT_FOUND')
+        return developerProject(project)
+      },
       build: async (projectId) => developerProject(await projects.build(projectId)),
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {
