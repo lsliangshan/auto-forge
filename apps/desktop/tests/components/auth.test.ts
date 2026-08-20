@@ -20,6 +20,10 @@ function createApi(): DesktopAPI {
       getSession: vi.fn().mockResolvedValue(null),
       login: vi.fn().mockResolvedValue(authSession),
       register: vi.fn().mockResolvedValue(authSession),
+      sendOtp: vi.fn(),
+      verifyOtp: vi.fn(),
+      cancelOtp: vi.fn().mockResolvedValue(undefined),
+      loginWithPassword: vi.fn().mockResolvedValue(authSession),
       logout: vi.fn().mockResolvedValue(undefined),
     },
     profile: {
@@ -93,15 +97,79 @@ describe('authentication store', () => {
     expect(auth.restoring).toBe(false)
   })
 
-  it('stores successful login and registration sessions', async () => {
+  it('stores only the current OTP challenge and authenticates after verification', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.sendOtp).mockResolvedValue({
+      challengeId: 'challenge_1',
+      expiresIn: 300,
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+
+    await expect(auth.sendOtp({
+      intent: 'login', channel: 'phone', target: '18311032722',
+    })).resolves.toEqual({ challengeId: 'challenge_1', expiresIn: 300 })
+    expect(auth.challenge).toEqual({ challengeId: 'challenge_1', expiresIn: 300 })
+    expect(auth.session).toBeNull()
+
+    vi.mocked(api.auth.verifyOtp).mockResolvedValue(authSession)
+    await expect(auth.verifyOtp('123456')).resolves.toEqual(authSession)
+    expect(auth.challenge).toBeNull()
+    expect(auth.session).toEqual(authSession)
+  })
+
+  it('clears a challenge locally before cancelling it in Main', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const cancelling = auth.cancelOtp()
+    expect(auth.challenge).toBeNull()
+    await cancelling
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+  })
+
+  it('cancels a prior challenge before sending a new OTP and suppresses duplicate sends', async () => {
+    const api = createApi()
+    let resolveOtp!: (value: { challengeId: string, expiresIn: number }) => void
+    vi.mocked(api.auth.sendOtp).mockReturnValue(new Promise((resolve) => { resolveOtp = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    const sending = auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })
+    const duplicate = auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })
+    expect(auth.challenge).toBeNull()
+    await vi.waitFor(() => expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1'))
+    expect(api.auth.sendOtp).toHaveBeenCalledOnce()
+    await expect(duplicate).resolves.toBeUndefined()
+
+    resolveOtp({ challengeId: 'challenge_2', expiresIn: 300 })
+    await expect(sending).resolves.toEqual({ challengeId: 'challenge_2', expiresIn: 300 })
+    expect(auth.challenge).toEqual({ challengeId: 'challenge_2', expiresIn: 300 })
+  })
+
+  it('clears an OTP challenge when verification fails', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.verifyOtp).mockRejectedValue(toSafeAppError({ code: 'AUTH_INVALID_OTP' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    await expect(auth.verifyOtp('123456')).resolves.toBeUndefined()
+    expect(api.auth.verifyOtp).toHaveBeenCalledWith({ challengeId: 'challenge_1', code: '123456' })
+    expect(auth.challenge).toBeNull()
+    expect(auth.session).toBeNull()
+    expect(auth.error).toBe('验证码错误，请重新发送后再试')
+  })
+
+  it('stores a password login session', async () => {
     const api = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
 
-    await expect(auth.login({ account: 'Alice', password: 'password' })).resolves.toEqual(authSession)
-    expect(auth.session).toEqual(authSession)
-    auth.session = null
-    await expect(auth.register({ account: 'Alice', password: 'password' })).resolves.toEqual(authSession)
+    await expect(auth.loginWithPassword({ account: 'Alice', password: 'password' })).resolves.toEqual(authSession)
     expect(auth.session).toEqual(authSession)
     expect(auth.submitting).toBe(false)
   })
@@ -117,6 +185,22 @@ describe('authentication store', () => {
 
     expect(auth.session).toEqual(authSession)
     expect(auth.error).toBe('操作失败，请稍后重试')
+  })
+
+  it('still logs out remotely after challenge cancellation fails', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.cancelOtp).mockRejectedValue(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.session = authSession
+    auth.challenge = { challengeId: 'challenge_1', expiresIn: 300 }
+
+    await expect(auth.logout()).resolves.toBe(true)
+
+    expect(api.auth.cancelOtp).toHaveBeenCalledWith('challenge_1')
+    expect(api.auth.logout).toHaveBeenCalledOnce()
+    expect(auth.challenge).toBeNull()
+    expect(auth.session).toBeNull()
   })
 
   it('clears the session only after logout succeeds', async () => {
