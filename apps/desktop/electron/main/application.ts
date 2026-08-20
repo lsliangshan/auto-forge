@@ -913,6 +913,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       run: async ({ projectId, input }) => {
         const releaseStart = maintenance.beginStart()
         try {
+          const session = await auth.requireSession()
           const built = await projects.build(projectId)
           const manifest = built.manifest as WorkflowManifest
           try {
@@ -923,6 +924,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw failure('INVALID_INPUT')
           }
           const started = await executions.start({
+            userId: session.user.id,
             workflowId: manifest.id,
             workflowVersion: manifest.version,
             input,

@@ -3453,6 +3453,7 @@ describe('createApplicationRuntime', () => {
         await rm(path, { recursive: true, force: true })
       },
     })
+    await authenticate(runtime)
     const installedProject = await runtime.services.developer.createProject('Installed Debug Source')
     const selectedProject = await runtime.services.developer.createProject('Selected Debug Source')
     for (const [projectId, marker] of [[installedProject.id, 'installed'], [selectedProject.id, 'selected']] as const) {

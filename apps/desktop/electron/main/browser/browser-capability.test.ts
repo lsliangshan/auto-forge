@@ -18,6 +18,7 @@ import { findBrowserArchiveRoot, stageBrowser } from '../../../scripts/stage-bro
 
 const approvedContext: BrowserCapabilityContext = {
   executionId: 'exec_approved',
+  userId: 'user_1',
   workflowId: 'com.autoforge.fixture',
   workflowVersion: '1.0.0',
 }
