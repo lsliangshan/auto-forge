@@ -237,6 +237,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
   async acquire(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
+    if (this.resetOperation) await this.resetOperation
+    if (this.shuttingDown) throw failure('CONFLICT')
     const acquisition = this.acquireCurrent(input)
     this.acquisitions.add(acquisition)
     try {
@@ -247,7 +249,6 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   }
 
   private async acquireCurrent(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
-    if (this.resetOperation) await this.resetOperation
     if (this.shuttingDown) throw failure('CONFLICT')
     const epoch = this.lifecycleEpoch
     const existing = [...this.tabs.values()].find((tab) => !tab.closed
@@ -704,7 +705,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         clearTimeout(maximumTimer)
         contents.removeListener('did-start-navigation', onStart)
         contents.removeListener('did-stop-loading', onStop)
-        contents.removeListener('did-fail-load', onStop)
+        contents.removeListener('did-fail-load', onFail)
         contents.removeListener('did-navigate-in-page', onInPage)
         contents.removeListener('destroyed', onDestroyed)
         if (error) reject(error)
@@ -718,11 +719,17 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         sameDocument = details?.isSameDocument === true || args[2] === true
       }
       const onStop = () => { if (started) finish() }
+      const onFail = (...args: unknown[]) => {
+        const details = args[0] as { isMainFrame?: boolean } | undefined
+        const deprecatedIsMainFrame = args[4]
+        if (details?.isMainFrame === false || deprecatedIsMainFrame === false) return
+        if (started) finish(failure('INTERNAL_ERROR'))
+      }
       const onInPage = () => { if (started && sameDocument) finish() }
       const onDestroyed = () => { finish() }
       contents.on('did-start-navigation', onStart)
       contents.on('did-stop-loading', onStop)
-      contents.on('did-fail-load', onStop)
+      contents.on('did-fail-load', onFail)
       contents.on('did-navigate-in-page', onInPage)
       contents.on('destroyed', onDestroyed)
       detectionTimer = setTimeout(() => { if (!started) finish() }, navigationDetectionMs)

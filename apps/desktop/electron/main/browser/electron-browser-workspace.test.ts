@@ -300,6 +300,18 @@ describe('ElectronBrowserWorkspace', () => {
     expect(views.every((view) => view.webContents.destroyed)).toBe(true)
   })
 
+  it('lets an acquire wait outside the reset acquisition set without deadlocking reset', async () => {
+    const { workspace, windows } = createHarness()
+    await acquire(workspace, 'exec_1', 'user_1')
+
+    const resetting = workspace.reset()
+    const acquiring = acquire(workspace, 'exec_2', 'user_1')
+
+    await resetting
+    await expect(acquiring).resolves.toBeDefined()
+    expect(windows).toHaveLength(2)
+  })
+
   it('closes the visible old-user window before waiting for a stuck tab acquisition', async () => {
     const debuggerSetup = deferred<unknown>()
     let blockDebuggerSetup = false
@@ -454,6 +466,35 @@ describe('ElectronBrowserWorkspace', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('ignores subframe load failures and reports a failed main-frame click navigation', async () => {
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '提交' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method] ?? {}
+    const { workspace, views } = createHarness(respond)
+    const tab = await acquire(workspace, 'exec_1')
+    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    const target = views[1]!.webContents
+    let settled = false
+
+    const clicking = tab.click('role=button[name="提交"]', 'https://www.baidu.com')
+      .finally(() => { settled = true })
+    while (!target.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
+      await Promise.resolve()
+    }
+    target.emit('did-start-navigation', {}, 'https://www.baidu.com/next', false, true)
+    target.emit('did-fail-load', {}, -2, 'failed', 'https://frame.example/', false)
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    const rejected = expect(clicking).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    target.emit('did-fail-load', {}, -2, 'failed', 'https://www.baidu.com/next', true)
+
+    await rejected
   })
 
   it('finishes click navigation when a same-document navigation completes in-page', async () => {
