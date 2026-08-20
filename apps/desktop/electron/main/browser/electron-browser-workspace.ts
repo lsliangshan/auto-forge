@@ -562,7 +562,13 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       return described.node.backendNodeId
     }
 
+    const document = await this.command(state, 'DOM.getDocument', { depth: 0 }) as {
+      root?: { nodeId?: number }
+    }
+    const nodeId = document.root?.nodeId
+    if (!nodeId) throw failure('INVALID_INPUT')
     const result = await this.command(state, 'Accessibility.queryAXTree', {
+      nodeId,
       role: parsed.value,
       ...(parsed.name === undefined ? {} : { accessibleName: parsed.name }),
     }) as {

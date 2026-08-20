@@ -238,7 +238,7 @@ describe('ElectronBrowserWorkspace', () => {
     expect(commands).toContainEqual({ method: 'DOM.querySelectorAll', params: { nodeId: 1, selector: '#kw' } })
     expect(commands).toContainEqual({
       method: 'Accessibility.queryAXTree',
-      params: { role: 'button', accessibleName: '百度一下' },
+      params: { nodeId: 1, role: 'button', accessibleName: '百度一下' },
     })
     expect(commands).toContainEqual({
       method: 'Input.dispatchMouseEvent',
