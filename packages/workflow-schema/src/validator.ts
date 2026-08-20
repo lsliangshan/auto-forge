@@ -1,27 +1,14 @@
 import Ajv from 'ajv'
 import addFormats from 'ajv-formats'
-import type { ValidationResult } from '@autoforge/shared'
+import { isHttpsUrlPattern, type ValidationResult } from '@autoforge/shared'
 import manifestSchema from '../manifest.schema.json' with { type: 'json' }
 import type { WorkflowManifest } from './manifest.js'
 
 const ajv = new Ajv({ allErrors: true, strict: true })
 addFormats(ajv)
-ajv.addFormat('https-origin', {
+ajv.addFormat('https-url-pattern', {
   type: 'string',
-  validate(value: string): boolean {
-    try {
-      const url = new URL(value)
-      return url.protocol === 'https:'
-        && url.username === ''
-        && url.password === ''
-        && url.pathname === '/'
-        && url.search === ''
-        && url.hash === ''
-        && url.origin === value
-    } catch {
-      return false
-    }
-  },
+  validate: (value: string) => isHttpsUrlPattern(value),
 })
 const validate = ajv.compile<WorkflowManifest>(manifestSchema)
 

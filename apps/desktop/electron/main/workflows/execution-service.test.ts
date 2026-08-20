@@ -562,6 +562,173 @@ describe('ExecutionService', () => {
     expect(worker.killed).toBe(true)
   })
 
+  it('matches a browser.open declaration against the complete requested URL', async () => {
+    const patternWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{ capability: 'browser.open', scope: { origins: ['*.baidu.com/api/*'] } }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: patternWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    const request: WorkerCapabilityRequest = {
+      capability: 'browser.open',
+      scope: { origins: ['https://a.b.baidu.com'] },
+      arguments: { url: 'https://a.b.baidu.com/api/a/b?query=1#result' },
+    }
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'request_pattern', request })
+    await turn()
+
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'approval_required',
+      permissionIndex: 0,
+      scope: { origins: ['https://a.b.baidu.com'] },
+      scopeHash: scopeHash(request.scope),
+    }))
+
+    await harness.service.decide({
+      executionId: execution.id,
+      permissionIndex: 0,
+      scopeHash: scopeHash(request.scope),
+      decision: 'once',
+    })
+    await turn()
+    expect(worker.requests).toContainEqual({
+      type: 'capability_result', requestId: 'request_pattern', result: { ok: true },
+    })
+    await harness.service.cancel(execution.id)
+  })
+
+  it('adds only explicitly declared exact hosts to a browser.open approval', async () => {
+    const requestCapability = vi.fn(async () => ({ ok: true }))
+    const redirectWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{
+        capability: 'browser.open',
+        scope: { origins: [
+          'https://fw.bjrcgz.gov.cn',
+          'https://bjt.beijing.gov.cn',
+          '*.example.com',
+          'https://path.example.com/login/*',
+        ] },
+      }],
+    }
+    const harness = createHarness({
+      capability: { request: requestCapability, closeExecution: async () => undefined },
+      source: {
+        workflow: redirectWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request',
+      requestId: 'request_redirect',
+      request: {
+        capability: 'browser.open',
+        scope: { origins: ['https://fw.bjrcgz.gov.cn'] },
+        arguments: { url: 'https://fw.bjrcgz.gov.cn/person-platform/' },
+      },
+    })
+    await turn()
+
+    const effectiveScope = {
+      origins: ['https://fw.bjrcgz.gov.cn', 'https://bjt.beijing.gov.cn'],
+    }
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'approval_required', permissionIndex: 0,
+      capability: 'browser.open', scope: effectiveScope, scopeHash: scopeHash(effectiveScope),
+    }))
+
+    await harness.service.decide({
+      executionId: execution.id,
+      permissionIndex: 0,
+      scopeHash: scopeHash(effectiveScope),
+      decision: 'once',
+    })
+    await turn()
+    expect(requestCapability).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({
+      capability: 'browser.open', scope: effectiveScope,
+    }))
+    await harness.service.cancel(execution.id)
+  })
+
+  it.each([
+    ['a path outside the declaration', 'https://demo.baidu.com', 'https://demo.baidu.com/admin'],
+    ['the apex host', 'https://baidu.com', 'https://baidu.com/api/a'],
+    ['a different port', 'https://demo.baidu.com:8443', 'https://demo.baidu.com:8443/api/a'],
+  ])('rejects browser.open for %s', async (_case, origin, url) => {
+    const patternWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{ capability: 'browser.open', scope: { origins: ['*.baidu.com/api/*'] } }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: patternWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request',
+      requestId: 'request_pattern',
+      request: { capability: 'browser.open', scope: { origins: [origin] }, arguments: { url } },
+    })
+
+    await execution.finished
+    expect(harness.repositories.records.get(execution.id)).toMatchObject({
+      status: 'failed', errorCode: 'CAPABILITY_SCOPE_DENIED',
+    })
+  })
+
+  it('ignores a declared path after opening when a browser action stays on the same host', async () => {
+    const patternWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{ capability: 'browser.click', scope: { origins: ['*.baidu.com/api/*'] } }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: patternWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request',
+      requestId: 'request_click',
+      request: {
+        capability: 'browser.click',
+        scope: { origins: ['https://demo.baidu.com'] },
+        arguments: { locator: '#next-page' },
+      },
+    })
+    await turn()
+
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: 'approval_required', permissionIndex: 0, scope: { origins: ['https://demo.baidu.com'] },
+    }))
+    await harness.service.cancel(execution.id)
+  })
+
   it('cancels an active worker and closes its capabilities', async () => {
     let closedExecution = ''
     const harness = createHarness({

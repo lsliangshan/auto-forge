@@ -55,18 +55,28 @@ function originOf(value: string): string {
   }
 }
 
-function browserScope(origin: string): BrowserScope {
-  return { origins: [origin] }
-}
-
-function assertExactScope(scope: CapabilityScope | undefined, origin: string): void {
+function exactBrowserScope(scope: CapabilityScope | undefined): BrowserScope {
+  const origins = scope && 'origins' in scope ? scope.origins : undefined
   if (!scope
-    || !('origins' in scope)
-    || scope.origins.length !== 1
-    || scope.origins[0] !== origin
-    || originOf(scope.origins[0]) !== scope.origins[0]) {
+    || !origins
+    || origins.length < 1
+    || new Set(origins).size !== origins.length) {
     throw failure('CAPABILITY_SCOPE_DENIED')
   }
+  try {
+    if (origins.some((origin) => originOf(origin) !== origin)) {
+      throw failure('CAPABILITY_SCOPE_DENIED')
+    }
+  } catch {
+    throw failure('CAPABILITY_SCOPE_DENIED')
+  }
+  return { origins }
+}
+
+function assertExactScope(scope: CapabilityScope | undefined, origin: string): BrowserScope {
+  const exactScope = exactBrowserScope(scope)
+  if (!exactScope.origins.includes(origin)) throw failure('CAPABILITY_SCOPE_DENIED')
+  return exactScope
 }
 
 function sameContext(left: BrowserCapabilityContext, right: BrowserCapabilityContext): boolean {
@@ -80,14 +90,7 @@ export class PolicyEngineBrowserAuthorization implements BrowserAuthorizationPor
   constructor(private readonly policy: Pick<PolicyEngine, 'evaluate'>) {}
 
   authorize(context: BrowserCapabilityContext, request: BrowserAuthorizationRequest): void {
-    if (request.scope.origins.length !== 1) throw failure('CAPABILITY_SCOPE_DENIED')
-    const origin = request.scope.origins[0]
-    try {
-      const url = new URL(origin)
-      if (url.protocol !== 'https:' || url.origin !== origin) throw failure('CAPABILITY_SCOPE_DENIED')
-    } catch {
-      throw failure('CAPABILITY_SCOPE_DENIED')
-    }
+    exactBrowserScope(request.scope)
     const evaluation = this.policy.evaluate({
       executionId: context.executionId,
       workflowId: context.workflowId,
@@ -133,11 +136,11 @@ export class BrowserCapabilityService implements CapabilityPort {
   ): Promise<void> {
     const state = await this.stateForCurrentUser(context, true)
     const origin = originOf(url)
-    await this.authorize(context, 'browser.open', declaredScope, origin)
+    const authorizedScope = await this.authorize(context, 'browser.open', declaredScope, origin)
     this.assertActive(state)
     const tab = await this.ensureTab(state)
     this.assertActive(state)
-    await tab.open(url, origin)
+    await tab.open(url, authorizedScope.origins)
     await this.authorizeCurrent(state, 'browser.open', declaredScope)
   }
 
@@ -283,12 +286,12 @@ export class BrowserCapabilityService implements CapabilityPort {
     capability: BrowserCapability,
     declaredScope: CapabilityScope | undefined,
     origin: string,
-  ): Promise<void> {
-    assertExactScope(declaredScope, origin)
+  ): Promise<BrowserScope> {
+    const scope = assertExactScope(declaredScope, origin)
     return Promise.resolve(this.options.authorization.authorize(context, {
       capability,
-      scope: browserScope(origin),
-    }))
+      scope,
+    })).then(() => scope)
   }
 
   private async authorizeCurrent(

@@ -27,6 +27,10 @@ const monacoHarness = vi.hoisted(() => {
   const setModelMarkers = vi.fn()
   const find = vi.fn()
   const replace = vi.fn()
+  const trigger = vi.fn((_source: string, id: string) => {
+    if (id === 'actions.find') find()
+    if (id === 'editor.action.startFindReplaceAction') replace()
+  })
   const createModel = (value: string, language: string, uri: { toString(): string }): Model => {
     const model: Model = {
       uri, value, language, disposed: false,
@@ -39,10 +43,10 @@ const monacoHarness = vi.hoisted(() => {
     return model
   }
   return {
-    models, disposeEditor, setModelMarkers,
+    models, disposeEditor, setModelMarkers, trigger,
     reset() {
       models.clear(); activeModel = null; changeListener = () => undefined; saveCommand = () => undefined
-      disposeEditor.mockClear(); setModelMarkers.mockClear(); find.mockClear(); replace.mockClear()
+      disposeEditor.mockClear(); setModelMarkers.mockClear(); find.mockClear(); replace.mockClear(); trigger.mockClear()
     },
     change(value: string) { if (!activeModel) throw new Error('No active Monaco model'); activeModel.value = value; changeListener() },
     save() { saveCommand() },
@@ -58,7 +62,9 @@ const monacoHarness = vi.hoisted(() => {
           setModel: (model: Model) => { activeModel = model },
           onDidChangeModelContent: (listener: () => void) => { changeListener = listener; return { dispose: vi.fn() } },
           addCommand: (_keybinding: number, handler: () => void) => { saveCommand = handler },
-          getAction: (id: string) => ({ run: id === 'actions.find' ? find : replace }),
+          getAction: () => null,
+          focus: vi.fn(),
+          trigger,
           updateOptions: vi.fn(), layout: vi.fn(), dispose: disposeEditor,
         })),
         createModel,
@@ -173,6 +179,26 @@ describe('developer workbench', () => {
     expect(wrapper.attributes()).not.toHaveProperty('data-local-path')
   })
 
+  it('creates Monaco after the initial file read finishes', async () => {
+    const { api, raw } = createApi()
+    let resolveSource!: (content: string) => void
+    raw.developer.readFile.mockImplementation((_projectId: string, path: string) => path === 'src/index.ts'
+      ? new Promise<string>((resolve) => { resolveSource = resolve })
+      : Promise.resolve('{}'))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    const wrapper = mount(CodeEditor)
+
+    const loading = store.loadProjects()
+    await vi.waitFor(() => expect(store.currentBuffer?.loading).toBe(true))
+    expect(monacoHarness.api.editor.create).not.toHaveBeenCalled()
+    resolveSource('export default 1')
+    await loading
+    await wrapper.vm.$nextTick()
+
+    expect(monacoHarness.api.editor.create).toHaveBeenCalledOnce()
+  })
+
   it('keeps independent Monaco models when switching files and disposes them on unmount', async () => {
     const { api } = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -239,6 +265,8 @@ describe('developer workbench', () => {
     await wrapper.get('[data-testid="editor-replace"]').trigger('click')
     expect(monacoHarness.find).toHaveBeenCalledOnce()
     expect(monacoHarness.replace).toHaveBeenCalledOnce()
+    expect(monacoHarness.trigger).toHaveBeenNthCalledWith(1, 'autoforge-toolbar', 'actions.find', null)
+    expect(monacoHarness.trigger).toHaveBeenNthCalledWith(2, 'autoforge-toolbar', 'editor.action.startFindReplaceAction', null)
   })
 
   it('creates a file and opens the refreshed entry from the developer store', async () => {
@@ -289,6 +317,65 @@ describe('developer workbench', () => {
     expect(store.selectedPath).toBe('src/index.ts')
   })
 
+  it('does not select a created file in a different project after an async response', async () => {
+    const { api, raw } = createApi()
+    const second = {
+      ...project, id: 'project_2', name: 'Second', rootPath: '/private/second',
+      directories: ['docs', 'src'], files: ['docs/draft.md', ...project.files],
+    }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    let resolveCreate!: (value: DeveloperProject) => void
+    raw.developer.createEntry.mockReturnValue(new Promise((resolve) => { resolveCreate = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+
+    const operation = store.createEntry('docs', 'draft.md', 'file')
+    await vi.waitFor(() => expect(raw.developer.createEntry).toHaveBeenCalled())
+    await store.selectProject('project_2')
+    resolveCreate({ ...project, directories: ['docs', 'src'], files: ['docs/draft.md', ...project.files] })
+    await operation
+
+    expect(store.selectedProjectId).toBe('project_2')
+    expect(store.selectedPath).toBe('src/index.ts')
+  })
+
+  it('does not move the active path in a different project after rename or delete resolves', async () => {
+    const { api, raw } = createApi()
+    const first = { ...project, directories: ['docs', 'src'], files: ['docs/notes.md', ...project.files] }
+    const second = { ...first, id: 'project_2', name: 'Second', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([first, second])
+    let resolveRename!: (value: DeveloperProject) => void
+    raw.developer.renameEntry.mockReturnValue(new Promise((resolve) => { resolveRename = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('docs/notes.md')
+
+    const renameOperation = store.renameEntry('docs/notes.md', 'readme.md')
+    await vi.waitFor(() => expect(raw.developer.renameEntry).toHaveBeenCalled())
+    await store.selectProject('project_2')
+    await store.selectFile('docs/notes.md')
+    resolveRename({ ...first, files: ['docs/readme.md', ...project.files] })
+    await renameOperation
+
+    expect(store.selectedProjectId).toBe('project_2')
+    expect(store.selectedPath).toBe('docs/notes.md')
+
+    let resolveDelete!: (value: DeveloperProject) => void
+    raw.developer.deleteEntry.mockReturnValue(new Promise((resolve) => { resolveDelete = resolve }))
+    await store.selectProject('project_1')
+    const deleteOperation = store.deleteEntry('docs/readme.md')
+    await vi.waitFor(() => expect(raw.developer.deleteEntry).toHaveBeenCalled())
+    await store.selectProject('project_2')
+    await store.selectFile('docs/notes.md')
+    resolveDelete({ ...first, files: [...project.files] })
+    await deleteOperation
+
+    expect(store.selectedProjectId).toBe('project_2')
+    expect(store.selectedPath).toBe('docs/notes.md')
+  })
+
   it('renders project paths as a collapsible directory tree', async () => {
     const { api, raw } = createApi()
     raw.developer.listProjects.mockResolvedValue([{
@@ -302,6 +389,9 @@ describe('developer workbench', () => {
     expect(wrapper.get('[data-testid="tree-entry-src"]').text()).toContain('src')
     expect(wrapper.get('[data-testid="tree-entry-src/index.ts"]').text()).toContain('index.ts')
     await wrapper.get('[data-testid="tree-entry-src"]').trigger('click')
+    expect(wrapper.find('[data-testid="tree-entry-src/index.ts"]').exists()).toBe(false)
+    store._upsertProject({ ...store.selectedProject!, directories: ['docs', 'src', 'vendor'] })
+    await wrapper.vm.$nextTick()
     expect(wrapper.find('[data-testid="tree-entry-src/index.ts"]').exists()).toBe(false)
     await wrapper.get('[data-testid="tree-entry-src"]').trigger('click')
     expect(wrapper.find('[data-testid="tree-entry-src/index.ts"]').exists()).toBe(true)
@@ -339,6 +429,24 @@ describe('developer workbench', () => {
     await wrapper.get('[data-action="delete"]').trigger('click')
     await vi.waitFor(() => expect(raw.developer.deleteEntry).toHaveBeenCalledWith('project_1', 'docs/readme.md'))
     expect(ElMessageBox.confirm).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('targets the project whose root context menu was opened', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    raw.developer.createEntry.mockResolvedValue({ ...second, directories: ['docs', 'src'] })
+    vi.spyOn(ElMessageBox, 'prompt').mockResolvedValue({ value: 'docs', action: 'confirm' })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(FileTree, { attachTo: document.body, global: { plugins: [ElementPlus] } })
+
+    await wrapper.findAll('.project-row')[1]!.trigger('contextmenu')
+    await wrapper.get('[data-action="create-directory"]').trigger('click')
+
+    await vi.waitFor(() => expect(raw.developer.createEntry).toHaveBeenCalledWith('project_2', '', 'docs', 'directory'))
     wrapper.unmount()
   })
 

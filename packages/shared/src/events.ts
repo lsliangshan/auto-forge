@@ -1,6 +1,10 @@
 import { z } from 'zod'
 import { appErrorCodeSchema, appErrorSchema } from './errors.js'
-import { capabilitySchema, capabilityScopeSchema } from './worker-protocol.js'
+import {
+  capabilitySchema,
+  runtimeCapabilityPermissionSchema,
+  runtimeCapabilityScopeSchema,
+} from './worker-protocol.js'
 
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
@@ -59,9 +63,13 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     workflowVersion: z.string().trim().min(1),
     permissionIndex: z.number().int().nonnegative(),
     capability: capabilitySchema,
-    scope: capabilityScopeSchema,
+    scope: runtimeCapabilityScopeSchema,
     scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
-  }).strict(),
+  }).strict().superRefine(({ capability, scope }, context) => {
+    if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
+      context.addIssue({ code: 'custom', message: 'Approval scope is invalid for this capability' })
+    }
+  }),
   z.object({ type: z.literal('workflow_execution'), executionId: identifierSchema }).strict(),
   z.object({
     type: z.literal('execution_result'),
@@ -146,10 +154,14 @@ export const executionEventSchema = z.discriminatedUnion('type', [
     executionId: identifierSchema,
     permissionIndex: z.number().int().nonnegative(),
     capability: capabilitySchema,
-    scope: capabilityScopeSchema,
+    scope: runtimeCapabilityScopeSchema,
     scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
     occurredAt: timestampSchema,
-  }).strict(),
+  }).strict().superRefine(({ capability, scope }, context) => {
+    if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
+      context.addIssue({ code: 'custom', message: 'Approval scope is invalid for this capability' })
+    }
+  }),
 ])
 
 export type ExecutionEvent = z.infer<typeof executionEventSchema>

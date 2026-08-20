@@ -12,7 +12,7 @@
       <button
         :class="['project-row', { active: project.id === developer.selectedProjectId }]"
         @click="developer.selectProject(project.id)"
-        @contextmenu.prevent="openContext($event, '', 'root')"
+        @contextmenu.prevent="openContext($event, project.id, '', 'root')"
       >
         <span class="af-truncate">{{ project.name }}</span><small>{{ project.status }}</small>
       </button>
@@ -24,7 +24,7 @@
             :title="entry.path"
             :data-testid="`tree-entry-${entry.path}`"
             @click="activateEntry(entry)"
-            @contextmenu.prevent="openContext($event, entry.path, entry.kind)"
+            @contextmenu.prevent="openContext($event, project.id, entry.path, entry.kind)"
           >
             <ArrowDown v-if="entry.kind === 'directory' && isExpanded(entry.path)" class="tree-chevron" />
             <ArrowRight v-else-if="entry.kind === 'directory'" class="tree-chevron" />
@@ -66,6 +66,7 @@ interface TreeEntry {
 }
 
 interface TreeContext {
+  projectId: string
   path: string
   kind: 'root' | 'file' | 'directory'
   x: number
@@ -74,8 +75,16 @@ interface TreeContext {
 
 const developer = useDeveloperStore()
 const projectName = ref('')
-const expandedPaths = ref<string[]>([])
+const expandedPathsByProject = ref<Record<string, string[]>>({})
 const context = ref<TreeContext>()
+
+const expandedPaths = computed({
+  get: () => expandedPathsByProject.value[developer.selectedProjectId] ?? [],
+  set: (paths: string[]) => {
+    const projectId = developer.selectedProjectId
+    if (projectId) expandedPathsByProject.value = { ...expandedPathsByProject.value, [projectId]: paths }
+  },
+})
 
 function parentPath(path: string): string {
   const separator = path.lastIndexOf('/')
@@ -119,9 +128,12 @@ const visibleEntries = computed<TreeEntry[]>(() => {
 const canCreate = computed(() => context.value?.kind === 'root' || context.value?.kind === 'directory')
 const canMutate = computed(() => Boolean(context.value && context.value.kind !== 'root' && !isProtected(context.value.path)))
 
-watch(() => developer.selectedProject?.directories.join('\u0000'), () => {
-  const directories = developer.selectedProject?.directories ?? []
-  expandedPaths.value = [...new Set([...expandedPaths.value, ...directories])]
+watch(() => developer.selectedProjectId, (projectId) => {
+  if (!projectId || Object.hasOwn(expandedPathsByProject.value, projectId)) return
+  expandedPathsByProject.value = {
+    ...expandedPathsByProject.value,
+    [projectId]: [...(developer.selectedProject?.directories ?? [])],
+  }
 }, { immediate: true })
 
 function isExpanded(path: string): boolean {
@@ -142,8 +154,8 @@ function activateEntry(entry: TreeEntry): void {
     : [...expandedPaths.value, entry.path]
 }
 
-function openContext(event: globalThis.MouseEvent, path: string, kind: TreeContext['kind']): void {
-  context.value = { path, kind, x: event.clientX, y: event.clientY }
+function openContext(event: globalThis.MouseEvent, projectId: string, path: string, kind: TreeContext['kind']): void {
+  context.value = { projectId, path, kind, x: event.clientX, y: event.clientY }
 }
 
 function closeContext(): void {
@@ -178,8 +190,10 @@ async function createEntry(kind: 'file' | 'directory'): Promise<void> {
   if (!current) return
   const name = await promptName(kind === 'file' ? '输入文件名' : '输入目录名')
   if (!name) return
-  await developer.createEntry(current.kind === 'directory' ? current.path : '', name, kind)
-  if (current.kind === 'directory' && !isExpanded(current.path)) expandedPaths.value = [...expandedPaths.value, current.path]
+  await developer.createEntry(current.kind === 'directory' ? current.path : '', name, kind, current.projectId)
+  if (current.projectId === developer.selectedProjectId && current.kind === 'directory' && !isExpanded(current.path)) {
+    expandedPaths.value = [...expandedPaths.value, current.path]
+  }
   closeContext()
 }
 
@@ -188,7 +202,7 @@ async function renameEntry(): Promise<void> {
   if (!current || !canMutate.value) return
   const name = await promptName('输入新名称', entryName(current.path))
   if (!name || name === entryName(current.path)) return
-  await developer.renameEntry(current.path, name)
+  await developer.renameEntry(current.path, name, current.projectId)
   closeContext()
 }
 
@@ -202,7 +216,7 @@ async function deleteEntry(): Promise<void> {
   } catch {
     return
   }
-  await developer.deleteEntry(current.path)
+  await developer.deleteEntry(current.path, current.projectId)
   closeContext()
 }
 

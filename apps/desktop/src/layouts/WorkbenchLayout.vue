@@ -1,7 +1,7 @@
 <template>
   <div class="workbench">
     <AppRail />
-    <ContextSidebar />
+    <ContextSidebar v-if="route.name !== 'profile'" />
     <main
       class="workspace"
       tabindex="-1"

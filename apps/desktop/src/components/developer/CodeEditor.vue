@@ -111,7 +111,8 @@ function ensureEditor() {
 }
 
 function runEditorAction(actionId: string): void {
-  void editor?.getAction(actionId)?.run()
+  editor?.focus()
+  editor?.trigger('autoforge-toolbar', actionId, null)
 }
 
 async function activateModel() {

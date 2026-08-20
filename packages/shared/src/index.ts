@@ -1,5 +1,6 @@
 export * from './desktop-api.js'
 export * from './errors.js'
 export * from './events.js'
+export * from './https-url-pattern.js'
 export * from './proxy-settings.js'
 export * from './worker-protocol.js'

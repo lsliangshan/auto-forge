@@ -121,7 +121,7 @@
           "minItems": 1,
           "items": {
             "type": "string",
-            "format": "https-origin"
+            "format": "https-url-pattern"
           }
         }
       }

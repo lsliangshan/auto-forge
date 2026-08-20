@@ -78,7 +78,6 @@ async function mountApp(path: string, api = createApi(), session: AuthSession | 
     global: {
       plugins: [pinia, router, ElementPlus],
       stubs: {
-        ContextSidebar: { template: '<aside />' },
         InspectorPanel: { template: '<aside />' },
       },
     },
@@ -94,6 +93,13 @@ afterEach(() => {
 })
 
 describe('personal profile page', () => {
+  it('does not render the settings sidebar on the profile route', async () => {
+    const app = await mountApp('/profile')
+    await vi.waitFor(() => expect(app.api.profile.get).toHaveBeenCalledOnce())
+
+    expect(app.wrapper.find('.context-sidebar').exists()).toBe(false)
+  })
+
   it('protects the profile route and renders the persisted fields', async () => {
     const anonymous = await mountApp('/profile', createApi(), null)
     expect(anonymous.router.currentRoute.value.fullPath).toBe('/login?redirect=/profile')

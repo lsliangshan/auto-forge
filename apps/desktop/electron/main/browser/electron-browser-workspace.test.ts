@@ -16,11 +16,18 @@ class FakeSession extends EventEmitter {
 class FakeDebugger {
   attached = false
   readonly commands: Array<{ method: string; params?: unknown }> = []
-  constructor(private readonly respond: (method: string, params?: unknown) => unknown) {}
+  constructor(
+    private readonly respond: (method: string, params?: unknown) => unknown,
+    private readonly documentReady: () => boolean,
+    private readonly requireDocumentBeforeCommands: boolean,
+  ) {}
   isAttached() { return this.attached }
   attach() { this.attached = true }
   detach() { this.attached = false }
   async sendCommand(method: string, params?: unknown) {
+    if (this.requireDocumentBeforeCommands && !this.documentReady()) {
+      throw new Error('Renderer document is not initialized')
+    }
     this.commands.push({ method, params })
     return this.respond(method, params)
   }
@@ -43,9 +50,13 @@ class FakeWebContents extends EventEmitter {
   currentUrl = 'about:blank'
   title = ''
 
-  constructor(readonly session: FakeSession, respond: (method: string, params?: unknown) => unknown) {
+  constructor(
+    readonly session: FakeSession,
+    respond: (method: string, params?: unknown) => unknown,
+    requireDocumentBeforeDebugger: boolean,
+  ) {
     super()
-    this.debugger = new FakeDebugger(respond)
+    this.debugger = new FakeDebugger(respond, () => this.loaded.length > 0, requireDocumentBeforeDebugger)
   }
 
   async loadURL(url: string) {
@@ -67,8 +78,9 @@ class FakeView {
     readonly options: Record<string, unknown>,
     session: FakeSession,
     respond: (method: string, params?: unknown) => unknown,
+    requireDocumentBeforeDebugger: boolean,
   ) {
-    this.webContents = new FakeWebContents(session, respond)
+    this.webContents = new FakeWebContents(session, respond, requireDocumentBeforeDebugger)
   }
   setBounds(bounds: { x: number; y: number; width: number; height: number }) { this.bounds.push(bounds) }
 }
@@ -87,7 +99,10 @@ class FakeBaseWindow extends EventEmitter {
   close() { if (!this.destroyed) { this.destroyed = true; this.emit('closed') } }
 }
 
-function createHarness(respond: (method: string, params?: unknown) => unknown = () => ({})) {
+function createHarness(
+  respond: (method: string, params?: unknown) => unknown = () => ({}),
+  requireDocumentBeforeDebugger = false,
+) {
   const sessions = new Map<string, FakeSession>()
   const views: FakeView[] = []
   const windows: FakeBaseWindow[] = []
@@ -99,7 +114,7 @@ function createHarness(respond: (method: string, params?: unknown) => unknown = 
   class ViewConstructor {
     constructor(options: Record<string, unknown> = {}) {
       const partition = String((options.webPreferences as { partition?: string } | undefined)?.partition ?? 'toolbar')
-      const view = new FakeView(options, fromPartition(partition), respond)
+      const view = new FakeView(options, fromPartition(partition), respond, requireDocumentBeforeDebugger)
       views.push(view)
       return view
     }
@@ -165,6 +180,13 @@ describe('ElectronBrowserWorkspace', () => {
     expect(targetPreferences[1]).toMatchObject({ partition: browserPartition('user_1') })
     expect(targetPreferences[2]).toMatchObject({ partition: browserPartition('user_2') })
     expect(windows[0]!.children).toHaveLength(2)
+  })
+
+  it('initializes a target document before enabling debugger domains', async () => {
+    const { workspace, views } = createHarness(() => ({}), true)
+
+    await expect(acquire(workspace, 'exec_1')).resolves.toBeDefined()
+    expect(views[1]!.webContents.loaded[0]).toBe('about:blank')
   })
 
   it('serializes the first concurrent tab acquisitions through one BaseWindow creation', async () => {
@@ -237,7 +259,7 @@ describe('ElectronBrowserWorkspace', () => {
       ?? (method === 'Input.dispatchMouseEvent' ? mousePressed.promise : {})
     const { workspace, views } = createHarness(respond)
     const first = await acquire(workspace, 'exec_1')
-    await first.open('https://www.baidu.com', 'https://www.baidu.com')
+    await first.open('https://www.baidu.com', ['https://www.baidu.com'])
 
     const clicking = first.click('role=button[name="百度一下"]', 'https://www.baidu.com')
     while (!views[1]!.webContents.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {
@@ -340,7 +362,7 @@ describe('ElectronBrowserWorkspace', () => {
   it('blocks non-HTTPS and out-of-scope navigation while allowing released user navigation', async () => {
     const { workspace, views } = createHarness()
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
     const target = views[1]!.webContents
     const denied = { preventDefault: vi.fn() }
     target.emit('will-navigate', denied, 'https://example.com/')
@@ -354,6 +376,42 @@ describe('ElectronBrowserWorkspace', () => {
     target.emit('will-navigate', unsafe, 'file:///etc/passwd')
     expect(unsafe.preventDefault).toHaveBeenCalledOnce()
     expect(target.windowOpenHandler?.({ url: 'https://example.com/' })).toEqual({ action: 'deny' })
+  })
+
+  it('allows an approved cross-origin redirect and waits for its replacement navigation', async () => {
+    const { workspace, views } = createHarness()
+    const tab = await acquire(workspace, 'exec_1')
+    const target = views[1]!.webContents
+    const initialUrl = 'https://fw.bjrcgz.gov.cn/person-platform/'
+    const loginUrl = 'https://bjt.beijing.gov.cn/renzheng/open/login/goUserLogin'
+    let stopped = false
+    vi.spyOn(target, 'loadURL').mockImplementationOnce(async (url) => {
+      target.loaded.push(url)
+      target.currentUrl = url
+      target.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+      target.currentUrl = loginUrl
+      target.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+      target.emit('did-fail-load', {}, -3, 'ERR_ABORTED', initialUrl, true)
+      setTimeout(() => {
+        stopped = true
+        target.emit('did-stop-loading')
+      }, 5)
+      throw Object.assign(new Error('navigation replaced'), { code: 'ERR_ABORTED', errno: -3, url: loginUrl })
+    })
+
+    await expect(tab.open(initialUrl, [
+      'https://fw.bjrcgz.gov.cn',
+      'https://bjt.beijing.gov.cn',
+    ])).resolves.toBeUndefined()
+
+    expect(stopped).toBe(true)
+    expect(await tab.url()).toBe(loginUrl)
+    const approved = { preventDefault: vi.fn() }
+    target.emit('will-navigate', approved, 'https://fw.bjrcgz.gov.cn/person-platform/redirectLogin')
+    expect(approved.preventDefault).not.toHaveBeenCalled()
+    const denied = { preventDefault: vi.fn() }
+    target.emit('will-navigate', denied, 'https://evil.example/')
+    expect(denied.preventDefault).toHaveBeenCalledOnce()
   })
 
   it('resolves exact CSS and accessibility locators and drives fill and click through CDP', async () => {
@@ -370,7 +428,7 @@ describe('ElectronBrowserWorkspace', () => {
     } as Record<string, unknown>)[method] ?? {}
     const { workspace, views } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
     await tab.fill('css=#kw', 'AutoForge', 'https://www.baidu.com')
     await tab.click('role=button[name="百度一下"]', 'https://www.baidu.com')
 
@@ -396,7 +454,7 @@ describe('ElectronBrowserWorkspace', () => {
     } as Record<string, unknown>)[method] ?? {}
     const { workspace, views } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
     const target = views[1]!.webContents
     let settled = false
 
@@ -423,7 +481,7 @@ describe('ElectronBrowserWorkspace', () => {
     } as Record<string, unknown>)[method] ?? {}
     const { workspace, views } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
     const target = views[1]!.webContents
     let settled = false
 
@@ -453,7 +511,7 @@ describe('ElectronBrowserWorkspace', () => {
       } as Record<string, unknown>)[method] ?? {}
       const { workspace, views } = createHarness(respond)
       const tab = await acquire(workspace, 'exec_1')
-      await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+      await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
       const target = views[1]!.webContents
 
       const clicking = tab.click('role=button[name="提交"]', 'https://www.baidu.com')
@@ -480,7 +538,7 @@ describe('ElectronBrowserWorkspace', () => {
     } as Record<string, unknown>)[method] ?? {}
     const { workspace, views } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
     const target = views[1]!.webContents
     let settled = false
 
@@ -509,7 +567,7 @@ describe('ElectronBrowserWorkspace', () => {
     } as Record<string, unknown>)[method] ?? {}
     const { workspace, views } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
     const target = views[1]!.webContents
     let settled = false
 
@@ -534,7 +592,7 @@ describe('ElectronBrowserWorkspace', () => {
       : method === 'DOM.querySelectorAll' ? { nodeIds: [1, 2] } : {}
     const { workspace } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
 
     await expect(tab.click('xpath=//button', 'https://www.baidu.com')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     await expect(tab.click('css=.duplicate', 'https://www.baidu.com')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
@@ -548,7 +606,7 @@ describe('ElectronBrowserWorkspace', () => {
     }
     const { workspace } = createHarness(respond)
     const tab = await acquire(workspace, 'exec_1')
-    await tab.open('https://www.baidu.com', 'https://www.baidu.com')
+    await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
 
     await expect(tab.fill('css=[', 'value', 'https://www.baidu.com'))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })

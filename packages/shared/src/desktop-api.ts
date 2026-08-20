@@ -11,6 +11,8 @@ import {
 import {
   capabilitySchema,
   capabilityScopeSchema,
+  runtimeCapabilityPermissionSchema,
+  runtimeCapabilityScopeSchema,
   type Capability,
   type CapabilityScope,
 } from './worker-protocol.js'
@@ -369,9 +371,9 @@ const persistentApprovalDecisionSchema = z.object({
   workflowId: identifierSchema,
   workflowVersion: nonEmptyStringSchema,
   capability: capabilitySchema,
-  scope: capabilityScopeSchema,
+  scope: runtimeCapabilityScopeSchema,
 }).strict().superRefine(({ capability, scope }, context) => {
-  const result = workflowPermissionSchema.safeParse({ capability, scope })
+  const result = runtimeCapabilityPermissionSchema.safeParse({ capability, scope })
   if (!result.success) {
     context.addIssue({ code: 'custom', message: 'Persistent approval scope is invalid for this capability' })
   }
@@ -389,9 +391,13 @@ export const permissionGrantSchema = z.object({
   workflowId: identifierSchema,
   workflowVersion: nonEmptyStringSchema,
   capability: capabilitySchema,
-  scope: capabilityScopeSchema,
+  scope: runtimeCapabilityScopeSchema,
   createdAt: timestampSchema,
-}).strict()
+}).strict().superRefine(({ capability, scope }, context) => {
+  if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
+    context.addIssue({ code: 'custom', message: 'Permission grant scope is invalid for this capability' })
+  }
+})
 
 export type PermissionGrant = z.infer<typeof permissionGrantSchema>
 

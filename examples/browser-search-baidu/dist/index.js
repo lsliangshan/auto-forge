@@ -1,4 +1,4 @@
-// src/index.ts
+// ../../examples/browser-search-baidu/src/index.ts
 import { defineWorkflow } from "@autoforge/workflow-sdk";
 var index_default = defineWorkflow({
   async run(ctx, input) {

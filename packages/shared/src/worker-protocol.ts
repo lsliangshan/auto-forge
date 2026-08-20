@@ -1,10 +1,32 @@
 import { z } from 'zod'
 import { appErrorSchema } from './errors.js'
+import { isHttpsUrlPattern } from './https-url-pattern.js'
 
 const identifierSchema = z.string().trim().min(1)
-const httpsUrlSchema = z.url().refine((value) => new URL(value).protocol === 'https:', {
+const httpsUrlSchema = z.url().refine((value) => {
+  try {
+    return new URL(value).protocol === 'https:'
+  } catch {
+    return false
+  }
+}, {
   message: 'Expected an HTTPS URL',
 })
+
+const httpsOriginSchema = z.url().refine((value) => {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.username === ''
+      && url.password === ''
+      && url.pathname === '/'
+      && url.search === ''
+      && url.hash === ''
+      && url.origin === value
+  } catch {
+    return false
+  }
+}, { message: 'Expected an exact HTTPS origin' })
 
 export const capabilitySchema = z.enum([
   'browser.open',
@@ -23,7 +45,10 @@ export const capabilitySchema = z.enum([
 
 export type Capability = z.infer<typeof capabilitySchema>
 
-const browserScopeSchema = z.object({ origins: z.array(httpsUrlSchema).min(1) }).strict()
+const browserScopeSchema = z.object({
+  origins: z.array(z.string().refine(isHttpsUrlPattern, { message: 'Expected an HTTPS URL pattern' })).min(1),
+}).strict()
+const runtimeBrowserScopeSchema = z.object({ origins: z.array(httpsOriginSchema).min(1) }).strict()
 const filesystemScopeSchema = z.object({ paths: z.array(z.string().trim().min(1)).min(1) }).strict()
 const emptyScopeSchema = z.object({}).strict()
 
@@ -35,30 +60,53 @@ export const capabilityScopeSchema = z.union([
 
 export type CapabilityScope = z.infer<typeof capabilityScopeSchema>
 
+export const runtimeCapabilityScopeSchema = z.union([
+  runtimeBrowserScopeSchema,
+  filesystemScopeSchema,
+  emptyScopeSchema,
+])
+
+export const runtimeCapabilityPermissionSchema = z.object({
+  capability: capabilitySchema,
+  scope: runtimeCapabilityScopeSchema,
+}).strict().superRefine(({ capability, scope }, context) => {
+  const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
+  const needsPaths = capability.startsWith('filesystem.')
+  if (needsOrigins && !('origins' in scope)) {
+    context.addIssue({ code: 'custom', message: 'This capability requires exact origin scope' })
+  }
+  if (needsPaths && !('paths' in scope)) {
+    context.addIssue({ code: 'custom', message: 'This capability requires path scope' })
+  }
+  if (!needsOrigins && !needsPaths && Object.keys(scope).length !== 0) {
+    context.addIssue({ code: 'custom', message: 'This capability requires an empty scope' })
+  }
+})
+
 export const workerCapabilityRequestSchema = z.discriminatedUnion('capability', [
   z.object({
     capability: z.literal('browser.open'),
-    scope: browserScopeSchema,
+    scope: runtimeBrowserScopeSchema,
     arguments: z.object({ url: httpsUrlSchema }).strict(),
   }).strict(),
   z.object({
     capability: z.literal('browser.fill'),
-    scope: browserScopeSchema,
+    scope: runtimeBrowserScopeSchema,
     arguments: z.object({ locator: z.string().trim().min(1), value: z.string() }).strict(),
   }).strict(),
   z.object({
     capability: z.literal('browser.click'),
-    scope: browserScopeSchema,
+    scope: runtimeBrowserScopeSchema,
     arguments: z.object({ locator: z.string().trim().min(1) }).strict(),
   }).strict(),
   z.object({
     capability: z.literal('browser.url'),
-    scope: browserScopeSchema,
+    scope: runtimeBrowserScopeSchema,
     arguments: z.object({}).strict(),
   }).strict(),
   z.object({
     capability: z.literal('browser.close'),
-    scope: browserScopeSchema,
+    scope: runtimeBrowserScopeSchema,
     arguments: z.object({}).strict(),
   }).strict(),
 ])

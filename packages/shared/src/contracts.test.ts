@@ -18,12 +18,14 @@ import {
   modelInfoSchema,
   normalizeProxySettings,
   parseProxyBypassText,
+  permissionGrantSchema,
   providerCredentialStatusSchema,
   proxySettingsSchema,
   toSafeAppError,
   tokenUsageSnapshotSchema,
   userProfileSchema,
   userProfileUpdateSchema,
+  workflowPermissionSchema,
   workerMessageSchema,
 } from './index'
 
@@ -728,6 +730,53 @@ describe('cross-process contracts', () => {
       workflowVersion: '1.0.0', capability: 'browser.open',
       scope: { origins: ['https://www.baidu.com'] },
     })).toMatchObject({ decision: 'always', workflowVersion: '1.0.0' })
+  })
+
+  it('allows HTTPS URL globs only in declared workflow permissions', () => {
+    expect(workflowPermissionSchema.parse({
+      capability: 'browser.open',
+      scope: { origins: ['*.baidu.com/api/*'] },
+    })).toMatchObject({ scope: { origins: ['*.baidu.com/api/*'] } })
+
+    expect(workerMessageSchema.safeParse({
+      type: 'capability_request',
+      requestId: 'request_1',
+      request: {
+        capability: 'browser.open',
+        scope: { origins: ['https://demo.baidu.com/api'] },
+        arguments: { url: 'https://demo.baidu.com/api' },
+      },
+    }).success).toBe(false)
+
+    expect(approvalDecisionSchema.safeParse({
+      executionId: 'exec_1', decision: 'always', workflowId: 'browser.search.baidu',
+      permissionIndex: 0, scopeHash: 'a'.repeat(64), workflowVersion: '1.0.0',
+      capability: 'browser.open', scope: { origins: ['*.baidu.com'] },
+    }).success).toBe(false)
+
+    expect(permissionGrantSchema.safeParse({
+      id: 'grant_1', workflowId: 'browser.search.baidu', workflowVersion: '1.0.0',
+      capability: 'browser.open', scope: { origins: ['*.baidu.com'] },
+      createdAt: '2026-07-19T00:00:00.000Z',
+    }).success).toBe(false)
+
+    expect(permissionGrantSchema.safeParse({
+      id: 'grant_1', workflowId: 'browser.search.baidu', workflowVersion: '1.0.0',
+      capability: 'browser.open', scope: {},
+      createdAt: '2026-07-19T00:00:00.000Z',
+    }).success).toBe(false)
+
+    expect(executionEventSchema.safeParse({
+      type: 'approval_required', executionId: 'exec_1', permissionIndex: 0,
+      capability: 'browser.open', scope: { paths: ['/tmp'] }, scopeHash: 'a'.repeat(64),
+      occurredAt: '2026-07-19T00:00:00.000Z',
+    }).success).toBe(false)
+
+    expect(chatBlockSchema.safeParse({
+      type: 'approval', executionId: 'exec_1', workflowId: 'browser.search.baidu',
+      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+      scope: {}, scopeHash: 'a'.repeat(64),
+    }).success).toBe(false)
   })
 
   it('requires exact identity on a dynamic execution approval event', () => {

@@ -78,7 +78,7 @@ export interface BrowserWorkspaceAcquireInput {
 }
 
 export interface BrowserWorkspaceTab {
-  open(url: string, allowedOrigin: string): Promise<void>
+  open(url: string, allowedOrigins: readonly string[]): Promise<void>
   fill(locator: string, value: string, allowedOrigin: string): Promise<void>
   click(locator: string, allowedOrigin: string): Promise<void>
   url(): Promise<string>
@@ -113,8 +113,8 @@ interface TargetTabState {
   partition: string
   view: WebContentsViewPort
   ownerExecutionId?: string
-  automationOrigin?: string
-  allowedOrigin?: string
+  automationOrigins?: readonly string[]
+  allowedOrigins?: readonly string[]
   navigationViolation?: AppError
   activeOperations: number
   closed: boolean
@@ -149,6 +149,13 @@ function originOf(value: string): string {
     if (typeof error === 'object' && error !== null && 'code' in error) throw error
     throw failure('INVALID_INPUT')
   }
+}
+
+function isAbortedNavigation(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === 'ERR_ABORTED'
 }
 
 function parseLocator(locator: string): ParsedLocator {
@@ -198,8 +205,8 @@ class ElectronBrowserTab implements BrowserWorkspaceTab {
     readonly state: TargetTabState,
   ) {}
 
-  open(url: string, allowedOrigin: string): Promise<void> {
-    return this.workspace.navigate(this.state, url, allowedOrigin)
+  open(url: string, allowedOrigins: readonly string[]): Promise<void> {
+    return this.workspace.navigate(this.state, url, allowedOrigins)
   }
 
   fill(locator: string, value: string, allowedOrigin: string): Promise<void> {
@@ -286,8 +293,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     this.executions.delete(executionId)
     if (state.ownerExecutionId === executionId) state.ownerExecutionId = undefined
     if (state.activeOperations === 0) {
-      state.automationOrigin = undefined
-      state.allowedOrigin = undefined
+      state.automationOrigins = undefined
+      state.allowedOrigins = undefined
       state.navigationViolation = undefined
     }
     await this.renderToolbar().catch(() => undefined)
@@ -334,17 +341,29 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     await this.closeWindow()
   }
 
-  async navigate(state: TargetTabState, url: string, allowedOrigin: string): Promise<void> {
+  async navigate(state: TargetTabState, url: string, allowedOrigins: readonly string[]): Promise<void> {
     this.assertOpen(state)
     const requestedOrigin = originOf(url)
-    if (requestedOrigin !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
-    await this.restricted(state, allowedOrigin, () => state.view.webContents.loadURL(url))
+    if (!allowedOrigins.includes(requestedOrigin)) throw failure('CAPABILITY_SCOPE_DENIED')
+    await this.restricted(state, allowedOrigins, async () => {
+      const navigation = this.waitForNavigation(state.view.webContents)
+      try {
+        await state.view.webContents.loadURL(url)
+        navigation.cancel()
+      } catch (error) {
+        if (!isAbortedNavigation(error) || state.navigationViolation) {
+          navigation.cancel()
+          throw error
+        }
+        await navigation.promise
+      }
+    })
     await this.renderToolbar().catch(() => undefined)
   }
 
   async fill(state: TargetTabState, locator: string, value: string, allowedOrigin: string): Promise<void> {
     this.assertOpen(state)
-    await this.restricted(state, allowedOrigin, async () => {
+    await this.restricted(state, [allowedOrigin], async () => {
       const backendNodeId = await this.resolveLocator(state, locator)
       const result = await this.command(state, 'DOM.resolveNode', { backendNodeId }) as {
         object?: { objectId?: string }
@@ -378,7 +397,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
 
   async click(state: TargetTabState, locator: string, allowedOrigin: string): Promise<void> {
     this.assertOpen(state)
-    await this.restricted(state, allowedOrigin, async () => {
+    await this.restricted(state, [allowedOrigin], async () => {
       const backendNodeId = await this.resolveLocator(state, locator)
       await this.command(state, 'DOM.scrollIntoViewIfNeeded', { backendNodeId })
       const result = await this.command(state, 'DOM.getBoxModel', { backendNodeId }) as {
@@ -395,7 +414,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       await this.command(state, 'Input.dispatchMouseEvent', {
         type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
       })
-      await navigation
+      await navigation.promise
     })
     await this.renderToolbar().catch(() => undefined)
   }
@@ -428,6 +447,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         navigateOnDragDrop: false,
       },
     })
+    await view.webContents.loadURL('about:blank')
     const state: TargetTabState = {
       id: randomUUID(), userId, workflowId, partition, view, activeOperations: 0, closed: false,
     }
@@ -593,20 +613,28 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private guardNavigation(state: TargetTabState, event: NavigationEvent, url: string): void {
     let origin: string
     try { origin = originOf(url) } catch { event.preventDefault(); return }
-    const restrictedOrigin = state.allowedOrigin ?? (state.ownerExecutionId ? state.automationOrigin : undefined)
-    if (restrictedOrigin && origin !== restrictedOrigin) {
+    const restrictedOrigins = state.allowedOrigins ?? (state.ownerExecutionId ? state.automationOrigins : undefined)
+    if (restrictedOrigins && !restrictedOrigins.includes(origin)) {
       event.preventDefault()
       state.navigationViolation = failure('CAPABILITY_SCOPE_DENIED')
     }
   }
 
-  private async restricted<T>(state: TargetTabState, allowedOrigin: string, action: () => Promise<T>): Promise<T> {
+  private async restricted<T>(
+    state: TargetTabState,
+    allowedOrigins: readonly string[],
+    action: () => Promise<T>,
+  ): Promise<T> {
     this.assertOpen(state)
-    if (originOf(allowedOrigin) !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
+    if (allowedOrigins.length < 1
+      || new Set(allowedOrigins).size !== allowedOrigins.length
+      || allowedOrigins.some((origin) => originOf(origin) !== origin)) {
+      throw failure('CAPABILITY_SCOPE_DENIED')
+    }
     const executionId = state.ownerExecutionId
     if (!executionId) throw failure('CANCELLED')
     state.activeOperations += 1
-    state.allowedOrigin = allowedOrigin
+    state.allowedOrigins = [...allowedOrigins]
     state.navigationViolation = undefined
     try {
       let result!: T
@@ -617,15 +645,17 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       if (problem) throw problem
       if (state.ownerExecutionId !== executionId) throw failure('CANCELLED')
       const current = state.view.webContents.getURL()
-      if (current !== 'about:blank' && originOf(current) !== allowedOrigin) throw failure('CAPABILITY_SCOPE_DENIED')
-      state.automationOrigin = allowedOrigin
+      if (current !== 'about:blank' && !allowedOrigins.includes(originOf(current))) {
+        throw failure('CAPABILITY_SCOPE_DENIED')
+      }
+      state.automationOrigins = [...allowedOrigins]
       return result
     } finally {
       state.activeOperations -= 1
       if (state.activeOperations === 0) {
-        state.allowedOrigin = undefined
+        state.allowedOrigins = undefined
         state.navigationViolation = undefined
-        if (!state.ownerExecutionId) state.automationOrigin = undefined
+        if (!state.ownerExecutionId) state.automationOrigins = undefined
       }
     }
   }
@@ -694,8 +724,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     return [...matches][0]!
   }
 
-  private waitForNavigation(contents: WebContentsPort): Promise<void> {
-    return new Promise((resolve, reject) => {
+  private waitForNavigation(contents: WebContentsPort): { promise: Promise<void>; cancel(): void } {
+    let cancel: () => void = () => undefined
+    const promise = new Promise<void>((resolve, reject) => {
       let started = false
       let sameDocument = false
       let settled = false
@@ -714,6 +745,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         if (error) reject(error)
         else resolve()
       }
+      cancel = () => finish()
       const onStart = (...args: unknown[]) => {
         const details = args[0] as { isMainFrame?: boolean; isSameDocument?: boolean } | undefined
         const deprecatedIsMainFrame = args[3]
@@ -723,9 +755,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       }
       const onStop = () => { if (started) finish() }
       const onFail = (...args: unknown[]) => {
-        const details = args[0] as { isMainFrame?: boolean } | undefined
+        const details = args[0] as { errorCode?: number; isMainFrame?: boolean } | undefined
+        const errorCode = details?.errorCode ?? args[1]
         const deprecatedIsMainFrame = args[4]
         if (details?.isMainFrame === false || deprecatedIsMainFrame === false) return
+        if (errorCode === -3) return
         if (started) finish(failure('INTERNAL_ERROR'))
       }
       const onInPage = () => { if (started && sameDocument) finish() }
@@ -738,6 +772,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       detectionTimer = setTimeout(() => { if (!started) finish() }, navigationDetectionMs)
       maximumTimer = setTimeout(() => { finish(failure('WORKER_TIMEOUT')) }, 30_000)
     })
+    return { promise, cancel: () => cancel() }
   }
 
   private handleDestroyed(state: TargetTabState): void {

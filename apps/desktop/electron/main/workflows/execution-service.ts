@@ -6,6 +6,8 @@ import { isAbsolute, join, resolve, sep } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import {
   approvalDecisionSchema,
+  matchesHttpsUrlPattern,
+  matchesHttpsUrlPatternOrigin,
   toSafeAppError,
   workerRequestSchema,
   workerResponseSchema,
@@ -156,6 +158,7 @@ interface ReservationRecord {
 interface PendingCapability {
   requestId: string
   request: WorkerCapabilityRequest
+  permissionIndex: number
   requiresApproval: boolean
 }
 
@@ -220,11 +223,60 @@ function inside(root: string, target: string): boolean {
   return target === root || target.startsWith(`${root}${sep}`)
 }
 
-function samePermission(
+function sameExactPermission(
   left: { capability: Capability; scope: CapabilityScope },
   right: { capability: Capability; scope: CapabilityScope },
 ): boolean {
   return left.capability === right.capability && scopeHash(left.scope) === scopeHash(right.scope)
+}
+
+function permissionCoversRequest(
+  declared: { capability: Capability; scope: CapabilityScope },
+  request: WorkerCapabilityRequest,
+): boolean {
+  if (declared.capability !== request.capability
+    || !('origins' in declared.scope)
+    || request.scope.origins.length !== 1) {
+    return false
+  }
+
+  const requestOrigin = request.scope.origins[0]!
+  if (request.capability === 'browser.open') {
+    try {
+      if (new URL(request.arguments.url).origin !== requestOrigin) return false
+    } catch {
+      return false
+    }
+    return declared.scope.origins.some((pattern) => matchesHttpsUrlPattern(pattern, request.arguments.url))
+  }
+
+  return declared.scope.origins.some((pattern) => matchesHttpsUrlPatternOrigin(pattern, requestOrigin))
+}
+
+function exactHostOrigin(pattern: string): string | undefined {
+  if (pattern.includes('*')) return undefined
+  const authority = pattern.replace(/^https:\/\//i, '')
+  if (!authority || authority.includes('/')) return undefined
+  try {
+    const url = new URL(/^https:\/\//i.test(pattern) ? pattern : `https://${pattern}`)
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) return undefined
+    return url.origin
+  } catch {
+    return undefined
+  }
+}
+
+function effectiveCapabilityRequest(
+  declared: { capability: Capability; scope: CapabilityScope },
+  request: WorkerCapabilityRequest,
+): WorkerCapabilityRequest {
+  if (request.capability !== 'browser.open' || !('origins' in declared.scope)) return request
+  const origins = [...request.scope.origins]
+  for (const pattern of declared.scope.origins) {
+    const origin = exactHostOrigin(pattern)
+    if (origin && !origins.includes(origin)) origins.push(origin)
+  }
+  return { ...request, scope: { origins } }
 }
 
 export class ExecutionService {
@@ -396,9 +448,7 @@ export class ExecutionService {
     const active = this.active.get(parsed.data.executionId)
     if (!active || active.terminal || !active.pending?.requiresApproval) throw failure('CONFLICT')
     const pending = active.pending
-    const permissionIndex = active.workflow.permissions.findIndex((permission) => samePermission(permission, pending.request))
-    if (permissionIndex < 0
-      || parsed.data.permissionIndex !== permissionIndex
+    if (parsed.data.permissionIndex !== pending.permissionIndex
       || parsed.data.scopeHash !== scopeHash(pending.request.scope)) {
       throw failure('CONFLICT')
     }
@@ -410,7 +460,7 @@ export class ExecutionService {
     if (parsed.data.decision === 'always' && (
       parsed.data.workflowId !== active.workflow.id
       || parsed.data.workflowVersion !== active.workflow.version
-      || !samePermission(parsed.data, pending.request)
+      || !sameExactPermission(parsed.data, pending.request)
     )) {
       throw failure('INVALID_INPUT')
     }
@@ -633,30 +683,36 @@ export class ExecutionService {
       await this.finish(active.id, 'failed', failure('WORKER_PROTOCOL_INVALID'))
       return
     }
-    if (!active.workflow.permissions.some((declared) => samePermission(declared, request))) {
+    const permissionIndex = active.workflow.permissions.findIndex((declared) => permissionCoversRequest(declared, request))
+    if (permissionIndex < 0) {
       await this.finish(active.id, 'failed', failure('CAPABILITY_SCOPE_DENIED'))
       return
     }
+    const effectiveRequest = effectiveCapabilityRequest(active.workflow.permissions[permissionIndex]!, request)
 
     const evaluation = this.dependencies.policy.evaluate({
       executionId: active.id,
       workflowId: active.workflow.id,
       workflowVersion: active.workflow.version,
-      capability: request.capability,
-      scope: request.scope,
+      capability: effectiveRequest.capability,
+      scope: effectiveRequest.scope,
     })
-    const pending: PendingCapability = { requestId, request, requiresApproval: evaluation.requiresApproval }
+    const pending: PendingCapability = {
+      requestId,
+      request: effectiveRequest,
+      permissionIndex,
+      requiresApproval: evaluation.requiresApproval,
+    }
     active.pending = pending
     if (evaluation.requiresApproval) {
-      const permissionIndex = active.workflow.permissions.findIndex((permission) => samePermission(permission, request))
       this.transition(active, 'awaiting_approval')
       this.emit({
         type: 'approval_required',
         executionId: active.id,
         permissionIndex,
-        capability: request.capability,
-        scope: request.scope,
-        scopeHash: scopeHash(request.scope),
+        capability: effectiveRequest.capability,
+        scope: effectiveRequest.scope,
+        scopeHash: scopeHash(effectiveRequest.scope),
         occurredAt: new Date().toISOString(),
       })
       return

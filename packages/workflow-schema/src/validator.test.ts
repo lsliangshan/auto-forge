@@ -24,7 +24,7 @@ function validManifest() {
 }
 
 describe('validateManifest', () => {
-  it('requires activation examples and exact browser origins', () => {
+  it('requires activation examples and browser origin scopes', () => {
     const result = validateManifest({
       id: 'bad',
       permissions: [{ capability: 'browser.open' }],
@@ -103,12 +103,30 @@ describe('validateManifest', () => {
     expect(validateManifest({ ...validManifest(), version: '1.2.3-01' }).valid).toBe(false)
   })
 
-  it('requires browser origins to be exact HTTPS URL origins', () => {
+  it.each([
+    '*.baidu.com',
+    '*.baidu.com/*',
+    'a*.baidu.com',
+    '*.baidu.*',
+    '*.baidu.com/api/*',
+    'https://*.baidu.com/api/*',
+  ])('accepts HTTPS URL pattern %s', (origin) => {
+    expect(validateManifest({
+      ...validManifest(),
+      permissions: [{ capability: 'browser.open', scope: { origins: [origin] } }],
+    }).valid).toBe(true)
+  })
+
+  it('rejects unsafe or unrestricted HTTPS URL patterns', () => {
     for (const origin of [
       'https://allowed.example@evil.example',
-      'https://allowed.example/path',
       'https://allowed.example?query=value',
       'https://allowed.example#fragment',
+      'http://allowed.example',
+      '*',
+      '*/*',
+      '*.baidu.com:*',
+      '127.0.*',
     ]) {
       expect(validateManifest({
         ...validManifest(),

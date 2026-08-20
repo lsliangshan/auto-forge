@@ -74,6 +74,27 @@ describe('PolicyEngineBrowserAuthorization', () => {
       capability: 'browser.open', scope: { origins: ['https://example.com'] },
     })).toThrow(expect.objectContaining({ code: 'CAPABILITY_SCOPE_DENIED' }))
   })
+
+  it('authorizes a finite set of exact HTTPS origins as one approved scope', () => {
+    const repository = { upsert: vi.fn(), get: vi.fn(), delete: vi.fn() }
+    const policy = new PolicyEngine(repository)
+    const redirectScope = {
+      origins: ['https://fw.bjrcgz.gov.cn', 'https://bjt.beijing.gov.cn'],
+    }
+    policy.record({
+      executionId: context.executionId,
+      workflowId: context.workflowId,
+      workflowVersion: context.workflowVersion,
+      capability: 'browser.open',
+      scope: redirectScope,
+      decision: 'once',
+    })
+    const authorization = new PolicyEngineBrowserAuthorization(policy)
+
+    expect(() => authorization.authorize(context, {
+      capability: 'browser.open', scope: redirectScope,
+    })).not.toThrow()
+  })
 })
 
 describe('BrowserCapabilityService', () => {
@@ -90,7 +111,7 @@ describe('BrowserCapabilityService', () => {
       userId: context.userId,
       workflowId: context.workflowId,
     } satisfies BrowserWorkspaceAcquireInput)
-    expect(tab.open).toHaveBeenCalledWith('https://www.baidu.com', 'https://www.baidu.com')
+    expect(tab.open).toHaveBeenCalledWith('https://www.baidu.com', ['https://www.baidu.com'])
     expect(tab.fill).toHaveBeenCalledWith('css=#kw', 'AutoForge', 'https://www.baidu.com')
     expect(tab.click).toHaveBeenCalledWith('role=button[name="百度一下"]', 'https://www.baidu.com')
     expect(authorize).toHaveBeenCalledWith(context, {
@@ -107,6 +128,30 @@ describe('BrowserCapabilityService', () => {
     setUrl('https://example.com/')
     await expect(service.fill(context, 'css=#kw', 'AutoForge', baiduScope))
       .rejects.toMatchObject({ code: 'CAPABILITY_SCOPE_DENIED' })
+  })
+
+  it('keeps an explicitly approved redirect origin authorized after browser.open', async () => {
+    const { service, tab, authorize, setUrl } = createHarness()
+    const redirectScope = {
+      origins: ['https://fw.bjrcgz.gov.cn', 'https://bjt.beijing.gov.cn'],
+    }
+    vi.mocked(tab.open).mockImplementationOnce(async () => {
+      setUrl('https://bjt.beijing.gov.cn/renzheng/open/login/goUserLogin')
+    })
+
+    await service.open(
+      context,
+      'https://fw.bjrcgz.gov.cn/person-platform/',
+      redirectScope,
+    )
+
+    expect(tab.open).toHaveBeenCalledWith(
+      'https://fw.bjrcgz.gov.cn/person-platform/',
+      redirectScope.origins,
+    )
+    expect(authorize).toHaveBeenLastCalledWith(context, {
+      capability: 'browser.open', scope: redirectScope,
+    })
   })
 
   it('releases execution ownership without closing the retained tab', async () => {

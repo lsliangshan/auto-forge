@@ -212,21 +212,21 @@ export const useDeveloperStore = defineStore('developer', {
       const next = remaining[index] ?? remaining[index - 1]
       if (next) await this.selectFile(next)
     },
-    async createEntry(parentPath: string, name: string, kind: 'file' | 'directory') {
-      const projectId = this.selectedProjectId
+    async createEntry(parentPath: string, name: string, kind: 'file' | 'directory', targetProjectId?: string) {
+      const projectId = targetProjectId ?? this.selectedProjectId
       if (!projectId) return
       this.error = ''
       try {
         const project = await getDesktopApi().developer.createEntry(projectId, parentPath, name, kind)
         this._upsertProject(project)
-        if (kind === 'file') {
+        if (kind === 'file' && this.selectedProjectId === projectId) {
           const path = parentPath ? `${parentPath}/${name}` : name
           await this.selectFile(path)
         }
       } catch (error) { this.error = displayError(error, '创建文件或目录失败') }
     },
-    async renameEntry(path: string, name: string) {
-      const projectId = this.selectedProjectId
+    async renameEntry(path: string, name: string, targetProjectId?: string) {
+      const projectId = targetProjectId ?? this.selectedProjectId
       if (!projectId) return
       this.error = ''
       await this._flushEntry(projectId, path)
@@ -247,11 +247,13 @@ export const useDeveloperStore = defineStore('developer', {
         }
         this.openPaths[projectId] = (this.openPaths[projectId] ?? [])
           .map((openPath) => entryContains(path, openPath) ? moveEntryPath(openPath, path, destination) : openPath)
-        if (entryContains(path, this.selectedPath)) this.selectedPath = moveEntryPath(this.selectedPath, path, destination)
+        if (this.selectedProjectId === projectId && entryContains(path, this.selectedPath)) {
+          this.selectedPath = moveEntryPath(this.selectedPath, path, destination)
+        }
       } catch (error) { this.error = displayError(error, '重命名失败') }
     },
-    async deleteEntry(path: string) {
-      const projectId = this.selectedProjectId
+    async deleteEntry(path: string, targetProjectId?: string) {
+      const projectId = targetProjectId ?? this.selectedProjectId
       if (!projectId) return
       this.error = ''
       await this._flushEntry(projectId, path)
@@ -263,14 +265,15 @@ export const useDeveloperStore = defineStore('developer', {
       try {
         const project = await getDesktopApi().developer.deleteEntry(projectId, path)
         const previousOpenPaths = this.openPaths[projectId] ?? []
-        const selectedIndex = previousOpenPaths.indexOf(this.selectedPath)
+        const selectedPath = this.selectedProjectId === projectId ? this.selectedPath : ''
+        const selectedIndex = previousOpenPaths.indexOf(selectedPath)
         this._upsertProject(project)
         for (const [key, buffer] of Object.entries(this.files)) {
           if (buffer.projectId === projectId && entryContains(path, buffer.path)) delete this.files[key]
         }
         const remaining = previousOpenPaths.filter((openPath) => !entryContains(path, openPath) && project.files.includes(openPath))
         this.openPaths[projectId] = remaining
-        if (!entryContains(path, this.selectedPath)) return
+        if (this.selectedProjectId !== projectId || !entryContains(path, selectedPath)) return
         this.selectedPath = ''
         const next = remaining[selectedIndex] ?? remaining[selectedIndex - 1]
           ?? (project.files.includes('src/index.ts') ? 'src/index.ts' : project.files[0])
@@ -287,15 +290,16 @@ export const useDeveloperStore = defineStore('developer', {
       buffer.loading = true
       buffer.error = ''
       this.files[key] = buffer
+      const reactiveBuffer = this.files[key]!
       try {
-        buffer.content = await getDesktopApi().developer.readFile(projectId, path)
-        buffer.loaded = true
-        if (path === 'workflow.json') this.manifests[projectId] = parseManifest(buffer.content)
+        reactiveBuffer.content = await getDesktopApi().developer.readFile(projectId, path)
+        reactiveBuffer.loaded = true
+        if (path === 'workflow.json') this.manifests[projectId] = parseManifest(reactiveBuffer.content)
       } catch (error) {
-        buffer.error = typeof error === 'object' && error !== null && 'code' in error && error.code === 'INVALID_INPUT'
+        reactiveBuffer.error = typeof error === 'object' && error !== null && 'code' in error && error.code === 'INVALID_INPUT'
           ? '文件过大、包含二进制内容或不可编辑'
           : displayError(error, '文件加载失败')
-      } finally { buffer.loading = false }
+      } finally { reactiveBuffer.loading = false }
     },
     editCurrent(content: string) {
       const buffer = this.currentBuffer
