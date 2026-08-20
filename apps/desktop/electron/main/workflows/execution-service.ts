@@ -67,6 +67,7 @@ export interface TemporaryDirectoryPort {
 
 export interface CapabilityContext {
   executionId: string
+  userId: string
   workflowId: string
   workflowVersion: string
 }
@@ -124,6 +125,7 @@ export class NodeWorkerFactory implements WorkflowWorkerFactory {
 }
 
 export interface ExecutionStartInput {
+  userId: string
   workflowId: string
   workflowVersion: string
   input: unknown
@@ -159,6 +161,7 @@ interface PendingCapability {
 
 interface ActiveExecution {
   id: string
+  userId: string
   workflow: WorkflowDetail
   worker: WorkflowWorker
   directory: string
@@ -351,6 +354,7 @@ export class ExecutionService {
     void finished.catch(() => undefined)
     const active: ActiveExecution = {
       id,
+      userId: input.userId,
       workflow,
       worker,
       directory,
@@ -664,6 +668,7 @@ export class ExecutionService {
     try {
       const result = await this.dependencies.capability.request({
         executionId: active.id,
+        userId: active.userId,
         workflowId: active.workflow.id,
         workflowVersion: active.workflow.version,
       }, pending.request)

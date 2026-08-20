@@ -181,6 +181,7 @@ function createHarness(options: {
   }
   const service = new ExecutionService(dependencies)
   const start = () => service.start({
+    userId: 'user_1',
     workflowId: workflow.id,
     workflowVersion: workflow.version,
     input: { query: 'weather' },
@@ -270,6 +271,7 @@ describe('ExecutionService', () => {
     const reservation = harness.service.reserve()
     expect(harness.service.hasActiveExecutions()).toBe(true)
     const execution = await harness.service.startReserved(reservation, {
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: { query: 'weather' },
@@ -281,7 +283,7 @@ describe('ExecutionService', () => {
     expect(harness.service.hasActiveExecutions()).toBe(false)
 
     await expect(harness.service.startReserved({ executionId: 'forged' } as never, {
-      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -295,7 +297,7 @@ describe('ExecutionService', () => {
     expect(harness.service.discardReservation(reservation)).toBe(false)
     expect(harness.service.discardReservation({ executionId: reservation.executionId } as never)).toBe(false)
     await expect(harness.service.startReserved(reservation, {
-      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -306,11 +308,11 @@ describe('ExecutionService', () => {
     controller.abort()
 
     await expect(harness.service.startReserved(reservation, {
-      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
     }, controller.signal)).rejects.toMatchObject({ code: 'CANCELLED' })
     expect(harness.service.discardReservation(reservation)).toBe(false)
     await expect(harness.service.startReserved(reservation, {
-      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -322,6 +324,7 @@ describe('ExecutionService', () => {
 
     expect(harness.service.hasActiveExecutions()).toBe(false)
     await expect(harness.service.startReserved(reservation, {
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
@@ -339,6 +342,7 @@ describe('ExecutionService', () => {
     })
     const reservation = harness.service.reserve()
     const starting = harness.service.startReserved(reservation, {
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
@@ -372,6 +376,7 @@ describe('ExecutionService', () => {
     })
     const existing = harness.service.reserve()
     const starting = harness.service.startReserved(existing, {
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
@@ -382,11 +387,13 @@ describe('ExecutionService', () => {
     expect(() => harness.service.reserve())
       .toThrow(expect.objectContaining({ code: 'CONFLICT' }))
     await expect(harness.service.start({
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
     })).rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(harness.service.startReserved(existing, {
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
@@ -396,6 +403,7 @@ describe('ExecutionService', () => {
     await starting
     await shutdown
     await expect(harness.service.start({
+      userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
@@ -413,7 +421,7 @@ describe('ExecutionService', () => {
     })
     const reservation = harness.service.reserve()
     const starting = harness.service.startReserved(reservation, {
-      workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
     })
     await turn()
     let cancelSettled = false
@@ -637,6 +645,34 @@ describe('ExecutionService', () => {
       status: 'failed',
       errorCode: 'WORKFLOW_INTEGRITY_FAILED',
     })
+  })
+
+  it('passes authenticated user attribution only to the main-process capability context', async () => {
+    const request = vi.fn(async () => ({ ok: true }))
+    const harness = createHarness({ capability: { request, closeExecution: async () => undefined } })
+    const execution = await harness.service.start({
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      input: { query: 'weather' },
+      userId: 'user_1',
+    } as Parameters<typeof harness.service.start>[0])
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    harness.policy.record({
+      executionId: execution.id,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: capabilityRequest.capability,
+      scope: capabilityRequest.scope,
+      decision: 'once',
+    })
+    worker.respond({ type: 'capability_request', requestId: 'request_user', request: capabilityRequest })
+    await turn()
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user_1' }), capabilityRequest)
+    expect(worker.requests.find((message) => message.type === 'start')).not.toHaveProperty('userId')
+    worker.respond({ type: 'result', output: { ok: true } })
+    await execution.finished
   })
 
   it('uses only the trusted resolver entry when callers supply an arbitrary external path', async () => {

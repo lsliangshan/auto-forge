@@ -31,6 +31,7 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
+import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 
 const directories: string[] = []
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
@@ -60,8 +61,18 @@ function createNetworkProxy() {
     transition,
     transitionOrFailClosed: transition,
     fetch: vi.fn(globalThis.fetch),
-    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
+    snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>' })),
     withTransportLease,
+  }
+}
+
+function createBrowserWorkspace(): BrowserWorkspacePort {
+  return {
+    acquire: vi.fn(async () => { throw new Error('Unexpected browser acquisition') }),
+    releaseExecution: vi.fn(async () => undefined),
+    updateProxy: vi.fn(async () => undefined),
+    reset: vi.fn(async () => undefined),
+    shutdown: vi.fn(async () => undefined),
   }
 }
 
@@ -169,7 +180,7 @@ function options(
     emitChat: vi.fn(),
     emitExecution: vi.fn(),
     networkProxy,
-    browserRuntime: { packaged: false },
+    browserWorkspace: createBrowserWorkspace(),
     ...overrides,
   }
 }
@@ -434,6 +445,20 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.auth.getSession()).resolves.toBeNull()
     await expect(runtime.services.settings.getTokenUsage())
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    await runtime.close()
+  })
+
+  it('closes live browser tabs when the authenticated AutoForge user changes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-user-'))
+    directories.push(root)
+    const browserWorkspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace }))
+
+    await runtime.services.auth.register({ account: 'Alice', password: 'password' })
+    expect(browserWorkspace.reset).toHaveBeenCalledOnce()
+    await runtime.services.auth.logout()
+    expect(browserWorkspace.reset).toHaveBeenCalledTimes(2)
+
     await runtime.close()
   })
 
@@ -1787,7 +1812,7 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
@@ -1856,7 +1881,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
 
     await authenticate(runtime)
@@ -1961,7 +1986,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2123,7 +2148,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await runtime.services.auth.register({ account: 'Alice', password: 'password' })
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2204,7 +2229,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2297,7 +2322,7 @@ describe('createApplicationRuntime', () => {
       emitExecution: vi.fn(),
       networkProxy,
       mediaTransport: { request: mediaRequest },
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2402,7 +2427,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2565,7 +2590,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -2638,7 +2663,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
 
     const deleted = await runtime.services.chat.createConversation()
@@ -2690,7 +2715,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     }
     const runtime = createApplicationRuntime(options)
     const conversation = await runtime.services.chat.createConversation()
@@ -2776,7 +2801,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2836,7 +2861,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -2895,7 +2920,7 @@ describe('createApplicationRuntime', () => {
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
         networkProxy,
-        browserRuntime: { packaged: false },
+        browserWorkspace: createBrowserWorkspace(),
       })
       await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2965,7 +2990,7 @@ describe('createApplicationRuntime', () => {
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
         networkProxy,
-        browserRuntime: { packaged: false },
+        browserWorkspace: createBrowserWorkspace(),
       }
       const runtime = createApplicationRuntime(options)
       await authenticate(runtime)
@@ -3045,7 +3070,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await runtime.recover()
     await expect(runtime.services.chat.listMessages('conversation_interrupted_image'))
@@ -3108,7 +3133,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     }
     const runtime = createApplicationRuntime(options)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -3173,7 +3198,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     let status: Awaited<ReturnType<typeof runtime.services.settings.saveProviderApiKey>> | undefined
     void runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -3218,7 +3243,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
 
     await authenticate(runtime)
@@ -3291,7 +3316,7 @@ describe('createApplicationRuntime', () => {
       openExternal,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await restarted.recover()
     expect(await restarted.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
@@ -3333,7 +3358,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -3446,13 +3471,14 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
       removeExecutionTemporaryDirectory: async (path: string) => {
         markCleanupStarted()
         await cleanupFinished
         await rm(path, { recursive: true, force: true })
       },
     })
+    await authenticate(runtime)
     const installedProject = await runtime.services.developer.createProject('Installed Debug Source')
     const selectedProject = await runtime.services.developer.createProject('Selected Debug Source')
     for (const [projectId, marker] of [[installedProject.id, 'installed'], [selectedProject.id, 'selected']] as const) {

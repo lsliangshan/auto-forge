@@ -661,6 +661,7 @@ export class AgentOrchestrator {
     this.appendBlock(active, { type: 'workflow_execution', executionId: pending.executionId })
     pending.reservationStarted = true
     const started = await this.dependencies.executions.startReserved(pending.reservation, {
+      userId: active.userId,
       workflowId: pending.workflow.id,
       workflowVersion: pending.workflow.version,
       input: pending.args,

@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   app,
+  BaseWindow,
   BrowserWindow,
   clipboard,
   dialog,
@@ -11,6 +12,7 @@ import {
   safeStorage,
   session,
   shell,
+  WebContentsView,
   type Event,
   type OpenDialogOptions,
 } from 'electron'
@@ -25,6 +27,7 @@ import {
 } from './development-parent-watchdog.js'
 import { createMediaProtocolHandler } from './media/media-protocol.js'
 import { NetworkProxyService } from './network/network-proxy-service.js'
+import { ElectronBrowserWorkspace } from './browser/electron-browser-workspace.js'
 import { createSecureWindow } from './window.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -76,6 +79,12 @@ async function initialize(): Promise<ApplicationRuntime> {
     closeAllConnections: () => session.defaultSession.closeAllConnections(),
     fetch: (input, init) => net.fetch(input, init),
   })
+  const browserWorkspace = new ElectronBrowserWorkspace({
+    BaseWindow: BaseWindow as never,
+    WebContentsView: WebContentsView as never,
+    fromPartition: (partition) => session.fromPartition(partition),
+    proxySnapshot: () => networkProxy.snapshot(),
+  })
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -92,6 +101,7 @@ async function initialize(): Promise<ApplicationRuntime> {
       decrypt: async (value) => ({ value: safeStorage.decryptString(value), shouldReEncrypt: false }),
     },
     networkProxy,
+    browserWorkspace,
     chooseProjectDirectory: async () => {
       const dialogOptions: OpenDialogOptions = {
         title: '注册本地工作流项目',
@@ -146,7 +156,6 @@ async function initialize(): Promise<ApplicationRuntime> {
       const parsed = executionEventSchema.safeParse(event)
       if (parsed.success) emit(ipcChannels.executionsEvent, parsed.data)
     },
-    browserRuntime: { packaged: app.isPackaged, ...(app.isPackaged ? { resourcesPath: process.resourcesPath } : {}) },
     appInfo: { version: app.getVersion(), platform: process.platform === 'win32' ? 'win32' : 'darwin' },
   })
 }

@@ -15,12 +15,12 @@
       <template v-else-if="objectFields.length">
         <label v-for="field in objectFields" :key="field.name" class="debug-field">
           <span>{{ field.title }}<em v-if="field.required">必填</em></span>
-          <select v-if="field.enumValues" :data-testid="`debug-field-${field.name}`" :required="field.required" @change="setPrimitive(field, ($event.target as HTMLSelectElement).value)">
+          <select v-if="field.enumValues" :data-testid="`debug-field-${field.name}`" :required="field.required" :value="enumIndex(field)" @change="setPrimitive(field, ($event.target as HTMLSelectElement).value)">
             <option value="">请选择</option><option v-for="(value, index) in field.enumValues" :key="index" :value="String(index)">{{ enumLabel(value) }}</option>
           </select>
-          <input v-else-if="field.kind === 'boolean'" :data-testid="`debug-field-${field.name}`" type="checkbox" :required="field.required" @change="setField(field.name, ($event.target as HTMLInputElement).checked)">
-          <input v-else-if="field.kind === 'string'" :data-testid="`debug-field-${field.name}`" type="text" :required="field.required" @input="setField(field.name, ($event.target as HTMLInputElement).value)">
-          <input v-else-if="field.kind === 'number' || field.kind === 'integer'" :data-testid="`debug-field-${field.name}`" type="number" :step="field.kind === 'integer' ? '1' : 'any'" :required="field.required" @input="setNumber(field.name, ($event.target as HTMLInputElement).value, field.kind === 'integer')">
+          <input v-else-if="field.kind === 'boolean'" :data-testid="`debug-field-${field.name}`" type="checkbox" :required="field.required" :checked="fieldValue(field.name) === true" @change="setField(field.name, ($event.target as HTMLInputElement).checked)">
+          <input v-else-if="field.kind === 'string'" :data-testid="`debug-field-${field.name}`" type="text" :required="field.required" :value="typeof fieldValue(field.name) === 'string' ? fieldValue(field.name) : ''" @input="setField(field.name, ($event.target as HTMLInputElement).value)">
+          <input v-else-if="field.kind === 'number' || field.kind === 'integer'" :data-testid="`debug-field-${field.name}`" type="number" :step="field.kind === 'integer' ? '1' : 'any'" :required="field.required" :value="typeof fieldValue(field.name) === 'number' ? fieldValue(field.name) : ''" @input="setNumber(field.name, ($event.target as HTMLInputElement).value, field.kind === 'integer')">
           <span v-else :data-testid="`debug-field-${field.name}-json`" class="json-field"><small>复杂 Schema，请输入 JSON</small><textarea :value="complexDrafts[field.name] ?? ''" @input="setComplex(field, ($event.target as HTMLTextAreaElement).value)" /><small v-if="draftErrors[field.name]" class="draft-error" role="alert">{{ draftErrors[field.name] }}</small></span>
         </label>
       </template>
@@ -66,6 +66,7 @@ const draftErrors = reactive<Record<string, string>>({})
 const rootDraft = ref('{}')
 const manifest = computed(() => developer.currentManifest)
 const inputSchema = computed(() => manifest.value?.inputSchema as JsonSchema | undefined)
+const inputSchemaKey = computed(() => `${developer.selectedProjectId}\n${JSON.stringify(inputSchema.value ?? null)}`)
 const objectFields = computed<Field[]>(() => {
   const schema = inputSchema.value
   if (schema?.type !== 'object' || !schema.properties) return []
@@ -85,6 +86,16 @@ function setPrimitive(field: Field, value: string) {
 function inputObject(): Record<string, unknown> {
   if (!developer.debugInput || typeof developer.debugInput !== 'object' || Array.isArray(developer.debugInput)) developer.debugInput = {}
   return developer.debugInput as Record<string, unknown>
+}
+function fieldValue(name: string): unknown {
+  return developer.debugInput && typeof developer.debugInput === 'object' && !Array.isArray(developer.debugInput)
+    ? (developer.debugInput as Record<string, unknown>)[name]
+    : undefined
+}
+function enumIndex(field: Field): string {
+  const current = fieldValue(field.name)
+  const index = field.enumValues?.findIndex((value) => Object.is(value, current)) ?? -1
+  return index < 0 ? '' : String(index)
 }
 function setField(name: string, value: unknown) {
   inputObject()[name] = value
@@ -152,7 +163,7 @@ function eventLine(event: ExecutionEvent) {
   if (event.type === 'approval_required') return `[授权] ${event.capability}`
   return `[状态] ${event.status}`
 }
-watch(inputSchema, initializeDrafts, { immediate: true, deep: true })
+watch(inputSchemaKey, initializeDrafts, { immediate: true })
 </script>
 
 <style scoped>

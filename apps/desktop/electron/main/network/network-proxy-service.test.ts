@@ -76,10 +76,6 @@ describe('proxyConfigFor', () => {
         enabled: true,
         proxyRules: expect.any(String),
         bypassRules: '<local>,example.com',
-        playwrightArgs: [
-          '--proxy-server=http=http://127.0.0.1:7890;https=socks5://127.0.0.1:7891;socks=socks5://127.0.0.1:7891',
-          '--proxy-bypass-list=<local>;example.com',
-        ],
       },
       settings: enabled,
     })
@@ -91,7 +87,6 @@ describe('proxyConfigFor', () => {
       snapshot: {
         enabled: false,
         bypassRules: '<local>',
-        playwrightArgs: ['--no-proxy-server'],
       },
       settings: { enabled: false, bypassDomains: [] },
     })
@@ -138,9 +133,6 @@ describe('proxyConfigFor', () => {
 
     expect(config.electron.proxyBypassRules).toBe('<local>,example.com,internal.example')
     expect(config.snapshot.bypassRules).toBe('<local>,example.com,internal.example')
-    expect(config.snapshot.playwrightArgs[1]).toBe(
-      '--proxy-bypass-list=<local>;example.com;internal.example',
-    )
   })
 
   it('never emits direct proxy pseudo-rules', () => {
@@ -401,11 +393,10 @@ describe('NetworkProxyService', () => {
     await service.initialize(firstSettings)
     const first = await service.snapshot()
 
-    expect(Object.isFrozen(first.playwrightArgs)).toBe(true)
-    expect(() => first.playwrightArgs.push('--mutated')).toThrow()
+    expect(Object.isFrozen(first)).toBe(true)
     const second = await service.snapshot()
-    expect(second.playwrightArgs).toEqual(proxyConfigFor(firstSettings).snapshot.playwrightArgs)
-    expect(second.playwrightArgs).not.toBe(first.playwrightArgs)
+    expect(second).toEqual(proxyConfigFor(firstSettings).snapshot)
+    expect(second).not.toBe(first)
 
     const apply = deferred<void>()
     session.setProxy.mockImplementationOnce(() => apply.promise)

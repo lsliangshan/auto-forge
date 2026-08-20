@@ -782,6 +782,7 @@ describe('AgentOrchestrator', () => {
 
     expect(done.status).toBe('completed')
     expect(dependencies.records.starts).toHaveLength(1)
+    expect(dependencies.records.starts[0]).toMatchObject({ userId: 'user_1' })
     expect(JSON.stringify(providerInputs[1])).toContain('"tool_call_id":"call_1"')
     expect(dependencies.records.terminal.at(-1)).toMatchObject({ status: 'completed' })
   })

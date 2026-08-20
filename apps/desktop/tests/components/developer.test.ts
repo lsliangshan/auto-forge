@@ -499,6 +499,33 @@ describe('developer workbench', () => {
     expect((store.debugInput as Record<string, unknown>).choice).toBe('1')
   })
 
+  it('submits an unchanged schema-driven input on consecutive debug runs', async () => {
+    const { api, raw, emit } = createApi()
+    raw.developer.run
+      .mockResolvedValueOnce({ executionId: 'exec_1' })
+      .mockResolvedValueOnce({ executionId: 'exec_2' })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    await wrapper.get('[data-testid="debug-field-keyword"]').setValue('今日天气')
+    await wrapper.get('.debug-actions .el-button--primary').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalledTimes(1))
+    emit({
+      type: 'status', executionId: 'exec_1', status: 'completed',
+      occurredAt: '2026-08-20T00:00:00.000Z',
+    })
+    await wrapper.vm.$nextTick()
+
+    await wrapper.get('.debug-actions .el-button--primary').trigger('click')
+    await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalledTimes(2))
+
+    expect(raw.developer.run).toHaveBeenNthCalledWith(1, { projectId: 'project_1', input: { keyword: '今日天气' } })
+    expect(raw.developer.run).toHaveBeenNthCalledWith(2, { projectId: 'project_1', input: { keyword: '今日天气' } })
+  })
+
   it('isolates execution events, handles approvals, and cancels only the active debug run', async () => {
     const { api, raw, emit } = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
