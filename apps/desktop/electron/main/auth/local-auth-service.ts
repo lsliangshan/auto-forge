@@ -9,14 +9,6 @@ import {
 import type { LocalAuthRepository, LocalAuthSessionRecord } from '../database/local-auth-repository.js'
 import { ScryptPasswordHasher, type PasswordHasher } from './password-hasher.js'
 
-export interface AuthService {
-  getSession(): Promise<AuthSession | null>
-  login(input: AuthCredentials): Promise<AuthSession>
-  register(input: AuthCredentials): Promise<AuthSession>
-  logout(): Promise<void>
-  requireSession(): Promise<AuthSession>
-}
-
 interface LocalAuthDependencies {
   hasher: PasswordHasher
   createId(): string
@@ -34,7 +26,7 @@ function session(record: LocalAuthSessionRecord): AuthSession {
   }
 }
 
-export class LocalAuthService implements AuthService {
+export class LocalAuthService {
   constructor(
     private readonly repository: LocalAuthRepository,
     private readonly dependencies: LocalAuthDependencies = {

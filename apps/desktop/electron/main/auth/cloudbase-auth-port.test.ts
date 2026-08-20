@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, expectTypeOf, it, vi } from 'vitest'
+import type { CloudBaseAuthPort } from './cloudbase-auth-port.js'
 import { createCloudBaseAuthPort, readCloudBaseAuthConfig } from './cloudbase-auth-port.js'
 
 describe('CloudBase auth port', () => {
@@ -27,6 +28,10 @@ describe('CloudBase auth port', () => {
     }, { init })
 
     await port.signInWithPassword({ username: 'alice', password: 'password' })
+    await port.setSession({
+      access_token: 'stored-access-token',
+      refresh_token: 'stored-refresh-token',
+    })
     expect(init).toHaveBeenCalledWith({
       env: 'autoforge-d1gkhyfb419ba8455',
       region: 'ap-shanghai',
@@ -36,5 +41,16 @@ describe('CloudBase auth port', () => {
     expect(auth.signInWithPassword).toHaveBeenCalledWith({
       username: 'alice', password: 'password',
     })
+    expect(auth.setSession).toHaveBeenCalledWith({
+      access_token: 'stored-access-token',
+      refresh_token: 'stored-refresh-token',
+    })
+  })
+
+  it('requires both encrypted tokens when restoring a session', () => {
+    expectTypeOf<Parameters<CloudBaseAuthPort['setSession']>[0]>().toEqualTypeOf<{
+      access_token: string
+      refresh_token: string
+    }>()
   })
 })

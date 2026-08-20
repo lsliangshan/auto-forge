@@ -18,7 +18,7 @@ export interface CloudBaseAuthPort {
   ): Promise<unknown>
   signInWithPassword(input: { username: string; password: string }): Promise<unknown>
   getSession(): Promise<unknown>
-  setSession(input: { refresh_token: string }): Promise<unknown>
+  setSession(input: { access_token: string; refresh_token: string }): Promise<unknown>
   refreshSession(refreshToken?: string): Promise<unknown>
   signOut(): Promise<unknown>
 }
