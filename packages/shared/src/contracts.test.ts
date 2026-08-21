@@ -6,7 +6,9 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  authSessionSchema,
   authUserSchema,
+  authorizationSnapshotSchema,
   chatBlockSchema,
   chatEventSchema,
   chatSendInputSchema,
@@ -26,6 +28,9 @@ import {
   proxySettingsSchema,
   toSafeAppError,
   tokenUsageSnapshotSchema,
+  userAdminListRequestSchema,
+  userAdminListResponseSchema,
+  userAdminUpdateRoleRequestSchema,
   userProfileSchema,
   userProfileUpdateSchema,
   workflowPermissionSchema,
@@ -74,6 +79,72 @@ describe('cross-process contracts', () => {
     })).toEqual({ challengeId: 'challenge_1', expiresIn: 300 })
   })
 
+  it('validates extensible business roles and confirmed capabilities on auth sessions', () => {
+    expect(authorizationSnapshotSchema.parse({
+      role: 'super_admin',
+      capabilities: ['manage_users'],
+      version: 3,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      confirmed: true,
+    })).toMatchObject({ role: 'super_admin', capabilities: ['manage_users'], confirmed: true })
+    expect(authorizationSnapshotSchema.parse({
+      role: 'support_operator',
+      capabilities: [],
+      version: 1,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      confirmed: true,
+    }).role).toBe('support_operator')
+    expect(authorizationSnapshotSchema.safeParse({
+      role: 'Super Admin', capabilities: [], version: 1, updatedAt: '2026-08-21T00:00:00.000Z', confirmed: true,
+    }).success).toBe(false)
+    expect(authSessionSchema.parse({
+      user: { id: 'cloud_uid', account: 'Alice_1' },
+      authenticatedAt: '2026-08-21T00:00:00.000Z',
+      authorization: {
+        role: 'user', capabilities: [], version: 0, updatedAt: '2026-08-21T00:00:00.000Z', confirmed: true,
+      },
+    }).authorization.role).toBe('user')
+  })
+
+  it('validates strict paged user administration requests and optimistic role updates', () => {
+    expect(userAdminListRequestSchema.parse({
+      page: 2,
+      pageSize: 50,
+      filter: { field: 'email', value: 'admin@example.com' },
+    })).toEqual({ page: 2, pageSize: 50, filter: { field: 'email', value: 'admin@example.com' } })
+    expect(userAdminListRequestSchema.safeParse({ page: 1, pageSize: 25 }).success).toBe(false)
+    expect(userAdminListRequestSchema.safeParse({
+      page: 1, pageSize: 20, filter: { field: 'all', value: 'alice' }, extra: true,
+    }).success).toBe(false)
+
+    expect(userAdminListResponseSchema.parse({
+      items: [{
+        userId: 'uid_1',
+        username: 'Alice_1',
+        displayName: 'Alice',
+        maskedEmail: 'a***@example.com',
+        maskedPhone: '138****8000',
+        status: 'active',
+        role: 'support_operator',
+        roleVersion: 2,
+        createdAt: '2026-08-21T00:00:00.000Z',
+      }],
+      page: 1,
+      pageSize: 20,
+      total: 1,
+    }).items[0]?.role).toBe('support_operator')
+
+    expect(userAdminUpdateRoleRequestSchema.parse({
+      requestId: '01K35P3Y6RZXQAG8A3J1AKM5F3',
+      targetUserId: 'uid_1',
+      newRole: 'super_admin',
+      expectedVersion: 1,
+    }).newRole).toBe('super_admin')
+    expect(userAdminUpdateRoleRequestSchema.safeParse({
+      requestId: 'request_1', targetUserId: 'uid_1', newRole: 'support_operator', expectedVersion: 1,
+    }).success).toBe(false)
+  })
+
   it.each([
     'AUTH_REQUIRED',
     'AUTH_INVALID_CREDENTIALS',
@@ -82,6 +153,13 @@ describe('cross-process contracts', () => {
     'AUTH_OTP_EXPIRED',
     'AUTH_OTP_RATE_LIMITED',
     'AUTH_ACCOUNT_NOT_FOUND',
+    'FORBIDDEN',
+    'USER_NOT_FOUND',
+    'ROLE_CONFLICT',
+    'SELF_ROLE_CHANGE_FORBIDDEN',
+    'LAST_SUPER_ADMIN',
+    'REQUEST_ID_CONFLICT',
+    'SERVICE_UNAVAILABLE',
   ] as const)(
     'keeps %s as a safe application error',
     (code) => expect(toSafeAppError({ code })).toMatchObject({ code }),

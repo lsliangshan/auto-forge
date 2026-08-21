@@ -129,11 +129,80 @@ export const authUserSchema = z.object({
 }).strict()
 export type AuthUser = z.infer<typeof authUserSchema>
 
+export const roleIdSchema = z.string().trim().regex(/^[a-z][a-z0-9_]{0,62}$/)
+export type RoleId = z.infer<typeof roleIdSchema>
+
+export const businessCapabilitySchema = z.enum(['manage_users'])
+export type BusinessCapability = z.infer<typeof businessCapabilitySchema>
+
+export const authorizationSnapshotSchema = z.object({
+  role: roleIdSchema,
+  capabilities: z.array(businessCapabilitySchema),
+  version: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+  confirmed: z.boolean(),
+}).strict()
+export type AuthorizationSnapshot = z.infer<typeof authorizationSnapshotSchema>
+
 export const authSessionSchema = z.object({
   user: authUserSchema,
   authenticatedAt: timestampSchema,
+  authorization: authorizationSnapshotSchema.optional(),
 }).strict()
 export type AuthSession = z.infer<typeof authSessionSchema>
+
+export const assignableRoleSchema = z.enum(['user', 'super_admin'])
+export type AssignableRole = z.infer<typeof assignableRoleSchema>
+
+export const userAdminFilterSchema = z.object({
+  field: z.enum(['username', 'displayName', 'userId', 'email', 'phone']),
+  value: z.string().trim().min(1).max(254),
+}).strict()
+export type UserAdminFilter = z.infer<typeof userAdminFilterSchema>
+
+export const userAdminListRequestSchema = z.object({
+  page: z.number().int().positive(),
+  pageSize: z.union([z.literal(20), z.literal(50), z.literal(100)]),
+  filter: userAdminFilterSchema.optional(),
+}).strict()
+export type UserAdminListRequest = z.infer<typeof userAdminListRequestSchema>
+
+export const userAdminListItemSchema = z.object({
+  userId: identifierSchema,
+  username: z.string().trim().min(1).max(64),
+  displayName: z.string().max(80).nullable(),
+  maskedEmail: z.string().max(254).nullable(),
+  maskedPhone: z.string().max(32).nullable(),
+  status: z.enum(['active', 'blocked']),
+  role: roleIdSchema,
+  roleVersion: z.number().int().nonnegative(),
+  createdAt: timestampSchema,
+}).strict()
+export type UserAdminListItem = z.infer<typeof userAdminListItemSchema>
+
+export const userAdminListResponseSchema = z.object({
+  items: z.array(userAdminListItemSchema),
+  page: z.number().int().positive(),
+  pageSize: z.union([z.literal(20), z.literal(50), z.literal(100)]),
+  total: z.number().int().nonnegative(),
+}).strict()
+export type UserAdminListResponse = z.infer<typeof userAdminListResponseSchema>
+
+export const userAdminUpdateRoleRequestSchema = z.object({
+  requestId: identifierSchema.max(128),
+  targetUserId: identifierSchema.max(64),
+  newRole: assignableRoleSchema,
+  expectedVersion: z.number().int().nonnegative(),
+}).strict()
+export type UserAdminUpdateRoleRequest = z.infer<typeof userAdminUpdateRoleRequestSchema>
+
+export const userAdminUpdateRoleResponseSchema = z.object({
+  userId: identifierSchema,
+  role: assignableRoleSchema,
+  version: z.number().int().positive(),
+  updatedAt: timestampSchema,
+}).strict()
+export type UserAdminUpdateRoleResponse = z.infer<typeof userAdminUpdateRoleResponseSchema>
 
 export const userProfileUpdateSchema = z.object({
   avatarUrl: canonicalHttpsUrlSchema.optional(),
@@ -705,6 +774,8 @@ export const ipcChannels = {
   authCancelOtp: 'auth:cancel-otp',
   authLoginWithPassword: 'auth:login-with-password',
   authLogout: 'auth:logout',
+  userAdminList: 'user-admin:list',
+  userAdminUpdateRole: 'user-admin:update-role',
   profileGet: 'profile:get',
   profileUpdate: 'profile:update',
   profilePickAndUploadAvatar: 'profile:pick-and-upload-avatar',
@@ -854,6 +925,8 @@ export const ipcRequestSchemas = {
   [ipcChannels.authCancelOtp]: z.object({ challengeId: identifierSchema }).strict(),
   [ipcChannels.authLoginWithPassword]: authCredentialsSchema,
   [ipcChannels.authLogout]: z.undefined(),
+  [ipcChannels.userAdminList]: userAdminListRequestSchema,
+  [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleRequestSchema,
   [ipcChannels.profileGet]: z.undefined(),
   [ipcChannels.profileUpdate]: userProfileUpdateSchema,
   [ipcChannels.profilePickAndUploadAvatar]: z.undefined(),
@@ -919,6 +992,8 @@ export const ipcResponseSchemas = {
   [ipcChannels.authCancelOtp]: voidResponseSchema,
   [ipcChannels.authLoginWithPassword]: authSessionSchema,
   [ipcChannels.authLogout]: voidResponseSchema,
+  [ipcChannels.userAdminList]: userAdminListResponseSchema,
+  [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleResponseSchema,
   [ipcChannels.profileGet]: userProfileSchema,
   [ipcChannels.profileUpdate]: userProfileSchema,
   [ipcChannels.profilePickAndUploadAvatar]: profileAvatarUploadResultSchema.nullable(),
@@ -986,6 +1061,10 @@ export interface DesktopAPI {
     get(): Promise<UserProfile>
     update(input: UserProfileUpdate): Promise<UserProfile>
     pickAndUploadAvatar(): Promise<ProfileAvatarUploadResult | null>
+  }
+  userAdmin: {
+    list(input: UserAdminListRequest): Promise<UserAdminListResponse>
+    updateRole(input: UserAdminUpdateRoleRequest): Promise<UserAdminUpdateRoleResponse>
   }
   chat: {
     listConversations(): Promise<ConversationSummary[]>
