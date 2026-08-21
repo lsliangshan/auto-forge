@@ -241,7 +241,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(6)
+    expect(database.schemaVersion()).toBe(7)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -249,7 +249,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(6)
+    expect(database.schemaVersion()).toBe(7)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
@@ -260,7 +260,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(6)
+    expect(database.schemaVersion()).toBe(7)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -271,17 +271,27 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(6)
+    expect(database.schemaVersion()).toBe(7)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
     expect(database.userProfiles.findByUserId('user_v4')).toBeUndefined()
   })
 
+  it('adds persistent conversation ownership when upgrading an existing database', () => {
+    const { path } = createV4Database()
+    const inspection = new Database(path)
+
+    const columns = inspection.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>
+    expect(columns.map(({ name }) => name)).toContain('user_id')
+
+    inspection.close()
+  })
+
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(6)
+    expect(database.schemaVersion()).toBe(7)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -319,6 +329,22 @@ describe('openAppDatabase', () => {
     database.localAuth.clearSession()
     database.localAuth.clearSession()
     expect(database.localAuth.getCurrentSession()).toBeUndefined()
+  })
+
+  it('persists the owning user when inserting a conversation', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'user_owner', 'Owner')
+
+    database.conversations.insert({
+      id: 'conversation_owned',
+      title: 'Owned conversation',
+      userId: 'user_owner',
+    })
+
+    expect(database.conversations.get('conversation_owned')).toMatchObject({
+      id: 'conversation_owned',
+      userId: 'user_owner',
+    })
   })
 
   it('rejects a case-insensitive duplicate without replacing the current session', () => {

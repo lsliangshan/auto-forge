@@ -137,7 +137,7 @@ export type UserProfileUpdate = z.infer<typeof userProfileUpdateSchema>
 
 export const userProfileSchema = normalizedProfileFieldsSchema.extend({
   userId: identifierSchema,
-  account: authAccountSchema,
+  account: authUserSchema.shape.account,
   updatedAt: timestampSchema.optional(),
 }).strict()
 export type UserProfile = z.infer<typeof userProfileSchema>

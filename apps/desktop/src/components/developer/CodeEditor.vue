@@ -64,6 +64,12 @@ const ownedModels = new Set<monaco.editor.ITextModel>()
 let editor: monaco.editor.IStandaloneCodeEditor | undefined
 let contentListener: monaco.IDisposable | undefined
 let suppressChange = false
+const colorSchemeMedia = typeof window.matchMedia === 'function'
+  ? window.matchMedia('(prefers-color-scheme: dark)')
+  : undefined
+const handleColorScheme = (event: { matches: boolean }) => {
+  monaco.editor.setTheme(event.matches ? 'vs-dark' : 'vs')
+}
 
 const modelKey = computed(() => developer.selectedProjectId && developer.selectedPath
   ? `${developer.selectedProjectId}/${developer.selectedPath}` : '')
@@ -101,7 +107,7 @@ function ensureEditor() {
     lineHeight: 21,
     scrollBeyondLastLine: false,
     tabSize: 2,
-    theme: 'vs',
+    theme: colorSchemeMedia?.matches ? 'vs-dark' : 'vs',
   })
   contentListener = editor.onDidChangeModelContent(() => {
     if (suppressChange) return
@@ -162,9 +168,11 @@ watch(() => developer.currentContent, (content) => {
 watch(() => developer.diagnostics, applyMarkers, { deep: true })
 
 onMounted(() => {
+  colorSchemeMedia?.addEventListener('change', handleColorScheme)
   void activateModel()
 })
 onBeforeUnmount(() => {
+  colorSchemeMedia?.removeEventListener('change', handleColorScheme)
   void developer.flushPendingSaves()
   contentListener?.dispose()
   editor?.dispose()
@@ -174,7 +182,7 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.code-editor { display: flex; min-height: 0; height: 100%; flex-direction: column; background: #fff; }
+.code-editor { display: flex; min-height: 0; height: 100%; flex-direction: column; background: var(--af-surface); }
 .editor-tabs { display: flex; min-height: 35px; overflow-x: auto; border-bottom: 1px solid var(--af-border); background: var(--af-surface-muted); }
 .editor-tab { display: flex; min-width: 112px; max-width: 220px; align-items: center; border-right: 1px solid var(--af-border); color: var(--af-text-muted); background: var(--af-surface-muted); }
 .editor-tab.active { color: var(--af-text); background: var(--af-surface); box-shadow: inset 0 2px var(--af-cobalt); }

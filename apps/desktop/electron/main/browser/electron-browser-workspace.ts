@@ -51,6 +51,7 @@ interface BaseWindowPort {
   isDestroyed(): boolean
   show(): void
   focus(): void
+  setBackgroundColor(color: string): void
   close(): void
   on(event: 'resize' | 'closed', listener: () => void): this
 }
@@ -98,6 +99,7 @@ export interface ElectronBrowserWorkspaceOptions {
   WebContentsView: WebContentsViewConstructor
   fromPartition(partition: string): SessionPort
   proxySnapshot(): Promise<NetworkProxySnapshot>
+  backgroundColor(): string
 }
 
 interface ParsedLocator {
@@ -117,6 +119,7 @@ interface TargetTabState {
   allowedOrigins?: readonly string[]
   navigationViolation?: AppError
   activeOperations: number
+  loading: boolean
   closed: boolean
   handle?: BrowserWorkspaceTab
 }
@@ -189,9 +192,13 @@ function toolbarDocument(tabs: readonly TargetTabState[], activeId: string | und
     return `<span class="tab${tab.id === activeId ? ' active' : ''}"><a href="autoforge-browser://activate/${tab.id}">${html(title)}</a><a class="close" href="autoforge-browser://close/${tab.id}">×</a></span>`
   }).join('')
   const address = active && !active.view.webContents.isDestroyed() ? active.view.webContents.getURL() : ''
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>
-  *{box-sizing:border-box}body{margin:0;background:#151922;color:#dbe4ef;font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:hidden}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid #303746}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:#242a35;border-radius:5px 5px 0 0}.tab.active{background:#343d4c}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:#202630}.nav a{color:#dbe4ef;text-decoration:none;padding:2px 7px;border-radius:4px;background:#313949}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:#11151c;color:#aeb8c6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div></div></div></body></html>`
+  const loading = active?.loading === true
+    ? '<main class="loading" role="status"><span class="spinner"></span><strong>正在加载网页</strong><small>正在建立安全连接，请稍候…</small></main>'
+    : ''
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>
+  :root{color-scheme:light dark;--canvas:#f3f5f8;--surface:#fff;--surface-muted:#f8f9fb;--border:#dfe3e8;--border-strong:#c8ced6;--text:#303640;--muted:#68717d;--accent:#2563eb;--accent-soft:#eaf1ff}@media(prefers-color-scheme:dark){:root{--canvas:#11151c;--surface:#181d26;--surface-muted:#202630;--border:#343d4c;--border-strong:#4a5565;--text:#dbe4ef;--muted:#aeb8c6;--accent:#6f9cff;--accent-soft:#26354f}}
+  *{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--text);font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;overflow:hidden}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid var(--border);background:var(--surface)}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:var(--surface-muted);border-radius:5px 5px 0 0}.tab.active{background:var(--accent-soft)}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-muted)}.nav a{color:var(--text);text-decoration:none;padding:2px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border)}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:var(--canvas);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.loading{height:calc(100vh - 52px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;padding-bottom:8vh;background:var(--canvas)}.loading strong{font-size:13px;font-weight:650}.loading small{color:var(--muted)}.spinner{width:28px;height:28px;margin-bottom:5px;border:3px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.spinner{animation:none}}
+  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div></div></div>${loading}</body></html>`
 }
 
 export function browserPartition(userId: string): string {
@@ -315,6 +322,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       }))
   }
 
+  updateTheme(): void {
+    const window = this.window
+    if (!window || window.isDestroyed()) return
+    window.setBackgroundColor(this.options.backgroundColor())
+  }
+
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
@@ -430,9 +443,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   }
 
   private async createTab(userId: string, workflowId: string): Promise<TargetTabState> {
-    await this.ensureWindow()
     const partition = browserPartition(userId)
-    await this.configureSession(partition)
+    await Promise.all([this.ensureWindow(), this.configureSession(partition)])
     const view = new this.options.WebContentsView({
       webPreferences: {
         partition,
@@ -449,7 +461,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     })
     await view.webContents.loadURL('about:blank')
     const state: TargetTabState = {
-      id: randomUUID(), userId, workflowId, partition, view, activeOperations: 0, closed: false,
+      id: randomUUID(), userId, workflowId, partition, view, activeOperations: 0, loading: false, closed: false,
     }
     this.tabs.set(state.id, state)
     const guard = (event: NavigationEvent, url: string) => this.guardNavigation(state, event, url)
@@ -459,6 +471,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     view.webContents.on('page-title-updated', () => { void this.renderToolbar().catch(() => undefined) })
     view.webContents.on('did-navigate', () => { void this.renderToolbar().catch(() => undefined) })
     view.webContents.on('did-navigate-in-page', () => { void this.renderToolbar().catch(() => undefined) })
+    view.webContents.on('did-start-loading', () => { this.setLoading(state, true) })
+    view.webContents.on('did-stop-loading', () => { this.setLoading(state, false) })
     view.webContents.on('render-process-gone', () => {
       if (!view.webContents.isDestroyed()) view.webContents.close()
       this.handleDestroyed(state)
@@ -486,7 +500,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     await this.configureSession(toolbarPartition)
     const window = new this.options.BaseWindow({
       width: 1280, height: 820, minWidth: 900, minHeight: 600,
-      show: false, title: 'AutoForge 浏览器', backgroundColor: '#11151c',
+      show: false, title: 'AutoForge 浏览器', backgroundColor: this.options.backgroundColor(),
     })
     const toolbar = new this.options.WebContentsView({
       webPreferences: {
@@ -570,11 +584,24 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     const toolbar = this.toolbar
     if (!window || window.isDestroyed() || !toolbar) return
     const bounds = window.getContentBounds()
-    toolbar.setBounds({ x: 0, y: 0, width: bounds.width, height: toolbarHeight })
     const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
+    const loading = active?.loading === true
+    toolbar.setBounds({ x: 0, y: 0, width: bounds.width, height: loading ? bounds.height : toolbarHeight })
     if (active && !active.closed) {
       active.view.setBounds({ x: 0, y: toolbarHeight, width: bounds.width, height: Math.max(0, bounds.height - toolbarHeight) })
     }
+    if (loading) {
+      window.contentView.removeChildView(toolbar)
+      window.contentView.addChildView(toolbar)
+    }
+  }
+
+  private setLoading(state: TargetTabState, loading: boolean): void {
+    if (state.closed || state.loading === loading) return
+    state.loading = loading
+    if (state.id !== this.activeTabId) return
+    this.layout()
+    void this.renderToolbar().catch(() => undefined)
   }
 
   private async renderToolbar(): Promise<void> {

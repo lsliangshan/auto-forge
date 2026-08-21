@@ -14,6 +14,7 @@ import {
   type AuthSession,
   type ChatEvent,
   type ChatSendInput,
+  type ExecutionEvent,
   type ModelInfo,
   type ProxySettings,
 } from '@autoforge/shared'
@@ -24,6 +25,7 @@ import {
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
+import type { BrowserWorkspacePort, BrowserWorkspaceTab } from './browser/electron-browser-workspace.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
@@ -70,6 +72,24 @@ function createNetworkProxy() {
     fetch: vi.fn(globalThis.fetch),
     snapshot: vi.fn(async () => ({ enabled: false, bypassRules: '<local>', playwrightArgs: [] })),
     withTransportLease,
+  }
+}
+
+function createBrowserWorkspace(): BrowserWorkspacePort {
+  let currentUrl = ''
+  const tab: BrowserWorkspaceTab = {
+    open: vi.fn(async (url) => { currentUrl = url }),
+    fill: vi.fn(async () => undefined),
+    click: vi.fn(async () => undefined),
+    url: vi.fn(async () => currentUrl),
+    close: vi.fn(async () => undefined),
+  }
+  return {
+    acquire: vi.fn(async () => tab),
+    releaseExecution: vi.fn(async () => undefined),
+    updateProxy: vi.fn(async () => undefined),
+    reset: vi.fn(async () => undefined),
+    shutdown: vi.fn(async () => undefined),
   }
 }
 
@@ -253,7 +273,7 @@ function options(
     emitChat: vi.fn(),
     emitExecution: vi.fn(),
     networkProxy,
-    browserRuntime: { packaged: false },
+    browserWorkspace: createBrowserWorkspace(),
     authService,
     ...overrides,
   }
@@ -554,6 +574,172 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('claims legacy conversations for the first user and isolates conversation lists by user', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-ownership-'))
+    directories.push(root)
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.conversations.insert({ id: 'legacy_conversation', title: 'Legacy' })
+    database.close()
+    const runtime = createApplicationRuntime(options(root))
+
+    const alice = await authenticate(runtime, 'Alice')
+    expect(await runtime.services.chat.listConversations()).toEqual([
+      expect.objectContaining({ id: 'legacy_conversation' }),
+    ])
+    const aliceConversation = await runtime.services.chat.createConversation()
+    expect(await runtime.services.chat.renameConversation(aliceConversation.id, 'Alice conversation'))
+      .not.toHaveProperty('userId')
+
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'Bobby')
+    expect(await runtime.services.chat.listConversations()).toEqual([])
+    const bobConversation = await runtime.services.chat.createConversation()
+    expect(await runtime.services.chat.listConversations()).toEqual([
+      expect.objectContaining({ id: bobConversation.id }),
+    ])
+
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    expect(await runtime.services.chat.listConversations()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'legacy_conversation' }),
+      expect.objectContaining({ id: aliceConversation.id }),
+    ]))
+    expect(await runtime.services.chat.listConversations()).toHaveLength(2)
+
+    const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(inspection.prepare('SELECT user_id AS userId FROM conversations WHERE id = ?')
+      .get('legacy_conversation')).toEqual({ userId: alice.user.id })
+    inspection.close()
+    await runtime.close()
+  })
+
+  it('rejects cross-user access to conversation operations without revealing existence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-access-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'Alice')
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'Bobby')
+
+    const preferences = {
+      outputType: 'auto' as const,
+      models: {},
+      generation: {
+        image: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+        audio: { format: 'mp3' },
+        video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+      },
+    }
+    for (const operation of [
+      () => runtime.services.chat.listMessages(conversation.id),
+      () => runtime.services.chat.getGenerationPreferences(conversation.id),
+      () => runtime.services.chat.updateGenerationPreferences(conversation.id, preferences),
+      () => runtime.services.chat.send(chatInput(conversation.id, 'not mine')),
+      () => runtime.services.chat.renameConversation(conversation.id, 'Stolen'),
+      () => runtime.services.chat.deleteConversation(conversation.id),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    }
+
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    expect(await runtime.services.chat.listConversations()).toEqual([
+      expect.objectContaining({ id: conversation.id, title: '新会话' }),
+    ])
+    await runtime.close()
+  })
+
+  it('rejects cross-user cancellation by request id', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-cancel-owner-'))
+    directories.push(root)
+    const emitChat = vi.fn()
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      } }),
+      emitChat,
+    }))
+    await authenticate(runtime, 'Alice')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const current = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...current.defaultModels, openrouter: { text: 'openrouter/text' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const { requestId } = await runtime.services.chat.send(chatInput(conversation.id, 'Alice request'))
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'status', requestId, status: 'completed',
+    })))
+
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'Bobby')
+    await expect(runtime.services.chat.cancel(requestId))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await runtime.close()
+  })
+
+  it('rejects cross-user media imports before processing empty input', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-media-owner-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'Alice')
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'Bobby')
+    const context = { conversationId: conversation.id, existingAssetIds: [] }
+
+    for (const operation of [
+      () => runtime.services.media.pickFiles(context),
+      () => runtime.services.media.importDroppedFiles({ ...context, paths: [] }),
+      () => runtime.services.media.importClipboardImage(context),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    }
+    await runtime.close()
+  })
+
+  it('rejects protocol media resolution and asset actions outside the owning user session', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-protocol-owner-'))
+    directories.push(root)
+    const source = join(root, 'alice.png')
+    await writeFile(source, Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'),
+      Buffer.from('alice-private-media'),
+    ]))
+    const runtime = createApplicationRuntime(options(root, {
+      chooseMediaFiles: async () => [source],
+    }))
+    await authenticate(runtime, 'Alice')
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id,
+      existingAssetIds: [],
+    })
+    await expect(runtime.mediaAssets.resolveReadyAsset(asset!.id))
+      .resolves.toMatchObject({ name: 'alice.png' })
+
+    await runtime.services.auth.logout()
+    await expect(runtime.mediaAssets.resolveReadyAsset(asset!.id))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+
+    await authenticate(runtime, 'Bobby')
+    for (const operation of [
+      () => runtime.mediaAssets.resolveReadyAsset(asset!.id),
+      () => runtime.services.media.removeDraft({ conversationId: conversation.id, assetId: asset!.id }),
+      () => runtime.services.media.saveCopy(asset!.id),
+      () => runtime.services.media.reveal(asset!.id),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    }
+    await runtime.close()
+  })
+
   it('maps an external identity projection failure to a safe application error', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-projection-error-'))
     directories.push(root)
@@ -609,6 +795,7 @@ describe('createApplicationRuntime', () => {
       } }),
       emitChat,
     }))
+    await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const current = await runtime.services.settings.get()
     await runtime.services.settings.update({
@@ -622,12 +809,14 @@ describe('createApplicationRuntime', () => {
       }
     }
 
+    await runtime.services.auth.logout()
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'anonymous')))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
-    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(0)
+    await expect(runtime.services.chat.listMessages(conversation.id))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(emitChat).not.toHaveBeenCalled()
 
-    await authenticate(runtime, 'Alice')
+    await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
     const authenticated = await runtime.services.chat.send(chatInput(conversation.id, 'authenticated'))
     await vi.waitFor(() => expect(emitChat.mock.calls.some(([event]) => (
       event.type === 'status'
@@ -640,8 +829,52 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'logged out')))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await settleEvents()
-    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(2)
+    await expect(runtime.services.chat.listMessages(conversation.id))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(emitChat).toHaveBeenCalledTimes(forwardedCount)
+    await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
+    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(2)
+    await runtime.close()
+  })
+
+  it('does not forward a previous user conversation events after the active user changes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-event-isolation-'))
+    directories.push(root)
+    const streamStarted = deferred<void>()
+    const releaseStream = deferred<void>()
+    const emitChat = vi.fn()
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          streamStarted.resolve()
+          await releaseStream.promise
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      } }),
+      emitChat,
+    }))
+    await authenticate(runtime, 'Alice')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const current = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...current.defaultModels, openrouter: { text: 'openrouter/text' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'Alice request'))
+    await streamStarted.promise
+
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'Bobby')
+    emitChat.mockClear()
+    releaseStream.resolve()
+    for (let index = 0; index < 10; index += 1) {
+      await new Promise<void>((resolve) => { setImmediate(resolve) })
+    }
+
+    expect(emitChat).not.toHaveBeenCalled()
     await runtime.close()
   })
 
@@ -688,9 +921,13 @@ describe('createApplicationRuntime', () => {
     const bob = await authenticate(runtime, 'Bobby')
     catalog.resolve([modelInfo('openai/gpt-4.1-mini', 'OpenRouter')])
     const openRouterRequest = await sending
-    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'status', requestId: openRouterRequest.requestId, status: 'completed',
-    })))
+    await vi.waitFor(() => {
+      const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+      const run = inspection.prepare('SELECT status FROM chat_runs WHERE request_id = ?')
+        .get(openRouterRequest.requestId)
+      inspection.close()
+      expect(run).toEqual({ status: 'completed' })
+    })
 
     await runtime.services.settings.update({ activeProvider: 'deepseek' })
     const deepSeekConversation = await runtime.services.chat.createConversation()
@@ -1874,6 +2111,26 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('applies the persisted theme at startup and every committed theme update', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-theme-'))
+    directories.push(root)
+    const applyTheme = vi.fn()
+    const runtimeOptions = { ...options(root), applyTheme }
+    const runtime = createApplicationRuntime(runtimeOptions)
+
+    expect(applyTheme).toHaveBeenCalledWith('system')
+    await runtime.services.settings.update({ theme: 'dark' })
+    expect(applyTheme).toHaveBeenLastCalledWith('dark')
+    expect(applyTheme).toHaveBeenCalledTimes(2)
+    await runtime.close()
+
+    applyTheme.mockClear()
+    const restarted = createApplicationRuntime({ ...options(root), applyTheme })
+    expect(applyTheme).toHaveBeenCalledOnce()
+    expect(applyTheme).toHaveBeenCalledWith('dark')
+    await restarted.close()
+  })
+
   it('keeps media paths in main while using explicit media ports and exact conversation preferences', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-'))
     directories.push(root)
@@ -1904,8 +2161,9 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
+    await authenticate(runtime)
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
       outputType: 'auto', models: {},
@@ -1974,7 +2232,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
 
     await authenticate(runtime)
@@ -2080,7 +2338,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2157,6 +2415,7 @@ describe('createApplicationRuntime', () => {
       emitChat,
     }))
     const session = await authenticate(runtime)
+    await runtime.services.chat.listConversations()
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
@@ -2243,7 +2502,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime, 'Alice')
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2325,7 +2584,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2419,7 +2678,7 @@ describe('createApplicationRuntime', () => {
       emitExecution: vi.fn(),
       networkProxy,
       mediaTransport: { request: mediaRequest },
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2525,7 +2784,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2689,7 +2948,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -2763,9 +3022,10 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
 
+    await authenticate(runtime)
     const deleted = await runtime.services.chat.createConversation()
     await runtime.services.media.pickFiles({
       conversationId: deleted.id,
@@ -2816,9 +3076,10 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     }
     const runtime = createApplicationRuntime(options)
+    await authenticate(runtime)
     const conversation = await runtime.services.chat.createConversation()
     await expect(runtime.services.chat.updateGenerationPreferences(
       conversation.id,
@@ -2903,7 +3164,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -2964,7 +3225,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -3024,7 +3285,7 @@ describe('createApplicationRuntime', () => {
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
         networkProxy,
-        browserRuntime: { packaged: false },
+        browserWorkspace: createBrowserWorkspace(),
       })
       await authenticate(runtime)
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -3095,7 +3356,7 @@ describe('createApplicationRuntime', () => {
         emitChat: vi.fn(),
         emitExecution: vi.fn(),
         networkProxy,
-        browserRuntime: { packaged: false },
+        browserWorkspace: createBrowserWorkspace(),
       }
       const runtime = createApplicationRuntime(options)
       await authenticate(runtime)
@@ -3176,8 +3437,10 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
+    await authenticate(runtime)
+    await runtime.services.chat.listConversations()
     await runtime.recover()
     await expect(runtime.services.chat.listMessages('conversation_interrupted_image'))
       .resolves.toEqual([
@@ -3240,7 +3503,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     }
     const runtime = createApplicationRuntime(options)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
@@ -3306,7 +3569,7 @@ describe('createApplicationRuntime', () => {
       emitChat: vi.fn(),
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     let status: Awaited<ReturnType<typeof runtime.services.settings.saveProviderApiKey>> | undefined
     void runtime.services.settings.saveProviderApiKey('deepseek', 'sk-deepseek')
@@ -3318,6 +3581,24 @@ describe('createApplicationRuntime', () => {
       validation: 'unchecked',
     }))
     expect(deepseek.validateCredential).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('returns project directories required by the developer IPC contract', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-project-directories-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    const project = await runtime.services.developer.createProject('Directory Tree')
+    await mkdir(join(project.rootPath, 'docs/nested'), { recursive: true })
+    await mkdir(join(project.rootPath, 'node_modules/private-package'), { recursive: true })
+
+    expect(await runtime.services.developer.listProjects()).toEqual([
+      expect.objectContaining({
+        id: project.id,
+        directories: ['docs', 'docs/nested', 'src'],
+      }),
+    ])
+
     await runtime.close()
   })
 
@@ -3352,7 +3633,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
 
     await authenticate(runtime)
@@ -3426,8 +3707,9 @@ describe('createApplicationRuntime', () => {
       openExternal,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
+    await authenticate(restarted)
     await restarted.recover()
     expect(await restarted.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
@@ -3469,7 +3751,7 @@ describe('createApplicationRuntime', () => {
       emitChat: (event) => { chatEvents.push(event) },
       emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
     await runtime.services.settings.update({ activeProvider: 'openrouter' })
@@ -3552,6 +3834,59 @@ describe('createApplicationRuntime', () => {
     expect(() => gate.beginStart()).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
   })
 
+  it('runs an authenticated development workflow through browser.open', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-run-'))
+    directories.push(root)
+    const executionEvents: ExecutionEvent[] = []
+    const baseOptions = options(root, {
+      emitExecution: (event) => { executionEvents.push(event) },
+    })
+    const runtime = createApplicationRuntime({
+      ...baseOptions,
+      paths: {
+        ...baseOptions.paths,
+        workflowRunner: join(import.meta.dirname, '../workers/workflow-runner.ts'),
+      },
+      browserWorkspace: createBrowserWorkspace(),
+    } as RuntimeOptions)
+
+    try {
+      await authenticate(runtime)
+      const project = await runtime.services.developer.createProject('Browser Run')
+      const manifest = JSON.parse(await runtime.services.developer.readFile(project.id, 'workflow.json')) as Record<string, unknown>
+      manifest.permissions = [{ capability: 'browser.open', scope: { origins: ['https://example.com'] } }]
+      await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+      await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+        "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+        "export default defineWorkflow({ async run(ctx) { await ctx.browser.open('https://example.com/path'); return { ok: true } } })",
+      ].join('\n'))
+
+      const { executionId } = await runtime.services.developer.run({ projectId: project.id, input: {} })
+      await vi.waitFor(() => {
+        expect(executionEvents.some((event) => event.type === 'approval_required'
+          && event.executionId === executionId)).toBe(true)
+      })
+      const approval = executionEvents.find((event): event is Extract<ExecutionEvent, { type: 'approval_required' }> => (
+        event.type === 'approval_required' && event.executionId === executionId
+      ))!
+      await runtime.services.executions.decide({
+        executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'once',
+      })
+
+      await vi.waitFor(async () => {
+        expect(await runtime.services.executions.get(executionId)).toMatchObject({
+          status: 'completed',
+          output: { ok: true },
+        })
+      })
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('runs the exact development project even when an installed workflow has the same identity', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)
@@ -3583,13 +3918,14 @@ describe('createApplicationRuntime', () => {
       openExternal: async () => undefined,
       emitChat: vi.fn(), emitExecution: vi.fn(),
       networkProxy,
-      browserRuntime: { packaged: false },
+      browserWorkspace: createBrowserWorkspace(),
       removeExecutionTemporaryDirectory: async (path: string) => {
         markCleanupStarted()
         await cleanupFinished
         await rm(path, { recursive: true, force: true })
       },
     })
+    await authenticate(runtime)
     const installedProject = await runtime.services.developer.createProject('Installed Debug Source')
     const selectedProject = await runtime.services.developer.createProject('Selected Debug Source')
     for (const [projectId, marker] of [[installedProject.id, 'installed'], [selectedProject.id, 'selected']] as const) {

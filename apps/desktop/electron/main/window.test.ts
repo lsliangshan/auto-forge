@@ -27,18 +27,21 @@ describe('createSecureWindow', () => {
   it('creates a sandboxed isolated window and loads only the trusted development target', async () => {
     const deny = vi.fn()
     const session = { setPermissionRequestHandler: vi.fn((handler) => { deny.mockImplementation(handler) }) }
-    await createSecureWindow({
+    const windowOptions = {
       BrowserWindow: FakeBrowserWindow as unknown as BrowserWindowConstructor,
       session,
       preloadPath: '/app/preload.js',
-      rendererTarget: { kind: 'development', origin: 'http://127.0.0.1:5173' },
-    })
+      rendererTarget: { kind: 'development' as const, origin: 'http://127.0.0.1:5173' },
+      backgroundColor: '#f3f5f8',
+    }
+    await createSecureWindow(windowOptions)
     const created = FakeBrowserWindow.last!
 
     expect(created.options.webPreferences as Record<string, unknown>).toMatchObject({
       contextIsolation: true, sandbox: true, webSecurity: true, nodeIntegration: false,
       preload: '/app/preload.js', webviewTag: false,
     })
+    expect(created.options.backgroundColor).toBe('#f3f5f8')
     expect(created.loadURL).toHaveBeenCalledWith('http://127.0.0.1:5173/')
     const callback = vi.fn()
     deny({}, 'media', callback)

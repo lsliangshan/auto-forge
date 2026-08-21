@@ -9,10 +9,14 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 export const conversations = sqliteTable('conversations', {
   id: text('id').primaryKey(),
   title: text('title').notNull(),
+  userId: text('user_id').references(() => localUsers.id),
   generationPreferencesJson: text('generation_preferences_json'),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
-}, (table) => [index('conversations_updated_at_idx').on(table.updatedAt)])
+}, (table) => [
+  index('conversations_updated_at_idx').on(table.updatedAt),
+  index('idx_conversations_user_updated_at').on(table.userId, table.updatedAt),
+])
 
 export const messages = sqliteTable('messages', {
   id: text('id').primaryKey(),

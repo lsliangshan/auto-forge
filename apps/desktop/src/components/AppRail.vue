@@ -110,7 +110,7 @@ watch(() => auth.session?.user.id, (userId) => {
 </script>
 
 <style scoped>
-.app-rail { z-index: 30; display: flex; width: 52px; min-width: 52px; height: 100%; flex-direction: column; align-items: center; gap: 4px; padding: 8px 4px; color: #c8d0dc; background: var(--af-graphite); }
+.app-rail { z-index: 30; display: flex; width: 52px; min-width: 52px; height: 100%; flex-direction: column; align-items: center; gap: 4px; padding: 8px 4px; color: #c8d0dc; background: var(--af-rail); }
 .app-mark { display: grid; width: 34px; height: 34px; margin-bottom: 10px; place-items: center; }
 .app-mark img { display: block; width: 32px; height: 32px; object-fit: contain; }
 .rail-item { display: flex; width: 44px; min-height: 62px; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border-radius: 6px; color: inherit; font-size: 9px; line-height: 1.15; text-align: center; text-decoration: none; }
@@ -124,5 +124,5 @@ watch(() => auth.session?.user.id, (userId) => {
 .rail-account button { display: grid; width: 34px; height: 34px; place-items: center; border: 0; border-radius: 6px; color: #c8d0dc; background: transparent; cursor: pointer; }
 .rail-account button:hover:not(:disabled) { color: white; background: #2c333d; }
 .rail-account button:disabled { cursor: wait; opacity: .55; }
-.rail-error { position: fixed; bottom: 12px; left: 64px; width: max-content; max-width: 320px; border: 1px solid #f2b8b5; border-radius: 7px; padding: 8px 10px; color: var(--af-danger); background: #fff5f5; font-size: 12px; box-shadow: 0 6px 20px rgb(32 36 43 / 12%); }
+.rail-error { position: fixed; bottom: 12px; left: 64px; width: max-content; max-width: 320px; border: 1px solid var(--af-danger-border); border-radius: 7px; padding: 8px 10px; color: var(--af-danger); background: var(--af-danger-soft); font-size: 12px; box-shadow: 0 6px 20px rgb(32 36 43 / 12%); }
 </style>

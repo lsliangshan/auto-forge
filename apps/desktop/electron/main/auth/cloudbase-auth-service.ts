@@ -218,12 +218,10 @@ function boundedAccount(value: string): string | undefined {
   return Array.from(normalized).slice(0, 64).join('')
 }
 
-function maskPhone(value: string): string | undefined {
-  const normalized = value.trim()
-  if (!normalized) return undefined
-  const suffixLength = Math.min(4, Math.max(1, normalized.length - 1))
-  const prefixLength = Math.min(normalized.startsWith('+') ? 5 : 3, normalized.length - suffixLength)
-  return boundedAccount(`${normalized.slice(0, prefixLength)}****${normalized.slice(-suffixLength)}`)
+function domesticPhone(value: string): string | undefined {
+  const compact = value.replace(/\s+/g, '')
+  const normalized = compact.startsWith('+86') ? compact.slice(3) : compact
+  return boundedAccount(normalized)
 }
 
 function maskEmail(value: string): string | undefined {
@@ -244,7 +242,7 @@ function displayAccount(user: CloudBaseUser): string {
     .map(boundedAccount)
     .find((value): value is string => value !== undefined)
   const fallback = typeof user.phone === 'string'
-    ? maskPhone(user.phone)
+    ? domesticPhone(user.phone)
     : typeof user.email === 'string'
       ? maskEmail(user.email)
       : undefined

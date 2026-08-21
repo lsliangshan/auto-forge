@@ -339,17 +339,29 @@ describe('CloudBaseAuthService', () => {
   })
 
   it.each([
-    [{ phone: '+8618311032722' }, '+8618311032722'],
-    [{ email: 'user@example.com' }, 'user@example.com'],
-  ] as const)('masks fallback identity %o', async (user, plaintext) => {
+    ['+8618311032722', '18311032722'],
+    ['+86 183 1103 2722', '18311032722'],
+  ] as const)('uses the complete domestic phone from %s as the fallback account', async (phone, expected) => {
     const app = harness()
-    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser(user)))
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({ phone })))
+
+    const session = await app.service.loginWithPassword({
+      account: 'alice_1', password: 'password',
+    })
+    expect(session.user.account).toBe(expected)
+  })
+
+  it('masks an email used as the fallback account', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      email: 'user@example.com',
+    })))
 
     const session = await app.service.loginWithPassword({
       account: 'alice_1', password: 'password',
     })
     expect(session.user.account).toContain('*')
-    expect(session.user.account).not.toBe(plaintext)
+    expect(session.user.account).not.toBe('user@example.com')
     expect(session.user.account.length).toBeLessThanOrEqual(64)
   })
 

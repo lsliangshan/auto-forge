@@ -100,7 +100,7 @@ async function decide(decision: 'once' | 'always' | 'deny') {
 
 <style scoped>
 .approval-card { max-width: 640px; border: 1px solid #f2c48f; border-left: 3px solid var(--af-warning); padding: 14px; background: var(--af-warning-soft); }
-.approval-heading { display: flex; align-items: flex-start; gap: 10px; color: #7c3f0b; }
+.approval-heading { display: flex; align-items: flex-start; gap: 10px; color: var(--af-warning-text); }
 .approval-heading strong { font-size: 14px; }
 .approval-heading p { margin: 2px 0 0; color: var(--af-text-muted); font-size: 12px; }
 dl { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 5px 12px; margin: 12px 0; font-size: 12px; }

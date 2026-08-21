@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import type { AuthCredentials, AuthOtpChallenge, AuthOtpRequest, AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
+import { useChatStore } from './chat'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -221,6 +222,7 @@ export const useAuthStore = defineStore('auth', {
         this.session = null
         this.initialized = true
         this.error = ''
+        useChatStore().resetLocalData()
         return true
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {

@@ -54,6 +54,7 @@ class FakeWebContents extends EventEmitter {
     readonly session: FakeSession,
     respond: (method: string, params?: unknown) => unknown,
     requireDocumentBeforeDebugger: boolean,
+    private readonly beforeLoad?: (url: string) => Promise<void>,
   ) {
     super()
     this.debugger = new FakeDebugger(respond, () => this.loaded.length > 0, requireDocumentBeforeDebugger)
@@ -61,6 +62,7 @@ class FakeWebContents extends EventEmitter {
 
   async loadURL(url: string) {
     this.loaded.push(url)
+    await this.beforeLoad?.(url)
     this.currentUrl = url
     this.emit('did-navigate', {}, url)
   }
@@ -79,8 +81,9 @@ class FakeView {
     session: FakeSession,
     respond: (method: string, params?: unknown) => unknown,
     requireDocumentBeforeDebugger: boolean,
+    beforeLoad?: (url: string) => Promise<void>,
   ) {
-    this.webContents = new FakeWebContents(session, respond, requireDocumentBeforeDebugger)
+    this.webContents = new FakeWebContents(session, respond, requireDocumentBeforeDebugger, beforeLoad)
   }
   setBounds(bounds: { x: number; y: number; width: number; height: number }) { this.bounds.push(bounds) }
 }
@@ -94,6 +97,8 @@ class FakeBaseWindow extends EventEmitter {
   destroyed = false
   readonly show = vi.fn()
   readonly focus = vi.fn()
+  readonly setBackgroundColor = vi.fn()
+  constructor(readonly options: Record<string, unknown>) { super() }
   getContentBounds() { return { x: 0, y: 0, width: 1200, height: 800 } }
   isDestroyed() { return this.destroyed }
   close() { if (!this.destroyed) { this.destroyed = true; this.emit('closed') } }
@@ -102,6 +107,7 @@ class FakeBaseWindow extends EventEmitter {
 function createHarness(
   respond: (method: string, params?: unknown) => unknown = () => ({}),
   requireDocumentBeforeDebugger = false,
+  beforeLoad?: (url: string) => Promise<void>,
 ) {
   const sessions = new Map<string, FakeSession>()
   const views: FakeView[] = []
@@ -114,26 +120,28 @@ function createHarness(
   class ViewConstructor {
     constructor(options: Record<string, unknown> = {}) {
       const partition = String((options.webPreferences as { partition?: string } | undefined)?.partition ?? 'toolbar')
-      const view = new FakeView(options, fromPartition(partition), respond, requireDocumentBeforeDebugger)
+      const view = new FakeView(options, fromPartition(partition), respond, requireDocumentBeforeDebugger, beforeLoad)
       views.push(view)
       return view
     }
   }
   class WindowConstructor {
-    constructor() { const window = new FakeBaseWindow(); windows.push(window); return window }
+    constructor(options: Record<string, unknown>) { const window = new FakeBaseWindow(options); windows.push(window); return window }
   }
   const proxySnapshot = vi.fn(async () => ({
     enabled: true,
     proxyRules: 'http=http://127.0.0.1:7890;https=http://127.0.0.1:7890',
     bypassRules: '<local>',
   }))
+  const backgroundColor = vi.fn(() => '#f3f5f8')
   const workspace = new ElectronBrowserWorkspace({
     BaseWindow: WindowConstructor as never,
     WebContentsView: ViewConstructor as never,
     fromPartition: fromPartition as never,
     proxySnapshot,
+    backgroundColor,
   })
-  return { workspace, sessions, views, windows, fromPartition, proxySnapshot }
+  return { workspace, sessions, views, windows, fromPartition, proxySnapshot, backgroundColor }
 }
 
 async function acquire(
@@ -160,7 +168,7 @@ describe('ElectronBrowserWorkspace', () => {
   })
 
   it('creates one BaseWindow and secure switchable target tabs sharing only the same user session', async () => {
-    const { workspace, views, windows } = createHarness()
+    const { workspace, views, windows, backgroundColor } = createHarness()
     const first = await acquire(workspace, 'exec_1', 'user_1', 'workflow.one')
     await workspace.releaseExecution('exec_1')
     const reused = await acquire(workspace, 'exec_2', 'user_1', 'workflow.one')
@@ -168,6 +176,12 @@ describe('ElectronBrowserWorkspace', () => {
     const secondUser = await acquire(workspace, 'exec_4', 'user_2', 'workflow.one')
 
     expect(windows).toHaveLength(1)
+    expect(windows[0]!.options.backgroundColor).toBe('#f3f5f8')
+    backgroundColor.mockReturnValue('#11151c')
+    const updateTheme = Reflect.get(workspace, 'updateTheme') as unknown
+    expect(updateTheme).toBeTypeOf('function')
+    if (typeof updateTheme === 'function') updateTheme.call(workspace)
+    expect(windows[0]!.setBackgroundColor).toHaveBeenLastCalledWith('#11151c')
     expect(reused).toBe(first)
     expect(secondWorkflow).not.toBe(first)
     expect(secondUser).not.toBe(first)
@@ -187,6 +201,41 @@ describe('ElectronBrowserWorkspace', () => {
 
     await expect(acquire(workspace, 'exec_1')).resolves.toBeDefined()
     expect(views[1]!.webContents.loaded[0]).toBe('about:blank')
+  })
+
+  it('covers the active page while it loads and restores the toolbar after loading stops', async () => {
+    const { workspace, views, windows } = createHarness()
+    await acquire(workspace, 'exec_1')
+    const toolbar = views[0]!
+    const target = views[1]!
+
+    target.webContents.emit('did-start-loading')
+    await vi.waitFor(() => expect(toolbar.bounds.at(-1)?.height).toBe(800))
+    expect(windows[0]!.children.at(-1)).toBe(toolbar)
+    const loadingDocument = decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!)
+    expect(loadingDocument).toContain('正在加载网页')
+
+    target.webContents.emit('did-stop-loading')
+    await vi.waitFor(() => expect(toolbar.bounds.at(-1)?.height).toBe(52))
+  })
+
+  it('starts persistent session setup before the browser toolbar finishes loading', async () => {
+    const toolbarLoad = deferred<void>()
+    let blocked = false
+    const harness = createHarness(() => ({}), false, async (url) => {
+      if (!blocked && url.startsWith('data:text/html')) {
+        blocked = true
+        await toolbarLoad.promise
+      }
+    })
+
+    const acquiring = acquire(harness.workspace, 'exec_1')
+    await vi.waitFor(() => expect(harness.views).toHaveLength(1))
+    await Promise.resolve()
+    expect(harness.proxySnapshot).toHaveBeenCalledOnce()
+
+    toolbarLoad.resolve()
+    await acquiring
   })
 
   it('serializes the first concurrent tab acquisitions through one BaseWindow creation', async () => {

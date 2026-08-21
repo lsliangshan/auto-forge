@@ -71,6 +71,7 @@ export interface SecureWindowOptions {
   session: SessionPort
   preloadPath: string
   rendererTarget: RendererTarget
+  backgroundColor?: string
   beforeLoad?(window: BrowserWindowPort): void | Promise<void>
   getMainWindow?(): BrowserWindowPort | null
 }
@@ -85,7 +86,7 @@ export async function createSecureWindow(options: SecureWindowOptions): Promise<
     minWidth: 1120,
     minHeight: 720,
     show: false,
-    backgroundColor: '#0b0d12',
+    backgroundColor: options.backgroundColor ?? '#0b0d12',
     webPreferences: {
       preload: options.preloadPath,
       nodeIntegration: false,

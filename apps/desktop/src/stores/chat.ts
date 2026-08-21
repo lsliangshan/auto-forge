@@ -229,6 +229,9 @@ export const useChatStore = defineStore('chat', {
       this._loadVersion += 1
       this._selectionVersion += 1
       this._stateEpoch += 1
+      storeReleases.get(this)?.()
+      storeReleases.delete(this)
+      this._subscribed = false
       this.conversations = []
       this.selectedConversationId = ''
       this.messagesByConversation = {}

@@ -25,6 +25,7 @@ const monacoHarness = vi.hoisted(() => {
   let saveCommand = () => undefined
   const disposeEditor = vi.fn()
   const setModelMarkers = vi.fn()
+  const setTheme = vi.fn()
   const find = vi.fn()
   const replace = vi.fn()
   const trigger = vi.fn((_source: string, id: string) => {
@@ -43,10 +44,10 @@ const monacoHarness = vi.hoisted(() => {
     return model
   }
   return {
-    models, disposeEditor, setModelMarkers, trigger,
+    models, disposeEditor, setModelMarkers, setTheme, trigger,
     reset() {
       models.clear(); activeModel = null; changeListener = () => undefined; saveCommand = () => undefined
-      disposeEditor.mockClear(); setModelMarkers.mockClear(); find.mockClear(); replace.mockClear(); trigger.mockClear()
+      disposeEditor.mockClear(); setModelMarkers.mockClear(); setTheme.mockClear(); find.mockClear(); replace.mockClear(); trigger.mockClear()
     },
     change(value: string) { if (!activeModel) throw new Error('No active Monaco model'); activeModel.value = value; changeListener() },
     save() { saveCommand() },
@@ -71,6 +72,7 @@ const monacoHarness = vi.hoisted(() => {
         getModel: (uri: { toString(): string }) => models.get(uri.toString()),
         setModelLanguage: (model: Model, language: string) => { model.language = language },
         setModelMarkers,
+        setTheme,
       },
     },
   }
@@ -156,6 +158,7 @@ describe('developer workbench', () => {
   })
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllGlobals()
     Reflect.deleteProperty(window, 'autoForge')
   })
 
@@ -198,6 +201,31 @@ describe('developer workbench', () => {
     await wrapper.vm.$nextTick()
 
     expect(monacoHarness.api.editor.create).toHaveBeenCalledOnce()
+  })
+
+  it('creates Monaco with the active color scheme and follows later scheme changes', async () => {
+    let change!: (event: { matches: boolean }) => void
+    const removeEventListener = vi.fn()
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: true,
+      addEventListener: (_event: string, listener: typeof change) => { change = listener },
+      removeEventListener,
+    })))
+    const { api } = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('src/index.ts')
+
+    const wrapper = mount(CodeEditor)
+    await wrapper.vm.$nextTick()
+    await Promise.resolve()
+    expect(monacoHarness.api.editor.create).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ theme: 'vs-dark' }))
+
+    change({ matches: false })
+    expect(monacoHarness.setTheme).toHaveBeenLastCalledWith('vs')
+    wrapper.unmount()
+    expect(removeEventListener).toHaveBeenCalledOnce()
   })
 
   it('keeps independent Monaco models when switching files and disposes them on unmount', async () => {

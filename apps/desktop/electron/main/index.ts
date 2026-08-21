@@ -8,6 +8,7 @@ import {
   dialog,
   ipcMain,
   net,
+  nativeTheme,
   protocol,
   safeStorage,
   session,
@@ -84,7 +85,9 @@ async function initialize(): Promise<ApplicationRuntime> {
     WebContentsView: WebContentsView as never,
     fromPartition: (partition) => session.fromPartition(partition),
     proxySnapshot: () => networkProxy.snapshot(),
+    backgroundColor: () => nativeTheme.shouldUseDarkColors ? '#11151c' : '#f3f5f8',
   })
+  nativeTheme.on('updated', () => browserWorkspace.updateTheme())
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -102,6 +105,10 @@ async function initialize(): Promise<ApplicationRuntime> {
     },
     networkProxy,
     browserWorkspace,
+    applyTheme: (theme) => {
+      nativeTheme.themeSource = theme
+      browserWorkspace.updateTheme()
+    },
     chooseProjectDirectory: async () => {
       const dialogOptions: OpenDialogOptions = {
         title: '注册本地工作流项目',
@@ -172,6 +179,7 @@ async function createMainWindow(application: ApplicationRuntime): Promise<void> 
     session: session.defaultSession,
     preloadPath: fileURLToPath(new URL('../preload/index.cjs', import.meta.url)),
     rendererTarget: target,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#11151c' : '#f3f5f8',
     getMainWindow: () => mainWindow,
     beforeLoad: (window) => {
       mainWindow = window as BrowserWindow

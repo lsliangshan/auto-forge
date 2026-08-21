@@ -8,6 +8,7 @@ import App from '../../src/App.vue'
 import AppRail from '../../src/components/AppRail.vue'
 import { createAuthGuard, routes, safeRedirect } from '../../src/router'
 import { useAuthStore } from '../../src/stores/auth'
+import { useChatStore } from '../../src/stores/chat'
 
 const authSession: AuthSession = {
   user: { id: 'user_1', account: 'Alice' },
@@ -436,6 +437,28 @@ describe('authentication store', () => {
 
     expect(auth.session).toEqual(authSession)
     expect(auth.error).toBe('操作失败，请稍后重试')
+  })
+
+  it('clears the previous user chat state after logout succeeds', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const chat = useChatStore()
+    auth.session = authSession
+    chat.conversations = [{
+      id: 'conversation_alice',
+      title: 'Alice conversation',
+      createdAt: '2026-08-21T00:00:00.000Z',
+      updatedAt: '2026-08-21T00:00:00.000Z',
+    }]
+    chat.selectedConversationId = 'conversation_alice'
+    chat.messagesByConversation.conversation_alice = []
+
+    await expect(auth.logout()).resolves.toBe(true)
+
+    expect(chat.conversations).toEqual([])
+    expect(chat.selectedConversationId).toBe('')
+    expect(chat.messagesByConversation).toEqual({})
   })
 
   it('clears the session after a pending logout succeeds despite a later OTP cancellation', async () => {

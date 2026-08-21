@@ -359,14 +359,14 @@ onBeforeUnmount(detachSettingsScrollSync)
 .context-list li + li { margin-top: 2px; }
 .conversation-group { padding: 9px 7px 3px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .conversation-row { display: grid; grid-template-columns: minmax(0, 1fr) 26px 26px; align-items: center; border-radius: 5px; }
-.conversation-row:hover { background: #edf0f4; }.conversation-row.active { color: #174ea6; background: var(--af-cobalt-soft); }
+.conversation-row:hover { background: var(--af-hover); }.conversation-row.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .conversation-select { display: flex; min-width: 0; align-items: center; gap: 8px; border: 0; padding: 9px 8px; color: inherit; background: transparent; cursor: pointer; text-align: left; }
 .conversation-action { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 4px; color: var(--af-text-muted); background: transparent; cursor: pointer; opacity: 0; }
-.conversation-row:hover .conversation-action, .conversation-action:focus-visible { opacity: 1; }.conversation-action:hover { color: var(--af-cobalt); background: white; }.conversation-action.danger:hover { color: var(--af-danger); }
+.conversation-row:hover .conversation-action, .conversation-action:focus-visible { opacity: 1; }.conversation-action:hover { color: var(--af-cobalt); background: var(--af-surface); }.conversation-action.danger:hover { color: var(--af-danger); }
 .sidebar-state { margin-top: 20px; color: var(--af-text-muted); font-size: 12px; line-height: 1.6; text-align: center; }
-.sidebar-state small { color: #8a939f; }.sidebar-error { color: var(--af-danger); font-size: 12px; }
+.sidebar-state small { color: var(--af-text-muted); }.sidebar-error { color: var(--af-danger); font-size: 12px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 11px; font-weight: 650; }
-.native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: white; font-size: 11px; }
+.native-filter { width: 100%; border: 1px solid var(--af-border-strong); border-radius: 4px; padding: 7px 8px; color: var(--af-text); background: var(--af-surface); font-size: 11px; }
 .settings-section-link { width: 100%; border: 0; border-radius: 5px; padding: 8px 9px; color: var(--af-text); background: transparent; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
 .settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .settings-section-link.active { font-weight: 650; }

@@ -5,9 +5,11 @@
   --af-canvas: #f3f5f8;
   --af-surface: #ffffff;
   --af-surface-muted: #f8f9fb;
+  --af-hover: #edf0f4;
   --af-border: #dfe3e8;
   --af-border-strong: #c8ced6;
   --af-graphite: #20242b;
+  --af-rail: #20242b;
   --af-text: #303640;
   --af-text-muted: #68717d;
   --af-cobalt: #2563eb;
@@ -15,13 +17,61 @@
   --af-cobalt-soft: #eaf1ff;
   --af-warning: #b45309;
   --af-warning-soft: #fff7ed;
+  --af-warning-text: #7c3f0b;
   --af-success: #15803d;
   --af-success-soft: #ecfdf3;
   --af-danger: #b42318;
+  --af-danger-soft: #fff5f5;
+  --af-danger-border: #f2b8b5;
+  --af-control-hover: #9aa6b5;
   --af-focus: 0 0 0 3px rgb(37 99 235 / 22%);
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --af-canvas: #11151c;
+    --af-surface: #181d26;
+    --af-surface-muted: #202630;
+    --af-hover: #242a35;
+    --af-border: #303746;
+    --af-border-strong: #4a5565;
+    --af-graphite: #e7edf5;
+    --af-rail: #0d1117;
+    --af-text: #dbe4ef;
+    --af-text-muted: #aeb8c6;
+    --af-cobalt: #6f9cff;
+    --af-cobalt-hover: #8fb4ff;
+    --af-cobalt-soft: #26354f;
+    --af-warning: #f0b36a;
+    --af-warning-soft: #332719;
+    --af-warning-text: #f6c58c;
+    --af-success: #65c987;
+    --af-success-soft: #193225;
+    --af-danger: #ff8b82;
+    --af-danger-soft: #351f22;
+    --af-danger-border: #744047;
+    --af-control-hover: #6c7889;
+    --af-focus: 0 0 0 3px rgb(111 156 255 / 28%);
+    --el-bg-color-page: var(--af-canvas);
+    --el-bg-color: var(--af-surface);
+    --el-bg-color-overlay: #202630;
+    --el-text-color-primary: var(--af-graphite);
+    --el-text-color-regular: var(--af-text);
+    --el-text-color-secondary: var(--af-text-muted);
+    --el-text-color-placeholder: #7f8997;
+    --el-border-color: var(--af-border-strong);
+    --el-border-color-light: var(--af-border);
+    --el-border-color-lighter: var(--af-border);
+    --el-fill-color: #303746;
+    --el-fill-color-light: var(--af-surface-muted);
+    --el-fill-color-lighter: #1d222b;
+    --el-fill-color-blank: var(--af-surface);
+    --el-mask-color: rgb(0 0 0 / 72%);
+  }
 }
 
 * { box-sizing: border-box; }
@@ -30,10 +80,10 @@ body { color: var(--af-text); background: var(--af-canvas); }
 button, input, textarea, select { font: inherit; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible { outline: none; box-shadow: var(--af-focus); }
 
-.af-scrollbar { scrollbar-width: thin; scrollbar-color: #bcc4cf transparent; }
+.af-scrollbar { scrollbar-width: thin; scrollbar-color: var(--af-border-strong) transparent; }
 .af-panel-heading { font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--af-text-muted); text-transform: uppercase; }
 .af-empty { display: grid; min-height: 240px; place-items: center; padding: 32px; color: var(--af-text-muted); text-align: center; }
-.af-error { border-left: 3px solid var(--af-danger); padding: 12px 14px; color: var(--af-danger); background: #fff5f5; }
+.af-error { border-left: 3px solid var(--af-danger); padding: 12px 14px; color: var(--af-danger); background: var(--af-danger-soft); }
 .af-status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--af-border-strong); }
 .af-status-dot.success { background: var(--af-success); }
 .af-status-dot.warning { background: var(--af-warning); }
@@ -52,7 +102,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .af-media-generation-status { display: flex; align-items: center; gap: 8px; }
 .af-media-generation-warning { margin: 0; color: var(--af-warning); font-size: 12px; line-height: 1.5; }
 .af-media-generation-failure { display: grid; gap: 4px; color: var(--af-danger); }
-.af-media-generation.is-failed { border-color: #f2b8b5; background: #fff5f5; }
+.af-media-generation.is-failed { border-color: var(--af-danger-border); background: var(--af-danger-soft); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }

@@ -16,6 +16,7 @@ import { redact } from '../security/redaction.js'
 export interface Conversation {
   id: string
   title: string
+  userId?: string
   generationPreferences?: ConversationGenerationPreferences
   createdAt: number
   updatedAt: number
@@ -487,9 +488,10 @@ export interface EncryptedSecretsRepository {
 
 export interface AppRepositories {
   conversations: {
-    insert(value: Pick<Conversation, 'id' | 'title'> & Partial<Pick<Conversation, 'createdAt' | 'updatedAt'>>): Conversation
+    insert(value: Pick<Conversation, 'id' | 'title'> & Partial<Pick<Conversation, 'userId' | 'createdAt' | 'updatedAt'>>): Conversation
     get(id: string): Conversation | undefined
     list(): Conversation[]
+    claimLegacyAndListForUser(userId: string): Conversation[]
     update(id: string, value: Partial<Pick<Conversation, 'title' | 'updatedAt'>>): Conversation | undefined
     updateGenerationPreferences(id: string, preferences: ConversationGenerationPreferences): Conversation | undefined
     delete(id: string): void
@@ -568,7 +570,7 @@ export interface AppRepositories {
   encryptedSecrets: EncryptedSecretsRepository
 }
 
-const conversationColumns = 'id, title, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
+const conversationColumns = 'id, title, user_id AS userId, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
 const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, ordinal, execution_id AS executionId, created_at AS createdAt'
 const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
@@ -798,9 +800,11 @@ function conversationContextFromRow(row: Query): ConversationContextRecord {
 
 function conversationFromRow(row: Query): Conversation {
   const preferences = parse(row.generationPreferencesJson as string | null)
+  const userId = optional<string>(row.userId)
   return {
     id: row.id as string,
     title: row.title as string,
+    ...(userId === undefined ? {} : { userId }),
     ...(preferences === undefined ? {} : { generationPreferences: conversationGenerationPreferencesSchema.parse(preferences) }),
     createdAt: row.createdAt as number,
     updatedAt: row.updatedAt as number,
@@ -1301,11 +1305,15 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       insert(value) {
         const createdAt = value.createdAt ?? now()
         const updatedAt = value.updatedAt ?? createdAt
-        transaction(database, () => database.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (@id, @title, @createdAt, @updatedAt)').run({ ...value, createdAt, updatedAt }))
-        return { id: value.id, title: value.title, createdAt, updatedAt }
+        transaction(database, () => database.prepare('INSERT INTO conversations (id, title, user_id, created_at, updated_at) VALUES (@id, @title, @userId, @createdAt, @updatedAt)').run({ ...value, userId: value.userId ?? null, createdAt, updatedAt }))
+        return { id: value.id, title: value.title, ...(value.userId === undefined ? {} : { userId: value.userId }), createdAt, updatedAt }
       },
       get: (id) => { const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id }); return row && conversationFromRow(row) },
       list: () => many<Query>(database, `SELECT ${conversationColumns} FROM conversations ORDER BY updated_at DESC, id`).map(conversationFromRow),
+      claimLegacyAndListForUser: (userId) => transaction(database, () => {
+        database.prepare('UPDATE conversations SET user_id = @userId WHERE user_id IS NULL').run({ userId })
+        return many<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE user_id = @userId ORDER BY updated_at DESC, id`, { userId }).map(conversationFromRow)
+      }),
       update(id, value) {
         const updatedAt = value.updatedAt ?? now()
         transaction(database, () => database.prepare('UPDATE conversations SET title = COALESCE(@title, title), updated_at = @updatedAt WHERE id = @id').run({ id, title: value.title ?? null, updatedAt }))

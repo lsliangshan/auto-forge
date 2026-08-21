@@ -115,7 +115,18 @@ function createEventApi() {
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
-  return { api, decide, chatUnsubscribe, executionUnsubscribe, emitChat: (event: ChatEvent) => chatListener?.(event), emitExecution: (event: ExecutionEvent) => executionListener?.(event) }
+  return {
+    api,
+    decide,
+    chatUnsubscribe,
+    executionUnsubscribe,
+    emitChat: (event: ChatEvent) => chatListener?.(event),
+    queueChat: (event: ChatEvent) => {
+      const queuedListener = chatListener
+      return () => queuedListener?.(event)
+    },
+    emitExecution: (event: ExecutionEvent) => executionListener?.(event),
+  }
 }
 
 function mountScrollableChat() {
@@ -1366,6 +1377,38 @@ describe('chat interactions', () => {
     expect(second.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
       expect.objectContaining({ text: '一次' }),
     ])
+  })
+
+  it('drops a previous user event that was queued before local auth state reset', () => {
+    const { api, chatUnsubscribe, queueChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [{
+      id: 'alice_conversation',
+      title: 'Alice',
+      createdAt: '2026-07-19T00:00:00.000Z',
+      updatedAt: '2026-07-19T00:00:00.000Z',
+    }]
+    store.ensureSubscriptions()
+    const deliverQueuedAliceEvent = queueChat({
+      type: 'block',
+      conversationId: 'alice_conversation',
+      messageId: 'alice_message',
+      block: { type: 'text', text: 'Alice private message' },
+    })
+
+    store.resetLocalData()
+    expect(chatUnsubscribe).toHaveBeenCalledTimes(1)
+    store.conversations = [{
+      id: 'bob_conversation',
+      title: 'Bobby',
+      createdAt: '2026-07-20T00:00:00.000Z',
+      updatedAt: '2026-07-20T00:00:00.000Z',
+    }]
+    store.ensureSubscriptions()
+    deliverQueuedAliceEvent()
+
+    expect(store.messagesByConversation.alice_conversation).toBeUndefined()
   })
 
   it('trims composer input, honors IME, and uses Shift+Enter for a newline', async () => {

@@ -98,6 +98,10 @@ describe('cross-process contracts', () => {
       phone: '+8613800138000',
       updatedAt: '2026-08-18T00:00:00.000Z',
     })).toMatchObject({ userId: 'user_1', account: 'Alice' })
+    expect(userProfileSchema.parse({
+      userId: 'cloud_uid',
+      account: 'u***@example.com',
+    })).toMatchObject({ userId: 'cloud_uid', account: 'u***@example.com' })
 
     expect(userProfileUpdateSchema.safeParse({ account: 'Mallory' }).success).toBe(false)
     expect(userProfileUpdateSchema.safeParse({ userId: 'user_2' }).success).toBe(false)
