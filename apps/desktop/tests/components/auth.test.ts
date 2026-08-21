@@ -1238,6 +1238,81 @@ describe('workbench authentication entry', () => {
     expect(logo.attributes('src')).toContain('autoforge-logo.png')
   })
 
+  it('places the mixed-tone application logo on a light contrasting surface', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const auth = useAuthStore(pinia)
+    auth.session = authSession
+    auth.initialized = true
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: ['/chat', '/workflows', '/developer', '/executions', '/settings', '/profile'].map((path) => ({
+        path,
+        component: { template: '<div />' },
+      })),
+    })
+    await router.push('/chat')
+    const wrapper = mount(AppRail, {
+      attachTo: document.body,
+      global: { plugins: [pinia, router, ElementPlus] },
+    })
+
+    try {
+      const surfaceColor = getComputedStyle(wrapper.get('.app-mark').element).backgroundColor
+      const hexColor = /^#([\da-f]{6})$/i.exec(surfaceColor)
+      const channels = hexColor
+        ? hexColor[1].match(/../g)?.map((channel) => Number.parseInt(channel, 16)) ?? []
+        : surfaceColor.match(/\d+/g)?.slice(0, 3).map(Number) ?? []
+      expect(channels).toHaveLength(3)
+      expect(Math.min(...channels)).toBeGreaterThanOrEqual(240)
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('separates account actions from primary navigation with hidden decoration', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const auth = useAuthStore(pinia)
+    auth.session = authSession
+    auth.initialized = true
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [{ path: '/chat', component: { template: '<div />' } }],
+    })
+    await router.push('/chat')
+    const wrapper = mount(AppRail, { global: { plugins: [pinia, router, ElementPlus] } })
+
+    const divider = wrapper.get('[data-testid="rail-account-divider"]')
+    expect(divider.attributes('aria-hidden')).toBe('true')
+    wrapper.unmount()
+  })
+
+  it('constrains every navigation icon with the shared icon wrapper', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const auth = useAuthStore(pinia)
+    auth.session = authSession
+    auth.initialized = true
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [{ path: '/chat', component: { template: '<div />' } }],
+    })
+    await router.push('/chat')
+    const wrapper = mount(AppRail, { global: { plugins: [pinia, router, ElementPlus] } })
+
+    const icons = wrapper.findAll('[data-testid="app-nav-item"] .rail-item-icon')
+    expect(icons).toHaveLength(wrapper.findAll('[data-testid="app-nav-item"]').length)
+    expect(icons.every((icon) => icon.element.tagName === 'I')).toBe(true)
+    wrapper.unmount()
+  })
+
   it('keeps the account visible on failed logout and navigates only after success', async () => {
     const api = createApi()
     vi.mocked(api.auth.logout).mockRejectedValueOnce(toSafeAppError({ code: 'INTERNAL_ERROR' }))

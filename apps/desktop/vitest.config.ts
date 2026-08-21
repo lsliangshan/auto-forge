@@ -7,5 +7,6 @@ export default defineConfig({
     name: 'desktop-renderer',
     environment: 'happy-dom',
     include: ['tests/components/**/*.test.ts'],
+    css: { include: [/AppRail\.vue/] },
   },
 })
