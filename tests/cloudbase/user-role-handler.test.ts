@@ -68,15 +68,38 @@ describe('CloudBase user role function', () => {
     })
     const handler = createUserRoleHandler({ rpc })
 
-    await expect(handler({ action: 'ensureMyRole' }, context)).resolves.toEqual({
+    await expect(handler({
+      action: 'ensureMyRole',
+      userId: 'attacker',
+      uid: 'attacker',
+      platformTraceId: 'trace_1',
+    }, context)).resolves.toEqual({
       ok: true,
       data: expect.objectContaining({ userId: 'admin_1', role: 'user' }),
     })
     expect(rpc).toHaveBeenCalledWith('autoforge_ensure_my_role', {
       p_caller_user_id: 'admin_1',
     })
-    await expect(handler({ action: 'ensureMyRole', userId: 'attacker' }, context)).resolves.toEqual({
-      ok: false, error: { code: 'INVALID_INPUT' },
+  })
+
+  it('ignores CloudBase-injected event identity metadata while trusting only the function context', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      userId: 'admin_1', role: 'user', capabilities: [], version: 0,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+    })
+    const handler = createUserRoleHandler({ rpc })
+
+    await expect(handler({
+      action: 'ensureMyRole',
+      openid: 'platform-injected-openid',
+      userInfo: { uid: 'attacker' },
+      source: 'cloudbase-runtime',
+    }, context)).resolves.toEqual({
+      ok: true,
+      data: expect.objectContaining({ userId: 'admin_1', role: 'user' }),
+    })
+    expect(rpc).toHaveBeenCalledWith('autoforge_ensure_my_role', {
+      p_caller_user_id: 'admin_1',
     })
   })
 
@@ -105,7 +128,7 @@ describe('CloudBase user role function', () => {
     })
   })
 
-  it('forwards only strict list and update fields to PostgreSQL RPC', async () => {
+  it('forwards only validated business fields to PostgreSQL RPC', async () => {
     const rpc = vi.fn()
       .mockResolvedValueOnce({ items: [], page: 1, pageSize: 20, total: 0 })
       .mockResolvedValueOnce({
@@ -117,10 +140,12 @@ describe('CloudBase user role function', () => {
     await handler({
       action: 'listUsers', page: 1, pageSize: 20,
       filter: { field: 'email', value: 'alice@example.com' },
+      platformTraceId: 'trace_1', userId: 'attacker',
     }, context)
     await handler({
       action: 'updateUserRole', requestId: 'request_1', targetUserId: 'user_1',
       newRole: 'super_admin', expectedVersion: 1,
+      source: 'cloudbase-runtime', callerUserId: 'attacker',
     }, context)
 
     expect(rpc).toHaveBeenNthCalledWith(1, 'autoforge_list_users', {
@@ -133,14 +158,14 @@ describe('CloudBase user role function', () => {
     })
   })
 
-  it('rejects unknown actions, extra fields and unsupported assigned roles', async () => {
+  it('rejects unknown actions and invalid business fields', async () => {
     const rpc = vi.fn()
     const handler = createUserRoleHandler({ rpc })
 
     await expect(handler({ action: 'deleteUser', userId: 'user_1' }, context)).resolves.toEqual({
       ok: false, error: { code: 'INVALID_INPUT' },
     })
-    await expect(handler({ action: 'listUsers', page: 1, pageSize: 20, extra: true }, context))
+    await expect(handler({ action: 'listUsers', page: 1, pageSize: 21, extra: true }, context))
       .resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
     await expect(handler({
       action: 'updateUserRole', requestId: 'request_1', targetUserId: 'user_1',

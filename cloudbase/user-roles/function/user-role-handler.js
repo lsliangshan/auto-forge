@@ -49,10 +49,7 @@ function callerUid(context) {
 }
 
 function parseList(event) {
-  const keys = event.filter === undefined
-    ? ['action', 'page', 'pageSize']
-    : ['action', 'filter', 'page', 'pageSize']
-  if (!hasExactKeys(event, keys)
+  if (event.action !== 'listUsers'
     || !Number.isInteger(event.page) || event.page < 1
     || ![20, 50, 100].includes(event.pageSize)) return undefined
   if (event.filter === undefined) return { page: event.page, pageSize: event.pageSize }
@@ -63,7 +60,7 @@ function parseList(event) {
 }
 
 function parseUpdate(event) {
-  if (!hasExactKeys(event, ['action', 'expectedVersion', 'newRole', 'requestId', 'targetUserId'])
+  if (event.action !== 'updateUserRole'
     || !nonEmptyString(event.requestId, 128)
     || !nonEmptyString(event.targetUserId, 64)
     || !assignableRoles.has(event.newRole)
@@ -90,7 +87,7 @@ function createUserRoleHandler({ rpc }) {
     if (!uid) return { ok: false, error: { code: 'AUTH_REQUIRED' } }
     const event = isRecord(rawEvent) ? rawEvent : {}
     try {
-      if (hasExactKeys(event, ['action']) && event.action === 'ensureMyRole') {
+      if (event.action === 'ensureMyRole') {
         return {
           ok: true,
           data: await rpc('autoforge_ensure_my_role', { p_caller_user_id: uid }),
