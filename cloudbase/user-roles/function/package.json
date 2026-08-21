@@ -2,7 +2,7 @@
   "name": "autoforge-user-roles",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
+  "type": "commonjs",
   "main": "index.js",
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=18" }
 }

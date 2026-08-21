@@ -1,4 +1,4 @@
-/* global fetch */
+/* global fetch, module */
 
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
@@ -74,7 +74,7 @@ function safeErrorCode(error) {
   return 'INTERNAL_ERROR'
 }
 
-export function createUserRoleHandler({ rpc }) {
+function createUserRoleHandler({ rpc }) {
   return async (rawEvent, context) => {
     const uid = callerUid(context)
     if (!uid) return { ok: false, error: { code: 'AUTH_REQUIRED' } }
@@ -121,7 +121,7 @@ export function createUserRoleHandler({ rpc }) {
   }
 }
 
-export function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
+function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
   if (!baseUrl || !serviceKey) throw new Error('CloudBase PostgreSQL RPC is not configured')
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
   return async (name, parameters) => {
@@ -131,7 +131,6 @@ export function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch
         method: 'POST',
         headers: {
           authorization: `Bearer ${serviceKey}`,
-          apikey: serviceKey,
           'content-type': 'application/json',
         },
         body: JSON.stringify(parameters),
@@ -141,8 +140,13 @@ export function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch
     }
     const body = await response.json().catch(() => undefined)
     if (response.ok) return body
-    const message = isRecord(body) && typeof body.message === 'string' ? body.message : undefined
-    if (message && stableErrorCodes.has(message)) throw { code: message }
+    const code = safeErrorCode(body)
+    if (code !== 'INTERNAL_ERROR') throw { code }
     throw { code: response.status >= 500 ? 'SERVICE_UNAVAILABLE' : 'INTERNAL_ERROR' }
   }
+}
+
+module.exports = {
+  createPostgresRpcClient,
+  createUserRoleHandler,
 }

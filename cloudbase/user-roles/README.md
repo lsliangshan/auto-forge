@@ -4,14 +4,14 @@
 
 本目录包含可部署工件；提交代码本身不会修改 CloudBase。推荐发布顺序：
 
-1. 在目标 PostgreSQL 执行 `migrations/0001_user_roles.sql`。
+1. 通过 CloudBase PG 迁移工具应用 `../../migrations/20260821105102_user_roles.sql`；`migrations/0001_user_roles.sql` 保留为功能目录内的可读副本，两者由测试保证一致。
 2. 为云函数配置 `AUTOFORGE_PG_RPC_BASE_URL` 与 `AUTOFORGE_PG_SERVICE_KEY`。服务密钥只能存在于云函数和受控运维环境，不得进入 Electron/Renderer。
-3. 将 `function/` 作为事件型 Node.js 20 云函数 `autoforge-user-roles` 部署。例如，在已确认目标环境和变量后使用：
+3. 将 `function/` 作为事件型 Node.js 18.15 云函数 `autoforge-user-roles` 部署。例如，在已确认目标环境和变量后使用：
 
    ```sh
    tcb functions:deploy autoforge-user-roles \
      --dir cloudbase/user-roles/function \
-     --runtime Nodejs20.19 \
+     --runtime Nodejs18.15 \
      --install-dependency false
    ```
 

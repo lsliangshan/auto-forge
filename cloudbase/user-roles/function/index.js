@@ -1,10 +1,10 @@
-/* global process */
+/* global exports, process, require */
 
-import { createPostgresRpcClient, createUserRoleHandler } from './user-role-handler.js'
+const { createPostgresRpcClient, createUserRoleHandler } = require('./user-role-handler.js')
 
 let handler
 
-export async function main(event, context) {
+async function main(event, context) {
   if (!handler) {
     const rpc = createPostgresRpcClient({
       baseUrl: process.env.AUTOFORGE_PG_RPC_BASE_URL,
@@ -15,4 +15,4 @@ export async function main(event, context) {
   return handler(event, context)
 }
 
-export default main
+exports.main = main

@@ -1,10 +1,66 @@
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it, vi } from 'vitest'
-import { createUserRoleHandler } from '../../cloudbase/user-roles/function/user-role-handler.js'
+import {
+  createPostgresRpcClient,
+  createUserRoleHandler,
+} from '../../cloudbase/user-roles/function/user-role-handler.js'
 
 const context = { auth: { uid: 'admin_1' } }
 
 describe('CloudBase user role function', () => {
+  it('uses a CommonJS entry compatible with the CloudBase index.main loader', async () => {
+    const packageJson = JSON.parse(await readFile(
+      new URL('../../cloudbase/user-roles/function/package.json', import.meta.url),
+      'utf8',
+    ))
+    const entry = await readFile(
+      new URL('../../cloudbase/user-roles/function/index.js', import.meta.url),
+      'utf8',
+    )
+
+    expect(packageJson.type).not.toBe('module')
+    expect(entry).toContain('exports.main = main')
+    expect(entry).not.toMatch(/\bexport\s+(?:default|async|function|const|let|var|class)/)
+  })
+
+  it('calls the CloudBase PostgreSQL RPC endpoint with a server-only bearer key', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ userId: '2089908515857502208', role: 'user' }),
+    })
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest/',
+      serviceKey: 'server-secret',
+      fetchImpl,
+    })
+
+    await expect(rpc('autoforge_ensure_my_role', {
+      p_caller_user_id: '2089908515857502208',
+    })).resolves.toEqual({ userId: '2089908515857502208', role: 'user' })
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://autoforge.example/v1/rdb/rest/rpc/autoforge_ensure_my_role',
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer server-secret',
+          'content-type': 'application/json',
+        },
+      }),
+    )
+
+    const failed = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        json: vi.fn().mockResolvedValue({ message: 'FORBIDDEN' }),
+      }),
+    })
+    await expect(failed('autoforge_list_users', {})).rejects.toEqual({ code: 'FORBIDDEN' })
+  })
+
   it('takes the caller only from trusted context and ensures the default role', async () => {
     const rpc = vi.fn().mockResolvedValue({
       userId: 'admin_1', role: 'user', capabilities: [], version: 0,
@@ -90,11 +146,20 @@ describe('CloudBase user role function', () => {
 })
 
 describe('CloudBase PostgreSQL user role migration', () => {
-  it('contains the required private tables and transaction protections', async () => {
+  it('keeps CloudBase bigint auth ids exact across the string API boundary', async () => {
     const sql = await readFile(new URL('../../cloudbase/user-roles/migrations/0001_user_roles.sql', import.meta.url), 'utf8')
+    const versionedSql = await readFile(new URL('../../cloudbase/migrations/20260821105102_user_roles.sql', import.meta.url), 'utf8')
+    expect(versionedSql).toBe(sql)
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_roles')
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_role_audit')
-    expect(sql).toContain('REFERENCES auth.users(id) ON DELETE CASCADE')
+    expect(sql).toContain('user_id bigint PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE')
+    expect(sql).toContain("'userId', role_row.user_id::text")
+    expect(sql).toContain('users.id::text = p_caller_user_id')
+    expect(sql).toContain('users.id::text = p_target_user_id')
+    expect(sql).not.toMatch(/users\.id\s*=\s*p_(?:caller|target)_user_id/)
+    expect(sql).not.toContain('roles.user_id = users.id::text')
+    expect(sql).toContain("existing_role varchar(63) := 'user'")
+    expect(sql).not.toMatch(/\bcurrent_role\b/)
     expect(sql).toContain('request_id varchar(128) NOT NULL UNIQUE')
     expect(sql).toContain('SELF_ROLE_CHANGE_FORBIDDEN')
     expect(sql).toContain('LAST_SUPER_ADMIN')
