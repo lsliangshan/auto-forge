@@ -381,6 +381,7 @@ describe('CloudBaseAuthService', () => {
       username: 'alice_1',
       email: 'unverified@example.com',
       phone: '+8618311032722',
+      confirmed_at: '2026-08-20T00:00:00.000Z',
       user_metadata: {
         avatarUrl: 'http://insecure.example.com/avatar.png',
         gender: 'UNKNOWN',
@@ -393,6 +394,34 @@ describe('CloudBaseAuthService', () => {
       user: { id: 'cloud_uid', account: 'alice_1' },
       authenticatedAt: AUTHENTICATED_AT,
     })
+  })
+
+  it.each([
+    [{
+      email: 'verified@example.com',
+      email_confirmed_at: '2026-08-20T00:00:00.000Z',
+      phone: '+8618311032722',
+      confirmed_at: '2026-08-20T00:00:00.000Z',
+    }, { email: 'verified@example.com' }],
+    [{
+      email: 'unverified@example.com',
+      phone: '+8618311032722',
+      phone_confirmed_at: '2026-08-20T00:00:00.000Z',
+      confirmed_at: '2026-08-20T00:00:00.000Z',
+    }, { phone: '+8618311032722' }],
+  ] as const)('projects only the contact with its matching confirmation timestamp', async (
+    contacts,
+    expectedProfile,
+  ) => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1',
+      ...contacts,
+    })))
+
+    await expect(app.service.loginWithPassword({
+      account: 'alice_1', password: 'password',
+    })).resolves.toMatchObject({ user: { profile: expectedProfile } })
   })
 
   it('updates editable CloudBase profile fields and persists the returned identity snapshot', async () => {
@@ -441,6 +470,55 @@ describe('CloudBaseAuthService', () => {
         profile: { displayName: 'Alice Cloud', gender: 'female' },
       },
     })
+  })
+
+  it('refreshes the CloudBase user when updateUser omits the updated identity', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1', user_metadata: { nickname: 'Alice' },
+    })))
+    vi.mocked(app.port.updateUser).mockResolvedValue({ data: {}, error: null })
+    vi.mocked(app.port.refreshUser).mockResolvedValue({
+      data: {
+        user: {
+          id: 'cloud_uid',
+          username: 'alice_1',
+          user_metadata: { nickname: 'Refreshed Name' },
+        },
+      },
+      error: null,
+    })
+    await app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+
+    await expect(app.service.updateUserProfile({ displayName: 'Requested Name' }))
+      .resolves.toMatchObject({ profile: { displayName: 'Refreshed Name' } })
+    expect(app.port.refreshUser).toHaveBeenCalledOnce()
+    expect(app.port.getUser).not.toHaveBeenCalled()
+  })
+
+  it('gets the current CloudBase user when refreshUser also omits the identity', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1', user_metadata: { nickname: 'Alice' },
+    })))
+    vi.mocked(app.port.updateUser).mockResolvedValue({ data: {}, error: null })
+    vi.mocked(app.port.refreshUser).mockResolvedValue({ data: {}, error: null })
+    vi.mocked(app.port.getUser).mockResolvedValue({
+      data: {
+        user: {
+          id: 'cloud_uid',
+          username: 'alice_1',
+          user_metadata: { nickname: 'Current Name' },
+        },
+      },
+      error: null,
+    })
+    await app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+
+    await expect(app.service.updateUserProfile({ displayName: 'Requested Name' }))
+      .resolves.toMatchObject({ profile: { displayName: 'Current Name' } })
+    expect(app.port.refreshUser).toHaveBeenCalledOnce()
+    expect(app.port.getUser).toHaveBeenCalledOnce()
   })
 
   it('discards local credentials even when remote signOut fails', async () => {

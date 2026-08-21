@@ -261,4 +261,3 @@ ProfileService 将输入拆分为云端字段和本地字段：
 - `pnpm build`。
 - CloudBase Code Review 的 AUTH001、SEC001 和 SDK 语义审查。
 - 不打开可见浏览器；如需运行端到端检查，使用 headless 模式。
-

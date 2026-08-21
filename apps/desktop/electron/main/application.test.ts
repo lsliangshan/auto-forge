@@ -21,6 +21,7 @@ import {
   createApplicationFailureRecorder,
   createApplicationRuntime,
   MaintenanceGate,
+  observeAuthService,
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
@@ -400,6 +401,33 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('stays unauthenticated when local session cleanup fails after CloudBase logout', async () => {
+    const delegate = createTestAuthService()
+    const clearSession = vi.fn(() => {
+      throw new Error('local database unavailable')
+    })
+    const auth = observeAuthService(delegate, {
+      sync: (session) => ({
+        user: session.user,
+        authenticatedAt: Date.parse(session.authenticatedAt),
+      }),
+      clearSession,
+    })
+    const challenge = await auth.sendOtp({
+      intent: 'register',
+      channel: 'email',
+      target: 'alice@example.com',
+      account: 'Alice',
+      password: 'password',
+    })
+    await auth.verifyOtp({ challengeId: challenge.challengeId, code: '123456' })
+    expect(auth.isAuthenticated()).toBe(true)
+
+    await expect(auth.logout()).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    expect(auth.isAuthenticated()).toBe(false)
+    expect(clearSession).toHaveBeenCalledOnce()
+  })
+
   it('records a failure identity once without merging distinct errors with the same message', () => {
     const latched: unknown[] = []
     const recorder = createApplicationFailureRecorder((error) => { latched.push(error) })

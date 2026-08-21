@@ -269,7 +269,6 @@ function providerUser(value: Record<string, unknown>, fallback?: AuthUser): Auth
   const emailValue = providerText([{ source: value, key: 'email' }])
   const emailConfirmed = safeAccount(providerText([
     { source: value, key: 'email_confirmed_at' },
-    { source: value, key: 'confirmed_at' },
   ]))
   const email = emailValue === null
     ? null
@@ -279,7 +278,6 @@ function providerUser(value: Record<string, unknown>, fallback?: AuthUser): Auth
   const phoneValue = providerText([{ source: value, key: 'phone' }])
   const phoneConfirmed = safeAccount(providerText([
     { source: value, key: 'phone_confirmed_at' },
-    { source: value, key: 'confirmed_at' },
   ]))
   const phone = phoneValue === null
     ? null
@@ -301,12 +299,18 @@ function providerUser(value: Record<string, unknown>, fallback?: AuthUser): Auth
   })
 }
 
-function cloudBaseUserResponse(response: unknown, fallback?: AuthUser): AuthUser {
+function optionalCloudBaseUserResponse(response: unknown, fallback?: AuthUser): AuthUser | undefined {
   if (!isRecord(response)) throw failure('INTERNAL_ERROR')
   if (response.error !== null) throw providerFailure(response.error)
-  if (!isRecord(response.data) || !isRecord(response.data.user)) throw failure('INTERNAL_ERROR')
+  if (!isRecord(response.data) || !isRecord(response.data.user)) return undefined
   if (response.data.user.is_anonymous === true) throw failure('INTERNAL_ERROR')
   return providerUser(response.data.user, fallback)
+}
+
+function cloudBaseUserResponse(response: unknown, fallback?: AuthUser): AuthUser {
+  const user = optionalCloudBaseUserResponse(response, fallback)
+  if (!user) throw failure('INTERNAL_ERROR')
+  return user
 }
 
 function cloudBaseSession(
@@ -566,7 +570,7 @@ export class CloudBaseAuthService implements AuthService {
       if (Object.keys(parsed.data).length === 0) return this.sessionUser
 
       const response = await this.updateProviderUser(parsed.data)
-      const user = cloudBaseUserResponse(response, this.sessionUser)
+      const user = await this.resolveUpdatedUser(response, this.sessionUser)
       await this.persistUser(user)
       return user
     })
@@ -618,6 +622,29 @@ export class CloudBaseAuthService implements AuthService {
         ...(input.avatarUrl !== undefined ? { avatar_url: input.avatarUrl } : {}),
         ...(input.gender !== undefined ? { gender: cloudBaseGender(input.gender) } : {}),
       })
+    } catch (error) {
+      throw providerFailure(error)
+    }
+  }
+
+  private async resolveUpdatedUser(response: unknown, fallback: AuthUser): Promise<AuthUser> {
+    const updated = optionalCloudBaseUserResponse(response, fallback)
+    if (updated) return updated
+
+    const refreshed = optionalCloudBaseUserResponse(
+      await this.callProviderUser(() => this.auth.refreshUser()),
+      fallback,
+    )
+    if (refreshed) return refreshed
+    return cloudBaseUserResponse(
+      await this.callProviderUser(() => this.auth.getUser()),
+      fallback,
+    )
+  }
+
+  private async callProviderUser(operation: () => Promise<unknown>): Promise<unknown> {
+    try {
+      return await operation()
     } catch (error) {
       throw providerFailure(error)
     }

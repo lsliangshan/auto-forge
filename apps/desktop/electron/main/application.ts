@@ -176,7 +176,8 @@ interface ObservedAuthService extends AuthService {
   isAuthenticated(): boolean
 }
 
-function observeAuthService(
+/** @internal Exported for direct failure-state verification. */
+export function observeAuthService(
   delegate: AuthService,
   identities: Pick<CloudBaseIdentityRepository, 'sync'> & { clearSession(): void },
 ): ObservedAuthService {
@@ -235,8 +236,8 @@ function observeAuthService(
     },
     async logout() {
       await delegate.logout()
-      clearLocalSession()
       authenticated = false
+      clearLocalSession()
     },
     requireSession: async () => synchronize(await delegate.requireSession()),
     isAuthenticated: () => authenticated,
