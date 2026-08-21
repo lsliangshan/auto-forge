@@ -80,6 +80,24 @@ describe('CloudBase user role function', () => {
     })
   })
 
+  it('reads a Web user UID from the CloudBase event context environment', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      userId: '2090350246298132480', role: 'super_admin', capabilities: ['manage_users'], version: 1,
+      updatedAt: '2026-08-21T11:14:02.802Z',
+    })
+    const handler = createUserRoleHandler({ rpc })
+
+    await expect(handler({ action: 'ensureMyRole' }, {
+      environment: JSON.stringify({ TCB_UUID: '2090350246298132480' }),
+    })).resolves.toEqual({
+      ok: true,
+      data: expect.objectContaining({ userId: '2090350246298132480', role: 'super_admin' }),
+    })
+    expect(rpc).toHaveBeenCalledWith('autoforge_ensure_my_role', {
+      p_caller_user_id: '2090350246298132480',
+    })
+  })
+
   it('rejects calls without a platform identity', async () => {
     const handler = createUserRoleHandler({ rpc: vi.fn() })
     await expect(handler({ action: 'ensureMyRole', userId: 'attacker' }, {})).resolves.toEqual({

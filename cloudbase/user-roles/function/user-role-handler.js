@@ -35,6 +35,16 @@ function callerUid(context) {
   if (isRecord(context.auth) && nonEmptyString(context.auth.uid, 64)) return context.auth.uid
   if (isRecord(context.userInfo) && nonEmptyString(context.userInfo.uid, 64)) return context.userInfo.uid
   if (nonEmptyString(context.UID, 64)) return context.UID
+  if (typeof context.environment === 'string') {
+    try {
+      const environment = JSON.parse(context.environment)
+      if (isRecord(environment) && nonEmptyString(environment.TCB_UUID, 64)) {
+        return environment.TCB_UUID
+      }
+    } catch {
+      return undefined
+    }
+  }
   return undefined
 }
 
