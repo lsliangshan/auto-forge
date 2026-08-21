@@ -100,6 +100,7 @@ describe('CloudBase PostgreSQL user role migration', () => {
     expect(sql).toContain('LAST_SUPER_ADMIN')
     expect(sql).toContain('ROLE_CONFLICT')
     expect(sql).toContain('REQUEST_ID_CONFLICT')
+    expect(sql).toContain("'total', (SELECT total FROM totals)")
     expect(sql).toMatch(/REVOKE ALL ON (TABLE )?public\.app_user_roles FROM PUBLIC/)
     expect(sql).toContain('REVOKE ALL ON FUNCTION public.autoforge_list_users')
     expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.autoforge_list_users')

@@ -1,3 +1,5 @@
+/* global fetch */
+
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
   'FORBIDDEN',

@@ -149,7 +149,7 @@ BEGIN
     FROM auth.users users
     LEFT JOIN public.app_user_roles roles ON roles.user_id = users.id
   ), filtered AS (
-    SELECT *, count(*) OVER () AS total_count
+    SELECT *
     FROM normalized
     WHERE NOT anonymous
       AND (
@@ -160,28 +160,30 @@ BEGIN
         OR (p_filter_field = 'username' AND username ILIKE '%' || p_filter_value || '%')
         OR (p_filter_field = 'displayName' AND display_name ILIKE '%' || p_filter_value || '%')
       )
+  ), totals AS (
+    SELECT count(*) AS total FROM filtered
   ), page_rows AS (
     SELECT * FROM filtered
     ORDER BY created_at DESC, user_id
     LIMIT p_page_size OFFSET ((p_page - 1) * p_page_size)
   )
   SELECT jsonb_build_object(
-    'items', COALESCE(jsonb_agg(jsonb_build_object(
-      'userId', user_id,
-      'username', username,
-      'displayName', display_name,
-      'maskedEmail', public.autoforge_mask_email(email),
-      'maskedPhone', public.autoforge_mask_phone(phone),
-      'status', CASE WHEN blocked THEN 'blocked' ELSE 'active' END,
-      'role', role,
-      'roleVersion', role_version,
-      'createdAt', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
-    ) ORDER BY created_at DESC, user_id), '[]'::jsonb),
+    'items', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'userId', user_id,
+        'username', username,
+        'displayName', display_name,
+        'maskedEmail', public.autoforge_mask_email(email),
+        'maskedPhone', public.autoforge_mask_phone(phone),
+        'status', CASE WHEN blocked THEN 'blocked' ELSE 'active' END,
+        'role', role,
+        'roleVersion', role_version,
+        'createdAt', to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+      ) ORDER BY created_at DESC, user_id), '[]'::jsonb)
+      FROM page_rows),
     'page', p_page,
     'pageSize', p_page_size,
-    'total', COALESCE(max(total_count), 0)
-  ) INTO result
-  FROM page_rows;
+    'total', (SELECT total FROM totals)
+  ) INTO result;
 
   RETURN result;
 END;

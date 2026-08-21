@@ -1,3 +1,5 @@
+/* global process */
+
 import { createPostgresRpcClient, createUserRoleHandler } from './user-role-handler.js'
 
 let handler

@@ -11,7 +11,7 @@ export class DesktopBridgeUnavailableError extends Error {
 
 export function getDesktopApi(): DesktopAPI {
   const api = window.autoForge
-  if (!api?.auth || !api?.profile || !api?.userAdmin || !api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
+  if (!api?.auth || !api?.profile || !api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
     throw new DesktopBridgeUnavailableError()
   }
   return api
@@ -25,6 +25,13 @@ const messages: Partial<Record<AppError['code'], string>> = {
   AUTH_OTP_EXPIRED: '验证码已失效，请重新发送',
   AUTH_OTP_RATE_LIMITED: '验证码发送过于频繁，请稍后再试',
   AUTH_ACCOUNT_NOT_FOUND: '该手机号或邮箱尚未注册',
+  FORBIDDEN: '没有用户管理权限',
+  USER_NOT_FOUND: '用户不存在或已被删除',
+  ROLE_CONFLICT: '用户角色已被其他管理员更新，请刷新后重试',
+  SELF_ROLE_CHANGE_FORBIDDEN: '不能修改自己的角色',
+  LAST_SUPER_ADMIN: '不能降级最后一个可用的超级管理员',
+  REQUEST_ID_CONFLICT: '本次角色修改请求与已完成请求冲突',
+  SERVICE_UNAVAILABLE: '用户角色服务暂时不可用，请稍后重试',
   CANCELLED: '操作已取消',
   INVALID_INPUT: '输入内容无效',
   NOT_FOUND: '请求的内容不存在',

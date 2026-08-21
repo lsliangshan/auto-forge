@@ -1,3 +1,5 @@
+/* global console, process */
+
 import { callRpc } from './rpc-client.mjs'
 
 function valueAfter(args, name) {

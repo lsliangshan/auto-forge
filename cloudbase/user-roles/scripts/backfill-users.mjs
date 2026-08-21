@@ -1,3 +1,5 @@
+/* global console, process */
+
 import { callRpc } from './rpc-client.mjs'
 
 const args = new Set(process.argv.slice(2))

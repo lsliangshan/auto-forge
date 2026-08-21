@@ -49,11 +49,20 @@ export class CloudBaseRoleService implements BusinessRoleService {
   ) {}
 
   private async invoke(action: string, input: Record<string, unknown> = {}): Promise<unknown> {
+    let rawResponse: unknown
     try {
-      const response = functionResponseSchema.parse(await this.functions.callFunction({
+      rawResponse = await this.functions.callFunction({
         name: this.functionName,
         data: { action, ...input },
-      }))
+      })
+    } catch (error) {
+      const safe = toSafeAppError(error)
+      throw safe.code === 'INTERNAL_ERROR'
+        ? toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
+        : safe
+    }
+    try {
+      const response = functionResponseSchema.parse(rawResponse)
       const failed = errorEnvelopeSchema.safeParse(response.result)
       if (failed.success) throw toSafeAppError({ code: failed.data.error.code })
       const succeeded = successEnvelopeSchema.safeParse(response.result)

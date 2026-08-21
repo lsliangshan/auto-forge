@@ -1,3 +1,5 @@
+/* global fetch, process */
+
 export function readRpcConfig(env = process.env) {
   const baseUrl = env.AUTOFORGE_PG_RPC_BASE_URL?.trim()
   const serviceKey = env.AUTOFORGE_PG_SERVICE_KEY?.trim()

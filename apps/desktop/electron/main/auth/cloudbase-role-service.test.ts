@@ -52,4 +52,11 @@ describe('CloudBaseRoleService', () => {
     })
     await expect(service.ensureMyRole()).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
   })
+
+  it('maps CloudBase invocation failures to service unavailable', async () => {
+    const service = new CloudBaseRoleService({
+      callFunction: vi.fn().mockRejectedValue(new Error('network details')),
+    })
+    await expect(service.ensureMyRole()).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+  })
 })
