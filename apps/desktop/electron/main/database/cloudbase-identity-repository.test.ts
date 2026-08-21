@@ -29,6 +29,13 @@ function cloudSession(profile: AuthSession['user']['profile'] = {
       ...(profile === undefined ? {} : { profile }),
     },
     authenticatedAt: '2026-08-21T01:02:03.000Z',
+    authorization: {
+      role: 'user',
+      capabilities: [],
+      version: 0,
+      updatedAt: '2026-08-21T01:02:03.000Z',
+      confirmed: true,
+    },
   }
 }
 
@@ -40,7 +47,7 @@ afterEach(() => {
 
 describe('CloudBaseIdentityRepository', () => {
   it('atomically creates the CloudBase user, profile and current local session', () => {
-    const { database } = openTestDatabase()
+    const { database, path } = openTestDatabase()
 
     expect(database.cloudBaseIdentities.sync(cloudSession(), 100)).toEqual({
       user: { id: 'cloud_uid', account: 'alice_1' },
@@ -67,6 +74,46 @@ describe('CloudBaseIdentityRepository', () => {
       user: { id: 'cloud_uid', account: 'alice_1' },
       authenticatedAt: Date.parse('2026-08-21T01:02:03.000Z'),
     })
+    const inspect = new Database(path)
+    expect(inspect.prepare(`
+      SELECT role, version, cloud_updated_at AS cloudUpdatedAt, synced_at AS syncedAt
+      FROM local_user_roles WHERE user_id = 'cloud_uid'
+    `).get()).toEqual({
+      role: 'user',
+      version: 0,
+      cloudUpdatedAt: Date.parse('2026-08-21T01:02:03.000Z'),
+      syncedAt: 100,
+    })
+    inspect.close()
+    database.close()
+  })
+
+  it('updates and preserves an unknown future role projection without granting capabilities locally', () => {
+    const { database, path } = openTestDatabase()
+    database.cloudBaseIdentities.sync(cloudSession(), 100)
+
+    database.cloudBaseIdentities.sync({
+      ...cloudSession(),
+      authorization: {
+        role: 'support_operator',
+        capabilities: [],
+        version: 4,
+        updatedAt: '2026-08-21T02:00:00.000Z',
+        confirmed: true,
+      },
+    }, 200)
+
+    const inspect = new Database(path)
+    expect(inspect.prepare(`
+      SELECT role, version, cloud_updated_at AS cloudUpdatedAt, synced_at AS syncedAt
+      FROM local_user_roles WHERE user_id = 'cloud_uid'
+    `).get()).toEqual({
+      role: 'support_operator',
+      version: 4,
+      cloudUpdatedAt: Date.parse('2026-08-21T02:00:00.000Z'),
+      syncedAt: 200,
+    })
+    inspect.close()
     database.close()
   })
 
@@ -183,6 +230,8 @@ describe('CloudBaseIdentityRepository', () => {
       updatedAt: 1,
     })
     expect(inspect.prepare('SELECT COUNT(*) AS count FROM local_user_profiles').get())
+      .toEqual({ count: 0 })
+    expect(inspect.prepare('SELECT COUNT(*) AS count FROM local_user_roles').get())
       .toEqual({ count: 0 })
     expect(inspect.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
       .toEqual({ count: 0 })

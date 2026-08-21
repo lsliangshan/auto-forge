@@ -270,3 +270,18 @@ export const localAuthSession = sqliteTable('local_auth_session', {
   userId: text('user_id').notNull().references(() => localUsers.id, { onDelete: 'cascade' }),
   authenticatedAt: integer('authenticated_at').notNull(),
 })
+
+export const localUserRoles = sqliteTable('local_user_roles', {
+  userId: text('user_id').primaryKey().references(() => localUsers.id, { onDelete: 'cascade' }),
+  role: text('role').notNull(),
+  version: integer('version').notNull(),
+  cloudUpdatedAt: integer('cloud_updated_at').notNull(),
+  syncedAt: integer('synced_at').notNull(),
+}, (table) => [
+  check('local_user_roles_role_check', sql`
+    length(${table.role}) BETWEEN 1 AND 63
+    AND ${table.role} GLOB '[a-z]*'
+    AND ${table.role} NOT GLOB '*[^a-z0-9_]*'
+  `),
+  check('local_user_roles_version_check', sql`${table.version} >= 0`),
+])

@@ -56,7 +56,13 @@ export function createCloudBaseIdentityRepository(
 
   const sync = database.transaction((session: AuthSession, timestamp: number) => {
     const authenticatedAt = Date.parse(session.authenticatedAt)
-    if (!Number.isFinite(authenticatedAt) || !Number.isSafeInteger(timestamp)) {
+    const authorizationUpdatedAt = session.authorization
+      ? Date.parse(session.authorization.updatedAt)
+      : Number.NaN
+    if (!Number.isFinite(authenticatedAt)
+      || !Number.isFinite(authorizationUpdatedAt)
+      || !Number.isSafeInteger(timestamp)
+      || session.authorization?.confirmed !== true) {
       throw new Error('CloudBase identity session timestamps are invalid')
     }
 
@@ -112,6 +118,24 @@ export function createCloudBaseIdentityRepository(
         phone = excluded.phone,
         updated_at = excluded.updated_at
     `).run(profile)
+
+    database.prepare(`
+      INSERT INTO local_user_roles
+        (user_id, role, version, cloud_updated_at, synced_at)
+      VALUES
+        (@userId, @role, @version, @cloudUpdatedAt, @syncedAt)
+      ON CONFLICT(user_id) DO UPDATE SET
+        role = excluded.role,
+        version = excluded.version,
+        cloud_updated_at = excluded.cloud_updated_at,
+        synced_at = excluded.synced_at
+    `).run({
+      userId: session.user.id,
+      role: session.authorization.role,
+      version: session.authorization.version,
+      cloudUpdatedAt: authorizationUpdatedAt,
+      syncedAt: timestamp,
+    })
 
     database.prepare(`
       INSERT INTO local_auth_session (id, user_id, authenticated_at)
