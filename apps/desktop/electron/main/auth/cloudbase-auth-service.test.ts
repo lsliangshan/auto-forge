@@ -419,9 +419,11 @@ describe('CloudBaseAuthService', () => {
       ...contacts,
     })))
 
-    await expect(app.service.loginWithPassword({
+    const authenticated = await app.service.loginWithPassword({
       account: 'alice_1', password: 'password',
-    })).resolves.toMatchObject({ user: { profile: expectedProfile } })
+    })
+
+    expect(authenticated.user.profile).toEqual(expectedProfile)
   })
 
   it('updates editable CloudBase profile fields and persists the returned identity snapshot', async () => {
