@@ -18,6 +18,13 @@ export interface CloudBaseAuthPort {
   ): Promise<unknown>
   signInWithPassword(input: { username: string; password: string }): Promise<unknown>
   getSession(): Promise<unknown>
+  getUser(): Promise<unknown>
+  refreshUser(): Promise<unknown>
+  updateUser(input: {
+    nickname?: string
+    avatar_url?: string
+    gender?: 'MALE' | 'FEMALE' | 'OTHER' | 'PREFER_NOT_TO_SAY'
+  }): Promise<unknown>
   setSession(input: { access_token: string; refresh_token: string }): Promise<unknown>
   refreshSession(refreshToken?: string): Promise<unknown>
   signOut(): Promise<unknown>
