@@ -3740,6 +3740,21 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('creates workflow manifests that apply to all cities by default', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-cities-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    const project = await runtime.services.developer.createProject('All Cities')
+    const manifest = JSON.parse(
+      await runtime.services.developer.readFile(project.id, 'workflow.json'),
+    ) as Record<string, unknown>
+
+    expect(manifest.cities).toEqual([])
+
+    await runtime.close()
+  })
+
   it('composes real persistence-backed DesktopAPI services and recovers before use', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)

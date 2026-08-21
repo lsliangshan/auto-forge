@@ -32,6 +32,11 @@
     "description": { "type": "string" },
     "author": { "type": "string", "minLength": 1 },
     "category": { "type": "string", "minLength": 1 },
+    "cities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "\\S" }
+    },
     "entryPath": {
       "type": "string",
       "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"

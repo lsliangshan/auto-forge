@@ -62,6 +62,22 @@ describe('validateManifest', () => {
     }).valid).toBe(false)
   })
 
+  it('accepts all-city and multi-city workflow manifests', () => {
+    expect(validateManifest({ ...validManifest(), cities: [] }).valid).toBe(true)
+    expect(validateManifest({ ...validManifest(), cities: ['上海', '杭州'] }).valid).toBe(true)
+  })
+
+  it('rejects malformed or duplicate workflow cities', () => {
+    for (const cities of [
+      [''],
+      ['   '],
+      ['上海', '上海'],
+      '上海',
+    ]) {
+      expect(validateManifest({ ...validManifest(), cities }).valid).toBe(false)
+    }
+  })
+
   it('enforces identifier, version, path, hash, and timeout constraints', () => {
     const manifest = {
       id: 'com.autoforge.browser.search',

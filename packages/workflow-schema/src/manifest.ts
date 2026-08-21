@@ -7,6 +7,7 @@ export interface WorkflowManifest {
   description: string
   author: string
   category: string
+  cities?: string[]
   entryPath: string
   codeSha256: string
   permissions: WorkflowPermission[]

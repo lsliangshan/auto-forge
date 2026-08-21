@@ -5,6 +5,7 @@
   "description": "在可见的受控浏览器中打开百度并搜索关键词。",
   "author": "AutoForge",
   "category": "browser",
+  "cities": [],
   "entryPath": "dist/index.js",
   "codeSha256": "eb590513e408bcb74c5a3cfa3fbe3fb18f564a0685f4e63bd49851641ad4ed2d",
   "permissions": [

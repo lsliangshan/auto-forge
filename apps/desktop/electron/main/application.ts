@@ -459,6 +459,7 @@ function newManifest(name: string): WorkflowManifest {
     description: '',
     author: 'Local developer',
     category: 'local',
+    cities: [],
     entryPath: 'dist/index.js',
     codeSha256: '0'.repeat(64),
     permissions: [],
