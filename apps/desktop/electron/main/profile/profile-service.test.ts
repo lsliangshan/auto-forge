@@ -58,10 +58,15 @@ function harness(record?: UserProfileRecord) {
 }
 
 describe('ProfileService', () => {
-  it('returns an empty profile without creating a row', async () => {
+  it('returns CloudBase contacts without creating a local profile row', async () => {
     const app = harness()
 
-    await expect(app.service.get()).resolves.toEqual({ userId: 'user_1', account: 'Alice' })
+    await expect(app.service.get()).resolves.toEqual({
+      userId: 'user_1',
+      account: 'Alice',
+      email: 'alice@example.com',
+      phone: '+8613800138000',
+    })
     expect(app.repository.findByUserId).toHaveBeenCalledWith('user_1')
     expect(app.repository.upsert).not.toHaveBeenCalled()
   })

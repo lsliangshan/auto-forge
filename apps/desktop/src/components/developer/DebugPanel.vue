@@ -47,7 +47,7 @@
         <p v-for="(event, index) in developer.debugEvents" :key="`${event.type}:${event.occurredAt}:${index}`">{{ eventLine(event) }}</p>
       </div>
       <ol v-if="developer.debugDetail?.steps.length" class="debug-steps"><li v-for="step in developer.debugDetail.steps" :key="step.id">{{ step.label }} · {{ step.status }}</li></ol>
-      <div v-if="developer.debugDetail?.logs.length" class="debug-log"><p v-for="log in developer.debugDetail.logs" :key="log.id">[{{ log.level }}] {{ log.message }}</p></div>
+      <div v-if="developer.debugDetail?.logs.length && !hasLiveLogs" class="debug-log"><p v-for="log in developer.debugDetail.logs" :key="log.id">[{{ log.level }}] {{ log.message }}</p></div>
       <pre v-if="developer.debugDetail?.output !== undefined">{{ JSON.stringify(developer.debugDetail.output, null, 2) }}</pre>
     </section>
   </div>
@@ -77,6 +77,7 @@ const objectFields = computed<Field[]>(() => {
 })
 const active = computed(() => ['starting', 'queued', 'awaiting_approval', 'running'].includes(developer.debugStatus))
 const statusLabel = computed(() => ({ idle: '未运行', starting: '启动中', queued: '排队中', awaiting_approval: '等待授权', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[developer.debugStatus])
+const hasLiveLogs = computed(() => developer.debugEvents.some((event) => event.type === 'log'))
 
 function setPrimitive(field: Field, value: string) {
   if (!value) { delete inputObject()[field.name]; return }

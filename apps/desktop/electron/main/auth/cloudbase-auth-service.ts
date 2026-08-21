@@ -274,13 +274,16 @@ function providerUser(value: Record<string, unknown>, fallback?: AuthUser): Auth
       ? emailValue
       : undefined
   const phoneValue = providerText([{ source: value, key: 'phone' }])
+  const normalizedPhone = typeof phoneValue === 'string'
+    ? phoneValue.replace(/\s+/g, '')
+    : phoneValue
   const phoneConfirmed = safeAccount(providerText([
     { source: value, key: 'phone_confirmed_at' },
   ]))
-  const phone = phoneValue === null
+  const phone = normalizedPhone === null
     ? null
-    : phoneValue !== undefined && phoneConfirmed && providerPhoneSchema.safeParse(phoneValue).success
-      ? phoneValue
+    : normalizedPhone !== undefined && phoneConfirmed && providerPhoneSchema.safeParse(normalizedPhone).success
+      ? normalizedPhone
       : undefined
   const providedProfile = {
     ...(displayName !== undefined ? { displayName } : {}),

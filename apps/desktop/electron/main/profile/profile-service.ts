@@ -43,6 +43,8 @@ function mergeCloudField<T>(value: T | null | undefined, stored: T | null | unde
 }
 
 function composeProfile(user: AuthUser, record?: UserProfileRecord): UserProfile {
+  const email = mergeCloudField(user.profile?.email, record?.email)
+  const phone = mergeCloudField(user.profile?.phone, record?.phone)
   return userProfileSchema.parse({
     userId: user.id,
     account: user.account,
@@ -50,8 +52,8 @@ function composeProfile(user: AuthUser, record?: UserProfileRecord): UserProfile
     ...(record?.displayName ? { displayName: record.displayName } : {}),
     ...(record?.gender ? { gender: record.gender } : {}),
     ...(record?.birthDate ? { birthDate: record.birthDate } : {}),
-    ...(record?.email ? { email: record.email } : {}),
-    ...(record?.phone ? { phone: record.phone } : {}),
+    ...(email ? { email } : {}),
+    ...(phone ? { phone } : {}),
     ...(record ? { updatedAt: new Date(record.updatedAt).toISOString() } : {}),
   })
 }

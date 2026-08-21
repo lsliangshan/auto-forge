@@ -209,14 +209,46 @@ describe('ElectronBrowserWorkspace', () => {
     const toolbar = views[0]!
     const target = views[1]!
 
+    target.webContents.currentUrl = 'https://www.baidu.com/s?wd=热点新闻'
     target.webContents.emit('did-start-loading')
     await vi.waitFor(() => expect(toolbar.bounds.at(-1)?.height).toBe(800))
     expect(windows[0]!.children.at(-1)).toBe(toolbar)
     const loadingDocument = decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!)
-    expect(loadingDocument).toContain('正在加载网页')
+    expect(loadingDocument).toContain('正在连接 <span>www.baidu.com</span>')
+    expect(loadingDocument).toContain('请求站点')
+    expect(loadingDocument).toContain('建立连接')
+    expect(loadingDocument).toContain('等待响应')
+    expect(loadingDocument).toContain('class="connection-orbit"')
+    expect(loadingDocument).toContain('@media(prefers-reduced-motion:reduce)')
 
     target.webContents.emit('did-stop-loading')
     await vi.waitFor(() => expect(toolbar.bounds.at(-1)?.height).toBe(52))
+  })
+
+  it('keeps one stable loading document while navigation metadata changes', async () => {
+    const { workspace, views } = createHarness()
+    await acquire(workspace, 'exec_1')
+    const toolbar = views[0]!
+    const target = views[1]!
+
+    const beforeLoading = toolbar.webContents.loaded.length
+    target.webContents.emit('did-start-loading')
+    await vi.waitFor(() => expect(toolbar.webContents.loaded).toHaveLength(beforeLoading + 1))
+
+    target.webContents.title = '最终页面'
+    target.webContents.currentUrl = 'https://example.com/final'
+    target.webContents.emit('page-title-updated')
+    target.webContents.emit('did-navigate')
+    target.webContents.emit('did-navigate-in-page')
+    await Promise.resolve()
+
+    expect(toolbar.webContents.loaded).toHaveLength(beforeLoading + 1)
+
+    target.webContents.emit('did-stop-loading')
+    await vi.waitFor(() => expect(toolbar.webContents.loaded).toHaveLength(beforeLoading + 2))
+    const settledDocument = decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!)
+    expect(settledDocument).toContain('最终页面')
+    expect(settledDocument).toContain('https://example.com/final')
   })
 
   it('starts persistent session setup before the browser toolbar finishes loading', async () => {

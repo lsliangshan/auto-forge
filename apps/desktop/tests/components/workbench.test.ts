@@ -1315,6 +1315,146 @@ describe('workbench', () => {
     }
   })
 
+  it('switches saved grants between workflow and capability tabs with matching filters', async () => {
+    const api = createApi()
+    vi.mocked(api.permissions.listGrants).mockResolvedValue([
+      {
+        id: 'grant_1', workflowId: 'search.real', workflowVersion: '1.2.3',
+        capability: 'browser.open', scope: { origins: ['https://example.com'] },
+        createdAt: '2026-07-19T00:00:00.000Z',
+      },
+      {
+        id: 'grant_2', workflowId: 'search.real', workflowVersion: '1.2.3',
+        capability: 'browser.open', scope: { origins: ['https://search.example.com'] },
+        createdAt: '2026-07-19T00:01:00.000Z',
+      },
+      {
+        id: 'grant_3', workflowId: 'search.real', workflowVersion: '1.2.3',
+        capability: 'browser.click', scope: { origins: ['https://example.com'] },
+        createdAt: '2026-07-19T00:02:00.000Z',
+      },
+      {
+        id: 'grant_4', workflowId: 'files.audit', workflowVersion: '2.0.0',
+        capability: 'filesystem.read', scope: { paths: ['/Users/demo/Documents'] },
+        createdAt: '2026-07-19T00:03:00.000Z',
+      },
+    ])
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.findAll('.grant-row')).toHaveLength(4))
+
+    expect(wrapper.findAll('[data-testid="grant-view-tabs"] .el-tabs__item').map((tab) => tab.text()))
+      .toEqual(['按工作流', '按功能'])
+    expect(wrapper.get('#tab-workflow').attributes('aria-selected')).toBe('true')
+    expect(wrapper.findAll('.grant-table-head')).toHaveLength(1)
+    expect(wrapper.findAll('.grant-table-head th').map((cell) => cell.text()))
+      .toEqual(['工作流', '功能', '授权范围', '操作'])
+    expect(wrapper.find('.grant-workflow-group').exists()).toBe(false)
+
+    const workflowFilter = wrapper.getComponent('[data-testid="grant-workflow-filter"]')
+    expect(workflowFilter.findAllComponents({ name: 'ElOption' }).map((option) => option.props('label')))
+      .toEqual(['全部工作流', 'search.real · v1.2.3', 'files.audit · v2.0.0'])
+    workflowFilter.vm.$emit('update:modelValue', '["files.audit","2.0.0"]')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.grant-row')).toHaveLength(1)
+    expect(wrapper.get('.grant-row').text()).toContain('/Users/demo/Documents')
+    expect(wrapper.get('.grant-row').text()).not.toContain('search.real')
+
+    await wrapper.get('#tab-capability').trigger('click')
+    expect(wrapper.findAll('.grant-table-head th').map((cell) => cell.text()))
+      .toEqual(['功能', '工作流', '授权范围', '操作'])
+    expect(wrapper.findAll('.grant-row')).toHaveLength(4)
+    const capabilityFilter = wrapper.getComponent('[data-testid="grant-capability-filter"]')
+    expect(capabilityFilter.findAllComponents({ name: 'ElOption' }).map((option) => option.props('label')))
+      .toEqual(['全部功能', '打开网页 · browser.open', '操作网页 · browser.click', '读取文件 · filesystem.read'])
+    capabilityFilter.vm.$emit('update:modelValue', 'browser.open')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.findAll('.grant-row')).toHaveLength(2)
+    expect(wrapper.findAll('.grant-row').every((row) => row.text().includes('browser.open'))).toBe(true)
+  })
+
+  it('refreshes saved grants when returning to settings after a persistent approval', async () => {
+    const api = createApi()
+    vi.mocked(api.permissions.listGrants)
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([{
+        id: 'grant_new', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0',
+        capability: 'browser.open', scope: { origins: ['https://www.baidu.com'] },
+        createdAt: '2026-08-21T00:00:00.000Z',
+    }])
+
+    const { wrapper, router } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('暂无已保存授权'))
+    expect(api.permissions.listGrants).toHaveBeenCalledTimes(1)
+
+    await router.push('/chat')
+    await wrapper.vm.$nextTick()
+    await router.push('/settings')
+
+    await vi.waitFor(() => expect(wrapper.text()).toContain('browser.search.baidu'))
+    expect(api.permissions.listGrants).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('https://www.baidu.com')
+  })
+
+  it('resets an unavailable workflow filter after revoking its last grant', async () => {
+    const api = createApi()
+    vi.mocked(api.permissions.listGrants).mockResolvedValue([
+      {
+        id: 'grant_1', workflowId: 'search.real', workflowVersion: '1.2.3',
+        capability: 'browser.open', scope: { origins: ['https://example.com'] },
+        createdAt: '2026-07-19T00:00:00.000Z',
+      },
+      {
+        id: 'grant_2', workflowId: 'files.audit', workflowVersion: '2.0.0',
+        capability: 'filesystem.read', scope: { paths: ['/Users/demo/Documents'] },
+        createdAt: '2026-07-19T00:01:00.000Z',
+      },
+    ])
+    vi.mocked(api.permissions.revoke).mockResolvedValue(undefined)
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.findAll('.grant-row')).toHaveLength(2))
+    const workflowFilter = wrapper.getComponent('[data-testid="grant-workflow-filter"]')
+    workflowFilter.vm.$emit('update:modelValue', '["files.audit","2.0.0"]')
+    await wrapper.vm.$nextTick()
+    await wrapper.get('.grant-row button').trigger('click')
+
+    await vi.waitFor(() => expect(api.permissions.revoke).toHaveBeenCalledWith('grant_2'))
+    await vi.waitFor(() => expect(workflowFilter.props('modelValue')).toBe(''))
+    expect(wrapper.findAll('.grant-row')).toHaveLength(1)
+    expect(wrapper.get('.grant-row').text()).toContain('search.real')
+  })
+
+  it('resets an unavailable capability filter after revoking its last grant', async () => {
+    const api = createApi()
+    vi.mocked(api.permissions.listGrants).mockResolvedValue([
+      {
+        id: 'grant_1', workflowId: 'search.real', workflowVersion: '1.2.3',
+        capability: 'browser.open', scope: { origins: ['https://example.com'] },
+        createdAt: '2026-07-19T00:00:00.000Z',
+      },
+      {
+        id: 'grant_2', workflowId: 'files.audit', workflowVersion: '2.0.0',
+        capability: 'filesystem.read', scope: { paths: ['/Users/demo/Documents'] },
+        createdAt: '2026-07-19T00:01:00.000Z',
+      },
+    ])
+    vi.mocked(api.permissions.revoke).mockResolvedValue(undefined)
+
+    const { wrapper } = await mountApp('/settings', api)
+    await vi.waitFor(() => expect(wrapper.findAll('.grant-row')).toHaveLength(2))
+    await wrapper.get('#tab-capability').trigger('click')
+    const capabilityFilter = wrapper.getComponent('[data-testid="grant-capability-filter"]')
+    capabilityFilter.vm.$emit('update:modelValue', 'browser.open')
+    await wrapper.vm.$nextTick()
+    await wrapper.get('.grant-row button').trigger('click')
+
+    await vi.waitFor(() => expect(api.permissions.revoke).toHaveBeenCalledWith('grant_1'))
+    await vi.waitFor(() => expect(capabilityFilter.props('modelValue')).toBe(''))
+    expect(wrapper.findAll('.grant-row')).toHaveLength(1)
+    expect(wrapper.get('.grant-row').text()).toContain('filesystem.read')
+  })
+
   it('loads app information and revokes an exact saved permission grant', async () => {
     const api = createApi()
     vi.mocked(api.permissions.listGrants).mockResolvedValue([{
@@ -1326,13 +1466,13 @@ describe('workbench', () => {
     vi.mocked(api.system.getAppInfo).mockResolvedValue({ version: '1.4.0', platform: 'win32' })
 
     const { wrapper } = await mountApp('/settings', api)
-    await vi.waitFor(() => expect(wrapper.text()).toContain('search.real · 1.2.3'))
+    await vi.waitFor(() => expect(wrapper.findAll('.grant-row')).toHaveLength(1))
     expect(wrapper.text()).toContain('1.4.0')
     expect(wrapper.text()).toContain('Windows')
     expect(wrapper.text()).toContain('https://example.com')
     await wrapper.get('.grant-row button').trigger('click')
     await vi.waitFor(() => expect(api.permissions.revoke).toHaveBeenCalledWith('grant_1'))
-    expect(wrapper.text()).not.toContain('search.real · 1.2.3')
+    expect(wrapper.find('.grant-row').exists()).toBe(false)
   })
 
   it('folds the inspector when the viewport crosses below 1180 and removes the listener on unmount', async () => {

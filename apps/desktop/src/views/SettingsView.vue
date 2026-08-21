@@ -289,16 +289,134 @@
           v-else
           class="grant-list"
         >
-          <div
-            v-for="grant in settings.grants"
-            :key="grant.id"
-            class="grant-row"
-          ><div><strong>{{ grant.workflowId }} · {{ grant.workflowVersion }}</strong><small>{{ grant.capability }}</small><small>{{ formatScope(grant.scope) }}</small></div><el-button
-            type="danger"
-            text
-            :disabled="settings.saving"
-            @click="settings.revokeGrant(grant.id)"
-          >撤销</el-button></div>
+          <el-tabs
+            v-model="grantView"
+            class="grant-view-tabs"
+            data-testid="grant-view-tabs"
+          >
+            <el-tab-pane
+              label="按工作流"
+              name="workflow"
+            />
+            <el-tab-pane
+              label="按功能"
+              name="capability"
+            />
+          </el-tabs>
+          <div class="grant-filter-bar">
+            <label v-if="grantView === 'workflow'">
+              <span>工作流筛选</span><el-select
+                v-model="workflowFilter"
+                data-testid="grant-workflow-filter"
+              >
+                <el-option
+                  label="全部工作流"
+                  value=""
+                />
+                <el-option
+                  v-for="option in workflowOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+            </label>
+            <label v-else>
+              <span>功能筛选</span><el-select
+                v-model="capabilityFilter"
+                data-testid="grant-capability-filter"
+              >
+                <el-option
+                  label="全部功能"
+                  value=""
+                />
+                <el-option
+                  v-for="option in capabilityOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+            </label><span class="grant-result-count">显示 {{ filteredGrants.length }} / {{ settings.grants.length }} 项</span>
+          </div>
+          <div class="grant-table-wrap">
+            <table class="grant-table">
+              <thead class="grant-table-head">
+                <tr>
+                  <template v-if="grantView === 'workflow'">
+                    <th scope="col">
+                      工作流
+                    </th><th scope="col">
+                      功能
+                    </th>
+                  </template>
+                  <template v-else>
+                    <th scope="col">
+                      功能
+                    </th><th scope="col">
+                      工作流
+                    </th>
+                  </template>
+                  <th scope="col">
+                    授权范围
+                  </th><th scope="col">
+                    操作
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="grant in filteredGrants"
+                  :key="grant.id"
+                  class="grant-row"
+                >
+                  <template v-if="grantView === 'workflow'">
+                    <td class="grant-workflow-cell">
+                      <div class="grant-workflow-value">
+                        <strong>{{ grant.workflowId }}</strong><span>v{{ grant.workflowVersion }}</span>
+                      </div>
+                    </td>
+                    <td class="grant-capability-cell">
+                      <div class="grant-capability-value">
+                        <strong>{{ capabilityLabels[grant.capability] }}</strong><code>{{ grant.capability }}</code>
+                      </div>
+                    </td>
+                  </template>
+                  <template v-else>
+                    <td class="grant-capability-cell">
+                      <div class="grant-capability-value">
+                        <strong>{{ capabilityLabels[grant.capability] }}</strong><code>{{ grant.capability }}</code>
+                      </div>
+                    </td>
+                    <td class="grant-workflow-cell">
+                      <div class="grant-workflow-value">
+                        <strong>{{ grant.workflowId }}</strong><span>v{{ grant.workflowVersion }}</span>
+                      </div>
+                    </td>
+                  </template>
+                  <td class="grant-scope-cell">
+                    <div class="grant-scope-values">
+                      <code
+                        v-for="value in scopeValues(grant.scope)"
+                        :key="value"
+                      >{{ value }}</code>
+                    </div>
+                  </td>
+                  <td class="grant-action-cell">
+                    <el-button
+                      type="danger"
+                      text
+                      :disabled="settings.saving"
+                      :aria-label="`撤销 ${capabilityLabels[grant.capability]}：${scopeValues(grant.scope).join('、')}`"
+                      @click="settings.revokeGrant(grant.id)"
+                    >
+                      撤销
+                    </el-button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
       <section
@@ -319,6 +437,7 @@ import {
   parseProxyBypassText,
   type ModelInfo,
   type ModelProviderId,
+  type PermissionGrant,
   type ProxySettings,
 } from '@autoforge/shared'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -404,7 +523,9 @@ watch(() => settings.settings?.proxy, (proxy) => {
 
 onMounted(async () => {
   await Promise.all([
-    !settings.settings && !settings.loading ? settings.load() : Promise.resolve(),
+    settings.settings
+      ? settings.refreshGrants()
+      : !settings.loading ? settings.load() : Promise.resolve(),
     settings.loadTokenUsage(),
   ])
 })
@@ -489,7 +610,64 @@ async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
     ElMessage.success('本地数据已清理')
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
 }
-const formatScope = (scope: { origins?: string[]; paths?: string[] }) => JSON.stringify(scope)
+const capabilityLabels: Record<PermissionGrant['capability'], string> = {
+  'browser.open': '打开网页',
+  'browser.fill': '填写网页内容',
+  'browser.click': '操作网页',
+  'browser.url': '读取网页地址',
+  'browser.close': '关闭网页',
+  'network.fetch': '访问网络',
+  'filesystem.read': '读取文件',
+  'filesystem.write': '写入文件',
+  'clipboard.read': '读取剪贴板',
+  'clipboard.write': '写入剪贴板',
+  'notification.send': '发送通知',
+  'artifact.create': '创建产物',
+}
+
+type GrantView = 'workflow' | 'capability'
+const grantView = ref<GrantView>('workflow')
+const workflowFilter = ref('')
+const capabilityFilter = ref<PermissionGrant['capability'] | ''>('')
+
+const workflowOptions = computed(() => {
+  const options = new Map<string, string>()
+  for (const grant of settings.grants) {
+    const value = JSON.stringify([grant.workflowId, grant.workflowVersion])
+    if (!options.has(value)) options.set(value, `${grant.workflowId} · v${grant.workflowVersion}`)
+  }
+  return [...options].map(([value, label]) => ({ value, label }))
+})
+
+const capabilityOptions = computed(() => {
+  const capabilities = new Set(settings.grants.map(({ capability }) => capability))
+  return [...capabilities].map((value) => ({ value, label: `${capabilityLabels[value]} · ${value}` }))
+})
+
+const filteredGrants = computed(() => settings.grants.filter((grant) => {
+  if (grantView.value === 'workflow') {
+    return !workflowFilter.value
+      || JSON.stringify([grant.workflowId, grant.workflowVersion]) === workflowFilter.value
+  }
+  return !capabilityFilter.value || grant.capability === capabilityFilter.value
+}))
+
+watch(workflowOptions, (options) => {
+  if (workflowFilter.value && !options.some(({ value }) => value === workflowFilter.value)) {
+    workflowFilter.value = ''
+  }
+})
+watch(capabilityOptions, (options) => {
+  if (capabilityFilter.value && !options.some(({ value }) => value === capabilityFilter.value)) {
+    capabilityFilter.value = ''
+  }
+})
+
+const scopeValues = (scope: PermissionGrant['scope']): string[] => {
+  if ('origins' in scope) return scope.origins
+  if ('paths' in scope) return scope.paths
+  return ['无需额外范围']
+}
 </script>
 
 <style scoped>
@@ -499,5 +677,5 @@ const formatScope = (scope: { origins?: string[]; paths?: string[] }) => JSON.st
 .proxy-validation-error { color: var(--af-danger); }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding-top: 15px; }.settings-grid label:not(.switch-row) { display: grid; gap: 7px; }.switch-row { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 0; }.model-id { float: right; margin-left: 18px; color: var(--af-text-muted); }
 .danger-zone { border-color: var(--af-danger-border); }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
-.grant-list { margin-top: 12px; }.grant-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 10px 0; }.grant-row div { display: grid; gap: 3px; }.grant-row strong { font-size: 12px; }.grant-row small { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 11px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }
+.grant-list { margin-top: 12px; }.grant-view-tabs :deep(.el-tabs__header) { margin-bottom: 10px; }.grant-filter-bar { display: flex; align-items: end; justify-content: space-between; gap: 16px; border: 1px solid var(--af-border); border-bottom: 0; padding: 10px 12px; background: var(--af-surface-muted); }.grant-filter-bar label { display: grid; width: min(360px, 65%); gap: 5px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; }.grant-result-count { flex: none; padding-bottom: 7px; color: var(--af-text-muted); font-size: 10px; }.grant-table-wrap { overflow-x: auto; border: 1px solid var(--af-border); }.grant-table { width: 100%; min-width: 680px; border-collapse: collapse; table-layout: fixed; background: var(--af-surface); }.grant-table th { padding: 8px 10px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 10px; font-weight: 700; text-align: left; }.grant-table th:last-child { width: 58px; text-align: right; }.grant-table td { border-top: 1px solid var(--af-border); padding: 10px; vertical-align: middle; }.grant-workflow-cell, .grant-capability-cell { width: 23%; }.grant-scope-cell { width: auto; }.grant-action-cell { width: 58px; text-align: right; }.grant-workflow-value, .grant-capability-value { display: grid; gap: 3px; }.grant-workflow-value strong, .grant-capability-value strong { overflow-wrap: anywhere; color: var(--af-graphite); font-size: 11px; }.grant-workflow-value span, .grant-capability-value code { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 10px; }.grant-scope-values { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }.grant-scope-values code { max-width: 100%; overflow-wrap: anywhere; border: 1px solid var(--af-border); border-radius: 4px; padding: 3px 6px; color: var(--af-text); background: var(--af-surface-muted); font-size: 10px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }
 </style>

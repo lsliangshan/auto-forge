@@ -28,16 +28,18 @@ interface DeveloperRuntime {
   queues: Map<string, Promise<void>>
   unsubscribe?: () => void
   pendingEvents: ExecutionEvent[]
+  lifecycleWrapped: boolean
 }
 
-const runtimes = new WeakMap<object, DeveloperRuntime>()
-const wrapped = new WeakSet<object>()
+const runtimeKey = Symbol.for('autoforge.developer.runtime')
 
 function runtime(store: object): DeveloperRuntime {
-  const existing = runtimes.get(store)
+  const existing = Reflect.get(store, runtimeKey) as DeveloperRuntime | undefined
   if (existing) return existing
-  const created: DeveloperRuntime = { timers: new Map(), queues: new Map(), pendingEvents: [] }
-  runtimes.set(store, created)
+  const created: DeveloperRuntime = {
+    timers: new Map(), queues: new Map(), pendingEvents: [], lifecycleWrapped: false,
+  }
+  Reflect.defineProperty(store, runtimeKey, { configurable: true, value: created })
   return created
 }
 
@@ -124,15 +126,15 @@ export const useDeveloperStore = defineStore('developer', {
       if (!state.unsubscribe) {
         state.unsubscribe = getDesktopApi().executions.onEvent((event) => this._receiveExecutionEvent(event))
       }
-      if (wrapped.has(this)) return
-      wrapped.add(this)
+      if (state.lifecycleWrapped) return
+      state.lifecycleWrapped = true
       const dispose = this.$dispose.bind(this)
       this.$dispose = () => {
         void this.flushPendingSaves()
         for (const timer of state.timers.values()) clearTimeout(timer)
         state.timers.clear()
         state.unsubscribe?.()
-        runtimes.delete(this)
+        Reflect.deleteProperty(this, runtimeKey)
         dispose()
       }
     },

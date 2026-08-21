@@ -663,6 +663,38 @@ describe('developer workbench', () => {
     expect(raw.developer.run).toHaveBeenNthCalledWith(2, { projectId: 'project_1', input: { keyword: '今日天气' } })
   })
 
+  it('renders a live execution log only once after terminal details load', async () => {
+    const { api, raw, emit } = createApi()
+    raw.executions.get.mockResolvedValue({
+      id: 'exec_1', workflowId: 'browser.search.baidu', workflowVersion: '1.0.0', status: 'completed',
+      createdAt: '2026-08-21T00:00:00.000Z', input: {}, output: { success: true }, steps: [],
+      logs: [{
+        id: 'log_1', executionId: 'exec_1', sequence: 0, level: 'info',
+        message: '正在使用百度搜索：今日天气', createdAt: '2026-08-21T00:00:01.000Z',
+      }],
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+    store.debugInput = { keyword: '今日天气' }
+    await store.runDebug()
+    const wrapper = mount(DebugPanel, { global: { plugins: [ElementPlus] } })
+
+    emit({
+      type: 'log', executionId: 'exec_1', level: 'info', message: '正在使用百度搜索：今日天气',
+      occurredAt: '2026-08-21T00:00:01.000Z',
+    })
+    emit({
+      type: 'status', executionId: 'exec_1', status: 'completed',
+      occurredAt: '2026-08-21T00:00:02.000Z',
+    })
+
+    await vi.waitFor(() => expect(store.debugDetail?.logs).toHaveLength(1))
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text().split('正在使用百度搜索：今日天气')).toHaveLength(2)
+  })
+
   it('isolates execution events, handles approvals, and cancels only the active debug run', async () => {
     const { api, raw, emit } = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

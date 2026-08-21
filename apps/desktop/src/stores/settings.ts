@@ -97,6 +97,14 @@ export const useSettingsStore = defineStore('settings', {
     },
   },
   actions: {
+    async refreshGrants() {
+      this.error = ''
+      try {
+        this.grants = await getDesktopApi().permissions.listGrants()
+      } catch (error) {
+        this.error = displayError(error, '授权列表加载失败')
+      }
+    },
     async loadTokenUsage() {
       const version = ++this._tokenUsageVersion
       this.tokenUsageLoading = true

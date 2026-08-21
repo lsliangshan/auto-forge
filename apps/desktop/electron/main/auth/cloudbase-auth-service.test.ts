@@ -348,7 +348,7 @@ describe('CloudBaseAuthService', () => {
       username: 'alice_1',
       email: 'alice@example.com',
       email_confirmed_at: '2026-08-20T00:00:00.000Z',
-      phone: '+8618311032722',
+      phone: '+86 18311032722',
       phone_confirmed_at: '2026-08-20T00:00:00.000Z',
       user_metadata: {
         nickname: 'Alice Zhang',
