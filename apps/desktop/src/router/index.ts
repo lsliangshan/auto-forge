@@ -1,5 +1,5 @@
 import { createRouter, createWebHashHistory, type NavigationGuard, type RouteRecordRaw } from 'vue-router'
-import type { AuthSession } from '@autoforge/shared'
+import { hasBusinessCapability, type AuthSession } from '@autoforge/shared'
 import WorkbenchLayout from '../layouts/WorkbenchLayout.vue'
 import ChatView from '../views/ChatView.vue'
 import DeveloperView from '../views/DeveloperView.vue'
@@ -20,13 +20,21 @@ export function safeRedirect(value: unknown): string {
   return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : '/chat'
 }
 
-export function createAuthGuard(auth: AuthGuardState): NavigationGuard {
+export function createAuthGuard(
+  auth: AuthGuardState,
+  notifyForbidden: () => void = () => undefined,
+): NavigationGuard {
   return async (to) => {
     if (!auth.initialized) await auth.restore()
     if (to.meta.requiresAuth && !auth.session) {
       return { name: 'login', query: { redirect: to.fullPath } }
     }
     if (to.meta.guestOnly && auth.session) return '/chat'
+    if (to.meta.capability === 'manage_users'
+      && !hasBusinessCapability(auth.session?.authorization, 'manage_users')) {
+      notifyForbidden()
+      return '/chat'
+    }
   }
 }
 
@@ -43,6 +51,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'workflows', name: 'workflows', component: WorkflowsView, meta: { title: '工作流', inspector: true } },
       { path: 'developer', name: 'developer', component: DeveloperView, meta: { title: '开发', inspector: true } },
       { path: 'executions', name: 'executions', component: ExecutionsView, meta: { title: '执行记录', inspector: true } },
+      { path: 'users', name: 'users', component: () => import('../views/UserManagementView.vue'), meta: { title: '用户管理', inspector: false, capability: 'manage_users' } },
       { path: 'settings', name: 'settings', component: SettingsView, meta: { title: '设置', inspector: false } },
       { path: 'profile', name: 'profile', component: ProfileView, meta: { title: '个人资料', inspector: false } },
     ],

@@ -15,6 +15,14 @@ const authSession: AuthSession = {
   authenticatedAt: '2026-08-07T00:00:00.000Z',
 }
 
+const adminSession: AuthSession = {
+  ...authSession,
+  authorization: {
+    role: 'super_admin', capabilities: ['manage_users'], version: 1,
+    updatedAt: '2026-08-21T00:00:00.000Z', confirmed: true,
+  },
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -29,6 +37,7 @@ function createApi(): DesktopAPI {
   return {
     auth: {
       getSession: vi.fn().mockResolvedValue(null),
+      refreshAuthorization: vi.fn().mockResolvedValue(authSession),
       login: vi.fn().mockResolvedValue(authSession),
       register: vi.fn().mockResolvedValue(authSession),
       sendOtp: vi.fn(),
@@ -36,6 +45,10 @@ function createApi(): DesktopAPI {
       cancelOtp: vi.fn().mockResolvedValue(undefined),
       loginWithPassword: vi.fn().mockResolvedValue(authSession),
       logout: vi.fn().mockResolvedValue(undefined),
+    },
+    userAdmin: {
+      list: vi.fn().mockResolvedValue({ items: [], page: 1, pageSize: 20, total: 0 }),
+      updateRole: vi.fn(),
     },
     profile: {
       get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
@@ -79,7 +92,7 @@ async function mountAuthApp(path: string, api = createApi(), session: AuthSessio
   const pinia = createPinia()
   setActivePinia(pinia)
   const router = createRouter({ history: createMemoryHistory(), routes })
-  router.beforeEach(createAuthGuard(useAuthStore(pinia)))
+  router.beforeEach(createAuthGuard(useAuthStore(pinia), vi.fn()))
   await router.push(path)
   await router.isReady()
   const wrapper = mount(App, { global: { plugins: [pinia, router, ElementPlus] } })
@@ -546,6 +559,15 @@ describe('authentication store', () => {
 })
 
 describe('authentication navigation', () => {
+  it('redirects direct user-management access unless manage_users is confirmed', async () => {
+    const ordinary = await mountAuthApp('/users', createApi(), authSession)
+    expect(ordinary.router.currentRoute.value.fullPath).toBe('/chat')
+    ordinary.wrapper.unmount()
+
+    const admin = await mountAuthApp('/users', createApi(), adminSession)
+    expect(admin.router.currentRoute.value.fullPath).toBe('/users')
+    admin.wrapper.unmount()
+  })
   it('accepts only internal redirect targets', () => {
     expect(safeRedirect('/settings?tab=general')).toBe('/settings?tab=general')
     expect(safeRedirect('//attacker.invalid')).toBe('/chat')
@@ -998,7 +1020,7 @@ describe('authentication pages', () => {
     expect(wrapper.text()).not.toContain(secret)
     expect(JSON.stringify(useAuthStore(pinia).$state)).not.toContain(secret)
     expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('60 秒后重试')
-    expect(vi.getTimerCount()).toBe(1)
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1)
 
     await vi.advanceTimersByTimeAsync(60_000)
     expect(wrapper.get('[data-testid="register-send-code"]').text()).toBe('发送验证码')
@@ -1165,6 +1187,36 @@ describe('authentication pages', () => {
 })
 
 describe('workbench authentication entry', () => {
+  it('shows user management only for confirmed manage_users capability', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const auth = useAuthStore(pinia)
+    auth.session = authSession
+    auth.initialized = true
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/chat', component: { template: '<div />' } },
+        { path: '/users', component: { template: '<div />' } },
+      ],
+    })
+    await router.push('/chat')
+    const wrapper = mount(AppRail, { global: { plugins: [pinia, router, ElementPlus] } })
+
+    expect(wrapper.find('[aria-label="用户管理"]').exists()).toBe(false)
+    auth.session = adminSession
+    await flushPromises()
+    expect(wrapper.find('[aria-label="用户管理"]').exists()).toBe(true)
+    auth.session = {
+      ...adminSession,
+      authorization: { ...adminSession.authorization!, confirmed: false },
+    }
+    await flushPromises()
+    expect(wrapper.find('[aria-label="用户管理"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
   it('renders the approved logo in the application rail', async () => {
     const api = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })

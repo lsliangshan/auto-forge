@@ -1,7 +1,7 @@
 <template>
   <div class="workbench">
     <AppRail />
-    <ContextSidebar v-if="route.name !== 'profile'" />
+    <ContextSidebar v-if="!['profile', 'users'].includes(String(route.name))" />
     <main
       class="workspace"
       tabindex="-1"

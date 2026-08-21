@@ -72,7 +72,7 @@
 </template>
 
 <script setup lang="ts">
-import { ChatDotRound, Clock, Operation, Setting, SwitchButton, Tools } from '@element-plus/icons-vue'
+import { ChatDotRound, Clock, Operation, Setting, SwitchButton, Tools, User } from '@element-plus/icons-vue'
 import { computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
@@ -85,13 +85,14 @@ const router = useRouter()
 const accountLabel = computed(() => profile.profile?.displayName ?? auth.session?.user.account ?? '')
 const accountInitial = computed(() => (auth.session?.user.account ?? '?').charAt(0).toUpperCase())
 
-const items = [
+const items = computed(() => [
   { to: '/chat', label: '聊天', icon: ChatDotRound },
   { to: '/workflows', label: '工作流', icon: Operation },
   { to: '/developer', label: '开发', icon: Tools },
   { to: '/executions', label: '执行记录', icon: Clock },
+  ...(auth.canManageUsers ? [{ to: '/users', label: '用户管理', icon: User }] : []),
   { to: '/settings', label: '设置', icon: Setting },
-]
+])
 
 async function logout() {
   if (await auth.logout()) {

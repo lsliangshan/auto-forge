@@ -144,6 +144,13 @@ export const authorizationSnapshotSchema = z.object({
 }).strict()
 export type AuthorizationSnapshot = z.infer<typeof authorizationSnapshotSchema>
 
+export function hasBusinessCapability(
+  authorization: AuthorizationSnapshot | undefined,
+  capability: BusinessCapability,
+): boolean {
+  return authorization?.confirmed === true && authorization.capabilities.includes(capability)
+}
+
 export const authSessionSchema = z.object({
   user: authUserSchema,
   authenticatedAt: timestampSchema,

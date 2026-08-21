@@ -11,7 +11,7 @@ export class DesktopBridgeUnavailableError extends Error {
 
 export function getDesktopApi(): DesktopAPI {
   const api = window.autoForge
-  if (!api?.auth || !api?.profile || !api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
+  if (!api?.auth || !api?.profile || !api?.userAdmin || !api?.chat || !api?.workflows || !api?.executions || !api?.settings) {
     throw new DesktopBridgeUnavailableError()
   }
   return api

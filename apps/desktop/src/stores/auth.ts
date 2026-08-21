@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { AuthCredentials, AuthOtpChallenge, AuthOtpRequest, AuthSession } from '@autoforge/shared'
+import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, type AuthOtpRequest, type AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
 
@@ -63,6 +63,9 @@ export const useAuthStore = defineStore('auth', {
     sendingOtp: false,
     error: '',
   }),
+  getters: {
+    canManageUsers: (state) => hasBusinessCapability(state.session?.authorization, 'manage_users'),
+  },
   actions: {
     restore(): Promise<void> {
       if (this.initialized) return Promise.resolve()
@@ -231,6 +234,27 @@ export const useAuthStore = defineStore('auth', {
         return false
       } finally {
         finishSubmitting(this)
+      }
+    },
+    async refreshAuthorization(): Promise<void> {
+      if (!this.session) return
+      const sessionOwner = sessionGeneration(this)
+      try {
+        const session = await getDesktopApi().auth.refreshAuthorization()
+        if (sessionOwner === sessionGeneration(this)) this.session = session
+      } catch (error) {
+        if (sessionOwner !== sessionGeneration(this) || !this.session) return
+        this.session = {
+          ...this.session,
+          authorization: {
+            role: this.session.authorization?.role ?? 'user',
+            capabilities: [],
+            version: this.session.authorization?.version ?? 0,
+            updatedAt: this.session.authorization?.updatedAt ?? this.session.authenticatedAt,
+            confirmed: false,
+          },
+        }
+        this.error = displayError(error, '权限刷新失败')
       }
     },
   },
