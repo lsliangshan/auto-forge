@@ -7,6 +7,7 @@ import {
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
+  type AppSettings,
   type AuthSession,
   type ChatBlock,
   type ChatEvent,
@@ -32,7 +33,8 @@ import {
 import type { AuthService } from './auth/auth-service.js'
 import { createCloudBaseAuthPort, readCloudBaseAuthConfig } from './auth/cloudbase-auth-port.js'
 import { CloudBaseAuthService } from './auth/cloudbase-auth-service.js'
-import { BrowserCapabilityService, PolicyEngineBrowserAuthorization, type BrowserRuntimeOptions } from './browser/browser-capability.js'
+import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
+import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
@@ -167,13 +169,15 @@ export interface ApplicationRuntimeOptions {
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
-  browserRuntime: Omit<BrowserRuntimeOptions, 'developmentExecutablePath'>
+  browserWorkspace: BrowserWorkspacePort
+  applyTheme?(theme: AppSettings['theme']): void
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
 }
 
 interface ObservedAuthService extends AuthService {
   isAuthenticated(): boolean
+  currentUserId(): string | undefined
 }
 
 /** @internal Exported for direct failure-state verification. */
@@ -182,6 +186,7 @@ export function observeAuthService(
   identities: Pick<CloudBaseIdentityRepository, 'sync'> & { clearSession(): void },
 ): ObservedAuthService {
   let authenticated = false
+  let currentUserId: string | undefined
   const clearLocalSession = (): void => {
     try {
       identities.clearSession()
@@ -193,9 +198,11 @@ export function observeAuthService(
     try {
       identities.sync(session, Date.now())
       authenticated = true
+      currentUserId = session.user.id
       return session
     } catch {
       authenticated = false
+      currentUserId = undefined
       let rollbackFailed = false
       try {
         await delegate.discardSession()
@@ -216,6 +223,7 @@ export function observeAuthService(
       const session = await delegate.getSession()
       if (session === null) {
         authenticated = false
+        currentUserId = undefined
         clearLocalSession()
         return null
       }
@@ -231,16 +239,19 @@ export function observeAuthService(
         await delegate.discardSession()
       } finally {
         authenticated = false
+        currentUserId = undefined
         clearLocalSession()
       }
     },
     async logout() {
       await delegate.logout()
       authenticated = false
+      currentUserId = undefined
       clearLocalSession()
     },
     requireSession: async () => synchronize(await delegate.requireSession()),
     isAuthenticated: () => authenticated,
+    currentUserId: () => currentUserId,
   }
 }
 
@@ -330,21 +341,27 @@ function summary(workflow: WorkflowDetail): WorkflowSummary {
   }
 }
 
-function projectFiles(root: string): Promise<string[]> {
+function projectEntries(root: string): Promise<{ files: string[]; directories: string[] }> {
   const ignoredDirectories = new Set(['.git', 'node_modules'])
-  const visit = async (directory: string, prefix = ''): Promise<string[]> => {
+  const visit = async (directory: string, prefix = ''): Promise<{ files: string[]; directories: string[] }> => {
     const entries = await readdir(directory, { withFileTypes: true })
-    const files = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
+    const nested = await Promise.all(entries.filter((entry) => !entry.isSymbolicLink()
       && !(entry.isDirectory() && ignoredDirectories.has(entry.name))).map(async (entry) => {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name
-      return entry.isDirectory() ? visit(join(directory, entry.name), relative) : [relative]
+      if (!entry.isDirectory()) return { files: [relative], directories: [] }
+      const children = await visit(join(directory, entry.name), relative)
+      return { files: children.files, directories: [relative, ...children.directories] }
     }))
-    return files.flat().sort()
+    return {
+      files: nested.flatMap(({ files }) => files).sort(),
+      directories: nested.flatMap(({ directories }) => directories).sort(),
+    }
   }
   return visit(root)
 }
 
 async function developerProject(project: WorkflowProject): Promise<DeveloperProject> {
+  const entries = await projectEntries(project.rootPath)
   return {
     id: project.id,
     name: project.name,
@@ -352,7 +369,7 @@ async function developerProject(project: WorkflowProject): Promise<DeveloperProj
     status: ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
       ? project.status as DeveloperProject['status']
       : 'error',
-    files: await projectFiles(project.rootPath),
+    ...entries,
     updatedAt: new Date(project.updatedAt).toISOString(),
   }
 }
@@ -435,6 +452,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     permissionDefault: 'ask',
     proxy: { enabled: false, bypassDomains: [] },
   })
+  options.applyTheme?.(settings.get().theme)
   const providerRegistry = new ModelProviderRegistry({
     openrouter: options.modelProviders?.openrouter ?? new OpenRouterProvider({
       credential: secretStore,
@@ -498,12 +516,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const policy = new PolicyEngine(database.permissionGrants)
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
-    runtime: options.browserRuntime,
-    proxySnapshot: () => options.networkProxy.snapshot(),
-    profileDirectories: {
-      create: async () => { await mkdir(options.paths.temporary, { recursive: true }); return mkdtemp(join(options.paths.temporary, 'autoforge-browser-')) },
-      remove: (path) => rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }),
-    },
+    workspace: options.browserWorkspace,
+    currentUserId: async () => (await auth.getSession())?.user.id,
   })
   const sourceResolver: WorkflowExecutionSourceResolver = {
     async resolve(id, version, selector) {
@@ -603,7 +617,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       activeRequests.delete(event.requestId)
       providerUsageReconciliationLoop.notifyUsageEnded()
     }
-    if (event.type === 'block' && event.block.type === 'approval') {
+    const ownerId = database.conversations.get(event.conversationId)?.userId
+    const belongsToCurrentUser = ownerId !== undefined && ownerId === auth.currentUserId()
+    if (belongsToCurrentUser && event.type === 'block' && event.block.type === 'approval') {
       emitExecution({
         type: 'approval_required',
         executionId: event.block.executionId,
@@ -614,7 +630,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         occurredAt: new Date().toISOString(),
       })
     }
-    if (auth.isAuthenticated()) {
+    if (belongsToCurrentUser) {
       try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
     }
   }
@@ -702,6 +718,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
   }
 
+  const requireOwnedConversation = (conversationId: string, userId: string) => {
+    const conversation = database.conversations.get(conversationId)
+    if (!conversation || conversation.userId !== userId) throw failure('NOT_FOUND')
+    return conversation
+  }
+
   let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
     auth: {
@@ -722,14 +744,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
     },
     chat: {
-      listConversations: async () => database.conversations.list().map((conversation) => ({
-        id: conversation.id,
-        title: conversation.title,
-        createdAt: new Date(conversation.createdAt).toISOString(),
-        updatedAt: new Date(conversation.updatedAt).toISOString(),
-      })),
+      listConversations: async () => {
+        const session = await auth.requireSession()
+        return database.conversations.claimLegacyAndListForUser(session.user.id).map((conversation) => ({
+          id: conversation.id,
+          title: conversation.title,
+          createdAt: new Date(conversation.createdAt).toISOString(),
+          updatedAt: new Date(conversation.updatedAt).toISOString(),
+        }))
+      },
       listMessages: async (conversationId) => {
-        if (!database.conversations.get(conversationId)) throw failure('NOT_FOUND')
+        const session = await auth.requireSession()
+        requireOwnedConversation(conversationId, session.user.id)
         return database.messages.listForConversation(conversationId).map((message) => {
           if (message.role !== 'user' && message.role !== 'assistant') throw failure('INTERNAL_ERROR')
           return {
@@ -743,33 +769,46 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         })
       },
       createConversation: async () => {
-        const conversation = database.conversations.insert({ id: randomUUID(), title: '新会话' })
-        return { ...conversation, createdAt: new Date(conversation.createdAt).toISOString(), updatedAt: new Date(conversation.updatedAt).toISOString() }
+        const session = await auth.requireSession()
+        const conversation = database.conversations.insert({ id: randomUUID(), title: '新会话', userId: session.user.id })
+        return {
+          id: conversation.id,
+          title: conversation.title,
+          createdAt: new Date(conversation.createdAt).toISOString(),
+          updatedAt: new Date(conversation.updatedAt).toISOString(),
+        }
       },
       renameConversation: async (conversationId, title) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(conversationId, session.user.id)
         const conversation = database.conversations.update(conversationId, { title })
         if (!conversation) throw failure('NOT_FOUND')
-        return { ...conversation, createdAt: new Date(conversation.createdAt).toISOString(), updatedAt: new Date(conversation.updatedAt).toISOString() }
+        return {
+          id: conversation.id,
+          title: conversation.title,
+          createdAt: new Date(conversation.createdAt).toISOString(),
+          updatedAt: new Date(conversation.updatedAt).toISOString(),
+        }
       },
-      deleteConversation: (conversationId) => maintenance.runExclusive(
-        () => [...activeChatWork.values()].some((work) => work.conversationId === conversationId)
-          || database.mediaGenerationJobs.listActive()
-            .some((job) => job.conversationId === conversationId),
-        async () => {
-          if (!database.conversations.get(conversationId)) throw failure('NOT_FOUND')
-          await mediaLifecycle.deleteConversation(conversationId)
-        },
-      ),
+      deleteConversation: async (conversationId) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(conversationId, session.user.id)
+        return maintenance.runExclusive(
+          () => [...activeChatWork.values()].some((work) => work.conversationId === conversationId)
+            || database.mediaGenerationJobs.listActive()
+              .some((job) => job.conversationId === conversationId),
+          () => mediaLifecycle.deleteConversation(conversationId),
+        )
+      },
       send: async (input) => {
         const session = await auth.requireSession()
         const releaseStart = maintenance.beginStart()
         try {
           if (!acceptingWork) throw failure('CONFLICT')
-          if (!database.conversations.get(input.conversationId)) throw failure('NOT_FOUND')
+          const conversation = requireOwnedConversation(input.conversationId, session.user.id)
           const snapshot = settings.get()
           const preferences = conversationGenerationPreferencesSchema.parse(
-            database.conversations.get(input.conversationId)?.generationPreferences
-              ?? defaultGenerationPreferences,
+            conversation.generationPreferences ?? defaultGenerationPreferences,
           )
           const requestedOutput = input.outputType === 'auto'
             ? preferences.outputType
@@ -880,19 +919,26 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         }
       },
       cancel: async (requestId) => {
+        const session = await auth.requireSession()
+        const conversationId = activeChatWork.get(requestId)?.conversationId
+          ?? database.chatRuns.getByRequestId(requestId)?.conversationId
+        if (!conversationId) throw failure('NOT_FOUND')
+        requireOwnedConversation(conversationId, session.user.id)
         await Promise.allSettled([
           agent.cancel(requestId),
           mediaGeneration.cancel(requestId),
         ])
       },
       getGenerationPreferences: async (conversationId) => {
-        const conversation = database.conversations.get(conversationId)
-        if (!conversation) throw failure('NOT_FOUND')
+        const session = await auth.requireSession()
+        const conversation = requireOwnedConversation(conversationId, session.user.id)
         return conversationGenerationPreferencesSchema.parse(
           conversation.generationPreferences ?? defaultGenerationPreferences,
         )
       },
       updateGenerationPreferences: async (conversationId, preferences) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(conversationId, session.user.id)
         const normalized = conversationGenerationPreferencesSchema.safeParse(preferences)
         if (!normalized.success) throw failure('INVALID_INPUT')
         const conversation = database.conversations.updateGenerationPreferences(conversationId, normalized.data)
@@ -902,28 +948,58 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     media: {
       pickFiles: async (context) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(context.conversationId, session.user.id)
         const remainingSlots = 5 - context.existingAssetIds.length
         if (remainingSlots <= 0) return []
         const paths = (await options.chooseMediaFiles(remainingSlots)).filter(Boolean)
         return media.importPaths({ ...context, paths })
       },
-      importDroppedFiles: (input) => media.importPaths(input),
+      importDroppedFiles: async (input) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(input.conversationId, session.user.id)
+        return media.importPaths(input)
+      },
       importClipboardImage: async (context) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(context.conversationId, session.user.id)
         const image = options.readClipboardImage()
         return image ? media.importClipboardImage({ ...context, ...image }) : []
       },
-      removeDraft: ({ conversationId, assetId }) => media.removeDraft(assetId, conversationId),
+      removeDraft: async ({ conversationId, assetId }) => {
+        const session = await auth.requireSession()
+        requireOwnedConversation(conversationId, session.user.id)
+        return media.removeDraft(assetId, conversationId)
+      },
       saveCopy: async (assetId) => {
+        const session = await auth.requireSession()
+        const record = database.mediaAssets.get(assetId)
+        if (record) requireOwnedConversation(record.conversationId, session.user.id)
         const asset = await media.resolveReadyAsset(assetId)
         const destination = await options.chooseMediaSavePath(asset.name)
         if (destination) await copyFile(asset.absolutePath, destination)
       },
       reveal: async (assetId) => {
+        const session = await auth.requireSession()
+        const record = database.mediaAssets.get(assetId)
+        if (record) requireOwnedConversation(record.conversationId, session.user.id)
         const asset = await media.resolveReadyAsset(assetId)
         options.revealPath(asset.absolutePath)
       },
-      pauseVideoJob: (jobId) => videoJobs.pause(jobId),
-      resumeVideoJob: (jobId) => videoJobs.resume(jobId),
+      pauseVideoJob: async (jobId) => {
+        const session = await auth.requireSession()
+        const job = database.mediaGenerationJobs.get(jobId)
+        if (!job) throw failure('NOT_FOUND')
+        requireOwnedConversation(job.conversationId, session.user.id)
+        return videoJobs.pause(jobId)
+      },
+      resumeVideoJob: async (jobId) => {
+        const session = await auth.requireSession()
+        const job = database.mediaGenerationJobs.get(jobId)
+        if (!job) throw failure('NOT_FOUND')
+        requireOwnedConversation(job.conversationId, session.user.id)
+        return videoJobs.resume(jobId)
+      },
     },
     workflows: {
       list: async (query?: WorkflowQuery) => {
@@ -978,6 +1054,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       run: async ({ projectId, input }) => {
         const releaseStart = maintenance.beginStart()
         try {
+          const session = await auth.requireSession()
           const built = await projects.build(projectId)
           const manifest = built.manifest as WorkflowManifest
           try {
@@ -988,6 +1065,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw failure('INVALID_INPUT')
           }
           const started = await executions.start({
+            userId: session.user.id,
             workflowId: manifest.id,
             workflowVersion: manifest.version,
             input,
@@ -1070,12 +1148,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const transaction = settingsUpdateTail.then(async () => {
           const previous = settings.get()
           const candidate = settings.preview(patch)
+          const commit = () => {
+            const committed = settings.commit(candidate)
+            if (committed.theme !== previous.theme) options.applyTheme?.(committed.theme)
+            return committed
+          }
           if (JSON.stringify(previous.proxy) === JSON.stringify(candidate.proxy)) {
-            return settings.commit(candidate)
+            return commit()
           }
           await options.networkProxy.transition(candidate.proxy)
           try {
-            return settings.commit(candidate)
+            return commit()
           } catch {
             await options.networkProxy.transitionOrFailClosed(previous.proxy)
             throw failure('INTERNAL_ERROR')
@@ -1142,7 +1225,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   return {
     services,
     mediaAssets: {
-      resolveReadyAsset: media.resolveReadyAsset,
+      resolveReadyAsset: async (assetId: string) => {
+        const session = await auth.requireSession()
+        const record = database.mediaAssets.get(assetId)
+        if (record) requireOwnedConversation(record.conversationId, session.user.id)
+        return media.resolveReadyAsset(assetId)
+      },
     },
     recover: async () => {
       if (closePromise) throw failure('CONFLICT')

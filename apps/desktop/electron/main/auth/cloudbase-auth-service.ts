@@ -214,12 +214,10 @@ function cloudBaseGender(
   return genders[value]
 }
 
-function maskPhone(value: string): string | undefined {
-  const normalized = value.trim()
-  if (!normalized) return undefined
-  const suffixLength = Math.min(4, Math.max(1, normalized.length - 1))
-  const prefixLength = Math.min(normalized.startsWith('+') ? 5 : 3, normalized.length - suffixLength)
-  return safeAccount(`${normalized.slice(0, prefixLength)}****${normalized.slice(-suffixLength)}`)
+function domesticPhone(value: string): string | undefined {
+  const compact = value.replace(/\s+/g, '')
+  const normalized = compact.startsWith('+86') ? compact.slice(3) : compact
+  return safeAccount(normalized)
 }
 
 function maskEmail(value: string): string | undefined {
@@ -250,7 +248,7 @@ function providerUser(value: Record<string, unknown>, fallback?: AuthUser): Auth
   const account = safeAccount(username)
     ?? fallback?.account
     ?? safeAccount(displayName)
-    ?? (typeof value.phone === 'string' ? maskPhone(value.phone) : undefined)
+    ?? (typeof value.phone === 'string' ? domesticPhone(value.phone) : undefined)
     ?? (typeof value.email === 'string' ? maskEmail(value.email) : undefined)
   if (!account) throw failure('INTERNAL_ERROR')
 
