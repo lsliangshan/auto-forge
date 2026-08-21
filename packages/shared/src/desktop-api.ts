@@ -78,18 +78,6 @@ export const authOtpVerificationSchema = z.object({
 }).strict()
 export type AuthOtpVerification = z.infer<typeof authOtpVerificationSchema>
 
-export const authUserSchema = z.object({
-  id: identifierSchema,
-  account: z.string().trim().min(1).max(64),
-}).strict()
-export type AuthUser = z.infer<typeof authUserSchema>
-
-export const authSessionSchema = z.object({
-  user: authUserSchema,
-  authenticatedAt: timestampSchema,
-}).strict()
-export type AuthSession = z.infer<typeof authSessionSchema>
-
 export const profileGenderSchema = z.enum(['male', 'female', 'other', 'prefer_not_to_say'])
 export type ProfileGender = z.infer<typeof profileGenderSchema>
 
@@ -123,13 +111,33 @@ const normalizedProfileFieldsSchema = z.object({
   phone: profilePhoneSchema.optional(),
 }).strict()
 
+export const authUserProfileSnapshotSchema = z.object({
+  avatarUrl: z.union([canonicalHttpsUrlSchema, z.null()]).optional(),
+  displayName: z.union([profileDisplayNameSchema.min(1), z.null()]).optional(),
+  gender: z.union([profileGenderSchema, z.null()]).optional(),
+  email: z.union([profileEmailSchema, z.null()]).optional(),
+  phone: z.union([profilePhoneSchema, z.null()]).optional(),
+}).strict()
+export type AuthUserProfileSnapshot = z.infer<typeof authUserProfileSnapshotSchema>
+
+export const authUserSchema = z.object({
+  id: identifierSchema,
+  account: z.string().trim().min(1).max(64),
+  profile: authUserProfileSnapshotSchema.optional(),
+}).strict()
+export type AuthUser = z.infer<typeof authUserSchema>
+
+export const authSessionSchema = z.object({
+  user: authUserSchema,
+  authenticatedAt: timestampSchema,
+}).strict()
+export type AuthSession = z.infer<typeof authSessionSchema>
+
 export const userProfileUpdateSchema = z.object({
   avatarUrl: canonicalHttpsUrlSchema.optional(),
   displayName: profileDisplayNameSchema.optional(),
   gender: profileGenderSchema.optional(),
   birthDate: z.union([z.literal(''), profileBirthDateSchema]).optional(),
-  email: z.union([z.literal(''), z.string().trim().email().max(254)]).optional(),
-  phone: z.string().trim().regex(/^(?:$|\+?[0-9 -]{6,32})$/).optional(),
 }).strict()
 export type UserProfileUpdate = z.infer<typeof userProfileUpdateSchema>
 

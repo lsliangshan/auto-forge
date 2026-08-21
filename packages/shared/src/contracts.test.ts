@@ -6,6 +6,7 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  authUserSchema,
   chatBlockSchema,
   chatEventSchema,
   chatSendInputSchema,
@@ -101,12 +102,39 @@ describe('cross-process contracts', () => {
     expect(userProfileUpdateSchema.safeParse({ userId: 'user_2' }).success).toBe(false)
     expect(userProfileUpdateSchema.safeParse({ displayName: 'A'.repeat(51) }).success).toBe(false)
     expect(userProfileUpdateSchema.safeParse({ avatarUrl: 'http://cdn.example.com/a.png' }).success).toBe(false)
-    expect(userProfileUpdateSchema.safeParse({ email: 'not-an-email' }).success).toBe(false)
-    expect(userProfileUpdateSchema.safeParse({ phone: '12345' }).success).toBe(false)
-    expect(userProfileUpdateSchema.safeParse({
-      displayName: '', birthDate: '', email: '', phone: '',
-    }).success).toBe(true)
-    expect(userProfileUpdateSchema.safeParse({ phone: '+86 138-0013-8000' }).success).toBe(true)
+    expect(userProfileUpdateSchema.safeParse({ email: 'alice@example.com' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ phone: '+8613800138000' }).success).toBe(false)
+    expect(userProfileUpdateSchema.safeParse({ displayName: '', birthDate: '' }).success).toBe(true)
+  })
+
+  it('validates strict three-state CloudBase profile snapshots on auth users', () => {
+    expect(authUserSchema.parse({
+      id: 'cloud_uid',
+      account: 'Alice_1',
+      profile: {
+        displayName: 'Alice',
+        avatarUrl: null,
+        gender: 'female',
+        email: 'alice@example.com',
+        phone: null,
+      },
+    })).toEqual({
+      id: 'cloud_uid',
+      account: 'Alice_1',
+      profile: {
+        displayName: 'Alice',
+        avatarUrl: null,
+        gender: 'female',
+        email: 'alice@example.com',
+        phone: null,
+      },
+    })
+    expect(authUserSchema.safeParse({
+      id: 'cloud_uid', account: 'Alice_1', profile: { avatarUrl: 'http://example.com/a.png' },
+    }).success).toBe(false)
+    expect(authUserSchema.safeParse({
+      id: 'cloud_uid', account: 'Alice_1', profile: { unknown: 'value' },
+    }).success).toBe(false)
   })
 
   it('maps the profile avatar upload failure without exposing provider details', () => {
