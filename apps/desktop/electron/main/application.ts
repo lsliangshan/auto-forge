@@ -53,7 +53,7 @@ import {
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
-import type { LocalAuthRepository } from './database/local-auth-repository.js'
+import type { CloudBaseIdentityRepository } from './database/cloudbase-identity-repository.js'
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
@@ -178,14 +178,35 @@ interface ObservedAuthService extends AuthService {
 
 function observeAuthService(
   delegate: AuthService,
-  identities: Pick<LocalAuthRepository, 'ensureExternalIdentity'>,
+  identities: Pick<CloudBaseIdentityRepository, 'sync'> & { clearSession(): void },
 ): ObservedAuthService {
   let authenticated = false
-  const project = (session: AuthSession): AuthSession => {
+  const clearLocalSession = (): void => {
     try {
-      identities.ensureExternalIdentity(session.user, Date.now())
+      identities.clearSession()
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+  }
+  const synchronize = async (session: AuthSession): Promise<AuthSession> => {
+    try {
+      identities.sync(session, Date.now())
+      authenticated = true
       return session
     } catch {
+      authenticated = false
+      let rollbackFailed = false
+      try {
+        await delegate.discardSession()
+      } catch {
+        rollbackFailed = true
+      }
+      try {
+        identities.clearSession()
+      } catch {
+        rollbackFailed = true
+      }
+      void rollbackFailed
       throw failure('INTERNAL_ERROR')
     }
   }
@@ -194,33 +215,30 @@ function observeAuthService(
       const session = await delegate.getSession()
       if (session === null) {
         authenticated = false
+        clearLocalSession()
         return null
       }
-      const projected = project(session)
-      authenticated = true
-      return projected
+      return synchronize(session)
     },
     sendOtp: (input) => delegate.sendOtp(input),
-    async verifyOtp(input) {
-      const session = project(await delegate.verifyOtp(input))
-      authenticated = true
-      return session
-    },
+    verifyOtp: async (input) => synchronize(await delegate.verifyOtp(input)),
     cancelOtp: (challengeId) => delegate.cancelOtp(challengeId),
-    async loginWithPassword(input) {
-      const session = project(await delegate.loginWithPassword(input))
-      authenticated = true
-      return session
+    loginWithPassword: async (input) => synchronize(await delegate.loginWithPassword(input)),
+    updateUserProfile: (input) => delegate.updateUserProfile(input),
+    async discardSession() {
+      try {
+        await delegate.discardSession()
+      } finally {
+        authenticated = false
+        clearLocalSession()
+      }
     },
     async logout() {
       await delegate.logout()
+      clearLocalSession()
       authenticated = false
     },
-    async requireSession() {
-      const session = project(await delegate.requireSession())
-      authenticated = true
-      return session
-    },
+    requireSession: async () => synchronize(await delegate.requireSession()),
     isAuthenticated: () => authenticated,
   }
 }
@@ -386,7 +404,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       createCloudBaseAuthPort(readCloudBaseAuthConfig(options.cloudbaseEnv ?? process.env)),
       secretStore,
     ),
-    database.localAuth,
+    {
+      sync: (session, timestamp) => database.cloudBaseIdentities.sync(session, timestamp),
+      clearSession: () => database.localAuth.clearSession(),
+    },
   )
   const profiles = new ProfileService(auth, database.userProfiles)
   const qiniuUploader = new QiniuFileUploader({

@@ -176,6 +176,21 @@ function createTestAuthService(): AuthService {
       currentSession = user.session
       return user.session
     },
+    async updateUserProfile(input) {
+      if (!currentSession) throw failure('AUTH_REQUIRED')
+      currentSession = {
+        ...currentSession,
+        user: {
+          ...currentSession.user,
+          profile: { ...currentSession.user.profile, ...input },
+        },
+      }
+      return currentSession.user
+    },
+    async discardSession() {
+      challenges.clear()
+      currentSession = null
+    },
     async logout() {
       challenges.clear()
       currentSession = null
@@ -532,7 +547,7 @@ describe('createApplicationRuntime', () => {
       logout: expect.any(Function),
       requireSession: expect.any(Function),
     })
-    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    const sqlite = new Database(join(root, 'autoforge.sqlite'))
     expect(sqlite.prepare(`
       SELECT id, account, account_normalized AS accountNormalized
       FROM local_users
@@ -542,10 +557,30 @@ describe('createApplicationRuntime', () => {
       account: 'Alice',
       accountNormalized: `cloudbase:${session.user.id}`,
     })
-    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
-      .toEqual({ count: 0 })
+    expect(sqlite.prepare(`
+      SELECT user_id AS userId, authenticated_at AS authenticatedAt
+      FROM local_auth_session WHERE id = 1
+    `).get()).toEqual({ userId: session.user.id, authenticatedAt: 0 })
+    expect(sqlite.prepare(`
+      SELECT user_id AS userId, birth_date AS birthDate
+      FROM local_user_profiles WHERE user_id = ?
+    `).get(session.user.id)).toEqual({ userId: session.user.id, birthDate: null })
     await runtime.services.auth.logout()
     await expect(runtime.services.auth.getSession()).resolves.toBeNull()
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
+      .toEqual({ count: 0 })
+    await expect(runtime.services.auth.loginWithPassword({
+      account: 'Alice', password: 'password',
+    })).resolves.toEqual(session)
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
+      .toEqual({ count: 1 })
+    sqlite.prepare('DELETE FROM local_auth_session').run()
+    await expect(runtime.services.auth.getSession()).resolves.toEqual(session)
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
+      .toEqual({ count: 1 })
+    await runtime.services.auth.logout()
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get())
+      .toEqual({ count: 0 })
     expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_users WHERE id = ?')
       .get(session.user.id)).toEqual({ count: 1 })
     sqlite.close()
@@ -564,12 +599,31 @@ describe('createApplicationRuntime', () => {
     }, 1)
     database.localAuth.clearSession()
     database.close()
-    const runtime = createApplicationRuntime(options(root))
+    const authService = createTestAuthService()
+    const discardSession = vi.spyOn(authService, 'discardSession')
+    const runtime = createApplicationRuntime(options(root, { authService }))
 
     await expect(authenticate(runtime, 'Alice'))
       .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
-    await expect(runtime.services.auth.getSession())
-      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    expect(discardSession).toHaveBeenCalledOnce()
+    await expect(runtime.services.auth.getSession()).resolves.toBeNull()
+    await runtime.close()
+  })
+
+  it('retains the projected local session when CloudBase logout fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-auth-logout-error-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const runtime = createApplicationRuntime(options(root, { authService }))
+    const session = await authenticate(runtime, 'Alice')
+    vi.spyOn(authService, 'logout').mockRejectedValueOnce(toSafeAppError({ code: 'INTERNAL_ERROR' }))
+
+    await expect(runtime.services.auth.logout()).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(sqlite.prepare('SELECT user_id AS userId FROM local_auth_session WHERE id = 1').get())
+      .toEqual({ userId: session.user.id })
+    sqlite.close()
     await runtime.close()
   })
 
