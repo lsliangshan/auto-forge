@@ -69,6 +69,7 @@ describe('cross-process contracts', () => {
 
   it('exposes the CloudBase authentication IPC contract', () => {
     expect(ipcChannels.authSendOtp).toBe('auth:send-otp')
+    expect(ipcChannels.authRefreshAuthorization).toBe('auth:refresh-authorization')
     expect(ipcChannels.authVerifyOtp).toBe('auth:verify-otp')
     expect(ipcChannels.authCancelOtp).toBe('auth:cancel-otp')
     expect(ipcChannels.authLoginWithPassword).toBe('auth:login-with-password')

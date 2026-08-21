@@ -26,6 +26,7 @@ import {
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
+import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
 import type { BrowserWorkspacePort, BrowserWorkspaceTab } from './browser/electron-browser-workspace.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
@@ -421,6 +422,61 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('requires the CloudBase role before projecting a login and fails closed on refresh', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-role-'))
+    directories.push(root)
+    const ensureMyRole = vi.fn().mockResolvedValue({
+      role: 'super_admin',
+      capabilities: ['manage_users'],
+      version: 2,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      confirmed: true,
+    })
+    const roleService: BusinessRoleService = {
+      ensureMyRole,
+      listUsers: vi.fn(),
+      updateUserRole: vi.fn(),
+    }
+    const runtime = createApplicationRuntime(options(root, { roleService }))
+
+    const session = await authenticate(runtime, 'Admin')
+    expect(session.authorization).toMatchObject({
+      role: 'super_admin', capabilities: ['manage_users'], confirmed: true,
+    })
+    expect(ensureMyRole).toHaveBeenCalledOnce()
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(sqlite.prepare(`
+      SELECT role, version FROM local_user_roles WHERE user_id = ?
+    `).get(session.user.id)).toEqual({ role: 'super_admin', version: 2 })
+    sqlite.close()
+
+    ensureMyRole.mockRejectedValueOnce(toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }))
+    await expect(runtime.services.auth.refreshAuthorization()).resolves.toMatchObject({
+      authorization: { role: 'super_admin', capabilities: [], confirmed: false },
+    })
+    await runtime.close()
+  })
+
+  it('discards a newly authenticated session when the role service is unavailable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-role-error-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const discardSession = vi.spyOn(authService, 'discardSession')
+    const roleService: BusinessRoleService = {
+      ensureMyRole: vi.fn().mockRejectedValue(toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })),
+      listUsers: vi.fn(),
+      updateUserRole: vi.fn(),
+    }
+    const runtime = createApplicationRuntime(options(root, { authService, roleService }))
+
+    await expect(authenticate(runtime, 'Alice')).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+    expect(discardSession).toHaveBeenCalled()
+    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(sqlite.prepare('SELECT COUNT(*) AS count FROM local_auth_session').get()).toEqual({ count: 0 })
+    sqlite.close()
+    await runtime.close()
+  })
+
   it('stays unauthenticated when local session cleanup fails after CloudBase logout', async () => {
     const delegate = createTestAuthService()
     const clearSession = vi.fn(() => {

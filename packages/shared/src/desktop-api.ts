@@ -769,6 +769,7 @@ export type AppInfo = z.infer<typeof appInfoSchema>
 
 export const ipcChannels = {
   authGetSession: 'auth:get-session',
+  authRefreshAuthorization: 'auth:refresh-authorization',
   authSendOtp: 'auth:send-otp',
   authVerifyOtp: 'auth:verify-otp',
   authCancelOtp: 'auth:cancel-otp',
@@ -920,6 +921,7 @@ export const openExternalRequestSchema = z.object({
 
 export const ipcRequestSchemas = {
   [ipcChannels.authGetSession]: z.undefined(),
+  [ipcChannels.authRefreshAuthorization]: z.undefined(),
   [ipcChannels.authSendOtp]: authOtpRequestSchema,
   [ipcChannels.authVerifyOtp]: authOtpVerificationSchema,
   [ipcChannels.authCancelOtp]: z.object({ challengeId: identifierSchema }).strict(),
@@ -987,6 +989,7 @@ const executionIdResponseSchema = z.object({ executionId: identifierSchema }).st
 
 export const ipcResponseSchemas = {
   [ipcChannels.authGetSession]: authSessionSchema.nullable(),
+  [ipcChannels.authRefreshAuthorization]: authSessionSchema,
   [ipcChannels.authSendOtp]: authOtpChallengeSchema,
   [ipcChannels.authVerifyOtp]: authSessionSchema,
   [ipcChannels.authCancelOtp]: voidResponseSchema,
@@ -1051,6 +1054,7 @@ export const ipcResponseSchemas = {
 export interface DesktopAPI {
   auth: {
     getSession(): Promise<AuthSession | null>
+    refreshAuthorization(): Promise<AuthSession>
     sendOtp(input: AuthOtpRequest): Promise<AuthOtpChallenge>
     verifyOtp(input: AuthOtpVerification): Promise<AuthSession>
     cancelOtp(challengeId: string): Promise<void>

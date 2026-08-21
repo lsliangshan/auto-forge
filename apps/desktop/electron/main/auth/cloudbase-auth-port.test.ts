@@ -23,7 +23,7 @@ describe('CloudBase auth port', () => {
       refreshSession: vi.fn(),
       signOut: vi.fn(),
     }
-    const init = vi.fn(() => ({ auth }))
+    const init = vi.fn(() => ({ auth, callFunction: vi.fn() }))
     const port = createCloudBaseAuthPort({
       env: 'autoforge-d1gkhyfb419ba8455',
       region: 'ap-shanghai',

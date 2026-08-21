@@ -38,6 +38,7 @@ export interface DesktopIpcServices {
   auth: DesktopAPI['auth'] & {
     requireSession(): Promise<AuthSession>
   }
+  userAdmin: DesktopAPI['userAdmin']
   profile: DesktopAPI['profile']
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
   media: {
@@ -139,11 +140,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   }
 
   register(ipcChannels.authGetSession, () => options.services.auth.getSession(), { anonymous: true })
+  register(ipcChannels.authRefreshAuthorization, () => options.services.auth.refreshAuthorization())
   register(ipcChannels.authSendOtp, (input) => options.services.auth.sendOtp(input), { anonymous: true })
   register(ipcChannels.authVerifyOtp, (input) => options.services.auth.verifyOtp(input), { anonymous: true })
   register(ipcChannels.authCancelOtp, (input) => options.services.auth.cancelOtp(input.challengeId), { anonymous: true })
   register(ipcChannels.authLoginWithPassword, (input) => options.services.auth.loginWithPassword(input), { anonymous: true })
   register(ipcChannels.authLogout, () => options.services.auth.logout(), { anonymous: true })
+  register(ipcChannels.userAdminList, (input) => options.services.userAdmin.list(input))
+  register(ipcChannels.userAdminUpdateRole, (input) => options.services.userAdmin.updateRole(input))
   register(ipcChannels.profileGet, () => options.services.profile.get())
   register(ipcChannels.profileUpdate, (input) => options.services.profile.update(input))
   register(ipcChannels.profilePickAndUploadAvatar, () => options.services.profile.pickAndUploadAvatar())

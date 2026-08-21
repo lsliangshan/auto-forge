@@ -8,6 +8,7 @@ import {
   toSafeAppError,
   type AppError,
   type AppSettings,
+  type AuthorizationSnapshot,
   type AuthSession,
   type ChatBlock,
   type ChatEvent,
@@ -31,8 +32,9 @@ import {
   type AgentRunResult,
 } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
-import { createCloudBaseAuthPort, readCloudBaseAuthConfig } from './auth/cloudbase-auth-port.js'
+import { createCloudBaseClientPorts, readCloudBaseAuthConfig } from './auth/cloudbase-auth-port.js'
 import { CloudBaseAuthService } from './auth/cloudbase-auth-service.js'
+import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
 import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
@@ -71,6 +73,7 @@ import { createTokenUsageSnapshot } from './token-usage.js'
 import { QiniuAvatarUploader } from './profile/avatar-uploader.js'
 import { ProfileService } from './profile/profile-service.js'
 import { QiniuFileUploader, readQiniuConfig } from './upload/qiniu-file-uploader.js'
+import { UserAdminService } from './user-admin/user-admin-service.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
@@ -155,6 +158,7 @@ export interface ApplicationRuntimeOptions {
   paths: ApplicationPaths
   safeStorage: SafeStoragePort
   authService?: AuthService
+  roleService?: BusinessRoleService
   cloudbaseEnv?: NodeJS.ProcessEnv
   networkProxy: NetworkProxyPort
   mediaTransport?: PinnedMediaTransportPort
@@ -178,15 +182,18 @@ export interface ApplicationRuntimeOptions {
 interface ObservedAuthService extends AuthService {
   isAuthenticated(): boolean
   currentUserId(): string | undefined
+  refreshAuthorization(): Promise<AuthSession>
 }
 
 /** @internal Exported for direct failure-state verification. */
 export function observeAuthService(
   delegate: AuthService,
   identities: Pick<CloudBaseIdentityRepository, 'sync'> & { clearSession(): void },
+  roles?: Pick<BusinessRoleService, 'ensureMyRole'>,
 ): ObservedAuthService {
   let authenticated = false
   let currentUserId: string | undefined
+  let currentAuthorization: AuthorizationSnapshot | undefined
   const clearLocalSession = (): void => {
     try {
       identities.clearSession()
@@ -194,15 +201,35 @@ export function observeAuthService(
       throw failure('INTERNAL_ERROR')
     }
   }
-  const synchronize = async (session: AuthSession): Promise<AuthSession> => {
+  const fallbackAuthorization = (session: AuthSession): AuthorizationSnapshot => (
+    session.authorization?.confirmed === true
+      ? session.authorization
+      : {
+          role: 'user',
+          capabilities: [],
+          version: 0,
+          updatedAt: session.authenticatedAt,
+          confirmed: true,
+        }
+  )
+  const resolveAuthorization = async (session: AuthSession): Promise<AuthorizationSnapshot> => (
+    roles ? roles.ensureMyRole() : fallbackAuthorization(session)
+  )
+  const synchronize = async (
+    session: AuthSession,
+    authorization: AuthorizationSnapshot,
+  ): Promise<AuthSession> => {
+    const authorizedSession = { ...session, authorization }
     try {
-      identities.sync(session, Date.now())
+      identities.sync(authorizedSession, Date.now())
       authenticated = true
       currentUserId = session.user.id
-      return session
+      currentAuthorization = authorization
+      return authorizedSession
     } catch {
       authenticated = false
       currentUserId = undefined
+      currentAuthorization = undefined
       let rollbackFailed = false
       try {
         await delegate.discardSession()
@@ -218,21 +245,36 @@ export function observeAuthService(
       throw failure('INTERNAL_ERROR')
     }
   }
+  const authorizeAndSynchronize = async (session: AuthSession): Promise<AuthSession> => {
+    let authorization: AuthorizationSnapshot
+    try {
+      authorization = await resolveAuthorization(session)
+    } catch (error) {
+      try { await delegate.discardSession() } catch { /* Best effort after role failure. */ }
+      authenticated = false
+      currentUserId = undefined
+      currentAuthorization = undefined
+      clearLocalSession()
+      throw toSafeAppError(error)
+    }
+    return synchronize(session, authorization)
+  }
   return {
     async getSession() {
       const session = await delegate.getSession()
       if (session === null) {
         authenticated = false
         currentUserId = undefined
+        currentAuthorization = undefined
         clearLocalSession()
         return null
       }
-      return synchronize(session)
+      return authorizeAndSynchronize(session)
     },
     sendOtp: (input) => delegate.sendOtp(input),
-    verifyOtp: async (input) => synchronize(await delegate.verifyOtp(input)),
+    verifyOtp: async (input) => authorizeAndSynchronize(await delegate.verifyOtp(input)),
     cancelOtp: (challengeId) => delegate.cancelOtp(challengeId),
-    loginWithPassword: async (input) => synchronize(await delegate.loginWithPassword(input)),
+    loginWithPassword: async (input) => authorizeAndSynchronize(await delegate.loginWithPassword(input)),
     updateUserProfile: (input) => delegate.updateUserProfile(input),
     async discardSession() {
       try {
@@ -240,6 +282,7 @@ export function observeAuthService(
       } finally {
         authenticated = false
         currentUserId = undefined
+        currentAuthorization = undefined
         clearLocalSession()
       }
     },
@@ -247,9 +290,34 @@ export function observeAuthService(
       await delegate.logout()
       authenticated = false
       currentUserId = undefined
+      currentAuthorization = undefined
       clearLocalSession()
     },
-    requireSession: async () => synchronize(await delegate.requireSession()),
+    requireSession: async () => {
+      const session = await delegate.requireSession()
+      if (currentAuthorization && currentUserId === session.user.id) {
+        return { ...session, authorization: currentAuthorization }
+      }
+      return synchronize(session, await resolveAuthorization(session))
+    },
+    async refreshAuthorization() {
+      const session = await delegate.requireSession()
+      try {
+        return await synchronize(session, await resolveAuthorization(session))
+      } catch {
+        const authorization: AuthorizationSnapshot = {
+          role: currentAuthorization?.role ?? 'user',
+          capabilities: [],
+          version: currentAuthorization?.version ?? 0,
+          updatedAt: currentAuthorization?.updatedAt ?? session.authenticatedAt,
+          confirmed: false,
+        }
+        authenticated = true
+        currentUserId = session.user.id
+        currentAuthorization = authorization
+        return { ...session, authorization }
+      }
+    },
     isAuthenticated: () => authenticated,
     currentUserId: () => currentUserId,
   }
@@ -417,16 +485,25 @@ function executionSummary(execution: Execution): ExecutionSummary {
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
+  const cloudBasePorts = options.authService
+    ? undefined
+    : createCloudBaseClientPorts(readCloudBaseAuthConfig(options.cloudbaseEnv ?? process.env))
+  const baseAuthService = options.authService
+    ?? new CloudBaseAuthService(cloudBasePorts!.auth, secretStore)
+  const roleService = options.roleService
+    ?? (cloudBasePorts ? new CloudBaseRoleService(cloudBasePorts.functions) : undefined)
   const auth = observeAuthService(
-    options.authService ?? new CloudBaseAuthService(
-      createCloudBaseAuthPort(readCloudBaseAuthConfig(options.cloudbaseEnv ?? process.env)),
-      secretStore,
-    ),
+    baseAuthService,
     {
       sync: (session, timestamp) => database.cloudBaseIdentities.sync(session, timestamp),
       clearSession: () => database.localAuth.clearSession(),
     },
+    roleService,
   )
+  const userAdmin = new UserAdminService(auth, roleService ?? {
+    listUsers: async () => { throw failure('SERVICE_UNAVAILABLE') },
+    updateUserRole: async () => { throw failure('SERVICE_UNAVAILABLE') },
+  })
   const profiles = new ProfileService(auth, database.userProfiles)
   const qiniuUploader = new QiniuFileUploader({
     config: () => readQiniuConfig(options.qiniuEnv ?? process.env),
@@ -728,12 +805,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const services: DesktopIpcServices = {
     auth: {
       getSession: () => auth.getSession(),
+      refreshAuthorization: () => auth.refreshAuthorization(),
       sendOtp: (input) => auth.sendOtp(input),
       verifyOtp: (input) => auth.verifyOtp(input),
       cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
       loginWithPassword: (input) => auth.loginWithPassword(input),
       logout: () => auth.logout(),
       requireSession: () => auth.requireSession(),
+    },
+    userAdmin: {
+      list: (input) => userAdmin.list(input),
+      updateRole: (input) => userAdmin.updateRole(input),
     },
     profile: {
       get: () => profiles.get(),
@@ -1049,6 +1131,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       readFile: (projectId, relativePath) => projects.readFile(projectId, relativePath),
       writeFile: (projectId, relativePath, content) => projects.write(projectId, relativePath, content),
+      createEntry: async (projectId, parentPath, name, kind) => {
+        await projects.createEntry(projectId, parentPath, name, kind)
+        const project = database.workflowProjects.get(projectId)
+        if (!project) throw failure('NOT_FOUND')
+        return developerProject(project)
+      },
+      renameEntry: async (projectId, relativePath, name) => {
+        await projects.renameEntry(projectId, relativePath, name)
+        const project = database.workflowProjects.get(projectId)
+        if (!project) throw failure('NOT_FOUND')
+        return developerProject(project)
+      },
+      deleteEntry: async (projectId, relativePath) => {
+        await projects.deleteEntry(projectId, relativePath)
+        const project = database.workflowProjects.get(projectId)
+        if (!project) throw failure('NOT_FOUND')
+        return developerProject(project)
+      },
       build: async (projectId) => developerProject(await projects.build(projectId)),
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {

@@ -52,12 +52,19 @@ function services(): DesktopIpcServices {
   return {
     auth: {
       getSession: vi.fn().mockResolvedValue(null),
+      refreshAuthorization: vi.fn().mockResolvedValue(authSession),
       sendOtp: vi.fn().mockResolvedValue({ challengeId: 'challenge_1', expiresIn: 300 }),
       verifyOtp: vi.fn().mockResolvedValue(authSession),
       cancelOtp: vi.fn().mockResolvedValue(undefined),
       loginWithPassword: vi.fn().mockResolvedValue(authSession),
       logout: vi.fn().mockResolvedValue(undefined),
       requireSession: vi.fn().mockResolvedValue(authSession),
+    },
+    userAdmin: {
+      list: vi.fn().mockResolvedValue({ items: [], page: 1, pageSize: 20, total: 0 }),
+      updateRole: vi.fn().mockResolvedValue({
+        userId: 'user_2', role: 'super_admin', version: 2, updatedAt: '2026-08-21T00:00:00.000Z',
+      }),
     },
     profile: {
       get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
@@ -202,6 +209,23 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.profile.pickAndUploadAvatar).toHaveBeenCalledOnce()
     await expect(app.invoke(ipcChannels.profileUpdate, { account: 'Mallory' }))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+  })
+
+  it('guards and validates user administration operations', async () => {
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.userAdminList, { page: 1, pageSize: 20 })).resolves.toEqual({
+      items: [], page: 1, pageSize: 20, total: 0,
+    })
+    await expect(app.invoke(ipcChannels.userAdminUpdateRole, {
+      requestId: 'request_1', targetUserId: 'user_2', newRole: 'super_admin', expectedVersion: 1,
+    })).resolves.toMatchObject({ userId: 'user_2', role: 'super_admin', version: 2 })
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(2)
+    await expect(app.invoke(ipcChannels.userAdminList, { page: 1, pageSize: 25 }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(app.invoke(ipcChannels.userAdminUpdateRole, {
+      requestId: 'request_2', targetUserId: 'user_2', newRole: 'support_operator', expectedVersion: 2,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
   })
 
   it('guards and validates fixed developer entry operations', async () => {

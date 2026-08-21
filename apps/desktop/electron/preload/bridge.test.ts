@@ -24,6 +24,7 @@ describe('preload desktop bridge', () => {
   it('maps the fixed CloudBase authentication methods', async () => {
     const app = harness()
     await app.api.auth.getSession()
+    await app.api.auth.refreshAuthorization()
     await app.api.auth.sendOtp({ intent: 'login', channel: 'phone', target: '18311032722' })
     await app.api.auth.verifyOtp({ challengeId: 'challenge_1', code: '123456' })
     await app.api.auth.cancelOtp('challenge_1')
@@ -31,25 +32,40 @@ describe('preload desktop bridge', () => {
     await app.api.auth.logout()
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.authGetSession, undefined)
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.authSendOtp, {
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.authRefreshAuthorization, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.authSendOtp, {
       intent: 'login', channel: 'phone', target: '18311032722',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.authVerifyOtp, {
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.authVerifyOtp, {
       challengeId: 'challenge_1', code: '123456',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.authCancelOtp, {
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.authCancelOtp, {
       challengeId: 'challenge_1',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.authLoginWithPassword, {
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(6, ipcChannels.authLoginWithPassword, {
       account: 'Alice_1', password: 'password',
     })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(6, ipcChannels.authLogout, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(7, ipcChannels.authLogout, undefined)
     expect(Object.keys(app.api.auth)).toEqual([
-      'getSession', 'sendOtp', 'verifyOtp', 'cancelOtp', 'loginWithPassword', 'logout',
+      'getSession', 'refreshAuthorization', 'sendOtp', 'verifyOtp', 'cancelOtp', 'loginWithPassword', 'logout',
     ])
     expect(app.api.auth).not.toHaveProperty('invoke')
     expect(app.api.auth).not.toHaveProperty('login')
     expect(app.api.auth).not.toHaveProperty('register')
+  })
+
+  it('maps only the fixed user administration methods', async () => {
+    const app = harness()
+    const list = { page: 1, pageSize: 20 as const }
+    const update = {
+      requestId: 'request_1', targetUserId: 'user_1', newRole: 'super_admin' as const, expectedVersion: 1,
+    }
+    await app.api.userAdmin.list(list)
+    await app.api.userAdmin.updateRole(update)
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.userAdminList, list)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.userAdminUpdateRole, update)
+    expect(Object.keys(app.api.userAdmin)).toEqual(['list', 'updateRole'])
   })
 
   it('exposes only the fixed profile operations', async () => {

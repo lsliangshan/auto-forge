@@ -56,11 +56,16 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
   return {
     auth: {
       getSession: () => invoke(ipcRenderer, ipcChannels.authGetSession),
+      refreshAuthorization: () => invoke(ipcRenderer, ipcChannels.authRefreshAuthorization),
       sendOtp: (input) => invoke(ipcRenderer, ipcChannels.authSendOtp, input),
       verifyOtp: (input) => invoke(ipcRenderer, ipcChannels.authVerifyOtp, input),
       cancelOtp: (challengeId) => invoke(ipcRenderer, ipcChannels.authCancelOtp, { challengeId }),
       loginWithPassword: (input) => invoke(ipcRenderer, ipcChannels.authLoginWithPassword, input),
       logout: () => invoke(ipcRenderer, ipcChannels.authLogout),
+    },
+    userAdmin: {
+      list: (input) => invoke(ipcRenderer, ipcChannels.userAdminList, input),
+      updateRole: (input) => invoke(ipcRenderer, ipcChannels.userAdminUpdateRole, input),
     },
     profile: {
       get: () => invoke(ipcRenderer, ipcChannels.profileGet),

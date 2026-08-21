@@ -36,12 +36,19 @@ interface CloudBaseFactory {
     region: string
     accessKey: string
     auth: { detectSessionInUrl: false }
-  }): { auth: CloudBaseAuthPort }
+  }): {
+    auth: CloudBaseAuthPort
+    callFunction(options: { name: string; data: Record<string, unknown> }): Promise<unknown>
+  }
 }
 
 const cloudBaseFactory: CloudBaseFactory = {
   init(config) {
-    return { auth: cloudbase.init(config).auth }
+    const app = cloudbase.init(config)
+    return {
+      auth: app.auth,
+      callFunction: (options) => app.callFunction(options),
+    }
   },
 }
 
@@ -63,6 +70,20 @@ export function createCloudBaseAuthPort(
     ...config,
     auth: { detectSessionInUrl: false },
   }).auth
+}
+
+export function createCloudBaseClientPorts(
+  config: CloudBaseAuthConfig,
+  factory: CloudBaseFactory = cloudBaseFactory,
+) {
+  const app = factory.init({
+    ...config,
+    auth: { detectSessionInUrl: false },
+  })
+  return {
+    auth: app.auth,
+    functions: { callFunction: app.callFunction.bind(app) },
+  }
 }
 
 export function cloudBaseOtpTarget(channel: AuthOtpChannel, target: string) {
