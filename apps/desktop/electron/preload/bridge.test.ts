@@ -54,7 +54,7 @@ describe('preload desktop bridge', () => {
 
   it('exposes only the fixed profile operations', async () => {
     const app = harness()
-    const update = { displayName: 'Alice', email: 'alice@example.com' }
+    const update = { displayName: 'Alice' }
 
     await app.api.profile.get()
     await app.api.profile.update(update)

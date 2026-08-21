@@ -75,21 +75,21 @@
       </section>
 
       <section class="profile-section">
-        <header><h2>联系方式</h2><p>邮箱和手机号暂不进行验证码验证。</p></header>
+        <header><h2>联系方式</h2><p>来自 CloudBase 账号，修改需验证码。</p></header>
         <div class="profile-grid">
           <label>邮箱<input
             v-model="draft.email"
             data-testid="profile-email"
             aria-label="邮箱"
             type="email"
-            autocomplete="email"
+            readonly
           ></label>
           <label>手机号<input
             v-model="draft.phone"
             data-testid="profile-phone"
             aria-label="手机号"
             type="tel"
-            autocomplete="tel"
+            readonly
           ></label>
         </div>
       </section>
@@ -140,6 +140,15 @@ const draft = reactive<ProfileDraft>({
 })
 const baseline = ref('')
 
+function editableDraft(value: ProfileDraft) {
+  return {
+    avatarUrl: value.avatarUrl,
+    displayName: value.displayName,
+    gender: value.gender,
+    birthDate: value.birthDate,
+  }
+}
+
 function profileDraft(value: UserProfile | null): ProfileDraft {
   return {
     avatarUrl: value?.avatarUrl ?? '',
@@ -153,10 +162,10 @@ function profileDraft(value: UserProfile | null): ProfileDraft {
 
 function replaceDraft(value: UserProfile | null) {
   Object.assign(draft, profileDraft(value))
-  baseline.value = JSON.stringify(draft)
+  baseline.value = JSON.stringify(editableDraft(draft))
 }
 
-const dirty = computed(() => JSON.stringify(draft) !== baseline.value)
+const dirty = computed(() => JSON.stringify(editableDraft(draft)) !== baseline.value)
 const accountInitial = computed(() => (profile.profile?.account ?? auth.session?.user.account ?? '?').charAt(0).toUpperCase())
 const today = computed(() => {
   const now = new Date()
@@ -178,13 +187,10 @@ function validDate(value: string): boolean {
 }
 
 function input(): UserProfileUpdate | undefined {
-  const phone = draft.phone.replace(/[ -]/g, '')
   const valid = Array.from(draft.displayName.trim()).length <= 50
     && validDate(draft.birthDate)
-    && (!draft.email.trim() || (draft.email.trim().length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(draft.email.trim())))
-    && (!phone || /^\+?\d{6,20}$/.test(phone))
   if (!valid) {
-    formError.value = '请检查显示名称、生日、邮箱或手机号格式'
+    formError.value = '请检查显示名称或生日格式'
     return undefined
   }
   return {
@@ -192,8 +198,6 @@ function input(): UserProfileUpdate | undefined {
     displayName: draft.displayName,
     ...(draft.gender ? { gender: draft.gender } : {}),
     birthDate: draft.birthDate,
-    email: draft.email,
-    phone: draft.phone,
   }
 }
 
@@ -214,7 +218,12 @@ async function save() {
 }
 
 watch(() => profile.profile, (value) => {
-  if (!dirty.value || !baseline.value) replaceDraft(value)
+  if (!dirty.value || !baseline.value) {
+    replaceDraft(value)
+    return
+  }
+  draft.email = value?.email ?? ''
+  draft.phone = value?.phone ?? ''
 }, { immediate: true })
 
 onMounted(() => {
