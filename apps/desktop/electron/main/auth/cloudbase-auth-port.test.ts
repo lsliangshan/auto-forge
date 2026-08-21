@@ -16,6 +16,9 @@ describe('CloudBase auth port', () => {
       signUp: vi.fn(),
       signInWithPassword: vi.fn(),
       getSession: vi.fn(),
+      getUser: vi.fn(),
+      refreshUser: vi.fn(),
+      updateUser: vi.fn(),
       setSession: vi.fn(),
       refreshSession: vi.fn(),
       signOut: vi.fn(),
@@ -32,6 +35,9 @@ describe('CloudBase auth port', () => {
       access_token: 'stored-access-token',
       refresh_token: 'stored-refresh-token',
     })
+    await port.getUser()
+    await port.refreshUser()
+    await port.updateUser({ nickname: 'Alice', gender: 'FEMALE' })
     expect(init).toHaveBeenCalledWith({
       env: 'autoforge-d1gkhyfb419ba8455',
       region: 'ap-shanghai',
@@ -45,6 +51,9 @@ describe('CloudBase auth port', () => {
       access_token: 'stored-access-token',
       refresh_token: 'stored-refresh-token',
     })
+    expect(auth.getUser).toHaveBeenCalledOnce()
+    expect(auth.refreshUser).toHaveBeenCalledOnce()
+    expect(auth.updateUser).toHaveBeenCalledWith({ nickname: 'Alice', gender: 'FEMALE' })
   })
 
   it('requires both encrypted tokens when restoring a session', () => {

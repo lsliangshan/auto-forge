@@ -114,8 +114,10 @@ describe('personal profile page', () => {
     expect((app.wrapper.get('[data-testid="profile-birth-date"]').element as HTMLInputElement).value).toBe('2000-01-01')
     expect((app.wrapper.get('[data-testid="profile-email"]').element as HTMLInputElement).value).toBe('alice@example.com')
     expect((app.wrapper.get('[data-testid="profile-phone"]').element as HTMLInputElement).value).toBe('+8613800138000')
+    expect(app.wrapper.get('[data-testid="profile-email"]').attributes('readonly')).toBeDefined()
+    expect(app.wrapper.get('[data-testid="profile-phone"]').attributes('readonly')).toBeDefined()
     expect(app.wrapper.get('[data-testid="profile-avatar"]').attributes('src')).toBe(savedProfile.avatarUrl)
-    expect(app.wrapper.text()).toContain('联系方式')
+    expect(app.wrapper.text()).toContain('来自 CloudBase 账号，修改需验证码。')
   })
 
   it('uploads a new avatar into the draft and saves all fields', async () => {
@@ -133,8 +135,6 @@ describe('personal profile page', () => {
       displayName: 'New Name',
       gender: 'female',
       birthDate: '2000-01-01',
-      email: 'alice@example.com',
-      phone: '+8613800138000',
     }))
   })
 
@@ -144,15 +144,11 @@ describe('personal profile page', () => {
     await vi.waitFor(() => expect(api.profile.get).toHaveBeenCalledOnce())
 
     await app.wrapper.get('[data-testid="profile-birth-date"]').setValue('2999-01-01')
-    await app.wrapper.get('[data-testid="profile-email"]').setValue('invalid')
-    await app.wrapper.get('[data-testid="profile-phone"]').setValue('123')
     await app.wrapper.get('form').trigger('submit')
     expect(api.profile.update).not.toHaveBeenCalled()
     expect(app.wrapper.get('[role="alert"]').text()).toContain('请检查')
 
     await app.wrapper.get('[data-testid="profile-birth-date"]').setValue('2001-01-01')
-    await app.wrapper.get('[data-testid="profile-email"]').setValue('new@example.com')
-    await app.wrapper.get('[data-testid="profile-phone"]').setValue('+8613900139000')
     await app.wrapper.get('[data-testid="profile-display-name"]').setValue('Unsaved')
     vi.mocked(api.profile.update).mockRejectedValueOnce(toSafeAppError({ code: 'INTERNAL_ERROR' }))
     await app.wrapper.get('form').trigger('submit')
@@ -160,6 +156,29 @@ describe('personal profile page', () => {
     await vi.waitFor(() => expect((app.wrapper.get('[data-testid="profile-display-name"]').element as HTMLInputElement).value)
       .toBe('Unsaved'))
     expect(app.wrapper.get('[role="alert"]').text()).toContain('保存')
+  })
+
+  it('refreshes read-only contacts without clearing editable draft changes', async () => {
+    const app = await mountApp('/profile')
+    await vi.waitFor(() => expect(app.api.profile.get).toHaveBeenCalledOnce())
+    await app.wrapper.get('[data-testid="profile-display-name"]').setValue('Unsaved Name')
+
+    const profile = useProfileStore(app.pinia)
+    profile.profile = {
+      ...savedProfile,
+      email: 'rotated@example.com',
+      phone: '+8613900139000',
+    }
+
+    await vi.waitFor(() => {
+      expect((app.wrapper.get('[data-testid="profile-email"]').element as HTMLInputElement).value)
+        .toBe('rotated@example.com')
+      expect((app.wrapper.get('[data-testid="profile-phone"]').element as HTMLInputElement).value)
+        .toBe('+8613900139000')
+    })
+    expect((app.wrapper.get('[data-testid="profile-display-name"]').element as HTMLInputElement).value)
+      .toBe('Unsaved Name')
+    expect(app.wrapper.get('[data-testid="save-profile"]').attributes('disabled')).toBeUndefined()
   })
 
   it('synchronizes a saved display name with the rail and uses account fallbacks', async () => {

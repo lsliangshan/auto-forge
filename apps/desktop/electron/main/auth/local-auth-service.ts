@@ -5,8 +5,10 @@ import {
   type AppError,
   type AuthCredentials,
   type AuthSession,
+  type AuthUser,
 } from '@autoforge/shared'
 import type { LocalAuthRepository, LocalAuthSessionRecord } from '../database/local-auth-repository.js'
+import type { AuthUserProfileUpdate } from './auth-service.js'
 import { ScryptPasswordHasher, type PasswordHasher } from './password-hasher.js'
 
 interface LocalAuthDependencies {
@@ -68,6 +70,18 @@ export class LocalAuthService {
   }
 
   async logout(): Promise<void> {
+    this.repository.clearSession()
+  }
+
+  async updateUserProfile(input: AuthUserProfileUpdate): Promise<AuthUser> {
+    const current = await this.requireSession()
+    return {
+      ...current.user,
+      ...(Object.keys(input).length > 0 ? { profile: { ...input } } : {}),
+    }
+  }
+
+  async discardSession(): Promise<void> {
     this.repository.clearSession()
   }
 

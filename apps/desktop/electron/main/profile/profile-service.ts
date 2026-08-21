@@ -7,6 +7,7 @@ import {
   type UserProfileUpdate,
 } from '@autoforge/shared'
 import type { AuthService } from '../auth/auth-service.js'
+import type { AuthUserProfileUpdate } from '../auth/auth-service.js'
 import type { UserProfileRecord, UserProfileRepository } from '../database/user-profile-repository.js'
 
 export interface ProfileServiceDependencies {
@@ -14,26 +15,17 @@ export interface ProfileServiceDependencies {
   today(): string
 }
 
-function optional(value: string | undefined): string | undefined {
-  const normalized = value?.trim()
-  return normalized ? normalized : undefined
-}
-
 function normalizeProfileInput(input: UserProfileUpdate): UserProfileUpdate {
   return {
     ...(input.avatarUrl === undefined ? {} : { avatarUrl: input.avatarUrl }),
-    ...(optional(input.displayName) ? { displayName: optional(input.displayName) } : {}),
+    ...(input.displayName === undefined ? {} : { displayName: input.displayName.trim() }),
     ...(input.gender === undefined ? {} : { gender: input.gender }),
-    ...(optional(input.birthDate) ? { birthDate: optional(input.birthDate) } : {}),
-    ...(optional(input.email) ? { email: optional(input.email) } : {}),
-    ...(optional(input.phone?.replace(/[ -]/g, ''))
-      ? { phone: optional(input.phone?.replace(/[ -]/g, '')) }
-      : {}),
+    ...(input.birthDate === undefined ? {} : { birthDate: input.birthDate.trim() }),
   }
 }
 
 function validBirthDate(value: string | undefined, today: string): boolean {
-  if (value === undefined) return true
+  if (value === undefined || value === '') return true
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
   if (!match) return false
   const year = Number(match[1])
@@ -44,6 +36,10 @@ function validBirthDate(value: string | undefined, today: string): boolean {
     && date.getMonth() === month - 1
     && date.getDate() === day
     && value <= today
+}
+
+function mergeCloudField<T>(value: T | null | undefined, stored: T | null | undefined): T | null {
+  return value === undefined ? stored ?? null : value
 }
 
 function composeProfile(user: AuthUser, record?: UserProfileRecord): UserProfile {
@@ -62,7 +58,7 @@ function composeProfile(user: AuthUser, record?: UserProfileRecord): UserProfile
 
 export class ProfileService {
   constructor(
-    private readonly auth: Pick<AuthService, 'requireSession'>,
+    private readonly auth: Pick<AuthService, 'requireSession' | 'updateUserProfile'>,
     private readonly repository: UserProfileRepository,
     private readonly dependencies: ProfileServiceDependencies = {
       now: Date.now,
@@ -87,16 +83,33 @@ export class ProfileService {
     if (!parsed.success || !validBirthDate(parsed.data.birthDate, this.dependencies.today())) {
       throw toSafeAppError({ code: 'INVALID_INPUT' })
     }
+    const existing = this.repository.findByUserId(session.user.id)
+    const cloudInput: AuthUserProfileUpdate = {
+      ...(parsed.data.avatarUrl === undefined ? {} : { avatarUrl: parsed.data.avatarUrl }),
+      ...(parsed.data.displayName === undefined ? {} : { displayName: parsed.data.displayName }),
+      ...(parsed.data.gender === undefined ? {} : { gender: parsed.data.gender }),
+    }
+    let user = session.user
+    if (Object.keys(cloudInput).length > 0) {
+      try {
+        user = await this.auth.updateUserProfile(cloudInput)
+      } catch (error) {
+        throw toSafeAppError(error)
+      }
+    }
+    const cloudProfile = user.profile
     const stored = this.repository.upsert({
       userId: session.user.id,
-      avatarUrl: parsed.data.avatarUrl ?? null,
-      displayName: parsed.data.displayName ?? null,
-      gender: parsed.data.gender ?? null,
-      birthDate: parsed.data.birthDate ?? null,
-      email: parsed.data.email ?? null,
-      phone: parsed.data.phone ?? null,
+      avatarUrl: mergeCloudField(cloudProfile?.avatarUrl, existing?.avatarUrl),
+      displayName: mergeCloudField(cloudProfile?.displayName, existing?.displayName),
+      gender: mergeCloudField(cloudProfile?.gender, existing?.gender),
+      birthDate: parsed.data.birthDate === undefined
+        ? existing?.birthDate ?? null
+        : parsed.data.birthDate || null,
+      email: mergeCloudField(cloudProfile?.email, existing?.email),
+      phone: mergeCloudField(cloudProfile?.phone, existing?.phone),
       updatedAt: this.dependencies.now(),
     })
-    return composeProfile(session.user, stored)
+    return composeProfile(user, stored)
   }
 }

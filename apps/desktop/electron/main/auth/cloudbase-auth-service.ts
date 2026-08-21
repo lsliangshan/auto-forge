@@ -6,6 +6,7 @@ import {
   authOtpVerificationSchema,
   authUserSchema,
   toSafeAppError,
+  userProfileUpdateSchema,
   type AppError,
   type AuthCredentials,
   type AuthOtpChallenge,
@@ -13,8 +14,9 @@ import {
   type AuthOtpVerification,
   type AuthSession,
   type AuthUser,
+  type AuthUserProfileSnapshot,
 } from '@autoforge/shared'
-import type { AuthSecretStore, AuthService } from './auth-service.js'
+import type { AuthSecretStore, AuthService, AuthUserProfileUpdate } from './auth-service.js'
 import {
   cloudBaseOtpTarget,
   cloudBasePasswordCredentials,
@@ -30,22 +32,11 @@ interface PendingChallenge {
   expiresAt: number
 }
 
-interface CloudBaseUser {
-  id: string
-  is_anonymous?: boolean
-  user_metadata?: { nickname?: string }
-  nickName?: string
-  username?: string
-  name?: string
-  phone?: string
-  email?: string
-}
-
 interface CloudBaseSession {
   accessToken: string
   refreshToken: string
   expiresIn: number
-  user: CloudBaseUser
+  user: AuthUser
 }
 
 interface StoredCloudBaseSession {
@@ -68,6 +59,14 @@ const storedCloudBaseSessionSchema: z.ZodType<StoredCloudBaseSession> = z.object
   authenticatedAt: z.string().datetime(),
   user: authUserSchema,
 }).strict()
+
+const cloudBaseProfileUpdateSchema = userProfileUpdateSchema.pick({
+  displayName: true,
+  avatarUrl: true,
+  gender: true,
+})
+const providerEmailSchema = z.string().email().max(254)
+const providerPhoneSchema = z.string().regex(/^\+?\d{6,20}$/)
 
 function failure(code: AppError['code']): AppError {
   return toSafeAppError({ code })
@@ -119,10 +118,10 @@ function responseError(response: unknown): unknown | undefined {
 }
 
 function isAnonymousSession(response: unknown): boolean {
-  if (!isRecord(response) || !isRecord(response.data) || !isRecord(response.data.session)) {
-    return false
-  }
-  const sessionUser = isRecord(response.data.session.user) ? response.data.session.user : undefined
+  if (!isRecord(response) || !isRecord(response.data)) return false
+  const sessionUser = isRecord(response.data.session) && isRecord(response.data.session.user)
+    ? response.data.session.user
+    : undefined
   const responseUser = isRecord(response.data.user) ? response.data.user : undefined
   return sessionUser?.is_anonymous === true || responseUser?.is_anonymous === true
 }
@@ -149,6 +148,171 @@ function verifyOtpCallback(response: unknown): PendingChallenge['verifyOtp'] {
   return (input) => verifyOtp.call(data, input) as Promise<unknown>
 }
 
+function providerText(
+  fields: Array<{ source: Record<string, unknown> | undefined; key: string }>,
+): string | null | undefined {
+  for (const { source, key } of fields) {
+    if (!source || !Object.prototype.hasOwnProperty.call(source, key)) continue
+    const value = source[key]
+    if (value === null) return null
+    if (typeof value !== 'string') continue
+    const normalized = value.trim()
+    return normalized.length > 0 ? normalized : null
+  }
+  return undefined
+}
+
+function safeAccount(value: string | null | undefined): string | undefined {
+  if (value === undefined || value === null) return undefined
+  const bounded = Array.from(value).slice(0, 64).join('')
+  return bounded.length > 0 ? bounded : undefined
+}
+
+function safeDisplayName(value: string | null | undefined): string | null | undefined {
+  if (value === undefined || value === null) return value
+  return Array.from(value).length <= 50 ? value : undefined
+}
+
+function safeAvatarUrl(value: string | null | undefined): string | null | undefined {
+  if (value === undefined || value === null) return value
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'https:'
+      && parsed.username === ''
+      && parsed.password === ''
+      && parsed.port === ''
+      && parsed.hash === ''
+      && parsed.href === value
+      ? value
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function safeGender(value: string | null | undefined): AuthUserProfileSnapshot['gender'] {
+  if (value === undefined || value === null) return value
+  const normalized = value.trim().toUpperCase().replaceAll('-', '_')
+  const genders = {
+    MALE: 'male',
+    FEMALE: 'female',
+    OTHER: 'other',
+    PREFER_NOT_TO_SAY: 'prefer_not_to_say',
+  } as const
+  return genders[normalized as keyof typeof genders]
+}
+
+function cloudBaseGender(
+  value: NonNullable<AuthUserProfileUpdate['gender']>,
+): 'MALE' | 'FEMALE' | 'OTHER' | 'PREFER_NOT_TO_SAY' {
+  const genders = {
+    male: 'MALE',
+    female: 'FEMALE',
+    other: 'OTHER',
+    prefer_not_to_say: 'PREFER_NOT_TO_SAY',
+  } as const
+  return genders[value]
+}
+
+function maskPhone(value: string): string | undefined {
+  const normalized = value.trim()
+  if (!normalized) return undefined
+  const suffixLength = Math.min(4, Math.max(1, normalized.length - 1))
+  const prefixLength = Math.min(normalized.startsWith('+') ? 5 : 3, normalized.length - suffixLength)
+  return safeAccount(`${normalized.slice(0, prefixLength)}****${normalized.slice(-suffixLength)}`)
+}
+
+function maskEmail(value: string): string | undefined {
+  const normalized = value.trim()
+  const at = normalized.lastIndexOf('@')
+  if (at <= 0 || at === normalized.length - 1) return undefined
+  return safeAccount(`${normalized[0]}***${normalized.slice(at)}`)
+}
+
+function providerUser(value: Record<string, unknown>, fallback?: AuthUser): AuthUser {
+  if (typeof value.id !== 'string' || value.id.trim().length === 0) {
+    if (fallback) return fallback
+    throw failure('INTERNAL_ERROR')
+  }
+  const id = value.id.trim()
+  const metadata = isRecord(value.user_metadata) ? value.user_metadata : undefined
+  const username = providerText([
+    { source: metadata, key: 'username' },
+    { source: value, key: 'username' },
+  ])
+  const displayName = safeDisplayName(providerText([
+    { source: metadata, key: 'nickname' },
+    { source: metadata, key: 'nickName' },
+    { source: value, key: 'nickName' },
+    { source: metadata, key: 'name' },
+    { source: value, key: 'name' },
+  ]))
+  const account = safeAccount(username)
+    ?? fallback?.account
+    ?? safeAccount(displayName)
+    ?? (typeof value.phone === 'string' ? maskPhone(value.phone) : undefined)
+    ?? (typeof value.email === 'string' ? maskEmail(value.email) : undefined)
+  if (!account) throw failure('INTERNAL_ERROR')
+
+  const avatarUrl = safeAvatarUrl(providerText([
+    { source: metadata, key: 'avatarUrl' },
+    { source: metadata, key: 'avatar_url' },
+    { source: metadata, key: 'picture' },
+    { source: value, key: 'avatarUrl' },
+    { source: value, key: 'avatar_url' },
+    { source: value, key: 'picture' },
+  ]))
+  const gender = safeGender(providerText([
+    { source: metadata, key: 'gender' },
+    { source: value, key: 'gender' },
+  ]))
+  const emailValue = providerText([{ source: value, key: 'email' }])
+  const emailConfirmed = safeAccount(providerText([
+    { source: value, key: 'email_confirmed_at' },
+  ]))
+  const email = emailValue === null
+    ? null
+    : emailValue !== undefined && emailConfirmed && providerEmailSchema.safeParse(emailValue).success
+      ? emailValue
+      : undefined
+  const phoneValue = providerText([{ source: value, key: 'phone' }])
+  const phoneConfirmed = safeAccount(providerText([
+    { source: value, key: 'phone_confirmed_at' },
+  ]))
+  const phone = phoneValue === null
+    ? null
+    : phoneValue !== undefined && phoneConfirmed && providerPhoneSchema.safeParse(phoneValue).success
+      ? phoneValue
+      : undefined
+  const providedProfile = {
+    ...(displayName !== undefined ? { displayName } : {}),
+    ...(avatarUrl !== undefined ? { avatarUrl } : {}),
+    ...(gender !== undefined ? { gender } : {}),
+    ...(email !== undefined ? { email } : {}),
+    ...(phone !== undefined ? { phone } : {}),
+  }
+  const profile = { ...fallback?.profile, ...providedProfile }
+  return authUserSchema.parse({
+    id,
+    account,
+    ...(Object.keys(profile).length > 0 ? { profile } : {}),
+  })
+}
+
+function optionalCloudBaseUserResponse(response: unknown, fallback?: AuthUser): AuthUser | undefined {
+  if (!isRecord(response)) throw failure('INTERNAL_ERROR')
+  if (response.error !== null) throw providerFailure(response.error)
+  if (!isRecord(response.data) || !isRecord(response.data.user)) return undefined
+  if (response.data.user.is_anonymous === true) throw failure('INTERNAL_ERROR')
+  return providerUser(response.data.user, fallback)
+}
+
+function cloudBaseUserResponse(response: unknown, fallback?: AuthUser): AuthUser {
+  const user = optionalCloudBaseUserResponse(response, fallback)
+  if (!user) throw failure('INTERNAL_ERROR')
+  return user
+}
+
 function cloudBaseSession(
   response: unknown,
   allowMissing = false,
@@ -171,34 +335,18 @@ function cloudBaseSession(
     || session.expires_in <= 0) {
     throw failure('INTERNAL_ERROR')
   }
-  const providerUser: (Record<string, unknown> & { id: string }) | undefined =
+  const providerRecord: (Record<string, unknown> & { id: string }) | undefined =
     isRecord(user) && typeof user.id === 'string' && user.id.trim().length > 0
     ? { ...user, id: user.id.trim() }
     : undefined
-  if (providerUser === undefined && fallbackUser === undefined) {
+  if (providerRecord === undefined && fallbackUser === undefined) {
     throw failure('INTERNAL_ERROR')
   }
-  const resolvedUser = providerUser
-    ?? (fallbackUser !== undefined
-      ? { id: fallbackUser.id, user_metadata: { nickname: fallbackUser.account } }
-      : undefined)
-  if (resolvedUser === undefined) throw failure('INTERNAL_ERROR')
-  const metadata = isRecord(resolvedUser.user_metadata) ? resolvedUser.user_metadata : undefined
   return {
     accessToken: session.access_token,
     refreshToken: session.refresh_token,
     expiresIn: session.expires_in,
-    user: {
-      id: resolvedUser.id,
-      ...(typeof metadata?.nickname === 'string'
-        ? { user_metadata: { nickname: metadata.nickname } }
-        : {}),
-      ...(typeof resolvedUser.nickName === 'string' ? { nickName: resolvedUser.nickName } : {}),
-      ...(typeof resolvedUser.username === 'string' ? { username: resolvedUser.username } : {}),
-      ...(typeof resolvedUser.name === 'string' ? { name: resolvedUser.name } : {}),
-      ...(typeof resolvedUser.phone === 'string' ? { phone: resolvedUser.phone } : {}),
-      ...(typeof resolvedUser.email === 'string' ? { email: resolvedUser.email } : {}),
-    },
+    user: providerRecord ? providerUser(providerRecord, fallbackUser) : fallbackUser!,
   }
 }
 
@@ -212,48 +360,9 @@ function parseStoredSession(value: string): StoredCloudBaseSession | undefined {
   }
 }
 
-function boundedAccount(value: string): string | undefined {
-  const normalized = value.trim()
-  if (!normalized) return undefined
-  return Array.from(normalized).slice(0, 64).join('')
-}
-
-function domesticPhone(value: string): string | undefined {
-  const compact = value.replace(/\s+/g, '')
-  const normalized = compact.startsWith('+86') ? compact.slice(3) : compact
-  return boundedAccount(normalized)
-}
-
-function maskEmail(value: string): string | undefined {
-  const normalized = value.trim()
-  const at = normalized.lastIndexOf('@')
-  if (at <= 0 || at === normalized.length - 1) return undefined
-  return boundedAccount(`${normalized[0]}***${normalized.slice(at)}`)
-}
-
-function displayAccount(user: CloudBaseUser): string {
-  const direct = [
-    user.user_metadata?.nickname,
-    user.nickName,
-    user.username,
-    user.name,
-  ]
-    .filter((value): value is string => typeof value === 'string')
-    .map(boundedAccount)
-    .find((value): value is string => value !== undefined)
-  const fallback = typeof user.phone === 'string'
-    ? domesticPhone(user.phone)
-    : typeof user.email === 'string'
-      ? maskEmail(user.email)
-      : undefined
-  if (direct) return direct
-  if (fallback) return fallback
-  throw failure('INTERNAL_ERROR')
-}
-
 function publicSession(session: CloudBaseSession, authenticatedAt: string): AuthSession {
   return {
-    user: { id: session.user.id, account: displayAccount(session.user) },
+    user: session.user,
     authenticatedAt,
   }
 }
@@ -263,7 +372,7 @@ export class CloudBaseAuthService implements AuthService {
   private challengeGeneration = 0
   private sessionOperationTail: Promise<void> = Promise.resolve()
   private sessionUser: AuthUser | undefined
-
+  private sessionDiscarded = false
   constructor(
     private readonly auth: CloudBaseAuthPort,
     private readonly secrets: AuthSecretStore,
@@ -357,6 +466,8 @@ export class CloudBaseAuthService implements AuthService {
   }
 
   private async getSessionWithoutLock(): Promise<AuthSession | null> {
+    if (this.sessionDiscarded) return null
+
     let currentResponse: unknown
     try {
       currentResponse = await this.auth.getSession()
@@ -450,6 +561,35 @@ export class CloudBaseAuthService implements AuthService {
     })
   }
 
+  async updateUserProfile(input: AuthUserProfileUpdate): Promise<AuthUser> {
+    const parsed = cloudBaseProfileUpdateSchema.safeParse(input)
+    if (!parsed.success) throw failure('INVALID_INPUT')
+
+    return this.runSessionOperation(async () => {
+      if (this.sessionDiscarded || !this.sessionUser) throw failure('AUTH_REQUIRED')
+      if (Object.keys(parsed.data).length === 0) return this.sessionUser
+
+      const response = await this.updateProviderUser(parsed.data)
+      const user = await this.resolveUpdatedUser(response, this.sessionUser)
+      await this.persistUser(user)
+      return user
+    })
+  }
+
+  async discardSession(): Promise<void> {
+    this.challengeGeneration++
+    this.challenges.clear()
+    return this.runSessionOperation(async () => {
+      this.sessionDiscarded = true
+      this.deleteStoredSession()
+      try {
+        await this.auth.signOut()
+      } catch {
+        return
+      }
+    })
+  }
+
   async requireSession(): Promise<AuthSession> {
     const session = await this.getSession()
     if (!session) throw failure('AUTH_REQUIRED')
@@ -471,7 +611,64 @@ export class CloudBaseAuthService implements AuthService {
       throw failure('INTERNAL_ERROR')
     }
     this.sessionUser = result.user
+    this.sessionDiscarded = false
     return result
+  }
+
+  private async updateProviderUser(input: AuthUserProfileUpdate): Promise<unknown> {
+    try {
+      return await this.auth.updateUser({
+        ...(input.displayName !== undefined ? { nickname: input.displayName } : {}),
+        ...(input.avatarUrl !== undefined ? { avatar_url: input.avatarUrl } : {}),
+        ...(input.gender !== undefined ? { gender: cloudBaseGender(input.gender) } : {}),
+      })
+    } catch (error) {
+      throw providerFailure(error)
+    }
+  }
+
+  private async resolveUpdatedUser(response: unknown, fallback: AuthUser): Promise<AuthUser> {
+    const updated = optionalCloudBaseUserResponse(response, fallback)
+    if (updated) return updated
+
+    const refreshed = optionalCloudBaseUserResponse(
+      await this.callProviderUser(() => this.auth.refreshUser()),
+      fallback,
+    )
+    if (refreshed) return refreshed
+    return cloudBaseUserResponse(
+      await this.callProviderUser(() => this.auth.getUser()),
+      fallback,
+    )
+  }
+
+  private async callProviderUser(operation: () => Promise<unknown>): Promise<unknown> {
+    try {
+      return await operation()
+    } catch (error) {
+      throw providerFailure(error)
+    }
+  }
+
+  private async persistUser(user: AuthUser): Promise<void> {
+    let serialized: string | undefined
+    try {
+      serialized = await this.secrets.get(SESSION_KEY)
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+    if (serialized === undefined) throw failure('AUTH_REQUIRED')
+    const stored = parseStoredSession(serialized)
+    if (!stored) {
+      this.deleteStoredSession()
+      throw failure('AUTH_REQUIRED')
+    }
+    try {
+      await this.secrets.set(SESSION_KEY, JSON.stringify({ ...stored, user }))
+    } catch {
+      throw failure('INTERNAL_ERROR')
+    }
+    this.sessionUser = user
   }
 
   private runSessionOperation<T>(operation: () => Promise<T>): Promise<T> {

@@ -25,6 +25,7 @@ function cloudSession(
     expires_in: tokens.expiresIn ?? 3_600,
     user: {
       id: 'cloud_uid',
+      username: account,
       user_metadata: { nickname: account },
     },
   }
@@ -99,7 +100,7 @@ function storedSession(overrides: Partial<{
   refreshToken: string
   expiresAt: number
   authenticatedAt: string
-  user: { id: string; account: string }
+  user: { id: string; account: string; profile?: Record<string, unknown> }
 }> = {}) {
   return JSON.stringify({
     accessToken: 'stored-access-token',
@@ -117,6 +118,9 @@ function harness() {
     signUp: vi.fn(),
     signInWithPassword: vi.fn(),
     getSession: vi.fn(),
+    getUser: vi.fn(),
+    refreshUser: vi.fn(),
+    updateUser: vi.fn(),
     setSession: vi.fn(),
     refreshSession: vi.fn(),
     signOut: vi.fn(),
@@ -325,8 +329,8 @@ describe('CloudBaseAuthService', () => {
   })
 
   it.each([
-    [{ user_metadata: { nickname: ' Metadata Nick ' }, username: 'username' }, 'Metadata Nick'],
-    [{ nickName: ' Camel Nick ', username: 'username' }, 'Camel Nick'],
+    [{ user_metadata: { nickname: ' Metadata Nick ' }, username: 'username' }, 'username'],
+    [{ nickName: ' Camel Nick ', username: 'username' }, 'username'],
     [{ username: ' normalized_user ', name: 'Friendly Name' }, 'normalized_user'],
     [{ name: ' Friendly Name ' }, 'Friendly Name'],
   ] as const)('uses the first safe display field from %o', async (user, expected) => {
@@ -336,6 +340,203 @@ describe('CloudBaseAuthService', () => {
     await expect(app.service.loginWithPassword({
       account: 'alice_1', password: 'password',
     })).resolves.toMatchObject({ user: { account: expected } })
+  })
+
+  it('normalizes CloudBase identity fields into the authenticated user snapshot', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1',
+      email: 'alice@example.com',
+      email_confirmed_at: '2026-08-20T00:00:00.000Z',
+      phone: '+8618311032722',
+      phone_confirmed_at: '2026-08-20T00:00:00.000Z',
+      user_metadata: {
+        nickname: 'Alice Zhang',
+        avatarUrl: 'https://cdn.example.com/profiles/cloud_uid/avatar.webp',
+        gender: 'FEMALE',
+      },
+    })))
+
+    await expect(app.service.loginWithPassword({
+      account: 'alice_1', password: 'password',
+    })).resolves.toEqual({
+      user: {
+        id: 'cloud_uid',
+        account: 'alice_1',
+        profile: {
+          displayName: 'Alice Zhang',
+          avatarUrl: 'https://cdn.example.com/profiles/cloud_uid/avatar.webp',
+          gender: 'female',
+          email: 'alice@example.com',
+          phone: '+8618311032722',
+        },
+      },
+      authenticatedAt: AUTHENTICATED_AT,
+    })
+  })
+
+  it('omits unverified or malformed CloudBase profile fields without erasing local values', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1',
+      email: 'unverified@example.com',
+      phone: '+8618311032722',
+      confirmed_at: '2026-08-20T00:00:00.000Z',
+      user_metadata: {
+        avatarUrl: 'http://insecure.example.com/avatar.png',
+        gender: 'UNKNOWN',
+      },
+    })))
+
+    await expect(app.service.loginWithPassword({
+      account: 'alice_1', password: 'password',
+    })).resolves.toEqual({
+      user: { id: 'cloud_uid', account: 'alice_1' },
+      authenticatedAt: AUTHENTICATED_AT,
+    })
+  })
+
+  it.each([
+    [{
+      email: 'verified@example.com',
+      email_confirmed_at: '2026-08-20T00:00:00.000Z',
+      phone: '+8618311032722',
+      confirmed_at: '2026-08-20T00:00:00.000Z',
+    }, { email: 'verified@example.com' }],
+    [{
+      email: 'unverified@example.com',
+      phone: '+8618311032722',
+      phone_confirmed_at: '2026-08-20T00:00:00.000Z',
+      confirmed_at: '2026-08-20T00:00:00.000Z',
+    }, { phone: '+8618311032722' }],
+  ] as const)('projects only the contact with its matching confirmation timestamp', async (
+    contacts,
+    expectedProfile,
+  ) => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1',
+      ...contacts,
+    })))
+
+    const authenticated = await app.service.loginWithPassword({
+      account: 'alice_1', password: 'password',
+    })
+
+    expect(authenticated.user.profile).toEqual(expectedProfile)
+  })
+
+  it('updates editable CloudBase profile fields and persists the returned identity snapshot', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1', user_metadata: { nickname: 'Alice' },
+    })))
+    vi.mocked(app.port.updateUser).mockResolvedValue({
+      data: {
+        user: {
+          id: 'cloud_uid',
+          username: 'alice_1',
+          user_metadata: {
+            nickname: 'Alice Cloud',
+            avatarUrl: 'https://cdn.example.com/profiles/cloud_uid/new.webp',
+            gender: 'FEMALE',
+          },
+        },
+      },
+      error: null,
+    })
+    await app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+
+    await expect(app.service.updateUserProfile({
+      displayName: 'Alice Cloud',
+      avatarUrl: 'https://cdn.example.com/profiles/cloud_uid/new.webp',
+      gender: 'female',
+    })).resolves.toEqual({
+      id: 'cloud_uid',
+      account: 'alice_1',
+      profile: {
+        displayName: 'Alice Cloud',
+        avatarUrl: 'https://cdn.example.com/profiles/cloud_uid/new.webp',
+        gender: 'female',
+      },
+    })
+    expect(app.port.updateUser).toHaveBeenCalledWith({
+      nickname: 'Alice Cloud',
+      avatar_url: 'https://cdn.example.com/profiles/cloud_uid/new.webp',
+      gender: 'FEMALE',
+    })
+    expect(JSON.parse(app.stored.get(SESSION_KEY) ?? '')).toMatchObject({
+      user: {
+        id: 'cloud_uid',
+        account: 'alice_1',
+        profile: { displayName: 'Alice Cloud', gender: 'female' },
+      },
+    })
+  })
+
+  it('refreshes the CloudBase user when updateUser omits the updated identity', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1', user_metadata: { nickname: 'Alice' },
+    })))
+    vi.mocked(app.port.updateUser).mockResolvedValue({ data: {}, error: null })
+    vi.mocked(app.port.refreshUser).mockResolvedValue({
+      data: {
+        user: {
+          id: 'cloud_uid',
+          username: 'alice_1',
+          user_metadata: { nickname: 'Refreshed Name' },
+        },
+      },
+      error: null,
+    })
+    await app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+
+    await expect(app.service.updateUserProfile({ displayName: 'Requested Name' }))
+      .resolves.toMatchObject({ profile: { displayName: 'Refreshed Name' } })
+    expect(app.port.refreshUser).toHaveBeenCalledOnce()
+    expect(app.port.getUser).not.toHaveBeenCalled()
+  })
+
+  it('gets the current CloudBase user when refreshUser also omits the identity', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse(cloudSessionForUser({
+      username: 'alice_1', user_metadata: { nickname: 'Alice' },
+    })))
+    vi.mocked(app.port.updateUser).mockResolvedValue({ data: {}, error: null })
+    vi.mocked(app.port.refreshUser).mockResolvedValue({ data: {}, error: null })
+    vi.mocked(app.port.getUser).mockResolvedValue({
+      data: {
+        user: {
+          id: 'cloud_uid',
+          username: 'alice_1',
+          user_metadata: { nickname: 'Current Name' },
+        },
+      },
+      error: null,
+    })
+    await app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+
+    await expect(app.service.updateUserProfile({ displayName: 'Requested Name' }))
+      .resolves.toMatchObject({ profile: { displayName: 'Current Name' } })
+    expect(app.port.refreshUser).toHaveBeenCalledOnce()
+    expect(app.port.getUser).toHaveBeenCalledOnce()
+  })
+
+  it('discards local credentials even when remote signOut fails', async () => {
+    const app = harness()
+    vi.mocked(app.port.signInWithPassword).mockResolvedValue(authResponse())
+    vi.mocked(app.port.signOut).mockRejectedValue({
+      code: 'NETWORK_ERROR', message: 'provider infrastructure detail',
+    })
+    await app.service.loginWithPassword({ account: 'alice_1', password: 'password' })
+
+    await expect(app.service.discardSession()).resolves.toBeUndefined()
+    expect(app.secrets.delete).toHaveBeenCalledWith(SESSION_KEY)
+    expect(app.stored.has(SESSION_KEY)).toBe(false)
+    expect(app.port.signOut).toHaveBeenCalledOnce()
+    await expect(app.service.getSession()).resolves.toBeNull()
+    expect(app.port.getSession).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -447,7 +648,11 @@ describe('CloudBaseAuthService', () => {
       refreshToken: 'sample-refresh-token',
       expiresAt: NOW + 120_000,
       authenticatedAt: AUTHENTICATED_AT,
-      user: { id: 'cloud_uid', account: 'Alice_1' },
+      user: {
+        id: 'cloud_uid',
+        account: 'Alice_1',
+        profile: { displayName: 'Alice_1' },
+      },
     })
     expect(encryptedBoundaryValue).not.toContain('password')
     expect(encryptedBoundaryValue).not.toContain('123456')
@@ -461,7 +666,11 @@ describe('CloudBaseAuthService', () => {
     })))
 
     await expect(app.service.getSession()).resolves.toEqual({
-      user: { id: 'cloud_uid', account: 'Memory User' },
+      user: {
+        id: 'cloud_uid',
+        account: 'Memory User',
+        profile: { displayName: 'Memory User' },
+      },
       authenticatedAt: AUTHENTICATED_AT,
     })
     expect(app.secrets.get).not.toHaveBeenCalled()
@@ -494,7 +703,11 @@ describe('CloudBaseAuthService', () => {
     })))
 
     await expect(app.service.getSession()).resolves.toEqual({
-      user: { id: 'cloud_uid', account: 'Restored User' },
+      user: {
+        id: 'cloud_uid',
+        account: 'Restored User',
+        profile: { displayName: 'Restored User' },
+      },
       authenticatedAt: '2026-08-17T00:00:00.000Z',
     })
     expect(app.port.setSession).toHaveBeenCalledWith({
@@ -507,7 +720,11 @@ describe('CloudBaseAuthService', () => {
       refreshToken: 'rotated-refresh-token',
       expiresAt: NOW + 3_600_000,
       authenticatedAt: '2026-08-17T00:00:00.000Z',
-      user: { id: 'cloud_uid', account: 'Restored User' },
+      user: {
+        id: 'cloud_uid',
+        account: 'Restored User',
+        profile: { displayName: 'Restored User' },
+      },
     })
   })
 
