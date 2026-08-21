@@ -105,6 +105,18 @@ describe('createSecureWindow', () => {
     expect(html).not.toContain('connect-src \'self\' https://openrouter.ai')
   })
 
+  it('allows the trusted avatar origin without allowing arbitrary HTTPS images', async () => {
+    const html = await readFile(new URL('../../index.html', import.meta.url), 'utf8')
+    const policy = /http-equiv="Content-Security-Policy" content="([^"]+)"/.exec(html)?.[1]
+    const imageSources = policy?.split(';')
+      .map((directive) => directive.trim())
+      .find((directive) => directive.startsWith('img-src '))
+      ?.split(/\s+/)
+    expect(imageSources).toEqual([
+      'img-src', "'self'", 'data:', 'autoforge-media:', 'https://img.liangqy.com',
+    ])
+  })
+
   it('allows main to register the fixed bridge before renderer code loads', async () => {
     const order: string[] = []
     class OrderedWindow extends FakeBrowserWindow {
