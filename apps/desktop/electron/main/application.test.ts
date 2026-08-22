@@ -333,6 +333,7 @@ async function authenticate(
 async function installApprovalWorkflow(
   runtime: ReturnType<typeof createApplicationRuntime>,
   activation = 'approval workflow',
+  options: { beijing?: boolean } = {},
 ) {
   const project = await runtime.services.developer.createProject('Approval Workflow')
   const manifest = JSON.parse(
@@ -341,6 +342,11 @@ async function installApprovalWorkflow(
   Object.assign(manifest, {
     id: 'local.autoforge.approval-workflow',
     version: '1.0.0',
+    ...(options.beijing ? {
+      name: '北京工作居住证',
+      description: '办理北京工作居住证',
+      cities: ['北京'],
+    } : {}),
     permissions: [{ capability: 'browser.fill', scope: { origins: ['https://example.com'] } }],
     activationExamples: [activation],
     inputSchema: { type: 'object', additionalProperties: false },
@@ -401,13 +407,15 @@ async function applicationHarness(input: {
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         return
       }
+      const selectedToolName = request.tools?.[0]?.function.name
+      if (!selectedToolName) throw new Error('Expected an opaque workflow tool in the provider request')
       yield {
         type: 'tool_call' as const,
         choiceIndex: 0,
         index: 0,
         id: `call_${providerRequests.length}`,
-        name: 'workflow_1',
-        arguments: { input: {} },
+        name: selectedToolName,
+        arguments: { resolvedCity: '北京', input: {} },
       }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
     }),
@@ -432,11 +440,11 @@ async function applicationHarness(input: {
       openrouter: { text: 'openrouter/tools' },
     },
   })
-  await installApprovalWorkflow(runtime, 'dynamic workflow')
+  await installApprovalWorkflow(runtime, 'dynamic workflow', { beijing: true })
 
   const sendToolPrompt = async () => {
     const conversation = await runtime.services.chat.createConversation()
-    const sent = await runtime.services.chat.send(chatInput(conversation.id, 'dynamic workflow'))
+    const sent = await runtime.services.chat.send(chatInput(conversation.id, '我想办理北京工作居住证'))
     await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
       type: 'block',
       conversationId: conversation.id,
@@ -1684,6 +1692,103 @@ describe('createApplicationRuntime', () => {
       })
     } finally {
       database.close()
+    }
+  })
+
+  it('keeps development starts at zero when mode is off and runs the installed workflow instead', async () => {
+    const app = await applicationHarness({ developerMode: false })
+    try {
+      const pending = await app.sendToolPrompt()
+      expect(pending.approval).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        workflowName: '北京工作居住证',
+        workflowVersion: '1.0.0',
+        source: 'installed',
+        city: '北京',
+      })
+      expect(pending.approval).not.toHaveProperty('buildHash')
+      expect(app.providerRequests[0]?.tools?.[0]?.function.name).toBeTruthy()
+
+      const decision = app.runtime.services.executions.decide({
+        executionId: pending.approval.executionId,
+        permissionIndex: pending.approval.permissionIndex,
+        scopeHash: pending.approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(app.executions.started).toHaveLength(1))
+      expect(app.executions.started[0]?.input).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        workflowVersion: '1.0.0',
+        input: {},
+      })
+      app.finishRunning(pending.approval.executionId)
+      await expect(decision).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({
+          type: 'workflow_provenance',
+          entries: [expect.objectContaining({
+            executionId: pending.approval.executionId,
+            source: 'installed',
+            city: '北京',
+            status: 'completed',
+          })],
+        }),
+      })))
+      expect(app.chatEvents).not.toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({
+          type: 'workflow_status',
+          source: 'development',
+        }),
+      }))
+    } finally {
+      await app.runtime.close()
+    }
+  })
+
+  it('binds a completed development run to the exact version, build, city, and final provenance', async () => {
+    const app = await applicationHarness({ developerMode: true })
+    try {
+      const pending = await app.sendToolPrompt()
+      expect(pending.approval).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        workflowName: '北京工作居住证',
+        workflowVersion: '1.0.0',
+        source: 'development',
+        buildHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        city: '北京',
+      })
+      const decision = app.runtime.services.executions.decide({
+        executionId: pending.approval.executionId,
+        permissionIndex: pending.approval.permissionIndex,
+        scopeHash: pending.approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(app.executions.started).toHaveLength(1))
+      expect(JSON.stringify(app.chatEvents)).not.toContain('工作流处理完成')
+
+      app.finishRunning(pending.approval.executionId)
+      await expect(decision).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({
+          type: 'workflow_provenance',
+          entries: [expect.objectContaining({
+            executionId: pending.approval.executionId,
+            workflowId: pending.approval.workflowId,
+            workflowName: pending.approval.workflowName,
+            workflowVersion: pending.approval.workflowVersion,
+            source: pending.approval.source,
+            buildHash: pending.approval.buildHash,
+            city: pending.approval.city,
+            status: 'completed',
+          })],
+        }),
+      })))
+      expect(JSON.stringify(app.chatEvents)).toContain('工作流处理完成')
+    } finally {
+      await app.runtime.close()
     }
   })
 

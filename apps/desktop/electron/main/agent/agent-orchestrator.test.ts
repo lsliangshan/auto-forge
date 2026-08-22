@@ -1020,6 +1020,27 @@ describe('AgentOrchestrator', () => {
     }))
   })
 
+  it('persists an unrelated direct answer without workflow status or provenance', async () => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '二进制使用 0 和 1 表示数值。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'direct_unrelated', content: '什么是二进制？', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]![0]).toHaveProperty('tools')
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks).toEqual([
+      expect.objectContaining({ type: 'text', text: '二进制使用 0 和 1 表示数值。' }),
+    ])
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({ type: 'workflow_status' }))
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({ type: 'workflow_provenance' }))
+  })
+
   it('returns semantic input failure to the model without reserving or starting', async () => {
     const invalidToolTurn: ProviderStreamEvent[] = [
       { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_invalid', name: 'workflow_1', arguments: { input: {} } },
@@ -1137,6 +1158,51 @@ describe('AgentOrchestrator', () => {
       })]),
     })
     expect(JSON.stringify(dependencies.records.events)).not.toContain('汉汉汉汉汉汉汉汉')
+    const provenance = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks.at(-1)
+    expect(provenance).toMatchObject({
+      type: 'workflow_provenance',
+      entries: [expect.objectContaining({ status: 'completed' })],
+    })
+  })
+
+  it('keeps invalid output failed while RESULT_TOO_LARGE leaves a completed execution', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '工作流输出无效' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.executions.startReserved = async (reservation, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+      return {
+        id: reservation.executionId,
+        finished: Promise.resolve({
+          id: reservation.executionId,
+          status: 'failed',
+          errorCode: 'INVALID_OUTPUT',
+        }),
+      }
+    }
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'invalid_output', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    const continuation = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(continuation.messages).toContainEqual(expect.objectContaining({
+      role: 'tool',
+      tool_call_id: 'call_1',
+      content: expect.stringContaining('INVALID_OUTPUT'),
+    }))
+    expect(JSON.stringify(continuation)).not.toContain('RESULT_TOO_LARGE')
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status', status: 'failed',
+    }))
+    expect(JSON.stringify(finalBlocks)).not.toContain('RESULT_TOO_LARGE')
+    expect(finalBlocks.at(-1)).toMatchObject({
+      type: 'workflow_provenance',
+      entries: [expect.objectContaining({ status: 'failed' })],
+    })
   })
 
   it('validates approval and tool arguments, then returns the result with the original tool call id', async () => {
