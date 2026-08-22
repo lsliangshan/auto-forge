@@ -123,7 +123,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await sendChat(page, electronApp, conversationId, '我的工作居住证“有效期至”是什么')
 
     await expect(page.getByText('有效期至：2028-06-30')).toBeVisible()
-    await expect(page.getByText(/来源：permit\.autoforge\.test \/ https:\/\/permit\.autoforge\.test；读取时间：\d{4}-\d{2}-\d{2}T/)).toBeVisible()
+    const evidence = page.getByText(/来源：permit\.autoforge\.test \/ https:\/\/permit\.autoforge\.test；读取时间：/)
+    await expect(evidence).toBeVisible()
+    const readTime = (await evidence.textContent())
+      ?.match(/；读取时间：(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)）。$/u)?.[1] ?? ''
+    expect(Number.isFinite(Date.parse(readTime))).toBe(true)
+    expect(new Date(readTime).toISOString()).toBe(readTime)
     expect(await fixture.snapshot()).toMatchObject({ authenticated: true, finalSubmissions: 0 })
   })
 
@@ -181,7 +186,10 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(await command<string>(electronApp, 'tabFieldValue', {
       tabId: binding.tabId, selector: '#employer',
     })).toBe('北京网聘信息技术有限公司')
-    expect(await fixture.snapshot()).toMatchObject({
+    await expect.poll(async () => fixture.snapshot(), {
+      message: 'the draft beacon should persist the exact replacement before final submit',
+      timeout: 5_000,
+    }).toMatchObject({
       employer: '北京网聘信息技术有限公司',
       lastDraftPayload: '北京网聘信息技术有限公司',
       draftSaves: 1,
@@ -308,7 +316,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(await command<string>(electronApp, 'pagePath')).toBe('/details')
   })
 
-  test('explicit browser-data clearing removes only the current user partition data', async () => {
+  test("explicit browser-data clearing removes the active test user's partition cookie", async () => {
     const conversationId = await createConversation(page, electronApp)
     await seed(electronApp, conversationId, '/login')
     await command(electronApp, 'userClick', { selector: '#manual-login' })

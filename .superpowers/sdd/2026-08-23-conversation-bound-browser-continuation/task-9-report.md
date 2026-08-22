@@ -163,3 +163,23 @@ The Electron logout case proves the visible pages close and the per-user partiti
 ### Explicit manual pending item after Fix Round 1
 
 The user-assisted Beijing portal smoke was **not performed and is not claimed as passed**. It remains the sole explicit manual item because it requires the user to enter private login credentials and personally observe the actual Beijing portal's visible login, source/read-time, draft stop-before-submit, takeover, cross-conversation denial, and durable-row redaction chain.
+
+## Fix Round 2: deterministic assertion cleanup
+
+### TDD and mutation evidence
+
+- Draft beacon RED: with a temporary deterministic 500 ms delay between receiving `/draft` and updating fixture state, the old immediate snapshot failed with `draftSaves: 0`, the original employer, and `lastDraftPayload: null`. This reproduced the `sendBeacon` race rather than relying on an intermittent failure.
+- Draft beacon GREEN: the assertion now uses `expect.poll` with an explicit 5-second timeout and the failure message `the draft beacon should persist the exact replacement before final submit`. Under the same temporary 500 ms delay it passed, proving the exact employer and payload are durable before the explicit test-user final click. The delay was then removed.
+- Read-time mutation RED: a temporary mutation rendered the safe answer with only `YYYY-MM-DDT`, a value the former partial regex accepted. The strengthened assertion failed at the finite `Date.parse` check. The mutation was removed.
+- Read-time GREEN: the test extracts a complete `YYYY-MM-DDTHH:mm:ss.sssZ` suffix, requires finite parsing, and requires exact `toISOString()` round-trip equality.
+- Claim correction: the data-clear Electron case is now named `explicit browser-data clearing removes the active test user's partition cookie`. It no longer claims multi-user scope; that remains attributed to the Application integration test named in Fix Round 1.
+
+### Verification
+
+- Focused real-Electron expiry and draft cases — PASS, **2/2** in 6.3 seconds after rebuilding the test entrypoint.
+- `pnpm test:e2e:browser-continuation` — PASS, **19/19** in 52.0 seconds, including native ABI preparation and a fresh production/test-entry build.
+- `pnpm exec eslint apps/desktop/tests/e2e/browser-continuation.spec.ts` — PASS with no output.
+- `pnpm typecheck` — PASS for all workspace projects.
+- `git diff --check` — PASS with no output.
+
+Fix Round 2 changes only the E2E specification and this report. No fixture, harness, runtime, production, permission, or packaging behavior changed. The user-assisted Beijing portal smoke remains pending and is not claimed.
