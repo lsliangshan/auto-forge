@@ -305,12 +305,17 @@ interface BrowserSessionInspectInput {
   cursor?: string
 }
 
+type BrowserValueSource =
+  | { kind: 'current_user' }
+  | { kind: 'history'; messageId: string }
+  | { kind: 'page'; snapshotId: string; ref: string }
+
 interface BrowserSessionActInput {
   bindingId: string
   snapshotId: string
   actions: Array<
-    | { type: 'fill'; ref: string; value: string }
-    | { type: 'select'; ref: string; value: string }
+    | { type: 'fill'; ref: string; value: string; source: BrowserValueSource }
+    | { type: 'select'; ref: string; value: string; source: BrowserValueSource }
     | { type: 'click'; ref: string }
     | { type: 'check'; ref: string; checked: boolean }
     | { type: 'navigate'; url: string }
@@ -342,6 +347,10 @@ content the user explicitly references for this task, or data inspected from the
 same bound page for this task. The model must ask for a missing value. It may not
 guess, search other conversations or tabs, read the clipboard, inspect local
 files, or treat profile knowledge as permission to populate a field.
+Main verifies `source` against run-local user/history/page evidence before
+acting. Only deterministic normalization such as trimming, boolean/enum
+selection, or converting an explicit date to the target control's ISO format is
+allowed.
 
 ### Page inspection and ephemeral references
 
@@ -400,8 +409,9 @@ also participate. If Main cannot establish that an action is reversible or a
 draft-only mutation, it returns `MANUAL_ACTION_REQUIRED`.
 
 For handoff, Main activates the exact tab, scrolls the target into view, applies
-a temporary AutoForge-owned highlight without changing page data, releases the
-automation lease, and ends the Agent run with a system-owned instruction. The
+a temporary highlight through CDP `Overlay.highlightNode` without changing the
+remote DOM, releases the automation lease, and ends the Agent run with a
+system-owned instruction. The
 user clicks the protected control manually. AutoForge does not watch the page
 afterward. A later message such as “已提交，帮我查看结果” starts a new run and
 re-inspects the page.
