@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { sql } from 'drizzle-orm'
 import { authAccountSchema, chatBlockSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
@@ -927,7 +927,7 @@ describe('openAppDatabase', () => {
     const legacyApproval = {
       type: 'approval', executionId: 'legacy_execution', workflowId: 'legacy.workflow',
       workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
-      scope: {}, scopeHash: 'a'.repeat(64),
+      scope: { origins: ['https://example.com'] }, scopeHash: 'a'.repeat(64),
     }
     const seed = new Database(path)
     seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
@@ -942,7 +942,7 @@ describe('openAppDatabase', () => {
       type: 'approval', state: 'invalidated', executionId: 'legacy_execution',
       workflowId: 'legacy.workflow', workflowName: 'legacy.workflow', workflowVersion: '1.0.0',
       source: 'installed', actionSummary: '历史权限审批已失效', permissionIndex: 0,
-      capability: 'browser.open', scope: { origins: ['https://invalid.invalid'] },
+      capability: 'browser.open', scope: { origins: ['https://example.com'] },
       scopeHash: 'a'.repeat(64),
     })
     if (!block || typeof block !== 'object' || !('blockId' in block) || typeof block.blockId !== 'string') {
@@ -963,6 +963,114 @@ describe('openAppDatabase', () => {
     })
     persisted.close()
     reopened.close()
+  })
+
+  it('matches the exact historical approval capability and runtime-scope matrix', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-legacy-approval-matrix-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'legacy_matrix_conversation', title: 'Legacy matrix' })
+    const cases = [
+      { name: 'browser exact origin', capability: 'browser.open', scope: { origins: ['https://example.com'] }, accepted: true },
+      { name: 'filesystem path', capability: 'filesystem.write', scope: { paths: ['/tmp/result.txt'] }, accepted: true },
+      { name: 'empty notification', capability: 'notification.send', scope: {}, accepted: true },
+      { name: 'browser empty scope', capability: 'browser.open', scope: {}, accepted: false },
+      { name: 'browser wildcard origin', capability: 'browser.open', scope: { origins: ['*.example.com'] }, accepted: false },
+      { name: 'browser path scope', capability: 'browser.open', scope: { paths: ['/tmp'] }, accepted: false },
+    ] as const
+    for (const index of cases.keys()) {
+      database.messages.insert({
+        id: `legacy_matrix_${index}`, conversationId: 'legacy_matrix_conversation',
+        role: 'assistant', blocks: [], createdAt: index + 1,
+      })
+    }
+    database.close()
+    const seed = new Database(path)
+    for (const [index, value] of cases.entries()) {
+      seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?').run(JSON.stringify([{
+        type: 'approval', executionId: `legacy_matrix_execution_${index}`,
+        workflowId: 'legacy.workflow', workflowVersion: '1.0.0', permissionIndex: 0,
+        capability: value.capability, scope: value.scope, scopeHash: 'a'.repeat(64),
+      }]), `legacy_matrix_${index}`)
+    }
+    seed.close()
+
+    const upgraded = openAppDatabase(path)
+    for (const [index, value] of cases.entries()) {
+      const block = upgraded.messages.get(`legacy_matrix_${index}`)?.blocks[0]
+      expect({ name: value.name, normalized: chatBlockSchema.safeParse(block).success }).toEqual({
+        name: value.name, normalized: value.accepted,
+      })
+      expect(upgraded.messages.hasAgentApproval(`legacy_matrix_execution_${index}`)).toBe(value.accepted)
+    }
+    upgraded.close()
+  })
+
+  it('targets persisted Agent ownership by exact JSON identity without parsing unrelated transcripts', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-agent-ownership-query-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'ownership_query_conversation', title: 'Ownership query' })
+    for (let index = 0; index < 100; index += 1) {
+      database.messages.insert({
+        id: `ownership_irrelevant_${index}`, conversationId: 'ownership_query_conversation',
+        role: 'assistant', blocks: [{ type: 'text', text: `irrelevant ${index}` }], createdAt: index + 1,
+      })
+    }
+    database.messages.insert({
+      id: 'ownership_malformed_json', conversationId: 'ownership_query_conversation',
+      role: 'assistant', blocks: [], createdAt: 101,
+    })
+    const fault = new Database(path)
+    fault.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run('{not valid json', 'ownership_malformed_json')
+    fault.close()
+    database.messages.insert({
+      id: 'ownership_invalid_legacy', conversationId: 'ownership_query_conversation', role: 'assistant',
+      blocks: [{
+        type: 'approval', executionId: 'invalid_legacy_execution', workflowId: 'legacy.workflow',
+        workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+        scope: {}, scopeHash: 'a'.repeat(64),
+      }], createdAt: 102,
+    })
+    database.messages.insert({
+      id: 'ownership_near_current', conversationId: 'ownership_query_conversation', role: 'assistant',
+      blocks: [{
+        type: 'approval', blockId: 'near_current', state: 'pending',
+        executionId: 'near_current_execution', workflowId: 'workflow.current',
+        workflowVersion: '1.0.0', source: 'installed', actionSummary: 'missing workflow name',
+        permissionIndex: 0, capability: 'notification.send', scope: {}, scopeHash: 'b'.repeat(64),
+      }], createdAt: 103,
+    })
+    database.messages.insert({
+      id: 'ownership_exact_current', conversationId: 'ownership_query_conversation', role: 'assistant',
+      blocks: [{
+        type: 'approval', blockId: 'exact_current', state: 'invalidated',
+        executionId: 'exact_current_execution', workflowId: 'workflow.current',
+        workflowName: 'Current workflow', workflowVersion: '1.0.0', source: 'installed',
+        actionSummary: 'Persisted approval', permissionIndex: 0,
+        capability: 'notification.send', scope: {}, scopeHash: 'c'.repeat(64),
+      }], createdAt: 104,
+    })
+    const parseJson = vi.spyOn(JSON, 'parse')
+    parseJson.mockClear()
+
+    expect(database.messages.hasAgentApproval('exact_current_execution')).toBe(true)
+    expect(parseJson).toHaveBeenCalledTimes(1)
+    parseJson.mockClear()
+    expect(database.messages.hasAgentApproval('invalid_legacy_execution')).toBe(false)
+    expect(parseJson).toHaveBeenCalledTimes(1)
+    parseJson.mockClear()
+    expect(database.messages.hasAgentApproval('near_current_execution')).toBe(false)
+    expect(parseJson).toHaveBeenCalledTimes(1)
+    parseJson.mockClear()
+    expect(database.messages.hasAgentApproval('manual_execution')).toBe(false)
+    expect(parseJson).not.toHaveBeenCalled()
+
+    parseJson.mockRestore()
+    database.close()
   })
 
   it('persists media ownership and generation preferences with the Task 1 schema', () => {

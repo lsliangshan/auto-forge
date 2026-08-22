@@ -4,9 +4,10 @@ import { z } from 'zod'
 import {
   appErrorCodeSchema,
   capabilitySchema,
-  capabilityScopeSchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  runtimeCapabilityPermissionSchema,
+  runtimeCapabilityScopeSchema,
   type AppErrorCode,
   type ChatBlock,
   type ConversationGenerationPreferences,
@@ -478,9 +479,13 @@ const legacyApprovalBlockSchema = z.object({
   workflowVersion: storedIdentifierSchema,
   permissionIndex: z.number().int().nonnegative(),
   capability: capabilitySchema,
-  scope: capabilityScopeSchema,
+  scope: runtimeCapabilityScopeSchema,
   scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
-}).strict()
+}).strict().superRefine(({ capability, scope }, context) => {
+  if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
+    context.addIssue({ code: 'custom', message: 'Historical approval capability scope is invalid' })
+  }
+})
 
 function storedBlocks(value: string): unknown[] | undefined {
   try {
@@ -501,17 +506,8 @@ function upgradedLegacyApproval(
   const blockId = `legacy_approval_${createHash('sha256')
     .update(JSON.stringify([messageId, index, legacy.data.executionId]))
     .digest('hex')}`
-  const needsOrigins = legacy.data.capability.startsWith('browser.')
-    || legacy.data.capability === 'network.fetch'
-  const needsPaths = legacy.data.capability.startsWith('filesystem.')
-  const scope = needsOrigins
-    ? 'origins' in legacy.data.scope ? legacy.data.scope : { origins: ['https://invalid.invalid'] }
-    : needsPaths
-      ? 'paths' in legacy.data.scope ? legacy.data.scope : { paths: ['[historical scope unavailable]'] }
-      : {}
   const upgraded = chatBlockSchema.safeParse({
     ...legacy.data,
-    scope,
     blockId,
     state: 'invalidated',
     workflowName: legacy.data.workflowId.slice(0, 500),
@@ -1491,10 +1487,30 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         })
       },
       hasAgentApproval(executionId) {
-        for (const row of many<Query>(database, "SELECT blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
-          const blocks = storedBlocks(row.blocksJson as string)
-          if (!blocks) continue
-          if (blocks.some((block) => storedApproval(block)?.executionId === executionId)) return true
+        const candidates = many<{ blockJson: string }>(database, `
+          WITH assistant_messages(blocks_json) AS MATERIALIZED (
+            SELECT CASE WHEN json_valid(blocks_json) THEN blocks_json ELSE '[]' END
+            FROM messages
+            WHERE role = 'assistant'
+          ), candidate_blocks(block_json) AS MATERIALIZED (
+            SELECT block.value
+            FROM assistant_messages
+            JOIN json_each(assistant_messages.blocks_json) AS block
+            WHERE typeof(block.key) = 'integer' AND block.type = 'object'
+          )
+          SELECT block_json AS blockJson
+          FROM candidate_blocks
+          WHERE json_extract(block_json, '$.type') = 'approval'
+            AND json_extract(block_json, '$.executionId') = @executionId
+        `, { executionId })
+        for (const { blockJson } of candidates) {
+          let block: unknown
+          try {
+            block = JSON.parse(blockJson) as unknown
+          } catch {
+            continue
+          }
+          if (storedApproval(block)?.executionId === executionId) return true
         }
         return false
       },
