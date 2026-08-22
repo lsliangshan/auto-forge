@@ -689,7 +689,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         || conversation.userId !== binding.userId
         || run.userId !== binding.userId
         || run.conversationId !== binding.conversationId) throw failure('NOT_FOUND')
-      if (!await agent.takeOverBrowser(run.requestId, binding.bindingId)) throw failure('NOT_FOUND')
+      if (!await agent.takeOverBrowser(run.requestId, binding.bindingId, runId)) throw failure('NOT_FOUND')
     },
   })
   const browser = new BrowserCapabilityService({
@@ -936,8 +936,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     userId: string,
   ): Promise<void> => {
     const binding = requireOwnedLiveBinding(bindingId, userId)
-    requireOwnedBrowserRun(requestId, binding.conversationId, userId)
-    if (!await agent.takeOverBrowser(requestId, bindingId)) throw failure('NOT_FOUND')
+    const run = requireOwnedBrowserRun(requestId, binding.conversationId, userId)
+    const lease = browserContinuations.currentLease(bindingId)
+    if (!lease || lease.binding !== binding || lease.runId !== run.id) throw failure('NOT_FOUND')
+    if (!await agent.takeOverBrowser(requestId, bindingId, run.id)) throw failure('NOT_FOUND')
   }
   const currentBrowserRequest = (bindingId: string, userId: string) => {
     const lease = browserContinuations.currentLease(bindingId)

@@ -5422,10 +5422,14 @@ describe('createApplicationRuntime', () => {
     })
     database.close()
 
+    const ipcLease = await registry.acquire(liveAlice.bindingId, {
+      userId: alice.user.id, conversationId: aliceConversation.id, runId: 'run_alice',
+    })
     await expect(runtime.services.chat.takeOverBrowser({
       requestId: 'request_alice', bindingId: liveAlice.bindingId,
     })).resolves.toBeUndefined()
-    expect(takeOver).toHaveBeenCalledWith('request_alice', liveAlice.bindingId)
+    expect(takeOver).toHaveBeenCalledWith('request_alice', liveAlice.bindingId, 'run_alice')
+    await ipcLease.release()
 
     const toolbarLease = await registry.acquire(liveAlice.bindingId, {
       userId: alice.user.id, conversationId: aliceConversation.id, runId: 'run_alice',
@@ -5433,14 +5437,14 @@ describe('createApplicationRuntime', () => {
     const toolbarHandlers = vi.mocked(workspace.setContinuationCommandHandlers).mock.calls[0]?.[0]
     if (!toolbarHandlers) throw new Error('Application did not register trusted toolbar commands')
     await toolbarHandlers.takeOver(liveAlice.bindingId)
-    expect(takeOver).toHaveBeenLastCalledWith('request_alice', liveAlice.bindingId)
+    expect(takeOver).toHaveBeenLastCalledWith('request_alice', liveAlice.bindingId, 'run_alice')
     await toolbarLease.release()
 
     await registry.acquire(liveAlice.bindingId, {
       userId: alice.user.id, conversationId: aliceConversation.id, runId: 'run_alice',
     })
     await registry.markTakenOver(liveAlice.tabId, 'run_alice')
-    expect(takeOver).toHaveBeenLastCalledWith('request_alice', liveAlice.bindingId)
+    expect(takeOver).toHaveBeenLastCalledWith('request_alice', liveAlice.bindingId, 'run_alice')
     await expect(runtime.services.chat.listBrowserAudit(liveAlice.bindingId)).resolves.toEqual([{
       id: 'audit_alice', bindingId: liveAlice.bindingId, sequence: 1,
       origin: 'https://permit.example.gov.cn', action: 'inspect', targetSummary: 'expiry control',
@@ -5456,6 +5460,218 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.chat.listBrowserAudit(liveBob.bindingId))
       .rejects.toMatchObject({ code: 'NOT_FOUND' })
     expect(takeOver).toHaveBeenCalledTimes(3)
+    await runtime.close()
+  })
+
+  it('denies catalog-only takeover without cancelling when the lease is exact, foreign, or released', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-takeover-denied-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const starts = [deferred<void>(), deferred<void>(), deferred<void>()]
+    const releases = [deferred<void>(), deferred<void>(), deferred<void>()]
+    let streamIndex = 0
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [visionTextModelInfo('openrouter/browser')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        const index = streamIndex++
+        starts[index]!.resolve()
+        await releases[index]!.promise
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      browserWorkspace: workspace,
+      modelProviders: { openrouter: provider },
+    }))
+    const session = await authenticate(runtime, 'TakeoverDenied')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser' } },
+    })
+    const registry = capturedContinuationRegistry(workspace)
+    const runs: Array<{ requestId: string; runId: string }> = []
+    const leases: Array<{ release(): Promise<void> }> = []
+
+    for (let index = 0; index < 3; index += 1) {
+      const conversation = await runtime.services.chat.createConversation()
+      const binding = continuationBinding(session.user.id, conversation.id, {
+        tabId: `tab_catalog_${index}`,
+        chatRunId: `parent_run_catalog_${index}`,
+        executionId: `parent_execution_catalog_${index}`,
+      })
+      seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+      const live = registry.bind(binding)
+      const { requestId } = await runtime.services.chat.send(chatInput(
+        conversation.id,
+        `catalog-only-${index}`,
+      ))
+      await starts[index]!.promise
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      const run = database.chatRuns.getByRequestId(requestId)!
+      database.close()
+      runs.push({ requestId, runId: run.id })
+
+      if (index === 0) {
+        leases.push(await registry.acquire(live.bindingId, {
+          userId: session.user.id, conversationId: conversation.id, runId: run.id,
+        }))
+      } else if (index === 1) {
+        seedContinuationParents(join(root, 'autoforge.sqlite'), {
+          ...binding,
+          tabId: 'tab_different_agent_run',
+          chatRunId: 'different_agent_run',
+          executionId: 'different_agent_execution',
+        }, 'different_agent_request')
+        leases.push(await registry.acquire(live.bindingId, {
+          userId: session.user.id, conversationId: conversation.id, runId: 'different_agent_run',
+        }))
+      } else {
+        const released = await registry.acquire(live.bindingId, {
+          userId: session.user.id, conversationId: conversation.id, runId: run.id,
+        })
+        await released.release()
+      }
+
+      await expect(runtime.services.chat.takeOverBrowser({ requestId, bindingId: live.bindingId }))
+        .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    }
+
+    await Promise.all(leases.map((lease) => lease.release()))
+    releases.forEach((release) => release.resolve())
+    await vi.waitFor(() => {
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      try {
+        expect(runs.map(({ requestId }) => database.chatRuns.getByRequestId(requestId)?.status))
+          .toEqual(['completed', 'completed', 'completed'])
+      } finally {
+        database.close()
+      }
+    })
+    await runtime.close()
+  })
+
+  it('allows only the exact active Agent lease and fails safely when cancellation releases it first', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-takeover-race-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const releaseInspectors = [deferred<void>(), deferred<void>()]
+    const inspectorStarted = [false, false]
+    const bindingIds: string[] = []
+    let streamTurn = 0
+    let inspection = 0
+    vi.mocked(workspace.readAccessibilitySnapshot).mockImplementation(async (input) => {
+      const index = inspection++
+      inspectorStarted[index] = true
+      await releaseInspectors[index]!.promise
+      return {
+        tabId: input.tabId,
+        navigationEpoch: input.expectedNavigationEpoch,
+        origin: input.expectedOrigin,
+        url: input.expectedOrigin,
+        title: 'Permit',
+        frameId: 'frame_main',
+        viewportWidth: 1200,
+        viewportHeight: 800,
+        nodes: [],
+        locatorMatches: [],
+      }
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [visionTextModelInfo('openrouter/browser')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        const turn = streamTurn++
+        yield {
+          type: 'tool_call' as const, choiceIndex: 0, index: 0,
+          id: `inspect_${turn}`, name: 'browser_session_inspect',
+          arguments: { bindingId: bindingIds[turn], intent: '读取状态' },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      browserWorkspace: workspace,
+      modelProviders: { openrouter: provider },
+    }))
+    const session = await authenticate(runtime, 'TakeoverRace')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser' } },
+    })
+    const registry = capturedContinuationRegistry(workspace)
+
+    const startActiveRun = async (index: number) => {
+      const conversation = await runtime.services.chat.createConversation()
+      const binding = continuationBinding(session.user.id, conversation.id, {
+        tabId: `tab_active_${index}`,
+        chatRunId: `parent_run_active_${index}`,
+        executionId: `parent_execution_active_${index}`,
+      })
+      seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+      const live = registry.bind(binding)
+      bindingIds[index] = live.bindingId
+      const sent = await runtime.services.chat.send(chatInput(conversation.id, `读取状态 active-${index}`))
+      await vi.waitFor(() => expect(inspectorStarted[index]).toBe(true))
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      const run = database.chatRuns.getByRequestId(sent.requestId)!
+      database.close()
+      expect(registry.currentLease(live.bindingId)?.runId).toBe(run.id)
+      return { ...sent, live, run }
+    }
+
+    const exact = await startActiveRun(0)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), continuationBinding(
+      session.user.id,
+      exact.live.conversationId,
+      {
+        tabId: 'tab_wrong_active_request',
+        chatRunId: 'wrong_active_run',
+        executionId: 'wrong_active_execution',
+      },
+    ), 'wrong_active_request')
+    await expect(runtime.services.chat.takeOverBrowser({
+      requestId: 'wrong_active_request', bindingId: exact.live.bindingId,
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    expect(registry.currentLease(exact.live.bindingId)?.runId).toBe(exact.run.id)
+    await expect(runtime.services.chat.takeOverBrowser({
+      requestId: exact.requestId, bindingId: exact.live.bindingId,
+    })).resolves.toBeUndefined()
+    expect(registry.currentLease(exact.live.bindingId)).toBeUndefined()
+    releaseInspectors[0]!.resolve()
+
+    const racing = await startActiveRun(1)
+    const completeRelease = deferred<void>()
+    let releaseDidStart = false
+    vi.mocked(workspace.releaseContinuation).mockImplementationOnce(async () => {
+      releaseDidStart = true
+      await completeRelease.promise
+    })
+    const cancelling = runtime.services.chat.cancel(racing.requestId)
+    await vi.waitFor(() => expect(releaseDidStart).toBe(true))
+    expect(registry.currentLease(racing.live.bindingId)).toBeUndefined()
+    const takeover = runtime.services.chat.takeOverBrowser({
+      requestId: racing.requestId, bindingId: racing.live.bindingId,
+    })
+    completeRelease.resolve()
+    await expect(takeover).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await cancelling
+    releaseInspectors[1]!.resolve()
+    await vi.waitFor(() => {
+      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+      try {
+        expect([
+          database.chatRuns.getByRequestId(exact.requestId)?.status,
+          database.chatRuns.getByRequestId(racing.requestId)?.status,
+        ]).toEqual(['cancelled', 'cancelled'])
+      } finally {
+        database.close()
+      }
+    })
     await runtime.close()
   })
 
@@ -5482,6 +5698,92 @@ describe('createApplicationRuntime', () => {
     expect(authService.logout).toHaveBeenCalledOnce()
     expect(workspace.clearUserData).not.toHaveBeenCalled()
     expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    await runtime.close()
+  })
+
+  const logoutCleanupFailureCases: Array<{
+    name: string
+    failed: Array<'agent' | 'revoke' | 'reset'>
+    earliest: 'agent' | 'revoke' | 'reset'
+  }> = [
+    { name: 'Agent cancellation', failed: ['agent'], earliest: 'agent' },
+    { name: 'continuation revocation', failed: ['revoke'], earliest: 'revoke' },
+    { name: 'browser reset', failed: ['reset'], earliest: 'reset' },
+    { name: 'all cleanup phases', failed: ['agent', 'revoke', 'reset'], earliest: 'agent' },
+  ]
+
+  it.each(logoutCleanupFailureCases)('continues logout cleanup after $name failure and returns the earliest error without changing identity', async ({ failed, earliest }) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-logout-failure-'))
+    directories.push(root)
+    const order: string[] = []
+    const errors = {
+      agent: new Error('agent cancellation failed'),
+      revoke: new Error('continuation revocation failed'),
+      reset: new Error('browser reset failed'),
+    }
+    const workspace = createBrowserWorkspace()
+    const providerStarted = deferred<void>()
+    const releaseProvider = deferred<void>()
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [visionTextModelInfo('openrouter/logout')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        providerStarted.resolve()
+        await releaseProvider.promise
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const authService = createTestAuthService()
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      browserWorkspace: workspace,
+      modelProviders: { openrouter: provider },
+    }))
+    const session = await authenticate(runtime, 'LogoutFailure')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/logout' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const binding = continuationBinding(session.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    registry.bind(binding)
+    const sent = await runtime.services.chat.send(chatInput(conversation.id, '保持请求活跃'))
+    await providerStarted.promise
+
+    const originalCancel = AgentOrchestrator.prototype.cancel
+    const cancel = vi.spyOn(AgentOrchestrator.prototype, 'cancel')
+      .mockImplementation(async function (this: AgentOrchestrator, requestId) {
+        order.push('cancel')
+        if (failed.includes('agent')) throw errors.agent
+        await originalCancel.call(this, requestId)
+      })
+    vi.mocked(workspace.closeContinuation).mockImplementation(async () => {
+      order.push('revoke')
+      if (failed.includes('revoke')) throw errors.revoke
+    })
+    vi.mocked(workspace.reset).mockImplementation(async () => {
+      order.push('reset')
+      if (failed.includes('reset')) throw errors.reset
+    })
+    const underlyingLogout = vi.spyOn(authService, 'logout')
+
+    await expect(runtime.services.auth.logout()).rejects.toBe(errors[earliest])
+
+    expect(order).toEqual(['cancel', 'revoke', 'reset'])
+    expect(underlyingLogout).not.toHaveBeenCalled()
+    expect(await runtime.services.auth.getSession()).toEqual(session)
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+
+    cancel.mockRestore()
+    underlyingLogout.mockRestore()
+    vi.mocked(workspace.closeContinuation).mockResolvedValue(undefined)
+    vi.mocked(workspace.reset).mockResolvedValue(undefined)
+    releaseProvider.resolve()
+    await runtime.services.chat.cancel(sent.requestId)
     await runtime.close()
   })
 
@@ -5516,6 +5818,44 @@ describe('createApplicationRuntime', () => {
     expect(bob.user.account).toBe('SwitchBobby')
     expect(order).toEqual(['revoke', 'reset', 'auth'])
     expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('does not switch accounts when browser reset fails after revoking the old identity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-account-switch-failure-'))
+    directories.push(root)
+    const order: string[] = []
+    const resetError = new Error('account switch reset failed')
+    const workspace = createBrowserWorkspace()
+    vi.mocked(workspace.closeContinuation).mockImplementation(async () => { order.push('revoke') })
+    vi.mocked(workspace.reset).mockImplementation(async () => {
+      order.push('reset')
+      throw resetError
+    })
+    const authService = createTestAuthService()
+    const runtime = createApplicationRuntime(options(root, { authService, browserWorkspace: workspace }))
+    const alice = await authenticate(runtime, 'SwitchFailureAlice')
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const binding = continuationBinding(alice.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    registry.bind(binding)
+    const challenge = await runtime.services.auth.sendOtp({
+      intent: 'register', channel: 'email', target: 'switch-failure-bob@example.com',
+      account: 'SwitchFailureBob', password: 'password',
+    })
+    const underlyingVerify = vi.spyOn(authService, 'verifyOtp')
+
+    await expect(runtime.services.auth.verifyOtp({ challengeId: challenge.challengeId, code: '123456' }))
+      .rejects.toBe(resetError)
+
+    expect(order).toEqual(['revoke', 'reset'])
+    expect(underlyingVerify).not.toHaveBeenCalled()
+    expect(await runtime.services.auth.getSession()).toEqual(alice)
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+
+    underlyingVerify.mockRestore()
+    vi.mocked(workspace.reset).mockResolvedValue(undefined)
     await runtime.close()
   })
 

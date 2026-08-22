@@ -2827,11 +2827,42 @@ describe('AgentOrchestrator', () => {
       await orchestrator.cancel('browser_cancel_request')
       expect(browser.executor.cancel).toHaveBeenCalledOnce()
     } else {
-      await expect(orchestrator.takeOverBrowser('browser_cancel_request', 'binding_1')).resolves.toBe(true)
+      await expect(orchestrator.takeOverBrowser('browser_cancel_request', 'binding_1', 'wrong_run'))
+        .resolves.toBe(false)
+      await expect(orchestrator.takeOverBrowser('browser_cancel_request', 'binding_1', 'id_2')).resolves.toBe(true)
       expect(browser.executor.takeOver).toHaveBeenCalledOnce()
     }
     releaseSecondTurn()
     await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+    expect(dependencies.records.terminal).toHaveLength(1)
+  })
+
+  it('does not cancel a catalog-only request that never acquired the exact browser binding', async () => {
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => []
+    let providerStarted!: () => void
+    let releaseProvider!: () => void
+    const started = new Promise<void>((resolve) => { providerStarted = resolve })
+    const released = new Promise<void>((resolve) => { releaseProvider = resolve })
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
+      providerStarted()
+      await released
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const browser = attachBrowserContinuation(dependencies)
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取状态', provider: 'openrouter', model: 'model',
+      requestId: 'catalog_only_request',
+    }))
+    await started
+
+    await expect(orchestrator.takeOverBrowser('catalog_only_request', 'binding_1', 'id_2'))
+      .resolves.toBe(false)
+    expect(browser.executor.takeOver).not.toHaveBeenCalled()
+
+    releaseProvider()
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 
@@ -3301,7 +3332,7 @@ describe('AgentOrchestrator', () => {
     await started
 
     if (mode === 'cancel') await orchestrator.cancel('late_executor_request')
-    else await orchestrator.takeOverBrowser('late_executor_request', 'binding_1')
+    else await orchestrator.takeOverBrowser('late_executor_request', 'binding_1', 'id_2')
     releaseExecutor(inspectedSnapshot([
       { ref: 'ref_expiry', role: 'text', name: '有效期至', value: '2028-06-30', enabled: true, actions: [] },
     ]))

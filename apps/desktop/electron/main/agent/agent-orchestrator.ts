@@ -864,16 +864,22 @@ export class AgentOrchestrator {
     if (!active.terminal) await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
   }
 
-  async takeOverBrowser(requestId: string, bindingId: string): Promise<boolean> {
+  async takeOverBrowser(requestId: string, bindingId: string, runId: string): Promise<boolean> {
     const active = this.activeByRequest.get(requestId)
-    if (!active || active.terminal || !active.browserCatalog.bindings.has(bindingId)) return false
-    if (active.browserBindingId !== undefined && active.browserBindingId !== bindingId) return false
+    if (!active
+      || active.runId !== runId
+      || active.terminal
+      || active.cancelled
+      || active.controller.signal.aborted
+      || !active.browserStarted
+      || active.browserBindingId !== bindingId) return false
+    const candidate = active.browserCatalog.bindings.get(bindingId)
+    if (!candidate) return false
     active.cancelled = true
     active.controller.abort()
     active.browserTerminal = true
-    const candidate = active.browserCatalog.bindings.get(bindingId)!
     this.updateBrowserStatus(active, candidate, 'cancelled', '用户已接管浏览器页面', 'CANCELLED')
-    if (active.browserStarted) await this.cleanupBrowser(active, 'takeOver')
+    await this.cleanupBrowser(active, 'takeOver')
     if (active.terminal) return true
     this.finish(active, 'cancelled', appFailure('CANCELLED'))
     return true
