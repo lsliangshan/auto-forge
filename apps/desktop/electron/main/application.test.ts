@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -7,6 +7,7 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  chatBlockSchema,
   developerRunResultSchema,
   toSafeAppError,
   type AppError,
@@ -22,6 +23,7 @@ import {
 import {
   createApplicationFailureRecorder,
   createApplicationRuntime,
+  createWorkflowExecutionSourceResolver,
   MaintenanceGate,
   observeAuthService,
 } from './application.js'
@@ -34,7 +36,7 @@ import { VideoJobRunner } from './chat/video-job-runner.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
 import type { CredentialBoundModelProvider } from './chat/model-provider-registry.js'
 import { openAppDatabase } from './database/client.js'
-import { ProviderUsageConsistencyError } from './database/repositories.js'
+import { ProviderUsageConsistencyError, type Execution } from './database/repositories.js'
 import {
   NetworkProxyService,
   type NetworkProxyPort,
@@ -44,6 +46,7 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
+import { createWorkflowSourceSelectorVault } from './workflows/workflow-source-selector.js'
 
 const directories: string[] = []
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
@@ -331,6 +334,7 @@ async function authenticate(
 async function installApprovalWorkflow(
   runtime: ReturnType<typeof createApplicationRuntime>,
   activation = 'approval workflow',
+  options: { beijing?: boolean } = {},
 ) {
   const project = await runtime.services.developer.createProject('Approval Workflow')
   const manifest = JSON.parse(
@@ -339,7 +343,12 @@ async function installApprovalWorkflow(
   Object.assign(manifest, {
     id: 'local.autoforge.approval-workflow',
     version: '1.0.0',
-    permissions: [{ capability: 'browser.open', scope: { origins: ['https://example.com'] } }],
+    ...(options.beijing ? {
+      name: '北京工作居住证',
+      description: '办理北京工作居住证',
+      cities: ['北京'],
+    } : {}),
+    permissions: [{ capability: 'browser.fill', scope: { origins: ['https://example.com'] } }],
     activationExamples: [activation],
     inputSchema: { type: 'object', additionalProperties: false },
   })
@@ -350,6 +359,138 @@ async function installApprovalWorkflow(
   ].join('\n'))
   await runtime.services.developer.build(project.id)
   return runtime.services.workflows.installProject(project.id)
+}
+
+async function applicationHarness(input: {
+  developerMode: boolean
+  failContinuationUsageReport?: boolean
+}) {
+  const root = await mkdtemp(join(tmpdir(), 'autoforge-application-dynamic-workflow-'))
+  directories.push(root)
+  const providerRequests: ModelStreamRequest[] = []
+  const chatEvents: ChatEvent[] = []
+  const executionStarts: Array<{ executionId: string; input: unknown }> = []
+  const runningCompletion = deferred<Execution>()
+  let inspectedAgent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'> | undefined
+  const startReserved = vi.spyOn(ExecutionService.prototype, 'startReserved')
+    .mockImplementation(async (reservation, startInput) => {
+      executionStarts.push({ executionId: reservation.executionId, input: startInput })
+      return { id: reservation.executionId, finished: runningCompletion.promise }
+    })
+  const provider = snapshotProvider('openrouter', {
+    listModels: vi.fn(async () => [{
+      ...modelInfo('openrouter/tools', 'Tools'),
+      supportsTools: true,
+    }]),
+    validateCredential: vi.fn(async () => ({ valid: true })),
+    stream: vi.fn(async function* (request: ModelStreamRequest) {
+      providerRequests.push(request)
+      if (request.messages.some((message) => message.role === 'tool')) {
+        if (input.failContinuationUsageReport) {
+          const tamper = new Database(join(root, 'autoforge.sqlite'))
+          try {
+            expect(tamper.prepare(`
+              DELETE FROM provider_usage_events
+              WHERE operation_key LIKE 'agent:%:turn:1'
+            `).run().changes).toBe(1)
+          } finally {
+            tamper.close()
+          }
+        }
+        yield {
+          type: 'usage' as const,
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          costUsd: '0.01',
+        }
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '工作流处理完成' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        return
+      }
+      const selectedToolName = request.tools?.[0]?.function.name
+      if (!selectedToolName) throw new Error('Expected an opaque workflow tool in the provider request')
+      yield {
+        type: 'tool_call' as const,
+        choiceIndex: 0,
+        index: 0,
+        id: `call_${providerRequests.length}`,
+        name: selectedToolName,
+        arguments: { resolvedCity: '北京', input: {} },
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+    }),
+  })
+  const runtimeOptions = options(root, {
+    modelProviders: { openrouter: provider },
+    emitChat: (event) => { chatEvents.push(event) },
+  })
+  Object.assign(runtimeOptions, {
+    inspectAgent: (agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>) => {
+      inspectedAgent = agent
+    },
+  })
+  const runtime = createApplicationRuntime(runtimeOptions)
+  await authenticate(runtime)
+  await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+  await runtime.services.settings.update({
+    activeProvider: 'openrouter',
+    developerMode: input.developerMode,
+    defaultModels: {
+      deepseek: { text: 'deepseek-v4-flash' },
+      openrouter: { text: 'openrouter/tools' },
+    },
+  })
+  const installedWorkflow = await installApprovalWorkflow(runtime, 'dynamic workflow', { beijing: true })
+  const authoritativeWorkflow = await runtime.services.workflows.get(installedWorkflow.id, installedWorkflow.version)
+
+  const sendToolPrompt = async () => {
+    const conversation = await runtime.services.chat.createConversation()
+    const sent = await runtime.services.chat.send(chatInput(conversation.id, '我想办理北京工作居住证'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block',
+      conversationId: conversation.id,
+      block: expect.objectContaining({ type: 'approval' }),
+    })))
+    const approval = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+      event.type === 'block'
+      && event.conversationId === conversation.id
+      && event.block.type === 'approval'
+    ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+    return { ...sent, approval, conversation }
+  }
+
+  return {
+    runtime,
+    settings: runtime.services.settings,
+    executions: { started: executionStarts, startReserved },
+    providerRequests,
+    chatEvents,
+    authoritativeWorkflow,
+    agent: () => inspectedAgent,
+    sendToolPrompt,
+    finishRunning(executionId: string) {
+      const started = executionStarts.find((execution) => execution.executionId === executionId)!
+      const startInput = started.input as {
+        workflowId: string
+        workflowVersion: string
+        input: unknown
+        chatRunId?: string
+      }
+      runningCompletion.resolve({
+        id: executionId,
+        workflowId: startInput.workflowId,
+        workflowVersion: startInput.workflowVersion,
+        ...(startInput.chatRunId === undefined ? {} : { chatRunId: startInput.chatRunId }),
+        status: 'completed',
+        input: startInput.input,
+        result: { ok: true },
+        createdAt: 0,
+        startedAt: 0,
+        endedAt: 1,
+      })
+    },
+  }
 }
 
 function modelInfo(id: string, name: string): ModelInfo {
@@ -423,6 +564,107 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('rejects selector-less resolution instead of using an id and version fallback', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const installed = {
+      id: 'workflow.installed', version: '1.0.0', name: 'Installed', description: 'Installed build',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'installed' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+      runtimeIdentity: { id: 'workflow.installed', version: '1.0.0', source: 'installed' as const },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: { selected: 'installed' },
+    }
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [] },
+        installedWorkflows: { get: () => ({
+          manifest: { id: installed.id, version: installed.version, entryPath: 'dist/index.js', codeSha256: installed.codeSha256 },
+          installPath: '/tmp/installed',
+        }) },
+      },
+      registry: {
+        getDevelopmentProject: async () => undefined,
+        get: async () => installed,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+
+    await expect(resolver.resolve(installed.id, installed.version, undefined as never)).resolves.toBeUndefined()
+  })
+
+  it('rejects a development selector after its persisted build changes without falling back to an installed duplicate', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const development = {
+      id: 'workflow.same', version: '1.0.0', name: 'Development', description: 'Development build',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'development' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+      runtimeIdentity: { id: 'workflow.same', version: '1.0.0', source: 'development' as const, buildHash: 'b'.repeat(64) },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: { selected: 'development' },
+    }
+    const project = {
+      id: 'project_dev', name: 'Development', rootPath: '/tmp/development', status: 'ready',
+      buildHash: 'b'.repeat(64), manifest: { id: development.id, version: development.version, entryPath: 'dist/index.js', codeSha256: development.codeSha256 },
+      createdAt: 0, updatedAt: 0,
+    }
+    const installedFallback = vi.fn(async () => ({
+      ...development,
+      source: 'installed' as const,
+      runtimeIdentity: { id: development.id, version: development.version, source: 'installed' as const },
+      outputSchema: { selected: 'installed' },
+    }))
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [project] },
+        installedWorkflows: { get: () => ({ manifest: { codeSha256: development.codeSha256 } }) },
+      },
+      registry: {
+        getDevelopmentProject: async () => development,
+        get: installedFallback,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+    const selector = vault.create(development)
+
+    await expect(resolver.resolve(development.id, development.version, selector)).resolves.toMatchObject({
+      workflow: { source: 'development', outputSchema: { selected: 'development' } },
+    })
+
+    project.buildHash = 'c'.repeat(64)
+    await expect(resolver.resolve(development.id, development.version, selector)).resolves.toBeUndefined()
+    expect(installedFallback).not.toHaveBeenCalled()
+  })
+
+  it('rejects a development selector when more than one project matches its exact build', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const workflow = {
+      id: 'workflow.same', version: '1.0.0', name: 'Development', description: 'Development build',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'development' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+      runtimeIdentity: { id: 'workflow.same', version: '1.0.0', source: 'development' as const, buildHash: 'b'.repeat(64) },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: {},
+    }
+    const project = (id: string) => ({
+      id, name: id, rootPath: `/tmp/${id}`, status: 'ready', buildHash: 'b'.repeat(64),
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'dist/index.js', codeSha256: workflow.codeSha256 },
+      createdAt: 0, updatedAt: 0,
+    })
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [project('project_one'), project('project_two')] },
+        installedWorkflows: { get: () => undefined },
+      },
+      registry: {
+        getDevelopmentProject: async () => workflow,
+        get: async () => undefined,
+        verifyIntegrity: async () => ({ valid: false, disabled: false }),
+      },
+    } as never)
+
+    await expect(resolver.resolve(workflow.id, workflow.version, vault.create(workflow))).resolves.toBeUndefined()
+  })
+
   it('requires the CloudBase role before projecting a login and fails closed on refresh', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-role-'))
     directories.push(root)
@@ -1401,7 +1643,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-close-'))
     directories.push(root)
     const chatEvents: ChatEvent[] = []
-    let workflowId = ''
+    const workflowToolName = 'workflow_1'
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [{
         ...modelInfo('openrouter/tools', 'Tools'),
@@ -1414,8 +1656,8 @@ describe('createApplicationRuntime', () => {
           choiceIndex: 0,
           index: 0,
           id: 'call_approval',
-          name: workflowId,
-          arguments: {},
+          name: workflowToolName,
+          arguments: { input: {} },
         }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
       }),
@@ -1433,7 +1675,7 @@ describe('createApplicationRuntime', () => {
         openrouter: { text: 'openrouter/tools' },
       },
     })
-    workflowId = (await installApprovalWorkflow(runtime)).id
+    await installApprovalWorkflow(runtime)
     const conversation = await runtime.services.chat.createConversation()
 
     const { requestId } = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
@@ -1456,11 +1698,218 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('keeps development starts at zero when mode is off and runs the installed workflow instead', async () => {
+    const app = await applicationHarness({ developerMode: false })
+    try {
+      const pending = await app.sendToolPrompt()
+      expect(pending.approval).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        workflowName: '北京工作居住证',
+        workflowVersion: '1.0.0',
+        source: 'installed',
+        city: '北京',
+      })
+      expect(pending.approval).not.toHaveProperty('buildHash')
+      expect(app.providerRequests[0]?.tools?.[0]?.function.name).toBeTruthy()
+
+      const decision = app.runtime.services.executions.decide({
+        executionId: pending.approval.executionId,
+        permissionIndex: pending.approval.permissionIndex,
+        scopeHash: pending.approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(app.executions.started).toHaveLength(1))
+      expect(app.executions.started[0]?.input).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        workflowVersion: '1.0.0',
+        input: {},
+      })
+      app.finishRunning(pending.approval.executionId)
+      await expect(decision).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({
+          type: 'workflow_provenance',
+          entries: [expect.objectContaining({
+            executionId: pending.approval.executionId,
+            source: 'installed',
+            city: '北京',
+            status: 'completed',
+          })],
+        }),
+      })))
+      expect(app.chatEvents).not.toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({
+          type: 'workflow_status',
+          source: 'development',
+        }),
+      }))
+    } finally {
+      await app.runtime.close()
+    }
+  })
+
+  it('binds a completed development run to the exact version, build, city, and final provenance', async () => {
+    const app = await applicationHarness({ developerMode: true })
+    try {
+      expect(app.authoritativeWorkflow).toMatchObject({
+        id: 'local.autoforge.approval-workflow',
+        name: '北京工作居住证',
+        version: '1.0.0',
+        source: 'development',
+        cities: ['北京'],
+        runtimeIdentity: {
+          id: 'local.autoforge.approval-workflow',
+          version: '1.0.0',
+          source: 'development',
+          buildHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
+      })
+      if (app.authoritativeWorkflow.runtimeIdentity.source !== 'development') {
+        throw new Error('Expected the Registry to select the ready development build')
+      }
+      const expectedWorkflowContext = {
+        workflowId: app.authoritativeWorkflow.runtimeIdentity.id,
+        workflowName: app.authoritativeWorkflow.name,
+        workflowVersion: app.authoritativeWorkflow.runtimeIdentity.version,
+        source: app.authoritativeWorkflow.runtimeIdentity.source,
+        buildHash: app.authoritativeWorkflow.runtimeIdentity.buildHash,
+        city: app.authoritativeWorkflow.cities[0],
+      }
+      const pending = await app.sendToolPrompt()
+      const approvalWorkflowContext = {
+        workflowId: pending.approval.workflowId,
+        workflowName: pending.approval.workflowName,
+        workflowVersion: pending.approval.workflowVersion,
+        source: pending.approval.source,
+        buildHash: pending.approval.buildHash,
+        city: pending.approval.city,
+      }
+      expect(approvalWorkflowContext).toStrictEqual(expectedWorkflowContext)
+      const wrongBuildHash = expectedWorkflowContext.buildHash === '0'.repeat(64)
+        ? '1'.repeat(64)
+        : '0'.repeat(64)
+      expect(wrongBuildHash).toMatch(/^[a-f0-9]{64}$/)
+      expect(() => expect({
+        ...approvalWorkflowContext,
+        buildHash: wrongBuildHash,
+      }).toStrictEqual(expectedWorkflowContext)).toThrow()
+      const decision = app.runtime.services.executions.decide({
+        executionId: pending.approval.executionId,
+        permissionIndex: pending.approval.permissionIndex,
+        scopeHash: pending.approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(app.executions.started).toHaveLength(1))
+      expect(JSON.stringify(app.chatEvents)).not.toContain('工作流处理完成')
+
+      app.finishRunning(pending.approval.executionId)
+      await expect(decision).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'workflow_provenance' }),
+      })))
+      const provenance = [...app.chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block'
+        && event.block.type === 'workflow_provenance'
+      ))!.block
+      expect(provenance).toStrictEqual({
+        type: 'workflow_provenance',
+        blockId: expect.any(String),
+        entries: [{
+          executionId: pending.approval.executionId,
+          ...expectedWorkflowContext,
+          status: 'completed',
+        }],
+      })
+      expect(JSON.stringify(app.chatEvents)).toContain('工作流处理完成')
+    } finally {
+      await app.runtime.close()
+    }
+  })
+
+  it('invalidates a pending development call when mode closes but retains installed tools', async () => {
+    const app = await applicationHarness({ developerMode: true })
+    try {
+      const pending = await app.sendToolPrompt()
+      expect(pending.approval.source).toBe('development')
+
+      await app.settings.update({ developerMode: false })
+
+      await vi.waitFor(() => expect(app.providerRequests.at(-1)?.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'tool', content: expect.stringContaining('WORKFLOW_CHANGED') }),
+      ])))
+      expect(app.executions.started).toHaveLength(0)
+      expect(app.agent()?.ownsExecution(pending.approval.executionId)).toBe(false)
+
+      const installed = await app.sendToolPrompt()
+      expect(installed.approval).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        source: 'installed',
+      })
+    } finally {
+      await app.runtime.close()
+    }
+  })
+
+  it('latches a provider usage consistency failure from the mode-transition continuation', async () => {
+    const app = await applicationHarness({
+      developerMode: true,
+      failContinuationUsageReport: true,
+    })
+    let closed = false
+    try {
+      const pending = await app.sendToolPrompt()
+
+      await app.settings.update({ developerMode: false })
+      await vi.waitFor(() => expect(app.providerRequests).toHaveLength(2))
+      await new Promise<void>((resolve) => { setImmediate(resolve) })
+
+      await expect(app.runtime.services.chat.send(chatInput(pending.conversation.id, 'refused')))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      let closeError: unknown
+      try {
+        await app.runtime.close()
+      } catch (error) {
+        closeError = error
+      }
+      closed = true
+      expect(closeError).toBeInstanceOf(ProviderUsageConsistencyError)
+    } finally {
+      if (!closed) await app.runtime.close().catch(() => undefined)
+    }
+  })
+
+  it('lets a running development Worker finish after mode closes and excludes development later', async () => {
+    const app = await applicationHarness({ developerMode: true })
+    try {
+      const pending = await app.sendToolPrompt()
+      const decision = app.runtime.services.executions.decide({
+        executionId: pending.approval.executionId,
+        permissionIndex: pending.approval.permissionIndex,
+        scopeHash: pending.approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(app.executions.started).toHaveLength(1))
+
+      await app.settings.update({ developerMode: false })
+      expect(app.agent()?.ownsExecution(pending.approval.executionId)).toBe(true)
+      app.finishRunning(pending.approval.executionId)
+      await expect(decision).resolves.toBeUndefined()
+
+      const installed = await app.sendToolPrompt()
+      expect(installed.approval.source).toBe('installed')
+    } finally {
+      await app.runtime.close()
+    }
+  })
+
   it('latches and rethrows the exact consistency failure from approval resume', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-resume-'))
     directories.push(root)
     const chatEvents: ChatEvent[] = []
-    let workflowId = ''
+    const workflowToolName = 'workflow_1'
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [{
         ...modelInfo('openrouter/tools', 'Tools'),
@@ -1473,8 +1922,8 @@ describe('createApplicationRuntime', () => {
           choiceIndex: 0,
           index: 0,
           id: 'call_approval',
-          name: workflowId,
-          arguments: {},
+          name: workflowToolName,
+          arguments: { input: {} },
         }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
       }),
@@ -1492,7 +1941,7 @@ describe('createApplicationRuntime', () => {
         openrouter: { text: 'openrouter/tools' },
       },
     })
-    workflowId = (await installApprovalWorkflow(runtime)).id
+    await installApprovalWorkflow(runtime)
     const conversation = await runtime.services.chat.createConversation()
 
     await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
@@ -1514,6 +1963,155 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'refused')))
       .rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(runtime.close()).rejects.toBe(consistencyError)
+  })
+
+  it('rejects Agent-owned invalid and stale approvals without legacy fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-routing-'))
+    directories.push(root)
+    const chatEvents: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_agent_owned',
+          name: 'workflow_1',
+          arguments: { input: {} },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    try {
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: { text: 'openrouter/tools' },
+        },
+      })
+      await installApprovalWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      const sent = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block', block: expect.objectContaining({ type: 'approval' }),
+      })))
+      const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block' && event.block.type === 'approval'
+      ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+      const legacyDecision = vi.spyOn(ExecutionService.prototype, 'decide').mockResolvedValueOnce(undefined)
+
+      await expect(runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'always',
+        workflowId: approval.workflowId,
+        workflowVersion: approval.workflowVersion,
+        capability: approval.capability,
+        scope: approval.scope,
+      })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+      await expect(runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: 'b'.repeat(64),
+        decision: 'once',
+      })).rejects.toMatchObject({ code: 'CONFLICT' })
+
+      expect(legacyDecision).not.toHaveBeenCalled()
+
+      await runtime.services.chat.cancel(sent.requestId)
+      await expect(runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'once',
+      })).rejects.toMatchObject({ code: 'CONFLICT' })
+      expect((await runtime.services.chat.listMessages(conversation.id))
+        .find((message) => message.role === 'assistant')?.blocks).toContainEqual(expect.objectContaining({
+        type: 'approval', blockId: approval.blockId, state: 'cancelled',
+      }))
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it('recovers a crash-persisted Agent approval and never routes its stale decision manually', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-crash-'))
+    const restartedRoot = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-restart-'))
+    directories.push(root, restartedRoot)
+    const chatEvents: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const, choiceIndex: 0, index: 0,
+          id: 'call_crash_approval', name: 'workflow_1', arguments: { input: {} },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime, 'RestartApproval')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    await installApprovalWorkflow(runtime)
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+    })))
+    const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+      event.type === 'block' && event.block.type === 'approval'
+    ))!.block
+    if (approval.type !== 'approval') throw new Error('Expected pending approval')
+    await copyFile(join(root, 'autoforge.sqlite'), join(restartedRoot, 'autoforge.sqlite'))
+    await runtime.close()
+
+    const restarted = createApplicationRuntime(options(restartedRoot))
+    await restarted.recover()
+    await authenticate(restarted, 'RestartApproval')
+    const recovered = (await restarted.services.chat.listMessages(conversation.id))
+      .flatMap((message) => message.blocks)
+      .find((block) => block.type === 'approval')
+    expect(chatBlockSchema.parse(recovered)).toMatchObject({
+      type: 'approval', blockId: approval.blockId, executionId: approval.executionId,
+      state: 'invalidated',
+    })
+    const manualDecision = vi.spyOn(ExecutionService.prototype, 'decide').mockResolvedValue(undefined)
+    await expect(restarted.services.executions.decide({
+      executionId: approval.executionId,
+      permissionIndex: approval.permissionIndex,
+      scopeHash: approval.scopeHash,
+      decision: 'once',
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(manualDecision).not.toHaveBeenCalled()
+
+    await expect(restarted.services.executions.decide({
+      executionId: 'manual_execution', permissionIndex: 0,
+      scopeHash: 'b'.repeat(64), decision: 'once',
+    })).resolves.toBeUndefined()
+    expect(manualDecision).toHaveBeenCalledTimes(1)
+    await restarted.close()
   })
 
   it('gives a latched consistency error priority over later shutdown failures', async () => {
@@ -2499,6 +3097,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send(chatInput(conversation.id, '第二轮追问'))
     await vi.waitFor(() => expect(captured).toHaveLength(2))
     expect(captured[1]?.messages).toEqual([
+      expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
       { role: 'user', content: '第一轮问题' },
       { role: 'assistant', content: '第一轮回答' },
       { role: 'user', content: '第二轮追问' },
@@ -2507,7 +3106,77 @@ describe('createApplicationRuntime', () => {
     const isolated = await runtime.services.chat.createConversation()
     await runtime.services.chat.send(chatInput(isolated.id, '独立问题'))
     await vi.waitFor(() => expect(captured).toHaveLength(3))
-    expect(captured[2]?.messages).toEqual([{ role: 'user', content: '独立问题' }])
+    expect(captured[2]?.messages).toEqual([
+      expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
+      { role: 'user', content: '独立问题' },
+    ])
+    await runtime.close()
+  })
+
+  it('loads, persists, and safely continues a conversation with an exact legacy approval block', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-legacy-approval-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const seedDatabase = openAppDatabase(databasePath)
+    seedDatabase.conversations.insert({ id: 'legacy_approval_conversation', title: 'Legacy approval' })
+    seedDatabase.messages.insert({
+      id: 'legacy_approval_message', conversationId: 'legacy_approval_conversation',
+      role: 'assistant', blocks: [], createdAt: 1,
+    })
+    seedDatabase.close()
+    const legacyApproval = {
+      type: 'approval', executionId: 'legacy_execution_secret', workflowId: 'legacy.workflow',
+      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'filesystem.write',
+      scope: { paths: ['/Users/private/legacy-secret.txt'] }, scopeHash: 'a'.repeat(64),
+    }
+    const seed = new Database(databasePath)
+    seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run(JSON.stringify([legacyApproval]), 'legacy_approval_message')
+    seed.close()
+    const captured: ModelStreamRequest[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 128_000 }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request) {
+        captured.push(request)
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '已继续' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime, 'LegacyApproval')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/context' } },
+    })
+    expect(await runtime.services.chat.listConversations()).toContainEqual(expect.objectContaining({
+      id: 'legacy_approval_conversation',
+    }))
+    const listed = await runtime.services.chat.listMessages('legacy_approval_conversation')
+    const approval = listed[0]?.blocks[0]
+    expect(chatBlockSchema.parse(approval)).toMatchObject({
+      type: 'approval', state: 'invalidated', source: 'installed',
+      workflowId: 'legacy.workflow', workflowName: 'legacy.workflow',
+      actionSummary: '历史权限审批已失效',
+    })
+    const persisted = new Database(databasePath, { readonly: true })
+    expect(JSON.parse((persisted.prepare('SELECT blocks_json AS blocksJson FROM messages WHERE id = ?')
+      .get('legacy_approval_message') as { blocksJson: string }).blocksJson)[0]).toMatchObject({
+      state: 'invalidated', actionSummary: '历史权限审批已失效',
+    })
+    persisted.close()
+
+    await runtime.services.chat.send(chatInput('legacy_approval_conversation', '继续处理'))
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    expect(captured[0]?.messages).toEqual(expect.arrayContaining([
+      { role: 'assistant', content: '[工作流权限审批状态: invalidated; legacy.workflow@1.0.0; 能力: filesystem.write]' },
+      { role: 'user', content: '继续处理' },
+    ]))
+    expect(JSON.stringify(captured[0])).not.toMatch(
+      /legacy_execution_secret|legacy_approval_|\/Users\/private|legacy-secret|aaaaaaaaaaaaaaaa/,
+    )
     await runtime.close()
   })
 
@@ -2952,18 +3621,21 @@ describe('createApplicationRuntime', () => {
     })
     await vi.waitFor(() => expect(stream).toHaveBeenCalledWith(expect.objectContaining({
       model: 'openrouter/text',
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: 'describe this image' },
-          {
-            type: 'media',
-            kind: 'image',
-            mimeType: 'image/png',
-            dataBase64: png.toString('base64'),
-          },
-        ],
-      }],
+      messages: [
+        expect.objectContaining({ role: 'system', content: expect.stringContaining('AutoForge Main') }),
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe this image' },
+            {
+              type: 'media',
+              kind: 'image',
+              mimeType: 'image/png',
+              dataBase64: png.toString('base64'),
+            },
+          ],
+        },
+      ],
     })))
     expect(JSON.stringify(await runtime.services.chat.listMessages(textConversation.id)))
       .not.toContain(png.toString('base64'))
@@ -3755,6 +4427,133 @@ describe('createApplicationRuntime', () => {
 
     await runtime.close()
   })
+
+  it('marks edited workflow sources unavailable to chat until an explicit successful build', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-chat-availability-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    const project = await runtime.services.developer.createProject('Chat Availability')
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'new',
+      chatAvailability: 'not_built',
+    })
+
+    await runtime.services.developer.build(project.id)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'ready',
+      chatAvailability: 'ready',
+    })
+
+    const created = await runtime.services.developer.createEntry(project.id, 'src', 'helpers.ts', 'file')
+    expect(created).toMatchObject({ status: 'new', chatAvailability: 'unbuilt_changes' })
+    await runtime.services.developer.writeFile(project.id, 'src/helpers.ts', 'export const helper = true\n')
+    await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+      "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+      "import { helper } from './helpers'",
+      'export default defineWorkflow({ run: async () => ({ helper }) })',
+      '',
+    ].join('\n'))
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      status: 'new', chatAvailability: 'unbuilt_changes',
+    })
+    await runtime.services.developer.build(project.id)
+
+    const renamed = await runtime.services.developer.renameEntry(project.id, 'src/helpers.ts', 'format.ts')
+    expect(renamed).toMatchObject({ status: 'new', chatAvailability: 'unbuilt_changes' })
+    expect(await runtime.services.developer.validate(project.id)).toMatchObject({ valid: false })
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      status: 'invalid', chatAvailability: 'invalid',
+    })
+    await runtime.services.developer.renameEntry(project.id, 'src/format.ts', 'helpers.ts')
+    await runtime.services.developer.build(project.id)
+
+    const deleted = await runtime.services.developer.deleteEntry(project.id, 'src/helpers.ts')
+    expect(deleted).toMatchObject({ status: 'new', chatAvailability: 'unbuilt_changes' })
+    expect(await runtime.services.developer.validate(project.id)).toMatchObject({ valid: false })
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      status: 'invalid', chatAvailability: 'invalid',
+    })
+
+    await runtime.services.developer.writeFile(project.id, 'src/index.ts', "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ changed: true }) })\n")
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'new',
+      chatAvailability: 'unbuilt_changes',
+    })
+
+    await runtime.services.developer.build(project.id)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'ready',
+      chatAvailability: 'ready',
+    })
+
+    const manifest = JSON.parse(await runtime.services.developer.readFile(project.id, 'workflow.json')) as Record<string, unknown>
+    manifest.description = 'Edited manifest requires another build'
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'new',
+      chatAvailability: 'unbuilt_changes',
+    })
+
+    await runtime.services.developer.build(project.id)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'ready',
+      chatAvailability: 'ready',
+    })
+
+    await runtime.close()
+  })
+
+  it.each(['src/index.ts', 'workflow.json'] as const)(
+    'reports a %s save queued behind build commit as unbuilt without losing the edit',
+    async (path) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-build-save-race-'))
+      directories.push(root)
+      let shouldBlock = false
+      let enterCommit!: () => void
+      let releaseCommit!: () => void
+      const commitEntered = new Promise<void>((resolvePromise) => { enterCommit = resolvePromise })
+      const commitGate = new Promise<void>((resolvePromise) => { releaseCommit = resolvePromise })
+      const runtime = createApplicationRuntime(options(root, {
+        projectServiceOptions: {
+          beforeBuildCommit: async () => {
+            if (!shouldBlock) return
+            enterCommit()
+            await commitGate
+          },
+        },
+      }))
+      const project = await runtime.services.developer.createProject('Build Save Race')
+      await runtime.services.developer.build(project.id)
+      const userContents = path === 'src/index.ts'
+        ? "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ userEdit: true }) })\n"
+        : `${JSON.stringify({
+            ...JSON.parse(await runtime.services.developer.readFile(project.id, path)) as Record<string, unknown>,
+            description: 'User manifest edit wins',
+          }, null, 2)}\n`
+      shouldBlock = true
+
+      const building = runtime.services.developer.build(project.id)
+      await commitEntered
+      const saving = runtime.services.developer.writeFile(project.id, path, userContents)
+      releaseCommit()
+      await Promise.all([building, saving])
+
+      expect(await runtime.services.developer.readFile(project.id, path)).toBe(userContents)
+      expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+        id: project.id,
+        status: 'new',
+        chatAvailability: 'unbuilt_changes',
+      })
+      await runtime.close()
+    },
+  )
 
   it('returns the titled first input validation error without starting an execution', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-input-error-'))

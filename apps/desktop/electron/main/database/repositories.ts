@@ -1,9 +1,13 @@
+import { createHash } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import { z } from 'zod'
 import {
   appErrorCodeSchema,
+  capabilitySchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  runtimeCapabilityPermissionSchema,
+  runtimeCapabilityScopeSchema,
   type AppErrorCode,
   type ChatBlock,
   type ConversationGenerationPreferences,
@@ -467,6 +471,82 @@ function parse(value: string | null): unknown | undefined {
   return value === null ? undefined : JSON.parse(value)
 }
 
+const storedIdentifierSchema = z.string().trim().min(1)
+const legacyApprovalBlockSchema = z.object({
+  type: z.literal('approval'),
+  executionId: storedIdentifierSchema,
+  workflowId: storedIdentifierSchema,
+  workflowVersion: storedIdentifierSchema,
+  permissionIndex: z.number().int().nonnegative(),
+  capability: capabilitySchema,
+  scope: runtimeCapabilityScopeSchema,
+  scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict().superRefine(({ capability, scope }, context) => {
+  if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
+    context.addIssue({ code: 'custom', message: 'Historical approval capability scope is invalid' })
+  }
+})
+
+function storedBlocks(value: string): unknown[] | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return Array.isArray(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function upgradedLegacyApproval(
+  messageId: string,
+  index: number,
+  value: unknown,
+): Extract<ChatBlock, { type: 'approval' }> | undefined {
+  const legacy = legacyApprovalBlockSchema.safeParse(value)
+  if (!legacy.success) return undefined
+  const blockId = `legacy_approval_${createHash('sha256')
+    .update(JSON.stringify([messageId, index, legacy.data.executionId]))
+    .digest('hex')}`
+  const upgraded = chatBlockSchema.safeParse({
+    ...legacy.data,
+    blockId,
+    state: 'invalidated',
+    workflowName: legacy.data.workflowId.slice(0, 500),
+    source: 'installed',
+    actionSummary: '历史权限审批已失效',
+  })
+  return upgraded.success && upgraded.data.type === 'approval' ? upgraded.data : undefined
+}
+
+function storedApproval(value: unknown): Extract<ChatBlock, { type: 'approval' }> | undefined {
+  const parsed = chatBlockSchema.safeParse(value)
+  return parsed.success && parsed.data.type === 'approval' ? parsed.data : undefined
+}
+
+function upsertWorkflowApprovalOwnership(
+  database: SqliteDatabase,
+  messageId: string,
+  role: string,
+  blocks: readonly unknown[],
+): void {
+  if (role !== 'assistant') return
+  const upsert = database.prepare(`
+    INSERT INTO agent_workflow_approvals (execution_id, message_id, block_id)
+    VALUES (@executionId, @messageId, @blockId)
+    ON CONFLICT(execution_id) DO UPDATE SET
+      message_id = excluded.message_id,
+      block_id = excluded.block_id
+  `)
+  for (const block of blocks) {
+    const approval = storedApproval(block)
+    if (!approval) continue
+    upsert.run({
+      executionId: approval.executionId,
+      messageId,
+      blockId: approval.blockId,
+    })
+  }
+}
+
 function transaction<T>(database: SqliteDatabase, operation: () => T): T {
   return database.transaction(operation)()
 }
@@ -504,6 +584,9 @@ export interface AppRepositories {
     listBeforeOrdinal(conversationId: string, beforeOrdinal: number): Message[]
     update(id: string, value: Partial<Pick<Message, 'blocks' | 'executionId'>>): Message | undefined
     replaceBlock(messageId: string, blockId: string, replacement: unknown): Message
+    upgradeLegacyApprovals(): number
+    invalidatePendingAgentApprovals(): number
+    hasWorkflowApproval(executionId: string): boolean
     failInterruptedMediaGenerations(): number
   }
   conversationContexts: {
@@ -1031,6 +1114,7 @@ function insertMessage(
     ordinal,
     executionId: value.executionId ?? null,
   })
+  upsertWorkflowApprovalOwnership(database, value.id, value.role, blocks)
   return { ...value, blocks, ordinal }
 }
 
@@ -1351,9 +1435,14 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         ORDER BY ordinal
       `, { conversationId, beforeOrdinal }).map(messageFromRow),
       update(id, value) {
-        transaction(database, () => database.prepare('UPDATE messages SET blocks_json = COALESCE(@blocksJson, blocks_json), execution_id = COALESCE(@executionId, execution_id) WHERE id = @id').run({ id, blocksJson: value.blocks === undefined ? null : JSON.stringify(value.blocks), executionId: value.executionId ?? null }))
-        const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id })
-        return row && messageFromRow(row)
+        return transaction(database, () => {
+          database.prepare('UPDATE messages SET blocks_json = COALESCE(@blocksJson, blocks_json), execution_id = COALESCE(@executionId, execution_id) WHERE id = @id').run({ id, blocksJson: value.blocks === undefined ? null : JSON.stringify(value.blocks), executionId: value.executionId ?? null })
+          const row = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id })
+          if (row && value.blocks !== undefined) {
+            upsertWorkflowApprovalOwnership(database, id, row.role as string, value.blocks)
+          }
+          return row && messageFromRow(row)
+        })
       },
       replaceBlock(messageId, blockId, replacement) {
         const parsedReplacement = chatBlockSchema.parse(replacement)
@@ -1378,10 +1467,68 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           }
           blocks[index] = parsedReplacement
           database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: messageId, blocksJson: JSON.stringify(blocks) })
+          upsertWorkflowApprovalOwnership(database, messageId, row.role as string, blocks)
           const stored = one<Query>(database, `SELECT ${messageColumns} FROM messages WHERE id = @id`, { id: messageId })
           if (!stored) throw new Error('Message not found')
           return messageFromRow(stored)
         })
+      },
+      upgradeLegacyApprovals() {
+        return transaction(database, () => {
+          let upgraded = 0
+          const normalized: Array<{ id: string; blocks: unknown[] }> = []
+          for (const row of many<Query>(database, "SELECT id, blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
+            const blocks = storedBlocks(row.blocksJson as string)
+            if (!blocks) continue
+            let changed = false
+            for (const [index, block] of blocks.entries()) {
+              if (chatBlockSchema.safeParse(block).success) continue
+              const replacement = upgradedLegacyApproval(row.id as string, index, block)
+              if (!replacement) continue
+              blocks[index] = replacement
+              upgraded += 1
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
+            normalized.push({ id: row.id as string, blocks })
+          }
+          for (const row of normalized) {
+            upsertWorkflowApprovalOwnership(database, row.id, 'assistant', row.blocks)
+          }
+          return upgraded
+        })
+      },
+      invalidatePendingAgentApprovals() {
+        return transaction(database, () => {
+          let invalidated = 0
+          for (const row of many<Query>(database, "SELECT id, blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
+            const blocks = storedBlocks(row.blocksJson as string)
+            if (!blocks) continue
+            let changed = false
+            for (const [index, block] of blocks.entries()) {
+              const approval = storedApproval(block)
+              if (!approval || approval.state !== 'pending') continue
+              blocks[index] = { ...approval, state: 'invalidated' }
+              invalidated += 1
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
+          }
+          return invalidated
+        })
+      },
+      hasWorkflowApproval(executionId) {
+        return one<{ owned: number }>(database, `
+          SELECT 1 AS owned
+          FROM agent_workflow_approvals
+          WHERE execution_id = @executionId
+        `, { executionId }) !== undefined
       },
       failInterruptedMediaGenerations() {
         return transaction(database, () => {
@@ -1959,6 +2106,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             blocksJson: JSON.stringify(blocks),
           })
           if (message.changes !== 1) throw new Error('Assistant message not found')
+          upsertWorkflowApprovalOwnership(database, messageId, messageRow.role as string, blocks)
           const run = database.prepare('UPDATE chat_runs SET status = @status, generation_id = @generationId, input_tokens = @inputTokens, output_tokens = @outputTokens, cost_usd = @costUsd, error_code = @errorCode, ended_at = @endedAt WHERE id = @id').run({
             id,
             status: value.status,

@@ -13,6 +13,15 @@
       </div>
     </div>
     <dl>
+      <dt>工作流</dt><dd>{{ approval.workflowName }}</dd>
+      <dt>标识</dt><dd>{{ approval.workflowId }}</dd>
+      <dt>版本</dt><dd>{{ approval.workflowVersion }}</dd>
+      <dt>来源</dt><dd>{{ sourceLabel }}</dd>
+      <template v-if="approval.buildHash">
+        <dt>构建</dt><dd>{{ approval.buildHash }}</dd>
+      </template>
+      <dt>城市</dt><dd>{{ approval.city ?? '不限城市' }}</dd>
+      <dt>操作</dt><dd>{{ approval.actionSummary }}</dd>
       <dt>能力</dt><dd>{{ approval.capability }}</dd>
       <dt>范围</dt><dd>{{ scopeLabel }}</dd>
     </dl>
@@ -26,32 +35,25 @@
     <div class="approval-actions">
       <el-button
         data-testid="deny-approval"
-        :disabled="busy || decided"
+        :disabled="busy || submitted || approval.state !== 'pending'"
         @click="decide('deny')"
       >
         拒绝
       </el-button>
       <el-button
-        data-testid="approve-always"
-        :disabled="busy || decided"
-        title="始终允许此工作流版本的相同权限"
-        @click="decide('always')"
-      >
-        始终允许
-      </el-button>
-      <el-button
         type="primary"
         data-testid="approve-once"
-        :disabled="busy || decided"
+        :disabled="busy || submitted || approval.state !== 'pending'"
         @click="decide('once')"
       >
         仅本次允许
       </el-button>
     </div>
     <span
-      v-if="decided"
+      v-if="approvalStateLabel"
       class="decision-result"
-    >审批已提交</span>
+      data-testid="approval-state"
+    >{{ approvalStateLabel }}</span>
   </section>
 </template>
 
@@ -64,18 +66,27 @@ import { displayError, getDesktopApi } from '../../services/desktop-api'
 type ApprovalBlock = Extract<ChatBlock, { type: 'approval' }>
 const props = defineProps<{ approval: ApprovalBlock }>()
 const busy = ref(false)
-const decided = ref(false)
+const submitted = ref(false)
 const error = ref('')
 
 const capabilityLabel = computed(() => props.approval.capability.startsWith('browser.') ? '工作流希望控制自动化浏览器' : '工作流请求受控宿主能力')
+const sourceLabel = computed(() => props.approval.source === 'development' ? '开发版本' : '已安装')
+const approvalStateLabel = computed(() => ({
+  pending: '',
+  approved: '已允许本次',
+  denied: '已拒绝',
+  expired: '审批已过期',
+  cancelled: '审批已取消',
+  invalidated: '审批已失效',
+})[props.approval.state])
 const scopeLabel = computed(() => {
   if ('origins' in props.approval.scope) return props.approval.scope.origins.join('、')
   if ('paths' in props.approval.scope) return props.approval.scope.paths.join('、')
   return '不包含附加范围'
 })
 
-async function decide(decision: 'once' | 'always' | 'deny') {
-  if (busy.value || decided.value) return
+async function decide(decision: 'once' | 'deny') {
+  if (busy.value || submitted.value || props.approval.state !== 'pending') return
   busy.value = true
   error.value = ''
   const base = {
@@ -83,16 +94,10 @@ async function decide(decision: 'once' | 'always' | 'deny') {
     permissionIndex: props.approval.permissionIndex,
     scopeHash: props.approval.scopeHash,
   }
-  const input: ApprovalDecision = decision === 'always'
-    ? {
-        ...base, decision, workflowId: props.approval.workflowId,
-        workflowVersion: props.approval.workflowVersion, capability: props.approval.capability,
-        scope: props.approval.scope,
-      }
-    : { ...base, decision }
+  const input: ApprovalDecision = { ...base, decision }
   try {
     await getDesktopApi().executions.decide(input)
-    decided.value = true
+    submitted.value = true
   } catch (caught) { error.value = displayError(caught, '审批提交失败') }
   finally { busy.value = false }
 }

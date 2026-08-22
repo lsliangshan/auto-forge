@@ -48,6 +48,7 @@ export interface PrepareConversationContextInput {
   callIdentity: { requestId: string; chatRunId: string; userId: string }
   model: string
   contextLength?: number
+  leadingMessages?: ModelMessage[]
   currentMessage: { role: 'user'; content: string | ModelContentPart[] }
   tools: ModelTool[]
   currentMedia: CurrentMediaMetadata[]
@@ -90,13 +91,21 @@ function serializeBlock(block: ChatBlock): string[] {
     case 'media':
       return [`[历史附件: ${block.kind}; 名称: ${block.name}; MIME: ${block.mimeType}; 大小: ${block.byteSize} bytes]`]
     case 'workflow_proposal':
-      return [`[工作流提议: ${block.workflowName} (${block.workflowId}); 参数: ${safeJson(block.args)}]`]
+      return [`[工作流提议: ${block.workflowName} (${block.workflowId})]`]
     case 'approval':
-      return [`[工作流等待权限审批: ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
+      return block.state === 'pending'
+        ? [`[工作流等待权限审批: ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
+        : [`[工作流权限审批状态: ${block.state}; ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
+    case 'workflow_status':
+      return [`[工作流: ${block.workflowName}; 城市: ${block.city ?? '不限城市'}; 状态: ${block.status}]`]
+    case 'workflow_provenance':
+      return block.entries.map((entry) => (
+        `[已使用工作流: ${entry.workflowName}; 城市: ${entry.city ?? '不限城市'}; 状态: ${entry.status}]`
+      ))
     case 'workflow_execution':
       return [`[工作流执行: ${block.executionId}]`]
     case 'execution_result':
-      return [`[工作流结果: ${block.executionId}; ${block.summary}]`]
+      return [`[工作流结果: ${block.executionId}; 已完成]`]
     case 'error':
       return [`[请求失败: ${block.code}; ${block.message}]`]
     case 'media_generation':
@@ -167,6 +176,13 @@ export function estimateRequestTokens(input: EstimateRequestTokensInput): number
     + input.currentMedia.reduce((total, media) => total + currentMediaTokenReserve(media), 0)
 }
 
+export function resolveChatInputBudget(contextLength?: number): number {
+  const resolvedContextLength = contextLength !== undefined && contextLength > 0
+    ? contextLength
+    : 32_000
+  return Math.floor(resolvedContextLength * 0.60)
+}
+
 function summaryMessage(summaryText: string): ModelMessage {
   return {
     role: 'system',
@@ -179,7 +195,7 @@ function requestTokens(
   input: PrepareConversationContextInput,
 ): number {
   return estimateRequestTokens({
-    messages: [...history, input.currentMessage],
+    messages: [...(input.leadingMessages ?? []), ...history, input.currentMessage],
     tools: input.tools,
     currentMedia: input.currentMedia,
   })
@@ -328,7 +344,7 @@ export function createConversationContextManager(
       const contextLength = input.contextLength && input.contextLength > 0
         ? input.contextLength
         : 32_000
-      const chatBudget = Math.floor(contextLength * 0.60)
+      const chatBudget = resolveChatInputBudget(input.contextLength)
       const summaryInputBudget = Math.floor(contextLength * 0.90)
       const summaryOutputTokens = Math.min(2_048, Math.floor(contextLength * 0.10))
 

@@ -1,14 +1,16 @@
 import { EventEmitter } from 'node:events'
-import { fork as forkProcess, type ForkOptions } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { execFileSync, fork as forkProcess, type ForkOptions } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { closeSync, constants, openSync, readFileSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import type { ApprovalDecision, ExecutionEvent, WorkerCapabilityRequest, WorkerRequest, WorkerResponse, WorkflowDetail } from '@autoforge/shared'
 import { workerRequestSchema } from '@autoforge/shared'
 import { describe, expect, it, vi } from 'vitest'
-import type { Execution, ExecutionLog, ExecutionStep } from '../database/repositories.js'
+import type { Execution, ExecutionLog, ExecutionStep, PermissionGrant } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import {
   ExecutionService,
@@ -19,6 +21,9 @@ import {
   type WorkflowWorker,
   type WorkflowWorkerFactory,
 } from './execution-service.js'
+import { createWorkflowExecutionSourceResolver } from '../application.js'
+import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
+import { createWorkflowSourceSelectorVault } from './workflow-source-selector.js'
 
 class FakeWorker extends EventEmitter implements WorkflowWorker {
   readonly stdin = new PassThrough()
@@ -26,6 +31,7 @@ class FakeWorker extends EventEmitter implements WorkflowWorker {
   readonly stderr = new PassThrough()
   killed = false
   readonly requests: WorkerRequest[] = []
+  loadedEntry?: Buffer
   private input = ''
 
   constructor() {
@@ -35,7 +41,10 @@ class FakeWorker extends EventEmitter implements WorkflowWorker {
       const lines = this.input.split('\n')
       this.input = lines.pop() ?? ''
       for (const line of lines) {
-        if (line) this.requests.push(workerRequestSchema.parse(JSON.parse(line)))
+        if (!line) continue
+        const request = workerRequestSchema.parse(JSON.parse(line))
+        this.requests.push(request)
+        if (request.type === 'start') this.loadedEntry = readFileSync(request.entryPath)
       }
     })
   }
@@ -55,7 +64,14 @@ class FakeWorkerFactory implements WorkflowWorkerFactory {
   readonly workers = new Map<string, FakeWorker>()
   readonly specifications: Array<{ executionId: string; cwd: string; env: NodeJS.ProcessEnv }> = []
 
+  constructor(
+    private readonly beforeSpawn: (
+      specification: Parameters<WorkflowWorkerFactory['spawn']>[0],
+    ) => Promise<void> | void = () => undefined,
+  ) {}
+
   async spawn(specification: Parameters<WorkflowWorkerFactory['spawn']>[0]): Promise<WorkflowWorker> {
+    await this.beforeSpawn(specification)
     const worker = new FakeWorker()
     this.workers.set(specification.executionId, worker)
     this.specifications.push({ executionId: specification.executionId, cwd: specification.cwd, env: specification.env })
@@ -102,9 +118,9 @@ function createRepositories(): ExecutionRepositories & { records: Map<string, Ex
 
 function createPermissionRepository() {
   return {
-    upsert: <T>(value: T) => value,
-    get: () => undefined,
-    delete: () => undefined,
+    upsert: vi.fn((value: PermissionGrant) => value),
+    get: vi.fn(() => undefined),
+    delete: vi.fn(() => undefined),
   }
 }
 
@@ -119,6 +135,11 @@ const workflow: WorkflowDetail = {
   source: 'installed',
   integrity: 'valid',
   updatedAt: new Date(0).toISOString(),
+  codeSha256: createHash('sha256')
+    .update(readFileSync(fileURLToPath(new URL('../../workers/workflow-runner.ts', import.meta.url))))
+    .digest('hex'),
+  cities: [],
+  runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' },
   permissions: [{ capability: 'browser.open', scope: { origins: ['https://www.baidu.com'] } }],
   activationExamples: ['search'],
   activationNegativeExamples: [],
@@ -150,10 +171,12 @@ function createHarness(options: {
     create(): Promise<string>
     remove(path: string): Promise<void>
   }
+  workerFactory?: FakeWorkerFactory
 } = {}) {
   const repositories = createRepositories()
-  const workerFactory = new FakeWorkerFactory()
-  const policy = new PolicyEngine(createPermissionRepository())
+  const workerFactory = options.workerFactory ?? new FakeWorkerFactory()
+  const permissionRepository = createPermissionRepository()
+  const policy = new PolicyEngine(permissionRepository)
   const events: ExecutionEvent[] = []
   const capability = options.capability ?? {
     request: async () => ({ ok: true }),
@@ -165,6 +188,7 @@ function createHarness(options: {
     entryPath: 'workers/workflow-runner.ts',
     integrity: 'valid' as const,
   }
+  const sourceSelector = createWorkflowSourceSelectorVault().create(workflow)
   const dependencies = {
     repositories,
     sourceResolver: options.sourceResolver ?? { resolve: async () => source },
@@ -186,8 +210,31 @@ function createHarness(options: {
     workflowVersion: workflow.version,
     input: { query: 'weather' },
     timeoutMs: options.timeoutMs,
+    sourceSelector,
   })
-  return { repositories, workerFactory, policy, events, capability, service, start }
+  return { repositories, workerFactory, permissionRepository, policy, events, capability, sourceSelector, service, start }
+}
+
+function agentStartInput(
+  selectedWorkflow: WorkflowDetail,
+  sourceSelector: ReturnType<ReturnType<typeof createWorkflowSourceSelectorVault>['create']>,
+) {
+  return {
+    userId: 'user_1',
+    workflowId: selectedWorkflow.id,
+    workflowVersion: selectedWorkflow.version,
+    input: { query: 'weather' },
+    sourceSelector,
+    agentAuthorization: {
+      workflowFingerprint: workflowSecurityFingerprint(selectedWorkflow),
+      permissions: selectedWorkflow.permissions.map((permission, permissionIndex) => ({
+        permissionIndex,
+        capability: permission.capability,
+        scope: permission.scope,
+        scopeHash: scopeHash(permission.scope),
+      })),
+    },
+  } as unknown as Parameters<ExecutionService['startReserved']>[1]
 }
 
 async function turn(): Promise<void> {
@@ -266,6 +313,93 @@ async function runActualWorker(source: string, options: ActualWorkerOptions = {}
 }
 
 describe('ExecutionService', () => {
+  it.each(['installed', 'development'] as const)('does not spawn after a selected %s source changes', async (source) => {
+    const selected = source === 'installed' ? workflow : {
+      ...workflow,
+      source: 'development' as const,
+      runtimeIdentity: {
+        id: workflow.id,
+        version: workflow.version,
+        source: 'development' as const,
+        buildHash: 'b'.repeat(64),
+      },
+    }
+    const vault = createWorkflowSourceSelectorVault()
+    const selector = vault.create(selected)
+    const project = {
+      id: 'project_development', name: 'Development', rootPath: trustedRootPath, status: 'ready',
+      buildHash: 'b'.repeat(64),
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'workers/workflow-runner.ts', codeSha256: workflow.codeSha256 },
+      createdAt: 0, updatedAt: 0,
+    }
+    const installed = {
+      workflowId: workflow.id,
+      version: workflow.version,
+      installPath: trustedRootPath,
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'workers/workflow-runner.ts', codeSha256: workflow.codeSha256 },
+    }
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => source === 'development' ? [project] : [] },
+        installedWorkflows: { get: () => source === 'installed' ? installed : undefined },
+      },
+      registry: {
+        getDevelopmentProject: async () => selected.source === 'development' ? selected : undefined,
+        get: async () => selected.source === 'installed' ? selected : undefined,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+    const harness = createHarness({ sourceResolver: resolver })
+
+    if (source === 'installed') installed.manifest.codeSha256 = 'c'.repeat(64)
+    else project.buildHash = 'd'.repeat(64)
+    const execution = await harness.service.start({
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: selector,
+    })
+
+    await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode: 'NOT_FOUND' })
+    expect(harness.workerFactory.specifications).toEqual([])
+  })
+
+  it('rejects an installed detail with a different identity before exposing its schema or spawning', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const selector = vault.create(workflow)
+    const wrongDetail = {
+      ...workflow,
+      id: 'browser.search.other',
+      runtimeIdentity: { id: 'browser.search.other', version: workflow.version, source: 'installed' as const },
+      outputSchema: { selected: 'wrong-installed-detail' },
+    }
+    const installed = {
+      workflowId: workflow.id,
+      version: workflow.version,
+      installPath: trustedRootPath,
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'workers/workflow-runner.ts', codeSha256: workflow.codeSha256 },
+    }
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [] },
+        installedWorkflows: { get: () => installed },
+      },
+      registry: {
+        getDevelopmentProject: async () => undefined,
+        get: async () => wrongDetail,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+    const harness = createHarness({ sourceResolver: resolver })
+
+    await expect(resolver.resolve(workflow.id, workflow.version, selector)).resolves.toBeUndefined()
+    const execution = await harness.service.start({
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: selector,
+    })
+
+    await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode: 'NOT_FOUND' })
+    expect(harness.workerFactory.specifications).toEqual([])
+  })
+
   it('uses an unforgeable reservation so pre-start approval remains bound to the worker', async () => {
     const harness = createHarness()
     const reservation = harness.service.reserve()
@@ -275,6 +409,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: { query: 'weather' },
+      sourceSelector: harness.sourceSelector,
     })
 
     expect(execution.id).toBe(reservation.executionId)
@@ -283,7 +418,7 @@ describe('ExecutionService', () => {
     expect(harness.service.hasActiveExecutions()).toBe(false)
 
     await expect(harness.service.startReserved({ executionId: 'forged' } as never, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -297,7 +432,7 @@ describe('ExecutionService', () => {
     expect(harness.service.discardReservation(reservation)).toBe(false)
     expect(harness.service.discardReservation({ executionId: reservation.executionId } as never)).toBe(false)
     await expect(harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -308,12 +443,65 @@ describe('ExecutionService', () => {
     controller.abort()
 
     await expect(harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     }, controller.signal)).rejects.toMatchObject({ code: 'CANCELLED' })
     expect(harness.service.discardReservation(reservation)).toBe(false)
     await expect(harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
+  })
+
+  it('owns and releases a pre-aborted reserved start exactly once without persistence or Worker leakage', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+    harness.policy.record({
+      executionId: reservation.executionId,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: workflow.permissions[0]!.capability,
+      scope: workflow.permissions[0]!.scope,
+      decision: 'once',
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+    }, controller.signal)).rejects.toMatchObject({ code: 'CANCELLED' })
+
+    expect(harness.service.hasActiveExecutions()).toBe(false)
+    expect(harness.repositories.records.size).toBe(0)
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
+    expect(releaseExecution).toHaveBeenCalledWith(reservation.executionId)
+  })
+
+  it('owns and releases a reserved start when execution insertion throws', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+    harness.policy.record({
+      executionId: reservation.executionId,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: workflow.permissions[0]!.capability,
+      scope: workflow.permissions[0]!.scope,
+      decision: 'once',
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+    harness.repositories.executions.insert = () => { throw new Error('insert unavailable') }
+
+    await expect(harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+    })).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+
+    expect(harness.service.hasActiveExecutions()).toBe(false)
+    expect(harness.repositories.records.size).toBe(0)
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
+    expect(releaseExecution).toHaveBeenCalledWith(reservation.executionId)
   })
 
   it('cancels and removes an unstarted reservation during shutdown', async () => {
@@ -328,6 +516,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -346,6 +535,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })
     await turn()
     let stopped = false
@@ -380,6 +570,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })
     await turn()
     const shutdown = harness.service.shutdown()
@@ -391,12 +582,14 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(harness.service.startReserved(existing, {
       userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
 
     release()
@@ -407,6 +600,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -421,7 +615,7 @@ describe('ExecutionService', () => {
     })
     const reservation = harness.service.reserve()
     const starting = harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })
     await turn()
     let cancelSettled = false
@@ -489,6 +683,180 @@ describe('ExecutionService', () => {
     expect(harness.repositories.records.get(execution.id)).toMatchObject({ status: 'completed', result: { title: 'weather' } })
   })
 
+  it('uses an Agent-authorized wildcard browser.open scope without a legacy approval', async () => {
+    const agentWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{
+        capability: 'browser.open',
+        scope: { origins: ['*.baidu.com/api/*', 'https://accounts.baidu.com'] },
+      }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: agentWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      agentStartInput(agentWorkflow, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request',
+      requestId: 'agent_open',
+      request: {
+        capability: 'browser.open',
+        scope: { origins: ['https://news.baidu.com'] },
+        arguments: { url: 'https://news.baidu.com/api/weather' },
+      },
+    })
+    await turn()
+
+    expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+    expect(worker.requests).toContainEqual({
+      type: 'capability_result', requestId: 'agent_open', result: { ok: true },
+    })
+    expect(harness.permissionRepository.upsert).not.toHaveBeenCalled()
+
+    worker.respond({ type: 'result', output: { title: 'weather' } })
+    await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it.each(['browser.fill', 'browser.click'] as const)(
+    'converts an Agent-approved declared %s scope into an exact execution-only grant',
+    async (capability) => {
+      const declared = {
+        capability,
+        scope: { origins: ['*.baidu.com/*', 'https://accounts.baidu.com'] },
+      }
+      const agentWorkflow: WorkflowDetail = { ...workflow, permissions: [declared] }
+      const harness = createHarness({
+        source: {
+          workflow: agentWorkflow,
+          rootPath: trustedRootPath,
+          entryPath: 'workers/workflow-runner.ts',
+          integrity: 'valid',
+        },
+      })
+      const record = vi.spyOn(harness.policy, 'record')
+      const reservation = harness.service.reserve()
+      const execution = await harness.service.startReserved(
+        reservation,
+        agentStartInput(agentWorkflow, harness.sourceSelector),
+      )
+      const worker = harness.workerFactory.workers.get(execution.id)!
+      worker.respond({ type: 'ready', executionId: execution.id })
+      worker.respond({
+        type: 'capability_request',
+        requestId: `agent_${capability}`,
+        request: capability === 'browser.fill'
+          ? { capability, scope: { origins: ['https://news.baidu.com'] }, arguments: { locator: '#query', value: 'weather' } }
+          : { capability, scope: { origins: ['https://news.baidu.com'] }, arguments: { locator: '#submit' } },
+      })
+      await turn()
+
+      expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+      expect(record).toHaveBeenCalledWith({
+        executionId: execution.id,
+        workflowId: agentWorkflow.id,
+        workflowVersion: agentWorkflow.version,
+        capability,
+        scope: { origins: ['https://news.baidu.com'] },
+        decision: 'once',
+      })
+      expect(record.mock.calls.some(([permission]) => permission.decision === 'always')).toBe(false)
+      expect(harness.permissionRepository.upsert).not.toHaveBeenCalled()
+      expect(worker.requests).toContainEqual({
+        type: 'capability_result', requestId: `agent_${capability}`, result: { ok: true },
+      })
+      await harness.service.cancel(execution.id)
+    },
+  )
+
+  it.each([
+    {
+      name: 'an origin outside the declared scope',
+      request: {
+        capability: 'browser.open' as const,
+        scope: { origins: ['https://attacker.example'] },
+        arguments: { url: 'https://attacker.example/path' },
+      },
+    },
+    {
+      name: 'a capability absent from the Agent binding',
+      request: {
+        capability: 'browser.fill' as const,
+        scope: { origins: ['https://news.baidu.com'] },
+        arguments: { locator: '#query', value: 'secret' },
+      },
+    },
+  ])('fails an Agent-owned request for $name without a legacy approval', async ({ request }) => {
+    const agentWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{ capability: 'browser.open', scope: { origins: ['*.baidu.com/*'] } }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: agentWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      agentStartInput(agentWorkflow, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'agent_denied', request })
+
+    await expect(execution.finished).resolves.toMatchObject({
+      status: 'failed', errorCode: 'CAPABILITY_SCOPE_DENIED',
+    })
+    expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+  })
+
+  it('persists invalid Worker output as failed without a completed terminal event', async () => {
+    const harness = createHarness({
+      source: {
+        workflow: {
+          ...workflow,
+          outputSchema: {
+            type: 'object',
+            required: ['title'],
+            properties: { title: { type: 'string' } },
+          },
+        },
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'result', output: { title: 42 } })
+
+    await expect(execution.finished).resolves.toMatchObject({
+      status: 'failed', errorCode: 'INVALID_OUTPUT', result: { title: 42 },
+    })
+    expect(harness.repositories.records.get(execution.id)).toMatchObject({
+      status: 'failed', errorCode: 'INVALID_OUTPUT', result: { title: 42 },
+    })
+    expect(harness.events.filter((event) => event.type === 'status' && [
+      'completed', 'failed', 'cancelled',
+    ].includes(event.status))).toMatchObject([{ status: 'failed', error: { code: 'INVALID_OUTPUT' } }])
+    expect(harness.events.some((event) => event.type === 'result')).toBe(false)
+    expect(worker.killed).toBe(true)
+  })
+
   it('emits exact identity for a later manifest permission and rejects an out-of-order decision', async () => {
     const fillPermission = { capability: 'browser.fill' as const, scope: capabilityRequest.scope }
     const twoPermissionWorkflow = { ...workflow, permissions: [workflow.permissions[0]!, fillPermission] }
@@ -544,6 +912,33 @@ describe('ExecutionService', () => {
 
     await expect(harness.service.decide(decision)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(harness.repositories.records.get(execution.id)?.status).toBe('awaiting_approval')
+  })
+
+  it('retains legacy always approval for a manual execution without Agent authorization', async () => {
+    const harness = createHarness()
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'manual_request', request: capabilityRequest })
+    await turn()
+
+    await harness.service.decide({
+      executionId: execution.id,
+      permissionIndex: 0,
+      scopeHash: scopeHash(capabilityRequest.scope),
+      decision: 'always',
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: capabilityRequest.capability,
+      scope: capabilityRequest.scope,
+    })
+    await turn()
+
+    expect(harness.permissionRepository.upsert).toHaveBeenCalledTimes(1)
+    expect(worker.requests).toContainEqual({
+      type: 'capability_result', requestId: 'manual_request', result: { ok: true },
+    })
+    await harness.service.cancel(execution.id)
   })
 
   it('rejects undeclared capability scopes before asking for approval', async () => {
@@ -822,6 +1217,7 @@ describe('ExecutionService', () => {
       workflowVersion: workflow.version,
       input: { query: 'weather' },
       userId: 'user_1',
+      sourceSelector: harness.sourceSelector,
     } as Parameters<typeof harness.service.start>[0])
     const worker = harness.workerFactory.workers.get(execution.id)!
     worker.respond({ type: 'ready', executionId: execution.id })
@@ -849,12 +1245,15 @@ describe('ExecutionService', () => {
       workflowVersion: workflow.version,
       input: {},
       entryPath: '/tmp/untrusted-workflow.mjs',
+      sourceSelector: harness.sourceSelector,
     } as never)
     const worker = harness.workerFactory.workers.get(execution.id)!
 
-    expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({
-      entryPath: join(trustedRootPath, 'workers/workflow-runner.ts'),
-    })
+    const stagedPath = join(harness.workerFactory.specifications[0]!.cwd, 'workflow-entry.mjs')
+    expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({ entryPath: stagedPath })
+    expect(await readFile(stagedPath)).toEqual(
+      await readFile(join(trustedRootPath, 'workers/workflow-runner.ts')),
+    )
     await harness.service.cancel(execution.id)
   })
 
@@ -878,6 +1277,335 @@ describe('ExecutionService', () => {
     expect(harness.workerFactory.workers.size).toBe(0)
   })
 
+  it.each([
+    ['installed', 'WORKFLOW_INTEGRITY_FAILED'],
+    ['development', 'WORKFLOW_CHANGED'],
+  ] as const)('fails a changed %s artifact before a Worker becomes active', async (source, errorCode) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-digest-race-'))
+    const entryPath = 'dist/index.mjs'
+    const original = 'export default { async run() { return "original" } }'
+    const changed = 'export default { async run() { return "changed" } }'
+    await mkdir(join(root, 'dist'))
+    await writeFile(join(root, entryPath), original)
+    const selected: WorkflowDetail = {
+      ...workflow,
+      source,
+      codeSha256: createHash('sha256').update(original).digest('hex'),
+      runtimeIdentity: source === 'installed'
+        ? { id: workflow.id, version: workflow.version, source }
+        : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+    }
+    const harness = createHarness({
+      timeoutMs: 10,
+      sourceResolver: {
+        resolve: async () => {
+          await writeFile(join(root, entryPath), changed)
+          return { workflow: selected, rootPath: root, entryPath, integrity: 'valid' }
+        },
+      },
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode })
+      expect(harness.workerFactory.workers.size).toBe(0)
+      expect(harness.service.hasActiveExecutions()).toBe(false)
+      expect(releaseExecution).toHaveBeenCalledTimes(1)
+      expect(releaseExecution).toHaveBeenCalledWith(execution.id)
+      expect(JSON.stringify(harness.events)).not.toContain(root)
+      expect(JSON.stringify(harness.events)).not.toContain(changed)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['installed', 'WORKFLOW_INTEGRITY_FAILED'],
+    ['development', 'WORKFLOW_INTEGRITY_FAILED'],
+  ] as const)('rejects a final-component symlink swap before reading a %s artifact', async (source, errorCode) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-preread-symlink-'))
+    const project = join(root, 'project')
+    const entryPath = 'dist/index.mjs'
+    const entry = join(project, entryPath)
+    const outside = join(root, 'outside.mjs')
+    const original = 'export default { async run() { return "verified" } }'
+    await mkdir(join(project, 'dist'), { recursive: true })
+    await writeFile(entry, original)
+    await writeFile(outside, original)
+    const selected: WorkflowDetail = {
+      ...workflow,
+      source,
+      codeSha256: createHash('sha256').update(original).digest('hex'),
+      runtimeIdentity: source === 'installed'
+        ? { id: workflow.id, version: workflow.version, source }
+        : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+    }
+    const harness = createHarness({
+      sourceResolver: {
+        resolve: async () => {
+          await unlink(entry)
+          await symlink(outside, entry)
+          return { workflow: selected, rootPath: project, entryPath, integrity: 'valid' }
+        },
+      },
+    })
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode })
+      expect(harness.workerFactory.workers.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['a directory', async (root: string, entry: string) => mkdir(entry), '0'.repeat(64)],
+    ['an oversized file', async (_root: string, entry: string) => writeFile(entry, Buffer.alloc(8 * 1024 * 1024 + 1)), createHash('sha256').update(Buffer.alloc(8 * 1024 * 1024 + 1)).digest('hex')],
+  ] as const)('rejects %s before spawning the Worker', async (_case, createEntry, codeSha256) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-invalid-entry-'))
+    const entryPath = 'entry.mjs'
+    await createEntry(root, join(root, entryPath))
+    const harness = createHarness({
+      source: {
+        workflow: { ...workflow, codeSha256 },
+        rootPath: root,
+        entryPath,
+        integrity: 'valid',
+      },
+    })
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({
+        status: 'failed', errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+      })
+      expect(harness.workerFactory.workers.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('promptly rejects a FIFO artifact before spawning the Worker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-fifo-'))
+    const entryPath = 'entry.mjs'
+    const entry = join(root, entryPath)
+    execFileSync('mkfifo', [entry])
+    const harness = createHarness({
+      source: {
+        workflow: { ...workflow, codeSha256: createHash('sha256').update('').digest('hex') },
+        rootPath: root,
+        entryPath,
+        integrity: 'valid',
+      },
+    })
+    const starting = harness.start()
+    const outcome = await Promise.race([
+      starting.then((execution) => ({ type: 'resolved' as const, execution })),
+      new Promise<{ type: 'timed-out' }>((resolvePromise) => {
+        setTimeout(() => resolvePromise({ type: 'timed-out' }), 100)
+      }),
+    ])
+
+    try {
+      if (outcome.type === 'timed-out') {
+        const writer = openSync(entry, constants.O_WRONLY | constants.O_NONBLOCK)
+        closeSync(writer)
+        const execution = await starting
+        await execution.finished
+      }
+      expect(outcome.type).toBe('resolved')
+      if (outcome.type === 'resolved') {
+        await expect(outcome.execution.finished).resolves.toMatchObject({
+          status: 'failed', errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+        })
+      }
+      expect(harness.workerFactory.workers.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['installed', 'development'] as const)(
+    'executes verified staged %s bytes when the original becomes an outside symlink after path resolution',
+    async (source) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-symlink-race-'))
+      const project = join(root, 'project')
+      const executionDirectory = join(root, 'execution')
+      const entryPath = 'dist/index.mjs'
+      const entry = join(project, entryPath)
+      const outside = join(root, 'outside.mjs')
+      const original = 'export default { async run() { return "verified" } }'
+      const replacement = 'export default { async run() { return "outside" } }'
+      await mkdir(join(project, 'dist'), { recursive: true })
+      await mkdir(executionDirectory)
+      await writeFile(entry, original)
+      await writeFile(outside, replacement)
+      const selected: WorkflowDetail = {
+        ...workflow,
+        source,
+        codeSha256: createHash('sha256').update(original).digest('hex'),
+        runtimeIdentity: source === 'installed'
+          ? { id: workflow.id, version: workflow.version, source }
+          : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+      }
+      const harness = createHarness({
+        source: { workflow: selected, rootPath: project, entryPath, integrity: 'valid' },
+        temporaryDirectories: {
+          create: async () => {
+            await unlink(entry)
+            await symlink(outside, entry)
+            return executionDirectory
+          },
+          remove: (path) => rm(path, { recursive: true, force: true }),
+        },
+      })
+
+      try {
+        const execution = await harness.start()
+        const worker = harness.workerFactory.workers.get(execution.id)!
+        const start = worker.requests.find((request) => request.type === 'start')
+        if (!start || start.type !== 'start') throw new Error('Expected Worker start')
+        expect(start.entryPath.startsWith(`${executionDirectory}${sep}`)).toBe(true)
+        expect(worker.loadedEntry?.toString('utf8')).toBe(original)
+        expect(harness.repositories.records.get(execution.id)).toMatchObject({
+          workflowId: selected.id,
+          workflowVersion: selected.version,
+        })
+        worker.respond({ type: 'ready', executionId: execution.id })
+        worker.respond({ type: 'result', output: { source } })
+        await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(['installed', 'development'] as const)(
+    'keeps staged %s bytes immutable when the original changes before Worker input',
+    async (source) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-stage-race-'))
+      const entryPath = 'dist/index.mjs'
+      const entry = join(root, entryPath)
+      const original = 'export default { async run() { return "staged" } }'
+      const replacement = 'export default { async run() { return "mutated" } }'
+      await mkdir(join(root, 'dist'))
+      await writeFile(entry, original)
+      const selected: WorkflowDetail = {
+        ...workflow,
+        source,
+        codeSha256: createHash('sha256').update(original).digest('hex'),
+        runtimeIdentity: source === 'installed'
+          ? { id: workflow.id, version: workflow.version, source }
+          : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+      }
+      const workerFactory = new FakeWorkerFactory(async () => { await writeFile(entry, replacement) })
+      const harness = createHarness({
+        source: { workflow: selected, rootPath: root, entryPath, integrity: 'valid' },
+        workerFactory,
+      })
+
+      try {
+        const execution = await harness.start()
+        const worker = workerFactory.workers.get(execution.id)!
+        const start = worker.requests.find((request) => request.type === 'start')
+        if (!start || start.type !== 'start') throw new Error('Expected Worker start')
+        const cwd = workerFactory.specifications[0]!.cwd
+        expect(start.entryPath.startsWith(`${cwd}${sep}`)).toBe(true)
+        expect(worker.loadedEntry?.toString('utf8')).toBe(original)
+        expect(await readFile(entry, 'utf8')).toBe(replacement)
+        worker.respond({ type: 'ready', executionId: execution.id })
+        worker.respond({ type: 'result', output: { source } })
+        await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('cleans an execution directory once and never spawns when exclusive staging fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-stage-failure-'))
+    const entryPath = 'dist/index.mjs'
+    const entry = join(root, entryPath)
+    const executionDirectory = join(root, 'execution')
+    const original = 'export default { async run() { return "verified" } }'
+    await mkdir(join(root, 'dist'))
+    await mkdir(executionDirectory)
+    await writeFile(entry, original)
+    await writeFile(join(executionDirectory, 'workflow-entry.mjs'), 'occupied')
+    const remove = vi.fn((path: string) => rm(path, { recursive: true, force: true }))
+    const harness = createHarness({
+      timeoutMs: 10,
+      source: {
+        workflow: {
+          ...workflow,
+          codeSha256: createHash('sha256').update(original).digest('hex'),
+        },
+        rootPath: root,
+        entryPath,
+        integrity: 'valid',
+      },
+      temporaryDirectories: { create: async () => executionDirectory, remove },
+    })
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({
+        status: 'failed',
+        errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+      })
+      expect(harness.workerFactory.workers.size).toBe(0)
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(executionDirectory)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('cleans the staged execution directory once when cancellation wins before staging', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-stage-cancel-'))
+    const executionDirectory = join(root, 'execution')
+    await mkdir(executionDirectory)
+    let entered!: () => void
+    const creating = new Promise<void>((resolvePromise) => { entered = resolvePromise })
+    let releaseCreate!: () => void
+    const createGate = new Promise<void>((resolvePromise) => { releaseCreate = resolvePromise })
+    const remove = vi.fn((path: string) => rm(path, { recursive: true, force: true }))
+    const harness = createHarness({
+      temporaryDirectories: {
+        create: async () => {
+          entered()
+          await createGate
+          return executionDirectory
+        },
+        remove,
+      },
+    })
+    const reservation = harness.service.reserve()
+    const starting = harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+    })
+
+    try {
+      await creating
+      const cancelling = harness.service.cancel(reservation.executionId)
+      releaseCreate()
+      const execution = await starting
+      await cancelling
+      await expect(execution.finished).resolves.toMatchObject({
+        status: 'cancelled', errorCode: 'CANCELLED',
+      })
+      expect(harness.workerFactory.workers.size).toBe(0)
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(executionDirectory)
+    } finally {
+      releaseCreate()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it.each(['installed', 'development'] as const)('runs a valid %s source resolved inside its root', async (source) => {
     const harness = createHarness({
       source: {
@@ -891,7 +1619,7 @@ describe('ExecutionService', () => {
     const worker = harness.workerFactory.workers.get(execution.id)!
 
     expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({
-      entryPath: join(trustedRootPath, 'workers/workflow-runner.ts'),
+      entryPath: join(harness.workerFactory.specifications[0]!.cwd, 'workflow-entry.mjs'),
     })
     await harness.service.cancel(execution.id)
   })
@@ -920,17 +1648,56 @@ describe('ExecutionService', () => {
     expect(closedExecution).toBe(execution.id)
   })
 
+  it.each([
+    ['throws', 'INTERNAL_ERROR', true],
+    ['returns empty', 'NOT_FOUND', false],
+  ] as const)('removes the staged directory once when pre-active terminal persistence %s', async (_case, code, throws) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-pre-active-persistence-'))
+    const executionDirectory = join(root, 'execution')
+    await mkdir(executionDirectory)
+    const remove = vi.fn((path: string) => rm(path, { recursive: true, force: true }))
+    const closeExecution = vi.fn(async () => undefined)
+    const workerFactory = new FakeWorkerFactory(() => { throw new Error('spawn unavailable') })
+    const harness = createHarness({
+      workerFactory,
+      capability: { request: async () => undefined, closeExecution },
+      temporaryDirectories: { create: async () => executionDirectory, remove },
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+    const update = harness.repositories.executions.update
+    harness.repositories.executions.update = (id, value) => {
+      if (value.status === 'failed') {
+        if (throws) throw new Error('database unavailable')
+        return undefined
+      }
+      return update(id, value)
+    }
+
+    try {
+      await expect(harness.start()).rejects.toMatchObject({ code })
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(executionDirectory)
+      expect(workerFactory.workers.size).toBe(0)
+      expect(releaseExecution).toHaveBeenCalledTimes(1)
+      expect(closeExecution).toHaveBeenCalledTimes(1)
+      expect(harness.service.hasActiveExecutions()).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('finishes cleanup when a terminal event listener throws', async () => {
     let closed = false
     let removed = ''
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-event-test-'))
     const harness = createHarness({
       capability: {
         request: async () => undefined,
         closeExecution: async () => { closed = true },
       },
       temporaryDirectories: {
-        create: async () => '/tmp/autoforge-event-test',
-        remove: async (path) => { removed = path },
+        create: async () => directory,
+        remove: async (path) => { removed = path; await rm(path, { recursive: true, force: true }) },
       },
       emit: (event) => {
         if (event.type === 'status' && event.status === 'completed') throw new Error('renderer listener failed')
@@ -952,7 +1719,7 @@ describe('ExecutionService', () => {
     expect(release).toHaveBeenCalledWith(execution.id)
     expect(closed).toBe(true)
     expect(worker.killed).toBe(true)
-    expect(removed).toBe('/tmp/autoforge-event-test')
+    expect(removed).toBe(directory)
   })
 
   it.each([
@@ -961,14 +1728,15 @@ describe('ExecutionService', () => {
   ] as const)('rejects finished and completes cleanup when terminal persistence %s', async (_case, code, throws) => {
     let closed = false
     let removed = false
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-persistence-test-'))
     const harness = createHarness({
       capability: {
         request: async () => undefined,
         closeExecution: async () => { closed = true },
       },
       temporaryDirectories: {
-        create: async () => '/tmp/autoforge-persistence-test',
-        remove: async () => { removed = true },
+        create: async () => directory,
+        remove: async (path) => { removed = true; await rm(path, { recursive: true, force: true }) },
       },
     })
     const update = harness.repositories.executions.update

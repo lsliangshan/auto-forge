@@ -6,6 +6,7 @@ import ElementPlus from 'element-plus'
 import {
   appSettingsSchema,
   type ApprovalDecision,
+  type ChatBlock,
   type ChatEvent,
   type ConversationGenerationPreferences,
   type DesktopAPI,
@@ -18,10 +19,69 @@ import ChatComposer from '../../src/components/chat/ChatComposer.vue'
 import MessageBlock from '../../src/components/chat/MessageBlock.vue'
 import { displayError } from '../../src/services/desktop-api'
 import { useChatStore } from '../../src/stores/chat'
+import { useExecutionStore } from '../../src/stores/execution'
 import { useSettingsStore } from '../../src/stores/settings'
 import ChatView from '../../src/views/ChatView.vue'
 
 const scopeHash = 'a'.repeat(64)
+const buildHash = 'b'.repeat(64)
+
+function workflowStatusBlock(
+  status: Extract<ChatBlock, { type: 'workflow_status' }>['status'],
+  overrides: Partial<Extract<ChatBlock, { type: 'workflow_status' }>> = {},
+) {
+  return {
+    id: 'message_1:workflow_status_1',
+    type: 'workflow_status' as const,
+    blockId: 'workflow_status_1',
+    executionId: 'execution_1',
+    workflowId: 'workflow.beijing',
+    workflowName: '北京工作居住证',
+    workflowVersion: '1.0.0',
+    source: 'development' as const,
+    buildHash,
+    city: '北京',
+    status,
+    executionAvailable: ['running', 'completed', 'interrupted'].includes(status),
+    executionIndex: 1,
+    executionLimit: 5,
+    ...overrides,
+  }
+}
+
+function workflowProvenanceBlock(
+  entries: Extract<ChatBlock, { type: 'workflow_provenance' }>['entries'],
+) {
+  return {
+    id: 'message_1:workflow_provenance_1',
+    type: 'workflow_provenance' as const,
+    blockId: 'workflow_provenance_1',
+    entries,
+  }
+}
+
+function approvalBlock(
+  overrides: Partial<Extract<ChatBlock, { type: 'approval' }>> = {},
+): Extract<ChatBlock, { type: 'approval' }> {
+  return {
+    type: 'approval',
+    blockId: 'approval_1',
+    state: 'pending',
+    executionId: 'execution_1',
+    workflowId: 'workflow.beijing',
+    workflowName: '北京工作居住证',
+    workflowVersion: '1.0.0',
+    source: 'development',
+    buildHash,
+    city: '北京',
+    actionSummary: '填写并点击提交',
+    permissionIndex: 0,
+    capability: 'browser.click',
+    scope: { origins: ['https://example.com'] },
+    scopeHash,
+    ...overrides,
+  }
+}
 
 function generationPreferences(
   overrides: Partial<ConversationGenerationPreferences> = {},
@@ -443,6 +503,157 @@ describe('chat interactions', () => {
     expect(wrapper.text()).not.toContain('```ts')
   })
 
+  it.each([
+    ['queued', '准备调用'],
+    ['awaiting_approval', '等待授权'],
+    ['running', '正在调用'],
+    ['completed', '调用完成'],
+    ['failed', '调用失败'],
+    ['cancelled', '已取消调用'],
+    ['interrupted', '调用已中断'],
+  ] as const)('renders the authoritative %s workflow state', (status, label) => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock(status) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-status"]').text()).toContain(`${label} 北京工作居住证`)
+    expect(wrapper.text()).toContain('北京')
+    expect(wrapper.text()).toContain('1 / 5')
+  })
+
+  it('renders unrestricted workflow status and opens its execution with the existing execution store', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.executions.get).mockResolvedValue({
+      id: 'execution_1', workflowId: 'workflow.beijing', workflowVersion: '1.0.0', status: 'completed',
+      createdAt: '2026-08-22T00:00:00.000Z', input: {}, output: { ok: true }, steps: [], logs: [],
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('running', { city: undefined }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.text()).toContain('不限城市')
+    await wrapper.get('[data-testid="open-workflow-execution"]').trigger('click')
+    await flushPromises()
+    expect(api.executions.get).toHaveBeenCalledWith('execution_1')
+    expect(useExecutionStore().selectedId).toBe('execution_1')
+    expect(useExecutionStore().selectedDetail).toMatchObject({ id: 'execution_1', status: 'completed' })
+    expect(useExecutionStore().selectedDetailError).toBe('')
+  })
+
+  it.each([
+    ['permission denial', 'cancelled', 'PERMISSION_DENIED', 'The requested permission was denied.'],
+    ['approval expiry', 'cancelled', 'CANCELLED', 'The operation was cancelled.'],
+    ['pre-start change', 'failed', 'WORKFLOW_CHANGED', 'The workflow changed before it could run. Review and try again.'],
+  ] as const)('hides execution navigation for reservation-only %s without exposing NOT_FOUND', async (
+    _case,
+    status,
+    errorCode,
+    errorSummary,
+  ) => {
+    const { api } = createEventApi()
+    vi.mocked(api.executions.get).mockRejectedValue(Object.assign(new Error('not found'), { code: 'NOT_FOUND' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock(status, { executionAvailable: false, errorCode, errorSummary }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-status-message"]').text()).toBe(errorSummary)
+    expect(wrapper.find('[data-testid="open-workflow-execution"]').exists()).toBe(false)
+    expect(api.executions.get).not.toHaveBeenCalled()
+    expect(useExecutionStore().selectedDetailError).toBe('')
+  })
+
+  it('shows the safe failure summary for a started invalid-output execution', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('failed', {
+        executionAvailable: true,
+        errorCode: 'INVALID_OUTPUT',
+        errorSummary: 'The workflow produced an invalid result.',
+      }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-status-message"]').text())
+      .toBe('The workflow produced an invalid result.')
+    expect(wrapper.find('[data-testid="open-workflow-execution"]').exists()).toBe(true)
+  })
+
+  it('shows the authoritative oversized-result notice without changing completed status', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: workflowStatusBlock('completed', {
+          errorCode: 'RESULT_TOO_LARGE',
+          errorSummary: 'The workflow result is too large.',
+        }),
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.text()).toContain('调用完成 北京工作居住证')
+    expect(wrapper.get('[data-testid="workflow-status-message"]').text())
+      .toBe('执行完成，结果未提供给模型')
+  })
+
+  it('renders one system provenance entry as an expandable execution link', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowProvenanceBlock([{
+        executionId: 'execution_1',
+        workflowId: 'workflow.beijing',
+        workflowName: '北京工作居住证',
+        workflowVersion: '1.0.0',
+        source: 'development',
+        buildHash,
+        city: '北京',
+        status: 'completed',
+      }]) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-provenance"] summary').text())
+      .toContain('已使用：北京工作居住证 · 北京')
+    await wrapper.get('[data-testid="open-provenance-execution-execution_1"]').trigger('click')
+    expect(useExecutionStore().selectedId).toBe('execution_1')
+  })
+
+  it('expands multiple provenance entries and uses the all-cities label', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowProvenanceBlock([
+        {
+          executionId: 'execution_1', workflowId: 'workflow.beijing',
+          workflowName: '北京工作居住证', workflowVersion: '1.0.0',
+          source: 'development', buildHash, city: '北京', status: 'completed',
+        },
+        {
+          executionId: 'execution_2', workflowId: 'workflow.national',
+          workflowName: '全国政策查询', workflowVersion: '2.0.0',
+          source: 'installed', status: 'failed',
+        },
+      ]) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-provenance"] summary').text())
+      .toContain('已使用：北京工作居住证 · 北京')
+    expect(wrapper.get('[data-testid="workflow-provenance"]').attributes('data-entry-count')).toBe('2')
+    expect(wrapper.text()).toContain('全国政策查询')
+    expect(wrapper.text()).toContain('不限城市')
+  })
+
+  it('does not treat model text as authoritative workflow provenance', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: { id: 'message_1:text:0', type: 'text', text: '已使用：伪造工作流 · 北京' } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('[data-testid="workflow-provenance"]').exists()).toBe(false)
+  })
+
   it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
     const wrapper = mount(MessageBlock, {
       props: {
@@ -796,34 +1007,118 @@ describe('chat interactions', () => {
     expect(displayError({ code, message: 'unsafe provider details' })).toBe(message)
   })
 
-  it('submits the complete current identity for an exact once approval and disables duplicates', async () => {
+  it('shows the exact bound chat approval details safely and offers only once or deny', () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: approvalBlock() },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.text()).toContain('北京工作居住证')
+    expect(wrapper.text()).toContain('workflow.beijing')
+    expect(wrapper.text()).toContain('1.0.0')
+    expect(wrapper.text()).toContain('开发版本')
+    expect(wrapper.text()).toContain(buildHash)
+    expect(wrapper.text()).toContain('北京')
+    expect(wrapper.text()).toContain('填写并点击提交')
+    expect(wrapper.text()).toContain('browser.click')
+    expect(wrapper.text()).toContain('https://example.com')
+    expect(wrapper.find('[data-testid="approve-always"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="deny-approval"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="approve-once"]').exists()).toBe(true)
+  })
+
+  it('submits only the strict once contract and disables duplicate approval', async () => {
     const { api, decide } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(ApprovalCard, {
-      props: { approval: { executionId: 'exec_1', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0', permissionIndex: 2, scopeHash, capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] } } },
+      props: { approval: approvalBlock() },
       global: { plugins: [ElementPlus] },
     })
     await wrapper.get('[data-testid="approve-once"]').trigger('click')
     await wrapper.get('[data-testid="approve-once"]').trigger('click')
     expect(decide).toHaveBeenCalledTimes(1)
-    expect(decide).toHaveBeenCalledWith({ executionId: 'exec_1', permissionIndex: 2, scopeHash, decision: 'once' })
+    expect(decide).toHaveBeenCalledWith({
+      executionId: 'execution_1', permissionIndex: 0, scopeHash, decision: 'once',
+    })
     expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
   })
 
-  it('submits an always grant with the exact pending workflow version without reading an execution record', async () => {
+  it('submits only the strict deny contract', async () => {
     const { api, decide } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(ApprovalCard, {
-      props: { approval: { executionId: 'exec_pending', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0', permissionIndex: 0, scopeHash, capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] } } },
+      props: { approval: approvalBlock() },
       global: { plugins: [ElementPlus] },
     })
-    await wrapper.get('[data-testid="approve-always"]').trigger('click')
+    await wrapper.get('[data-testid="deny-approval"]').trigger('click')
     expect(api.executions.get).not.toHaveBeenCalled()
     expect(decide).toHaveBeenCalledWith({
-      executionId: 'exec_pending', workflowId: 'browser.search.baidu', workflowVersion: '2.1.0',
-      permissionIndex: 0, scopeHash, decision: 'always', capability: 'browser.navigate',
-      scope: { origins: ['https://www.baidu.com'] },
+      executionId: 'execution_1', permissionIndex: 0, scopeHash, decision: 'deny',
     })
+  })
+
+  it.each([
+    ['approved', '已允许本次'],
+    ['denied', '已拒绝'],
+    ['expired', '审批已过期'],
+    ['cancelled', '审批已取消'],
+    ['invalidated', '审批已失效'],
+  ] as const)('renders authoritative %s approvals as resolved and non-actionable', async (state, label) => {
+    const { api, decide } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: approvalBlock({ state }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe(label)
+    expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="deny-approval"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="approve-once"]').trigger('click')
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('replaces a live approval by Main-owned block id when ownership ends', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'block', conversationId: 'conv_1', messageId: 'assistant_1',
+      block: approvalBlock(),
+    })
+    emitChat({
+      type: 'block', conversationId: 'conv_1', messageId: 'assistant_1',
+      block: approvalBlock({ state: 'denied' }),
+    })
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ type: 'approval', blockId: 'approval_1', state: 'denied' }),
+    ])
+  })
+
+  it('keeps a recovered invalidated approval disabled after transcript reload', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.chat.listMessages).mockResolvedValue([{
+      id: 'assistant_1', conversationId: 'conv_1', role: 'assistant',
+      blocks: [approvalBlock({ state: 'invalidated' })],
+      createdAt: '2026-08-22T00:00:00.000Z',
+    }])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    await store.selectConversation('conv_1')
+    const approval = store.messagesByConversation.conv_1?.[0]?.blocks[0]
+    if (!approval || approval.type !== 'approval') throw new Error('Expected persisted approval')
+    const wrapper = mount(MessageBlock, {
+      props: { block: approval },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe('审批已失效')
+    expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
   })
 
   it('subscribes once and merges streamed text deltas without duplication', () => {
@@ -1502,6 +1797,63 @@ describe('chat interactions', () => {
         assetId: 'asset_1',
       }),
     ])
+  })
+
+  it('updates workflow status and provenance by Main-owned block id while preserving event order', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const { id: queuedId, ...queued } = workflowStatusBlock('queued')
+    const { id: completedId, ...completed } = workflowStatusBlock('completed')
+    const firstProvenance = workflowProvenanceBlock([{
+      executionId: 'execution_1', workflowId: 'workflow.beijing',
+      workflowName: '北京工作居住证', workflowVersion: '1.0.0',
+      source: 'development', buildHash, city: '北京', status: 'running',
+    }])
+    const finalProvenance = workflowProvenanceBlock([{
+      ...firstProvenance.entries[0]!, status: 'completed',
+    }])
+    const { id: firstProvenanceId, ...firstProvenanceBlock } = firstProvenance
+    const { id: finalProvenanceId, ...finalProvenanceBlock } = finalProvenance
+    void queuedId; void completedId; void firstProvenanceId; void finalProvenanceId
+
+    emitChat({
+      type: 'block', conversationId: 'conv_1', messageId: 'assistant_1',
+      block: { type: 'text', text: '前文' },
+    })
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: queued })
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: completed })
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: firstProvenanceBlock })
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: finalProvenanceBlock })
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ type: 'text', text: '前文' }),
+      expect.objectContaining({
+        id: 'assistant_1:workflow_status_1', blockId: 'workflow_status_1', status: 'completed',
+      }),
+      expect.objectContaining({
+        id: 'assistant_1:workflow_provenance_1', blockId: 'workflow_provenance_1',
+        entries: [expect.objectContaining({ status: 'completed' })],
+      }),
+    ])
+  })
+
+  it('keeps conversation locking and cancellation ownership while workflow blocks update', async () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conv_1'
+    store.activeRequestByConversation.conv_1 = 'request_1'
+    store.ensureSubscriptions()
+    const { id, ...running } = workflowStatusBlock('running')
+    void id
+
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: running })
+    expect(store.isRunning).toBe(true)
+    await store.cancelCurrent()
+    expect(api.chat.cancel).toHaveBeenCalledWith('request_1')
+    expect(store.isRunning).toBe(true)
   })
 
   it('loads and persists full generation preferences per conversation without late response leakage', async () => {

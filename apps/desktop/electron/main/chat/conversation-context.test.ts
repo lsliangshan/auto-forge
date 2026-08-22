@@ -13,19 +13,26 @@ import {
   currentMediaTokenReserve,
   estimateRequestTokens,
   estimateTextTokens,
+  resolveChatInputBudget,
   type ConversationContextProviderPort,
   type PrepareConversationContextInput,
   serializeHistoricalMessage,
 } from './conversation-context.js'
 
 describe('conversation context primitives', () => {
+  it('uses 60 percent of a positive context length and the 32000 fallback otherwise', () => {
+    expect(resolveChatInputBudget(100_000)).toBe(60_000)
+    expect(resolveChatInputBudget(0)).toBe(19_200)
+    expect(resolveChatInputBudget(undefined)).toBe(19_200)
+  })
+
   it('serializes text, workflows, failures, and attachment metadata without payloads, paths, or asset IDs', () => {
     const message: Message = {
       id: 'm1', conversationId: 'c1', role: 'assistant', ordinal: 1, createdAt: 1,
       blocks: [
         { type: 'text', text: '结果如下' },
-        { type: 'workflow_proposal', workflowId: 'browser.search.baidu', workflowName: '百度搜索', args: { keyword: '天气' } },
-        { type: 'execution_result', executionId: 'e1', summary: 'Workflow completed.' },
+        { type: 'workflow_proposal', workflowId: 'browser.search.baidu', workflowName: '百度搜索', args: { path: '/Users/private/query.json' } },
+        { type: 'execution_result', executionId: 'e1', summary: 'Raw result at /Users/private/result.json' },
         { type: 'media', blockId: 'b1', assetId: 'asset-private-id', kind: 'image', purpose: 'output', name: 'weather.png', mimeType: 'image/png', byteSize: 2048, width: 4321, height: 5432, durationMs: 6543 },
       ],
     }
@@ -45,6 +52,39 @@ describe('conversation context primitives', () => {
     expect(body).not.toMatch(/base64|\/Users\/|file:\/\/|https?:\/\//i)
   })
 
+  it('serializes workflow status and provenance without build, input, result, path, or scope data', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'workflow_message', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,
+      blocks: [
+        {
+          type: 'workflow_status', blockId: 'status_1', executionId: 'execution_1',
+          workflowId: 'workflow.secret', workflowName: '安全查询', workflowVersion: '1.2.3',
+          source: 'development', buildHash: 'a'.repeat(64), city: '北京', status: 'completed',
+          executionAvailable: true, executionIndex: 1, executionLimit: 5,
+          errorCode: 'RESULT_TOO_LARGE', errorSummary: 'The workflow result is too large.',
+        },
+        {
+          type: 'workflow_provenance', blockId: 'provenance_1', entries: [{
+            executionId: 'execution_1', workflowId: 'workflow.secret', workflowName: '安全查询',
+            workflowVersion: '1.2.3', source: 'development', buildHash: 'a'.repeat(64),
+            city: '北京', status: 'completed',
+          }],
+        },
+      ],
+    })
+
+    expect(serialized).toEqual({
+      role: 'assistant',
+      content: [
+        '[工作流: 安全查询; 城市: 北京; 状态: completed]',
+        '[已使用工作流: 安全查询; 城市: 北京; 状态: completed]',
+      ].join('\n'),
+    })
+    expect(serialized?.content).not.toContain('RESULT_TOO_LARGE')
+    expect(serialized?.content).not.toContain('The workflow result is too large.')
+    expect(JSON.stringify(serialized)).not.toMatch(/a{64}|execution_1|workflow\.secret|1\.2\.3|input|result|path|scope/i)
+  })
+
   it('omits transient-only history and rejects unknown roles', () => {
     expect(serializeHistoricalMessage({
       id: 'm2', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,
@@ -60,7 +100,7 @@ describe('conversation context primitives', () => {
     const serialized = serializeHistoricalMessage({
       id: 'm4', conversationId: 'c1', role: 'assistant', ordinal: 4, createdAt: 4,
       blocks: [
-        { type: 'approval', executionId: 'execution-secret', workflowId: 'workflow', workflowVersion: '1.0.0', permissionIndex: 0, capability: 'filesystem.write', scope: { paths: ['/Users/private'] }, scopeHash: 'a'.repeat(64) },
+        { type: 'approval', blockId: 'approval-secret', state: 'denied', executionId: 'execution-secret', workflowId: 'workflow', workflowName: '工作流', workflowVersion: '1.0.0', source: 'installed', actionSummary: '写入文件', permissionIndex: 0, capability: 'filesystem.write', scope: { paths: ['/Users/private'] }, scopeHash: 'a'.repeat(64) },
         { type: 'workflow_execution', executionId: 'execution-1' },
         { type: 'error', code: 'WORKFLOW_FAILED', message: 'did not complete' },
         { type: 'media_generation', blockId: 'block-secret', jobId: 'job-secret', kind: 'video', status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' },
@@ -70,13 +110,13 @@ describe('conversation context primitives', () => {
     expect(serialized).toEqual({
       role: 'assistant',
       content: [
-        '[工作流等待权限审批: workflow@1.0.0; 能力: filesystem.write]',
+        '[工作流权限审批状态: denied; workflow@1.0.0; 能力: filesystem.write]',
         '[工作流执行: execution-1]',
         '[请求失败: WORKFLOW_FAILED; did not complete]',
         '[video 生成状态: failed; MEDIA_GENERATION_FAILED]',
       ].join('\n'),
     })
-    expect(JSON.stringify(serialized)).not.toMatch(/execution-secret|\/Users\/private|block-secret|job-secret/)
+    expect(JSON.stringify(serialized)).not.toMatch(/execution-secret|approval-secret|\/Users\/private|block-secret|job-secret/)
   })
 
   it('rejects unparsed historical block fields instead of serializing arbitrary media data', () => {
@@ -410,6 +450,27 @@ describe('conversation context manager', () => {
       contextLength: 100,
       currentMessage: { role: 'user', content: '当前输入'.repeat(100) },
     }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
+  it('reserves the Main policy prefix before admitting the current message', async () => {
+    const currentMessage = { role: 'user' as const, content: 'current'.repeat(100) }
+    const leadingMessage = { role: 'system' as const, content: 'policy'.repeat(200) }
+    const withoutPolicy = estimateRequestTokens({ messages: [currentMessage], tools: [], currentMedia: [] })
+    const withPolicy = estimateRequestTokens({
+      messages: [leadingMessage, currentMessage], tools: [], currentMedia: [],
+    })
+    const contextLength = Array.from({ length: 20_000 }, (_, index) => index + 1)
+      .find((value) => {
+        const budget = Math.floor(value * 0.60)
+        return withoutPolicy <= budget && budget < withPolicy
+      })!
+    const { manager, provider, store } = contextHarness()
+    const input = prepareInput({ provider, contextLength, currentMessage })
+    Object.assign(input, { leadingMessages: [leadingMessage] })
+
+    await expect(manager.prepare(input)).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
     expect(provider.stream).not.toHaveBeenCalled()
     expect(store.advance).not.toHaveBeenCalled()
   })

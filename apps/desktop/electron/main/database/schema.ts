@@ -27,6 +27,12 @@ export const messages = sqliteTable('messages', {
   createdAt: integer('created_at').notNull(),
 }, (table) => [index('messages_conversation_created_at_idx').on(table.conversationId, table.createdAt, table.id)])
 
+export const agentWorkflowApprovals = sqliteTable('agent_workflow_approvals', {
+  executionId: text('execution_id').primaryKey(),
+  messageId: text('message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
+  blockId: text('block_id').notNull(),
+})
+
 export const mediaAssets = sqliteTable('media_assets', {
   id: text('id').primaryKey(),
   conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),

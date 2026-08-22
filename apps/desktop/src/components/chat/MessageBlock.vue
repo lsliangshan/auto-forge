@@ -25,6 +25,14 @@
       v-else-if="block.type === 'approval'"
       :approval="block"
     />
+    <WorkflowStatusCard
+      v-else-if="block.type === 'workflow_status'"
+      :block="block"
+    />
+    <WorkflowProvenance
+      v-else-if="block.type === 'workflow_provenance'"
+      :block="block"
+    />
     <ExecutionCard
       v-else-if="block.type === 'workflow_execution'"
       :execution-id="block.executionId"
@@ -62,6 +70,8 @@ import ExecutionCard from './ExecutionCard.vue'
 import { renderMarkdown } from './markdown'
 import MediaBlock from './MediaBlock.vue'
 import MediaGenerationBlock from './MediaGenerationBlock.vue'
+import WorkflowProvenance from './WorkflowProvenance.vue'
+import WorkflowStatusCard from './WorkflowStatusCard.vue'
 
 defineProps<{ block: UiChatBlock }>()
 </script>

@@ -7,7 +7,14 @@
       </div>
     </div>
     <div class="editor-status">
-      <span class="af-truncate">{{ developer.selectedPath || '未选择文件' }}</span>
+      <div class="editor-context">
+        <span class="af-truncate">{{ developer.selectedPath || '未选择文件' }}</span>
+        <span
+          v-if="developer.chatAvailabilityMessage"
+          class="chat-availability"
+          data-testid="chat-availability"
+        >{{ developer.chatAvailabilityMessage }}</span>
+      </div>
       <div class="editor-tools">
         <button data-testid="editor-find" title="查找" aria-label="查找" @click="runEditorAction('actions.find')"><Search /></button>
         <button data-testid="editor-replace" title="替换" aria-label="替换" @click="runEditorAction('editor.action.startFindReplaceAction')"><EditPen /></button>
@@ -190,6 +197,7 @@ onBeforeUnmount(() => {
 .tab-select { display: flex; min-width: 0; flex: 1; align-items: center; gap: 6px; padding: 9px 6px 8px 10px; text-align: left; }.editor-tab.dirty .tab-select::before { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--af-danger); content: ''; }
 .tab-close { margin-right: 4px; border-radius: 3px; padding: 2px 5px; font-size: 14px; line-height: 1; }.tab-close:hover { background: var(--af-border); }
 .editor-status { display: flex; min-height: 34px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 0 12px; color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 11px; }
+.editor-context { display: flex; min-width: 0; align-items: center; gap: 10px; }.chat-availability { color: var(--af-warning-text); white-space: nowrap; }
 .editor-tools { display: flex; align-items: center; gap: 5px; }.editor-tools button { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 4px; padding: 5px; color: var(--af-text-muted); background: transparent; cursor: pointer; }.editor-tools button:hover { color: var(--af-cobalt); background: var(--af-cobalt-soft); }.editor-tools svg { width: 14px; height: 14px; }
 .save-state { white-space: nowrap; }.is-dirty, .is-error { color: var(--af-danger); }.is-saving { color: var(--af-warning); }.is-saved { color: var(--af-success); }
 .monaco-host { min-height: 280px; flex: 1; }

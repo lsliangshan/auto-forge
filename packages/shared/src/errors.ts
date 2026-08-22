@@ -51,6 +51,13 @@ export const appErrorCodeSchema = z.enum([
   'MEDIA_GENERATION_TIMEOUT',
   'PROFILE_AVATAR_UPLOAD_FAILED',
   'NETWORK_PROXY_APPLY_FAILED',
+  'CITY_REQUIRED',
+  'CITY_NOT_SUPPORTED',
+  'WORKFLOW_CHANGED',
+  'INVALID_TOOL_SEQUENCE',
+  'TOOL_CALL_LIMIT',
+  'INVALID_OUTPUT',
+  'RESULT_TOO_LARGE',
 ])
 
 export type AppErrorCode = z.infer<typeof appErrorCodeSchema>
@@ -113,6 +120,13 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   MEDIA_GENERATION_TIMEOUT: 'The media generation timed out.',
   PROFILE_AVATAR_UPLOAD_FAILED: 'The profile avatar upload failed.',
   NETWORK_PROXY_APPLY_FAILED: 'The network proxy configuration could not be applied.',
+  CITY_REQUIRED: 'Choose a city before running this workflow.',
+  CITY_NOT_SUPPORTED: 'This workflow is not available for the selected city.',
+  WORKFLOW_CHANGED: 'The workflow changed before it could run. Review and try again.',
+  INVALID_TOOL_SEQUENCE: 'The workflow tool sequence is invalid.',
+  TOOL_CALL_LIMIT: 'The workflow reached its tool call limit.',
+  INVALID_OUTPUT: 'The workflow produced an invalid result.',
+  RESULT_TOO_LARGE: 'The workflow result is too large.',
 }
 
 export function toSafeAppError(error: unknown): AppError {

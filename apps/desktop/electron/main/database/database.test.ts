@@ -2,10 +2,10 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { sql } from 'drizzle-orm'
-import { authAccountSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
+import { authAccountSchema, chatBlockSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
 import { ProviderUsageConsistencyError } from './repositories.js'
@@ -241,7 +241,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(8)
+    expect(database.schemaVersion()).toBe(9)
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
   })
@@ -249,7 +249,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(8)
+    expect(database.schemaVersion()).toBe(9)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
@@ -260,7 +260,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(8)
+    expect(database.schemaVersion()).toBe(9)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -271,7 +271,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(8)
+    expect(database.schemaVersion()).toBe(9)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -291,7 +291,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(8)
+    expect(database.schemaVersion()).toBe(9)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -844,6 +844,46 @@ describe('openAppDatabase', () => {
     }
   })
 
+  it('invalidates persisted pending Agent approvals while tolerating unrelated malformed blocks', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'approval_recovery_conversation', title: 'Approval recovery' })
+    const approval = {
+      type: 'approval', blockId: 'approval_pending', state: 'pending',
+      executionId: 'execution_approval_recovery', workflowId: 'workflow.recovery',
+      workflowName: 'Recovery workflow', workflowVersion: '1.0.0', source: 'installed',
+      actionSummary: '恢复前待审批操作', permissionIndex: 0, capability: 'filesystem.write',
+      scope: { paths: ['/Users/private/recovery.txt'] }, scopeHash: 'a'.repeat(64),
+    }
+    database.messages.insert({
+      id: 'approval_recovery_message', conversationId: 'approval_recovery_conversation',
+      role: 'assistant', createdAt: 1,
+      blocks: [
+        approval,
+        { type: 'malformed_unrelated', rawSecret: 'must remain isolated' },
+        { ...approval, blockId: 'approval_already_denied', executionId: 'execution_denied', state: 'denied' },
+      ],
+    })
+    database.executions.insert({
+      id: 'execution_approval_recovery', status: 'awaiting_approval',
+      workflowId: 'workflow.recovery', workflowVersion: '1.0.0',
+    })
+    database.chatRuns.insert({
+      id: 'run_approval_recovery', conversationId: 'approval_recovery_conversation',
+      requestId: 'request_approval_recovery', model: 'model', status: 'awaiting_approval', startedAt: 1,
+    })
+
+    expect(database.recoverInterrupted()).toEqual({ executions: 1, chatRuns: 1 })
+    expect(database.executions.get('execution_approval_recovery')).toMatchObject({ status: 'interrupted' })
+    expect(database.chatRuns.get('run_approval_recovery')).toMatchObject({ status: 'failed' })
+    expect(database.messages.get('approval_recovery_message')?.blocks).toEqual([
+      { ...approval, state: 'invalidated' },
+      { type: 'malformed_unrelated', rawSecret: 'must remain isolated' },
+      { ...approval, blockId: 'approval_already_denied', executionId: 'execution_denied', state: 'denied' },
+    ])
+    expect(database.messages.hasWorkflowApproval('execution_approval_recovery')).toBe(true)
+    expect(database.messages.hasWorkflowApproval('manual_execution')).toBe(false)
+  })
+
   it('persists JSON message blocks in chronological order and cascades deletion', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_1', title: 'First conversation' })
@@ -867,6 +907,253 @@ describe('openAppDatabase', () => {
 
     database.conversations.delete('conversation_1')
     expect(database.messages.listForConversation('conversation_1')).toEqual([])
+  })
+
+  it('upgrades only the exact strict legacy approval shape to a stable disabled block', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-legacy-approval-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'legacy_approval_conversation', title: 'Legacy approval' })
+    database.messages.insert({
+      id: 'legacy_approval_message', conversationId: 'legacy_approval_conversation', role: 'assistant',
+      blocks: [], createdAt: 1,
+    })
+    database.messages.insert({
+      id: 'near_legacy_approval_message', conversationId: 'legacy_approval_conversation', role: 'assistant',
+      blocks: [], createdAt: 2,
+    })
+    database.close()
+    const legacyApproval = {
+      type: 'approval', executionId: 'legacy_execution', workflowId: 'legacy.workflow',
+      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+      scope: { origins: ['https://example.com'] }, scopeHash: 'a'.repeat(64),
+    }
+    const seed = new Database(path)
+    seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run(JSON.stringify([legacyApproval]), 'legacy_approval_message')
+    seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run(JSON.stringify([{ ...legacyApproval, unexpected: true }]), 'near_legacy_approval_message')
+    seed.close()
+
+    const upgraded = openAppDatabase(path)
+    const block = upgraded.messages.get('legacy_approval_message')?.blocks[0]
+    expect(chatBlockSchema.parse(block)).toMatchObject({
+      type: 'approval', state: 'invalidated', executionId: 'legacy_execution',
+      workflowId: 'legacy.workflow', workflowName: 'legacy.workflow', workflowVersion: '1.0.0',
+      source: 'installed', actionSummary: '历史权限审批已失效', permissionIndex: 0,
+      capability: 'browser.open', scope: { origins: ['https://example.com'] },
+      scopeHash: 'a'.repeat(64),
+    })
+    if (!block || typeof block !== 'object' || !('blockId' in block) || typeof block.blockId !== 'string') {
+      throw new Error('Expected upgraded approval identity')
+    }
+    const blockId = block.blockId
+    expect(blockId).not.toMatch(/legacy_execution|legacy\.workflow|private|secret/)
+    expect(chatBlockSchema.safeParse(upgraded.messages.get('near_legacy_approval_message')?.blocks[0]).success)
+      .toBe(false)
+    upgraded.close()
+
+    const reopened = openAppDatabase(path)
+    expect(reopened.messages.get('legacy_approval_message')?.blocks[0]).toMatchObject({ blockId })
+    const persisted = new Database(path, { readonly: true })
+    expect(JSON.parse((persisted.prepare('SELECT blocks_json AS blocksJson FROM messages WHERE id = ?')
+      .get('legacy_approval_message') as { blocksJson: string }).blocksJson)[0]).toMatchObject({
+      blockId, state: 'invalidated', actionSummary: '历史权限审批已失效',
+    })
+    persisted.close()
+    reopened.close()
+  })
+
+  it('matches the exact historical approval capability and runtime-scope matrix', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-legacy-approval-matrix-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'legacy_matrix_conversation', title: 'Legacy matrix' })
+    const cases = [
+      { name: 'browser exact origin', capability: 'browser.open', scope: { origins: ['https://example.com'] }, accepted: true },
+      { name: 'filesystem path', capability: 'filesystem.write', scope: { paths: ['/tmp/result.txt'] }, accepted: true },
+      { name: 'empty notification', capability: 'notification.send', scope: {}, accepted: true },
+      { name: 'browser empty scope', capability: 'browser.open', scope: {}, accepted: false },
+      { name: 'browser wildcard origin', capability: 'browser.open', scope: { origins: ['*.example.com'] }, accepted: false },
+      { name: 'browser path scope', capability: 'browser.open', scope: { paths: ['/tmp'] }, accepted: false },
+    ] as const
+    for (const index of cases.keys()) {
+      database.messages.insert({
+        id: `legacy_matrix_${index}`, conversationId: 'legacy_matrix_conversation',
+        role: 'assistant', blocks: [], createdAt: index + 1,
+      })
+    }
+    database.close()
+    const seed = new Database(path)
+    for (const [index, value] of cases.entries()) {
+      seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?').run(JSON.stringify([{
+        type: 'approval', executionId: `legacy_matrix_execution_${index}`,
+        workflowId: 'legacy.workflow', workflowVersion: '1.0.0', permissionIndex: 0,
+        capability: value.capability, scope: value.scope, scopeHash: 'a'.repeat(64),
+      }]), `legacy_matrix_${index}`)
+    }
+    seed.close()
+
+    const upgraded = openAppDatabase(path)
+    for (const [index, value] of cases.entries()) {
+      const block = upgraded.messages.get(`legacy_matrix_${index}`)?.blocks[0]
+      expect({ name: value.name, normalized: chatBlockSchema.safeParse(block).success }).toEqual({
+        name: value.name, normalized: value.accepted,
+      })
+      expect(upgraded.messages.hasWorkflowApproval(`legacy_matrix_execution_${index}`)).toBe(value.accepted)
+    }
+    upgraded.close()
+  })
+
+  it('targets persisted Agent ownership by indexed identity without parsing unrelated transcripts', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-agent-ownership-query-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'ownership_query_conversation', title: 'Ownership query' })
+    const bulk = new Database(path)
+    const insertIrrelevant = bulk.prepare(`
+      INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at)
+      VALUES (?, 'ownership_query_conversation', 'assistant', ?, ?, ?)
+    `)
+    bulk.transaction(() => {
+      for (let index = 0; index < 10_000; index += 1) {
+        insertIrrelevant.run(
+          `ownership_irrelevant_${index}`,
+          JSON.stringify([{ type: 'text', text: `irrelevant ${index}` }]),
+          index + 1,
+          index + 1,
+        )
+      }
+    })()
+    bulk.close()
+    database.messages.insert({
+      id: 'ownership_malformed_json', conversationId: 'ownership_query_conversation',
+      role: 'assistant', blocks: [], createdAt: 10_001,
+    })
+    const fault = new Database(path)
+    fault.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run('{not valid json', 'ownership_malformed_json')
+    fault.close()
+    database.messages.insert({
+      id: 'ownership_invalid_legacy', conversationId: 'ownership_query_conversation', role: 'assistant',
+      blocks: [{
+        type: 'approval', executionId: 'invalid_legacy_execution', workflowId: 'legacy.workflow',
+        workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+        scope: {}, scopeHash: 'a'.repeat(64),
+      }], createdAt: 10_002,
+    })
+    database.messages.insert({
+      id: 'ownership_near_current', conversationId: 'ownership_query_conversation', role: 'assistant',
+      blocks: [{
+        type: 'approval', blockId: 'near_current', state: 'pending',
+        executionId: 'near_current_execution', workflowId: 'workflow.current',
+        workflowVersion: '1.0.0', source: 'installed', actionSummary: 'missing workflow name',
+        permissionIndex: 0, capability: 'notification.send', scope: {}, scopeHash: 'b'.repeat(64),
+      }], createdAt: 10_003,
+    })
+    database.messages.insert({
+      id: 'ownership_exact_current', conversationId: 'ownership_query_conversation', role: 'assistant',
+      blocks: [{
+        type: 'approval', blockId: 'exact_current', state: 'invalidated',
+        executionId: 'exact_current_execution', workflowId: 'workflow.current',
+        workflowName: 'Current workflow', workflowVersion: '1.0.0', source: 'installed',
+        actionSummary: 'Persisted approval', permissionIndex: 0,
+        capability: 'notification.send', scope: {}, scopeHash: 'c'.repeat(64),
+      }], createdAt: 10_004,
+    })
+    const inspection = new Database(path, { readonly: true })
+    const plan = inspection.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT 1 FROM agent_workflow_approvals WHERE execution_id = ?
+    `).all('exact_current_execution') as Array<{ detail: string }>
+    expect(plan.map(({ detail }) => detail).join('\n')).toMatch(
+      /SEARCH agent_workflow_approvals USING (?:COVERING )?INDEX .* \(execution_id=\?\)/,
+    )
+    inspection.close()
+    const parseJson = vi.spyOn(JSON, 'parse')
+    parseJson.mockClear()
+
+    expect(database.messages.hasWorkflowApproval('exact_current_execution')).toBe(true)
+    expect(parseJson).not.toHaveBeenCalled()
+    parseJson.mockClear()
+    expect(database.messages.hasWorkflowApproval('invalid_legacy_execution')).toBe(false)
+    expect(parseJson).not.toHaveBeenCalled()
+    parseJson.mockClear()
+    expect(database.messages.hasWorkflowApproval('near_current_execution')).toBe(false)
+    expect(parseJson).not.toHaveBeenCalled()
+    parseJson.mockClear()
+    expect(database.messages.hasWorkflowApproval('manual_execution')).toBe(false)
+    expect(parseJson).not.toHaveBeenCalled()
+
+    parseJson.mockRestore()
+    database.close()
+  })
+
+  it('backfills current and exact legacy Agent approvals and cascades their ownership', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-agent-ownership-migration-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const sqlite = new Database(path)
+    const migrations = [
+      '0001_init.sql', '0002_multimodal_media.sql', '0003_conversation_context.sql',
+      '0004_local_auth.sql', '0005_user_profile.sql', '0006_provider_usage.sql',
+      '0007_conversation_ownership.sql', '0008_local_user_roles.sql',
+    ]
+    for (const [index, fileName] of migrations.entries()) {
+      sqlite.exec(readFileSync(fileURLToPath(new URL(`../../../resources/migrations/${fileName}`, import.meta.url)), 'utf8'))
+      sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)').run(index + 1, index + 1)
+    }
+    sqlite.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
+      .run('ownership_migration_conversation', 'Ownership migration', 1, 1)
+    const currentApproval = {
+      type: 'approval', blockId: 'current_approval', state: 'denied',
+      executionId: 'current_execution', workflowId: 'workflow.current',
+      workflowName: 'Current workflow', workflowVersion: '1.0.0', source: 'installed',
+      actionSummary: 'Current persisted approval', permissionIndex: 0,
+      capability: 'notification.send', scope: {}, scopeHash: 'a'.repeat(64),
+    }
+    const legacyApproval = {
+      type: 'approval', executionId: 'legacy_execution', workflowId: 'workflow.legacy',
+      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+      scope: { origins: ['https://example.com'] }, scopeHash: 'b'.repeat(64),
+    }
+    const invalidApproval = { ...legacyApproval, executionId: 'invalid_execution', scope: {} }
+    const insert = sqlite.prepare(`
+      INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at)
+      VALUES (?, 'ownership_migration_conversation', ?, ?, ?, ?)
+    `)
+    insert.run('current_message', 'assistant', JSON.stringify([currentApproval]), 1, 1)
+    insert.run('legacy_message', 'assistant', JSON.stringify([legacyApproval]), 2, 2)
+    insert.run('invalid_message', 'assistant', JSON.stringify([invalidApproval]), 3, 3)
+    insert.run('user_message', 'user', JSON.stringify([{ ...currentApproval, executionId: 'user_execution' }]), 4, 4)
+    sqlite.close()
+
+    const database = openAppDatabase(path)
+    expect(database.schemaVersion()).toBe(9)
+    expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
+    expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
+    expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)
+    expect(database.messages.hasWorkflowApproval('invalid_execution')).toBe(false)
+    expect(database.messages.hasWorkflowApproval('user_execution')).toBe(false)
+
+    const inspection = new Database(path)
+    expect(inspection.prepare(`
+      SELECT execution_id AS executionId, message_id AS messageId
+      FROM agent_workflow_approvals
+      ORDER BY execution_id
+    `).all()).toEqual([
+      { executionId: 'current_execution', messageId: 'current_message' },
+      { executionId: 'legacy_execution', messageId: 'legacy_message' },
+    ])
+    inspection.close()
+
+    database.conversations.delete('ownership_migration_conversation')
+    expect(database.messages.hasWorkflowApproval('current_execution')).toBe(false)
+    expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(false)
+    database.close()
   })
 
   it('persists media ownership and generation preferences with the Task 1 schema', () => {

@@ -20,6 +20,7 @@ import {
   type ModelProviderId,
   type PermissionGrant,
   type ProviderCredentialStatus,
+  type WorkflowChatAvailability,
   type WorkflowDetail,
   type WorkflowQuery,
   type WorkflowSummary,
@@ -53,6 +54,7 @@ import { VideoJobRunner } from './chat/video-job-runner.js'
 import { openAppDatabase } from './database/client.js'
 import {
   ProviderUsageConsistencyError,
+  type AppRepositories,
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
@@ -76,12 +78,17 @@ import { UserAdminService } from './user-admin/user-admin-service.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
+  type WorkflowExecutionSource,
   type WorkflowExecutionSourceResolver,
-  type WorkflowExecutionSourceSelector,
 } from './workflows/execution-service.js'
 import { validateWorkflowInput } from './workflows/input-validation.js'
-import { WorkflowProjectService } from './workflows/project-service.js'
+import { WorkflowProjectService, type WorkflowProjectServiceOptions } from './workflows/project-service.js'
 import { WorkflowRegistry } from './workflows/registry.js'
+import {
+  createWorkflowSourceSelectorVault,
+  type ExactWorkflowSource,
+  type WorkflowSourceSelectorVault,
+} from './workflows/workflow-source-selector.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
 
 export interface ApplicationPaths {
@@ -175,6 +182,10 @@ export interface ApplicationRuntimeOptions {
   emitExecution(event: ExecutionEvent): void
   browserWorkspace: BrowserWorkspacePort
   applyTheme?(theme: AppSettings['theme']): void
+  /** @internal Test-only observation hook for the Main-owned Agent instance. */
+  inspectAgent?(agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>): void
+  /** @internal Test-only hooks for deterministic project mutation races. */
+  projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
 }
@@ -430,15 +441,85 @@ function projectEntries(root: string): Promise<{ files: string[]; directories: s
 
 async function developerProject(project: WorkflowProject): Promise<DeveloperProject> {
   const entries = await projectEntries(project.rootPath)
+  const status = ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
+    ? project.status as DeveloperProject['status']
+    : 'error'
+  const chatAvailability: WorkflowChatAvailability = status === 'invalid' || status === 'error'
+    ? 'invalid'
+    : !project.buildHash
+      ? 'not_built'
+      : status === 'ready'
+        ? 'ready'
+        : 'unbuilt_changes'
   return {
     id: project.id,
     name: project.name,
     rootPath: project.rootPath,
-    status: ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
-      ? project.status as DeveloperProject['status']
-      : 'error',
+    status,
+    chatAvailability,
     ...entries,
     updatedAt: new Date(project.updatedAt).toISOString(),
+  }
+}
+
+export interface WorkflowExecutionSourceResolverDependencies {
+  repositories: Pick<AppRepositories, 'workflowProjects' | 'installedWorkflows'>
+  registry: Pick<WorkflowRegistry, 'get' | 'getDevelopmentProject' | 'verifyIntegrity'>
+}
+
+function matchingDevelopmentSource(
+  project: WorkflowProject,
+  workflow: WorkflowDetail | undefined,
+  exact: Extract<ExactWorkflowSource, { source: 'development' }>,
+): WorkflowExecutionSource | undefined {
+  const manifest = project.manifest as Partial<WorkflowManifest> | undefined
+  if (!workflow
+    || project.status !== 'ready'
+    || project.buildHash !== exact.buildHash
+    || manifest?.id !== exact.id
+    || manifest.version !== exact.version
+    || typeof manifest.entryPath !== 'string'
+    || manifest.codeSha256 !== workflow.codeSha256
+    || workflow.id !== exact.id
+    || workflow.version !== exact.version
+    || workflow.source !== 'development'
+    || workflow.runtimeIdentity.source !== 'development'
+    || workflow.runtimeIdentity.buildHash !== exact.buildHash) return undefined
+  return { workflow, rootPath: project.rootPath, entryPath: manifest.entryPath, integrity: workflow.integrity }
+}
+
+export function createWorkflowExecutionSourceResolver(
+  selectors: WorkflowSourceSelectorVault,
+  dependencies: WorkflowExecutionSourceResolverDependencies,
+): WorkflowExecutionSourceResolver {
+  return {
+    async resolve(id, version, selector) {
+      const exact = selectors.inspect(selector)
+      if (!exact || exact.id !== id || exact.version !== version) return undefined
+      if (exact.source === 'development') {
+        const matches = (await Promise.all(dependencies.repositories.workflowProjects.list().map(async (project) => (
+          matchingDevelopmentSource(project, await dependencies.registry.getDevelopmentProject(project.id), exact)
+        )))).filter((source): source is WorkflowExecutionSource => source !== undefined)
+        return matches.length === 1 ? matches[0] : undefined
+      }
+
+      const installed = dependencies.repositories.installedWorkflows.get(id, version)
+      const manifest = installed?.manifest as Partial<WorkflowManifest> | undefined
+      if (!installed
+        || manifest?.id !== exact.id
+        || manifest.version !== exact.version
+        || manifest.codeSha256 !== exact.codeSha256) return undefined
+      const integrity = await dependencies.registry.verifyIntegrity(id, version)
+      const workflow = await dependencies.registry.get(id, version, { developerMode: false })
+      if (!integrity.valid
+        || !workflow
+        || workflow.id !== exact.id
+        || workflow.version !== exact.version
+        || workflow.source !== 'installed'
+        || workflow.runtimeIdentity.source !== 'installed'
+        || workflow.codeSha256 !== exact.codeSha256) return undefined
+      return { workflow, rootPath: installed.installPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
+    },
   }
 }
 
@@ -547,7 +628,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerUsage: database.providerUsage,
     providers: providerRegistry,
   })
-  const projects = new WorkflowProjectService(database, options.paths.installations)
+  const projects = new WorkflowProjectService(database, options.paths.installations, options.projectServiceOptions)
   const registry = new WorkflowRegistry(database, projects)
   const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
   const mediaLifecycle = new MediaLifecycle({
@@ -585,54 +666,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
     return entry.promise
   }
-  const developmentSourceSelectors = new WeakMap<WorkflowExecutionSourceSelector, string>()
-  const selectDevelopmentProject = (projectId: string): WorkflowExecutionSourceSelector => {
-    const selector = Object.freeze({ kind: 'development-project' as const, projectId })
-    developmentSourceSelectors.set(selector, projectId)
-    return selector
-  }
+  const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const policy = new PolicyEngine(database.permissionGrants)
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
     workspace: options.browserWorkspace,
     currentUserId: async () => (await auth.getSession())?.user.id,
   })
-  const sourceResolver: WorkflowExecutionSourceResolver = {
-    async resolve(id, version, selector) {
-      if (selector) {
-        const projectId = developmentSourceSelectors.get(selector)
-        if (!projectId || selector.kind !== 'development-project' || selector.projectId !== projectId) return undefined
-        const project = database.workflowProjects.get(projectId)
-        const workflow = await registry.getDevelopmentProject(projectId)
-        if (!project || !workflow) return undefined
-        const manifest = JSON.parse(await projects.read(projectId, 'workflow.json')) as WorkflowManifest
-        if (manifest.id !== id || manifest.version !== version) return undefined
-        return {
-          workflow,
-          rootPath: project.rootPath,
-          entryPath: String(manifest.entryPath),
-          integrity: workflow.integrity,
-        }
-      }
-      const installed = database.installedWorkflows.get(id, version)
-      if (installed) {
-        const integrity = await registry.verifyIntegrity(id, version)
-        const workflow = await registry.get(id, version, { developerMode: false })
-        if (!workflow || !integrity.valid) return undefined
-        const manifest = installed.manifest as WorkflowManifest
-        return { workflow, rootPath: installed.installPath, entryPath: manifest.entryPath, integrity: workflow.integrity }
-      }
-      for (const project of database.workflowProjects.list()) {
-        const manifest = project.manifest as Partial<WorkflowManifest> | undefined
-        if (project.status !== 'ready' || manifest?.id !== id || manifest.version !== version) continue
-        const workflow = await registry.getDevelopmentProject(project.id)
-        if (workflow) {
-          return { workflow, rootPath: project.rootPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
-        }
-      }
-      return undefined
-    },
-  }
+  const sourceResolver = createWorkflowExecutionSourceResolver(sourceSelectorVault, {
+    repositories: database,
+    registry,
+  })
 
   const activeExecutions = new Set<string>()
   const activeRequests = new Set<string>()
@@ -719,10 +763,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     history: conversationContext,
     policy,
     executions,
+    createSourceSelector: sourceSelectorVault.create,
+    inspectSource: sourceSelectorVault.inspect,
+    resolveCurrentWorkflow: async (selector, id, version) => (
+      (await sourceResolver.resolve(id, version, selector))?.workflow
+    ),
+    checkRemainingBudgets: ({ toolExecutions }) => (
+      toolExecutions >= 5 ? 'TOOL_CALL_LIMIT' : undefined
+    ),
     providerUsage: database.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
   })
+  options.inspectAgent?.(agent)
   const persistence = createAgentPersistence(database)
   const mediaGeneration = new MediaGenerationOrchestrator({
     providers: providerRegistry,
@@ -1165,12 +1218,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             if (typeof error === 'object' && error !== null && 'code' in error) throw error
             throw failure('INVALID_INPUT')
           }
+          const workflow = await registry.getDevelopmentProject(projectId)
+          if (!workflow) throw failure('WORKFLOW_INTEGRITY_FAILED')
           const started = await executions.start({
             userId: session.user.id,
             workflowId: manifest.id,
             workflowVersion: manifest.version,
             input,
-            sourceSelector: selectDevelopmentProject(projectId),
+            sourceSelector: sourceSelectorVault.create(workflow),
           })
           void started.finished.catch(() => undefined)
           return { executionId: started.id }
@@ -1214,6 +1269,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return result
       },
       decide: async (decision) => {
+        const agentOwned = agent.recognizesExecution(decision.executionId)
+          || database.messages.hasWorkflowApproval(decision.executionId)
         let result
         try {
           result = await agent.resumeApproval(decision)
@@ -1221,6 +1278,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           recordFailure(error, 'background-chat')
           throw error
         }
+        if (result.error && agentOwned) throw result.error
         if (result.error?.code === 'CONFLICT') await executions.decide(decision)
       },
       cancel: async (executionId) => {
@@ -1251,6 +1309,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const candidate = settings.preview(patch)
           const commit = () => {
             const committed = settings.commit(candidate)
+            if (committed.developerMode !== previous.developerMode) {
+              void agent.onDeveloperModeChanged(committed.developerMode).catch((error: unknown) => {
+                recordFailure(error, 'background-chat')
+              })
+            }
             if (committed.theme !== previous.theme) options.applyTheme?.(committed.theme)
             return committed
           }

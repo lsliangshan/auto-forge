@@ -24,6 +24,8 @@ const baiduWorkflow: WorkflowDetail = {
   ...baseWorkflow,
   id: 'browser.search.baidu',
   name: '百度搜索',
+  cities: [],
+  runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' },
   activationExamples: ['使用百度搜索今日天气'],
   activationNegativeExamples: [],
 }
@@ -32,6 +34,8 @@ const answerWeatherWorkflow: WorkflowDetail = {
   ...baseWorkflow,
   id: 'weather.answer',
   name: '天气回答',
+  cities: [],
+  runtimeIdentity: { id: 'weather.answer', version: '1.0.0', source: 'installed' },
   activationExamples: ['回答今日天气'],
   activationNegativeExamples: ['使用百度搜索今日天气'],
 }

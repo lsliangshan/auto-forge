@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { fork as nodeFork, type ChildProcess, type ForkOptions } from 'node:child_process'
-import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
@@ -29,8 +30,13 @@ import type {
   ExecutionStep,
 } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
+import { validateWorkflowOutput } from './output-validation.js'
+import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
+import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
+import { MAX_WORKFLOW_ARTIFACT_BYTES, readStableRegularFile } from './artifact-reader.js'
 
 const MAX_LINE_BYTES = 1024 * 1024
+const STAGED_WORKFLOW_ENTRY = 'workflow-entry.mjs'
 
 type ExecutionRepository = Pick<AppRepositories['executions'], 'insert' | 'get' | 'update'>
 type ExecutionLogRepository = Pick<AppRepositories['executionLogs'], 'insert'>
@@ -53,13 +59,8 @@ export interface WorkflowExecutionSourceResolver {
   resolve(
     workflowId: string,
     version: string,
-    selector?: WorkflowExecutionSourceSelector,
+    selector: WorkflowExecutionSourceSelector,
   ): Promise<WorkflowExecutionSource | undefined>
-}
-
-export interface WorkflowExecutionSourceSelector {
-  readonly kind: 'development-project'
-  readonly projectId: string
 }
 
 export interface TemporaryDirectoryPort {
@@ -134,8 +135,22 @@ export interface ExecutionStartInput {
   chatRunId?: string
   timeoutMs?: number
   sensitivePaths?: readonly string[]
-  /** Main-process-only selector. The application resolver accepts only selectors it created. */
-  sourceSelector?: WorkflowExecutionSourceSelector
+  /** Main-process-only selector. The application resolver accepts only selectors its vault created. */
+  sourceSelector: WorkflowExecutionSourceSelector
+  /** Present only for Agent starts whose manifest permissions were authorized in chat. */
+  agentAuthorization?: AgentExecutionAuthorization
+}
+
+export interface AgentAuthorizedPermissionBinding {
+  readonly permissionIndex: number
+  readonly capability: Capability
+  readonly scope: CapabilityScope
+  readonly scopeHash: string
+}
+
+export interface AgentExecutionAuthorization {
+  readonly workflowFingerprint: string
+  readonly permissions: readonly AgentAuthorizedPermissionBinding[]
 }
 
 export interface StartedExecution {
@@ -152,6 +167,7 @@ interface ReservationRecord {
   readonly executionId: string
   cancelled: boolean
   started: boolean
+  cleaned: boolean
   starting?: Promise<StartedExecution>
 }
 
@@ -169,6 +185,7 @@ interface ActiveExecution {
   worker: WorkflowWorker
   directory: string
   sensitivePaths: readonly string[]
+  agentAuthorization?: AgentExecutionAuthorization
   buffer: Buffer
   messageQueue: Promise<void>
   pending?: PendingCapability
@@ -181,6 +198,11 @@ interface ActiveExecution {
   resolveFinished: (execution: Execution) => void
   rejectFinished: (error: AppError) => void
   finishing?: Promise<void>
+}
+
+interface ResolvedArtifactPath {
+  rootPath: string
+  entryPath: string
 }
 
 export interface ExecutionServiceDependencies {
@@ -228,6 +250,41 @@ function sameExactPermission(
   right: { capability: Capability; scope: CapabilityScope },
 ): boolean {
   return left.capability === right.capability && scopeHash(left.scope) === scopeHash(right.scope)
+}
+
+function snapshotAgentAuthorization(
+  authorization: AgentExecutionAuthorization,
+): AgentExecutionAuthorization {
+  const permissions = authorization.permissions.map((permission) => {
+    const scope = structuredClone(permission.scope)
+    if ('origins' in scope) Object.freeze(scope.origins)
+    if ('paths' in scope) Object.freeze(scope.paths)
+    Object.freeze(scope)
+    return Object.freeze({
+      permissionIndex: permission.permissionIndex,
+      capability: permission.capability,
+      scope,
+      scopeHash: permission.scopeHash,
+    })
+  })
+  return Object.freeze({
+    workflowFingerprint: authorization.workflowFingerprint,
+    permissions: Object.freeze(permissions),
+  })
+}
+
+function agentAuthorizationMatchesWorkflow(
+  authorization: AgentExecutionAuthorization,
+  workflow: WorkflowDetail,
+): boolean {
+  if (authorization.permissions.length !== workflow.permissions.length) return false
+  return authorization.permissions.every((permission, permissionIndex) => {
+    const declared = workflow.permissions[permissionIndex]
+    return declared !== undefined
+      && permission.permissionIndex === permissionIndex
+      && sameExactPermission(permission, declared)
+      && permission.scopeHash === scopeHash(permission.scope)
+  })
 }
 
 function permissionCoversRequest(
@@ -306,6 +363,7 @@ export class ExecutionService {
       executionId: handle.executionId,
       cancelled: false,
       started: false,
+      cleaned: false,
     }
     this.reservationHandles.set(handle, record)
     this.reservationsById.set(record.executionId, record)
@@ -330,19 +388,34 @@ export class ExecutionService {
     input: ExecutionStartInput,
     signal?: AbortSignal,
   ): Promise<StartedExecution> {
-    if (this.stopped) throw failure('CONFLICT')
     const record = this.reservationHandles.get(reservation)
     if (!record || record.handle !== reservation || record.started) throw failure('CONFLICT')
-    if (record.cancelled || signal?.aborted) {
-      this.discardReservation(reservation)
-      throw failure('CANCELLED')
-    }
+    // A valid reservation transfers to ExecutionService at invocation. Every rejection
+    // after this point is service-owned and must release its reservation and once grants.
     record.started = true
+    if (this.stopped) return this.rejectOwnedReservation(record, failure('CONFLICT'))
+    if (record.cancelled || signal?.aborted) {
+      record.cancelled = true
+      return this.rejectOwnedReservation(record, failure('CANCELLED'))
+    }
+    let startInput: ExecutionStartInput
+    try {
+      startInput = {
+        ...input,
+        ...(input.agentAuthorization
+          ? { agentAuthorization: snapshotAgentAuthorization(input.agentAuthorization) }
+          : {}),
+      }
+    } catch {
+      return this.rejectOwnedReservation(record, failure('INVALID_INPUT'))
+    }
     const onAbort = () => { record.cancelled = true }
     signal?.addEventListener('abort', onAbort, { once: true })
-    record.starting = this.startReservation(record, input)
+    record.starting = this.startReservation(record, startInput)
     try {
       return await record.starting
+    } catch (error) {
+      return this.rejectOwnedReservation(record, toSafeAppError(error))
     } finally {
       signal?.removeEventListener('abort', onAbort)
     }
@@ -377,9 +450,21 @@ export class ExecutionService {
       checkCancelled()
       if (!source) throw failure('NOT_FOUND')
       workflow = source.workflow
-      entryPath = await this.resolveEntryPath(input, source, checkCancelled)
+      const artifactPath = await this.resolveEntryPath(input, source, checkCancelled)
+      checkCancelled()
+      if (input.agentAuthorization) {
+        if (input.agentAuthorization.workflowFingerprint !== workflowSecurityFingerprint(workflow)) {
+          throw failure('WORKFLOW_CHANGED')
+        }
+        if (!agentAuthorizationMatchesWorkflow(input.agentAuthorization, workflow)) {
+          throw failure('CAPABILITY_SCOPE_DENIED')
+        }
+      }
+      const artifact = await this.readVerifiedArtifact(source, artifactPath)
       checkCancelled()
       directory = await this.temporaryDirectories.create()
+      checkCancelled()
+      entryPath = await this.stageVerifiedArtifact(source, directory, artifact)
       checkCancelled()
       const nonce = randomUUID()
       worker = await this.dependencies.workers.spawn({
@@ -411,6 +496,7 @@ export class ExecutionService {
       worker,
       directory,
       sensitivePaths: input.sensitivePaths ?? [],
+      ...(input.agentAuthorization ? { agentAuthorization: input.agentAuthorization } : {}),
       buffer: Buffer.alloc(0),
       messageQueue: Promise.resolve(),
       timer: setTimeout(() => { void this.finish(id, 'failed', failure('WORKER_TIMEOUT')) }, input.timeoutMs ?? workflow.timeoutMs),
@@ -486,7 +572,8 @@ export class ExecutionService {
         this.discardReservation(reservation.handle)
         return
       }
-      const started = await reservation.starting
+      let started: StartedExecution
+      try { started = await reservation.starting } catch { return }
       const activeAfterStart = this.active.get(executionId)
       if (!activeAfterStart) {
         await started.finished.catch(() => undefined)
@@ -530,7 +617,7 @@ export class ExecutionService {
     input: ExecutionStartInput,
     source: WorkflowExecutionSource,
     checkCancelled: () => void = () => undefined,
-  ): Promise<string> {
+  ): Promise<ResolvedArtifactPath> {
     if (source.workflow.id !== input.workflowId
       || source.workflow.version !== input.workflowVersion
       || !source.workflow.enabled
@@ -546,9 +633,69 @@ export class ExecutionService {
       const entry = await realpath(resolve(root, source.entryPath))
       checkCancelled()
       if (!inside(root, entry)) throw failure('WORKFLOW_INTEGRITY_FAILED')
-      return entry
+      return { rootPath: root, entryPath: entry }
     } catch {
       throw failure('WORKFLOW_INTEGRITY_FAILED')
+    }
+  }
+
+  private artifactFailure(source: WorkflowExecutionSource): AppError {
+    return failure(source.workflow.source === 'development'
+      ? 'WORKFLOW_CHANGED'
+      : 'WORKFLOW_INTEGRITY_FAILED')
+  }
+
+  private async readVerifiedArtifact(
+    source: WorkflowExecutionSource,
+    path: ResolvedArtifactPath,
+  ): Promise<Buffer> {
+    const expectedDigest = source.workflow.codeSha256
+    if (!expectedDigest || !/^[a-f0-9]{64}$/.test(expectedDigest)) {
+      throw this.artifactFailure(source)
+    }
+    try {
+      const canonicalBefore = await realpath(path.entryPath)
+      if (canonicalBefore !== path.entryPath || !inside(path.rootPath, canonicalBefore)) {
+        throw this.artifactFailure(source)
+      }
+      const artifact = await readStableRegularFile(path.entryPath, MAX_WORKFLOW_ARTIFACT_BYTES)
+      const canonicalAfter = await realpath(path.entryPath)
+      if (canonicalAfter !== canonicalBefore || artifact.sha256 !== expectedDigest) {
+        throw this.artifactFailure(source)
+      }
+      return artifact.contents
+    } catch {
+      throw this.artifactFailure(source)
+    }
+  }
+
+  private async stageVerifiedArtifact(
+    source: WorkflowExecutionSource,
+    directory: string,
+    contents: Buffer,
+  ): Promise<string> {
+    const entryPath = join(directory, STAGED_WORKFLOW_ENTRY)
+    let handle
+    try {
+      handle = await open(
+        entryPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      )
+      let offset = 0
+      while (offset < contents.length) {
+        const { bytesWritten } = await handle.write(contents, offset, contents.length - offset, offset)
+        if (bytesWritten === 0) throw this.artifactFailure(source)
+        offset += bytesWritten
+      }
+      await handle.sync()
+      const stored = await handle.stat()
+      if (!stored.isFile() || stored.size !== contents.length) throw this.artifactFailure(source)
+      return entryPath
+    } catch {
+      throw this.artifactFailure(source)
+    } finally {
+      await handle?.close().catch(() => undefined)
     }
   }
 
@@ -558,28 +705,50 @@ export class ExecutionService {
     directory?: string,
   ): Promise<StartedExecution> {
     const status = error.code === 'CANCELLED' ? 'cancelled' : 'failed'
-    const terminal = this.dependencies.repositories.executions.update(executionId, {
-      status,
-      errorCode: error.code,
-      endedAt: Date.now(),
-    })
-    if (!terminal) throw failure('NOT_FOUND')
-    this.emit(statusEvent(executionId, status, error))
     try {
-      this.dependencies.policy.releaseExecution(executionId)
-    } catch {
-      // Cleanup continues even if a policy implementation rejects release.
+      const terminal = this.dependencies.repositories.executions.update(executionId, {
+        status,
+        errorCode: error.code,
+        endedAt: Date.now(),
+      })
+      if (!terminal) throw failure('NOT_FOUND')
+      this.emit(statusEvent(executionId, status, error))
+      try {
+        this.dependencies.policy.releaseExecution(executionId)
+      } catch {
+        // Cleanup continues even if a policy implementation rejects release.
+      }
+      try {
+        await this.dependencies.capability.closeExecution(executionId)
+      } catch {
+        // Pre-active capability cleanup is best effort after the terminal state is durable.
+      }
+      const reservation = this.reservationsById.get(executionId)
+      if (reservation) this.reservationHandles.delete(reservation.handle)
+      this.reservationsById.delete(executionId)
+      return { id: executionId, finished: Promise.resolve(terminal) }
+    } finally {
+      if (directory) await this.removeTemporaryDirectory(directory)
     }
-    try {
-      await this.dependencies.capability.closeExecution(executionId)
-    } catch {
-      // Pre-active capability cleanup is best effort after the terminal state is durable.
+  }
+
+  private async rejectOwnedReservation(record: ReservationRecord, error: AppError): Promise<never> {
+    if (!record.cleaned) {
+      record.cleaned = true
+      this.reservationHandles.delete(record.handle)
+      this.reservationsById.delete(record.executionId)
+      try {
+        this.dependencies.policy.releaseExecution(record.executionId)
+      } catch {
+        // Ownership cleanup continues even if policy cleanup rejects.
+      }
+      try {
+        await this.dependencies.capability.closeExecution(record.executionId)
+      } catch {
+        // No Worker can start after this terminal reservation cleanup.
+      }
     }
-    if (directory) await this.removeTemporaryDirectory(directory)
-    const reservation = this.reservationsById.get(executionId)
-    if (reservation) this.reservationHandles.delete(reservation.handle)
-    this.reservationsById.delete(executionId)
-    return { id: executionId, finished: Promise.resolve(terminal) }
+    throw error
   }
 
   private attach(active: ActiveExecution): void {
@@ -667,6 +836,10 @@ export class ExecutionService {
         await this.handleCapabilityRequest(active, message.requestId, message.request)
         return
       case 'result':
+        if (!validateWorkflowOutput(active.workflow.outputSchema, message.output).valid) {
+          await this.finish(active.id, 'failed', failure('INVALID_OUTPUT'), message.output)
+          return
+        }
         await this.finish(active.id, 'completed', undefined, message.output)
         return
       case 'error':
@@ -689,6 +862,38 @@ export class ExecutionService {
       return
     }
     const effectiveRequest = effectiveCapabilityRequest(active.workflow.permissions[permissionIndex]!, request)
+
+    if (active.agentAuthorization) {
+      const authorized = active.agentAuthorization.permissions[permissionIndex]
+      if (!authorized
+        || authorized.permissionIndex !== permissionIndex
+        || !sameExactPermission(authorized, active.workflow.permissions[permissionIndex]!)) {
+        await this.finish(active.id, 'failed', failure('CAPABILITY_SCOPE_DENIED'))
+        return
+      }
+      try {
+        this.dependencies.policy.record({
+          executionId: active.id,
+          workflowId: active.workflow.id,
+          workflowVersion: active.workflow.version,
+          capability: effectiveRequest.capability,
+          scope: effectiveRequest.scope,
+          decision: 'once',
+        })
+      } catch {
+        await this.finish(active.id, 'failed', failure('INTERNAL_ERROR'))
+        return
+      }
+      const pending: PendingCapability = {
+        requestId,
+        request: effectiveRequest,
+        permissionIndex,
+        requiresApproval: false,
+      }
+      active.pending = pending
+      await this.dispatchCapability(active, pending)
+      return
+    }
 
     const evaluation = this.dependencies.policy.evaluate({
       executionId: active.id,
