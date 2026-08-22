@@ -12,6 +12,13 @@ import {
   frozenBrowserContinuationProvenance,
   type BrowserContinuationProvenance,
 } from './browser-continuation-types.js'
+import type {
+  BrowserInspectionDomSummary,
+  BrowserInspectionNode,
+  BrowserInspectionNodeBox,
+  BrowserPageCdpPort,
+  BrowserPageReadResult,
+} from './browser-page-inspector.js'
 
 interface Rectangle { x: number; y: number; width: number; height: number }
 interface NavigationEvent { preventDefault(): void }
@@ -151,6 +158,28 @@ interface TargetTabState {
   handle?: BrowserWorkspaceTab
 }
 
+interface AccessibilityValue {
+  value?: unknown
+}
+
+interface AccessibilityNodeResult {
+  nodeId?: string
+  parentId?: string
+  backendDOMNodeId?: number
+  frameId?: string
+  ignored?: boolean
+  role?: AccessibilityValue
+  name?: AccessibilityValue
+  value?: AccessibilityValue
+  properties?: Array<{ name?: string; value?: AccessibilityValue }>
+}
+
+interface DescribedDomNode {
+  backendNodeId?: number
+  nodeName?: string
+  attributes?: string[]
+}
+
 const toolbarHeight = 52
 const navigationDetectionMs = 500
 const postLoadNavigationDetectionMs = 1_000
@@ -209,6 +238,12 @@ function isAbortedNavigation(error: unknown): boolean {
     && error !== null
     && 'code' in error
     && error.code === 'ERR_ABORTED'
+}
+
+function normalizedAccessibilityRole(value: string): string {
+  const role = value.replaceAll(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
+  if (role === 'static-text' || role === 'inline-text-box') return 'statictext'
+  return role
 }
 
 function parseLocator(locator: string) {
@@ -293,7 +328,7 @@ class ElectronBrowserTab implements BrowserWorkspaceTab {
   }
 }
 
-export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
+export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPageCdpPort {
   private window: BaseWindowPort | undefined
   private toolbar: WebContentsViewPort | undefined
   private activeTabId: string | undefined
@@ -308,6 +343,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private shuttingDown = false
   private closingViews = false
   private continuationRegistry: BrowserWorkspaceContinuationRegistryPort | undefined
+  private readonly pageInvalidationListeners = new Set<(tabId: string) => void>()
 
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
@@ -397,6 +433,141 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   async releaseContinuation(tabId: string, runId: string): Promise<void> {
     const state = this.tabs.get(tabId)
     if (state?.ownerContinuationRunId === runId) state.ownerContinuationRunId = undefined
+  }
+
+  onPageInvalidated(listener: (tabId: string) => void): () => void {
+    this.pageInvalidationListeners.add(listener)
+    return () => { this.pageInvalidationListeners.delete(listener) }
+  }
+
+  async readAccessibilitySnapshot(
+    input: Parameters<BrowserPageCdpPort['readAccessibilitySnapshot']>[0],
+  ): Promise<BrowserPageReadResult> {
+    const state = this.continuationState(input)
+    const result = await this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      const frameTree = await this.command(state, 'Page.getFrameTree') as {
+        frameTree?: { frame?: { id?: string } }
+      }
+      const frameId = frameTree.frameTree?.frame?.id
+      if (!frameId) throw failure('PAGE_CHANGED')
+      const accessibility = await this.command(state, 'Accessibility.getFullAXTree') as {
+        nodes?: AccessibilityNodeResult[]
+      }
+      const rawNodes = (accessibility.nodes ?? [])
+        .filter((node) => node.frameId === undefined || node.frameId === frameId)
+        .filter((node) => typeof node.nodeId === 'string' && typeof node.backendDOMNodeId === 'number')
+        .slice(0, 2_000)
+      const nodes: BrowserInspectionNode[] = []
+      for (const rawNode of rawNodes) {
+        const backendNodeId = rawNode.backendDOMNodeId!
+        let described: DescribedDomNode | undefined
+        try {
+          const result = await this.command(state, 'DOM.describeNode', {
+            backendNodeId, depth: 0, pierce: false,
+          }) as { node?: DescribedDomNode }
+          described = result.node
+        } catch {
+          this.assertOpen(state)
+          continue
+        }
+        if (!described) continue
+        nodes.push(this.inspectionNode(rawNode, described))
+      }
+      const locatorMatches = []
+      for (const locator of input.locators) {
+        locatorMatches.push({
+          locator,
+          backendNodeIds: await this.resolveLocatorMatches(state, locator, rawNodes),
+        })
+      }
+      const viewport = await this.layoutViewport(state)
+      return {
+        tabId: state.id,
+        navigationEpoch: state.navigationEpoch,
+        origin: originOf(state.view.webContents.getURL()),
+        url: state.view.webContents.getURL(),
+        title: state.view.webContents.getTitle(),
+        frameId,
+        viewportWidth: viewport.width,
+        viewportHeight: viewport.height,
+        nodes: Object.freeze(nodes),
+        locatorMatches: Object.freeze(locatorMatches),
+      }
+    })
+    this.assertContinuationState(state, input)
+    return Object.freeze(result)
+  }
+
+  async readNode(
+    input: Parameters<BrowserPageCdpPort['readNode']>[0],
+  ): Promise<BrowserInspectionNode | undefined> {
+    const state = this.continuationState(input)
+    return this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      try {
+        return await this.readInspectionNode(state, input.backendNodeId)
+      } catch {
+        this.assertOpen(state)
+        throw failure('PAGE_CHANGED')
+      }
+    })
+  }
+
+  async getContinuationNodeBox(
+    input: Parameters<BrowserPageCdpPort['getNodeBox']>[0],
+  ): Promise<BrowserInspectionNodeBox> {
+    const state = this.continuationState(input)
+    return this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      return Object.freeze(await this.nodeBox(state, input.backendNodeId))
+    })
+  }
+
+  getNodeBox(
+    input: Parameters<BrowserPageCdpPort['getNodeBox']>[0],
+  ): Promise<BrowserInspectionNodeBox> {
+    return this.getContinuationNodeBox(input)
+  }
+
+  async captureContinuationNodeScreenshot(
+    input: Parameters<BrowserPageCdpPort['captureNodeScreenshot']>[0],
+  ): Promise<string> {
+    const state = this.continuationState(input)
+    return this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      const currentNode = await this.readInspectionNode(state, input.backendNodeId)
+      if (!currentNode
+        || currentNode.ignored
+        || currentNode.dom.hidden
+        || normalizedAccessibilityRole(currentNode.role) !== input.expectedRole
+        || currentNode.name !== input.expectedName
+        || currentNode.dom.tagName.toLowerCase() !== input.expectedTagName
+        || currentNode.dom.inputType?.toLowerCase() !== input.expectedInputType) {
+        throw failure('PAGE_CHANGED')
+      }
+      const current = await this.nodeBox(state, input.backendNodeId)
+      if (current.x !== input.clip.x
+        || current.y !== input.clip.y
+        || current.width !== input.clip.width
+        || current.height !== input.clip.height) throw failure('PAGE_CHANGED')
+      const screenshot = await this.command(state, 'Page.captureScreenshot', {
+        format: 'png',
+        fromSurface: true,
+        captureBeyondViewport: false,
+        clip: { ...input.clip, scale: 1 },
+      }) as { data?: unknown }
+      if (typeof screenshot.data !== 'string' || screenshot.data.length === 0) {
+        throw failure('INTERNAL_ERROR')
+      }
+      return screenshot.data
+    })
+  }
+
+  captureNodeScreenshot(
+    input: Parameters<BrowserPageCdpPort['captureNodeScreenshot']>[0],
+  ): Promise<string> {
+    return this.captureContinuationNodeScreenshot(input)
   }
 
   async closeContinuation(tabId: string): Promise<void> {
@@ -591,9 +762,16 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     }
     const navigationChanged = () => {
       state.navigationEpoch += 1
+      this.emitPageInvalidated(state.id)
       renderNavigationMetadata()
     }
+    const navigationStarted = (...args: unknown[]) => {
+      const details = args[0] as { isMainFrame?: boolean } | undefined
+      if (details?.isMainFrame === false || args[3] === false) return
+      this.emitPageInvalidated(state.id)
+    }
     view.webContents.on('page-title-updated', renderNavigationMetadata)
+    view.webContents.on('did-start-navigation', navigationStarted)
     view.webContents.on('did-navigate', navigationChanged)
     view.webContents.on('did-navigate-in-page', navigationChanged)
     view.webContents.on('did-start-loading', () => { this.setLoading(state, true) })
@@ -664,6 +842,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     const runId = state.ownerContinuationRunId
     if (!runId || (!force && state.activeOperations > 0)) return
     state.ownerContinuationRunId = undefined
+    this.emitPageInvalidated(state.id)
     this.continuationRegistry?.markTakenOver(state.id, runId)
   }
 
@@ -922,6 +1101,184 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     }
   }
 
+  private continuationState(input: { tabId: string; runId: string }): TargetTabState {
+    const state = this.tabs.get(input.tabId)
+    if (!state || state.closed || state.view.webContents.isDestroyed()) throw failure('PAGE_CLOSED')
+    if (state.ownerContinuationRunId !== input.runId) {
+      throw failure(state.ownerContinuationRunId ? 'PAGE_BUSY' : 'CANCELLED')
+    }
+    return state
+  }
+
+  private assertContinuationState(
+    state: TargetTabState,
+    input: {
+      runId: string
+      expectedOrigin: string
+      expectedNavigationEpoch: number
+    },
+  ): void {
+    this.assertOpen(state)
+    if (state.ownerContinuationRunId !== input.runId) throw failure('CANCELLED')
+    if (state.navigationEpoch !== input.expectedNavigationEpoch
+      || originOf(state.view.webContents.getURL()) !== input.expectedOrigin) {
+      throw failure('PAGE_CHANGED')
+    }
+  }
+
+  private inspectionNode(
+    node: AccessibilityNodeResult,
+    described: DescribedDomNode,
+  ): BrowserInspectionNode {
+    const dom = this.domSummary(described, this.axBoolean(node, 'readonly'))
+    const protectedValue = dom.hidden
+      || dom.inputType === 'password'
+      || dom.inputType === 'file'
+      || dom.autocomplete === 'one-time-code'
+    const value = protectedValue ? undefined : this.axString(node.value)
+    return Object.freeze({
+      axNodeId: node.nodeId!,
+      parentAxNodeId: node.parentId,
+      backendNodeId: node.backendDOMNodeId ?? described.backendNodeId!,
+      role: this.axString(node.role) ?? '',
+      name: this.axString(node.name) ?? '',
+      ...(value === undefined ? {} : { value }),
+      enabled: this.axBoolean(node, 'disabled') !== true,
+      ...(this.axBoolean(node, 'checked') === undefined ? {} : { checked: this.axBoolean(node, 'checked') }),
+      ...(this.axBoolean(node, 'selected') === undefined ? {} : { selected: this.axBoolean(node, 'selected') }),
+      ignored: node.ignored === true || this.axBoolean(node, 'hidden') === true || this.axBoolean(node, 'offscreen') === true,
+      frameId: node.frameId,
+      ...(this.axBoolean(node, 'scrollable') === undefined ? {} : { scrollable: this.axBoolean(node, 'scrollable') }),
+      dom,
+    })
+  }
+
+  private async readInspectionNode(
+    state: TargetTabState,
+    backendNodeId: number,
+  ): Promise<BrowserInspectionNode | undefined> {
+    const described = await this.command(state, 'DOM.describeNode', {
+      backendNodeId, depth: 0, pierce: false,
+    }) as { node?: DescribedDomNode }
+    const accessibility = await this.command(state, 'Accessibility.getPartialAXTree', {
+      backendNodeId, fetchRelatives: false,
+    }) as { nodes?: AccessibilityNodeResult[] }
+    const rawNode = accessibility.nodes?.find((node) => node.backendDOMNodeId === backendNodeId)
+      ?? accessibility.nodes?.[0]
+    if (!rawNode || !described.node) return undefined
+    return Object.freeze(this.inspectionNode(rawNode, described.node))
+  }
+
+  private domSummary(node: DescribedDomNode, axReadOnly: boolean | undefined): BrowserInspectionDomSummary {
+    const attributes = new Map<string, string>()
+    for (let index = 0; index < (node.attributes?.length ?? 0); index += 2) {
+      const name = node.attributes?.[index]?.toLowerCase()
+      if (name) attributes.set(name, node.attributes?.[index + 1] ?? '')
+    }
+    const inputType = attributes.get('type')?.toLowerCase()
+    const autocomplete = attributes.get('autocomplete')?.toLowerCase()
+    const style = attributes.get('style')?.toLowerCase() ?? ''
+    const hidden = attributes.has('hidden')
+      || attributes.get('aria-hidden')?.toLowerCase() === 'true'
+      || inputType === 'hidden'
+      || /(?:display\s*:\s*none|visibility\s*:\s*hidden)/u.test(style)
+    const readOnly = axReadOnly === true || attributes.has('readonly') || attributes.get('aria-readonly') === 'true'
+    const contentEditable = attributes.get('contenteditable')?.toLowerCase() === 'true'
+    return Object.freeze({
+      tagName: node.nodeName?.toLowerCase() ?? '',
+      ...(inputType === undefined ? {} : { inputType }),
+      ...(autocomplete === undefined ? {} : { autocomplete }),
+      ...(hidden ? { hidden: true } : {}),
+      ...(readOnly ? { readOnly: true } : {}),
+      ...(contentEditable ? { contentEditable: true } : {}),
+    })
+  }
+
+  private axString(value: AccessibilityValue | undefined): string | undefined {
+    return typeof value?.value === 'string' ? value.value : undefined
+  }
+
+  private axBoolean(node: AccessibilityNodeResult, name: string): boolean | undefined {
+    const value = node.properties?.find((property) => property.name === name)?.value?.value
+    if (typeof value === 'boolean') return value
+    if (value === 'true') return true
+    if (value === 'false') return false
+    return undefined
+  }
+
+  private async resolveLocatorMatches(
+    state: TargetTabState,
+    locator: string,
+    accessibilityNodes: readonly AccessibilityNodeResult[],
+  ): Promise<readonly number[]> {
+    const parsed = parseLocator(locator)
+    if (parsed.kind === 'role') {
+      return Object.freeze(accessibilityNodes
+        .filter((node) => !node.ignored
+          && this.axString(node.role)?.toLowerCase() === parsed.value
+          && (parsed.name === undefined || this.axString(node.name) === parsed.name)
+          && typeof node.backendDOMNodeId === 'number')
+        .map((node) => node.backendDOMNodeId!))
+    }
+    const document = await this.command(state, 'DOM.getDocument', { depth: 0, pierce: true }) as {
+      root?: { nodeId?: number }
+    }
+    const nodeId = document.root?.nodeId
+    if (!nodeId) throw failure('PAGE_CHANGED')
+    let queried: { nodeIds?: number[] }
+    try {
+      queried = await this.command(state, 'DOM.querySelectorAll', {
+        nodeId, selector: parsed.value,
+      }) as { nodeIds?: number[] }
+    } catch {
+      this.assertOpen(state)
+      throw failure('PAGE_CHANGED')
+    }
+    const backendNodeIds: number[] = []
+    for (const matchedNodeId of (queried.nodeIds ?? []).slice(0, 100)) {
+      const described = await this.command(state, 'DOM.describeNode', {
+        nodeId: matchedNodeId, depth: 0, pierce: false,
+      }) as { node?: DescribedDomNode }
+      if (typeof described.node?.backendNodeId === 'number') backendNodeIds.push(described.node.backendNodeId)
+    }
+    return Object.freeze([...new Set(backendNodeIds)].slice(0, 2_000))
+  }
+
+  private async nodeBox(state: TargetTabState, backendNodeId: number): Promise<BrowserInspectionNodeBox> {
+    const result = await this.command(state, 'DOM.getBoxModel', { backendNodeId }) as {
+      model?: { content?: number[] }
+    }
+    const points = result.model?.content
+    if (!points || points.length !== 8 || points.some((value) => !Number.isFinite(value))) {
+      throw failure('PAGE_CHANGED')
+    }
+    const xs = [points[0]!, points[2]!, points[4]!, points[6]!]
+    const ys = [points[1]!, points[3]!, points[5]!, points[7]!]
+    const x = Math.min(...xs)
+    const y = Math.min(...ys)
+    const viewport = await this.layoutViewport(state)
+    return {
+      x,
+      y,
+      width: Math.max(...xs) - x,
+      height: Math.max(...ys) - y,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+    }
+  }
+
+  private async layoutViewport(state: TargetTabState): Promise<{ width: number; height: number }> {
+    const result = await this.command(state, 'Page.getLayoutMetrics') as {
+      cssLayoutViewport?: { clientWidth?: number; clientHeight?: number }
+      layoutViewport?: { clientWidth?: number; clientHeight?: number }
+    }
+    const viewport = result.cssLayoutViewport ?? result.layoutViewport
+    if (typeof viewport?.clientWidth !== 'number' || typeof viewport.clientHeight !== 'number') {
+      throw failure('PAGE_CHANGED')
+    }
+    return { width: viewport.clientWidth, height: viewport.clientHeight }
+  }
+
   private async attachDebugger(state: TargetTabState): Promise<void> {
     const target = state.view.webContents.debugger
     if (!target.isAttached()) target.attach('1.3')
@@ -1043,6 +1400,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private handleDestroyed(state: TargetTabState): void {
     if (state.closed) return
     state.closed = true
+    this.emitPageInvalidated(state.id)
     this.tabs.delete(state.id)
     if (state.ownerExecutionId) this.removeExecutionTab(state.ownerExecutionId, state)
     try { this.continuationRegistry?.markClosed(state.id, 'PAGE_CLOSED') } catch { /* Audit persistence cannot revive a closed renderer. */ }
@@ -1057,6 +1415,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       }
     }
     if (!this.closingViews) void this.renderToolbar().catch(() => undefined)
+  }
+
+  private emitPageInvalidated(tabId: string): void {
+    for (const listener of this.pageInvalidationListeners) {
+      try { listener(tabId) } catch { /* Inspector cleanup cannot interrupt browser lifecycle. */ }
+    }
   }
 
   private destroyViews(): void {

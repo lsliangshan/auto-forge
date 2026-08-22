@@ -211,6 +211,157 @@ function deferred<T>() {
 }
 
 describe('ElectronBrowserWorkspace', () => {
+  it('adapts bounded continuation inspection commands without exposing raw DOM attributes', async () => {
+    const respond = (method: string, params?: unknown) => {
+      const input = params as { backendNodeId?: number; nodeId?: number; selector?: string } | undefined
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+      if (method === 'Accessibility.getFullAXTree') return {
+        nodes: [
+          {
+            nodeId: 'ax_main', backendDOMNodeId: 10, frameId: 'frame_main', ignored: false,
+            role: { type: 'role', value: 'main' }, name: { type: 'computedString', value: '办事详情' },
+          },
+          {
+            nodeId: 'ax_date', parentId: 'ax_main', backendDOMNodeId: 11, frameId: 'frame_main', ignored: false,
+            role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '有效期至' },
+            value: { type: 'string', value: '2028-06-30' },
+            properties: [{ name: 'readonly', value: { type: 'boolean', value: true } }],
+          },
+          {
+            nodeId: 'ax_hidden', parentId: 'ax_main', backendDOMNodeId: 12, frameId: 'frame_main', ignored: false,
+            role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '内部字段' },
+            value: { type: 'string', value: 'hidden-token' },
+          },
+          {
+            nodeId: 'ax_other', backendDOMNodeId: 99, frameId: 'frame_other', ignored: false,
+            role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '其他 frame' },
+          },
+        ],
+      }
+      if (method === 'Accessibility.getPartialAXTree') return {
+        nodes: [{
+          nodeId: 'ax_date', parentId: 'ax_main', backendDOMNodeId: input?.backendNodeId,
+          frameId: 'frame_main', ignored: false,
+          role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '有效期至' },
+          value: { type: 'string', value: '2028-06-30' },
+          properties: [{ name: 'readonly', value: { type: 'boolean', value: true } }],
+        }],
+      }
+      if (method === 'DOM.describeNode') {
+        if (input?.nodeId === 7) {
+          return {
+            node: {
+              backendNodeId: 10, nodeName: 'MAIN', attributes: [],
+              children: [{ backendNodeId: 11, nodeName: 'INPUT', attributes: ['type', 'date'] }],
+            },
+          }
+        }
+        if (input?.backendNodeId === 12) {
+          return { node: { backendNodeId: 12, nodeName: 'INPUT', attributes: ['type', 'hidden', 'value', 'hidden-token'] } }
+        }
+        return { node: { backendNodeId: input?.backendNodeId, nodeName: input?.backendNodeId === 11 ? 'INPUT' : 'MAIN', attributes: input?.backendNodeId === 11 ? ['type', 'date', 'readonly', ''] : [] } }
+      }
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
+      if (method === 'DOM.querySelectorAll') return { nodeIds: input?.selector === 'main' ? [7] : [] }
+      if (method === 'Accessibility.queryAXTree') return { nodes: [] }
+      if (method === 'DOM.getBoxModel') return {
+        model: { content: [20, 30, 340, 30, 340, 230, 20, 230] },
+      }
+      if (method === 'Page.getLayoutMetrics') return {
+        cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 },
+      }
+      if (method === 'Page.captureScreenshot') return { data: 'png-data' }
+      return {}
+    }
+    const { workspace, views } = createHarness(respond)
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/detail', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'agent_run_1')
+
+    const result = await workspace.readAccessibilitySnapshot({
+      tabId: tab.id,
+      runId: 'agent_run_1',
+      expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch,
+      locators: ['role=main', 'css=main', 'css=form#login'],
+    })
+
+    expect(result).toMatchObject({
+      tabId: tab.id,
+      navigationEpoch: tab.navigationEpoch,
+      origin: 'https://www.baidu.com',
+      url: 'https://www.baidu.com/detail',
+      frameId: 'frame_main',
+      viewportWidth: 1200,
+      viewportHeight: 800,
+    })
+    expect(result.nodes).toEqual([
+      expect.objectContaining({ backendNodeId: 10, role: 'main', name: '办事详情', dom: { tagName: 'main' } }),
+      expect.objectContaining({ backendNodeId: 11, role: 'textbox', name: '有效期至', value: '2028-06-30', dom: { tagName: 'input', inputType: 'date', readOnly: true } }),
+      expect.objectContaining({ backendNodeId: 12, dom: { tagName: 'input', inputType: 'hidden', hidden: true } }),
+    ])
+    expect(JSON.stringify(result)).not.toContain('hidden-token')
+    expect(result.locatorMatches).toEqual([
+      { locator: 'role=main', backendNodeIds: [10] },
+      { locator: 'css=main', backendNodeIds: [10] },
+      { locator: 'css=form#login', backendNodeIds: [] },
+    ])
+
+    const box = await workspace.getContinuationNodeBox({
+      tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 11,
+    })
+    expect(box).toEqual({ x: 20, y: 30, width: 320, height: 200, viewportWidth: 1200, viewportHeight: 800 })
+    await expect(workspace.captureContinuationNodeScreenshot({
+      tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 11,
+      clip: { x: 20, y: 30, width: 320, height: 200 },
+      expectedRole: 'textbox', expectedName: '有效期至', expectedTagName: 'input',
+      expectedInputType: 'date',
+    })).resolves.toBe('png-data')
+
+    const commands = views[1]!.webContents.debugger.commands
+    expect(commands).toContainEqual({
+      method: 'Page.captureScreenshot',
+      params: {
+        format: 'png', fromSurface: true, captureBeyondViewport: false,
+        clip: { x: 20, y: 30, width: 320, height: 200, scale: 1 },
+      },
+    })
+    expect(commands.some(({ method }) => method === 'Runtime.evaluate')).toBe(false)
+  })
+
+  it('notifies inspectors and rejects stale adapter reads after navigation and close', async () => {
+    const { workspace, views } = createHarness((method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+      if (method === 'Page.getLayoutMetrics') return { cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 } }
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [] }
+      return {}
+    })
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/detail', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'agent_run_1')
+    const invalidated: string[] = []
+    const unsubscribe = workspace.onPageInvalidated((tabId) => { invalidated.push(tabId) })
+    const epoch = tab.navigationEpoch
+
+    views[1]!.webContents.emit('did-start-navigation', { isMainFrame: true })
+    expect(invalidated).toEqual([tab.id])
+    views[1]!.webContents.emit('did-navigate', {}, 'https://www.baidu.com/next')
+
+    expect(invalidated).toEqual([tab.id, tab.id])
+    await expect(workspace.readAccessibilitySnapshot({
+      tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: epoch, locators: [],
+    })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+
+    await tab.close()
+    expect(invalidated).toEqual([tab.id, tab.id, tab.id])
+    unsubscribe()
+  })
+
   it('uses a stable opaque persistent partition per AutoForge user', () => {
     expect(browserPartition('user_1')).toMatch(/^persist:autoforge-browser-[a-f0-9]{32}$/)
     expect(browserPartition('user_1')).toBe(browserPartition('user_1'))

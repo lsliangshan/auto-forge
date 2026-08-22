@@ -44,6 +44,43 @@ export interface BrowserContinuationLease {
   release(): Promise<void>
 }
 
+export interface BrowserSemanticNode {
+  readonly ref: string
+  readonly role: string
+  readonly name: string
+  readonly value?: string
+  readonly enabled: boolean
+  readonly checked?: boolean
+  readonly selected?: boolean
+  readonly actions: readonly ('fill' | 'select' | 'click' | 'check' | 'scroll')[]
+}
+
+export interface BrowserPageSnapshot {
+  readonly snapshotId: string
+  readonly bindingId: string
+  readonly origin: string
+  readonly url: string
+  readonly title: string
+  readonly capturedAt: string
+  readonly navigationEpoch: number
+  readonly auth: 'authenticated' | 'required' | 'unknown'
+  readonly nodes: readonly BrowserSemanticNode[]
+  readonly cursor?: string
+  readonly serializedBytes: number
+}
+
+export interface BrowserRegionImage {
+  readonly snapshotId: string
+  readonly bindingId: string
+  readonly origin: string
+  readonly ref: string
+  readonly capturedAt: string
+  readonly mediaType: 'image/png'
+  readonly width: number
+  readonly height: number
+  readonly data: string
+}
+
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
   if (!value || typeof value !== 'object' || seen.has(value)) return value
   seen.add(value)
