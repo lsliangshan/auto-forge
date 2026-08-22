@@ -13,7 +13,6 @@ import {
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
 import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
 import type { WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
-import { retrieveWorkflows } from '../workflows/retriever.js'
 import { addUsd } from '../billing/decimal-usd.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import {
@@ -31,9 +30,9 @@ import type {
 } from '../chat/model-provider.js'
 import type { ConversationHistoryPort, CurrentMediaMetadata } from '../chat/conversation-context.js'
 import { createWorkflowCatalog, type WorkflowCandidate } from './workflow-catalog.js'
+import { WorkflowRouter, type WorkflowRoutingRequest } from './workflow-router.js'
 
 const MAX_MODEL_TURNS = 8
-const RETRIEVAL_LIMIT = 8
 
 export type ProviderStreamEvent = ModelStreamEvent
 
@@ -216,7 +215,6 @@ export interface AgentOrchestratorDependencies {
   history: ConversationHistoryPort
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
-  retrieve?: typeof retrieveWorkflows
   id?: () => string
   now?: () => number
   developerMode?: () => boolean
@@ -307,12 +305,10 @@ export class AgentOrchestrator {
   private readonly activeByRequest = new Map<string, ActiveAgentRun>()
   private readonly activeByExecution = new Map<string, ActiveAgentRun>()
   private readonly activeByConversation = new Map<string, string>()
-  private readonly retrieve: typeof retrieveWorkflows
   private readonly id: () => string
   private readonly now: () => number
 
   constructor(private readonly dependencies: AgentOrchestratorDependencies) {
-    this.retrieve = dependencies.retrieve ?? retrieveWorkflows
     this.id = dependencies.id ?? randomUUID
     this.now = dependencies.now ?? Date.now
   }
@@ -389,14 +385,12 @@ export class AgentOrchestrator {
           workflows: this.dependencies.workflows,
           selectorFor: this.dependencies.createSourceSelector,
         }).create({ developerMode: this.dependencies.developerMode?.() ?? false })
-        const selectedWorkflows = this.retrieve(
-          input.content,
-          catalog.map(({ workflow }) => workflow),
-          RETRIEVAL_LIMIT,
-        )
-        const candidates = selectedWorkflows.flatMap((workflow) => {
-          const candidate = catalog.find(({ workflow: snapshot }) => snapshot === workflow)
-          return candidate ? [candidate] : []
+        const candidates = await new WorkflowRouter().route({
+          query: input.content,
+          candidates: catalog,
+          ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
+          select: (request) => this.selectWorkflowRouting(active!, request),
+          signal: active.controller.signal,
         })
         active.tools = candidates.map(({ tool }) => tool)
         active.workflows = new Map(candidates.map((candidate) => [candidate.toolName, candidate]))
@@ -574,11 +568,7 @@ export class AgentOrchestrator {
         if (active.cancelled) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       }
       if (turnUsage) {
-        active.inputTokens = (active.inputTokens ?? 0) + turnUsage.inputTokens
-        active.outputTokens = (active.outputTokens ?? 0) + turnUsage.outputTokens
-        if (turnUsage.costUsd !== undefined) {
-          active.costUsd = addUsd([active.costUsd ?? '0', turnUsage.costUsd])
-        }
+        this.addUsage(active, turnUsage)
       }
 
       if (toolCalls.length === 1) {
@@ -592,6 +582,55 @@ export class AgentOrchestrator {
       return this.finish(active, 'failed', appFailure('MODEL_PROVIDER_REQUEST_FAILED'))
     }
     return this.finish(active, 'failed', appFailure('MODEL_PROVIDER_REQUEST_FAILED'))
+  }
+
+  private async selectWorkflowRouting(
+    active: ActiveAgentRun,
+    request: WorkflowRoutingRequest,
+  ): Promise<string> {
+    let text = ''
+    let finishReason: string | undefined
+    let usageRecorded = false
+    for await (const event of trackProviderStream({
+      operationKey: `agent:${active.requestId}:workflow-routing`,
+      attribution: {
+        userId: active.userId,
+        requestId: active.requestId,
+        chatRunId: active.runId,
+        model: active.model,
+        modality: 'text',
+      },
+      request: {
+        model: active.model,
+        messages: request.messages,
+        signal: request.signal,
+        endUserId: active.userId,
+      },
+      provider: active.providerSnapshot,
+      providerUsage: this.dependencies.providerUsage,
+      id: this.id,
+      now: this.now,
+    })) {
+      if (event.type === 'usage' && !usageRecorded) {
+        this.addUsage(active, event)
+        usageRecorded = true
+      }
+      if (active.cancelled || request.signal.aborted) continue
+      if ('choiceIndex' in event && event.choiceIndex !== 0) continue
+      if (event.type === 'text_delta') text += event.text
+      if (event.type === 'finish') finishReason = event.reason
+    }
+    if (active.cancelled || request.signal.aborted) throw appFailure('CANCELLED')
+    if (finishReason !== 'stop' || !text.trim()) throw appFailure('MODEL_PROVIDER_REQUEST_FAILED')
+    return text.trim()
+  }
+
+  private addUsage(active: ActiveAgentRun, usage: Extract<ModelStreamEvent, { type: 'usage' }>): void {
+    active.inputTokens = (active.inputTokens ?? 0) + usage.inputTokens
+    active.outputTokens = (active.outputTokens ?? 0) + usage.outputTokens
+    if (usage.costUsd !== undefined) {
+      active.costUsd = addUsd([active.costUsd ?? '0', usage.costUsd])
+    }
   }
 
   private prepareTool(

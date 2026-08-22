@@ -10,7 +10,7 @@ import {
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type { ConversationHistoryPort } from '../chat/conversation-context.js'
-import type { ModelProvider, ModelProviderSnapshot } from '../chat/model-provider.js'
+import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '../chat/model-provider.js'
 import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
@@ -26,6 +26,24 @@ const workflow: WorkflowDetail = {
   activationExamples: ['使用百度搜索今日天气'], activationNegativeExamples: [],
   inputSchema: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'], additionalProperties: false },
   outputSchema: { type: 'object' },
+}
+
+function largeWorkflow(index: number, options: { descriptionPadding?: number } = {}): WorkflowDetail {
+  return {
+    ...workflow,
+    id: `workflow.${index}`,
+    name: `工作流 ${index}`,
+    description: `处理任务 ${index}${'说明'.repeat(options.descriptionPadding ?? 0)}`,
+    codeSha256: String(index).padStart(64, '0'),
+    runtimeIdentity: { id: `workflow.${index}`, version: workflow.version, source: 'installed' },
+    activationExamples: [`执行任务 ${index}`],
+    activationNegativeExamples: [`不要执行任务 ${index}`],
+    inputSchema: {
+      type: 'object',
+      properties: { value: { type: 'string', description: 'x'.repeat(5_000) } },
+      additionalProperties: false,
+    },
+  }
 }
 
 let currentProviderInstances: Record<ModelProviderId, AgentProviderPort>
@@ -96,7 +114,6 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     records,
     providerInstances,
     workflows: { list: async () => [workflow] },
-    retrieve: (_content, workflows) => [...workflows],
     policy: {
       evaluate: () => ({ allowed: false, requiresApproval: true }),
       record: (value) => { records.decisions.push(value); return value as never },
@@ -202,6 +219,138 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.providerUsage.start).toHaveBeenCalledWith(expect.objectContaining({
       apiKeyFingerprint: 'snapshot_fingerprint',
     }))
+  })
+
+  it('routes oversized tools with the same model attribution and invisibly aggregates routing usage', async () => {
+    const dependencies = harness([])
+    const workflows = [largeWorkflow(1), largeWorkflow(2), largeWorkflow(3)]
+    dependencies.workflows.list = async () => workflows
+    const providerInputs: Array<Parameters<ModelProvider['stream']>[0]> = []
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      providerInputs.push(request)
+      return events(providerInputs.length === 1 ? [
+        { type: 'generation', id: 'routing_generation' },
+        { type: 'text_delta', choiceIndex: 0, text: JSON.stringify([
+          'workflow.3\u00001.0.0\u00003',
+          'workflow.1\u00001.0.0\u00001',
+        ]) },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+        { type: 'usage', inputTokens: 2, outputTokens: 3, totalTokens: 5, costUsd: '0.01' },
+      ] : [
+        { type: 'text_delta', choiceIndex: 0, text: '直接回答' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+        { type: 'usage', inputTokens: 5, outputTokens: 7, totalTokens: 12, costUsd: '0.02' },
+      ])
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'conversation_routing', content: '执行第三个再第一个', provider: 'openrouter',
+        model: 'openrouter/model', requestId: 'request_routing',
+      }),
+      contextLength: 32_000,
+    })
+
+    expect(result.status).toBe('completed')
+    expect(providerInputs).toHaveLength(2)
+    expect(providerInputs[0]).toMatchObject({
+      model: 'openrouter/model', endUserId: 'user_1', messages: expect.any(Array),
+    })
+    expect(providerInputs[0]).not.toHaveProperty('tools')
+    expect(JSON.stringify(providerInputs[0])).not.toContain('dataBase64')
+    expect(providerInputs[1]).toMatchObject({
+      model: 'openrouter/model', endUserId: 'user_1',
+      tools: [
+        expect.objectContaining({ function: expect.objectContaining({ name: 'workflow_3' }) }),
+        expect.objectContaining({ function: expect.objectContaining({ name: 'workflow_1' }) }),
+      ],
+    })
+    expect(providerInputs[0]!.signal).toBe(providerInputs[1]!.signal)
+    expect(dependencies.providerUsage.start).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      operationKey: 'agent:request_routing:workflow-routing',
+      userId: 'user_1', requestId: 'request_routing', model: 'openrouter/model',
+      apiKeyFingerprint: 'fingerprint_1', chatRunId: expect.any(String),
+    }))
+    expect(dependencies.providerUsage.start).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      operationKey: 'agent:request_routing:turn:0',
+    }))
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      status: 'completed', inputTokens: 7, outputTokens: 10, costUsd: '0.03',
+      blocks: [{ type: 'text', text: '直接回答' }],
+    })
+    expect(JSON.stringify(dependencies.records.events)).not.toContain('workflow.3\\u0000')
+    expect(dependencies.records.starts).toHaveLength(0)
+  })
+
+  it('fails compact routing overflow before provider selection or workflow execution', async () => {
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => [
+      largeWorkflow(1, { descriptionPadding: 10_000 }),
+      largeWorkflow(2, { descriptionPadding: 10_000 }),
+    ]
+
+    const result = await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'conversation_routing_overflow', content: '执行任务', provider: 'openrouter',
+        model: 'openrouter/model', requestId: 'request_routing_overflow',
+      }),
+      contextLength: 32_000,
+    })
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'CONTEXT_LIMIT_EXCEEDED' } })
+    expect(dependencies.providerInstances.openrouter.stream).not.toHaveBeenCalled()
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.terminal).toEqual([
+      expect.objectContaining({ status: 'failed', errorCode: 'CONTEXT_LIMIT_EXCEEDED' }),
+    ])
+  })
+
+  it('aborts routing without entering a normal model decision or workflow execution', async () => {
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => [largeWorkflow(1), largeWorkflow(2), largeWorkflow(3)]
+    let routingStarted!: () => void
+    let releaseRouting!: () => void
+    const started = new Promise<void>((resolve) => { routingStarted = resolve })
+    const released = new Promise<void>((resolve) => { releaseRouting = resolve })
+    const requests: ModelStreamRequest[] = []
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* (request) {
+      requests.push(request)
+      yield {
+        type: 'usage' as const, inputTokens: 3, outputTokens: 2, totalTokens: 5, costUsd: '0.04',
+      }
+      routingStarted()
+      await released
+      yield {
+        type: 'text_delta' as const, choiceIndex: 0,
+        text: JSON.stringify(['workflow.1\u00001.0.0\u00001']),
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run({
+      ...textRunInput({
+        conversationId: 'conversation_routing_abort', content: '执行任务', provider: 'openrouter',
+        model: 'openrouter/model', requestId: 'request_routing_abort',
+      }),
+      contextLength: 32_000,
+    })
+    await started
+
+    await orchestrator.cancel('request_routing_abort')
+    releaseRouting()
+
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.signal?.aborted).toBe(true)
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.terminal).toEqual([
+      expect.objectContaining({
+        status: 'cancelled', inputTokens: 3, outputTokens: 2, costUsd: '0.04',
+      }),
+    ])
+    expect(dependencies.records.events).toEqual([
+      expect.objectContaining({ type: 'status', status: 'cancelled' }),
+    ])
   })
 
   it('propagates a context compression usage consistency error after terminalizing the durable run', async () => {
@@ -721,13 +870,12 @@ describe('AgentOrchestrator', () => {
     )
   })
 
-  it('skips workflow listing and retrieval when tools are disabled', async () => {
+  it('skips workflow listing when tools are disabled', async () => {
     const dependencies = harness([[
       { type: 'text_delta', choiceIndex: 0, text: '视觉结果' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = vi.fn(async () => { throw new Error('must not list workflows') })
-    dependencies.retrieve = vi.fn(() => { throw new Error('must not retrieve workflows') })
 
     const result = await new AgentOrchestrator(dependencies).run({
       userId: 'user_1',
@@ -748,7 +896,6 @@ describe('AgentOrchestrator', () => {
 
     expect(result.status).toBe('completed')
     expect(dependencies.workflows.list).not.toHaveBeenCalled()
-    expect(dependencies.retrieve).not.toHaveBeenCalled()
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(
       expect.not.objectContaining({ tools: expect.anything() }),
     )
@@ -961,7 +1108,6 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => [twoPermissionWorkflow]
-    dependencies.retrieve = (_content, workflows) => [...workflows]
     dependencies.policy.evaluate = (request) => ({
       allowed: dependencies.records.decisions.some((record) => {
         const value = record as { capability: string; scope: unknown }

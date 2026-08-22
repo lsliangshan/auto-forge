@@ -13,12 +13,19 @@ import {
   currentMediaTokenReserve,
   estimateRequestTokens,
   estimateTextTokens,
+  resolveChatInputBudget,
   type ConversationContextProviderPort,
   type PrepareConversationContextInput,
   serializeHistoricalMessage,
 } from './conversation-context.js'
 
 describe('conversation context primitives', () => {
+  it('uses 60 percent of a positive context length and the 32000 fallback otherwise', () => {
+    expect(resolveChatInputBudget(100_000)).toBe(60_000)
+    expect(resolveChatInputBudget(0)).toBe(19_200)
+    expect(resolveChatInputBudget(undefined)).toBe(19_200)
+  })
+
   it('serializes text, workflows, failures, and attachment metadata without payloads, paths, or asset IDs', () => {
     const message: Message = {
       id: 'm1', conversationId: 'c1', role: 'assistant', ordinal: 1, createdAt: 1,

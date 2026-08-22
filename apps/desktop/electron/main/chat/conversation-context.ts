@@ -167,6 +167,13 @@ export function estimateRequestTokens(input: EstimateRequestTokensInput): number
     + input.currentMedia.reduce((total, media) => total + currentMediaTokenReserve(media), 0)
 }
 
+export function resolveChatInputBudget(contextLength?: number): number {
+  const resolvedContextLength = contextLength !== undefined && contextLength > 0
+    ? contextLength
+    : 32_000
+  return Math.floor(resolvedContextLength * 0.60)
+}
+
 function summaryMessage(summaryText: string): ModelMessage {
   return {
     role: 'system',
@@ -328,7 +335,7 @@ export function createConversationContextManager(
       const contextLength = input.contextLength && input.contextLength > 0
         ? input.contextLength
         : 32_000
-      const chatBudget = Math.floor(contextLength * 0.60)
+      const chatBudget = resolveChatInputBudget(input.contextLength)
       const summaryInputBudget = Math.floor(contextLength * 0.90)
       const summaryOutputTokens = Math.min(2_048, Math.floor(contextLength * 0.10))
 
