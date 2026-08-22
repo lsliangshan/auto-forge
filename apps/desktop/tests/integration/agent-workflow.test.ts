@@ -179,7 +179,7 @@ describe('agent workflow integration', () => {
         requests.push(init ?? {})
         turn += 1
         if (turn === 1) return response([
-          { id: 'generation_tool', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'tool_original', function: { name: 'browser.search.baidu', arguments: '{"keyword":"今日天气"}' } }] }, finish_reason: 'tool_calls' }] },
+          { id: 'generation_tool', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'tool_original', function: { name: 'workflow_1', arguments: '{"input":{"keyword":"今日天气"}}' } }] }, finish_reason: 'tool_calls' }] },
           '[DONE]',
         ])
         return response([
@@ -269,7 +269,7 @@ describe('agent workflow integration', () => {
         },
       },
       fetch: async () => response([
-        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'cancel_tool', function: { name: 'browser.search.baidu', arguments: '{"keyword":"今日天气"}' } }] }, finish_reason: 'tool_calls' }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'cancel_tool', function: { name: 'workflow_1', arguments: '{"input":{"keyword":"今日天气"}}' } }] }, finish_reason: 'tool_calls' }] },
         '[DONE]',
       ]),
     })

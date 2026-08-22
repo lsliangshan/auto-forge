@@ -60,7 +60,7 @@ describe('conversation context primitives', () => {
     const serialized = serializeHistoricalMessage({
       id: 'm4', conversationId: 'c1', role: 'assistant', ordinal: 4, createdAt: 4,
       blocks: [
-        { type: 'approval', executionId: 'execution-secret', workflowId: 'workflow', workflowVersion: '1.0.0', permissionIndex: 0, capability: 'filesystem.write', scope: { paths: ['/Users/private'] }, scopeHash: 'a'.repeat(64) },
+        { type: 'approval', executionId: 'execution-secret', workflowId: 'workflow', workflowName: '工作流', workflowVersion: '1.0.0', source: 'installed', actionSummary: '写入文件', permissionIndex: 0, capability: 'filesystem.write', scope: { paths: ['/Users/private'] }, scopeHash: 'a'.repeat(64) },
         { type: 'workflow_execution', executionId: 'execution-1' },
         { type: 'error', code: 'WORKFLOW_FAILED', message: 'did not complete' },
         { type: 'media_generation', blockId: 'block-secret', jobId: 'job-secret', kind: 'video', status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' },

@@ -30,6 +30,7 @@ import type {
   ModelTool,
 } from '../chat/model-provider.js'
 import type { ConversationHistoryPort, CurrentMediaMetadata } from '../chat/conversation-context.js'
+import { createWorkflowCatalog, type WorkflowCandidate } from './workflow-catalog.js'
 
 const MAX_MODEL_TURNS = 8
 const RETRIEVAL_LIMIT = 8
@@ -252,6 +253,8 @@ interface PendingTool {
   assistantContent: string
   workflow: WorkflowDetail
   sourceSelector: WorkflowExecutionSourceSelector
+  toolName: string
+  resolvedCity?: string
   args: unknown
   executionId: string
   reservation: ExecutionReservation
@@ -270,7 +273,7 @@ interface ActiveAgentRun {
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]
-  workflows: Map<string, WorkflowDetail>
+  workflows: Map<string, WorkflowCandidate>
   controller: AbortController
   modelTurns: number
   busy: boolean
@@ -291,17 +294,6 @@ function appFailure(code: AppError['code']): AppError {
 function asAppError(error: unknown): AppError {
   if (typeof error === 'object' && error !== null && 'code' in error) return toSafeAppError(error)
   return appFailure('INTERNAL_ERROR')
-}
-
-function manifestTool(workflow: WorkflowDetail): ModelTool {
-  return {
-    type: 'function',
-    function: {
-      name: workflow.id,
-      description: workflow.description || workflow.name,
-      parameters: workflow.inputSchema,
-    },
-  }
 }
 
 function samePermission(
@@ -393,13 +385,21 @@ export class AgentOrchestrator {
       }
       this.activeByRequest.set(requestId, active)
       if (input.allowTools) {
-        const candidates = this.retrieve(
+        const catalog = await createWorkflowCatalog({
+          workflows: this.dependencies.workflows,
+          selectorFor: this.dependencies.createSourceSelector,
+        }).create({ developerMode: this.dependencies.developerMode?.() ?? false })
+        const selectedWorkflows = this.retrieve(
           input.content,
-          await this.dependencies.workflows.list({ developerMode: this.dependencies.developerMode?.() ?? false }),
+          catalog.map(({ workflow }) => workflow),
           RETRIEVAL_LIMIT,
         )
-        active.tools = candidates.map(manifestTool)
-        active.workflows = new Map(candidates.map((workflow) => [workflow.id, workflow]))
+        const candidates = selectedWorkflows.flatMap((workflow) => {
+          const candidate = catalog.find(({ workflow: snapshot }) => snapshot === workflow)
+          return candidate ? [candidate] : []
+        })
+        active.tools = candidates.map(({ tool }) => tool)
+        active.workflows = new Map(candidates.map((candidate) => [candidate.toolName, candidate]))
       }
       const historyMessages = await this.dependencies.history.prepare({
         conversationId: input.conversationId,
@@ -599,23 +599,29 @@ export class AgentOrchestrator {
     call: Extract<ModelStreamEvent, { type: 'tool_call' }>,
     assistantContent: string,
   ): AgentRunResult | undefined {
-    const workflow = active.workflows.get(call.name)
-    if (!workflow) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    const candidate = active.workflows.get(call.name)
+    if (!candidate) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    const workflow = candidate.workflow
     try {
-      const validate = new Ajv({ allErrors: true, strict: false }).compile(workflow.inputSchema as object)
+      const validate = new Ajv({ allErrors: true, strict: false }).compile(candidate.tool.function.parameters as object)
       if (!validate(call.arguments)) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
     } catch {
       return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
     }
-    const sourceSelector = this.dependencies.createSourceSelector(workflow)
+    if (typeof call.arguments !== 'object' || call.arguments === null || !('input' in call.arguments)) {
+      return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    }
+    const argumentsWithInput = call.arguments as { input: unknown; resolvedCity?: string }
     const reservation = this.dependencies.executions.reserve()
     const executionId = reservation.executionId
     active.pending = {
       callId: call.id,
       assistantContent,
       workflow,
-      sourceSelector,
-      args: call.arguments,
+      sourceSelector: candidate.selector,
+      toolName: candidate.toolName,
+      ...(argumentsWithInput.resolvedCity === undefined ? {} : { resolvedCity: argumentsWithInput.resolvedCity }),
+      args: argumentsWithInput.input,
       executionId,
       reservation,
       reservationStarted: false,
@@ -651,7 +657,10 @@ export class AgentOrchestrator {
             type: 'approval',
             executionId: pending.executionId,
             workflowId: pending.workflow.id,
+            workflowName: pending.workflow.name,
             workflowVersion: pending.workflow.version,
+            source: pending.workflow.source,
+            actionSummary: `${pending.workflow.name}: ${permission.capability}`,
             permissionIndex: pending.permissionIndex,
             capability: permission.capability,
             scope: permission.scope,
@@ -683,7 +692,9 @@ export class AgentOrchestrator {
     })
     active.messages.push({
       role: 'assistant', content: pending.assistantContent || null,
-      tool_calls: [{ id: pending.callId, type: 'function', function: { name: pending.workflow.id, arguments: JSON.stringify(pending.args) } }],
+      tool_calls: [{ id: pending.callId, type: 'function', function: { name: pending.toolName, arguments: JSON.stringify({
+        ...(pending.resolvedCity === undefined ? {} : { resolvedCity: pending.resolvedCity }), input: pending.args,
+      }) } }],
     })
     active.messages.push({
       role: 'tool', tool_call_id: pending.callId, content: JSON.stringify(execution.result ?? null),

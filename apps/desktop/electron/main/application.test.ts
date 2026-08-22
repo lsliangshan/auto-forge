@@ -1504,7 +1504,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-close-'))
     directories.push(root)
     const chatEvents: ChatEvent[] = []
-    let workflowId = ''
+    const workflowToolName = 'workflow_1'
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [{
         ...modelInfo('openrouter/tools', 'Tools'),
@@ -1517,8 +1517,8 @@ describe('createApplicationRuntime', () => {
           choiceIndex: 0,
           index: 0,
           id: 'call_approval',
-          name: workflowId,
-          arguments: {},
+          name: workflowToolName,
+          arguments: { input: {} },
         }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
       }),
@@ -1536,7 +1536,7 @@ describe('createApplicationRuntime', () => {
         openrouter: { text: 'openrouter/tools' },
       },
     })
-    workflowId = (await installApprovalWorkflow(runtime)).id
+    await installApprovalWorkflow(runtime)
     const conversation = await runtime.services.chat.createConversation()
 
     const { requestId } = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
@@ -1563,7 +1563,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-awaiting-resume-'))
     directories.push(root)
     const chatEvents: ChatEvent[] = []
-    let workflowId = ''
+    const workflowToolName = 'workflow_1'
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [{
         ...modelInfo('openrouter/tools', 'Tools'),
@@ -1576,8 +1576,8 @@ describe('createApplicationRuntime', () => {
           choiceIndex: 0,
           index: 0,
           id: 'call_approval',
-          name: workflowId,
-          arguments: {},
+          name: workflowToolName,
+          arguments: { input: {} },
         }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
       }),
@@ -1595,7 +1595,7 @@ describe('createApplicationRuntime', () => {
         openrouter: { text: 'openrouter/tools' },
       },
     })
-    workflowId = (await installApprovalWorkflow(runtime)).id
+    await installApprovalWorkflow(runtime)
     const conversation = await runtime.services.chat.createConversation()
 
     await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))

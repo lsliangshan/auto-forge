@@ -96,7 +96,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     records,
     providerInstances,
     workflows: { list: async () => [workflow] },
-    retrieve: () => [workflow],
+    retrieve: (_content, workflows) => [...workflows],
     policy: {
       evaluate: () => ({ allowed: false, requiresApproval: true }),
       record: (value) => { records.decisions.push(value); return value as never },
@@ -142,7 +142,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
 }
 
 const toolTurn: ProviderStreamEvent[] = [
-  { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1', name: workflow.id, arguments: { keyword: '今日天气' } },
+  { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1', name: 'workflow_1', arguments: { input: { keyword: '今日天气' } } },
   { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
 ]
 const approvalIdentity = { permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope) }
@@ -471,9 +471,12 @@ describe('AgentOrchestrator', () => {
       tools: [{
         type: 'function',
         function: {
-          name: workflow.id,
-          description: workflow.description,
-          parameters: workflow.inputSchema,
+          name: 'workflow_1',
+          description: expect.stringContaining(workflow.id),
+          parameters: {
+            type: 'object', additionalProperties: false, required: ['input'],
+            properties: { input: workflow.inputSchema },
+          },
         },
       }],
       currentMedia,
@@ -791,6 +794,28 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal.at(-1)).toMatchObject({ status: 'completed' })
   })
 
+  it('keeps a resolved city outside the workflow input passed to the Worker', async () => {
+    const cityWorkflow: WorkflowDetail = { ...workflow, cities: ['北京'] }
+    const cityToolTurn: ProviderStreamEvent[] = [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_city', name: 'workflow_1',
+        arguments: { resolvedCity: '北京', input: { keyword: '今日天气' } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]
+    const dependencies = harness([cityToolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
+    dependencies.workflows.list = async () => [cityWorkflow]
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'city', content: '北京今天天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.starts[0]).toMatchObject({ input: { keyword: '今日天气' } })
+    expect(dependencies.records.starts[0]).not.toMatchObject({ input: expect.objectContaining({ resolvedCity: expect.anything() }) })
+  })
+
   it('keeps the first normalized media message unchanged across a tool follow-up', async () => {
     const dependencies = harness([])
     const providerInputs: Array<Parameters<AgentProviderPort['stream']>[0]> = []
@@ -908,7 +933,7 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => [twoPermissionWorkflow]
-    dependencies.retrieve = () => [twoPermissionWorkflow]
+    dependencies.retrieve = (_content, workflows) => [...workflows]
     dependencies.policy.evaluate = (request) => ({
       allowed: dependencies.records.decisions.some((record) => {
         const value = record as { capability: string; scope: unknown }
