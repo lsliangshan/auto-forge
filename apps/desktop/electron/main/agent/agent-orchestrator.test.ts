@@ -2918,7 +2918,7 @@ describe('AgentOrchestrator', () => {
     })
 
     await expect(new AgentOrchestrator(dependencies).run(textRunInput({
-      conversationId: 'browser_conversation', content: '打开证件详情', provider: 'openrouter', model: 'model',
+      conversationId: 'browser_conversation', content: '请点击证件详情', provider: 'openrouter', model: 'model',
     }))).resolves.toMatchObject({ status: 'completed' })
 
     expect(browser.executor.execute).toHaveBeenCalledTimes(2)
@@ -2927,6 +2927,115 @@ describe('AgentOrchestrator', () => {
       expect.objectContaining({ actions: [{ type: 'click', ref: 'ref_detail' }] }),
       expect.any(Object),
     )
+  })
+
+  it.each([
+    {
+      name: 'Chinese click negation',
+      content: '不要点击证件详情',
+      node: { ref: 'ref_target', role: 'button', name: '证件详情', enabled: true, actions: ['click'] as const },
+      action: { type: 'click' as const, ref: 'ref_target' },
+    },
+    {
+      name: 'Chinese view-only fill contradiction',
+      content: '只查看姓名 Alice，不要修改/填写姓名 Alice',
+      node: { ref: 'ref_target', role: 'textbox', name: '姓名', enabled: true, actions: ['fill'] as const },
+      action: {
+        type: 'fill' as const, ref: 'ref_target', value: 'Alice', source: { kind: 'current_user' as const },
+      },
+    },
+    {
+      name: 'English click negation',
+      content: 'Do not click Certificate Details',
+      node: {
+        ref: 'ref_target', role: 'button', name: 'Certificate Details', enabled: true, actions: ['click'] as const,
+      },
+      action: { type: 'click' as const, ref: 'ref_target' },
+    },
+    {
+      name: 'English uncheck negation',
+      content: 'Do not uncheck Terms Consent',
+      node: {
+        ref: 'ref_target', role: 'checkbox', name: 'Terms Consent', checked: true,
+        enabled: true, actions: ['check'] as const,
+      },
+      action: {
+        type: 'check' as const, ref: 'ref_target', checked: false, source: { kind: 'current_user' as const },
+      },
+    },
+  ])('denies $name before page target overlap can authorize it', async ({ content, node, action }) => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'negated_inspect_call',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '按页面说明操作' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'negated_action_call',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [action],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => tool === 'browser_session_inspect'
+        ? inspectedSnapshot([node])
+        : { kind: 'success', data: { completedActions: 1 } },
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content, provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).toHaveBeenCalledOnce()
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0].messages)
+      .toContainEqual(expect.objectContaining({
+        role: 'tool', tool_call_id: 'negated_action_call', content: expect.stringContaining('INVALID_INPUT'),
+      }))
+  })
+
+  it('keeps a positive category after a separately negated action category', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'separate_category_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '定位姓名字段' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'separate_category_fill',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{
+            type: 'fill', ref: 'ref_name', value: 'Alice', source: { kind: 'current_user' },
+          }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => tool === 'browser_session_inspect'
+        ? inspectedSnapshot([{
+          ref: 'ref_name', role: 'textbox', name: '姓名', enabled: true, actions: ['fill'],
+        }])
+        : { kind: 'success', data: { completedActions: 1 } },
+    })
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation',
+      content: '不要点击证件详情，然后填写姓名 Alice',
+      provider: 'openrouter',
+      model: 'model',
+    }))
+
+    expect(browser.executor.execute).toHaveBeenCalledTimes(2)
   })
 
   it('projects only uniquely requested evidence into a host-owned durable answer', async () => {
@@ -3107,6 +3216,62 @@ describe('AgentOrchestrator', () => {
     }))
 
     expect(exactBrowser.executor.execute).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { name: 'candidate origin with path', content: '继续 https://permit.example.gov.cn/detail', selected: true },
+    { name: 'lookalike host', content: '继续 https://permit.example.gov.cn.evil.test/detail', selected: false },
+    { name: 'userinfo trick', content: '继续 https://permit.example.gov.cn@evil.test/detail', selected: false },
+    {
+      name: 'origin only inside query text',
+      content: '继续 https://evil.test/?next=https://permit.example.gov.cn',
+      selected: false,
+    },
+    { name: 'malformed URL', content: '继续 https://permit.example.gov.cn%2Fevil.test/detail', selected: false },
+  ])('uses parsed exact canonical origins for $name', async ({ content, selected }) => {
+    const bindings = [
+      continuationBinding({ workflowId: 'permit.generic' }),
+      continuationBinding({
+        bindingId: 'binding_2', tabId: 'tab_2', workflowId: 'permit.renew',
+        workflowVersion: '2.0.0', createdAt: 200,
+      }),
+    ]
+    const describe = (binding: BrowserContinuationBinding) => ({
+      workflowLabel: binding.bindingId === 'binding_1' ? '证件' : '证件续期',
+      pageLabel: binding.bindingId === 'binding_1' ? '证件详情' : '证件续期表单',
+      origin: binding.bindingId === 'binding_1'
+        ? 'https://permit.example.gov.cn'
+        : 'https://renew.example.gov.cn',
+      lastActiveAt: binding.createdAt,
+    })
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'origin_binding_call',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取页面' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      bindings,
+      describe,
+      execute: async () => inspectedSnapshot([]),
+    })
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content, provider: 'openrouter', model: 'model',
+    }))
+
+    if (selected) expect(browser.executor.execute).toHaveBeenCalledOnce()
+    else {
+      expect(browser.executor.execute).not.toHaveBeenCalled()
+      expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0].messages)
+        .toContainEqual(expect.objectContaining({
+          role: 'tool', tool_call_id: 'origin_binding_call', content: expect.stringContaining('TARGET_AMBIGUOUS'),
+        }))
+    }
   })
 
   it.each(['cancel', 'takeover'] as const)('discards a late browser result after %s terminalizes the run', async (mode) => {

@@ -476,8 +476,9 @@ function explicitBrowserBinding(
   if (catalog.bindings.size === 1) return catalog.bindings.keys().next().value
   const candidates = [...catalog.bindings.values()]
   const labels = candidates.flatMap((candidate) => [candidate.workflowLabel, candidate.pageLabel])
+  const explicitOrigins = explicitHttpsOrigins(content)
   const matches = candidates.filter((candidate) => {
-    if (content.includes(candidate.origin)) return true
+    if (explicitOrigins.has(candidate.origin)) return true
     return [candidate.workflowLabel, candidate.pageLabel].some((label) => (
       content.includes(label)
       && !labels.some((other) => other !== label && other.includes(label))
@@ -486,14 +487,55 @@ function explicitBrowserBinding(
   return matches.length === 1 ? matches[0]!.bindingId : undefined
 }
 
+function explicitHttpsOrigins(content: string): ReadonlySet<string> {
+  const origins = new Set<string>()
+  const tokens = content.matchAll(/https:\/\/[^\s<>"'“”‘’（）()[\]{}，。；！？]+/giu)
+  for (const match of tokens) {
+    const token = match[0].replace(/[.,;!?，。；！？）)\]}]+$/gu, '')
+    try {
+      const url = new URL(token)
+      if (url.protocol === 'https:' && !url.username && !url.password) origins.add(url.origin)
+    } catch { /* Malformed current-user URL tokens are not selection authority. */ }
+  }
+  return origins
+}
+
+function actionCategoryAuthorized(
+  content: string,
+  positive: RegExp,
+  negative: RegExp,
+): boolean {
+  return !negative.test(content) && positive.test(content)
+}
+
 function browserAuthorization(content: string): BrowserAuthorizationEnvelope {
   const trustedRequest = content.trim().slice(0, 500)
   const mutationTypes: BrowserMutationType[] = []
-  if (/(?:navigate|go\s+to|visit|open|导航|访问|前往|跳转|打开)/iu.test(trustedRequest)) mutationTypes.push('navigate')
-  if (/(?:\b(?:click|press|open|expand)\b|点击|按下|打开|进入|展开)/iu.test(trustedRequest)) mutationTypes.push('click')
-  if (/(?:\b(?:fill|enter|input)\b|\btype\s+(?:in|into)\b|填写|输入|填入)/iu.test(trustedRequest)) mutationTypes.push('fill')
-  if (/(?:select|choose|选择|选中)/iu.test(trustedRequest)) mutationTypes.push('select')
-  if (/(?:\b(?:uncheck|tick|untick|agree)\b|\bcheck\s+(?:the\s+)?(?:box|checkbox)\b|勾选|取消勾选|取消选中|同意)/iu.test(trustedRequest)) mutationTypes.push('check')
+  if (actionCategoryAuthorized(
+    trustedRequest,
+    /(?:\b(?:navigate|visit|open)\b|\bgo\s+to\b|导航|访问|前往|跳转|打开)/iu,
+    /(?:(?:不要|不准|禁止|请勿|不可|不能|别|不得|无需|不需要|不)[^。！？.!?，,；;：:\n]{0,12}(?:导航|访问|前往|跳转|打开)|(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)(?:\s+\w+){0,3}\s+(?:navigate|visit|open|go\s+to)\b)/iu,
+  )) mutationTypes.push('navigate')
+  if (actionCategoryAuthorized(
+    trustedRequest,
+    /(?:\b(?:click|press|open|expand)\b|点击|按下|打开|进入|展开)/iu,
+    /(?:(?:不要|不准|禁止|请勿|不可|不能|别|不得|无需|不需要|不)[^。！？.!?，,；;：:\n]{0,12}(?:点击|按下|打开|进入|展开)|(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)(?:\s+\w+){0,3}\s+(?:click|press|open|expand)\b)/iu,
+  )) mutationTypes.push('click')
+  if (actionCategoryAuthorized(
+    trustedRequest,
+    /(?:\b(?:fill|enter|input)\b|\btype\s+(?:in|into)\b|填写|输入|填入)/iu,
+    /(?:(?:不要|不准|禁止|请勿|不可|不能|别|不得|无需|不需要|不)[^。！？.!?，,；;：:\n]{0,12}(?:修改|填写|输入|填入)|(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)(?:\s+\w+){0,3}\s+(?:modify|edit|fill|enter|input|type)\b)/iu,
+  )) mutationTypes.push('fill')
+  if (actionCategoryAuthorized(
+    trustedRequest,
+    /(?:\b(?:select|choose)\b|选择|选中)/iu,
+    /(?:(?:不要|不准|禁止|请勿|不可|不能|别|不得|无需|不需要|不)[^。！？.!?，,；;：:\n]{0,12}(?:选择|选中)|(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)(?:\s+\w+){0,3}\s+(?:select|choose)\b)/iu,
+  )) mutationTypes.push('select')
+  if (actionCategoryAuthorized(
+    trustedRequest,
+    /(?:\b(?:uncheck|tick|untick|agree)\b|\bcheck\s+(?:the\s+)?(?:box|checkbox)\b|勾选|取消勾选|取消选中|同意)/iu,
+    /(?:(?:不要|不准|禁止|请勿|不可|不能|别|不得|无需|不需要|不)[^。！？.!?，,；;：:\n]{0,12}(?:勾选|选中|同意)|(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)(?:\s+\w+){0,3}\s+(?:check|uncheck|tick|untick|agree)\b)/iu,
+  )) mutationTypes.push('check')
   return Object.freeze({
     inspectIntent: trustedRequest,
     trustedRequest,
