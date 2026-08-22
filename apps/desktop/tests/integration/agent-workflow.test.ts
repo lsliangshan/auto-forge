@@ -35,7 +35,14 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
-const permission = { capability: 'browser.fill' as const, scope: { origins: ['https://www.baidu.com'] } }
+const permission = {
+  capability: 'browser.fill' as const,
+  scope: { origins: ['*.baidu.com/*', 'https://accounts.baidu.com'] },
+}
+const runtimePermission = {
+  capability: permission.capability,
+  scope: { origins: ['https://www.baidu.com'] },
+}
 
 function detail(codeSha256: string): WorkflowDetail & { entryPath: string; codeSha256: string } {
   return {
@@ -76,7 +83,7 @@ class IntegrationWorker extends EventEmitter implements WorkflowWorker {
             this.stdout.write(`${JSON.stringify({ type: 'ready', executionId: request.executionId })}\n`)
             this.stdout.write(`${JSON.stringify({
               type: 'capability_request', requestId: 'capability_1',
-              request: { ...permission, arguments: { locator: '#query', value: '今日天气' } },
+              request: { ...runtimePermission, arguments: { locator: '#query', value: '今日天气' } },
             })}\n`)
           })
         }

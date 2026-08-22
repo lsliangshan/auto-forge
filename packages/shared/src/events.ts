@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { appErrorCodeSchema, appErrorSchema } from './errors.js'
 import {
+  capabilityScopeSchema,
   capabilitySchema,
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
@@ -11,6 +12,16 @@ const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
 const workflowSourceSchema = z.enum(['installed', 'development'])
 const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
+
+function declaredScopeMatchesCapability(capability: string, scope: Record<string, unknown>): boolean {
+  const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
+  const needsPaths = capability.startsWith('filesystem.')
+  return needsOrigins
+    ? 'origins' in scope
+    : needsPaths
+      ? 'paths' in scope
+      : Object.keys(scope).length === 0
+}
 
 const workflowBlockContextSchema = z.object({
   workflowId: identifierSchema,
@@ -87,10 +98,10 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     actionSummary: nonEmptyStringSchema.max(500),
     permissionIndex: z.number().int().nonnegative(),
     capability: capabilitySchema,
-    scope: runtimeCapabilityScopeSchema,
+    scope: capabilityScopeSchema,
     scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
   }).strict().superRefine(({ capability, scope, source, buildHash }, context) => {
-    if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
+    if (!declaredScopeMatchesCapability(capability, scope)) {
       context.addIssue({ code: 'custom', message: 'Approval scope is invalid for this capability' })
     }
     if (source === 'development' && buildHash === undefined) {

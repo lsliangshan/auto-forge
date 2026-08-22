@@ -527,6 +527,16 @@ export class WorkflowToolExecutor {
         input: binding.input,
         ...(input.chatRunId === undefined ? {} : { chatRunId: input.chatRunId }),
         sourceSelector: binding.candidate.selector,
+        agentAuthorization: Object.freeze({
+          permissions: Object.freeze(binding.candidate.workflow.permissions.map((permission, permissionIndex) => (
+            Object.freeze({
+              permissionIndex,
+              capability: permission.capability,
+              scope: permission.scope,
+              scopeHash: scopeHash(permission.scope),
+            })
+          ))),
+        }),
       }, input.signal)
     } catch (error) {
       lifecycle.phase = 'started'

@@ -474,6 +474,11 @@ export class AgentOrchestrator {
     return true
   }
 
+  ownsExecution(executionId: string): boolean {
+    const active = this.activeByExecution.get(executionId)
+    return active !== undefined && !active.terminal
+  }
+
   hasActiveRuns(): boolean {
     return this.activeByRequest.size > 0
   }

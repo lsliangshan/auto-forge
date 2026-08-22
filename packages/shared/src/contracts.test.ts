@@ -932,6 +932,12 @@ describe('cross-process contracts', () => {
     expect(chatBlockSchema.parse(approval)).toMatchObject({
       workflowName: '百度搜索', source: 'development', city: '北京', actionSummary: '打开百度首页',
     })
+    expect(chatBlockSchema.parse({
+      ...approval,
+      scope: { origins: ['*.baidu.com/*', 'https://accounts.baidu.com'] },
+    })).toMatchObject({
+      scope: { origins: ['*.baidu.com/*', 'https://accounts.baidu.com'] },
+    })
     expect(chatBlockSchema.safeParse({ ...approval, actionSummary: 'x'.repeat(501) }).success).toBe(false)
     expect(chatBlockSchema.safeParse({ ...approval, source: 'installed', buildHash: undefined }).success).toBe(true)
     expect(chatBlockSchema.safeParse({ ...approval, buildHash: undefined }).success).toBe(false)

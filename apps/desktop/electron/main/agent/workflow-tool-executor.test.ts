@@ -725,7 +725,8 @@ describe('WorkflowToolExecutor', () => {
   })
 
   it('starts only with validated input and preserves exact selector identity', async () => {
-    const test = harness()
+    const permission = { capability: 'browser.open' as const, scope: { origins: ['https://example.com'] } }
+    const test = harness({ detail: workflow({ permissions: [permission] }) })
     const prepared = await test.executor.prepare({
       candidate: test.candidate,
       arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
@@ -742,6 +743,13 @@ describe('WorkflowToolExecutor', () => {
         userId: 'user_1', workflowId: test.candidate.workflow.id,
         workflowVersion: test.candidate.workflow.version, input: { topic: '居住证' },
         chatRunId: 'run_1', sourceSelector: test.candidate.selector,
+        agentAuthorization: {
+          permissions: [{
+            permissionIndex: 0,
+            ...permission,
+            scopeHash: scopeHash(permission.scope),
+          }],
+        },
       },
       undefined,
     )

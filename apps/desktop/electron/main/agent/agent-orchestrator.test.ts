@@ -1122,6 +1122,39 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal.at(-1)).toMatchObject({ status: 'completed' })
   })
 
+  it.each(['terminal completion', 'cancellation'] as const)(
+    'cleans Agent execution ownership after %s',
+    async (testCase) => {
+      const dependencies = harness([toolTurn, [
+        { type: 'text_delta', choiceIndex: 0, text: 'done' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ]])
+      requireChatApproval(dependencies)
+      const orchestrator = new AgentOrchestrator(dependencies)
+      const pending = await orchestrator.run(textRunInput({
+        conversationId: `ownership_${testCase}`,
+        content: 'search',
+        provider: 'openrouter',
+        model: 'model',
+      }))
+      const ownsExecution = (executionId: string) => (
+        orchestrator as unknown as { ownsExecution(id: string): boolean }
+      ).ownsExecution(executionId)
+
+      expect(ownsExecution(pending.executionId!)).toBe(true)
+      if (testCase === 'terminal completion') {
+        await orchestrator.resumeApproval({
+          executionId: pending.executionId!,
+          ...externalApprovalIdentity,
+          decision: 'once',
+        })
+      } else {
+        await orchestrator.cancelExecution(pending.executionId!)
+      }
+      expect(ownsExecution(pending.executionId!)).toBe(false)
+    },
+  )
+
   it('keeps a resolved city outside the workflow input passed to the Worker', async () => {
     const cityWorkflow: WorkflowDetail = { ...workflow, cities: ['北京'] }
     const cityToolTurn: ProviderStreamEvent[] = [

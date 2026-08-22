@@ -1264,6 +1264,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return result
       },
       decide: async (decision) => {
+        const agentOwned = agent.ownsExecution(decision.executionId)
         let result
         try {
           result = await agent.resumeApproval(decision)
@@ -1271,7 +1272,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           recordFailure(error, 'background-chat')
           throw error
         }
-        if (result.error?.code === 'CONFLICT') await executions.decide(decision)
+        if (result.error?.code === 'CONFLICT' && !agentOwned) await executions.decide(decision)
       },
       cancel: async (executionId) => {
         const cancelledAgent = await agent.cancelExecution(executionId)

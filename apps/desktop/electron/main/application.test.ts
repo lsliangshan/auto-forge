@@ -1619,6 +1619,70 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.close()).rejects.toBe(consistencyError)
   })
 
+  it('never routes an Agent-owned approval to the legacy decision path after a resume conflict', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-routing-'))
+    directories.push(root)
+    const chatEvents: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const,
+          choiceIndex: 0,
+          index: 0,
+          id: 'call_agent_owned',
+          name: 'workflow_1',
+          arguments: { input: {} },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    try {
+      await authenticate(runtime)
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: { text: 'openrouter/tools' },
+        },
+      })
+      await installApprovalWorkflow(runtime)
+      const conversation = await runtime.services.chat.createConversation()
+      await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+      await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+        type: 'block', block: expect.objectContaining({ type: 'approval' }),
+      })))
+      const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block' && event.block.type === 'approval'
+      ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+      vi.spyOn(AgentOrchestrator.prototype, 'resumeApproval').mockResolvedValueOnce({
+        requestId: 'request_conflict', status: 'failed', error: toSafeAppError({ code: 'CONFLICT' }),
+      })
+      const legacyDecision = vi.spyOn(ExecutionService.prototype, 'decide').mockResolvedValueOnce(undefined)
+
+      await runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'always',
+        workflowId: approval.workflowId,
+        workflowVersion: approval.workflowVersion,
+        capability: approval.capability,
+        scope: approval.scope,
+      })
+
+      expect(legacyDecision).not.toHaveBeenCalled()
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('gives a latched consistency error priority over later shutdown failures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-consistency-priority-'))
     directories.push(root)

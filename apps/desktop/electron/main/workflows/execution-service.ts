@@ -133,6 +133,19 @@ export interface ExecutionStartInput {
   sensitivePaths?: readonly string[]
   /** Main-process-only selector. The application resolver accepts only selectors its vault created. */
   sourceSelector: WorkflowExecutionSourceSelector
+  /** Present only for Agent starts whose manifest permissions were authorized in chat. */
+  agentAuthorization?: AgentExecutionAuthorization
+}
+
+export interface AgentAuthorizedPermissionBinding {
+  readonly permissionIndex: number
+  readonly capability: Capability
+  readonly scope: CapabilityScope
+  readonly scopeHash: string
+}
+
+export interface AgentExecutionAuthorization {
+  readonly permissions: readonly AgentAuthorizedPermissionBinding[]
 }
 
 export interface StartedExecution {
@@ -167,6 +180,7 @@ interface ActiveExecution {
   worker: WorkflowWorker
   directory: string
   sensitivePaths: readonly string[]
+  agentAuthorization?: AgentExecutionAuthorization
   buffer: Buffer
   messageQueue: Promise<void>
   pending?: PendingCapability
@@ -226,6 +240,38 @@ function sameExactPermission(
   right: { capability: Capability; scope: CapabilityScope },
 ): boolean {
   return left.capability === right.capability && scopeHash(left.scope) === scopeHash(right.scope)
+}
+
+function snapshotAgentAuthorization(
+  authorization: AgentExecutionAuthorization,
+): AgentExecutionAuthorization {
+  const permissions = authorization.permissions.map((permission) => {
+    const scope = structuredClone(permission.scope)
+    if ('origins' in scope) Object.freeze(scope.origins)
+    if ('paths' in scope) Object.freeze(scope.paths)
+    Object.freeze(scope)
+    return Object.freeze({
+      permissionIndex: permission.permissionIndex,
+      capability: permission.capability,
+      scope,
+      scopeHash: permission.scopeHash,
+    })
+  })
+  return Object.freeze({ permissions: Object.freeze(permissions) })
+}
+
+function agentAuthorizationMatchesWorkflow(
+  authorization: AgentExecutionAuthorization,
+  workflow: WorkflowDetail,
+): boolean {
+  if (authorization.permissions.length !== workflow.permissions.length) return false
+  return authorization.permissions.every((permission, permissionIndex) => {
+    const declared = workflow.permissions[permissionIndex]
+    return declared !== undefined
+      && permission.permissionIndex === permissionIndex
+      && sameExactPermission(permission, declared)
+      && permission.scopeHash === scopeHash(permission.scope)
+  })
 }
 
 function permissionCoversRequest(
@@ -339,9 +385,20 @@ export class ExecutionService {
       record.cancelled = true
       return this.rejectOwnedReservation(record, failure('CANCELLED'))
     }
+    let startInput: ExecutionStartInput
+    try {
+      startInput = {
+        ...input,
+        ...(input.agentAuthorization
+          ? { agentAuthorization: snapshotAgentAuthorization(input.agentAuthorization) }
+          : {}),
+      }
+    } catch {
+      return this.rejectOwnedReservation(record, failure('INVALID_INPUT'))
+    }
     const onAbort = () => { record.cancelled = true }
     signal?.addEventListener('abort', onAbort, { once: true })
-    record.starting = this.startReservation(record, input)
+    record.starting = this.startReservation(record, startInput)
     try {
       return await record.starting
     } catch (error) {
@@ -380,6 +437,9 @@ export class ExecutionService {
       checkCancelled()
       if (!source) throw failure('NOT_FOUND')
       workflow = source.workflow
+      if (input.agentAuthorization && !agentAuthorizationMatchesWorkflow(input.agentAuthorization, workflow)) {
+        throw failure('CAPABILITY_SCOPE_DENIED')
+      }
       entryPath = await this.resolveEntryPath(input, source, checkCancelled)
       checkCancelled()
       directory = await this.temporaryDirectories.create()
@@ -414,6 +474,7 @@ export class ExecutionService {
       worker,
       directory,
       sensitivePaths: input.sensitivePaths ?? [],
+      ...(input.agentAuthorization ? { agentAuthorization: input.agentAuthorization } : {}),
       buffer: Buffer.alloc(0),
       messageQueue: Promise.resolve(),
       timer: setTimeout(() => { void this.finish(id, 'failed', failure('WORKER_TIMEOUT')) }, input.timeoutMs ?? workflow.timeoutMs),
@@ -716,6 +777,38 @@ export class ExecutionService {
       return
     }
     const effectiveRequest = effectiveCapabilityRequest(active.workflow.permissions[permissionIndex]!, request)
+
+    if (active.agentAuthorization) {
+      const authorized = active.agentAuthorization.permissions[permissionIndex]
+      if (!authorized
+        || authorized.permissionIndex !== permissionIndex
+        || !sameExactPermission(authorized, active.workflow.permissions[permissionIndex]!)) {
+        await this.finish(active.id, 'failed', failure('CAPABILITY_SCOPE_DENIED'))
+        return
+      }
+      try {
+        this.dependencies.policy.record({
+          executionId: active.id,
+          workflowId: active.workflow.id,
+          workflowVersion: active.workflow.version,
+          capability: effectiveRequest.capability,
+          scope: effectiveRequest.scope,
+          decision: 'once',
+        })
+      } catch {
+        await this.finish(active.id, 'failed', failure('INTERNAL_ERROR'))
+        return
+      }
+      const pending: PendingCapability = {
+        requestId,
+        request: effectiveRequest,
+        permissionIndex,
+        requiresApproval: false,
+      }
+      active.pending = pending
+      await this.dispatchCapability(active, pending)
+      return
+    }
 
     const evaluation = this.dependencies.policy.evaluate({
       executionId: active.id,

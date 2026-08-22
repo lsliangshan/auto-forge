@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import type { ApprovalDecision, ExecutionEvent, WorkerCapabilityRequest, WorkerRequest, WorkerResponse, WorkflowDetail } from '@autoforge/shared'
 import { workerRequestSchema } from '@autoforge/shared'
 import { describe, expect, it, vi } from 'vitest'
-import type { Execution, ExecutionLog, ExecutionStep } from '../database/repositories.js'
+import type { Execution, ExecutionLog, ExecutionStep, PermissionGrant } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import {
   ExecutionService,
@@ -104,9 +104,9 @@ function createRepositories(): ExecutionRepositories & { records: Map<string, Ex
 
 function createPermissionRepository() {
   return {
-    upsert: <T>(value: T) => value,
-    get: () => undefined,
-    delete: () => undefined,
+    upsert: vi.fn((value: PermissionGrant) => value),
+    get: vi.fn(() => undefined),
+    delete: vi.fn(() => undefined),
   }
 }
 
@@ -158,7 +158,8 @@ function createHarness(options: {
 } = {}) {
   const repositories = createRepositories()
   const workerFactory = new FakeWorkerFactory()
-  const policy = new PolicyEngine(createPermissionRepository())
+  const permissionRepository = createPermissionRepository()
+  const policy = new PolicyEngine(permissionRepository)
   const events: ExecutionEvent[] = []
   const capability = options.capability ?? {
     request: async () => ({ ok: true }),
@@ -194,7 +195,28 @@ function createHarness(options: {
     timeoutMs: options.timeoutMs,
     sourceSelector,
   })
-  return { repositories, workerFactory, policy, events, capability, sourceSelector, service, start }
+  return { repositories, workerFactory, permissionRepository, policy, events, capability, sourceSelector, service, start }
+}
+
+function agentStartInput(
+  selectedWorkflow: WorkflowDetail,
+  sourceSelector: ReturnType<ReturnType<typeof createWorkflowSourceSelectorVault>['create']>,
+) {
+  return {
+    userId: 'user_1',
+    workflowId: selectedWorkflow.id,
+    workflowVersion: selectedWorkflow.version,
+    input: { query: 'weather' },
+    sourceSelector,
+    agentAuthorization: {
+      permissions: selectedWorkflow.permissions.map((permission, permissionIndex) => ({
+        permissionIndex,
+        capability: permission.capability,
+        scope: permission.scope,
+        scopeHash: scopeHash(permission.scope),
+      })),
+    },
+  } as unknown as Parameters<ExecutionService['startReserved']>[1]
 }
 
 async function turn(): Promise<void> {
@@ -643,6 +665,146 @@ describe('ExecutionService', () => {
     expect(harness.repositories.records.get(execution.id)).toMatchObject({ status: 'completed', result: { title: 'weather' } })
   })
 
+  it('uses an Agent-authorized wildcard browser.open scope without a legacy approval', async () => {
+    const agentWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{
+        capability: 'browser.open',
+        scope: { origins: ['*.baidu.com/api/*', 'https://accounts.baidu.com'] },
+      }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: agentWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      agentStartInput(agentWorkflow, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request',
+      requestId: 'agent_open',
+      request: {
+        capability: 'browser.open',
+        scope: { origins: ['https://news.baidu.com'] },
+        arguments: { url: 'https://news.baidu.com/api/weather' },
+      },
+    })
+    await turn()
+
+    expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+    expect(worker.requests).toContainEqual({
+      type: 'capability_result', requestId: 'agent_open', result: { ok: true },
+    })
+    expect(harness.permissionRepository.upsert).not.toHaveBeenCalled()
+
+    worker.respond({ type: 'result', output: { title: 'weather' } })
+    await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it.each(['browser.fill', 'browser.click'] as const)(
+    'converts an Agent-approved declared %s scope into an exact execution-only grant',
+    async (capability) => {
+      const declared = {
+        capability,
+        scope: { origins: ['*.baidu.com/*', 'https://accounts.baidu.com'] },
+      }
+      const agentWorkflow: WorkflowDetail = { ...workflow, permissions: [declared] }
+      const harness = createHarness({
+        source: {
+          workflow: agentWorkflow,
+          rootPath: trustedRootPath,
+          entryPath: 'workers/workflow-runner.ts',
+          integrity: 'valid',
+        },
+      })
+      const record = vi.spyOn(harness.policy, 'record')
+      const reservation = harness.service.reserve()
+      const execution = await harness.service.startReserved(
+        reservation,
+        agentStartInput(agentWorkflow, harness.sourceSelector),
+      )
+      const worker = harness.workerFactory.workers.get(execution.id)!
+      worker.respond({ type: 'ready', executionId: execution.id })
+      worker.respond({
+        type: 'capability_request',
+        requestId: `agent_${capability}`,
+        request: capability === 'browser.fill'
+          ? { capability, scope: { origins: ['https://news.baidu.com'] }, arguments: { locator: '#query', value: 'weather' } }
+          : { capability, scope: { origins: ['https://news.baidu.com'] }, arguments: { locator: '#submit' } },
+      })
+      await turn()
+
+      expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+      expect(record).toHaveBeenCalledWith({
+        executionId: execution.id,
+        workflowId: agentWorkflow.id,
+        workflowVersion: agentWorkflow.version,
+        capability,
+        scope: { origins: ['https://news.baidu.com'] },
+        decision: 'once',
+      })
+      expect(record.mock.calls.some(([permission]) => permission.decision === 'always')).toBe(false)
+      expect(harness.permissionRepository.upsert).not.toHaveBeenCalled()
+      expect(worker.requests).toContainEqual({
+        type: 'capability_result', requestId: `agent_${capability}`, result: { ok: true },
+      })
+      await harness.service.cancel(execution.id)
+    },
+  )
+
+  it.each([
+    {
+      name: 'an origin outside the declared scope',
+      request: {
+        capability: 'browser.open' as const,
+        scope: { origins: ['https://attacker.example'] },
+        arguments: { url: 'https://attacker.example/path' },
+      },
+    },
+    {
+      name: 'a capability absent from the Agent binding',
+      request: {
+        capability: 'browser.fill' as const,
+        scope: { origins: ['https://news.baidu.com'] },
+        arguments: { locator: '#query', value: 'secret' },
+      },
+    },
+  ])('fails an Agent-owned request for $name without a legacy approval', async ({ request }) => {
+    const agentWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{ capability: 'browser.open', scope: { origins: ['*.baidu.com/*'] } }],
+    }
+    const harness = createHarness({
+      source: {
+        workflow: agentWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const reservation = harness.service.reserve()
+    const execution = await harness.service.startReserved(
+      reservation,
+      agentStartInput(agentWorkflow, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'agent_denied', request })
+
+    await expect(execution.finished).resolves.toMatchObject({
+      status: 'failed', errorCode: 'CAPABILITY_SCOPE_DENIED',
+    })
+    expect(harness.events.some((event) => event.type === 'approval_required')).toBe(false)
+  })
+
   it('persists invalid Worker output as failed without a completed terminal event', async () => {
     const harness = createHarness({
       source: {
@@ -732,6 +894,33 @@ describe('ExecutionService', () => {
 
     await expect(harness.service.decide(decision)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(harness.repositories.records.get(execution.id)?.status).toBe('awaiting_approval')
+  })
+
+  it('retains legacy always approval for a manual execution without Agent authorization', async () => {
+    const harness = createHarness()
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'capability_request', requestId: 'manual_request', request: capabilityRequest })
+    await turn()
+
+    await harness.service.decide({
+      executionId: execution.id,
+      permissionIndex: 0,
+      scopeHash: scopeHash(capabilityRequest.scope),
+      decision: 'always',
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: capabilityRequest.capability,
+      scope: capabilityRequest.scope,
+    })
+    await turn()
+
+    expect(harness.permissionRepository.upsert).toHaveBeenCalledTimes(1)
+    expect(worker.requests).toContainEqual({
+      type: 'capability_result', requestId: 'manual_request', result: { ok: true },
+    })
+    await harness.service.cancel(execution.id)
   })
 
   it('rejects undeclared capability scopes before asking for approval', async () => {
