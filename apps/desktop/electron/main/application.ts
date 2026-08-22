@@ -20,6 +20,7 @@ import {
   type ModelProviderId,
   type PermissionGrant,
   type ProviderCredentialStatus,
+  type WorkflowChatAvailability,
   type WorkflowDetail,
   type WorkflowQuery,
   type WorkflowSummary,
@@ -430,13 +431,22 @@ function projectEntries(root: string): Promise<{ files: string[]; directories: s
 
 async function developerProject(project: WorkflowProject): Promise<DeveloperProject> {
   const entries = await projectEntries(project.rootPath)
+  const status = ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
+    ? project.status as DeveloperProject['status']
+    : 'error'
+  const chatAvailability: WorkflowChatAvailability = status === 'invalid' || status === 'error'
+    ? 'invalid'
+    : !project.buildHash
+      ? 'not_built'
+      : status === 'ready'
+        ? 'ready'
+        : 'unbuilt_changes'
   return {
     id: project.id,
     name: project.name,
     rootPath: project.rootPath,
-    status: ['new', 'building', 'ready', 'invalid', 'error'].includes(project.status)
-      ? project.status as DeveloperProject['status']
-      : 'error',
+    status,
+    chatAvailability,
     ...entries,
     updatedAt: new Date(project.updatedAt).toISOString(),
   }

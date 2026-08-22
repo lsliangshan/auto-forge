@@ -16,6 +16,10 @@ function timestamp(value: number): string {
   return new Date(value).toISOString()
 }
 
+function identityKey(workflow: Pick<WorkflowDetail, 'id' | 'version'>): string {
+  return `${workflow.id}\u0000${workflow.version}`
+}
+
 function toDetail(workflow: InstalledWorkflow): WorkflowDetail | undefined {
   const result = validateManifest(workflow.manifest)
   if (!result.valid) return undefined
@@ -32,6 +36,8 @@ function toDetail(workflow: InstalledWorkflow): WorkflowDetail | undefined {
     integrity: workflow.integrityStatus === 'failed' ? 'failed' : workflow.integrityStatus === 'valid' ? 'valid' : 'unchecked',
     updatedAt: timestamp(workflow.updatedAt),
     codeSha256: manifest.codeSha256,
+    cities: manifest.cities ?? [],
+    runtimeIdentity: { id: manifest.id, version: manifest.version, source: 'installed' },
     permissions: manifest.permissions,
     activationExamples: manifest.activationExamples,
     activationNegativeExamples: manifest.activationNegativeExamples,
@@ -55,7 +61,12 @@ export class WorkflowRegistry {
     const development = await Promise.all(
       this.repositories.workflowProjects.list().map((project) => this.getDevelopmentProject(project.id)),
     )
-    return [...installed, ...development.filter((workflow): workflow is WorkflowDetail => workflow !== undefined)]
+    const developmentDetails = development.filter((workflow): workflow is WorkflowDetail => workflow !== undefined)
+    const developmentByIdentity = new Map(developmentDetails.map((workflow) => [identityKey(workflow), workflow]))
+    return [
+      ...installed.filter((workflow) => !developmentByIdentity.has(identityKey(workflow))),
+      ...developmentDetails,
+    ]
   }
 
   async getDevelopmentProject(projectId: string): Promise<WorkflowDetail | undefined> {
@@ -79,6 +90,13 @@ export class WorkflowRegistry {
         integrity: 'valid',
         updatedAt: timestamp(project.updatedAt),
         codeSha256: manifest.codeSha256,
+        cities: manifest.cities ?? [],
+        runtimeIdentity: {
+          id: manifest.id,
+          version: manifest.version,
+          source: 'development',
+          buildHash: project.buildHash,
+        },
         permissions: manifest.permissions,
         activationExamples: manifest.activationExamples,
         activationNegativeExamples: manifest.activationNegativeExamples,

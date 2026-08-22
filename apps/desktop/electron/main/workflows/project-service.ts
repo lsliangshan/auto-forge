@@ -136,6 +136,7 @@ export class WorkflowProjectService {
     const filePath = await this.filePath(projectId, path, true)
     await mkdir(dirname(filePath), { recursive: true })
     await writeFile(filePath, contents, 'utf8')
+    if (path === 'workflow.json' || path === 'src/index.ts') this.persist(projectId, { status: 'new' })
   }
 
   async createEntry(projectId: string, parentPath: string, name: string, kind: 'file' | 'directory'): Promise<void> {

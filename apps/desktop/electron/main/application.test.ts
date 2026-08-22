@@ -3756,6 +3756,58 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('marks edited workflow sources unavailable to chat until an explicit successful build', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-chat-availability-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    const project = await runtime.services.developer.createProject('Chat Availability')
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'new',
+      chatAvailability: 'not_built',
+    })
+
+    await runtime.services.developer.build(project.id)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'ready',
+      chatAvailability: 'ready',
+    })
+
+    await runtime.services.developer.writeFile(project.id, 'src/index.ts', "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ changed: true }) })\n")
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'new',
+      chatAvailability: 'unbuilt_changes',
+    })
+
+    await runtime.services.developer.build(project.id)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'ready',
+      chatAvailability: 'ready',
+    })
+
+    const manifest = JSON.parse(await runtime.services.developer.readFile(project.id, 'workflow.json')) as Record<string, unknown>
+    manifest.description = 'Edited manifest requires another build'
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'new',
+      chatAvailability: 'unbuilt_changes',
+    })
+
+    await runtime.services.developer.build(project.id)
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      id: project.id,
+      status: 'ready',
+      chatAvailability: 'ready',
+    })
+
+    await runtime.close()
+  })
+
   it('returns the titled first input validation error without starting an execution', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-input-error-'))
     directories.push(root)
