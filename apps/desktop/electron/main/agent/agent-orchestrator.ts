@@ -283,6 +283,11 @@ interface ActiveAgentRun {
   inputTokens?: number
   outputTokens?: number
   costUsd?: string
+  workflowRoutingUsage?: {
+    inputTokens: number
+    outputTokens: number
+    costUsd?: string
+  }
 }
 
 function appFailure(code: AppError['code']): AppError {
@@ -590,7 +595,6 @@ export class AgentOrchestrator {
   ): Promise<string> {
     let text = ''
     let finishReason: string | undefined
-    let usageRecorded = false
     for await (const event of trackProviderStream({
       operationKey: `agent:${active.requestId}:workflow-routing`,
       attribution: {
@@ -611,9 +615,12 @@ export class AgentOrchestrator {
       id: this.id,
       now: this.now,
     })) {
-      if (event.type === 'usage' && !usageRecorded) {
-        this.addUsage(active, event)
-        usageRecorded = true
+      if (event.type === 'usage') {
+        active.workflowRoutingUsage = {
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+          ...(event.costUsd === undefined ? {} : { costUsd: event.costUsd }),
+        }
       }
       if (active.cancelled || request.signal.aborted) continue
       if ('choiceIndex' in event && event.choiceIndex !== 0) continue
@@ -773,6 +780,16 @@ export class AgentOrchestrator {
       ? { type: 'error', code: error.code, message: error.message }
       : undefined
     if (errorBlock) blocks.push(errorBlock)
+    const routingUsage = active.workflowRoutingUsage
+    const inputTokens = active.inputTokens === undefined && routingUsage === undefined
+      ? undefined
+      : (active.inputTokens ?? 0) + (routingUsage?.inputTokens ?? 0)
+    const outputTokens = active.outputTokens === undefined && routingUsage === undefined
+      ? undefined
+      : (active.outputTokens ?? 0) + (routingUsage?.outputTokens ?? 0)
+    const costs = [active.costUsd, routingUsage?.costUsd]
+      .filter((cost): cost is string => cost !== undefined)
+    const costUsd = costs.length === 0 ? undefined : addUsd(costs)
     this.dependencies.persistence.finalize({
       runId: active.runId,
       requestId: active.requestId,
@@ -781,9 +798,9 @@ export class AgentOrchestrator {
       status,
       endedAt: this.now(),
       ...(active.generationId ? { generationId: active.generationId } : {}),
-      ...(active.inputTokens === undefined ? {} : { inputTokens: active.inputTokens }),
-      ...(active.outputTokens === undefined ? {} : { outputTokens: active.outputTokens }),
-      ...(active.costUsd === undefined ? {} : { costUsd: active.costUsd }),
+      ...(inputTokens === undefined ? {} : { inputTokens }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+      ...(costUsd === undefined ? {} : { costUsd }),
       ...(error ? { errorCode: error.code } : {}),
     })
     active.blocks = blocks

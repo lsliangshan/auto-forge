@@ -230,16 +230,18 @@ describe('AgentOrchestrator', () => {
       providerInputs.push(request)
       return events(providerInputs.length === 1 ? [
         { type: 'generation', id: 'routing_generation' },
+        { type: 'usage', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
         { type: 'text_delta', choiceIndex: 0, text: JSON.stringify([
           'workflow.3\u00001.0.0\u00003',
           'workflow.1\u00001.0.0\u00001',
         ]) },
         { type: 'finish', choiceIndex: 0, reason: 'stop' },
-        { type: 'usage', inputTokens: 2, outputTokens: 3, totalTokens: 5, costUsd: '0.01' },
+        { type: 'usage', inputTokens: 4, outputTokens: 5, totalTokens: 9, costUsd: '0.03' },
+        { type: 'usage', inputTokens: 4, outputTokens: 5, totalTokens: 9, costUsd: '0.03' },
       ] : [
         { type: 'text_delta', choiceIndex: 0, text: '直接回答' },
         { type: 'finish', choiceIndex: 0, reason: 'stop' },
-        { type: 'usage', inputTokens: 5, outputTokens: 7, totalTokens: 12, costUsd: '0.02' },
+        { type: 'usage', inputTokens: 7, outputTokens: 11, totalTokens: 18, costUsd: '0.04' },
       ])
     })
 
@@ -275,7 +277,7 @@ describe('AgentOrchestrator', () => {
       operationKey: 'agent:request_routing:turn:0',
     }))
     expect(dependencies.records.terminal.at(-1)).toMatchObject({
-      status: 'completed', inputTokens: 7, outputTokens: 10, costUsd: '0.03',
+      status: 'completed', inputTokens: 11, outputTokens: 16, costUsd: '0.07',
       blocks: [{ type: 'text', text: '直接回答' }],
     })
     expect(JSON.stringify(dependencies.records.events)).not.toContain('workflow.3\\u0000')
@@ -316,7 +318,10 @@ describe('AgentOrchestrator', () => {
     dependencies.providerInstances.openrouter.stream = vi.fn(async function* (request) {
       requests.push(request)
       yield {
-        type: 'usage' as const, inputTokens: 3, outputTokens: 2, totalTokens: 5, costUsd: '0.04',
+        type: 'usage' as const, inputTokens: 3, outputTokens: 2, totalTokens: 5,
+      }
+      yield {
+        type: 'usage' as const, inputTokens: 5, outputTokens: 4, totalTokens: 9, costUsd: '0.06',
       }
       routingStarted()
       await released
@@ -345,7 +350,7 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts).toHaveLength(0)
     expect(dependencies.records.terminal).toEqual([
       expect.objectContaining({
-        status: 'cancelled', inputTokens: 3, outputTokens: 2, costUsd: '0.04',
+        status: 'cancelled', inputTokens: 5, outputTokens: 4, costUsd: '0.06',
       }),
     ])
     expect(dependencies.records.events).toEqual([
