@@ -45,6 +45,36 @@ export interface BrowserContinuationLease {
   release(): Promise<void>
 }
 
+export type BrowserValueSource =
+  | { readonly kind: 'current_user' }
+  | { readonly kind: 'history'; readonly messageId: string }
+  | { readonly kind: 'page'; readonly snapshotId: string; readonly ref: string }
+
+export type BrowserAction =
+  | { readonly type: 'fill'; readonly ref: string; readonly value: string; readonly source: BrowserValueSource }
+  | { readonly type: 'select'; readonly ref: string; readonly value: string; readonly source: BrowserValueSource }
+  | { readonly type: 'click'; readonly ref: string }
+  | { readonly type: 'check'; readonly ref: string; readonly checked: boolean; readonly source: BrowserValueSource }
+  | { readonly type: 'navigate'; readonly url: string }
+  | { readonly type: 'scroll'; readonly ref?: string; readonly direction: 'up' | 'down' }
+  | { readonly type: 'wait'; readonly milliseconds: number }
+  | { readonly type: 'focus' }
+
+export interface BrowserContinuationPageState {
+  readonly origin: string
+  readonly url: string
+  readonly navigationEpoch: number
+}
+
+export interface BrowserContinuationResolvedTargetInput {
+  readonly runId: string
+  readonly expectedOrigin: string
+  readonly expectedNavigationEpoch: number
+  readonly backendNodeId: number
+  readonly expectedRole?: string
+  readonly expectedName?: string
+}
+
 export interface BrowserSemanticNode {
   readonly ref: string
   readonly role: string

@@ -1,3 +1,5 @@
+import type { BrowserAction } from '../browser/browser-continuation-types.js'
+
 export type CapabilityRisk = 'safe_navigation' | 'sensitive_read' | 'external_action' | 'unsupported' | 'unknown'
 
 const capabilityRisks: Readonly<Record<string, CapabilityRisk>> = {
@@ -17,4 +19,21 @@ const capabilityRisks: Readonly<Record<string, CapabilityRisk>> = {
 
 export function classifyCapability(capability: string): CapabilityRisk {
   return capabilityRisks[capability] ?? 'unknown'
+}
+
+export function classifyBrowserActionRisk(
+  action: BrowserAction,
+): Extract<CapabilityRisk, 'safe_navigation' | 'external_action'> {
+  switch (action.type) {
+    case 'fill':
+    case 'select':
+    case 'click':
+    case 'check':
+      return 'external_action'
+    case 'navigate':
+    case 'scroll':
+    case 'wait':
+    case 'focus':
+      return 'safe_navigation'
+  }
 }

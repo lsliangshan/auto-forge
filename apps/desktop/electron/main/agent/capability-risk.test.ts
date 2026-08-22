@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { classifyCapability } from './capability-risk.js'
+import { classifyBrowserActionRisk, classifyCapability } from './capability-risk.js'
 
 describe('classifyCapability', () => {
   it.each([
@@ -12,5 +12,27 @@ describe('classifyCapability', () => {
     ['future.unknown', 'unknown'],
   ] as const)('classifies %s as %s', (capability, expected) => {
     expect(classifyCapability(capability)).toBe(expected)
+  })
+})
+
+describe('classifyBrowserActionRisk', () => {
+  it.each([
+    ['fill', 'external_action'], ['select', 'external_action'],
+    ['click', 'external_action'], ['check', 'external_action'],
+    ['navigate', 'safe_navigation'], ['scroll', 'safe_navigation'],
+    ['wait', 'safe_navigation'], ['focus', 'safe_navigation'],
+  ] as const)('classifies %s as %s without accepting a model-supplied risk', (type, expected) => {
+    const action = type === 'fill' || type === 'select'
+      ? { type, ref: 'ref_1', value: 'value', source: { kind: 'current_user' as const } }
+      : type === 'click'
+        ? { type, ref: 'ref_1' }
+        : type === 'check'
+          ? { type, ref: 'ref_1', checked: true, source: { kind: 'current_user' as const } }
+          : type === 'navigate'
+            ? { type, url: 'https://example.com' }
+            : type === 'scroll'
+              ? { type, direction: 'down' as const }
+              : type === 'wait' ? { type, milliseconds: 50 } : { type }
+    expect(classifyBrowserActionRisk(action)).toBe(expected)
   })
 })

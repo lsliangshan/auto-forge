@@ -211,6 +211,98 @@ function deferred<T>() {
 }
 
 describe('ElectronBrowserWorkspace', () => {
+  it('focuses and highlights a continuation ref only through CDP Overlay without DOM mutation', async () => {
+    const { workspace, views, windows } = createHarness(() => ({}))
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/form', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'agent_run_1')
+
+    await workspace.focusContinuation(tab.id)
+    await workspace.highlightContinuationTarget(tab.id, 'ref_submit', {
+      runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 99,
+    })
+    await workspace.clearContinuationHighlight(tab.id)
+
+    expect(windows[0]!.focus).toHaveBeenCalled()
+    expect(views[1]!.webContents.debugger.commands).toEqual(expect.arrayContaining([
+      { method: 'Overlay.enable', params: undefined },
+      { method: 'DOM.scrollIntoViewIfNeeded', params: { backendNodeId: 99 } },
+      { method: 'Overlay.highlightNode', params: expect.objectContaining({ backendNodeId: 99 }) },
+      { method: 'Overlay.hideHighlight', params: undefined },
+    ]))
+    expect(views[1]!.webContents.debugger.commands.some(({ method }) => (
+      method === 'Runtime.callFunctionOn' || method === 'Runtime.evaluate'
+        || method === 'Input.dispatchMouseEvent'
+    ))).toBe(false)
+  })
+
+  it('hides an Overlay highlight when navigation races target highlighting', async () => {
+    const target: { current?: FakeWebContents } = {}
+    const harness = createHarness((method) => {
+      if (method === 'Overlay.highlightNode') {
+        target.current!.currentUrl = 'https://www.baidu.com/changed'
+        target.current!.emit('did-navigate', {}, target.current!.currentUrl)
+      }
+      return {}
+    })
+    const tab = await harness.workspace.acquire(executionInput())
+    target.current = harness.views[1]!.webContents
+    await tab.open('https://www.baidu.com/form', ['https://www.baidu.com'])
+    await harness.workspace.releaseExecution('e1')
+    await harness.workspace.acquireContinuation(tab.id, 'agent_run_1')
+
+    await expect(harness.workspace.highlightContinuationTarget(tab.id, 'ref_submit', {
+      runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 99,
+    })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(target.current!.debugger.commands).toContainEqual({ method: 'Overlay.hideHighlight', params: undefined })
+  })
+
+  it('rechecks continuation target semantics and the requested checkbox state after fixed dispatch', async () => {
+    let accessibleName = '同意须知'
+    const harness = createHarness((method, params) => {
+      const input = params as { backendNodeId?: number } | undefined
+      if (method === 'DOM.describeNode') return {
+        node: { backendNodeId: input?.backendNodeId, nodeName: 'INPUT', attributes: ['type', 'checkbox'] },
+      }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{
+        nodeId: 'ax_checkbox', backendDOMNodeId: input?.backendNodeId, ignored: false,
+        role: { value: 'checkbox' }, name: { value: accessibleName },
+        properties: [{ name: 'checked', value: { value: false } }],
+      }] }
+      if (method === 'DOM.getBoxModel') return { model: { content: [10, 10, 30, 10, 30, 30, 10, 30] } }
+      if (method === 'Page.getLayoutMetrics') return { cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 } }
+      return {}
+    })
+    const tab = await harness.workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/form', ['https://www.baidu.com'])
+    await harness.workspace.releaseExecution('e1')
+    await harness.workspace.acquireContinuation(tab.id, 'agent_run_1')
+    const input = {
+      tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 20,
+      expectedRole: 'checkbox', expectedName: '同意须知',
+      action: {
+        type: 'check' as const, ref: 'ref_agree', checked: true,
+        source: { kind: 'current_user' as const },
+      },
+    }
+
+    await expect(harness.workspace.performContinuationAction(input))
+      .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    const dispatches = harness.views[1]!.webContents.debugger.commands
+      .filter(({ method }) => method === 'Input.dispatchMouseEvent')
+    expect(dispatches).toHaveLength(2)
+
+    accessibleName = '另一个控件'
+    await expect(harness.workspace.performContinuationAction(input))
+      .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(harness.views[1]!.webContents.debugger.commands
+      .filter(({ method }) => method === 'Input.dispatchMouseEvent')).toHaveLength(2)
+  })
+
   it('adapts bounded continuation inspection commands without exposing raw DOM attributes', async () => {
     const respond = (method: string, params?: unknown) => {
       const input = params as { backendNodeId?: number; nodeId?: number; selector?: string } | undefined

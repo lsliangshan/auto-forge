@@ -10,7 +10,10 @@ import type { NetworkProxySnapshot } from '../network/network-proxy-service.js'
 import { canonicalJson } from '../workflows/workflow-security-fingerprint.js'
 import {
   frozenBrowserContinuationProvenance,
+  type BrowserAction,
+  type BrowserContinuationPageState,
   type BrowserContinuationProvenance,
+  type BrowserContinuationResolvedTargetInput,
 } from './browser-continuation-types.js'
 import type {
   BrowserInspectionDomSummary,
@@ -345,6 +348,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private closingViews = false
   private continuationRegistry: BrowserWorkspaceContinuationRegistryPort | undefined
   private readonly pageInvalidationListeners = new Set<(tabId: string) => void>()
+  private readonly highlightedContinuationTabs = new Set<string>()
 
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
@@ -428,6 +432,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     if (state.ownerExecutionId || state.ownerContinuationRunId || state.activeOperations > 0) {
       throw failure('PAGE_BUSY')
     }
+    await this.clearContinuationHighlight(tabId)
     state.ownerContinuationRunId = runId
   }
 
@@ -439,6 +444,112 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   onPageInvalidated(listener: (tabId: string) => void): () => void {
     this.pageInvalidationListeners.add(listener)
     return () => { this.pageInvalidationListeners.delete(listener) }
+  }
+
+  async getContinuationState(tabId: string, runId: string): Promise<BrowserContinuationPageState> {
+    const state = this.continuationState({ tabId, runId })
+    return Object.freeze({
+      origin: originOf(state.view.webContents.getURL()),
+      url: state.view.webContents.getURL(),
+      navigationEpoch: state.navigationEpoch,
+    })
+  }
+
+  async focusContinuation(tabId: string): Promise<void> {
+    const state = this.tabs.get(tabId)
+    if (!state || !state.ownerContinuationRunId) throw failure('CANCELLED')
+    await this.activate(state)
+  }
+
+  async highlightContinuationTarget(
+    tabId: string,
+    ref: string,
+    target: BrowserContinuationResolvedTargetInput,
+  ): Promise<void> {
+    if (!ref || ref.length > 128) throw failure('INVALID_INPUT')
+    const state = this.continuationState({ tabId, runId: target.runId })
+    let highlightSent = false
+    try {
+      await this.restricted(state, [target.expectedOrigin], async () => {
+        this.assertContinuationState(state, target)
+        await this.assertContinuationTarget(state, target)
+        await this.command(state, 'Overlay.enable')
+        this.assertContinuationState(state, target)
+        await this.command(state, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: target.backendNodeId })
+        this.assertContinuationState(state, target)
+        await this.command(state, 'Overlay.highlightNode', {
+          backendNodeId: target.backendNodeId,
+          highlightConfig: {
+            showInfo: true,
+            contentColor: { r: 37, g: 99, b: 235, a: 0.18 },
+            borderColor: { r: 37, g: 99, b: 235, a: 0.95 },
+          },
+        })
+        highlightSent = true
+        this.assertContinuationState(state, target)
+        this.highlightedContinuationTabs.add(tabId)
+      })
+    } catch (error) {
+      if (highlightSent) await this.command(state, 'Overlay.hideHighlight').catch(() => undefined)
+      this.highlightedContinuationTabs.delete(tabId)
+      throw error
+    }
+  }
+
+  async clearContinuationHighlight(tabId: string): Promise<void> {
+    if (!this.highlightedContinuationTabs.has(tabId)) return
+    this.highlightedContinuationTabs.delete(tabId)
+    const state = this.tabs.get(tabId)
+    if (!state || state.closed || state.view.webContents.isDestroyed()) return
+    await this.command(state, 'Overlay.hideHighlight').catch(() => undefined)
+  }
+
+  async performContinuationAction(
+    input: BrowserContinuationResolvedTargetInput & { readonly tabId: string; readonly action: BrowserAction },
+  ): Promise<void> {
+    const state = this.continuationState(input)
+    this.assertContinuationState(state, input)
+    const action = input.action
+    if (action.type === 'focus') {
+      await this.activate(state)
+      this.assertContinuationState(state, input)
+      return
+    }
+    if (action.type === 'navigate') {
+      await this.navigate(state, action.url, [originOf(action.url)])
+      return
+    }
+    await this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      const initialTarget = await this.assertContinuationTarget(state, input)
+      if (action.type === 'wait') {
+        await new Promise<void>((resolve) => { setTimeout(resolve, action.milliseconds) })
+      } else if (action.type === 'scroll') {
+        if (action.ref) {
+          await this.command(state, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: input.backendNodeId })
+        } else {
+          await this.syntheticInput(state, () => this.command(state, 'Input.dispatchMouseEvent', {
+            type: 'mouseWheel', x: 0, y: 0, deltaX: 0,
+            deltaY: action.direction === 'down' ? 560 : -560,
+          }))
+        }
+      } else if (action.type === 'fill' || action.type === 'select') {
+        await this.setContinuationValue(state, input.backendNodeId, action.type, action.value)
+      } else if (action.type === 'check') {
+        if (initialTarget?.checked !== action.checked) {
+          await this.clickContinuationNode(state, input.backendNodeId)
+        }
+        const checked = await this.assertContinuationTarget(state, input)
+        if (checked?.checked !== action.checked) throw failure('PAGE_CHANGED')
+      } else if (action.type === 'click') {
+        await this.clickContinuationNode(state, input.backendNodeId)
+      }
+      if (action.type === 'fill' || action.type === 'select') {
+        await this.assertContinuationTarget(state, input)
+      }
+      this.assertContinuationState(state, input)
+    })
+    await this.renderToolbar().catch(() => undefined)
   }
 
   async readAccessibilitySnapshot(
@@ -726,6 +837,89 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     await this.renderToolbar().catch(() => undefined)
   }
 
+  private async setContinuationValue(
+    state: TargetTabState,
+    backendNodeId: number,
+    kind: 'fill' | 'select',
+    value: string,
+  ): Promise<void> {
+    const resolved = await this.command(state, 'DOM.resolveNode', { backendNodeId }) as {
+      object?: { objectId?: string }
+    }
+    const objectId = resolved.object?.objectId
+    if (!objectId) throw failure('PAGE_CHANGED')
+    const called = await this.command(state, 'Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration: `function(kind, value) {
+        const element = this
+        if (kind === 'select') {
+          if (!(element instanceof HTMLSelectElement)) return false
+          const option = Array.from(element.options).find((candidate) => candidate.value === value || candidate.text.trim() === value)
+          if (!option) return false
+          Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(element, option.value)
+        } else if (element instanceof HTMLInputElement) {
+          if (['checkbox','radio','file','button','submit','reset','image','hidden','password'].includes(element.type)) return false
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(element, value)
+        } else if (element instanceof HTMLTextAreaElement) {
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(element, value)
+        } else if (element.isContentEditable) {
+          element.textContent = value
+        } else return false
+        element.focus()
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }))
+        element.dispatchEvent(new Event('change', { bubbles: true }))
+        return true
+      }`,
+      arguments: [{ value: kind }, { value }],
+      returnByValue: true,
+      awaitPromise: true,
+    }) as { result?: { value?: unknown }; exceptionDetails?: unknown }
+    if (called.exceptionDetails || called.result?.value !== true) throw failure('UNSUPPORTED_CONTROL')
+  }
+
+  private async assertContinuationTarget(
+    state: TargetTabState,
+    target: BrowserContinuationResolvedTargetInput,
+  ): Promise<BrowserInspectionNode | undefined> {
+    if (target.expectedRole === undefined && target.expectedName === undefined) return undefined
+    const current = await this.readInspectionNode(state, target.backendNodeId)
+    this.assertContinuationState(state, target)
+    if (!current
+      || current.ignored
+      || current.dom.hidden
+      || !current.enabled
+      || (target.expectedRole !== undefined
+        && normalizedAccessibilityRole(current.role) !== target.expectedRole)
+      || (target.expectedName !== undefined && current.name !== target.expectedName)) {
+      throw failure('PAGE_CHANGED')
+    }
+    return current
+  }
+
+  private async clickContinuationNode(state: TargetTabState, backendNodeId: number): Promise<void> {
+    await this.command(state, 'DOM.scrollIntoViewIfNeeded', { backendNodeId })
+    const box = await this.nodeBox(state, backendNodeId)
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+    await this.syntheticInput(state, async () => {
+      await this.command(state, 'Input.dispatchMouseEvent', {
+        type: 'mousePressed', x, y, button: 'left', clickCount: 1,
+      })
+      await this.command(state, 'Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
+      })
+    })
+  }
+
+  private async syntheticInput<T>(state: TargetTabState, operation: () => Promise<T>): Promise<T> {
+    state.syntheticInputOperations += 1
+    try {
+      return await operation()
+    } finally {
+      state.syntheticInputOperations -= 1
+    }
+  }
+
   currentUrl(state: TargetTabState): string {
     this.assertOpen(state)
     return state.view.webContents.getURL()
@@ -865,6 +1059,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   }
 
   private handleUserTakeover(state: TargetTabState, force = false): void {
+    void this.clearContinuationHighlight(state.id).catch(() => undefined)
     const runId = state.ownerContinuationRunId
     if (!runId || (!force && state.syntheticInputOperations > 0)) return
     state.ownerContinuationRunId = undefined
@@ -1438,6 +1633,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private handleDestroyed(state: TargetTabState): void {
     if (state.closed) return
     state.closed = true
+    this.highlightedContinuationTabs.delete(state.id)
     this.emitPageInvalidated(state.id)
     this.tabs.delete(state.id)
     if (state.ownerExecutionId) this.removeExecutionTab(state.ownerExecutionId, state)
@@ -1456,6 +1652,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   }
 
   private emitPageInvalidated(tabId: string): void {
+    void this.clearContinuationHighlight(tabId).catch(() => undefined)
     for (const listener of this.pageInvalidationListeners) {
       try { listener(tabId) } catch { /* Inspector cleanup cannot interrupt browser lifecycle. */ }
     }
