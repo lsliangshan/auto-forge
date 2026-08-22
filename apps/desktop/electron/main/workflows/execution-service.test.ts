@@ -322,6 +322,44 @@ describe('ExecutionService', () => {
     expect(harness.workerFactory.specifications).toEqual([])
   })
 
+  it('rejects an installed detail with a different identity before exposing its schema or spawning', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const selector = vault.create(workflow)
+    const wrongDetail = {
+      ...workflow,
+      id: 'browser.search.other',
+      runtimeIdentity: { id: 'browser.search.other', version: workflow.version, source: 'installed' as const },
+      outputSchema: { selected: 'wrong-installed-detail' },
+    }
+    const installed = {
+      workflowId: workflow.id,
+      version: workflow.version,
+      installPath: trustedRootPath,
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'workers/workflow-runner.ts', codeSha256: workflow.codeSha256 },
+    }
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [] },
+        installedWorkflows: { get: () => installed },
+      },
+      registry: {
+        getDevelopmentProject: async () => undefined,
+        get: async () => wrongDetail,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+    const harness = createHarness({ sourceResolver: resolver })
+
+    await expect(resolver.resolve(workflow.id, workflow.version, selector)).resolves.toBeUndefined()
+    const execution = await harness.service.start({
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: selector,
+    })
+
+    await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode: 'NOT_FOUND' })
+    expect(harness.workerFactory.specifications).toEqual([])
+  })
+
   it('uses an unforgeable reservation so pre-start approval remains bound to the worker', async () => {
     const harness = createHarness()
     const reservation = harness.service.reserve()

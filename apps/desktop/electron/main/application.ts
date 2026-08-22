@@ -509,6 +509,8 @@ export function createWorkflowExecutionSourceResolver(
       const workflow = await dependencies.registry.get(id, version, { developerMode: false })
       if (!integrity.valid
         || !workflow
+        || workflow.id !== exact.id
+        || workflow.version !== exact.version
         || workflow.source !== 'installed'
         || workflow.runtimeIdentity.source !== 'installed'
         || workflow.codeSha256 !== exact.codeSha256) return undefined
