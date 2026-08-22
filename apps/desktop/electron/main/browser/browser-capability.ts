@@ -8,6 +8,9 @@ import {
 } from '@autoforge/shared'
 import type { PolicyEngine } from '../permissions/policy-engine.js'
 import type { CapabilityContext, CapabilityPort } from '../workflows/execution-service.js'
+import { canonicalJson } from '../workflows/workflow-security-fingerprint.js'
+import type { BrowserContinuationRegistry } from './browser-continuation-registry.js'
+import type { BrowserContinuationBindingInput } from './browser-continuation-types.js'
 import type { BrowserWorkspacePort, BrowserWorkspaceTab } from './electron-browser-workspace.js'
 
 type BrowserCapability = Extract<Capability, `browser.${string}`>
@@ -31,6 +34,7 @@ export interface BrowserCapabilityServiceOptions {
   authorization: BrowserAuthorizationPort
   workspace: BrowserWorkspacePort
   currentUserId(): Promise<string | undefined> | string | undefined
+  continuationRegistry?: BrowserContinuationRegistry
 }
 
 interface ExecutionBrowserState {
@@ -80,10 +84,8 @@ function assertExactScope(scope: CapabilityScope | undefined, origin: string): B
 }
 
 function sameContext(left: BrowserCapabilityContext, right: BrowserCapabilityContext): boolean {
-  return left.executionId === right.executionId
-    && left.userId === right.userId
-    && left.workflowId === right.workflowId
-    && left.workflowVersion === right.workflowVersion
+  try { return canonicalJson(left) === canonicalJson(right) }
+  catch { return false }
 }
 
 export class PolicyEngineBrowserAuthorization implements BrowserAuthorizationPort {
@@ -108,7 +110,11 @@ export class BrowserCapabilityService implements CapabilityPort {
   private identityEpoch = 0
   private stopped = false
 
-  constructor(private readonly options: BrowserCapabilityServiceOptions) {}
+  constructor(private readonly options: BrowserCapabilityServiceOptions) {
+    if (options.continuationRegistry) {
+      options.workspace.setContinuationRegistry?.(options.continuationRegistry)
+    }
+  }
 
   hasActiveContexts(): boolean {
     return this.executions.size > 0
@@ -142,6 +148,11 @@ export class BrowserCapabilityService implements CapabilityPort {
     this.assertActive(state)
     await tab.open(url, authorizedScope.origins)
     await this.authorizeCurrent(state, 'browser.open', declaredScope)
+    const binding = this.bindingInput(state.context, tab.id)
+    if (binding && this.options.continuationRegistry) {
+      this.options.continuationRegistry.bind(binding)
+      this.options.workspace.markContinuationBound?.(tab.id)
+    }
   }
 
   async fill(
@@ -264,9 +275,7 @@ export class BrowserCapabilityService implements CapabilityPort {
     if (state.tab) return Promise.resolve(state.tab)
     if (state.creation) return state.creation
     const creation = this.options.workspace.acquire({
-      executionId: state.context.executionId,
-      userId: state.context.userId,
-      workflowId: state.context.workflowId,
+      ...state.context,
     }).then(async (tab) => {
       if (state.released || this.executions.get(state.context.executionId) !== state) {
         await this.options.workspace.releaseExecution(state.context.executionId)
@@ -308,5 +317,28 @@ export class BrowserCapabilityService implements CapabilityPort {
 
   private assertActive(state: ExecutionBrowserState): void {
     if (state.released || this.executions.get(state.context.executionId) !== state) throw failure('CANCELLED')
+  }
+
+  private bindingInput(
+    context: BrowserCapabilityContext,
+    tabId: string,
+  ): BrowserContinuationBindingInput | undefined {
+    if (!context.conversationId || !context.chatRunId) return undefined
+    return {
+      tabId,
+      userId: context.userId,
+      conversationId: context.conversationId,
+      chatRunId: context.chatRunId,
+      executionId: context.executionId,
+      workflowId: context.workflowId,
+      workflowVersion: context.workflowVersion,
+      source: context.source,
+      ...(context.buildHash === undefined ? {} : { buildHash: context.buildHash }),
+      securityFingerprint: context.securityFingerprint,
+      permissionMatrix: context.permissionMatrix,
+      ...(context.browserContinuation === undefined
+        ? {}
+        : { browserContinuation: context.browserContinuation }),
+    }
   }
 }

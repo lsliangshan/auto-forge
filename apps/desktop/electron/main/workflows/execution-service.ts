@@ -29,9 +29,14 @@ import type {
   ExecutionLogInput,
   ExecutionStep,
 } from '../database/repositories.js'
+import type { BrowserContinuationPolicy } from '../browser/browser-continuation-types.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import { validateWorkflowOutput } from './output-validation.js'
-import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
+import {
+  browserPermissionMatrix,
+  workflowSecurityFingerprint,
+  type BrowserPermissionMatrix,
+} from './workflow-security-fingerprint.js'
 import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
 import { MAX_WORKFLOW_ARTIFACT_BYTES, readStableRegularFile } from './artifact-reader.js'
 
@@ -71,8 +76,15 @@ export interface TemporaryDirectoryPort {
 export interface CapabilityContext {
   executionId: string
   userId: string
+  conversationId?: string
+  chatRunId?: string
   workflowId: string
   workflowVersion: string
+  source: 'installed' | 'development'
+  buildHash?: string
+  securityFingerprint: string
+  permissionMatrix: BrowserPermissionMatrix
+  browserContinuation?: BrowserContinuationPolicy
 }
 
 export interface CapabilityPort {
@@ -133,6 +145,7 @@ export interface ExecutionStartInput {
   workflowVersion: string
   input: unknown
   chatRunId?: string
+  conversationId?: string
   timeoutMs?: number
   sensitivePaths?: readonly string[]
   /** Main-process-only selector. The application resolver accepts only selectors its vault created. */
@@ -182,6 +195,7 @@ interface ActiveExecution {
   id: string
   userId: string
   workflow: WorkflowDetail
+  capabilityContext: CapabilityContext
   worker: WorkflowWorker
   directory: string
   sensitivePaths: readonly string[]
@@ -271,6 +285,40 @@ function snapshotAgentAuthorization(
     workflowFingerprint: authorization.workflowFingerprint,
     permissions: Object.freeze(permissions),
   })
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (!value || typeof value !== 'object' || seen.has(value)) return value
+  seen.add(value)
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (descriptor && 'value' in descriptor) deepFreeze(descriptor.value, seen)
+  }
+  return Object.freeze(value)
+}
+
+function capabilityContext(
+  executionId: string,
+  input: ExecutionStartInput,
+  workflow: WorkflowDetail,
+): CapabilityContext {
+  return deepFreeze(structuredClone({
+    executionId,
+    userId: input.userId,
+    ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+    ...(input.chatRunId === undefined ? {} : { chatRunId: input.chatRunId }),
+    workflowId: workflow.id,
+    workflowVersion: workflow.version,
+    source: workflow.runtimeIdentity.source,
+    ...(workflow.runtimeIdentity.source === 'development'
+      ? { buildHash: workflow.runtimeIdentity.buildHash }
+      : {}),
+    securityFingerprint: workflowSecurityFingerprint(workflow),
+    permissionMatrix: browserPermissionMatrix(workflow),
+    ...(workflow.browserContinuation === undefined
+      ? {}
+      : { browserContinuation: workflow.browserContinuation }),
+  }))
 }
 
 function agentAuthorizationMatchesWorkflow(
@@ -493,6 +541,7 @@ export class ExecutionService {
       id,
       userId: input.userId,
       workflow,
+      capabilityContext: capabilityContext(id, input, workflow),
       worker,
       directory,
       sensitivePaths: input.sensitivePaths ?? [],
@@ -928,10 +977,7 @@ export class ExecutionService {
   private async dispatchCapability(active: ActiveExecution, pending: PendingCapability): Promise<void> {
     try {
       const result = await this.dependencies.capability.request({
-        executionId: active.id,
-        userId: active.userId,
-        workflowId: active.workflow.id,
-        workflowVersion: active.workflow.version,
+        ...active.capabilityContext,
       }, pending.request)
       if (active.terminal) return
       this.write(active, { type: 'capability_result', requestId: pending.requestId, result: result ?? null })

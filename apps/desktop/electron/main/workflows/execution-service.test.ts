@@ -16,13 +16,14 @@ import {
   ExecutionService,
   NodeWorkerFactory,
   type CapabilityPort,
+  type CapabilityContext,
   type ExecutionRepositories,
   type WorkflowExecutionSourceResolver,
   type WorkflowWorker,
   type WorkflowWorkerFactory,
 } from './execution-service.js'
 import { createWorkflowExecutionSourceResolver } from '../application.js'
-import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
+import { browserPermissionMatrix, workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
 import { createWorkflowSourceSelectorVault } from './workflow-source-selector.js'
 
 class FakeWorker extends EventEmitter implements WorkflowWorker {
@@ -221,6 +222,8 @@ function agentStartInput(
 ) {
   return {
     userId: 'user_1',
+    conversationId: 'conversation_1',
+    chatRunId: 'chat_run_1',
     workflowId: selectedWorkflow.id,
     workflowVersion: selectedWorkflow.version,
     input: { query: 'weather' },
@@ -725,6 +728,74 @@ describe('ExecutionService', () => {
 
     worker.respond({ type: 'result', output: { title: 'weather' } })
     await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+  })
+
+  it('keeps exact continuation identity in Main capability context and out of Worker requests', async () => {
+    const agentWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [
+        { capability: 'browser.open', scope: { origins: ['https://www.baidu.com/*'] } },
+        { capability: 'browser.click', scope: { origins: ['https://actions.baidu.com/*'] } },
+      ],
+      browserContinuation: {
+        auth: { loggedIn: ['role=button[name="账户"]'] },
+        readableRegions: ['css=main'],
+      },
+    }
+    const request = vi.fn(async (
+      _context: CapabilityContext,
+      _request: WorkerCapabilityRequest,
+    ) => ({ ok: true }))
+    const harness = createHarness({
+      capability: { request, closeExecution: vi.fn(async () => undefined) },
+      source: {
+        workflow: agentWorkflow,
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.service.startReserved(
+      harness.service.reserve(),
+      agentStartInput(agentWorkflow, harness.sourceSelector),
+    )
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({
+      type: 'capability_request',
+      requestId: 'agent_open_context',
+      request: {
+        capability: 'browser.open',
+        scope: { origins: ['https://www.baidu.com'] },
+        arguments: { url: 'https://www.baidu.com/start' },
+      },
+    })
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce())
+
+    const capabilityContext = request.mock.calls[0]![0]
+    expect(capabilityContext).toEqual({
+      executionId: execution.id,
+      userId: 'user_1',
+      conversationId: 'conversation_1',
+      chatRunId: 'chat_run_1',
+      workflowId: agentWorkflow.id,
+      workflowVersion: agentWorkflow.version,
+      source: 'installed',
+      securityFingerprint: workflowSecurityFingerprint(agentWorkflow),
+      permissionMatrix: browserPermissionMatrix(agentWorkflow),
+      browserContinuation: agentWorkflow.browserContinuation,
+    })
+    expect(Object.isFrozen(capabilityContext.permissionMatrix)).toBe(true)
+    expect(Object.isFrozen(capabilityContext.permissionMatrix['browser.open'])).toBe(true)
+    expect(Object.isFrozen(capabilityContext.browserContinuation?.auth?.loggedIn)).toBe(true)
+    const workerStart = worker.requests.find((message) => message.type === 'start')!
+    expect(workerStart).not.toHaveProperty('conversationId')
+    expect(workerStart).not.toHaveProperty('chatRunId')
+    expect(workerStart).not.toHaveProperty('securityFingerprint')
+    expect(workerStart).not.toHaveProperty('permissionMatrix')
+    expect(workerStart).not.toHaveProperty('browserContinuation')
+
+    await harness.service.cancel(execution.id)
   })
 
   it.each(['browser.fill', 'browser.click'] as const)(

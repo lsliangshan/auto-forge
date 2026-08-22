@@ -878,6 +878,7 @@ export class AgentOrchestrator {
     let loopStart: { kind: 'started'; executionIndex: number } | undefined
     const started = await this.workflowTools.start(tool, {
       userId: active.userId,
+      conversationId: active.conversationId,
       chatRunId: active.runId,
       signal: active.controller.signal,
       budget: this.toolBudget(active),

@@ -3,8 +3,11 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   ElectronBrowserWorkspace,
   browserPartition,
+  type BrowserWorkspaceAcquireInput,
   type BrowserWorkspaceTab,
 } from './electron-browser-workspace.js'
+import { BrowserContinuationRegistry } from './browser-continuation-registry.js'
+import type { BrowserContinuationBindingInput } from './browser-continuation-types.js'
 
 class FakeSession extends EventEmitter {
   readonly setProxy = vi.fn(async () => undefined)
@@ -153,6 +156,47 @@ async function acquire(
   return workspace.acquire({ executionId, userId, workflowId })
 }
 
+function executionInput(
+  overrides: Partial<BrowserWorkspaceAcquireInput> = {},
+): BrowserWorkspaceAcquireInput {
+  return {
+    executionId: 'e1',
+    userId: 'user_1',
+    conversationId: 'conversation_1',
+    chatRunId: 'chat_run_1',
+    workflowId: 'workflow.one',
+    workflowVersion: '1.0.0',
+    source: 'installed',
+    securityFingerprint: 'a'.repeat(64),
+    permissionMatrix: {
+      'browser.open': ['https://www.baidu.com/*'],
+      'browser.click': ['https://www.baidu.com/*'],
+    },
+    browserContinuation: { readableRegions: ['css=main'] },
+    ...overrides,
+  }
+}
+
+function continuationRegistry(workspace: ElectronBrowserWorkspace) {
+  const rows = new Map<string, unknown>()
+  let id = 0
+  return new BrowserContinuationRegistry({
+    workspace,
+    repository: {
+      insert: vi.fn((value) => { rows.set(value.id, value); return value }),
+      terminate: vi.fn((bindingId, value) => {
+        const current = rows.get(bindingId)
+        if (!current || typeof current !== 'object') return undefined
+        const updated = { ...current, ...value }
+        rows.set(bindingId, updated)
+        return updated as never
+      }),
+    },
+    id: () => `binding_${++id}`,
+    now: () => id,
+  })
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((done) => { resolve = done })
@@ -169,11 +213,15 @@ describe('ElectronBrowserWorkspace', () => {
 
   it('creates one BaseWindow and secure switchable target tabs sharing only the same user session', async () => {
     const { workspace, views, windows, backgroundColor } = createHarness()
-    const first = await acquire(workspace, 'exec_1', 'user_1', 'workflow.one')
+    const first = await workspace.acquire(executionInput({ executionId: 'exec_1' }))
     await workspace.releaseExecution('exec_1')
-    const reused = await acquire(workspace, 'exec_2', 'user_1', 'workflow.one')
-    const secondWorkflow = await acquire(workspace, 'exec_3', 'user_1', 'workflow.two')
-    const secondUser = await acquire(workspace, 'exec_4', 'user_2', 'workflow.one')
+    const reused = await workspace.acquire(executionInput({ executionId: 'exec_2', chatRunId: 'chat_run_2' }))
+    const secondWorkflow = await workspace.acquire(executionInput({
+      executionId: 'exec_3', chatRunId: 'chat_run_3', workflowId: 'workflow.two',
+    }))
+    const secondUser = await workspace.acquire(executionInput({
+      executionId: 'exec_4', chatRunId: 'chat_run_4', userId: 'user_2',
+    }))
 
     expect(windows).toHaveLength(1)
     expect(windows[0]!.options.backgroundColor).toBe('#f3f5f8')
@@ -194,6 +242,114 @@ describe('ElectronBrowserWorkspace', () => {
     expect(targetPreferences[1]).toMatchObject({ partition: browserPartition('user_1') })
     expect(targetPreferences[2]).toMatchObject({ partition: browserPartition('user_2') })
     expect(windows[0]!.children).toHaveLength(2)
+  })
+
+  it('does not reuse across exact provenance changes or silently upgrade an unclaimed tab', async () => {
+    const { workspace } = createHarness()
+    const legacy = await acquire(workspace, 'legacy_execution')
+    await workspace.releaseExecution('legacy_execution')
+    const first = await workspace.acquire(executionInput())
+    await workspace.releaseExecution('e1')
+    const same = await workspace.acquire(executionInput({ executionId: 'e2', chatRunId: 'chat_run_2' }))
+    await workspace.releaseExecution('e2')
+    const otherConversation = await workspace.acquire(executionInput({
+      executionId: 'e3', chatRunId: 'chat_run_3', conversationId: 'conversation_2',
+    }))
+    const otherFingerprint = await workspace.acquire(executionInput({
+      executionId: 'e4', chatRunId: 'chat_run_4', securityFingerprint: 'b'.repeat(64),
+    }))
+    const otherMatrix = await workspace.acquire(executionInput({
+      executionId: 'e5', chatRunId: 'chat_run_5',
+      permissionMatrix: { 'browser.open': ['https://example.com/*'] },
+    }))
+    const otherPolicy = await workspace.acquire(executionInput({
+      executionId: 'e6', chatRunId: 'chat_run_6',
+      browserContinuation: { readableRegions: ['css=article'] },
+    }))
+    const otherVersion = await workspace.acquire(executionInput({
+      executionId: 'e7', chatRunId: 'chat_run_7', workflowVersion: '2.0.0',
+    }))
+    const development = await workspace.acquire(executionInput({
+      executionId: 'e8', chatRunId: 'chat_run_8', source: 'development', buildHash: 'c'.repeat(64),
+    }))
+    await workspace.releaseExecution('e8')
+    const otherBuild = await workspace.acquire(executionInput({
+      executionId: 'e9', chatRunId: 'chat_run_9', source: 'development', buildHash: 'd'.repeat(64),
+    }))
+
+    expect(same.id).toBe(first.id)
+    expect(new Set([
+      legacy.id, first.id, otherConversation.id, otherFingerprint.id, otherMatrix.id, otherPolicy.id,
+      otherVersion.id, development.id, otherBuild.id,
+    ]).size).toBe(9)
+  })
+
+  it('keeps workflow and continuation ownership exclusive and releases takeover synchronously', async () => {
+    const { workspace, views } = createHarness()
+    const tab = await workspace.acquire(executionInput())
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...executionInput(), tabId: tab.id } as BrowserContinuationBindingInput)
+
+    await expect(registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_2',
+    })).rejects.toMatchObject({ code: 'PAGE_BUSY' })
+    await workspace.releaseExecution('e1')
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_2',
+    })
+    await expect(registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_3',
+    })).rejects.toMatchObject({ code: 'PAGE_BUSY' })
+
+    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
+    const replacement = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_3',
+    })
+
+    expect(replacement.ownerRunId).toBe('run_3')
+    await lease.release()
+    await replacement.release()
+  })
+
+  it('inherits a separate binding only for an allowed popup after the parent was bound', async () => {
+    const { workspace, views } = createHarness()
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const input = executionInput()
+    const parent = await workspace.acquire(input)
+    await parent.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    const parentBinding = registry.bind({ ...input, tabId: parent.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(parent.id)
+
+    expect(views[1]!.webContents.windowOpenHandler?.({ url: 'https://www.baidu.com/child' }))
+      .toEqual({ action: 'deny' })
+    await vi.waitFor(() => expect(registry.list('user_1', 'conversation_1')).toHaveLength(2))
+    const child = registry.list('user_1', 'conversation_1').find(({ bindingId }) => bindingId !== parentBinding.bindingId)
+
+    expect(child).toMatchObject({ conversationId: 'conversation_1', workflowId: 'workflow.one' })
+    expect(child?.tabId).not.toBe(parent.id)
+  })
+
+  it('denies a disallowed popup visibly without creating a child binding', async () => {
+    const { workspace, views } = createHarness()
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const input = executionInput()
+    const parent = await workspace.acquire(input)
+    await parent.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    registry.bind({ ...input, tabId: parent.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(parent.id)
+
+    expect(views[1]!.webContents.windowOpenHandler?.({ url: 'https://attacker.example/' }))
+      .toEqual({ action: 'deny' })
+    await vi.waitFor(() => {
+      const toolbar = decodeURIComponent(views[0]!.webContents.loaded.at(-1)!.split(',')[1]!)
+      expect(toolbar).toContain('DOMAIN_BLOCKED')
+    })
+
+    expect(registry.list('user_1', 'conversation_1')).toHaveLength(1)
+    expect(views).toHaveLength(2)
   })
 
   it('initializes a target document before enabling debugger domains', async () => {
@@ -227,7 +383,7 @@ describe('ElectronBrowserWorkspace', () => {
 
   it('keeps one stable loading document while navigation metadata changes', async () => {
     const { workspace, views } = createHarness()
-    await acquire(workspace, 'exec_1')
+    const tab = await acquire(workspace, 'exec_1')
     const toolbar = views[0]!
     const target = views[1]!
 
@@ -249,6 +405,7 @@ describe('ElectronBrowserWorkspace', () => {
     const settledDocument = decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!)
     expect(settledDocument).toContain('最终页面')
     expect(settledDocument).toContain('https://example.com/final')
+    expect(tab.navigationEpoch).toBe(2)
   })
 
   it('starts persistent session setup before the browser toolbar finishes loading', async () => {
@@ -326,6 +483,22 @@ describe('ElectronBrowserWorkspace', () => {
     expect(target.destroyed).toBe(true)
     expect(replacement).not.toBe(first)
     expect(views).toHaveLength(3)
+  })
+
+  it('closes live continuation authority when the bound renderer crashes', async () => {
+    const { workspace, views } = createHarness()
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+
+    views[1]!.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+
+    expect(registry.list('user_1', 'conversation_1')).toEqual([])
+    await expect(registry.acquire('binding_1', {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_after_crash',
+    })).rejects.toMatchObject({ code: 'PAGE_CLOSED' })
   })
 
   it('does not reuse a released tab while its previous execution still has an operation in flight', async () => {

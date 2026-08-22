@@ -14,8 +14,17 @@ import type {
 const context: BrowserCapabilityContext = {
   executionId: 'exec_1',
   userId: 'user_1',
+  conversationId: 'conversation_1',
+  chatRunId: 'chat_run_1',
   workflowId: 'browser.search.baidu',
   workflowVersion: '1.0.0',
+  source: 'installed',
+  securityFingerprint: 'a'.repeat(64),
+  permissionMatrix: {
+    'browser.open': ['https://www.baidu.com/*'],
+    'browser.click': ['https://www.baidu.com/*'],
+  },
+  browserContinuation: { readableRegions: ['css=main'] },
 }
 const baiduScope = { origins: ['https://www.baidu.com'] }
 
@@ -23,15 +32,24 @@ function createHarness() {
   let currentUserId: string | undefined = context.userId
   let currentUrl = 'about:blank'
   const tab: BrowserWorkspaceTab = {
+    id: 'tab_1',
+    navigationEpoch: 0,
     open: vi.fn(async (url) => { currentUrl = url }),
     fill: vi.fn(async () => undefined),
     click: vi.fn(async () => { currentUrl = 'https://www.baidu.com/s?wd=AutoForge' }),
     url: vi.fn(async () => currentUrl),
+    currentOrigin: vi.fn(async () => new URL(currentUrl).origin),
+    focus: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
+  }
+  const continuationRegistry = {
+    bind: vi.fn((input) => ({ ...input, bindingId: 'binding_1', createdAt: 1, status: 'active' as const })),
   }
   const workspace: BrowserWorkspacePort = {
     acquire: vi.fn(async () => tab),
     releaseExecution: vi.fn(async () => undefined),
+    markContinuationBound: vi.fn(),
+    setContinuationRegistry: vi.fn(),
     updateProxy: vi.fn(async () => undefined),
     reset: vi.fn(async () => undefined),
     shutdown: vi.fn(async () => undefined),
@@ -41,11 +59,13 @@ function createHarness() {
     authorization: { authorize },
     workspace,
     currentUserId: () => currentUserId,
+    continuationRegistry: continuationRegistry as never,
   })
   return {
     service,
     tab,
     workspace,
+    continuationRegistry,
     authorize,
     setUrl: (value: string) => { currentUrl = value },
     setCurrentUser: (value: string | undefined) => { currentUserId = value },
@@ -99,7 +119,7 @@ describe('PolicyEngineBrowserAuthorization', () => {
 
 describe('BrowserCapabilityService', () => {
   it('acquires a user-scoped tab and preserves the existing browser workflow contract', async () => {
-    const { service, tab, workspace, authorize } = createHarness()
+    const { service, tab, workspace, authorize, continuationRegistry } = createHarness()
 
     await service.open(context, 'https://www.baidu.com', baiduScope)
     await service.fill(context, 'css=#kw', 'AutoForge', baiduScope)
@@ -107,9 +127,7 @@ describe('BrowserCapabilityService', () => {
     await expect(service.url(context, baiduScope)).resolves.toBe('https://www.baidu.com/s?wd=AutoForge')
 
     expect(workspace.acquire).toHaveBeenCalledWith({
-      executionId: context.executionId,
-      userId: context.userId,
-      workflowId: context.workflowId,
+      ...context,
     } satisfies BrowserWorkspaceAcquireInput)
     expect(tab.open).toHaveBeenCalledWith('https://www.baidu.com', ['https://www.baidu.com'])
     expect(tab.fill).toHaveBeenCalledWith('css=#kw', 'AutoForge', 'https://www.baidu.com')
@@ -117,6 +135,24 @@ describe('BrowserCapabilityService', () => {
     expect(authorize).toHaveBeenCalledWith(context, {
       capability: 'browser.url', scope: { origins: ['https://www.baidu.com'] },
     })
+    expect(continuationRegistry.bind).toHaveBeenCalledWith({ ...context, tabId: tab.id })
+    expect(workspace.markContinuationBound).toHaveBeenCalledWith(tab.id)
+  })
+
+  it('registers only after a successful Agent-owned browser.open and leaves manual starts unbound', async () => {
+    const failed = createHarness()
+    vi.mocked(failed.tab.open).mockRejectedValueOnce(new Error('navigation failed'))
+
+    await expect(failed.service.open(context, 'https://www.baidu.com', baiduScope)).rejects.toThrow()
+    expect(failed.continuationRegistry.bind).not.toHaveBeenCalled()
+    expect(failed.workspace.markContinuationBound).not.toHaveBeenCalled()
+
+    const manual = createHarness()
+    const { conversationId: _conversationId, chatRunId: _chatRunId, ...manualContext } = context
+    await manual.service.open(manualContext, 'https://www.baidu.com', baiduScope)
+
+    expect(manual.continuationRegistry.bind).not.toHaveBeenCalled()
+    expect(manual.workspace.markContinuationBound).not.toHaveBeenCalled()
   })
 
   it('rejects mismatched declared scopes and post-operation cross-origin navigation', async () => {
@@ -197,7 +233,9 @@ describe('BrowserCapabilityService', () => {
   it('cancels an acquire that finishes after terminal cleanup', async () => {
     let resolveAcquire!: (tab: BrowserWorkspaceTab) => void
     const tab: BrowserWorkspaceTab = {
-      open: vi.fn(), fill: vi.fn(), click: vi.fn(), url: vi.fn(), close: vi.fn(),
+      id: 'tab_delayed', navigationEpoch: 0,
+      open: vi.fn(), fill: vi.fn(), click: vi.fn(), url: vi.fn(),
+      currentOrigin: vi.fn(), focus: vi.fn(), close: vi.fn(),
     }
     const workspace: BrowserWorkspacePort = {
       acquire: vi.fn(() => new Promise<BrowserWorkspaceTab>((resolve) => { resolveAcquire = resolve })),

@@ -330,9 +330,31 @@ describe('openAppDatabase', () => {
     expect(() => database.browserTabBindings.insert({
       ...binding, id: 'binding_path_reason', status: 'closed', terminalReason: 'filePath=/tmp/a',
     })).toThrow()
+    expect(() => database.browserTabBindings.terminate(binding.id, {
+      status: 'active', terminalReason: 'CANCELLED', endedAt: 20,
+    } as never)).toThrow()
+    expect(() => database.browserTabBindings.terminate(binding.id, {
+      status: 'closed', terminalReason: 'PAGE_CLOSED', endedAt: -1,
+    })).toThrow()
+    expect(() => database.browserTabBindings.terminate(binding.id, {
+      status: 'closed', terminalReason: 'PAGE_CLOSED', endedAt: 20, unexpected: true,
+    } as never)).toThrow()
+
+    expect(database.browserTabBindings.terminate(binding.id, {
+      status: 'revoked', terminalReason: 'CANCELLED', endedAt: 20,
+    })).toMatchObject({
+      id: binding.id, status: 'revoked', terminalReason: 'CANCELLED', endedAt: 20,
+      permissionMatrix: { 'browser.open': ['https://fw.bjrcgz.gov.cn/*'] },
+    })
+    expect(database.browserTabBindings.terminate('missing_binding', {
+      status: 'closed', terminalReason: 'PAGE_CLOSED', endedAt: 21,
+    })).toBeUndefined()
+    expect(database.browserTabBindings.get(binding.id)).toMatchObject({
+      status: 'revoked', terminalReason: 'CANCELLED', endedAt: 20,
+    })
 
     database.recoverInterrupted()
-    expect(database.browserTabBindings.get(binding.id)).toMatchObject({ status: 'stale', endedAt: expect.any(Number) })
+    expect(database.browserTabBindings.get(binding.id)).toMatchObject({ status: 'revoked', endedAt: 20 })
     database.conversations.delete(conversation.id)
     expect(database.browserTabBindings.get(binding.id)).toBeUndefined()
   })

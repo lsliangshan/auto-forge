@@ -1,6 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { parseBrowserLocator, toSafeAppError, type AppError, type AppErrorCode } from '@autoforge/shared'
+import {
+  matchesHttpsUrlPattern,
+  parseBrowserLocator,
+  toSafeAppError,
+  type AppError,
+  type AppErrorCode,
+} from '@autoforge/shared'
 import type { NetworkProxySnapshot } from '../network/network-proxy-service.js'
+import { canonicalJson } from '../workflows/workflow-security-fingerprint.js'
+import {
+  frozenBrowserContinuationProvenance,
+  type BrowserContinuationProvenance,
+} from './browser-continuation-types.js'
 
 interface Rectangle { x: number; y: number; width: number; height: number }
 interface NavigationEvent { preventDefault(): void }
@@ -72,23 +83,37 @@ interface SessionPort {
 type BaseWindowConstructor = new (options: Record<string, unknown>) => BaseWindowPort
 type WebContentsViewConstructor = new (options?: Record<string, unknown>) => WebContentsViewPort
 
-export interface BrowserWorkspaceAcquireInput {
-  executionId: string
-  userId: string
-  workflowId: string
-}
+export type BrowserWorkspaceAcquireInput = Pick<
+  BrowserContinuationProvenance,
+  'executionId' | 'userId' | 'workflowId'
+> & Partial<Omit<
+  BrowserContinuationProvenance,
+  'executionId' | 'userId' | 'workflowId'
+>>
 
 export interface BrowserWorkspaceTab {
+  readonly id: string
+  readonly navigationEpoch: number
   open(url: string, allowedOrigins: readonly string[]): Promise<void>
   fill(locator: string, value: string, allowedOrigin: string): Promise<void>
   click(locator: string, allowedOrigin: string): Promise<void>
   url(): Promise<string>
+  currentOrigin(): Promise<string>
+  focus(): Promise<void>
   close(): Promise<void>
+}
+
+export interface BrowserWorkspaceContinuationRegistryPort {
+  bindPopup(parentTabId: string, tabId: string): unknown
+  markClosed(tabId: string, reason: AppErrorCode): void
+  markTakenOver(tabId: string, runId: string): void
 }
 
 export interface BrowserWorkspacePort {
   acquire(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab>
   releaseExecution(executionId: string): Promise<void> | void
+  markContinuationBound?(tabId: string): void
+  setContinuationRegistry?(registry: BrowserWorkspaceContinuationRegistryPort): void
   updateProxy(): Promise<void>
   reset(): Promise<void>
   shutdown(): Promise<void>
@@ -109,10 +134,17 @@ interface TargetTabState {
   partition: string
   view: WebContentsViewPort
   ownerExecutionId?: string
+  ownerContinuationRunId?: string
+  continuation?: BrowserContinuationProvenance
+  reuseIdentity?: string
+  continuationBound: boolean
+  popupPatterns?: readonly string[]
+  navigationEpoch: number
   automationOrigins?: readonly string[]
   allowedOrigins?: readonly string[]
   navigationViolation?: AppError
   blockedOrigin?: string
+  blockedErrorCode?: AppErrorCode
   activeOperations: number
   loading: boolean
   closed: boolean
@@ -124,6 +156,41 @@ const navigationDetectionMs = 500
 const postLoadNavigationDetectionMs = 1_000
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
+}
+
+function continuationFromAcquire(
+  input: BrowserWorkspaceAcquireInput,
+): BrowserContinuationProvenance | undefined {
+  if (input.conversationId === undefined || input.chatRunId === undefined
+    || input.workflowVersion === undefined || input.source === undefined
+    || input.securityFingerprint === undefined || input.permissionMatrix === undefined) return undefined
+  return frozenBrowserContinuationProvenance({
+    userId: input.userId,
+    conversationId: input.conversationId,
+    chatRunId: input.chatRunId,
+    executionId: input.executionId,
+    workflowId: input.workflowId,
+    workflowVersion: input.workflowVersion,
+    source: input.source,
+    ...(input.buildHash === undefined ? {} : { buildHash: input.buildHash }),
+    securityFingerprint: input.securityFingerprint,
+    permissionMatrix: input.permissionMatrix,
+    ...(input.browserContinuation === undefined ? {} : { browserContinuation: input.browserContinuation }),
+  })
+}
+
+function continuationReuseIdentity(provenance: BrowserContinuationProvenance): string {
+  return canonicalJson({
+    userId: provenance.userId,
+    conversationId: provenance.conversationId,
+    workflowId: provenance.workflowId,
+    workflowVersion: provenance.workflowVersion,
+    source: provenance.source,
+    buildHash: provenance.buildHash,
+    securityFingerprint: provenance.securityFingerprint,
+    permissionMatrix: provenance.permissionMatrix,
+    browserContinuation: provenance.browserContinuation,
+  })
 }
 
 function originOf(value: string): string {
@@ -170,7 +237,7 @@ function toolbarDocument(tabs: readonly TargetTabState[], activeId: string | und
   const host = loadingHost(address)
   const blockedOrigin = active?.blockedOrigin
   const blocked = blockedOrigin
-    ? `<main class="blocked" role="alert"><div class="blocked-card"><span class="blocked-kicker">SECURITY BLOCK</span><strong>已阻止未授权跳转</strong><p>工作流尝试访问未在精确权限范围内的网站：</p><code>${html(blockedOrigin)}</code><small>请在工作流权限中添加该精确域名并重新构建后重试。</small></div></main>`
+    ? `<main class="blocked" role="alert"><div class="blocked-card"><span class="blocked-kicker">SECURITY BLOCK · ${active?.blockedErrorCode ?? 'CAPABILITY_SCOPE_DENIED'}</span><strong>已阻止未授权跳转</strong><p>工作流尝试访问未在精确权限范围内的网站：</p><code>${html(blockedOrigin)}</code><small>请在工作流权限中添加该精确域名并重新构建后重试。</small></div></main>`
     : ''
   const loading = !blockedOrigin && active?.loading === true
     ? `<main class="loading" role="status" aria-live="polite"><div class="loading-shell"><div class="connection-orbit" aria-hidden="true"><span class="orbit orbit-outer"></span><span class="orbit orbit-inner"></span><span class="orbit-core"></span></div><div class="loading-copy"><span class="loading-kicker">SECURE SESSION</span><strong>正在连接 <span>${html(host)}</span></strong><small>正在建立受保护的网页会话，请稍候</small><div class="progress-track" aria-hidden="true"><span></span></div><div class="connection-stages" aria-hidden="true"><span class="complete">请求站点</span><i></i><span class="current">建立连接</span><i></i><span>等待响应</span></div></div></div></main>`
@@ -194,6 +261,9 @@ class ElectronBrowserTab implements BrowserWorkspaceTab {
     readonly state: TargetTabState,
   ) {}
 
+  get id(): string { return this.state.id }
+  get navigationEpoch(): number { return this.state.navigationEpoch }
+
   open(url: string, allowedOrigins: readonly string[]): Promise<void> {
     return this.workspace.navigate(this.state, url, allowedOrigins)
   }
@@ -210,6 +280,14 @@ class ElectronBrowserTab implements BrowserWorkspaceTab {
     return this.workspace.currentUrl(this.state)
   }
 
+  async currentOrigin(): Promise<string> {
+    return this.workspace.currentOrigin(this.state)
+  }
+
+  focus(): Promise<void> {
+    return this.workspace.focusTab(this.state)
+  }
+
   close(): Promise<void> {
     return this.workspace.closeTab(this.state)
   }
@@ -220,7 +298,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private toolbar: WebContentsViewPort | undefined
   private activeTabId: string | undefined
   private readonly tabs = new Map<string, TargetTabState>()
-  private readonly executions = new Map<string, TargetTabState>()
+  private readonly executions = new Map<string, Set<TargetTabState>>()
   private readonly sessions = new Map<string, SessionPort>()
   private readonly sessionSetups = new Map<string, Promise<SessionPort>>()
   private readonly acquisitions = new Set<Promise<BrowserWorkspaceTab>>()
@@ -229,6 +307,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private lifecycleEpoch = 0
   private shuttingDown = false
   private closingViews = false
+  private continuationRegistry: BrowserWorkspaceContinuationRegistryPort | undefined
 
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
 
@@ -250,21 +329,27 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private async acquireCurrent(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
     if (this.shuttingDown) throw failure('CONFLICT')
     const epoch = this.lifecycleEpoch
-    const existing = [...this.tabs.values()].find((tab) => !tab.closed
-      && !tab.ownerExecutionId
-      && tab.activeOperations === 0
-      && tab.userId === input.userId
-      && tab.workflowId === input.workflowId)
+    const continuation = continuationFromAcquire(input)
+    const reuseIdentity = continuation && continuationReuseIdentity(continuation)
+    const existing = reuseIdentity === undefined
+      ? undefined
+      : [...this.tabs.values()].find((tab) => !tab.closed
+        && !tab.ownerExecutionId
+        && !tab.ownerContinuationRunId
+        && tab.activeOperations === 0
+        && tab.reuseIdentity === reuseIdentity)
     let state: TargetTabState
     try {
-      state = existing ?? await this.createTab(input.userId, input.workflowId)
+      state = existing ?? await this.createTab(input)
     } catch (error) {
       if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
       throw error
     }
     if (epoch !== this.lifecycleEpoch) throw failure('CANCELLED')
     state.ownerExecutionId = input.executionId
-    this.executions.set(input.executionId, state)
+    state.continuation = continuation
+    state.reuseIdentity = reuseIdentity
+    this.addExecutionTab(input.executionId, state)
     try {
       await this.activate(state)
     } catch (error) {
@@ -277,16 +362,46 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   }
 
   async releaseExecution(executionId: string): Promise<void> {
-    const state = this.executions.get(executionId)
-    if (!state) return
+    const states = this.executions.get(executionId)
+    if (!states) return
     this.executions.delete(executionId)
-    if (state.ownerExecutionId === executionId) state.ownerExecutionId = undefined
-    if (state.activeOperations === 0) {
-      state.automationOrigins = undefined
-      state.allowedOrigins = undefined
-      state.navigationViolation = undefined
+    for (const state of states) {
+      if (state.ownerExecutionId === executionId) state.ownerExecutionId = undefined
+      if (state.activeOperations === 0) {
+        state.automationOrigins = undefined
+        state.allowedOrigins = undefined
+        state.navigationViolation = undefined
+      }
     }
     await this.renderToolbar().catch(() => undefined)
+  }
+
+  setContinuationRegistry(registry: BrowserWorkspaceContinuationRegistryPort): void {
+    this.continuationRegistry = registry
+  }
+
+  markContinuationBound(tabId: string): void {
+    const state = this.tabs.get(tabId)
+    if (state && state.continuation) state.continuationBound = true
+  }
+
+  async acquireContinuation(tabId: string, runId: string): Promise<void> {
+    const state = this.tabs.get(tabId)
+    if (!state || state.closed || state.view.webContents.isDestroyed()) throw failure('PAGE_CLOSED')
+    if (state.ownerExecutionId || state.ownerContinuationRunId || state.activeOperations > 0) {
+      throw failure('PAGE_BUSY')
+    }
+    state.ownerContinuationRunId = runId
+  }
+
+  async releaseContinuation(tabId: string, runId: string): Promise<void> {
+    const state = this.tabs.get(tabId)
+    if (state?.ownerContinuationRunId === runId) state.ownerContinuationRunId = undefined
+  }
+
+  async closeContinuation(tabId: string): Promise<void> {
+    const state = this.tabs.get(tabId)
+    if (state) await this.closeTab(state)
   }
 
   async updateProxy(): Promise<void> {
@@ -420,13 +535,21 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     return state.view.webContents.getURL()
   }
 
+  currentOrigin(state: TargetTabState): string {
+    return originOf(this.currentUrl(state))
+  }
+
+  focusTab(state: TargetTabState): Promise<void> {
+    return this.activate(state)
+  }
+
   async closeTab(state: TargetTabState): Promise<void> {
     if (state.closed) return
     state.view.webContents.close()
   }
 
-  private async createTab(userId: string, workflowId: string): Promise<TargetTabState> {
-    const partition = browserPartition(userId)
+  private async createTab(input: BrowserWorkspaceAcquireInput): Promise<TargetTabState> {
+    const partition = browserPartition(input.userId)
     await Promise.all([this.ensureWindow(), this.configureSession(partition)])
     const view = new this.options.WebContentsView({
       webPreferences: {
@@ -443,8 +566,20 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       },
     })
     await view.webContents.loadURL('about:blank')
+    const continuation = continuationFromAcquire(input)
     const state: TargetTabState = {
-      id: randomUUID(), userId, workflowId, partition, view, activeOperations: 0, loading: false, closed: false,
+      id: randomUUID(),
+      userId: input.userId,
+      workflowId: input.workflowId,
+      partition,
+      view,
+      continuation,
+      reuseIdentity: continuation && continuationReuseIdentity(continuation),
+      continuationBound: false,
+      navigationEpoch: 0,
+      activeOperations: 0,
+      loading: false,
+      closed: false,
     }
     this.tabs.set(state.id, state)
     const guard = (event: NavigationEvent, url: string) => this.guardNavigation(state, event, url)
@@ -454,19 +589,95 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     const renderNavigationMetadata = () => {
       if (!state.loading) void this.renderToolbar().catch(() => undefined)
     }
+    const navigationChanged = () => {
+      state.navigationEpoch += 1
+      renderNavigationMetadata()
+    }
     view.webContents.on('page-title-updated', renderNavigationMetadata)
-    view.webContents.on('did-navigate', renderNavigationMetadata)
-    view.webContents.on('did-navigate-in-page', renderNavigationMetadata)
+    view.webContents.on('did-navigate', navigationChanged)
+    view.webContents.on('did-navigate-in-page', navigationChanged)
     view.webContents.on('did-start-loading', () => { this.setLoading(state, true) })
     view.webContents.on('did-stop-loading', () => { this.setLoading(state, false) })
+    view.webContents.on('before-input-event', () => { this.handleUserTakeover(state) })
+    view.webContents.on('before-mouse-event', () => { this.handleUserTakeover(state) })
     view.webContents.on('render-process-gone', () => {
       if (!view.webContents.isDestroyed()) view.webContents.close()
       this.handleDestroyed(state)
     })
     view.webContents.on('destroyed', () => { this.handleDestroyed(state) })
-    view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    view.webContents.setWindowOpenHandler(({ url }) => {
+      this.handleWindowOpen(state, url)
+      return { action: 'deny' }
+    })
     await this.attachDebugger(state)
     return state
+  }
+
+  private handleWindowOpen(parent: TargetTabState, url: string): void {
+    const patterns = parent.continuation?.permissionMatrix['browser.open']
+    if (!parent.continuationBound || !patterns?.some((pattern) => matchesHttpsUrlPattern(pattern, url))) {
+      let blocked = url
+      try { blocked = originOf(url) } catch { /* Keep the bounded toolbar escaping below. */ }
+      this.setBlockedOrigin(parent, blocked, 'DOMAIN_BLOCKED')
+      return
+    }
+    void this.createPopup(parent, url).catch(() => {
+      this.setBlockedOrigin(parent, originOf(url), 'DOMAIN_BLOCKED')
+    })
+  }
+
+  private async createPopup(parent: TargetTabState, url: string): Promise<void> {
+    this.assertOpen(parent)
+    const continuation = parent.continuation
+    if (!continuation || !parent.continuationBound) throw failure('DOMAIN_BLOCKED')
+    const child = await this.createTab(continuation)
+    const patterns = continuation.permissionMatrix['browser.open'] ?? []
+    child.popupPatterns = patterns
+    if (parent.ownerExecutionId) {
+      child.ownerExecutionId = parent.ownerExecutionId
+      this.addExecutionTab(parent.ownerExecutionId, child)
+    }
+    const origin = originOf(url)
+    child.allowedOrigins = [origin]
+    try {
+      await child.view.webContents.loadURL(url)
+      const current = child.view.webContents.getURL()
+      if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, current))) {
+        throw failure('DOMAIN_BLOCKED')
+      }
+      child.automationOrigins = [originOf(current)]
+    } finally {
+      child.allowedOrigins = undefined
+    }
+    try {
+      this.continuationRegistry?.bindPopup(parent.id, child.id)
+      child.continuationBound = this.continuationRegistry !== undefined
+      if (!child.continuationBound) throw failure('PAGE_CLOSED')
+    } catch (error) {
+      await this.closeTab(child)
+      throw error
+    }
+    await this.activate(child)
+  }
+
+  private handleUserTakeover(state: TargetTabState): void {
+    const runId = state.ownerContinuationRunId
+    if (!runId || state.activeOperations > 0) return
+    state.ownerContinuationRunId = undefined
+    this.continuationRegistry?.markTakenOver(state.id, runId)
+  }
+
+  private addExecutionTab(executionId: string, state: TargetTabState): void {
+    const existing = this.executions.get(executionId)
+    if (existing) existing.add(state)
+    else this.executions.set(executionId, new Set([state]))
+  }
+
+  private removeExecutionTab(executionId: string, state: TargetTabState): void {
+    const existing = this.executions.get(executionId)
+    if (!existing) return
+    existing.delete(state)
+    if (existing.size === 0) this.executions.delete(executionId)
   }
 
   private async ensureWindow(): Promise<void> {
@@ -626,19 +837,34 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
   private guardNavigation(state: TargetTabState, event: NavigationEvent, url: string): void {
     let origin: string
     try { origin = originOf(url) } catch { event.preventDefault(); return }
+    if (state.popupPatterns) {
+      if (!state.popupPatterns.some((pattern) => matchesHttpsUrlPattern(pattern, url))) {
+        event.preventDefault()
+        state.navigationViolation = failure('DOMAIN_BLOCKED')
+        this.setBlockedOrigin(state, origin, 'DOMAIN_BLOCKED')
+        return
+      }
+      this.setBlockedOrigin(state, undefined)
+      return
+    }
     const restrictedOrigins = state.allowedOrigins ?? (state.ownerExecutionId ? state.automationOrigins : undefined)
     if (restrictedOrigins && !restrictedOrigins.includes(origin)) {
       event.preventDefault()
       state.navigationViolation = failure('CAPABILITY_SCOPE_DENIED')
-      this.setBlockedOrigin(state, origin)
+      this.setBlockedOrigin(state, origin, 'CAPABILITY_SCOPE_DENIED')
       return
     }
     this.setBlockedOrigin(state, undefined)
   }
 
-  private setBlockedOrigin(state: TargetTabState, origin: string | undefined): void {
-    if (state.closed || state.blockedOrigin === origin) return
+  private setBlockedOrigin(
+    state: TargetTabState,
+    origin: string | undefined,
+    code?: AppErrorCode,
+  ): void {
+    if (state.closed || (state.blockedOrigin === origin && state.blockedErrorCode === code)) return
     state.blockedOrigin = origin
+    state.blockedErrorCode = origin === undefined ? undefined : code
     if (state.id !== this.activeTabId) return
     this.layout()
     void this.renderToolbar().catch(() => undefined)
@@ -656,7 +882,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       throw failure('CAPABILITY_SCOPE_DENIED')
     }
     const executionId = state.ownerExecutionId
-    if (!executionId) throw failure('CANCELLED')
+    const continuationRunId = state.ownerContinuationRunId
+    if (!executionId && !continuationRunId) throw failure('CANCELLED')
     state.activeOperations += 1
     state.allowedOrigins = [...allowedOrigins]
     state.navigationViolation = undefined
@@ -668,7 +895,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       const violation = state.navigationViolation
       if (violation) throw violation
       if (problem) throw problem
-      if (state.ownerExecutionId !== executionId) throw failure('CANCELLED')
+      if (state.ownerExecutionId !== executionId
+        || state.ownerContinuationRunId !== continuationRunId) throw failure('CANCELLED')
       const current = state.view.webContents.getURL()
       if (current !== 'about:blank' && !allowedOrigins.includes(originOf(current))) {
         throw failure('CAPABILITY_SCOPE_DENIED')
@@ -680,7 +908,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       if (state.activeOperations === 0) {
         state.allowedOrigins = undefined
         state.navigationViolation = undefined
-        if (!state.ownerExecutionId) state.automationOrigins = undefined
+        if (!state.ownerExecutionId && !state.ownerContinuationRunId) state.automationOrigins = undefined
       }
     }
   }
@@ -807,7 +1035,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (state.closed) return
     state.closed = true
     this.tabs.delete(state.id)
-    if (state.ownerExecutionId) this.executions.delete(state.ownerExecutionId)
+    if (state.ownerExecutionId) this.removeExecutionTab(state.ownerExecutionId, state)
+    try { this.continuationRegistry?.markClosed(state.id, 'PAGE_CLOSED') } catch { /* Audit persistence cannot revive a closed renderer. */ }
     try {
       if (state.view.webContents.debugger.isAttached()) state.view.webContents.debugger.detach()
     } catch { /* already detached by renderer teardown */ }

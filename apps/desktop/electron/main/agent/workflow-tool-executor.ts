@@ -391,6 +391,7 @@ export class WorkflowToolExecutor {
     pending: PendingWorkflowTool,
     input: {
       userId: string
+      conversationId: string
       chatRunId?: string
       signal?: AbortSignal
       budget: WorkflowToolRunBudget
@@ -497,6 +498,7 @@ export class WorkflowToolExecutor {
         workflowId: binding.candidate.workflow.id,
         workflowVersion: binding.candidate.workflow.version,
         input: binding.input,
+        conversationId: input.conversationId,
         ...(input.chatRunId === undefined ? {} : { chatRunId: input.chatRunId }),
         sourceSelector: binding.candidate.selector,
         agentAuthorization: Object.freeze({

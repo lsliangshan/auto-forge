@@ -97,9 +97,12 @@ function harness(options: {
       deny: executor.deny.bind(executor),
       start: (
         pending: Parameters<WorkflowToolExecutor['start']>[0],
-        input: Omit<Parameters<WorkflowToolExecutor['start']>[1], 'budget'>,
+        input: Omit<Parameters<WorkflowToolExecutor['start']>[1], 'budget' | 'conversationId'>
+          & Partial<Pick<Parameters<WorkflowToolExecutor['start']>[1], 'conversationId'>>,
       ) => (
-        executor.start(pending, { ...input, budget })
+        executor.start(pending, {
+          ...input, conversationId: input.conversationId ?? 'conversation_1', budget,
+        })
       ),
       cancel: executor.cancel.bind(executor),
       toModelResult: executor.toModelResult.bind(executor),
@@ -755,7 +758,9 @@ describe('WorkflowToolExecutor', () => {
     })
     if (prepared.kind !== 'ready') throw new Error('expected ready')
 
-    const started = await test.executor.start(prepared.pending, { userId: 'user_1', chatRunId: 'run_1' })
+    const started = await test.executor.start(prepared.pending, {
+      userId: 'user_1', conversationId: 'conversation_exact', chatRunId: 'run_1',
+    })
 
     expect(started).toMatchObject({ kind: 'started', executionId: 'execution_1' })
     expect(test.executions.startReserved).toHaveBeenCalledWith(
@@ -763,7 +768,7 @@ describe('WorkflowToolExecutor', () => {
       {
         userId: 'user_1', workflowId: test.candidate.workflow.id,
         workflowVersion: test.candidate.workflow.version, input: { topic: '居住证' },
-        chatRunId: 'run_1', sourceSelector: test.candidate.selector,
+        chatRunId: 'run_1', conversationId: 'conversation_exact', sourceSelector: test.candidate.selector,
         agentAuthorization: {
           workflowFingerprint: expect.any(String),
           permissions: [{

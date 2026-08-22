@@ -84,10 +84,14 @@ function createNetworkProxy() {
 function createBrowserWorkspace(): BrowserWorkspacePort {
   let currentUrl = ''
   const tab: BrowserWorkspaceTab = {
+    id: 'tab_test',
+    navigationEpoch: 0,
     open: vi.fn(async (url) => { currentUrl = url }),
     fill: vi.fn(async () => undefined),
     click: vi.fn(async () => undefined),
     url: vi.fn(async () => currentUrl),
+    currentOrigin: vi.fn(async () => new URL(currentUrl).origin),
+    focus: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
   }
   return {

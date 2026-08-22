@@ -1057,6 +1057,9 @@ describe('AgentOrchestrator', () => {
 
     expect(result.status).toBe('completed')
     expect(dependencies.records.starts).toHaveLength(1)
+    expect(dependencies.records.starts[0]).toMatchObject({
+      userId: 'user_1', conversationId: 'safe_navigation', chatRunId: expect.any(String),
+    })
     expect(dependencies.policy.record).toHaveBeenCalledWith(expect.objectContaining({
       executionId: expect.any(String), capability: 'browser.open', decision: 'once',
     }))

@@ -564,6 +564,11 @@ const browserTabBindingSchema = z.object({
     context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Installed browser bindings cannot include a build hash' })
   }
 })
+const browserTabBindingTerminalSchema = z.object({
+  status: z.enum(['revoked', 'closed']),
+  terminalReason: appErrorCodeSchema,
+  endedAt: z.number().int().nonnegative(),
+}).strict()
 const browserActionAuditSchema = z.object({
   id: storedIdentifierSchema,
   bindingId: storedIdentifierSchema,
@@ -757,6 +762,11 @@ export interface AppRepositories {
   browserTabBindings: {
     insert(value: BrowserTabBinding): BrowserTabBinding
     get(id: string): BrowserTabBinding | undefined
+    terminate(id: string, value: {
+      status: 'revoked' | 'closed'
+      terminalReason: AppErrorCode
+      endedAt: number
+    }): BrowserTabBinding | undefined
     markActiveStale(endedAt: number): number
   }
   browserActionAudits: {
@@ -2596,6 +2606,17 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         const row = one<Query>(database, `SELECT ${browserTabBindingColumns} FROM browser_tab_bindings WHERE id = @id`, { id })
         return row && browserTabBindingFromRow(row)
       },
+      terminate: (id, value) => transaction(database, () => {
+        const terminal = browserTabBindingTerminalSchema.parse(value)
+        const updated = database.prepare(`
+          UPDATE browser_tab_bindings
+          SET status = @status, terminal_reason = @terminalReason, ended_at = @endedAt
+          WHERE id = @id AND status = 'active'
+        `).run({ id, ...terminal })
+        if (updated.changes !== 1) return undefined
+        const row = one<Query>(database, `SELECT ${browserTabBindingColumns} FROM browser_tab_bindings WHERE id = @id`, { id })
+        return row && browserTabBindingFromRow(row)
+      }),
       markActiveStale: (endedAt) => transaction(database, () => database.prepare(`
         UPDATE browser_tab_bindings
         SET status = 'stale', ended_at = @endedAt
