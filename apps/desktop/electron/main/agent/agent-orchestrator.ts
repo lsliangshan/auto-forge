@@ -12,6 +12,7 @@ import {
 } from '@autoforge/shared'
 import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
 import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
+import type { WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import { retrieveWorkflows } from '../workflows/retriever.js'
 import { addUsd } from '../billing/decimal-usd.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
@@ -210,6 +211,7 @@ export interface AgentOrchestratorDependencies {
   persistence: AgentPersistencePort
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
   executions: AgentExecutionPort
+  createSourceSelector(workflow: WorkflowDetail): WorkflowExecutionSourceSelector
   history: ConversationHistoryPort
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
@@ -249,6 +251,7 @@ interface PendingTool {
   callId: string
   assistantContent: string
   workflow: WorkflowDetail
+  sourceSelector: WorkflowExecutionSourceSelector
   args: unknown
   executionId: string
   reservation: ExecutionReservation
@@ -604,12 +607,14 @@ export class AgentOrchestrator {
     } catch {
       return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
     }
+    const sourceSelector = this.dependencies.createSourceSelector(workflow)
     const reservation = this.dependencies.executions.reserve()
     const executionId = reservation.executionId
     active.pending = {
       callId: call.id,
       assistantContent,
       workflow,
+      sourceSelector,
       args: call.arguments,
       executionId,
       reservation,
@@ -666,6 +671,7 @@ export class AgentOrchestrator {
       workflowVersion: pending.workflow.version,
       input: pending.args,
       chatRunId: active.runId,
+      sourceSelector: pending.sourceSelector,
     }, active.controller.signal)
     if (started.id !== pending.executionId) throw appFailure('CONFLICT')
     const execution = await started.finished

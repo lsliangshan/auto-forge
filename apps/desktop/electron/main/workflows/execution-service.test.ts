@@ -19,6 +19,8 @@ import {
   type WorkflowWorker,
   type WorkflowWorkerFactory,
 } from './execution-service.js'
+import { createWorkflowExecutionSourceResolver } from '../application.js'
+import { createWorkflowSourceSelectorVault } from './workflow-source-selector.js'
 
 class FakeWorker extends EventEmitter implements WorkflowWorker {
   readonly stdin = new PassThrough()
@@ -119,6 +121,9 @@ const workflow: WorkflowDetail = {
   source: 'installed',
   integrity: 'valid',
   updatedAt: new Date(0).toISOString(),
+  codeSha256: 'a'.repeat(64),
+  cities: [],
+  runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' },
   permissions: [{ capability: 'browser.open', scope: { origins: ['https://www.baidu.com'] } }],
   activationExamples: ['search'],
   activationNegativeExamples: [],
@@ -165,6 +170,7 @@ function createHarness(options: {
     entryPath: 'workers/workflow-runner.ts',
     integrity: 'valid' as const,
   }
+  const sourceSelector = createWorkflowSourceSelectorVault().create(workflow)
   const dependencies = {
     repositories,
     sourceResolver: options.sourceResolver ?? { resolve: async () => source },
@@ -186,8 +192,9 @@ function createHarness(options: {
     workflowVersion: workflow.version,
     input: { query: 'weather' },
     timeoutMs: options.timeoutMs,
+    sourceSelector,
   })
-  return { repositories, workerFactory, policy, events, capability, service, start }
+  return { repositories, workerFactory, policy, events, capability, sourceSelector, service, start }
 }
 
 async function turn(): Promise<void> {
@@ -266,6 +273,55 @@ async function runActualWorker(source: string, options: ActualWorkerOptions = {}
 }
 
 describe('ExecutionService', () => {
+  it.each(['installed', 'development'] as const)('does not spawn after a selected %s source changes', async (source) => {
+    const selected = source === 'installed' ? workflow : {
+      ...workflow,
+      source: 'development' as const,
+      runtimeIdentity: {
+        id: workflow.id,
+        version: workflow.version,
+        source: 'development' as const,
+        buildHash: 'b'.repeat(64),
+      },
+    }
+    const vault = createWorkflowSourceSelectorVault()
+    const selector = vault.create(selected)
+    const project = {
+      id: 'project_development', name: 'Development', rootPath: trustedRootPath, status: 'ready',
+      buildHash: 'b'.repeat(64),
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'workers/workflow-runner.ts', codeSha256: workflow.codeSha256 },
+      createdAt: 0, updatedAt: 0,
+    }
+    const installed = {
+      workflowId: workflow.id,
+      version: workflow.version,
+      installPath: trustedRootPath,
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'workers/workflow-runner.ts', codeSha256: workflow.codeSha256 },
+    }
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => source === 'development' ? [project] : [] },
+        installedWorkflows: { get: () => source === 'installed' ? installed : undefined },
+      },
+      registry: {
+        getDevelopmentProject: async () => selected.source === 'development' ? selected : undefined,
+        get: async () => selected.source === 'installed' ? selected : undefined,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+    const harness = createHarness({ sourceResolver: resolver })
+
+    if (source === 'installed') installed.manifest.codeSha256 = 'c'.repeat(64)
+    else project.buildHash = 'd'.repeat(64)
+    const execution = await harness.service.start({
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: selector,
+    })
+
+    await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode: 'NOT_FOUND' })
+    expect(harness.workerFactory.specifications).toEqual([])
+  })
+
   it('uses an unforgeable reservation so pre-start approval remains bound to the worker', async () => {
     const harness = createHarness()
     const reservation = harness.service.reserve()
@@ -275,6 +331,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: { query: 'weather' },
+      sourceSelector: harness.sourceSelector,
     })
 
     expect(execution.id).toBe(reservation.executionId)
@@ -283,7 +340,7 @@ describe('ExecutionService', () => {
     expect(harness.service.hasActiveExecutions()).toBe(false)
 
     await expect(harness.service.startReserved({ executionId: 'forged' } as never, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -297,7 +354,7 @@ describe('ExecutionService', () => {
     expect(harness.service.discardReservation(reservation)).toBe(false)
     expect(harness.service.discardReservation({ executionId: reservation.executionId } as never)).toBe(false)
     await expect(harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -308,11 +365,11 @@ describe('ExecutionService', () => {
     controller.abort()
 
     await expect(harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     }, controller.signal)).rejects.toMatchObject({ code: 'CANCELLED' })
     expect(harness.service.discardReservation(reservation)).toBe(false)
     await expect(harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -328,6 +385,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -346,6 +404,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })
     await turn()
     let stopped = false
@@ -380,6 +439,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })
     await turn()
     const shutdown = harness.service.shutdown()
@@ -391,12 +451,14 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(harness.service.startReserved(existing, {
       userId: 'user_1',
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
 
     release()
@@ -407,6 +469,7 @@ describe('ExecutionService', () => {
       workflowId: workflow.id,
       workflowVersion: workflow.version,
       input: {},
+      sourceSelector: harness.sourceSelector,
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
@@ -421,7 +484,7 @@ describe('ExecutionService', () => {
     })
     const reservation = harness.service.reserve()
     const starting = harness.service.startReserved(reservation, {
-      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {},
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version, input: {}, sourceSelector: harness.sourceSelector,
     })
     await turn()
     let cancelSettled = false
@@ -822,6 +885,7 @@ describe('ExecutionService', () => {
       workflowVersion: workflow.version,
       input: { query: 'weather' },
       userId: 'user_1',
+      sourceSelector: harness.sourceSelector,
     } as Parameters<typeof harness.service.start>[0])
     const worker = harness.workerFactory.workers.get(execution.id)!
     worker.respond({ type: 'ready', executionId: execution.id })
@@ -849,6 +913,7 @@ describe('ExecutionService', () => {
       workflowVersion: workflow.version,
       input: {},
       entryPath: '/tmp/untrusted-workflow.mjs',
+      sourceSelector: harness.sourceSelector,
     } as never)
     const worker = harness.workerFactory.workers.get(execution.id)!
 

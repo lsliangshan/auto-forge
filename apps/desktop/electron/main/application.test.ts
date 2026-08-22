@@ -425,6 +425,34 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('rejects selector-less resolution instead of using an id and version fallback', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const installed = {
+      id: 'workflow.installed', version: '1.0.0', name: 'Installed', description: 'Installed build',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'installed' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+      runtimeIdentity: { id: 'workflow.installed', version: '1.0.0', source: 'installed' as const },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: { selected: 'installed' },
+    }
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [] },
+        installedWorkflows: { get: () => ({
+          manifest: { id: installed.id, version: installed.version, entryPath: 'dist/index.js', codeSha256: installed.codeSha256 },
+          installPath: '/tmp/installed',
+        }) },
+      },
+      registry: {
+        getDevelopmentProject: async () => undefined,
+        get: async () => installed,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+
+    await expect(resolver.resolve(installed.id, installed.version, undefined as never)).resolves.toBeUndefined()
+  })
+
   it('rejects a development selector after its persisted build changes without falling back to an installed duplicate', async () => {
     const vault = createWorkflowSourceSelectorVault()
     const development = {

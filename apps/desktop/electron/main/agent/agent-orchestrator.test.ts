@@ -15,11 +15,13 @@ import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
 } from '../database/repositories.js'
+import { createWorkflowSourceSelectorVault } from '../workflows/workflow-source-selector.js'
 
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
   author: 'AutoForge', category: 'search', enabled: true, source: 'installed', integrity: 'valid',
-  updatedAt: '2026-07-19T00:00:00.000Z', timeoutMs: 30_000,
+  updatedAt: '2026-07-19T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+  runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' }, timeoutMs: 30_000,
   permissions: [{ capability: 'browser.open', scope: { origins: ['https://www.baidu.com'] } }],
   activationExamples: ['使用百度搜索今日天气'], activationNegativeExamples: [],
   inputSchema: { type: 'object', properties: { keyword: { type: 'string' } }, required: ['keyword'], additionalProperties: false },
@@ -67,6 +69,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
   }
   currentProviderInstances = providerInstances
   const history = { prepare: vi.fn<ConversationHistoryPort['prepare']>(async () => []) }
+  const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const providerUsage = {
     start: vi.fn((...args: unknown[]) => {
       records.order.push('usage.start')
@@ -108,6 +111,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
       },
       cancel: async () => undefined,
     },
+    createSourceSelector: sourceSelectorVault.create,
     persistence: {
       persistUser(value) { records.users.push(value); return { ordinal: records.users.length } },
       createRun(value) { records.runs.push(value) },

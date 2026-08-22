@@ -22,6 +22,7 @@ import {
   type WorkflowWorker,
   type WorkflowWorkerFactory,
 } from '../../electron/main/workflows/execution-service.js'
+import { createWorkflowSourceSelectorVault } from '../../electron/main/workflows/workflow-source-selector.js'
 import { WorkflowRegistry } from '../../electron/main/workflows/registry.js'
 import { retrieveWorkflows } from '../../electron/main/workflows/retriever.js'
 
@@ -39,7 +40,8 @@ function detail(codeSha256: string): WorkflowDetail & { entryPath: string; codeS
   return {
     id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索网页',
     author: 'AutoForge', category: 'search', enabled: true, source: 'installed', integrity: 'valid',
-    updatedAt: new Date(0).toISOString(), timeoutMs: 30_000, permissions: [permission],
+    updatedAt: new Date(0).toISOString(), timeoutMs: 30_000, permissions: [permission], cities: [],
+    runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' },
     activationExamples: ['使用百度搜索今日天气'], activationNegativeExamples: [],
     inputSchema: { type: 'object', required: ['keyword'], properties: { keyword: { type: 'string' } }, additionalProperties: false },
     outputSchema: { type: 'object' }, entryPath: 'workflow.mjs', codeSha256,
@@ -154,12 +156,14 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
     emit: (event) => { executionEvents.push(event) },
   })
   const registry = new WorkflowRegistry(database, {} as never)
+  const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const orchestrator = new AgentOrchestrator({
     workflows: registry,
     persistence: createAgentPersistence(database),
     history: { prepare: async () => [] },
     policy,
     executions: executionService,
+    createSourceSelector: sourceSelectorVault.create,
     providerUsage: database.providerUsage,
     emit: () => undefined,
   })

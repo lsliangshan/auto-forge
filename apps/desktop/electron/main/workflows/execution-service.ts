@@ -54,7 +54,7 @@ export interface WorkflowExecutionSourceResolver {
   resolve(
     workflowId: string,
     version: string,
-    selector?: WorkflowExecutionSourceSelector,
+    selector: WorkflowExecutionSourceSelector,
   ): Promise<WorkflowExecutionSource | undefined>
 }
 
@@ -130,8 +130,8 @@ export interface ExecutionStartInput {
   chatRunId?: string
   timeoutMs?: number
   sensitivePaths?: readonly string[]
-  /** Main-process-only selector. The application resolver accepts only selectors it created. */
-  sourceSelector?: WorkflowExecutionSourceSelector
+  /** Main-process-only selector. The application resolver accepts only selectors its vault created. */
+  sourceSelector: WorkflowExecutionSourceSelector
 }
 
 export interface StartedExecution {

@@ -490,49 +490,29 @@ export function createWorkflowExecutionSourceResolver(
 ): WorkflowExecutionSourceResolver {
   return {
     async resolve(id, version, selector) {
-      if (selector) {
-        const exact = selectors.inspect(selector)
-        if (!exact || exact.id !== id || exact.version !== version) return undefined
-        if (exact.source === 'development') {
-          const matches = (await Promise.all(dependencies.repositories.workflowProjects.list().map(async (project) => (
-            matchingDevelopmentSource(project, await dependencies.registry.getDevelopmentProject(project.id), exact)
-          )))).filter((source): source is WorkflowExecutionSource => source !== undefined)
-          return matches.length === 1 ? matches[0] : undefined
-        }
-
-        const installed = dependencies.repositories.installedWorkflows.get(id, version)
-        const manifest = installed?.manifest as Partial<WorkflowManifest> | undefined
-        if (!installed
-          || manifest?.id !== exact.id
-          || manifest.version !== exact.version
-          || manifest.codeSha256 !== exact.codeSha256) return undefined
-        const integrity = await dependencies.registry.verifyIntegrity(id, version)
-        const workflow = await dependencies.registry.get(id, version, { developerMode: false })
-        if (!integrity.valid
-          || !workflow
-          || workflow.source !== 'installed'
-          || workflow.runtimeIdentity.source !== 'installed'
-          || workflow.codeSha256 !== exact.codeSha256) return undefined
-        return { workflow, rootPath: installed.installPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
+      const exact = selectors.inspect(selector)
+      if (!exact || exact.id !== id || exact.version !== version) return undefined
+      if (exact.source === 'development') {
+        const matches = (await Promise.all(dependencies.repositories.workflowProjects.list().map(async (project) => (
+          matchingDevelopmentSource(project, await dependencies.registry.getDevelopmentProject(project.id), exact)
+        )))).filter((source): source is WorkflowExecutionSource => source !== undefined)
+        return matches.length === 1 ? matches[0] : undefined
       }
 
       const installed = dependencies.repositories.installedWorkflows.get(id, version)
-      if (installed) {
-        const integrity = await dependencies.registry.verifyIntegrity(id, version)
-        const workflow = await dependencies.registry.get(id, version, { developerMode: false })
-        if (!workflow || !integrity.valid) return undefined
-        const manifest = installed.manifest as WorkflowManifest
-        return { workflow, rootPath: installed.installPath, entryPath: manifest.entryPath, integrity: workflow.integrity }
-      }
-      for (const project of dependencies.repositories.workflowProjects.list()) {
-        const manifest = project.manifest as Partial<WorkflowManifest> | undefined
-        if (project.status !== 'ready' || manifest?.id !== id || manifest.version !== version) continue
-        const workflow = await dependencies.registry.getDevelopmentProject(project.id)
-        if (workflow) {
-          return { workflow, rootPath: project.rootPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
-        }
-      }
-      return undefined
+      const manifest = installed?.manifest as Partial<WorkflowManifest> | undefined
+      if (!installed
+        || manifest?.id !== exact.id
+        || manifest.version !== exact.version
+        || manifest.codeSha256 !== exact.codeSha256) return undefined
+      const integrity = await dependencies.registry.verifyIntegrity(id, version)
+      const workflow = await dependencies.registry.get(id, version, { developerMode: false })
+      if (!integrity.valid
+        || !workflow
+        || workflow.source !== 'installed'
+        || workflow.runtimeIdentity.source !== 'installed'
+        || workflow.codeSha256 !== exact.codeSha256) return undefined
+      return { workflow, rootPath: installed.installPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
     },
   }
 }
@@ -777,6 +757,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     history: conversationContext,
     policy,
     executions,
+    createSourceSelector: sourceSelectorVault.create,
     providerUsage: database.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
