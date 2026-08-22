@@ -112,22 +112,36 @@ afterEach(() => {
 })
 
 describe('WorkflowRegistry', () => {
-  it('normalizes missing cities and shadows an installed identity with a ready development build', async () => {
+  it('normalizes missing cities and shadows only the exact installed identity with a ready development build', async () => {
     const development = readyProject({ buildHash: 'b'.repeat(64) })
     development.project.buildHash = buildFingerprint(development.source, development.manifest)
     const installedManifest = { ...development.manifest }
     delete installedManifest.cities
     const registry = registryHarness({
-      installed: [installedWorkflow({ manifest: installedManifest })],
+      installed: [
+        installedWorkflow({ manifest: installedManifest }),
+        installedWorkflow({
+          version: '2.0.0',
+          manifest: { ...installedManifest, version: '2.0.0' },
+        }),
+      ],
       projects: [development],
     })
 
     expect(await registry.list({ developerMode: false })).toMatchObject([
       { id: 'workflow.same', source: 'installed', cities: [] },
+      { id: 'workflow.same', version: '2.0.0', source: 'installed', cities: [] },
     ])
     expect(await registry.list({ developerMode: true })).toEqual([
       expect.objectContaining({
         id: 'workflow.same',
+        version: '2.0.0',
+        source: 'installed',
+        cities: [],
+      }),
+      expect.objectContaining({
+        id: 'workflow.same',
+        version: '1.0.0',
         source: 'development',
         cities: ['北京'],
         runtimeIdentity: {

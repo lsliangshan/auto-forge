@@ -232,6 +232,7 @@ describe('registerDesktopIpc', () => {
     const app = harness()
     const project = {
       id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new' as const,
+      chatAvailability: 'not_built' as const,
       files: ['src/index.ts', 'workflow.json'], directories: ['src'], updatedAt: '2026-07-19T00:00:00.000Z',
     }
     vi.mocked(app.dependencies.developer.createEntry).mockResolvedValue(project)
