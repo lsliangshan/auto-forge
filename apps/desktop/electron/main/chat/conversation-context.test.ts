@@ -100,7 +100,7 @@ describe('conversation context primitives', () => {
     const serialized = serializeHistoricalMessage({
       id: 'm4', conversationId: 'c1', role: 'assistant', ordinal: 4, createdAt: 4,
       blocks: [
-        { type: 'approval', executionId: 'execution-secret', workflowId: 'workflow', workflowName: '工作流', workflowVersion: '1.0.0', source: 'installed', actionSummary: '写入文件', permissionIndex: 0, capability: 'filesystem.write', scope: { paths: ['/Users/private'] }, scopeHash: 'a'.repeat(64) },
+        { type: 'approval', blockId: 'approval-secret', state: 'denied', executionId: 'execution-secret', workflowId: 'workflow', workflowName: '工作流', workflowVersion: '1.0.0', source: 'installed', actionSummary: '写入文件', permissionIndex: 0, capability: 'filesystem.write', scope: { paths: ['/Users/private'] }, scopeHash: 'a'.repeat(64) },
         { type: 'workflow_execution', executionId: 'execution-1' },
         { type: 'error', code: 'WORKFLOW_FAILED', message: 'did not complete' },
         { type: 'media_generation', blockId: 'block-secret', jobId: 'job-secret', kind: 'video', status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED' },
@@ -110,13 +110,13 @@ describe('conversation context primitives', () => {
     expect(serialized).toEqual({
       role: 'assistant',
       content: [
-        '[工作流等待权限审批: workflow@1.0.0; 能力: filesystem.write]',
+        '[工作流权限审批状态: denied; workflow@1.0.0; 能力: filesystem.write]',
         '[工作流执行: execution-1]',
         '[请求失败: WORKFLOW_FAILED; did not complete]',
         '[video 生成状态: failed; MEDIA_GENERATION_FAILED]',
       ].join('\n'),
     })
-    expect(JSON.stringify(serialized)).not.toMatch(/execution-secret|\/Users\/private|block-secret|job-secret/)
+    expect(JSON.stringify(serialized)).not.toMatch(/execution-secret|approval-secret|\/Users\/private|block-secret|job-secret/)
   })
 
   it('rejects unparsed historical block fields instead of serializing arbitrary media data', () => {

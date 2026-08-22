@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, open, opendir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
 import type { AppErrorCode, ValidationResult } from '@autoforge/shared'
@@ -16,8 +16,24 @@ type ProjectRepositories = Pick<AppRepositories, 'workflowProjects' | 'installed
 
 export interface WorkflowProjectServiceOptions {
   beforeReservation?: () => void | Promise<void>
+  beforeBuildCommit?: () => void | Promise<void>
   removeQuarantine?: (path: string) => Promise<void>
+  sourceLimits?: Partial<WorkflowSourceLimits>
 }
+
+export interface WorkflowSourceLimits {
+  maxFiles: number
+  maxEntries: number
+  maxFileBytes: number
+  maxTotalBytes: number
+}
+
+export const workflowSourceLimits: Readonly<WorkflowSourceLimits> = Object.freeze({
+  maxFiles: 512,
+  maxEntries: 1_024,
+  maxFileBytes: editableFileLimit,
+  maxTotalBytes: 8 * 1024 * 1024,
+})
 
 const quarantineDirectoryName = '.autoforge-quarantine'
 const removalJournalDirectoryName = '.autoforge-removals'
@@ -97,6 +113,7 @@ async function pathExists(path: string): Promise<boolean> {
 
 export class WorkflowProjectService {
   private readonly installationLocks = new Map<string, Promise<void>>()
+  private readonly projectLocks = new Map<string, Promise<void>>()
 
   constructor(
     private readonly repositories: ProjectRepositories,
@@ -163,6 +180,10 @@ export class WorkflowProjectService {
   }
 
   async write(projectId: string, path: string, contents: string): Promise<void> {
+    return this.withProjectLock(projectId, () => this.writeUnlocked(projectId, path, contents))
+  }
+
+  private async writeUnlocked(projectId: string, path: string, contents: string): Promise<void> {
     if (Buffer.byteLength(contents, 'utf8') > editableFileLimit) throw failure('INVALID_INPUT')
     const filePath = await this.filePath(projectId, path, true)
     await mkdir(dirname(filePath), { recursive: true })
@@ -171,6 +192,10 @@ export class WorkflowProjectService {
   }
 
   async createEntry(projectId: string, parentPath: string, name: string, kind: 'file' | 'directory'): Promise<void> {
+    return this.withProjectLock(projectId, () => this.createEntryUnlocked(projectId, parentPath, name, kind))
+  }
+
+  private async createEntryUnlocked(projectId: string, parentPath: string, name: string, kind: 'file' | 'directory'): Promise<void> {
     this.validateEntryName(name)
     const parent = await this.filePath(projectId, parentPath || '.', false)
     if (!(await stat(parent)).isDirectory()) throw failure('INVALID_INPUT')
@@ -187,6 +212,10 @@ export class WorkflowProjectService {
   }
 
   async renameEntry(projectId: string, path: string, name: string): Promise<void> {
+    return this.withProjectLock(projectId, () => this.renameEntryUnlocked(projectId, path, name))
+  }
+
+  private async renameEntryUnlocked(projectId: string, path: string, name: string): Promise<void> {
     this.validateEntryName(name)
     const source = await this.mutableEntryPath(projectId, path)
     const destination = await this.filePath(projectId, join(dirname(path), name), true)
@@ -199,6 +228,10 @@ export class WorkflowProjectService {
   }
 
   async deleteEntry(projectId: string, path: string): Promise<void> {
+    return this.withProjectLock(projectId, () => this.deleteEntryUnlocked(projectId, path))
+  }
+
+  private async deleteEntryUnlocked(projectId: string, path: string): Promise<void> {
     const target = await this.mutableEntryPath(projectId, path)
     const affectsBuild = this.isBuildInputPath(this.projectRelativePath(projectId, target))
     await rm(target, { recursive: true })
@@ -206,6 +239,10 @@ export class WorkflowProjectService {
   }
 
   async validate(projectId: string): Promise<ValidationResult> {
+    return this.withProjectLock(projectId, () => this.validateUnlocked(projectId))
+  }
+
+  private async validateUnlocked(projectId: string): Promise<ValidationResult> {
     const project = this.require(projectId)
     let manifest: unknown
     try {
@@ -218,12 +255,9 @@ export class WorkflowProjectService {
 
     const manifestResult = validateManifest(manifest)
     const diagnostics = [...manifestResult.diagnostics]
-    const sourcePath = await this.filePath(project.id, 'src/index.ts', false)
     try {
-      await esbuild({
-        entryPoints: [sourcePath], bundle: true, write: false, platform: 'browser', format: 'esm',
-        target: 'es2022', external: ['@autoforge/workflow-sdk'], logLevel: 'silent',
-      })
+      await this.sourceBuildInputs(project.id)
+      await this.bundleProject(project.id)
     } catch (error) {
       const messages = typeof error === 'object' && error !== null && 'errors' in error
         ? (error as { errors?: Array<{ text?: string; location?: { line?: number; column?: number } }> }).errors
@@ -240,9 +274,13 @@ export class WorkflowProjectService {
   }
 
   async build(projectId: string): Promise<WorkflowProject> {
+    return this.withProjectLock(projectId, () => this.buildUnlocked(projectId))
+  }
+
+  private async buildUnlocked(projectId: string): Promise<WorkflowProject> {
     const project = this.require(projectId)
     const sourceInputsBefore = await this.sourceBuildInputs(project.id)
-    const validation = await this.validate(project.id)
+    const validation = await this.validateUnlocked(project.id)
     if (!validation.valid) {
       if (validation.diagnostics.length > 0 && validation.diagnostics.every(({ path }) => path === 'src/index.ts')) {
         this.persist(project.id, { status: 'error', lastError: validation.diagnostics.map(({ message }) => message).join('; ') })
@@ -253,18 +291,9 @@ export class WorkflowProjectService {
     this.persist(project.id, { status: 'building' })
 
     try {
-      const sourcePath = await this.filePath(project.id, 'src/index.ts', false)
-      const result = await esbuild({
-        entryPoints: [sourcePath],
-        bundle: true,
-        write: false,
-        platform: 'browser',
-        format: 'esm',
-        target: 'es2022',
-        external: ['@autoforge/workflow-sdk'],
-        logLevel: 'silent',
-      })
-      const output = result.outputFiles[0]
+      const result = await this.bundleProject(project.id)
+      const output = result.outputFiles?.[0]
+      if (!output) throw failure('INVALID_INPUT')
       const entryPath = 'dist/index.js'
       const entry = await this.filePath(project.id, entryPath, true)
       await mkdir(dirname(entry), { recursive: true })
@@ -275,8 +304,13 @@ export class WorkflowProjectService {
       const sourceInputsAfter = await this.sourceBuildInputs(project.id)
       const buildHash = buildFingerprint(sourceInputsAfter, builtManifest)
       if (buildFingerprint(sourceInputsBefore, builtManifest) !== buildHash) throw failure('WORKFLOW_CHANGED')
+      await this.options.beforeBuildCommit?.()
       await writeFile(entry, output.contents)
-      await this.write(project.id, 'workflow.json', `${JSON.stringify(builtManifest, null, 2)}\n`)
+      await writeFile(
+        await this.filePath(project.id, 'workflow.json', false),
+        `${JSON.stringify(builtManifest, null, 2)}\n`,
+        'utf8',
+      )
 
       return this.persist(project.id, {
         name: builtManifest.name,
@@ -298,12 +332,18 @@ export class WorkflowProjectService {
     return this.withInstallationLock('installation-root', async () => {
       const storage = await this.ensureInstallationStorage()
       await this.recoverRemovalJournalsUnlocked(storage)
-      return this.installUnlocked(projectId, storage)
+      return this.withProjectLock(projectId, () => this.installUnlocked(projectId, storage))
     })
   }
 
   async currentBuildFingerprint(projectId: string, manifest: WorkflowManifest): Promise<string> {
-    return buildFingerprint(await this.sourceBuildInputs(projectId), manifest)
+    return this.withProjectLock(projectId, () => this.currentBuildFingerprintUnlocked(projectId, manifest))
+  }
+
+  private async currentBuildFingerprintUnlocked(projectId: string, manifest: WorkflowManifest): Promise<string> {
+    const inputs = await this.sourceBuildInputs(projectId)
+    await this.bundleProject(projectId)
+    return buildFingerprint(inputs, manifest)
   }
 
   async removeInstalled(workflowId: string, version: string): Promise<void> {
@@ -520,13 +560,13 @@ export class WorkflowProjectService {
 
   private async installUnlocked(projectId: string, storage: InstallationStorage): Promise<InstalledWorkflow> {
     const project = this.require(projectId)
-    const validation = await this.validate(project.id)
+    const validation = await this.validateUnlocked(project.id)
     if (!validation.valid || project.status !== 'ready') throw failure('INVALID_INPUT')
     const manifest = JSON.parse(await this.readFile(project.id, 'workflow.json')) as WorkflowManifest
     const sourceEntry = await this.filePath(project.id, manifest.entryPath, false)
     const entry = await this.readFile(project.id, manifest.entryPath)
     if (sha256(Buffer.from(entry)) !== manifest.codeSha256) throw failure('WORKFLOW_INTEGRITY_FAILED')
-    if (await this.currentBuildFingerprint(project.id, manifest) !== project.buildHash) throw failure('INVALID_INPUT')
+    if (await this.currentBuildFingerprintUnlocked(project.id, manifest) !== project.buildHash) throw failure('INVALID_INPUT')
 
     this.validateWorkflowIdentity(manifest.id, manifest.version)
     const destination = join(storage.root, manifest.id, manifest.version)
@@ -647,34 +687,130 @@ export class WorkflowProjectService {
     return path === 'workflow.json' || path === 'src' || path.startsWith('src/')
   }
 
-  private async sourceBuildInputs(projectId: string): Promise<WorkflowBuildInput[]> {
+  private effectiveSourceLimits(): WorkflowSourceLimits {
+    const limits = { ...workflowSourceLimits, ...this.options.sourceLimits }
+    if (Object.values(limits).some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+      throw failure('INVALID_INPUT')
+    }
+    return limits
+  }
+
+  private async assertSafeBuildGraphFile(sourceRoot: string, path: string): Promise<string> {
+    let metadata: Awaited<ReturnType<typeof lstat>>
+    try {
+      metadata = await lstat(path)
+    } catch {
+      throw failure('INVALID_INPUT')
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw failure('INVALID_INPUT')
+    const canonical = await realpath(path)
+    if (!inside(sourceRoot, canonical)) throw failure('INVALID_INPUT')
+    return canonical
+  }
+
+  private async bundleProject(projectId: string) {
     const root = await realpath(this.require(projectId).rootPath)
     const sourceRoot = await this.filePath(projectId, 'src', false)
+    let graphFailure: Error | undefined
+    let result: Awaited<ReturnType<typeof esbuild>>
+    try {
+      result = await esbuild({
+        absWorkingDir: root,
+        entryPoints: ['src/index.ts'],
+        bundle: true,
+        write: false,
+        metafile: true,
+        platform: 'browser',
+        format: 'esm',
+        target: 'es2022',
+        external: ['@autoforge/workflow-sdk'],
+        logLevel: 'silent',
+        plugins: [{
+          name: 'autoforge-source-boundary',
+          setup: (build) => {
+            build.onLoad({ filter: /.*/ }, async ({ path }) => {
+              try {
+                await this.assertSafeBuildGraphFile(sourceRoot, path)
+                return undefined
+              } catch {
+                graphFailure = failure('INVALID_INPUT')
+                return { errors: [{ text: 'Workflow build inputs must be regular files inside src' }] }
+              }
+            })
+          },
+        }],
+      })
+    } catch (error) {
+      if (graphFailure) throw graphFailure
+      throw error
+    }
+    if (!result.metafile) throw failure('INVALID_INPUT')
+    const canonicalInputs = new Set<string>()
+    for (const [inputPath, input] of Object.entries(result.metafile.inputs)) {
+      const candidate = isAbsolute(inputPath) ? inputPath : resolve(root, inputPath)
+      const canonical = await this.assertSafeBuildGraphFile(sourceRoot, candidate)
+      if (canonicalInputs.has(canonical)) throw failure('INVALID_INPUT')
+      canonicalInputs.add(canonical)
+      for (const imported of input.imports) {
+        if (imported.external && imported.path !== '@autoforge/workflow-sdk') throw failure('INVALID_INPUT')
+      }
+    }
+    if (canonicalInputs.size === 0) throw failure('INVALID_INPUT')
+    return result
+  }
+
+  private async sourceBuildInputs(projectId: string): Promise<WorkflowBuildInput[]> {
+    const sourceRoot = await this.filePath(projectId, 'src', false)
     if (!(await stat(sourceRoot)).isDirectory()) throw failure('INVALID_INPUT')
+    const limits = this.effectiveSourceLimits()
     const inputs: WorkflowBuildInput[] = []
+    let entryCount = 0
+    let totalBytes = 0
     const visit = async (directory: string, prefix: string): Promise<void> => {
-      const entries = (await readdir(directory, { withFileTypes: true }))
-        .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
-      for (const entry of entries) {
+      const entries = await opendir(directory)
+      for await (const entry of entries) {
+        entryCount += 1
+        if (entryCount > limits.maxEntries) throw failure('INVALID_INPUT')
         const path = join(directory, entry.name)
         const metadata = await lstat(path)
         if (metadata.isSymbolicLink()) throw failure('PATH_OUTSIDE_PROJECT')
         const projectPath = `${prefix}/${entry.name}`
         if (metadata.isDirectory()) {
           const canonical = await realpath(path)
-          if (!inside(root, canonical)) throw failure('PATH_OUTSIDE_PROJECT')
+          if (!inside(sourceRoot, canonical)) throw failure('PATH_OUTSIDE_PROJECT')
           await visit(canonical, projectPath)
         } else if (metadata.isFile()) {
           const canonical = await realpath(path)
-          if (!inside(root, canonical)) throw failure('PATH_OUTSIDE_PROJECT')
-          inputs.push({ path: projectPath, contents: await readFile(canonical) })
+          if (!inside(sourceRoot, canonical)) throw failure('PATH_OUTSIDE_PROJECT')
+          if (inputs.length >= limits.maxFiles || metadata.size > limits.maxFileBytes
+            || totalBytes + metadata.size > limits.maxTotalBytes) throw failure('INVALID_INPUT')
+          const handle = await open(canonical, 'r')
+          try {
+            const before = await handle.stat()
+            if (!before.isFile() || before.size !== metadata.size) throw failure('WORKFLOW_CHANGED')
+            const contents = Buffer.alloc(before.size)
+            let offset = 0
+            while (offset < contents.length) {
+              const { bytesRead } = await handle.read(contents, offset, contents.length - offset, offset)
+              if (bytesRead === 0) break
+              offset += bytesRead
+            }
+            const after = await handle.stat()
+            if (offset !== contents.length || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+              throw failure('WORKFLOW_CHANGED')
+            }
+            inputs.push({ path: projectPath, contents })
+            totalBytes += contents.length
+          } finally {
+            await handle.close()
+          }
         } else {
           throw failure('INVALID_INPUT')
         }
       }
     }
     await visit(sourceRoot, 'src')
-    return inputs
+    return inputs.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
   }
 
   private async mutableEntryPath(projectId: string, requestedPath: string): Promise<string> {
@@ -723,6 +859,20 @@ export class WorkflowProjectService {
     } finally {
       release()
       if (this.installationLocks.get(key) === current) this.installationLocks.delete(key)
+    }
+  }
+
+  private async withProjectLock<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.projectLocks.get(projectId) ?? Promise.resolve()
+    let release: () => void = () => undefined
+    const current = new Promise<void>((resolveLock) => { release = resolveLock })
+    this.projectLocks.set(projectId, current)
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (this.projectLocks.get(projectId) === current) this.projectLocks.delete(projectId)
     }
   }
 

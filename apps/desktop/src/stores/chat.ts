@@ -79,7 +79,6 @@ function acquireChatEvents(api: DesktopAPI, listener: (event: ChatEvent) => void
 
 function blockIdentity(messageId: string, block: ChatBlock, index: number): string {
   if ('blockId' in block) return `${messageId}:${block.blockId}`
-  if (block.type === 'approval') return `${messageId}:approval:${block.executionId}:${block.permissionIndex}:${block.scopeHash}`
   if ('executionId' in block) return `${messageId}:${block.type}:${block.executionId}`
   if (block.type === 'error') return `${messageId}:error:${block.code}`
   return `${messageId}:${block.type}:${index}`
@@ -731,7 +730,9 @@ export const useChatStore = defineStore('chat', {
       const id = blockIdentity(event.messageId, event.block, message.blocks.length)
       const existingIndex = message.blocks.findIndex((block) => block.id === id)
       if (existingIndex >= 0) {
-        if (event.block.type === 'workflow_status' || event.block.type === 'workflow_provenance') {
+        if (event.block.type === 'approval'
+          || event.block.type === 'workflow_status'
+          || event.block.type === 'workflow_provenance') {
           message.blocks[existingIndex] = { ...event.block, id }
         }
         return

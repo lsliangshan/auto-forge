@@ -504,6 +504,27 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('requires a stable Main-owned approval identity and authoritative state', () => {
+    const approval = {
+      type: 'approval' as const,
+      blockId: 'approval_1',
+      state: 'pending' as const,
+      executionId: 'execution_1',
+      workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
+      source: 'installed' as const, actionSummary: '填写并点击提交', permissionIndex: 0,
+      capability: 'browser.click' as const, scope: { origins: ['https://example.com'] },
+      scopeHash: 'a'.repeat(64),
+    }
+
+    expect(chatBlockSchema.parse(approval)).toMatchObject({ blockId: 'approval_1', state: 'pending' })
+    for (const state of ['approved', 'denied', 'expired', 'cancelled', 'invalidated'] as const) {
+      expect(chatBlockSchema.parse({ ...approval, state })).toMatchObject({ state })
+    }
+    expect(chatBlockSchema.safeParse({ ...approval, blockId: undefined }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...approval, state: undefined }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...approval, state: 'always' }).success).toBe(false)
+  })
+
   it('requires Main-owned execution availability with strict status semantics', () => {
     const status = {
       type: 'workflow_status' as const,
@@ -961,7 +982,7 @@ describe('cross-process contracts', () => {
 
   it('requires exact pending workflow identity on approval blocks', () => {
     expect(() => chatBlockSchema.parse({
-      type: 'approval', executionId: 'exec_1', workflowId: 'browser.search.baidu',
+      type: 'approval', blockId: 'approval_1', state: 'pending', executionId: 'exec_1', workflowId: 'browser.search.baidu',
       workflowName: '百度搜索', source: 'installed', actionSummary: '打开百度首页', permissionIndex: 0,
       capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
     })).toThrow()
@@ -969,7 +990,8 @@ describe('cross-process contracts', () => {
 
   it('requires bound approval context fields', () => {
     const approval = {
-      type: 'approval' as const, executionId: 'exec_1', workflowId: 'browser.search.baidu',
+      type: 'approval' as const, blockId: 'approval_1', state: 'pending' as const,
+      executionId: 'exec_1', workflowId: 'browser.search.baidu',
       workflowName: '百度搜索', workflowVersion: '1.0.0', source: 'development' as const,
       buildHash: 'a'.repeat(64), city: '北京', actionSummary: '打开百度首页', permissionIndex: 0,
       capability: 'browser.open' as const, scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
@@ -1094,7 +1116,7 @@ describe('cross-process contracts', () => {
     }).success).toBe(false)
 
     expect(chatBlockSchema.safeParse({
-      type: 'approval', executionId: 'exec_1', workflowId: 'browser.search.baidu',
+      type: 'approval', blockId: 'approval_1', state: 'pending', executionId: 'exec_1', workflowId: 'browser.search.baidu',
       workflowName: '百度搜索', workflowVersion: '1.0.0', source: 'installed', actionSummary: '打开百度首页',
       permissionIndex: 0, capability: 'browser.open',
       scope: {}, scopeHash: 'a'.repeat(64),

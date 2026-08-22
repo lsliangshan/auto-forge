@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import { afterEach, describe, expect, it } from 'vitest'
 import { openAppDatabase } from '../database/client.js'
-import { buildFingerprint, WorkflowProjectService } from './project-service.js'
+import { buildFingerprint, WorkflowProjectService, workflowSourceLimits } from './project-service.js'
 import { WorkflowRegistry } from './registry.js'
 
 const temporaryDirectories: string[] = []
@@ -94,6 +94,166 @@ afterEach(() => {
 })
 
 describe('WorkflowProjectService', () => {
+  it('keeps explicit source scan limits proportional to local workflow files', () => {
+    expect(workflowSourceLimits).toEqual({
+      maxFiles: 512,
+      maxEntries: 1_024,
+      maxFileBytes: 2 * 1024 * 1024,
+      maxTotalBytes: 8 * 1024 * 1024,
+    })
+  })
+
+  it.each([
+    ['parent-relative module', (root: string): string => {
+      writeFileSync(join(root, 'helper.ts'), 'export const answer = 1\n')
+      return "import { answer } from '../helper'\nexport default { answer }\n"
+    }],
+    ['absolute local module', (root: string): string => {
+      const helper = join(root, 'absolute-helper.ts')
+      writeFileSync(helper, 'export const answer = 1\n')
+      return `import { answer } from ${JSON.stringify(helper)}\nexport default { answer }\n`
+    }],
+    ['local package', (root: string): string => {
+      mkdirSync(join(root, 'node_modules/local-workflow-helper'), { recursive: true })
+      writeFileSync(join(root, 'node_modules/local-workflow-helper/package.json'), JSON.stringify({
+        name: 'local-workflow-helper', version: '1.0.0', main: 'index.js',
+      }))
+      writeFileSync(join(root, 'node_modules/local-workflow-helper/index.js'), 'export const answer = 1\n')
+      return "import { answer } from 'local-workflow-helper'\nexport default { answer }\n"
+    }],
+  ] as const)('rejects an esbuild graph containing a %s outside src', async (_case, escapedSource) => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    writeFileSync(join(root, 'src/index.ts'), escapedSource(root))
+    const project = projects.register(root)
+
+    await expect(projects.build(project.id)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(existsSync(join(root, 'dist/index.js'))).toBe(false)
+  })
+
+  it('excludes a legacy ready project whose current esbuild graph escapes src', async () => {
+    const { directory, database, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+    const builtManifest = JSON.parse(readFileSync(join(root, 'workflow.json'), 'utf8')) as WorkflowManifest
+    writeFileSync(join(root, 'helper.ts'), 'export const answer = 1\n')
+    const escapedSource = "import { answer } from '../helper'\nexport default { answer }\n"
+    writeFileSync(join(root, 'src/index.ts'), escapedSource)
+    database.workflowProjects.update(project.id, {
+      ...database.workflowProjects.get(project.id)!,
+      status: 'ready',
+      buildHash: buildFingerprint([{ path: 'src/index.ts', contents: Buffer.from(escapedSource) }], builtManifest),
+    })
+    const registry = new WorkflowRegistry(database, projects)
+
+    expect(await registry.list({ developerMode: true })).toEqual([])
+    writeFileSync(join(root, 'helper.ts'), 'export const answer = 2\n')
+    expect(await registry.list({ developerMode: true })).toEqual([])
+  })
+
+  it.each(['src/index.ts', 'workflow.json'] as const)(
+    'serializes a %s save queued after the final build comparison so the edit wins',
+    async (path) => {
+      const { directory, database, installs, projects: setupProjects } = openTestServices()
+      const root = join(directory, 'project')
+      writeProject(root)
+      const project = setupProjects.register(root)
+      await setupProjects.build(project.id)
+      let enterCommit!: () => void
+      let releaseCommit!: () => void
+      const commitEntered = new Promise<void>((resolvePromise) => { enterCommit = resolvePromise })
+      const commitGate = new Promise<void>((resolvePromise) => { releaseCommit = resolvePromise })
+      const projects = new WorkflowProjectService(database, installs, {
+        beforeBuildCommit: async () => { enterCommit(); await commitGate },
+      })
+      const userContents = path === 'src/index.ts'
+        ? "export default { userEdit: true }\n"
+        : `${JSON.stringify({
+            ...JSON.parse(readFileSync(join(root, path), 'utf8')) as WorkflowManifest,
+            description: 'User manifest edit wins',
+          }, null, 2)}\n`
+
+      const building = projects.build(project.id)
+      const first = await Promise.race([
+        commitEntered.then(() => 'commit' as const),
+        building.then(() => 'completed' as const),
+      ])
+      expect(first).toBe('commit')
+      let saveSettled = false
+      const saving = projects.write(project.id, path, userContents).then(() => { saveSettled = true })
+      await Promise.resolve()
+      await Promise.resolve()
+      const settledBeforeCommit = saveSettled
+      releaseCommit()
+      const [built] = await Promise.all([building, saving])
+
+      expect(settledBeforeCommit).toBe(false)
+      expect(readFileSync(join(root, path), 'utf8')).toBe(userContents)
+      expect(database.workflowProjects.get(project.id)).toMatchObject({
+        status: 'new', buildHash: built.buildHash,
+      })
+    },
+  )
+
+  it.each(['src/index.ts', 'workflow.json'] as const)(
+    'builds from a completed %s save when the save acquires ordering first',
+    async (path) => {
+      const { directory, database, projects } = openTestServices()
+      const root = join(directory, 'project')
+      writeProject(root)
+      const project = projects.register(root)
+      await projects.build(project.id)
+      const userContents = path === 'src/index.ts'
+        ? "export default { userEdit: 'included' }\n"
+        : `${JSON.stringify({
+            ...JSON.parse(readFileSync(join(root, path), 'utf8')) as WorkflowManifest,
+            description: 'Build consumes this edit',
+          }, null, 2)}\n`
+
+      const saving = projects.write(project.id, path, userContents)
+      const building = projects.build(project.id)
+      await saving
+      const built = await building
+
+      expect(built.status).toBe('ready')
+      expect(database.workflowProjects.get(project.id)).toMatchObject({ status: 'ready', buildHash: built.buildHash })
+      if (path === 'workflow.json') {
+        expect(JSON.parse(readFileSync(join(root, path), 'utf8'))).toMatchObject({ description: 'Build consumes this edit' })
+      } else {
+        expect(readFileSync(join(root, path), 'utf8')).toBe(userContents)
+        expect(readFileSync(join(root, 'dist/index.js'), 'utf8')).toContain('included')
+      }
+    },
+  )
+
+  it.each([
+    ['per-file bytes', { maxFileBytes: 256 }, (root: string): void => {
+      writeFileSync(join(root, 'src/unused.bin'), Buffer.alloc(257, 0x61))
+    }],
+    ['file count', { maxFiles: 1 }, (root: string): void => {
+      writeFileSync(join(root, 'src/unused.ts'), 'export {}\n')
+    }],
+    ['aggregate bytes', { maxTotalBytes: 1 }, (): void => undefined],
+  ] as const)('bounds registered source scanning by %s and excludes the project', async (_case, sourceLimits, mutate) => {
+    const { directory, database, installs, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeProject(root)
+    const project = projects.register(root)
+    await projects.build(project.id)
+    mutate(root)
+    const bounded = new WorkflowProjectService(database, installs, { sourceLimits })
+    const registry = new WorkflowRegistry(database, bounded)
+
+    await expect(bounded.currentBuildFingerprint(
+      project.id,
+      JSON.parse(readFileSync(join(root, 'workflow.json'), 'utf8')) as WorkflowManifest,
+    )).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(await registry.list({ developerMode: true })).toEqual([])
+  })
+
   it('fingerprints a stable relative-path-sorted source tree and rejects absolute inputs', () => {
     const value = manifest() as WorkflowManifest
     const forward = [

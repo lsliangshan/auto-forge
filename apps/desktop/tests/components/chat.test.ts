@@ -60,9 +60,13 @@ function workflowProvenanceBlock(
   }
 }
 
-function approvalBlock(): Extract<ChatBlock, { type: 'approval' }> {
+function approvalBlock(
+  overrides: Partial<Extract<ChatBlock, { type: 'approval' }>> = {},
+): Extract<ChatBlock, { type: 'approval' }> {
   return {
     type: 'approval',
+    blockId: 'approval_1',
+    state: 'pending',
     executionId: 'execution_1',
     workflowId: 'workflow.beijing',
     workflowName: '北京工作居住证',
@@ -75,6 +79,7 @@ function approvalBlock(): Extract<ChatBlock, { type: 'approval' }> {
     capability: 'browser.click',
     scope: { origins: ['https://example.com'] },
     scopeHash,
+    ...overrides,
   }
 }
 
@@ -1052,6 +1057,68 @@ describe('chat interactions', () => {
     expect(decide).toHaveBeenCalledWith({
       executionId: 'execution_1', permissionIndex: 0, scopeHash, decision: 'deny',
     })
+  })
+
+  it.each([
+    ['approved', '已允许本次'],
+    ['denied', '已拒绝'],
+    ['expired', '审批已过期'],
+    ['cancelled', '审批已取消'],
+    ['invalidated', '审批已失效'],
+  ] as const)('renders authoritative %s approvals as resolved and non-actionable', async (state, label) => {
+    const { api, decide } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: approvalBlock({ state }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe(label)
+    expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="deny-approval"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="approve-once"]').trigger('click')
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('replaces a live approval by Main-owned block id when ownership ends', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'block', conversationId: 'conv_1', messageId: 'assistant_1',
+      block: approvalBlock(),
+    })
+    emitChat({
+      type: 'block', conversationId: 'conv_1', messageId: 'assistant_1',
+      block: approvalBlock({ state: 'denied' }),
+    })
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({ type: 'approval', blockId: 'approval_1', state: 'denied' }),
+    ])
+  })
+
+  it('keeps a terminal approval disabled after transcript reload', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.chat.listMessages).mockResolvedValue([{
+      id: 'assistant_1', conversationId: 'conv_1', role: 'assistant',
+      blocks: [approvalBlock({ state: 'expired' })],
+      createdAt: '2026-08-22T00:00:00.000Z',
+    }])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    await store.selectConversation('conv_1')
+    const approval = store.messagesByConversation.conv_1?.[0]?.blocks[0]
+    if (!approval || approval.type !== 'approval') throw new Error('Expected persisted approval')
+    const wrapper = mount(MessageBlock, {
+      props: { block: approval },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe('审批已过期')
+    expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
   })
 
   it('subscribes once and merges streamed text deltas without duplication', () => {

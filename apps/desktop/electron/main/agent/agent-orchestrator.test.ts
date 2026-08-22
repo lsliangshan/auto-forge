@@ -996,7 +996,10 @@ describe('AgentOrchestrator', () => {
       }),
       expect.objectContaining({
         type: 'block',
-        block: expect.objectContaining({ type: 'approval', workflowId: workflow.id, workflowVersion: workflow.version }),
+        block: expect.objectContaining({
+          type: 'approval', blockId: expect.any(String), state: 'pending',
+          workflowId: workflow.id, workflowVersion: workflow.version,
+        }),
       }),
     ]))
   })
@@ -1119,6 +1122,9 @@ describe('AgentOrchestrator', () => {
         type: 'workflow_status', status: 'cancelled', executionAvailable: false,
         errorCode: 'PERMISSION_DENIED', errorSummary: 'The requested permission was denied.',
       }),
+    )
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'approval', state: 'denied' }),
     )
   })
 
@@ -1304,6 +1310,9 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts[0]).toMatchObject({ userId: 'user_1' })
     expect(JSON.stringify(providerInputs[1])).toContain('"tool_call_id":"call_1"')
     expect(dependencies.records.terminal.at(-1)).toMatchObject({ status: 'completed' })
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'approval', state: 'approved' }),
+    )
   })
 
   it.each(['terminal completion', 'cancellation'] as const)(
@@ -1525,7 +1534,10 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts).toHaveLength(0)
     const approvals = dependencies.records.events
       .map((event) => (event as { block?: unknown }).block)
-      .filter((block): block is { type: string; permissionIndex: number; scopeHash: string; capability: string } => Boolean(block) && (block as { type?: string }).type === 'approval')
+      .filter((block): block is { type: string; state: string; permissionIndex: number; scopeHash: string; capability: string } => (
+        Boolean(block) && (block as { type?: string; state?: string }).type === 'approval'
+        && (block as { state?: string }).state === 'pending'
+      ))
     expect(approvals.map((block) => block.permissionIndex)).toEqual([0, 1])
     expect(approvals.map((block) => block.capability)).toEqual(['browser.fill', 'browser.click'])
 
@@ -1834,6 +1846,9 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.terminal).toEqual([
       expect.objectContaining({ requestId: pending.requestId, status: 'cancelled' }),
     ])
+    expect((dependencies.records.terminal[0] as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'approval', state: 'cancelled' }),
+    )
     expect(dependencies.records.discards).toHaveLength(1)
   })
 
@@ -2096,7 +2111,8 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts).toHaveLength(1)
     const approvalBlocks = dependencies.records.events.filter((event) => (
       typeof event === 'object' && event !== null && 'block' in event
-      && (event as { block?: { type?: string } }).block?.type === 'approval'
+      && (event as { block?: { type?: string; state?: string } }).block?.type === 'approval'
+      && (event as { block?: { state?: string } }).block?.state === 'pending'
     ))
     expect(approvalBlocks).toHaveLength(1)
   })
@@ -2121,6 +2137,9 @@ describe('AgentOrchestrator', () => {
       type: 'workflow_status', status: 'cancelled', executionAvailable: false,
       errorCode: 'CANCELLED', errorSummary: 'The operation was cancelled.',
     }))
+    expect((expired.records.terminal[0] as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'approval', state: 'expired' }),
+    )
 
     milliseconds = 0
     const timely = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
@@ -2172,6 +2191,9 @@ describe('AgentOrchestrator', () => {
       errorCode: 'WORKFLOW_CHANGED',
       errorSummary: 'The workflow changed before it could run. Review and try again.',
     }))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'approval', state: 'invalidated' }),
+    )
   })
 
   it('rethrows a usage consistency failure from the WORKFLOW_CHANGED continuation', async () => {

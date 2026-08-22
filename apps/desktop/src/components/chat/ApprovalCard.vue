@@ -35,7 +35,7 @@
     <div class="approval-actions">
       <el-button
         data-testid="deny-approval"
-        :disabled="busy || decided"
+        :disabled="busy || submitted || approval.state !== 'pending'"
         @click="decide('deny')"
       >
         拒绝
@@ -43,16 +43,17 @@
       <el-button
         type="primary"
         data-testid="approve-once"
-        :disabled="busy || decided"
+        :disabled="busy || submitted || approval.state !== 'pending'"
         @click="decide('once')"
       >
         仅本次允许
       </el-button>
     </div>
     <span
-      v-if="decided"
+      v-if="approvalStateLabel"
       class="decision-result"
-    >审批已提交</span>
+      data-testid="approval-state"
+    >{{ approvalStateLabel }}</span>
   </section>
 </template>
 
@@ -65,11 +66,19 @@ import { displayError, getDesktopApi } from '../../services/desktop-api'
 type ApprovalBlock = Extract<ChatBlock, { type: 'approval' }>
 const props = defineProps<{ approval: ApprovalBlock }>()
 const busy = ref(false)
-const decided = ref(false)
+const submitted = ref(false)
 const error = ref('')
 
 const capabilityLabel = computed(() => props.approval.capability.startsWith('browser.') ? '工作流希望控制自动化浏览器' : '工作流请求受控宿主能力')
 const sourceLabel = computed(() => props.approval.source === 'development' ? '开发版本' : '已安装')
+const approvalStateLabel = computed(() => ({
+  pending: '',
+  approved: '已允许本次',
+  denied: '已拒绝',
+  expired: '审批已过期',
+  cancelled: '审批已取消',
+  invalidated: '审批已失效',
+})[props.approval.state])
 const scopeLabel = computed(() => {
   if ('origins' in props.approval.scope) return props.approval.scope.origins.join('、')
   if ('paths' in props.approval.scope) return props.approval.scope.paths.join('、')
@@ -77,7 +86,7 @@ const scopeLabel = computed(() => {
 })
 
 async function decide(decision: 'once' | 'deny') {
-  if (busy.value || decided.value) return
+  if (busy.value || submitted.value || props.approval.state !== 'pending') return
   busy.value = true
   error.value = ''
   const base = {
@@ -88,7 +97,7 @@ async function decide(decision: 'once' | 'deny') {
   const input: ApprovalDecision = { ...base, decision }
   try {
     await getDesktopApi().executions.decide(input)
-    decided.value = true
+    submitted.value = true
   } catch (caught) { error.value = displayError(caught, '审批提交失败') }
   finally { busy.value = false }
 }

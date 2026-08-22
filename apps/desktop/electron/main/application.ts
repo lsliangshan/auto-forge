@@ -82,7 +82,7 @@ import {
   type WorkflowExecutionSourceResolver,
 } from './workflows/execution-service.js'
 import { validateWorkflowInput } from './workflows/input-validation.js'
-import { WorkflowProjectService } from './workflows/project-service.js'
+import { WorkflowProjectService, type WorkflowProjectServiceOptions } from './workflows/project-service.js'
 import { WorkflowRegistry } from './workflows/registry.js'
 import {
   createWorkflowSourceSelectorVault,
@@ -184,6 +184,8 @@ export interface ApplicationRuntimeOptions {
   applyTheme?(theme: AppSettings['theme']): void
   /** @internal Test-only observation hook for the Main-owned Agent instance. */
   inspectAgent?(agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>): void
+  /** @internal Test-only hooks for deterministic project mutation races. */
+  projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
 }
@@ -626,7 +628,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerUsage: database.providerUsage,
     providers: providerRegistry,
   })
-  const projects = new WorkflowProjectService(database, options.paths.installations)
+  const projects = new WorkflowProjectService(database, options.paths.installations, options.projectServiceOptions)
   const registry = new WorkflowRegistry(database, projects)
   const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
   const mediaLifecycle = new MediaLifecycle({
@@ -1267,7 +1269,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return result
       },
       decide: async (decision) => {
-        const agentOwned = agent.ownsExecution(decision.executionId)
+        const agentOwned = agent.recognizesExecution(decision.executionId)
         let result
         try {
           result = await agent.resumeApproval(decision)

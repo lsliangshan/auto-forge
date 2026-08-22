@@ -93,7 +93,9 @@ function serializeBlock(block: ChatBlock): string[] {
     case 'workflow_proposal':
       return [`[工作流提议: ${block.workflowName} (${block.workflowId})]`]
     case 'approval':
-      return [`[工作流等待权限审批: ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
+      return block.state === 'pending'
+        ? [`[工作流等待权限审批: ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
+        : [`[工作流权限审批状态: ${block.state}; ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
     case 'workflow_status':
       return [`[工作流: ${block.workflowName}; 城市: ${block.city ?? '不限城市'}; 状态: ${block.status}]`]
     case 'workflow_provenance':

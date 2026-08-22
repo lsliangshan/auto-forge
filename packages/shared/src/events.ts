@@ -88,6 +88,8 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
   }).strict(),
   z.object({
     type: z.literal('approval'),
+    blockId: identifierSchema,
+    state: z.enum(['pending', 'approved', 'denied', 'expired', 'cancelled', 'invalidated']),
     executionId: identifierSchema,
     workflowId: identifierSchema,
     workflowName: nonEmptyStringSchema,

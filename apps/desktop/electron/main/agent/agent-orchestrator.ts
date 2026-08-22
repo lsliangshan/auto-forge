@@ -282,6 +282,7 @@ interface ToolExchange {
 interface PendingTool extends ToolExchange {
   tool: PendingWorkflowTool
   statusBlockId: string
+  approvalBlockId?: string
   executionIndex?: number
   executionAvailable: boolean
 }
@@ -335,6 +336,7 @@ function asAppError(error: unknown): AppError {
 export class AgentOrchestrator {
   private readonly activeByRequest = new Map<string, ActiveAgentRun>()
   private readonly activeByExecution = new Map<string, ActiveAgentRun>()
+  private readonly recognizedExecutionIds = new Set<string>()
   private readonly activeByConversation = new Map<string, string>()
   private readonly id: () => string
   private readonly now: () => number
@@ -496,6 +498,7 @@ export class AgentOrchestrator {
     if (active.loop.approvalExpired()) {
       this.clearApprovalTimer(active)
       await this.workflowTools.cancel(pending.tool)
+      this.updateApprovalState(active, pending, 'expired')
       this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
       this.clearPending(active)
       return this.finish(active, 'cancelled', appFailure('CANCELLED'))
@@ -509,12 +512,14 @@ export class AgentOrchestrator {
       }
       this.clearApprovalTimer(active)
       active.loop.resumeApproval()
+      this.updateApprovalState(active, pending, parsed.data.decision === 'deny' ? 'denied' : 'approved')
       this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed', result)
       this.appendToolExchange(active, pending, result)
       this.clearPending(active)
     } else {
       this.clearApprovalTimer(active)
       active.loop.resumeApproval()
+      this.updateApprovalState(active, pending, 'approved')
     }
     return this.driveExclusive(active)
   }
@@ -526,6 +531,7 @@ export class AgentOrchestrator {
     active.controller.abort()
     if (active.pending) {
       await this.workflowTools.cancel(active.pending.tool)
+      this.updateApprovalState(active, active.pending, 'cancelled')
       this.updateWorkflowStatus(active, active.pending, 'cancelled', appFailure('CANCELLED'))
     }
     if (!active.terminal) this.finish(active, 'cancelled', appFailure('CANCELLED'))
@@ -541,6 +547,10 @@ export class AgentOrchestrator {
   ownsExecution(executionId: string): boolean {
     const active = this.activeByExecution.get(executionId)
     return active !== undefined && !active.terminal
+  }
+
+  recognizesExecution(executionId: string): boolean {
+    return this.recognizedExecutionIds.has(executionId)
   }
 
   hasActiveRuns(): boolean {
@@ -598,6 +608,7 @@ export class AgentOrchestrator {
       }
       await this.workflowTools.cancel(pending.tool)
       if (active.terminal || active.pending !== pending) return
+      this.updateApprovalState(active, pending, 'invalidated')
       this.updateWorkflowStatus(active, pending, 'failed', appFailure('WORKFLOW_CHANGED'))
       this.appendToolExchange(active, pending, { kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
       this.clearPending(active)
@@ -808,6 +819,7 @@ export class AgentOrchestrator {
       executionAvailable: false,
     }
     active.executionId = executionId
+    this.recognizedExecutionIds.add(executionId)
     this.activeByExecution.set(executionId, active)
     this.appendBlock(active, {
       ...this.workflowStatusContext(prepared.pending),
@@ -831,12 +843,16 @@ export class AgentOrchestrator {
       && tool.actionSummary !== undefined) {
       const last = active.blocks.at(-1)
       if (last?.type !== 'approval'
+        || last.state !== 'pending'
         || last.executionId !== tool.executionId
         || last.permissionIndex !== tool.permissionIndex
         || last.scopeHash !== tool.scopeHash) {
         const source = tool.source
+        pending.approvalBlockId = this.id()
         this.appendBlock(active, {
           type: 'approval',
+          blockId: pending.approvalBlockId,
+          state: 'pending',
           executionId: tool.executionId,
           workflowId: tool.candidate.workflow.id,
           workflowName: tool.candidate.workflow.name,
@@ -850,6 +866,8 @@ export class AgentOrchestrator {
           scope: tool.scope,
           scopeHash: tool.scopeHash,
         })
+      } else {
+        pending.approvalBlockId = last.blockId
       }
       this.updateWorkflowStatus(active, pending, 'awaiting_approval')
       active.loop.awaitApproval()
@@ -1013,6 +1031,26 @@ export class AgentOrchestrator {
     })
   }
 
+  private updateApprovalState(
+    active: ActiveAgentRun,
+    pending: PendingTool,
+    state: Exclude<Extract<ChatBlock, { type: 'approval' }>['state'], 'pending'>,
+  ): void {
+    const blockId = pending.approvalBlockId
+    if (!blockId) return
+    const index = active.blocks.findIndex((block) => block.type === 'approval' && block.blockId === blockId)
+    if (index < 0) return
+    const current = active.blocks[index]
+    if (current?.type !== 'approval' || current.state !== 'pending') return
+    const replacement = { ...current, state }
+    active.blocks[index] = replacement
+    pending.approvalBlockId = undefined
+    this.dependencies.persistence.replaceAssistantBlock(active.messageId, blockId, structuredClone(replacement))
+    this.safeEmit({
+      type: 'block', conversationId: active.conversationId, messageId: active.messageId, block: replacement,
+    })
+  }
+
   private appendWorkflowProvenance(active: ActiveAgentRun): void {
     if (active.actualExecutions.length === 0) return
     this.appendBlock(active, {
@@ -1047,6 +1085,7 @@ export class AgentOrchestrator {
     active.controller.abort()
     const pending = active.pending
     await this.workflowTools.cancel(pending.tool)
+    this.updateApprovalState(active, pending, 'expired')
     this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
     this.clearPending(active)
     this.finish(active, 'cancelled', appFailure('CANCELLED'))

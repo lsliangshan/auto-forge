@@ -1999,7 +1999,7 @@ describe('createApplicationRuntime', () => {
       })
       await installApprovalWorkflow(runtime)
       const conversation = await runtime.services.chat.createConversation()
-      await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+      const sent = await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
       await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
         type: 'block', block: expect.objectContaining({ type: 'approval' }),
       })))
@@ -2027,6 +2027,18 @@ describe('createApplicationRuntime', () => {
       })).rejects.toMatchObject({ code: 'CONFLICT' })
 
       expect(legacyDecision).not.toHaveBeenCalled()
+
+      await runtime.services.chat.cancel(sent.requestId)
+      await expect(runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: approval.scopeHash,
+        decision: 'once',
+      })).rejects.toMatchObject({ code: 'CONFLICT' })
+      expect((await runtime.services.chat.listMessages(conversation.id))
+        .find((message) => message.role === 'assistant')?.blocks).toContainEqual(expect.objectContaining({
+        type: 'approval', blockId: approval.blockId, state: 'cancelled',
+      }))
     } finally {
       await runtime.close()
     }
@@ -4360,6 +4372,51 @@ describe('createApplicationRuntime', () => {
 
     await runtime.close()
   })
+
+  it.each(['src/index.ts', 'workflow.json'] as const)(
+    'reports a %s save queued behind build commit as unbuilt without losing the edit',
+    async (path) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-build-save-race-'))
+      directories.push(root)
+      let shouldBlock = false
+      let enterCommit!: () => void
+      let releaseCommit!: () => void
+      const commitEntered = new Promise<void>((resolvePromise) => { enterCommit = resolvePromise })
+      const commitGate = new Promise<void>((resolvePromise) => { releaseCommit = resolvePromise })
+      const runtime = createApplicationRuntime(options(root, {
+        projectServiceOptions: {
+          beforeBuildCommit: async () => {
+            if (!shouldBlock) return
+            enterCommit()
+            await commitGate
+          },
+        },
+      }))
+      const project = await runtime.services.developer.createProject('Build Save Race')
+      await runtime.services.developer.build(project.id)
+      const userContents = path === 'src/index.ts'
+        ? "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ userEdit: true }) })\n"
+        : `${JSON.stringify({
+            ...JSON.parse(await runtime.services.developer.readFile(project.id, path)) as Record<string, unknown>,
+            description: 'User manifest edit wins',
+          }, null, 2)}\n`
+      shouldBlock = true
+
+      const building = runtime.services.developer.build(project.id)
+      await commitEntered
+      const saving = runtime.services.developer.writeFile(project.id, path, userContents)
+      releaseCommit()
+      await Promise.all([building, saving])
+
+      expect(await runtime.services.developer.readFile(project.id, path)).toBe(userContents)
+      expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+        id: project.id,
+        status: 'new',
+        chatAvailability: 'unbuilt_changes',
+      })
+      await runtime.close()
+    },
+  )
 
   it('returns the titled first input validation error without starting an execution', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-input-error-'))
