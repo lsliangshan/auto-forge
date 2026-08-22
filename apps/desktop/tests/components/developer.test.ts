@@ -99,6 +99,7 @@ vi.mock('monaco-editor/esm/vs/language/typescript/ts.worker?worker', () => ({ de
 
 const project: DeveloperProject = {
   id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new',
+  chatAvailability: 'ready',
   files: ['src/index.ts', 'workflow.json'], directories: ['src'], updatedAt: '2026-07-19T00:00:00.000Z',
 }
 
@@ -181,6 +182,26 @@ describe('developer workbench', () => {
     expect(raw.developer.validate).toHaveBeenCalledWith('project_1')
     expect(store.saveState).toBe('saved')
     expect(wrapper.attributes()).not.toHaveProperty('data-local-path')
+  })
+
+  it.each([
+    ['unbuilt_changes', '有未构建修改，暂不可用于聊天'],
+    ['not_built', '尚未构建，暂不可用于聊天'],
+    ['invalid', '项目无效，暂不可用于聊天'],
+    ['ready', ''],
+  ] as const)('renders authoritative %s chat availability without building on mount', async (chatAvailability, message) => {
+    const { api, raw } = createApi()
+    raw.developer.listProjects.mockResolvedValue([{ ...project, chatAvailability }])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(CodeEditor)
+    await wrapper.vm.$nextTick()
+
+    expect(store.chatAvailabilityMessage).toBe(message)
+    if (message) expect(wrapper.get('[data-testid="chat-availability"]').text()).toBe(message)
+    else expect(wrapper.find('[data-testid="chat-availability"]').exists()).toBe(false)
+    expect(raw.developer.build).not.toHaveBeenCalled()
   })
 
   it('creates Monaco after the initial file read finishes', async () => {

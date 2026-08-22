@@ -503,6 +503,29 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('binds safe workflow status errors to valid terminal states', () => {
+    const completed = {
+      type: 'workflow_status' as const,
+      blockId: 'status_1', executionId: 'exec_1',
+      workflowId: 'workflow.beijing', workflowName: '北京工作居住证',
+      workflowVersion: '1.0.0', source: 'installed' as const,
+      status: 'completed' as const, executionIndex: 1, executionLimit: 5,
+      errorCode: 'RESULT_TOO_LARGE' as const,
+      errorSummary: 'The workflow result is too large.',
+    }
+
+    expect(chatBlockSchema.parse(completed)).toMatchObject({
+      status: 'completed', errorCode: 'RESULT_TOO_LARGE',
+      errorSummary: 'The workflow result is too large.',
+    })
+    expect(chatBlockSchema.safeParse({ ...completed, status: 'failed' }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...completed, status: 'running' }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...completed, errorCode: 'INVALID_OUTPUT' }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...completed, errorSummary: undefined }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...completed, errorCode: undefined }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...completed, errorSummary: 'x'.repeat(501) }).success).toBe(false)
+  })
+
   it('requires exact conversation ownership for public draft removal', () => {
     const schema = ipcRequestSchemas[ipcChannels.mediaRemoveDraft]
     expect(schema.parse({

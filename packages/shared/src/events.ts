@@ -118,9 +118,24 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     status: executionStatusSchema,
     executionIndex: z.number().int().positive(),
     executionLimit: z.number().int().positive().max(5),
-  }).superRefine(({ executionIndex, executionLimit }, context) => {
+    errorCode: appErrorCodeSchema.optional(),
+    errorSummary: nonEmptyStringSchema.max(500).optional(),
+  }).superRefine(({ executionIndex, executionLimit, status, errorCode, errorSummary }, context) => {
     if (executionIndex > executionLimit) {
       context.addIssue({ code: 'custom', path: ['executionIndex'], message: 'Execution index cannot exceed its limit' })
+    }
+    if ((errorCode === undefined) !== (errorSummary === undefined)) {
+      context.addIssue({ code: 'custom', message: 'Workflow status errors require both code and summary' })
+    }
+    if (errorCode === undefined) return
+    if (['queued', 'awaiting_approval', 'running'].includes(status)) {
+      context.addIssue({ code: 'custom', path: ['errorCode'], message: 'Active workflow status cannot include an error' })
+    }
+    if (errorCode === 'RESULT_TOO_LARGE' && status !== 'completed') {
+      context.addIssue({ code: 'custom', path: ['errorCode'], message: 'Oversized results must remain completed' })
+    }
+    if (status === 'completed' && errorCode !== 'RESULT_TOO_LARGE') {
+      context.addIssue({ code: 'custom', path: ['errorCode'], message: 'Completed workflow status only accepts an oversized-result notice' })
     }
   }),
   z.object({

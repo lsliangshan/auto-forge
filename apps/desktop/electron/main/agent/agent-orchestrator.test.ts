@@ -1122,6 +1122,21 @@ describe('AgentOrchestrator', () => {
       expect.objectContaining({ role: 'tool', content: expect.stringContaining('RESULT_TOO_LARGE') }),
     ]))
     expect(JSON.stringify(providerInputs[1])).not.toContain('汉汉汉汉汉汉汉汉')
+    expect(dependencies.records.events).toContainEqual(expect.objectContaining({
+      type: 'block',
+      block: expect.objectContaining({
+        type: 'workflow_status', status: 'completed', errorCode: 'RESULT_TOO_LARGE',
+        errorSummary: 'The workflow result is too large.',
+      }),
+    }))
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      status: 'completed',
+      blocks: expect.arrayContaining([expect.objectContaining({
+        type: 'workflow_status', status: 'completed', errorCode: 'RESULT_TOO_LARGE',
+        errorSummary: 'The workflow result is too large.',
+      })]),
+    })
+    expect(JSON.stringify(dependencies.records.events)).not.toContain('汉汉汉汉汉汉汉汉')
   })
 
   it('validates approval and tool arguments, then returns the result with the original tool call id', async () => {
@@ -1758,6 +1773,9 @@ describe('AgentOrchestrator', () => {
     const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
     expect(finalBlocks).not.toContainEqual(expect.objectContaining({ type: 'text', text: '我来帮你查询' }))
     expect(finalBlocks).toContainEqual(expect.objectContaining({ type: 'workflow_status', status: 'completed' }))
+    expect(finalBlocks.find((block) => (
+      typeof block === 'object' && block !== null && 'type' in block && block.type === 'workflow_status'
+    ))).not.toHaveProperty('errorCode')
     expect(finalBlocks.at(-1)).toMatchObject({
       type: 'workflow_provenance',
       entries: [expect.objectContaining({

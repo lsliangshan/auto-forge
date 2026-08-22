@@ -13,6 +13,15 @@
       </div>
     </div>
     <dl>
+      <dt>工作流</dt><dd>{{ approval.workflowName }}</dd>
+      <dt>标识</dt><dd>{{ approval.workflowId }}</dd>
+      <dt>版本</dt><dd>{{ approval.workflowVersion }}</dd>
+      <dt>来源</dt><dd>{{ sourceLabel }}</dd>
+      <template v-if="approval.buildHash">
+        <dt>构建</dt><dd>{{ approval.buildHash }}</dd>
+      </template>
+      <dt>城市</dt><dd>{{ approval.city ?? '不限城市' }}</dd>
+      <dt>操作</dt><dd>{{ approval.actionSummary }}</dd>
       <dt>能力</dt><dd>{{ approval.capability }}</dd>
       <dt>范围</dt><dd>{{ scopeLabel }}</dd>
     </dl>
@@ -30,14 +39,6 @@
         @click="decide('deny')"
       >
         拒绝
-      </el-button>
-      <el-button
-        data-testid="approve-always"
-        :disabled="busy || decided"
-        title="始终允许此工作流版本的相同权限"
-        @click="decide('always')"
-      >
-        始终允许
       </el-button>
       <el-button
         type="primary"
@@ -68,13 +69,14 @@ const decided = ref(false)
 const error = ref('')
 
 const capabilityLabel = computed(() => props.approval.capability.startsWith('browser.') ? '工作流希望控制自动化浏览器' : '工作流请求受控宿主能力')
+const sourceLabel = computed(() => props.approval.source === 'development' ? '开发版本' : '已安装')
 const scopeLabel = computed(() => {
   if ('origins' in props.approval.scope) return props.approval.scope.origins.join('、')
   if ('paths' in props.approval.scope) return props.approval.scope.paths.join('、')
   return '不包含附加范围'
 })
 
-async function decide(decision: 'once' | 'always' | 'deny') {
+async function decide(decision: 'once' | 'deny') {
   if (busy.value || decided.value) return
   busy.value = true
   error.value = ''
@@ -83,13 +85,7 @@ async function decide(decision: 'once' | 'always' | 'deny') {
     permissionIndex: props.approval.permissionIndex,
     scopeHash: props.approval.scopeHash,
   }
-  const input: ApprovalDecision = decision === 'always'
-    ? {
-        ...base, decision, workflowId: props.approval.workflowId,
-        workflowVersion: props.approval.workflowVersion, capability: props.approval.capability,
-        scope: props.approval.scope,
-      }
-    : { ...base, decision }
+  const input: ApprovalDecision = { ...base, decision }
   try {
     await getDesktopApi().executions.decide(input)
     decided.value = true

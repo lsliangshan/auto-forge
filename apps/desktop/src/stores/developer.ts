@@ -111,6 +111,13 @@ export const useDeveloperStore = defineStore('developer', {
     currentManifest(state): WorkflowManifest | undefined { return state.manifests[state.selectedProjectId] },
     saveState(): FileSaveState { return this.currentBuffer?.saveState ?? 'idle' },
     fileUnavailableReason(): string { return this.currentBuffer?.error ?? '' },
+    chatAvailabilityMessage(): string {
+      const value = this.selectedProject?.chatAvailability
+      if (value === 'unbuilt_changes') return '有未构建修改，暂不可用于聊天'
+      if (value === 'not_built') return '尚未构建，暂不可用于聊天'
+      if (value === 'invalid') return '项目无效，暂不可用于聊天'
+      return ''
+    },
     pendingApproval(): Extract<ExecutionEvent, { type: 'approval_required' }> | undefined {
       for (let index = this.debugEvents.length - 1; index >= 0; index -= 1) {
         const event = this.debugEvents[index]!

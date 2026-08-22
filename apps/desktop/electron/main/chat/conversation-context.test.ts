@@ -61,6 +61,7 @@ describe('conversation context primitives', () => {
           workflowId: 'workflow.secret', workflowName: '安全查询', workflowVersion: '1.2.3',
           source: 'development', buildHash: 'a'.repeat(64), city: '北京', status: 'completed',
           executionIndex: 1, executionLimit: 5,
+          errorCode: 'RESULT_TOO_LARGE', errorSummary: 'The workflow result is too large.',
         },
         {
           type: 'workflow_provenance', blockId: 'provenance_1', entries: [{
@@ -79,6 +80,8 @@ describe('conversation context primitives', () => {
         '[已使用工作流: 安全查询; 城市: 北京; 状态: completed]',
       ].join('\n'),
     })
+    expect(serialized?.content).not.toContain('RESULT_TOO_LARGE')
+    expect(serialized?.content).not.toContain('The workflow result is too large.')
     expect(JSON.stringify(serialized)).not.toMatch(/a{64}|execution_1|workflow\.secret|1\.2\.3|input|result|path|scope/i)
   })
 

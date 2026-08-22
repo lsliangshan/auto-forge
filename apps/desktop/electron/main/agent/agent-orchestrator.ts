@@ -916,7 +916,13 @@ export class AgentOrchestrator {
     const terminalStatus = execution.status === 'completed' ? 'completed' : 'failed'
     active.loop.finishExecution(loopStart.executionIndex, terminalStatus)
     actual.status = terminalStatus
-    this.updateWorkflowStatus(active, pending, terminalStatus)
+    const statusError = modelResult.kind === 'tool_error' && modelResult.code === 'RESULT_TOO_LARGE'
+      ? appFailure(modelResult.code)
+      : undefined
+    this.updateWorkflowStatus(active, pending, terminalStatus, statusError && {
+      errorCode: statusError.code,
+      errorSummary: statusError.message,
+    })
     this.appendToolExchange(active, pending, modelResult)
     this.clearPending(active)
     return this.drive(active)
@@ -979,6 +985,7 @@ export class AgentOrchestrator {
     active: ActiveAgentRun,
     pending: PendingTool,
     status: WorkflowStatusBlock['status'],
+    error?: Pick<WorkflowStatusBlock, 'errorCode' | 'errorSummary'>,
   ): void {
     const index = active.blocks.findIndex((block) => (
       block.type === 'workflow_status' && block.blockId === pending.statusBlockId
@@ -990,6 +997,7 @@ export class AgentOrchestrator {
       ...current,
       status,
       ...(pending.executionIndex === undefined ? {} : { executionIndex: pending.executionIndex }),
+      ...error,
     }
     active.blocks[index] = replacement
     this.dependencies.persistence.replaceAssistantBlock(

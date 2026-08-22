@@ -729,7 +729,14 @@ export const useChatStore = defineStore('chat', {
         return
       }
       const id = blockIdentity(event.messageId, event.block, message.blocks.length)
-      if (!message.blocks.some((block) => block.id === id)) message.blocks.push({ ...event.block, id })
+      const existingIndex = message.blocks.findIndex((block) => block.id === id)
+      if (existingIndex >= 0) {
+        if (event.block.type === 'workflow_status' || event.block.type === 'workflow_provenance') {
+          message.blocks[existingIndex] = { ...event.block, id }
+        }
+        return
+      }
+      message.blocks.push({ ...event.block, id })
     },
   },
 })
