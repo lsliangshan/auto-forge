@@ -354,7 +354,10 @@ async function installApprovalWorkflow(
   return runtime.services.workflows.installProject(project.id)
 }
 
-async function applicationHarness(input: { developerMode: boolean }) {
+async function applicationHarness(input: {
+  developerMode: boolean
+  failContinuationUsageReport?: boolean
+}) {
   const root = await mkdtemp(join(tmpdir(), 'autoforge-application-dynamic-workflow-'))
   directories.push(root)
   const providerRequests: ModelStreamRequest[] = []
@@ -376,6 +379,24 @@ async function applicationHarness(input: { developerMode: boolean }) {
     stream: vi.fn(async function* (request: ModelStreamRequest) {
       providerRequests.push(request)
       if (request.messages.some((message) => message.role === 'tool')) {
+        if (input.failContinuationUsageReport) {
+          const tamper = new Database(join(root, 'autoforge.sqlite'))
+          try {
+            expect(tamper.prepare(`
+              DELETE FROM provider_usage_events
+              WHERE operation_key LIKE 'agent:%:turn:1'
+            `).run().changes).toBe(1)
+          } finally {
+            tamper.close()
+          }
+        }
+        yield {
+          type: 'usage' as const,
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          costUsd: '0.01',
+        }
         yield { type: 'text_delta' as const, choiceIndex: 0, text: '工作流处理完成' }
         yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
         return
@@ -1687,6 +1708,34 @@ describe('createApplicationRuntime', () => {
       })
     } finally {
       await app.runtime.close()
+    }
+  })
+
+  it('latches a provider usage consistency failure from the mode-transition continuation', async () => {
+    const app = await applicationHarness({
+      developerMode: true,
+      failContinuationUsageReport: true,
+    })
+    let closed = false
+    try {
+      const pending = await app.sendToolPrompt()
+
+      await app.settings.update({ developerMode: false })
+      await vi.waitFor(() => expect(app.providerRequests).toHaveLength(2))
+      await new Promise<void>((resolve) => { setImmediate(resolve) })
+
+      await expect(app.runtime.services.chat.send(chatInput(pending.conversation.id, 'refused')))
+        .rejects.toMatchObject({ code: 'CONFLICT' })
+      let closeError: unknown
+      try {
+        await app.runtime.close()
+      } catch (error) {
+        closeError = error
+      }
+      closed = true
+      expect(closeError).toBeInstanceOf(ProviderUsageConsistencyError)
+    } finally {
+      if (!closed) await app.runtime.close().catch(() => undefined)
     }
   })
 

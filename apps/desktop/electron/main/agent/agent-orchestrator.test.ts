@@ -1988,10 +1988,7 @@ describe('AgentOrchestrator', () => {
     }))
 
     developerMode = false
-    const transition = orchestrator as AgentOrchestrator & {
-      onDeveloperModeChanged?: (enabled: boolean) => void
-    }
-    transition.onDeveloperModeChanged?.(false)
+    await orchestrator.onDeveloperModeChanged(false)
 
     await vi.waitFor(() => expect(dependencies.records.terminal).toHaveLength(1))
     expect(pending).toMatchObject({ status: 'awaiting_approval', executionId: 'reserved_1' })
@@ -2004,6 +2001,73 @@ describe('AgentOrchestrator', () => {
     expect(request.messages).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'tool', content: expect.stringContaining('WORKFLOW_CHANGED') }),
     ]))
+  })
+
+  it('rethrows a usage consistency failure from the WORKFLOW_CHANGED continuation', async () => {
+    let developerMode = true
+    const dependencies = harness([toolTurn, [
+      { type: 'usage', inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: '0.01' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [developmentApprovalWorkflow]
+    dependencies.developerMode = () => developerMode
+    const consistencyError = new ProviderUsageConsistencyError()
+    vi.mocked(dependencies.providerUsage.report).mockImplementation(() => { throw consistencyError })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    await orchestrator.run(textRunInput({
+      conversationId: 'mode_transition_consistency', content: '运行开发工作流',
+      provider: 'openrouter', model: 'model',
+    }))
+
+    developerMode = false
+    await expect(orchestrator.onDeveloperModeChanged(false)).rejects.toBe(consistencyError)
+    expect(dependencies.records.terminal).toEqual([
+      expect.objectContaining({ status: 'failed', errorCode: 'INTERNAL_ERROR' }),
+    ])
+  })
+
+  it('lets an already-expired approval cancel before developer-mode invalidation can continue', async () => {
+    let milliseconds = 0
+    let developerMode = true
+    const dependencies = harness([toolTurn, [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async ({ developerMode: includeDevelopment } = {}) => (
+      includeDevelopment ? [developmentApprovalWorkflow] : [workflow]
+    )
+    dependencies.developerMode = () => developerMode
+    dependencies.now = () => milliseconds
+    dependencies.setTimer = vi.fn(() => 'undelivered_expiry_timer')
+    dependencies.clearTimer = vi.fn()
+    const orchestrator = new AgentOrchestrator(dependencies)
+    await expect(orchestrator.run(textRunInput({
+      conversationId: 'expired_mode_transition', content: '运行开发工作流',
+      provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'awaiting_approval' })
+    milliseconds = APPROVAL_EXPIRY_MS
+
+    developerMode = false
+    await orchestrator.onDeveloperModeChanged(false)
+
+    expect(dependencies.records.terminal).toEqual([
+      expect.objectContaining({ status: 'cancelled', errorCode: 'CANCELLED' }),
+    ])
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(1)
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.discards).toHaveLength(1)
+    expect(dependencies.policy.releaseExecution).toHaveBeenCalledTimes(1)
+    expect(orchestrator.ownsExecution('reserved_1')).toBe(false)
+    expect(dependencies.records.events.filter((event) => (
+      typeof event === 'object' && event !== null && 'type' in event
+      && (event as { type: string; status?: string }).type === 'status'
+      && (event as { status?: string }).status === 'cancelled'
+    ))).toHaveLength(1)
+
+    await expect(orchestrator.run(textRunInput({
+      conversationId: 'expired_mode_transition', content: '重试',
+      provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+    expect(dependencies.records.terminal).toHaveLength(2)
   })
 
   it('automatically cancels an expired approval and releases all pending ownership once', async () => {

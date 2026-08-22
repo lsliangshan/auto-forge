@@ -1307,7 +1307,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const commit = () => {
             const committed = settings.commit(candidate)
             if (committed.developerMode !== previous.developerMode) {
-              agent.onDeveloperModeChanged(committed.developerMode)
+              void agent.onDeveloperModeChanged(committed.developerMode).catch((error: unknown) => {
+                recordFailure(error, 'background-chat')
+              })
             }
             if (committed.theme !== previous.theme) options.applyTheme?.(committed.theme)
             return committed

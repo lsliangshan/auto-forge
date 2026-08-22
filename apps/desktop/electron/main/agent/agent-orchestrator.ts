@@ -546,8 +546,9 @@ export class AgentOrchestrator {
     return this.activeByRequest.size > 0
   }
 
-  onDeveloperModeChanged(enabled: boolean): void {
+  async onDeveloperModeChanged(enabled: boolean): Promise<void> {
     if (enabled) return
+    const invalidations: Promise<void>[] = []
     for (const active of this.activeByRequest.values()) {
       const pending = active.pending
       if (!pending
@@ -555,8 +556,9 @@ export class AgentOrchestrator {
         || pending.executionIndex !== undefined
         || active.terminal
         || active.busy) continue
-      void this.invalidatePendingDevelopment(active)
+      invalidations.push(this.invalidatePendingDevelopment(active))
     }
+    await Promise.all(invalidations)
   }
 
   private async driveExclusive(active: ActiveAgentRun): Promise<AgentRunResult> {
@@ -586,7 +588,13 @@ export class AgentOrchestrator {
     active.busy = true
     try {
       this.clearApprovalTimer(active)
-      if (active.loop.awaitingApproval()) active.loop.resumeApproval()
+      if (active.loop.awaitingApproval()) {
+        const resumed = active.loop.resumeApproval()
+        if (resumed.kind === 'failed') {
+          await this.expireApproval(active)
+          return
+        }
+      }
       await this.workflowTools.cancel(pending.tool)
       if (active.terminal || active.pending !== pending) return
       this.updateWorkflowStatus(active, pending, 'failed')
@@ -594,6 +602,10 @@ export class AgentOrchestrator {
       this.clearPending(active)
       await this.drive(active)
     } catch (error) {
+      if (error instanceof ProviderUsageConsistencyError) {
+        if (!active.terminal) this.finish(active, 'failed', appFailure('INTERNAL_ERROR'))
+        throw error
+      }
       if (!active.terminal) this.finish(active, 'failed', asAppError(error))
     } finally {
       active.busy = false
