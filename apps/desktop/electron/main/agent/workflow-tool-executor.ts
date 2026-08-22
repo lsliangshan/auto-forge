@@ -38,6 +38,7 @@ export interface WorkflowToolPolicyPort {
 export interface WorkflowToolExecutionPort {
   reserve(): ExecutionReservation
   discardReservation(reservation: ExecutionReservation): boolean
+  /** Invocation transfers a valid reservation and all execution-scoped grants to this port. */
   startReserved(
     reservation: ExecutionReservation,
     input: ExecutionStartInput,
@@ -211,12 +212,22 @@ function workflowSecurityFingerprint(workflow: WorkflowDetail): string {
   return stableJson({
     id: workflow.id,
     version: workflow.version,
+    name: workflow.name,
+    description: workflow.description,
+    author: workflow.author,
+    category: workflow.category,
+    enabled: workflow.enabled,
     source: workflow.source,
+    integrity: workflow.integrity,
     codeSha256: workflow.codeSha256,
     runtimeIdentity: workflow.runtimeIdentity,
     cities: workflow.cities,
-    inputSchema: workflow.inputSchema,
     permissions: workflow.permissions,
+    activationExamples: workflow.activationExamples,
+    activationNegativeExamples: workflow.activationNegativeExamples,
+    timeoutMs: workflow.timeoutMs,
+    inputSchema: workflow.inputSchema,
+    outputSchema: workflow.outputSchema,
   })
 }
 
@@ -466,6 +477,14 @@ export class WorkflowToolExecutor {
       this.cleanupPending(pending)
       return toolError('INTERNAL_ERROR')
     }
+    if (lifecycle.phase !== 'ready' || input.signal?.aborted) {
+      if (lifecycle.phase === 'ready') this.cleanupPending(pending)
+      return toolError('CANCELLED')
+    }
+    if (!this.pendingMatchesBinding(pending, lifecycle, false)) {
+      this.cleanupPending(pending)
+      return toolError('CONFLICT')
+    }
     try {
       if (!currentWorkflow
         || workflowSecurityFingerprint(currentWorkflow) !== binding.candidateFingerprint
@@ -499,9 +518,9 @@ export class WorkflowToolExecutor {
     }
 
     lifecycle.phase = 'starting'
-    let started: Awaited<ReturnType<WorkflowToolExecutionPort['startReserved']>>
+    let startPromise: ReturnType<WorkflowToolExecutionPort['startReserved']>
     try {
-      started = await this.dependencies.executions.startReserved(binding.reservation, {
+      startPromise = this.dependencies.executions.startReserved(binding.reservation, {
         userId: input.userId,
         workflowId: binding.candidate.workflow.id,
         workflowVersion: binding.candidate.workflow.version,
@@ -510,12 +529,19 @@ export class WorkflowToolExecutor {
         sourceSelector: binding.candidate.selector,
       }, input.signal)
     } catch (error) {
-      this.cleanupStarting(pending)
+      lifecycle.phase = 'started'
       return toolError(toSafeAppError(error).code)
     }
     lifecycle.phase = 'started'
+    let started: Awaited<ReturnType<WorkflowToolExecutionPort['startReserved']>>
+    try {
+      started = await startPromise
+    } catch (error) {
+      return toolError(toSafeAppError(error).code)
+    }
     if (started.id !== binding.executionId) {
-      try { await this.dependencies.executions.cancel(started.id) } catch { /* Fail closed on an inconsistent execution port. */ }
+      void Promise.resolve(started.finished).catch(() => undefined)
+      try { await this.dependencies.executions.cancel(binding.executionId) } catch { /* Cancellation remains best effort. */ }
       return toolError('CONFLICT')
     }
     const finished = Promise.resolve(started.finished).then((completion) => (
@@ -637,18 +663,6 @@ export class WorkflowToolExecutor {
       try { this.dependencies.executions.discardReservation(lifecycle.binding.reservation) } catch { /* Cleanup is best effort. */ }
     }
     this.releaseGrants(pending)
-  }
-
-  private cleanupStarting(pending: PendingWorkflowTool): void {
-    const lifecycle = this.lifecycle.get(pending)
-    if (!lifecycle || lifecycle.phase !== 'starting') return
-    lifecycle.phase = 'discarded'
-    if (lifecycle.discarded) return
-    lifecycle.discarded = true
-    let discarded = false
-    try { discarded = this.dependencies.executions.discardReservation(lifecycle.binding.reservation) } catch { /* Ownership is unknown; fail closed. */ }
-    if (discarded) this.releaseGrants(pending)
-    else lifecycle.phase = 'started'
   }
 
   private pendingMatchesBinding(

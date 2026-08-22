@@ -411,6 +411,59 @@ describe('ExecutionService', () => {
     })).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
+  it('owns and releases a pre-aborted reserved start exactly once without persistence or Worker leakage', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+    harness.policy.record({
+      executionId: reservation.executionId,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: workflow.permissions[0]!.capability,
+      scope: workflow.permissions[0]!.scope,
+      decision: 'once',
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+    }, controller.signal)).rejects.toMatchObject({ code: 'CANCELLED' })
+
+    expect(harness.service.hasActiveExecutions()).toBe(false)
+    expect(harness.repositories.records.size).toBe(0)
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
+    expect(releaseExecution).toHaveBeenCalledWith(reservation.executionId)
+  })
+
+  it('owns and releases a reserved start when execution insertion throws', async () => {
+    const harness = createHarness()
+    const reservation = harness.service.reserve()
+    harness.policy.record({
+      executionId: reservation.executionId,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      capability: workflow.permissions[0]!.capability,
+      scope: workflow.permissions[0]!.scope,
+      decision: 'once',
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+    harness.repositories.executions.insert = () => { throw new Error('insert unavailable') }
+
+    await expect(harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+    })).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+
+    expect(harness.service.hasActiveExecutions()).toBe(false)
+    expect(harness.repositories.records.size).toBe(0)
+    expect(harness.workerFactory.workers.size).toBe(0)
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
+    expect(releaseExecution).toHaveBeenCalledWith(reservation.executionId)
+  })
+
   it('cancels and removes an unstarted reservation during shutdown', async () => {
     const harness = createHarness()
     const reservation = harness.service.reserve()

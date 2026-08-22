@@ -149,6 +149,7 @@ interface ReservationRecord {
   readonly executionId: string
   cancelled: boolean
   started: boolean
+  cleaned: boolean
   starting?: Promise<StartedExecution>
 }
 
@@ -303,6 +304,7 @@ export class ExecutionService {
       executionId: handle.executionId,
       cancelled: false,
       started: false,
+      cleaned: false,
     }
     this.reservationHandles.set(handle, record)
     this.reservationsById.set(record.executionId, record)
@@ -327,19 +329,23 @@ export class ExecutionService {
     input: ExecutionStartInput,
     signal?: AbortSignal,
   ): Promise<StartedExecution> {
-    if (this.stopped) throw failure('CONFLICT')
     const record = this.reservationHandles.get(reservation)
     if (!record || record.handle !== reservation || record.started) throw failure('CONFLICT')
-    if (record.cancelled || signal?.aborted) {
-      this.discardReservation(reservation)
-      throw failure('CANCELLED')
-    }
+    // A valid reservation transfers to ExecutionService at invocation. Every rejection
+    // after this point is service-owned and must release its reservation and once grants.
     record.started = true
+    if (this.stopped) return this.rejectOwnedReservation(record, failure('CONFLICT'))
+    if (record.cancelled || signal?.aborted) {
+      record.cancelled = true
+      return this.rejectOwnedReservation(record, failure('CANCELLED'))
+    }
     const onAbort = () => { record.cancelled = true }
     signal?.addEventListener('abort', onAbort, { once: true })
     record.starting = this.startReservation(record, input)
     try {
       return await record.starting
+    } catch (error) {
+      return this.rejectOwnedReservation(record, toSafeAppError(error))
     } finally {
       signal?.removeEventListener('abort', onAbort)
     }
@@ -483,7 +489,8 @@ export class ExecutionService {
         this.discardReservation(reservation.handle)
         return
       }
-      const started = await reservation.starting
+      let started: StartedExecution
+      try { started = await reservation.starting } catch { return }
       const activeAfterStart = this.active.get(executionId)
       if (!activeAfterStart) {
         await started.finished.catch(() => undefined)
@@ -577,6 +584,25 @@ export class ExecutionService {
     if (reservation) this.reservationHandles.delete(reservation.handle)
     this.reservationsById.delete(executionId)
     return { id: executionId, finished: Promise.resolve(terminal) }
+  }
+
+  private async rejectOwnedReservation(record: ReservationRecord, error: AppError): Promise<never> {
+    if (!record.cleaned) {
+      record.cleaned = true
+      this.reservationHandles.delete(record.handle)
+      this.reservationsById.delete(record.executionId)
+      try {
+        this.dependencies.policy.releaseExecution(record.executionId)
+      } catch {
+        // Ownership cleanup continues even if policy cleanup rejects.
+      }
+      try {
+        await this.dependencies.capability.closeExecution(record.executionId)
+      } catch {
+        // No Worker can start after this terminal reservation cleanup.
+      }
+    }
+    throw error
   }
 
   private attach(active: ActiveExecution): void {

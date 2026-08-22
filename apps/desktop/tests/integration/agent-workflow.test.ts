@@ -260,7 +260,9 @@ describe('agent workflow integration', () => {
     expect(releaseExecution).toHaveBeenCalledTimes(1)
   })
 
-  it('rejects live Registry manifest metadata drift before execution persistence or Worker start', async () => {
+  it.each(['disabled', 'renamed', 'output schema', 'timeout'] as const)(
+    'rejects live Registry %s drift before execution persistence or Worker start',
+    async (drift) => {
     let turn = 0
     const app = await runtime({
       fetch: async () => {
@@ -283,9 +285,14 @@ describe('agent workflow integration', () => {
     })
     expect(pending).toMatchObject({ status: 'awaiting_approval' })
     const installed = app.database.installedWorkflows.get(app.workflow.id, app.workflow.version)!
+    const manifest = { ...(installed.manifest as Record<string, unknown>) }
+    if (drift === 'renamed') manifest.name = '已改名的百度搜索'
+    if (drift === 'output schema') manifest.outputSchema = { type: 'object', required: ['changed'] }
+    if (drift === 'timeout') manifest.timeoutMs = 45_000
     app.database.installedWorkflows.upsert({
       ...installed,
-      manifest: { ...(installed.manifest as Record<string, unknown>), cities: ['北京'] },
+      ...(drift === 'disabled' ? { enabled: false } : {}),
+      manifest,
       updatedAt: 2,
     })
 
@@ -298,7 +305,8 @@ describe('agent workflow integration', () => {
     expect(app.database.executions.get(pending.executionId!)).toBeUndefined()
     expect(app.workers.workers).toHaveLength(0)
     expect(JSON.stringify(app.database.messages.listForConversation('conversation_1'))).toContain('工作流已变化，未执行')
-  })
+    },
+  )
 
   it('cancels a real execution service start blocked before active registration', async () => {
     let release!: () => void

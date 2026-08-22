@@ -504,6 +504,35 @@ describe('WorkflowToolExecutor', () => {
     expect(test.executions.startReserved).not.toHaveBeenCalled()
   })
 
+  it('does not start after cancellation discards a pending tool during the live lookup', async () => {
+    let releaseLookup!: () => void
+    const lookupGate = new Promise<void>((resolve) => { releaseLookup = resolve })
+    let lookupEntered!: () => void
+    const entered = new Promise<void>((resolve) => { lookupEntered = resolve })
+    const test = harness()
+    test.dependencies.resolveCurrentWorkflow.mockImplementationOnce(async () => {
+      lookupEntered()
+      await lookupGate
+      return workflow()
+    })
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+
+    const starting = test.executor.start(prepared.pending, { userId: 'user_1' })
+    await entered
+    await test.executor.cancel(prepared.pending)
+    releaseLookup()
+
+    await expect(starting).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(test.executions.discardReservation).toHaveBeenCalledTimes(1)
+    expect(test.policy.releaseExecution).toHaveBeenCalledTimes(1)
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['input', (pending: Record<string, unknown>) => { pending.input = { topic: '篡改' } }],
     ['city', (pending: Record<string, unknown>) => { pending.city = '上海' }],
@@ -566,7 +595,7 @@ describe('WorkflowToolExecutor', () => {
     })
   })
 
-  it('discards and releases an unaccepted reservation when startReserved throws', async () => {
+  it('never cleans transferred ownership when startReserved rejects', async () => {
     const test = harness()
     test.executions.startReserved.mockRejectedValueOnce(Object.assign(new Error('port rejected'), { code: 'CONFLICT' }))
     const prepared = await test.executor.prepare({
@@ -578,14 +607,20 @@ describe('WorkflowToolExecutor', () => {
 
     await expect(test.executor.start(prepared.pending, { userId: 'user_1' }))
       .resolves.toEqual({ kind: 'tool_error', code: 'CONFLICT' })
-    expect(test.executions.discardReservation).toHaveBeenCalledTimes(1)
-    expect(test.policy.releaseExecution).toHaveBeenCalledTimes(1)
+    expect(test.executions.discardReservation).not.toHaveBeenCalled()
+    expect(test.policy.releaseExecution).not.toHaveBeenCalled()
+    await test.executor.cancel(prepared.pending)
+    expect(test.executions.cancel).toHaveBeenCalledWith('execution_1')
   })
 
-  it('does not release an accepted reservation when a starting port rejects', async () => {
+  it('cancels only the bound execution when a start port returns a foreign id', async () => {
     const test = harness()
-    test.executions.discardReservation.mockReturnValueOnce(false)
-    test.executions.startReserved.mockRejectedValueOnce(Object.assign(new Error('accepted then rejected'), { code: 'INTERNAL_ERROR' }))
+    test.executions.startReserved.mockImplementationOnce(async () => ({
+      id: 'execution_foreign',
+      finished: Promise.resolve({
+        id: 'execution_foreign', status: 'completed', result: { ok: true, secret: 'foreign' }, input: undefined,
+      }),
+    }))
     const prepared = await test.executor.prepare({
       candidate: test.candidate,
       arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
@@ -594,11 +629,10 @@ describe('WorkflowToolExecutor', () => {
     if (prepared.kind !== 'ready') throw new Error('expected ready')
 
     await expect(test.executor.start(prepared.pending, { userId: 'user_1' }))
-      .resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
-    expect(test.executions.discardReservation).toHaveBeenCalledTimes(1)
-    expect(test.policy.releaseExecution).not.toHaveBeenCalled()
-    await test.executor.cancel(prepared.pending)
+      .resolves.toEqual({ kind: 'tool_error', code: 'CONFLICT' })
+    expect(test.executions.cancel).toHaveBeenCalledTimes(1)
     expect(test.executions.cancel).toHaveBeenCalledWith('execution_1')
+    expect(test.executions.cancel).not.toHaveBeenCalledWith('execution_foreign')
   })
 
   it('leaves started grant cleanup exclusively to ExecutionService', async () => {
