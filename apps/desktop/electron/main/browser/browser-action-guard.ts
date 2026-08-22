@@ -35,6 +35,7 @@ const loginText = /(?:^|\s)(?:log[ -]?in|sign[ -]?in)(?:\s|$)|登录|登陆/iu
 const logoutText = /退出登录|注销登录|log[ -]?out|sign[ -]?out/iu
 const protectedText = /(?:正式|最终)?提交|确认(?:变更|申请|订单|发布|支付|删除|撤回)|支付|付款|购买|签名|签字|发布|删除|移除|撤回|撤销申请|退出登录|注销|withdraw|delete|remove|publish|payment|purchase|signature|log[ -]?out|sign[ -]?out|confirm|submit/iu
 const fileText = /上传|附件|文件|upload|attachment|file/iu
+const captchaText = /验证码|captcha/iu
 const signatureText = /签名|签字|signature/iu
 const paymentText = /支付|付款|银行卡|信用卡|订单|payment|credit card|debit card|purchase/iu
 const draftText = /保存(?:草稿)?|暂存|save(?: draft)?/iu
@@ -122,7 +123,7 @@ export class BrowserActionGuard {
 
     const evidence = targetEvidence(context)
     const inputType = context.targetContext?.inputType?.toLowerCase()
-    if (inputType === 'file' || fileText.test(evidence)) {
+    if (inputType === 'file' || fileText.test(evidence) || captchaText.test(evidence)) {
       return { kind: 'handoff', code: 'UNSUPPORTED_CONTROL' }
     }
     if (signatureText.test(evidence) || paymentText.test(evidence) || protectedText.test(evidence)) {

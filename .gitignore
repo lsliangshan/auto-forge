@@ -1,5 +1,6 @@
 .superpowers/
 .worktrees/
+.e2e/
 node_modules/
 out/
 dist/

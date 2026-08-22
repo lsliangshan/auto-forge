@@ -6,6 +6,7 @@ export default tseslint.config(
   {
     ignores: [
       '.superpowers/**',
+      '**/.e2e/**',
       '**/node_modules/**',
       '**/out/**',
       '**/dist/**',
