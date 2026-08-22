@@ -4,7 +4,7 @@ import { resolve, sep } from 'node:path'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
 import type { WorkflowDetail } from '@autoforge/shared'
 import type { AppRepositories, InstalledWorkflow } from '../database/repositories.js'
-import { buildFingerprint, WorkflowProjectService } from './project-service.js'
+import { WorkflowProjectService } from './project-service.js'
 
 type RegistryRepositories = Pick<AppRepositories, 'workflowProjects' | 'installedWorkflows' | 'workflowFiles'>
 
@@ -75,9 +75,9 @@ export class WorkflowRegistry {
     try {
       const manifest = JSON.parse(await this.projects.read(project.id, 'workflow.json')) as WorkflowManifest
       if (!validateManifest(manifest).valid) return undefined
-      const source = await this.projects.read(project.id, 'src/index.ts')
       const entry = await this.projects.read(project.id, manifest.entryPath)
-      if (buildFingerprint(source, manifest) !== project.buildHash || sha256(Buffer.from(entry)) !== manifest.codeSha256) return undefined
+      if (await this.projects.currentBuildFingerprint(project.id, manifest) !== project.buildHash
+        || sha256(Buffer.from(entry)) !== manifest.codeSha256) return undefined
       return {
         id: manifest.id,
         version: manifest.version,

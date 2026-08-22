@@ -4298,6 +4298,36 @@ describe('createApplicationRuntime', () => {
       chatAvailability: 'ready',
     })
 
+    const created = await runtime.services.developer.createEntry(project.id, 'src', 'helpers.ts', 'file')
+    expect(created).toMatchObject({ status: 'new', chatAvailability: 'unbuilt_changes' })
+    await runtime.services.developer.writeFile(project.id, 'src/helpers.ts', 'export const helper = true\n')
+    await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+      "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+      "import { helper } from './helpers'",
+      'export default defineWorkflow({ run: async () => ({ helper }) })',
+      '',
+    ].join('\n'))
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      status: 'new', chatAvailability: 'unbuilt_changes',
+    })
+    await runtime.services.developer.build(project.id)
+
+    const renamed = await runtime.services.developer.renameEntry(project.id, 'src/helpers.ts', 'format.ts')
+    expect(renamed).toMatchObject({ status: 'new', chatAvailability: 'unbuilt_changes' })
+    expect(await runtime.services.developer.validate(project.id)).toMatchObject({ valid: false })
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      status: 'invalid', chatAvailability: 'invalid',
+    })
+    await runtime.services.developer.renameEntry(project.id, 'src/format.ts', 'helpers.ts')
+    await runtime.services.developer.build(project.id)
+
+    const deleted = await runtime.services.developer.deleteEntry(project.id, 'src/helpers.ts')
+    expect(deleted).toMatchObject({ status: 'new', chatAvailability: 'unbuilt_changes' })
+    expect(await runtime.services.developer.validate(project.id)).toMatchObject({ valid: false })
+    expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
+      status: 'invalid', chatAvailability: 'invalid',
+    })
+
     await runtime.services.developer.writeFile(project.id, 'src/index.ts', "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ changed: true }) })\n")
     expect((await runtime.services.developer.listProjects())[0]).toMatchObject({
       id: project.id,

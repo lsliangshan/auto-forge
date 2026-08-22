@@ -1,5 +1,5 @@
 import Ajv from 'ajv'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { WorkflowDetail } from '@autoforge/shared'
 import { createWorkflowCatalog } from './workflow-catalog.js'
 import { createWorkflowSourceSelectorVault } from '../workflows/workflow-source-selector.js'
@@ -23,6 +23,40 @@ const allCitiesWorkflow: WorkflowDetail = {
 }
 
 describe('WorkflowCatalog', () => {
+  it('filters ineligible workflows before assigning opaque names or selectors', async () => {
+    const eligibleSecond: WorkflowDetail = {
+      ...allCitiesWorkflow,
+      id: 'weather.second',
+      runtimeIdentity: { id: 'weather.second', version: allCitiesWorkflow.version, source: 'installed' },
+    }
+    const workflows = {
+      list: async () => [
+        beijingWorkflow,
+        { ...allCitiesWorkflow, id: 'weather.disabled', enabled: false,
+          runtimeIdentity: { id: 'weather.disabled', version: allCitiesWorkflow.version, source: 'installed' as const } },
+        { ...allCitiesWorkflow, id: 'weather.failed', integrity: 'failed' as const,
+          runtimeIdentity: { id: 'weather.failed', version: allCitiesWorkflow.version, source: 'installed' as const } },
+        { ...allCitiesWorkflow, id: 'weather.unchecked', integrity: 'unchecked' as const,
+          runtimeIdentity: { id: 'weather.unchecked', version: allCitiesWorkflow.version, source: 'installed' as const } },
+        eligibleSecond,
+      ],
+    }
+    const vault = createWorkflowSourceSelectorVault()
+    const selectorFor = vi.fn(vault.create)
+
+    const catalog = await createWorkflowCatalog({ workflows, selectorFor }).create({ developerMode: false })
+
+    expect(catalog.map(({ toolName, workflow }) => [toolName, workflow.id])).toEqual([
+      ['workflow_1', beijingWorkflow.id],
+      ['workflow_2', eligibleSecond.id],
+    ])
+    expect(selectorFor).toHaveBeenCalledTimes(2)
+    expect(selectorFor.mock.calls.map(([candidate]) => candidate.id)).toEqual([
+      beijingWorkflow.id,
+      eligibleSecond.id,
+    ])
+  })
+
   it('creates unique tools with city routing outside workflow input', async () => {
     const workflows = { list: async () => [beijingWorkflow, allCitiesWorkflow] }
     const selectorFor = createWorkflowSourceSelectorVault().create

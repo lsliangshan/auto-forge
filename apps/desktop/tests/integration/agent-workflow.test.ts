@@ -267,11 +267,53 @@ async function runtime(options: {
   }
   return {
     directory, workflow, database, workers, executionEvents, orchestrator, registry, policy,
-    providerSnapshot, installWorkflow,
+    providerSnapshot, installWorkflow, executionService,
   }
 }
 
 describe('agent workflow integration', () => {
+  it.each([
+    ['disabled', async (app: Awaited<ReturnType<typeof runtime>>) => {
+      const installed = app.database.installedWorkflows.get(app.workflow.id, app.workflow.version)!
+      app.database.installedWorkflows.upsert({ ...installed, enabled: false })
+    }],
+    ['failed integrity', async (app: Awaited<ReturnType<typeof runtime>>) => {
+      await writeFile(join(app.directory, 'workflow.mjs'), 'tampered')
+    }],
+    ['unchecked integrity', async (app: Awaited<ReturnType<typeof runtime>>) => {
+      vi.spyOn(app.registry, 'list').mockResolvedValue([{ ...app.workflow, integrity: 'unchecked' }])
+    }],
+  ] as const)('does not advertise or reserve an installed workflow with %s', async (_case, makeIneligible) => {
+    const providerRequests: Array<{ tools?: unknown[] }> = []
+    const app = await runtime({
+      workerBehavior: 'complete',
+      fetch: async (_input, init) => {
+        providerRequests.push(JSON.parse(String(init?.body)) as { tools?: unknown[] })
+        return response([
+          { id: 'generation_direct', choices: [{ index: 0, delta: { content: '未调用工作流' }, finish_reason: 'stop' }] },
+          '[DONE]',
+        ])
+      },
+    })
+    await makeIneligible(app)
+    const reserve = vi.spyOn(app.executionService, 'reserve')
+
+    const result = await app.orchestrator.run({
+      conversationId: 'conversation_1', content: '请运行这个工作流', provider: 'openrouter', userId: 'user_1',
+      userBlocks: [{ type: 'text', text: '请运行这个工作流' }], modelContent: '请运行这个工作流',
+      assetIds: [], currentMedia: [], allowTools: true,
+      model: 'local-test-model', requestId: `request_ineligible_${_case.replaceAll(' ', '_')}`,
+      providerSnapshot: app.providerSnapshot,
+    })
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(providerRequests).toHaveLength(1)
+    expect(providerRequests[0]?.tools ?? []).toEqual([])
+    expect(reserve).not.toHaveBeenCalled()
+    expect(app.database.executions.list()).toEqual([])
+    expect(app.workers.workers).toEqual([])
+  })
+
   it('semantically selects a restricted workflow by its opaque provider tool name and persists exact provenance', async () => {
     const requests: RequestInit[] = []
     let turn = 0
@@ -829,6 +871,10 @@ describe('agent workflow integration', () => {
     await expect(resuming).resolves.toMatchObject({ status: 'cancelled' })
     expect(app.workers.workers).toHaveLength(0)
     expect(app.database.executions.get(pending.executionId!)).toMatchObject({ status: 'cancelled', errorCode: 'CANCELLED' })
+    expect(app.database.messages.listForConversation('conversation_1')
+      .find((message) => message.role === 'assistant')?.blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status', status: 'cancelled', executionAvailable: true,
+    }))
     expect(releaseExecution).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(app.database.messages.listForConversation('conversation_1').find((message) => message.role === 'assistant')!.blocks)).not.toContain('真实执行完成')
   })

@@ -483,7 +483,7 @@ describe('cross-process contracts', () => {
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证',
       workflowVersion: '1.0.0', source: 'development', buildHash: 'a'.repeat(64),
-      city: '北京', status: 'running', executionIndex: 1, executionLimit: 5,
+      city: '北京', status: 'running', executionAvailable: true, executionIndex: 1, executionLimit: 5,
     }).type).toBe('workflow_status')
     expect(chatBlockSchema.parse({
       type: 'workflow_provenance', blockId: 'provenance_1',
@@ -494,13 +494,36 @@ describe('cross-process contracts', () => {
     expect(() => chatBlockSchema.parse({
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
-      source: 'installed', buildHash: 'a'.repeat(64), status: 'running', executionIndex: 1, executionLimit: 5,
+      source: 'installed', buildHash: 'a'.repeat(64), status: 'running', executionAvailable: true,
+      executionIndex: 1, executionLimit: 5,
     })).toThrow()
     expect(() => chatBlockSchema.parse({
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
-      source: 'installed', status: 'running', executionIndex: 6, executionLimit: 6,
+      source: 'installed', status: 'running', executionAvailable: true, executionIndex: 6, executionLimit: 6,
     })).toThrow()
+  })
+
+  it('requires Main-owned execution availability with strict status semantics', () => {
+    const status = {
+      type: 'workflow_status' as const,
+      blockId: 'status_1', executionId: 'exec_1', workflowId: 'workflow.beijing',
+      workflowName: '北京工作居住证', workflowVersion: '1.0.0', source: 'installed' as const,
+      executionIndex: 1, executionLimit: 5,
+    }
+
+    expect(chatBlockSchema.parse({ ...status, status: 'queued', executionAvailable: false }))
+      .toMatchObject({ status: 'queued', executionAvailable: false })
+    expect(chatBlockSchema.parse({ ...status, status: 'failed', executionAvailable: false,
+      errorCode: 'WORKFLOW_CHANGED', errorSummary: 'The workflow changed before it could run. Review and try again.' }))
+      .toMatchObject({ status: 'failed', executionAvailable: false })
+    expect(chatBlockSchema.parse({ ...status, status: 'failed', executionAvailable: true,
+      errorCode: 'WORKER_TIMEOUT', errorSummary: 'The worker timed out.' }))
+      .toMatchObject({ status: 'failed', executionAvailable: true })
+    expect(chatBlockSchema.safeParse({ ...status, status: 'queued', executionAvailable: true }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...status, status: 'running', executionAvailable: false }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...status, status: 'completed', executionAvailable: false }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...status, status: 'queued' }).success).toBe(false)
   })
 
   it('binds safe workflow status errors to valid terminal states', () => {
@@ -509,7 +532,7 @@ describe('cross-process contracts', () => {
       blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证',
       workflowVersion: '1.0.0', source: 'installed' as const,
-      status: 'completed' as const, executionIndex: 1, executionLimit: 5,
+      status: 'completed' as const, executionAvailable: true, executionIndex: 1, executionLimit: 5,
       errorCode: 'RESULT_TOO_LARGE' as const,
       errorSummary: 'The workflow result is too large.',
     }

@@ -99,7 +99,7 @@ export function createWorkflowCatalog(dependencies: WorkflowCatalogDependencies)
   return {
     async create(options) {
       const workflows = await dependencies.workflows.list({ developerMode: options.developerMode })
-      return workflows.map((detail, index) => {
+      return workflows.filter((workflow) => workflow.enabled && workflow.integrity === 'valid').map((detail, index) => {
         const workflow = snapshot(detail)
         const toolName = `workflow_${index + 1}`
         const candidate: WorkflowCandidate = {

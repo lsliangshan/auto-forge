@@ -283,6 +283,7 @@ interface PendingTool extends ToolExchange {
   tool: PendingWorkflowTool
   statusBlockId: string
   executionIndex?: number
+  executionAvailable: boolean
 }
 
 type WorkflowStatusBlock = Extract<ChatBlock, { type: 'workflow_status' }>
@@ -495,7 +496,7 @@ export class AgentOrchestrator {
     if (active.loop.approvalExpired()) {
       this.clearApprovalTimer(active)
       await this.workflowTools.cancel(pending.tool)
-      this.updateWorkflowStatus(active, pending, 'cancelled')
+      this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
       this.clearPending(active)
       return this.finish(active, 'cancelled', appFailure('CANCELLED'))
     }
@@ -508,7 +509,7 @@ export class AgentOrchestrator {
       }
       this.clearApprovalTimer(active)
       active.loop.resumeApproval()
-      this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed')
+      this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed', result)
       this.appendToolExchange(active, pending, result)
       this.clearPending(active)
     } else {
@@ -525,7 +526,7 @@ export class AgentOrchestrator {
     active.controller.abort()
     if (active.pending) {
       await this.workflowTools.cancel(active.pending.tool)
-      this.updateWorkflowStatus(active, active.pending, 'cancelled')
+      this.updateWorkflowStatus(active, active.pending, 'cancelled', appFailure('CANCELLED'))
     }
     if (!active.terminal) this.finish(active, 'cancelled', appFailure('CANCELLED'))
   }
@@ -597,7 +598,7 @@ export class AgentOrchestrator {
       }
       await this.workflowTools.cancel(pending.tool)
       if (active.terminal || active.pending !== pending) return
-      this.updateWorkflowStatus(active, pending, 'failed')
+      this.updateWorkflowStatus(active, pending, 'failed', appFailure('WORKFLOW_CHANGED'))
       this.appendToolExchange(active, pending, { kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
       this.clearPending(active)
       await this.drive(active)
@@ -804,6 +805,7 @@ export class AgentOrchestrator {
       toolName: candidate.toolName,
       tool: prepared.pending,
       statusBlockId: this.id(),
+      executionAvailable: false,
     }
     active.executionId = executionId
     this.activeByExecution.set(executionId, active)
@@ -813,6 +815,7 @@ export class AgentOrchestrator {
       blockId: active.pending.statusBlockId,
       executionId,
       status: 'queued',
+      executionAvailable: false,
       executionIndex: active.loop.workflowExecutions() + 1,
       executionLimit: MAX_WORKFLOW_EXECUTIONS,
     })
@@ -855,7 +858,6 @@ export class AgentOrchestrator {
     }
 
     let loopStart: { kind: 'started'; executionIndex: number } | undefined
-    let actual: WorkflowProvenanceEntry | undefined
     const started = await this.workflowTools.start(tool, {
       userId: active.userId,
       chatRunId: active.runId,
@@ -873,35 +875,36 @@ export class AgentOrchestrator {
         if (boundary.kind === 'failed') return { kind: 'tool_error' as const, code: boundary.code }
         loopStart = boundary
         pending.executionIndex = boundary.executionIndex
-        this.updateWorkflowStatus(active, pending, 'running')
-        actual = {
-          ...this.workflowStatusContext(tool),
-          executionId: tool.executionId,
-          status: 'running',
-        }
-        active.actualExecutions.push(actual)
         return boundary
       },
     })
     if (started.kind === 'tool_error') {
       if (loopStart) active.loop.finishExecution(loopStart.executionIndex, 'failed')
-      if (actual) actual.status = 'failed'
-      this.updateWorkflowStatus(active, pending, 'failed')
+      this.updateWorkflowStatus(active, pending, 'failed', started)
       this.appendToolExchange(active, pending, started)
       this.clearPending(active)
       return this.drive(active)
     }
-    if (!loopStart || !actual) {
-      this.updateWorkflowStatus(active, pending, 'failed')
-      this.appendToolExchange(active, pending, { kind: 'tool_error', code: 'INTERNAL_ERROR' })
+    if (!loopStart) {
+      const error = { kind: 'tool_error' as const, code: 'INTERNAL_ERROR' as const }
+      this.updateWorkflowStatus(active, pending, 'failed', error)
+      this.appendToolExchange(active, pending, error)
       this.clearPending(active)
       return this.drive(active)
     }
+    pending.executionAvailable = true
+    this.updateWorkflowStatus(active, pending, 'running')
+    const actual: WorkflowProvenanceEntry = {
+      ...this.workflowStatusContext(tool),
+      executionId: tool.executionId,
+      status: 'running',
+    }
+    active.actualExecutions.push(actual)
     const execution = await started.finished
     if (active.cancelled || execution.status === 'cancelled') {
       active.loop.finishExecution(loopStart.executionIndex, 'cancelled')
       actual.status = 'cancelled'
-      this.updateWorkflowStatus(active, pending, 'cancelled')
+      this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
       return this.finish(active, 'cancelled', appFailure('CANCELLED'))
     }
     const modelResult = execution.status === 'completed'
@@ -916,13 +919,11 @@ export class AgentOrchestrator {
     const terminalStatus = execution.status === 'completed' ? 'completed' : 'failed'
     active.loop.finishExecution(loopStart.executionIndex, terminalStatus)
     actual.status = terminalStatus
-    const statusError = modelResult.kind === 'tool_error' && modelResult.code === 'RESULT_TOO_LARGE'
-      ? appFailure(modelResult.code)
+    const statusError = modelResult.kind === 'tool_error'
+      && (terminalStatus === 'failed' || modelResult.code === 'RESULT_TOO_LARGE')
+      ? modelResult
       : undefined
-    this.updateWorkflowStatus(active, pending, terminalStatus, statusError && {
-      errorCode: statusError.code,
-      errorSummary: statusError.message,
-    })
+    this.updateWorkflowStatus(active, pending, terminalStatus, statusError)
     this.appendToolExchange(active, pending, modelResult)
     this.clearPending(active)
     return this.drive(active)
@@ -985,7 +986,7 @@ export class AgentOrchestrator {
     active: ActiveAgentRun,
     pending: PendingTool,
     status: WorkflowStatusBlock['status'],
-    error?: Pick<WorkflowStatusBlock, 'errorCode' | 'errorSummary'>,
+    error?: unknown,
   ): void {
     const index = active.blocks.findIndex((block) => (
       block.type === 'workflow_status' && block.blockId === pending.statusBlockId
@@ -993,11 +994,13 @@ export class AgentOrchestrator {
     if (index < 0) return
     const current = active.blocks[index]
     if (current?.type !== 'workflow_status') return
+    const safeError = error === undefined ? undefined : toSafeAppError(error)
     const replacement: WorkflowStatusBlock = {
       ...current,
       status,
+      executionAvailable: pending.executionAvailable,
       ...(pending.executionIndex === undefined ? {} : { executionIndex: pending.executionIndex }),
-      ...error,
+      ...(safeError === undefined ? {} : { errorCode: safeError.code, errorSummary: safeError.message }),
     }
     active.blocks[index] = replacement
     this.dependencies.persistence.replaceAssistantBlock(
@@ -1044,7 +1047,7 @@ export class AgentOrchestrator {
     active.controller.abort()
     const pending = active.pending
     await this.workflowTools.cancel(pending.tool)
-    this.updateWorkflowStatus(active, pending, 'cancelled')
+    this.updateWorkflowStatus(active, pending, 'cancelled', appFailure('CANCELLED'))
     this.clearPending(active)
     this.finish(active, 'cancelled', appFailure('CANCELLED'))
   }

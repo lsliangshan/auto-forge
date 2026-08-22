@@ -61,7 +61,7 @@ function readyProject(overrides: Partial<WorkflowProject> = {}): { project: Work
       rootPath: '',
       manifest,
       status: 'ready',
-      buildHash: buildFingerprint(source, manifest),
+      buildHash: buildFingerprint([{ path: 'src/index.ts', contents: Buffer.from(source) }], manifest),
       lastError: undefined,
       createdAt: 1,
       updatedAt: 1,
@@ -114,7 +114,9 @@ afterEach(() => {
 describe('WorkflowRegistry', () => {
   it('normalizes missing cities and shadows only the exact installed identity with a ready development build', async () => {
     const development = readyProject({ buildHash: 'b'.repeat(64) })
-    development.project.buildHash = buildFingerprint(development.source, development.manifest)
+    development.project.buildHash = buildFingerprint([
+      { path: 'src/index.ts', contents: Buffer.from(development.source) },
+    ], development.manifest)
     const installedManifest = { ...development.manifest }
     delete installedManifest.cities
     const registry = registryHarness({

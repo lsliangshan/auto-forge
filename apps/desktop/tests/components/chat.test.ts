@@ -42,6 +42,7 @@ function workflowStatusBlock(
     buildHash,
     city: '北京',
     status,
+    executionAvailable: ['running', 'completed', 'interrupted'].includes(status),
     executionIndex: 1,
     executionLimit: 5,
     ...overrides,
@@ -518,6 +519,10 @@ describe('chat interactions', () => {
 
   it('renders unrestricted workflow status and opens its execution with the existing execution store', async () => {
     const { api } = createEventApi()
+    vi.mocked(api.executions.get).mockResolvedValue({
+      id: 'execution_1', workflowId: 'workflow.beijing', workflowVersion: '1.0.0', status: 'completed',
+      createdAt: '2026-08-22T00:00:00.000Z', input: {}, output: { ok: true }, steps: [], logs: [],
+    })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(MessageBlock, {
       props: { block: workflowStatusBlock('running', { city: undefined }) },
@@ -526,7 +531,50 @@ describe('chat interactions', () => {
 
     expect(wrapper.text()).toContain('不限城市')
     await wrapper.get('[data-testid="open-workflow-execution"]').trigger('click')
+    await flushPromises()
+    expect(api.executions.get).toHaveBeenCalledWith('execution_1')
     expect(useExecutionStore().selectedId).toBe('execution_1')
+    expect(useExecutionStore().selectedDetail).toMatchObject({ id: 'execution_1', status: 'completed' })
+    expect(useExecutionStore().selectedDetailError).toBe('')
+  })
+
+  it.each([
+    ['permission denial', 'cancelled', 'PERMISSION_DENIED', 'The requested permission was denied.'],
+    ['approval expiry', 'cancelled', 'CANCELLED', 'The operation was cancelled.'],
+    ['pre-start change', 'failed', 'WORKFLOW_CHANGED', 'The workflow changed before it could run. Review and try again.'],
+  ] as const)('hides execution navigation for reservation-only %s without exposing NOT_FOUND', async (
+    _case,
+    status,
+    errorCode,
+    errorSummary,
+  ) => {
+    const { api } = createEventApi()
+    vi.mocked(api.executions.get).mockRejectedValue(Object.assign(new Error('not found'), { code: 'NOT_FOUND' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock(status, { executionAvailable: false, errorCode, errorSummary }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-status-message"]').text()).toBe(errorSummary)
+    expect(wrapper.find('[data-testid="open-workflow-execution"]').exists()).toBe(false)
+    expect(api.executions.get).not.toHaveBeenCalled()
+    expect(useExecutionStore().selectedDetailError).toBe('')
+  })
+
+  it('shows the safe failure summary for a started invalid-output execution', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('failed', {
+        executionAvailable: true,
+        errorCode: 'INVALID_OUTPUT',
+        errorSummary: 'The workflow produced an invalid result.',
+      }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-status-message"]').text())
+      .toBe('The workflow produced an invalid result.')
+    expect(wrapper.find('[data-testid="open-workflow-execution"]').exists()).toBe(true)
   })
 
   it('shows the authoritative oversized-result notice without changing completed status', () => {

@@ -21,7 +21,10 @@
     >
       {{ statusMessage }}
     </p>
-    <div class="status-actions">
+    <div
+      v-if="block.executionAvailable"
+      class="status-actions"
+    >
       <el-button
         size="small"
         data-testid="open-workflow-execution"

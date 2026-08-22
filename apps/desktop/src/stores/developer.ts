@@ -377,7 +377,7 @@ export const useDeveloperStore = defineStore('developer', {
         await api.developer.writeFile(buffer.projectId, buffer.path, snapshot.content)
         const validation = await api.developer.validate(buffer.projectId)
         let project: DeveloperProject | undefined
-        if (isCurrent() && ['workflow.json', 'src/index.ts'].includes(buffer.path)) {
+        if (isCurrent() && (buffer.path === 'workflow.json' || buffer.path.startsWith('src/'))) {
           try {
             project = (await api.developer.listProjects()).find(({ id }) => id === buffer.projectId)
           } catch (error) {

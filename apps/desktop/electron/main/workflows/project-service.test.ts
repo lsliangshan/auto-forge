@@ -3,9 +3,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import { afterEach, describe, expect, it } from 'vitest'
 import { openAppDatabase } from '../database/client.js'
-import { WorkflowProjectService } from './project-service.js'
+import { buildFingerprint, WorkflowProjectService } from './project-service.js'
 import { WorkflowRegistry } from './registry.js'
 
 const temporaryDirectories: string[] = []
@@ -40,6 +41,17 @@ function writeProject(root: string, value = manifest()): void {
   mkdirSync(join(root, 'src'), { recursive: true })
   writeFileSync(join(root, 'workflow.json'), `${JSON.stringify(value, null, 2)}\n`)
   writeFileSync(join(root, 'src/index.ts'), "import { defineWorkflow } from '@autoforge/workflow-sdk'\nexport default defineWorkflow({ run: async () => ({ ok: true }) })\n")
+}
+
+function writeImportedProject(root: string, value = manifest()): void {
+  writeProject(root, value)
+  writeFileSync(join(root, 'src/index.ts'), [
+    "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+    "import { answer } from './helpers'",
+    'export default defineWorkflow({ run: async () => ({ answer }) })',
+    '',
+  ].join('\n'))
+  writeFileSync(join(root, 'src/helpers.ts'), 'export const answer = 1\n')
 }
 
 function openTestServices() {
@@ -82,6 +94,79 @@ afterEach(() => {
 })
 
 describe('WorkflowProjectService', () => {
+  it('fingerprints a stable relative-path-sorted source tree and rejects absolute inputs', () => {
+    const value = manifest() as WorkflowManifest
+    const forward = [
+      { path: 'src/index.ts', contents: Buffer.from('import "./helpers"\n') },
+      { path: 'src/helpers.ts', contents: Buffer.from('export const answer = 1\n') },
+    ]
+    const reversed = [...forward].reverse()
+
+    expect(buildFingerprint(forward, value)).toBe(buildFingerprint(reversed, value))
+    expect(buildFingerprint(forward, value)).not.toBe(buildFingerprint([
+      { path: 'src/index.ts', contents: Buffer.from('import "./helpers"\n') },
+      { path: 'src/helpers.ts', contents: Buffer.from('export const answer = 2\n') },
+    ], value))
+    expect(() => buildFingerprint([{ path: join('/private', 'src/index.ts'), contents: Buffer.from('x') }], value))
+      .toThrow()
+  })
+
+  it('invalidates every source-tree mutation until an explicit rebuild while leaving unrelated files ready', async () => {
+    const { directory, database, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeImportedProject(root)
+    const project = projects.register(root)
+    const firstBuild = await projects.build(project.id)
+    const firstArtifact = readFileSync(join(root, 'dist/index.js'), 'utf8')
+
+    await projects.write(project.id, 'src/helpers.ts', 'export const answer = 2\n')
+    expect(database.workflowProjects.get(project.id)).toMatchObject({ status: 'new', buildHash: firstBuild.buildHash })
+    expect(readFileSync(join(root, 'dist/index.js'), 'utf8')).toBe(firstArtifact)
+    await projects.build(project.id)
+    expect(readFileSync(join(root, 'dist/index.js'), 'utf8')).not.toBe(firstArtifact)
+
+    await projects.createEntry(project.id, 'src', 'empty.ts', 'file')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('new')
+    await projects.build(project.id)
+
+    await projects.renameEntry(project.id, 'src/empty.ts', 'renamed.ts')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('new')
+    await projects.build(project.id)
+
+    await projects.deleteEntry(project.id, 'src/renamed.ts')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('new')
+    await projects.build(project.id)
+
+    await projects.createEntry(project.id, 'src', 'generated', 'directory')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('new')
+    await projects.build(project.id)
+    await projects.renameEntry(project.id, 'src/generated', 'renamed-generated')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('new')
+    await projects.build(project.id)
+    await projects.deleteEntry(project.id, 'src/renamed-generated')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('new')
+    await projects.build(project.id)
+
+    await projects.createEntry(project.id, '', 'notes.md', 'file')
+    await projects.write(project.id, 'notes.md', 'not a build input\n')
+    await projects.renameEntry(project.id, 'notes.md', 'readme.md')
+    await projects.deleteEntry(project.id, 'readme.md')
+    expect(database.workflowProjects.get(project.id)?.status).toBe('ready')
+  })
+
+  it('rejects a source-tree symlink instead of fingerprinting or bundling it', async () => {
+    const { directory, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeImportedProject(root)
+    const outside = join(directory, 'outside-helper.ts')
+    writeFileSync(outside, 'export const answer = 42\n')
+    rmSync(join(root, 'src/helpers.ts'))
+    symlinkSync(outside, join(root, 'src/helpers.ts'))
+    const project = projects.register(root)
+
+    await expect(projects.build(project.id)).rejects.toMatchObject({ code: 'PATH_OUTSIDE_PROJECT' })
+  })
+
   it('reports TypeScript build diagnostics during validation without writing build output', async () => {
     const { directory, projects } = openTestServices()
     const root = join(directory, 'project')
@@ -631,5 +716,20 @@ describe('WorkflowRegistry', () => {
 
     writeFileSync(join(root, 'src/index.ts'), 'export default {}\n')
     expect(await registry.list({ developerMode: true })).toEqual([])
+  })
+
+  it('fails closed when an imported source file drifts outside the project IPC path', async () => {
+    const { directory, database, projects } = openTestServices()
+    const root = join(directory, 'project')
+    writeImportedProject(root)
+    const project = projects.register(root)
+    const registry = new WorkflowRegistry(database, projects)
+    await projects.build(project.id)
+    expect(await registry.list({ developerMode: true })).toHaveLength(1)
+
+    writeFileSync(join(root, 'src/helpers.ts'), 'export const answer = 99\n')
+
+    expect(await registry.list({ developerMode: true })).toEqual([])
+    expect(database.workflowProjects.get(project.id)?.status).toBe('ready')
   })
 })

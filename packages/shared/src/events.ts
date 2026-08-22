@@ -116,16 +116,23 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     blockId: identifierSchema,
     executionId: identifierSchema,
     status: executionStatusSchema,
+    executionAvailable: z.boolean(),
     executionIndex: z.number().int().positive(),
     executionLimit: z.number().int().positive().max(5),
     errorCode: appErrorCodeSchema.optional(),
     errorSummary: nonEmptyStringSchema.max(500).optional(),
-  }).superRefine(({ executionIndex, executionLimit, status, errorCode, errorSummary }, context) => {
+  }).superRefine(({ executionIndex, executionLimit, status, executionAvailable, errorCode, errorSummary }, context) => {
     if (executionIndex > executionLimit) {
       context.addIssue({ code: 'custom', path: ['executionIndex'], message: 'Execution index cannot exceed its limit' })
     }
     if ((errorCode === undefined) !== (errorSummary === undefined)) {
       context.addIssue({ code: 'custom', message: 'Workflow status errors require both code and summary' })
+    }
+    if (['queued', 'awaiting_approval'].includes(status) && executionAvailable) {
+      context.addIssue({ code: 'custom', path: ['executionAvailable'], message: 'Pre-start workflow status cannot expose an execution' })
+    }
+    if (['running', 'completed', 'interrupted'].includes(status) && !executionAvailable) {
+      context.addIssue({ code: 'custom', path: ['executionAvailable'], message: 'Started workflow status must expose its execution' })
     }
     if (errorCode === undefined) return
     if (['queued', 'awaiting_approval', 'running'].includes(status)) {

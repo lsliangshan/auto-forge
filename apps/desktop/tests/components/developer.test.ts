@@ -204,6 +204,26 @@ describe('developer workbench', () => {
     expect(raw.developer.build).not.toHaveBeenCalled()
   })
 
+  it('refreshes authoritative chat availability after saving an imported source file', async () => {
+    const { api, raw } = createApi()
+    const withHelper = { ...project, files: [...project.files, 'src/helpers.ts'] }
+    raw.developer.listProjects
+      .mockResolvedValueOnce([withHelper])
+      .mockResolvedValueOnce([{ ...withHelper, status: 'new', chatAvailability: 'unbuilt_changes' }])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('src/helpers.ts')
+
+    store.editCurrent('export const helper = 2')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => expect(raw.developer.listProjects).toHaveBeenCalledTimes(2))
+
+    expect(store.selectedProject?.chatAvailability).toBe('unbuilt_changes')
+    expect(store.chatAvailabilityMessage).toBe('有未构建修改，暂不可用于聊天')
+    expect(raw.developer.build).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['new', 'unbuilt_changes', true, '有未构建修改，暂不可用于聊天'],
     ['invalid', 'invalid', false, '项目无效，暂不可用于聊天'],

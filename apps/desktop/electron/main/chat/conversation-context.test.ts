@@ -60,7 +60,7 @@ describe('conversation context primitives', () => {
           type: 'workflow_status', blockId: 'status_1', executionId: 'execution_1',
           workflowId: 'workflow.secret', workflowName: '安全查询', workflowVersion: '1.2.3',
           source: 'development', buildHash: 'a'.repeat(64), city: '北京', status: 'completed',
-          executionIndex: 1, executionLimit: 5,
+          executionAvailable: true, executionIndex: 1, executionLimit: 5,
           errorCode: 'RESULT_TOO_LARGE', errorSummary: 'The workflow result is too large.',
         },
         {

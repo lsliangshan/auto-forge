@@ -990,7 +990,9 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.events).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'block',
-        block: expect.objectContaining({ type: 'workflow_status', workflowId: workflow.id, status: 'awaiting_approval' }),
+        block: expect.objectContaining({
+          type: 'workflow_status', workflowId: workflow.id, status: 'awaiting_approval', executionAvailable: false,
+        }),
       }),
       expect.objectContaining({
         type: 'block',
@@ -1112,6 +1114,12 @@ describe('AgentOrchestrator', () => {
     expect(providerInputs[1]?.messages).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'tool', content: expect.stringContaining('PERMISSION_DENIED') }),
     ]))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({
+        type: 'workflow_status', status: 'cancelled', executionAvailable: false,
+        errorCode: 'PERMISSION_DENIED', errorSummary: 'The requested permission was denied.',
+      }),
+    )
   })
 
   it('keeps an oversized completed workflow result out of the next model request', async () => {
@@ -1196,13 +1204,83 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(continuation)).not.toContain('RESULT_TOO_LARGE')
     const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
     expect(finalBlocks).toContainEqual(expect.objectContaining({
-      type: 'workflow_status', status: 'failed',
+      type: 'workflow_status', status: 'failed', executionAvailable: true,
+      errorCode: 'INVALID_OUTPUT', errorSummary: 'The workflow produced an invalid result.',
     }))
     expect(JSON.stringify(finalBlocks)).not.toContain('RESULT_TOO_LARGE')
     expect(finalBlocks.at(-1)).toMatchObject({
       type: 'workflow_provenance',
       entries: [expect.objectContaining({ status: 'failed' })],
     })
+  })
+
+  it('keeps the reservation-only status unavailable when start rejects safely before creating a record', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '工作流在启动前发生变更' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.executions.startReserved = async () => { throw Object.assign(new Error('private path'), { code: 'WORKFLOW_CHANGED' }) }
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'pre_start_changed', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({
+        type: 'workflow_status', status: 'failed', executionAvailable: false,
+        errorCode: 'WORKFLOW_CHANGED',
+        errorSummary: 'The workflow changed before it could run. Review and try again.',
+      }),
+    )
+  })
+
+  it('marks an execution available only after startReserved returns an owned record', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    let statusAtStart: unknown
+    dependencies.executions.startReserved = async (reservation) => {
+      statusAtStart = dependencies.records.events
+        .map((event) => (event as { block?: unknown }).block)
+        .filter((block) => typeof block === 'object' && block !== null && 'type' in block
+          && (block as { type: string }).type === 'workflow_status')
+        .at(-1)
+      return {
+        id: reservation.executionId,
+        finished: Promise.resolve({ id: reservation.executionId, status: 'completed', result: { ok: true } }),
+      }
+    }
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'start_authority', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(statusAtStart).toMatchObject({ status: 'queued', executionAvailable: false })
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'workflow_status', status: 'completed', executionAvailable: true }),
+    )
+  })
+
+  it('shows a bounded safe timeout on a started execution record', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.executions.startReserved = async (reservation) => ({
+      id: reservation.executionId,
+      finished: Promise.resolve({ id: reservation.executionId, status: 'failed', errorCode: 'WORKER_TIMEOUT' }),
+    })
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'worker_timeout', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({
+        type: 'workflow_status', status: 'failed', executionAvailable: true,
+        errorCode: 'WORKER_TIMEOUT', errorSummary: 'The worker timed out.',
+      }),
+    )
   })
 
   it('validates approval and tool arguments, then returns the result with the original tool call id', async () => {
@@ -2039,6 +2117,10 @@ describe('AgentOrchestrator', () => {
     })).resolves.toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } })
     expect(expired.records.starts).toHaveLength(0)
     expect(expired.records.terminal).toHaveLength(1)
+    expect((expired.records.terminal[0] as { blocks: unknown[] }).blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status', status: 'cancelled', executionAvailable: false,
+      errorCode: 'CANCELLED', errorSummary: 'The operation was cancelled.',
+    }))
 
     milliseconds = 0
     const timely = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
@@ -2085,6 +2167,11 @@ describe('AgentOrchestrator', () => {
     expect(request.messages).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'tool', content: expect.stringContaining('WORKFLOW_CHANGED') }),
     ]))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(expect.objectContaining({
+      type: 'workflow_status', status: 'failed', executionAvailable: false,
+      errorCode: 'WORKFLOW_CHANGED',
+      errorSummary: 'The workflow changed before it could run. Review and try again.',
+    }))
   })
 
   it('rethrows a usage consistency failure from the WORKFLOW_CHANGED continuation', async () => {
