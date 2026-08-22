@@ -208,7 +208,7 @@ describe('WorkflowRegistry', () => {
     ])
   })
 
-  it('promptly rejects an installed FIFO without advertising a catalog candidate', async () => {
+  it.skipIf(process.platform === 'win32')('promptly rejects an installed FIFO without advertising a catalog candidate', async () => {
     const { registry, entry } = installedRegistryFixture(Buffer.from('export default {}\n'))
     unlinkSync(entry)
     execFileSync('mkfifo', [entry])

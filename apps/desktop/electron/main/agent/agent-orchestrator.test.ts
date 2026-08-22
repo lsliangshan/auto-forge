@@ -29,14 +29,21 @@ const workflow: WorkflowDetail = {
   outputSchema: { type: 'object' },
 }
 
-function largeWorkflow(index: number, options: { descriptionPadding?: number } = {}): WorkflowDetail {
+function largeWorkflow(index: number, options: {
+  descriptionPadding?: number
+  developmentBuildHash?: string
+} = {}): WorkflowDetail {
+  const source = options.developmentBuildHash === undefined ? 'installed' : 'development'
   return {
     ...workflow,
     id: `workflow.${index}`,
     name: `工作流 ${index}`,
     description: `处理任务 ${index}${'说明'.repeat(options.descriptionPadding ?? 0)}`,
+    source,
     codeSha256: String(index).padStart(64, '0'),
-    runtimeIdentity: { id: `workflow.${index}`, version: workflow.version, source: 'installed' },
+    runtimeIdentity: source === 'development'
+      ? { id: `workflow.${index}`, version: workflow.version, source, buildHash: options.developmentBuildHash! }
+      : { id: `workflow.${index}`, version: workflow.version, source },
     activationExamples: [`执行任务 ${index}`],
     activationNegativeExamples: [`不要执行任务 ${index}`],
     inputSchema: {
@@ -284,7 +291,12 @@ describe('AgentOrchestrator', () => {
 
   it('routes oversized tools with the same model attribution and invisibly aggregates routing usage', async () => {
     const dependencies = harness([])
-    const workflows = [largeWorkflow(1), largeWorkflow(2), largeWorkflow(3)]
+    const developmentBuildHash = '0123456789abcdef'.repeat(4)
+    const workflows = [
+      largeWorkflow(1, { developmentBuildHash }),
+      largeWorkflow(2),
+      largeWorkflow(3),
+    ]
     dependencies.workflows.list = async () => workflows
     const providerInputs: Array<Parameters<ModelProvider['stream']>[0]> = []
     dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
@@ -320,7 +332,36 @@ describe('AgentOrchestrator', () => {
       model: 'openrouter/model', endUserId: 'user_1', messages: expect.any(Array),
     })
     expect(providerInputs[0]).not.toHaveProperty('tools')
-    expect(JSON.stringify(providerInputs[0])).not.toContain('dataBase64')
+    const routingRequest = JSON.stringify(providerInputs[0])
+    expect(routingRequest).not.toContain('dataBase64')
+    expect(routingRequest).not.toContain('runtimeIdentity')
+    expect(routingRequest).not.toContain('buildHash')
+    expect(routingRequest).not.toContain(developmentBuildHash)
+    expect(routingRequest).not.toContain('development-build')
+    expect(routingRequest).not.toContain('"source"')
+    expect(routingRequest).not.toContain('"selector"')
+    expect(routingRequest).not.toContain('sourceSelector')
+    expect(routingRequest).not.toContain('entryPath')
+    expect(routingRequest).not.toContain('rootPath')
+    expect(routingRequest).not.toContain('installPath')
+    expect(routingRequest).not.toContain('/tmp/')
+    const routingMessage = providerInputs[0]!.messages.at(-1)
+    expect(routingMessage?.role).toBe('user')
+    const routingBody = JSON.parse(routingMessage!.content as string) as {
+      candidates: Array<Record<string, unknown>>
+    }
+    expect(Object.keys(routingBody.candidates[0]!)).toEqual([
+      'key', 'toolName', 'id', 'version', 'name', 'description', 'cities', 'category',
+      'activationExamples', 'activationNegativeExamples',
+    ])
+    expect(routingBody.candidates[0]).toMatchObject({
+      key: 'workflow.1\u00001.0.0\u00001',
+      toolName: 'workflow_1',
+      id: 'workflow.1',
+      version: '1.0.0',
+      name: '工作流 1',
+      cities: [],
+    })
     expect(providerInputs[1]).toMatchObject({
       model: 'openrouter/model', endUserId: 'user_1',
       tools: [

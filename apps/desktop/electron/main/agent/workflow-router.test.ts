@@ -149,12 +149,14 @@ describe('WorkflowRouter', () => {
     expect(body.request).toBe('执行第三个任务')
     expect(body.candidates).toHaveLength(available.length)
     expect(Object.keys(body.candidates[0] as object)).toEqual([
-      'key', 'identity', 'name', 'description', 'cities', 'category',
+      'key', 'toolName', 'id', 'version', 'name', 'description', 'cities', 'category',
       'activationExamples', 'activationNegativeExamples',
     ])
     expect(body.candidates[0]).toMatchObject({
       key: available[0]!.key,
-      identity: available[0]!.workflow.runtimeIdentity,
+      toolName: available[0]!.toolName,
+      id: available[0]!.workflow.id,
+      version: available[0]!.workflow.version,
       name: available[0]!.workflow.name,
       cities: available[0]!.workflow.cities,
     })

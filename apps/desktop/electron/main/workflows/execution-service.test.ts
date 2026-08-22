@@ -1387,7 +1387,7 @@ describe('ExecutionService', () => {
     }
   })
 
-  it('promptly rejects a FIFO artifact before spawning the Worker', async () => {
+  it.skipIf(process.platform === 'win32')('promptly rejects a FIFO artifact before spawning the Worker', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-fifo-'))
     const entryPath = 'entry.mjs'
     const entry = join(root, entryPath)

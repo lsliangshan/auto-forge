@@ -16,7 +16,9 @@ const ROUTING_SYSTEM_PROMPT = [
 
 interface CompactWorkflowCandidate {
   key: string
-  identity: WorkflowCandidate['workflow']['runtimeIdentity']
+  toolName: string
+  id: string
+  version: string
   name: string
   description: string
   cities: string[]
@@ -50,7 +52,9 @@ function compactCandidate(candidate: WorkflowCandidate): CompactWorkflowCandidat
   const { workflow } = candidate
   return {
     key: candidate.key,
-    identity: workflow.runtimeIdentity,
+    toolName: candidate.toolName,
+    id: workflow.id,
+    version: workflow.version,
     name: workflow.name,
     description: workflow.description,
     cities: workflow.cities,
