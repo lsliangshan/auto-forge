@@ -1,3 +1,4 @@
+import Ajv from 'ajv'
 import { describe, expect, it } from 'vitest'
 import type { WorkflowDetail } from '@autoforge/shared'
 import { createWorkflowCatalog } from './workflow-catalog.js'
@@ -75,5 +76,28 @@ describe('WorkflowCatalog', () => {
     expect(catalog[0]!.tool.function.description).toContain('北京今天天气')
     expect(catalog[0]!.tool.function.description).toContain('上海今天天气')
     expect(catalog[1]!.tool.function.description).toContain('不限城市')
+  })
+
+  it.each([
+    ['$defs', {
+      type: 'object', additionalProperties: false, required: ['amount'],
+      $defs: { amount: { type: 'number' } },
+      properties: { amount: { $ref: '#/$defs/amount' } },
+    }],
+    ['definitions', {
+      type: 'object', additionalProperties: false, required: ['amount'],
+      definitions: { amount: { type: 'number' } },
+      properties: { amount: { $ref: '#/definitions/amount' } },
+    }],
+  ] as const)('keeps %s references within the workflow input schema', async (_kind, inputSchema) => {
+    const workflow: WorkflowDetail = { ...beijingWorkflow, cities: [], inputSchema }
+    const [candidate] = await createWorkflowCatalog({
+      workflows: { list: async () => [workflow] },
+      selectorFor: createWorkflowSourceSelectorVault().create,
+    }).create({ developerMode: false })
+    const validate = new Ajv({ strict: false }).compile(candidate!.tool.function.parameters as object)
+
+    expect(validate({ input: { amount: 1 } })).toBe(true)
+    expect(validate({ input: { amount: '1' } })).toBe(false)
   })
 })

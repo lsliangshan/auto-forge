@@ -816,6 +816,34 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts[0]).not.toMatchObject({ input: expect.objectContaining({ resolvedCity: expect.anything() }) })
   })
 
+  it.each([
+    ['$defs', {
+      type: 'object', additionalProperties: false, required: ['amount'],
+      $defs: { amount: { type: 'number' } },
+      properties: { amount: { $ref: '#/$defs/amount' } },
+    }],
+    ['definitions', {
+      type: 'object', additionalProperties: false, required: ['amount'],
+      definitions: { amount: { type: 'number' } },
+      properties: { amount: { $ref: '#/definitions/amount' } },
+    }],
+  ] as const)('validates a workflow input with local %s references', async (_kind, inputSchema) => {
+    const referencedWorkflow: WorkflowDetail = { ...workflow, inputSchema }
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_ref', name: 'workflow_1', arguments: { input: { amount: 1 } } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
+    dependencies.workflows.list = async () => [referencedWorkflow]
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: `references_${_kind}`, content: '金额', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.starts[0]).toMatchObject({ input: { amount: 1 } })
+  })
+
   it('keeps the first normalized media message unchanged across a tool follow-up', async () => {
     const dependencies = harness([])
     const providerInputs: Array<Parameters<AgentProviderPort['stream']>[0]> = []

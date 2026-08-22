@@ -33,14 +33,36 @@ function snapshot(workflow: WorkflowDetail): WorkflowDetail {
   return deepFreeze(structuredClone(workflow))
 }
 
-function toolParameters(workflow: WorkflowDetail): Record<string, unknown> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasLocalReference(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== 'object') return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  for (const [key, child] of Object.entries(value)) {
+    if ((key === '$ref' || key === '$dynamicRef') && typeof child === 'string' && child.startsWith('#')) return true
+    if (hasLocalReference(child, seen)) return true
+  }
+  return false
+}
+
+function inputSchemaWithBoundary(inputSchema: unknown, toolName: string): unknown {
+  if (!isRecord(inputSchema)
+    || Object.prototype.hasOwnProperty.call(inputSchema, '$id')
+    || !hasLocalReference(inputSchema)) return inputSchema
+  return { $id: `urn:autoforge:workflow-tool:${toolName}:input`, ...inputSchema }
+}
+
+function toolParameters(workflow: WorkflowDetail, toolName: string): Record<string, unknown> {
   const restricted = workflow.cities.length > 0
   return {
     type: 'object', additionalProperties: false,
     required: restricted ? ['resolvedCity', 'input'] : ['input'],
     properties: {
       ...(restricted ? { resolvedCity: { type: 'string', enum: workflow.cities } } : {}),
-      input: workflow.inputSchema,
+      input: inputSchemaWithBoundary(workflow.inputSchema, toolName),
     },
   }
 }
@@ -69,7 +91,7 @@ export function createWorkflowCatalog(dependencies: WorkflowCatalogDependencies)
             function: {
               name: toolName,
               description: toolDescription(workflow),
-              parameters: toolParameters(workflow),
+              parameters: toolParameters(workflow, toolName),
             },
           },
         }
