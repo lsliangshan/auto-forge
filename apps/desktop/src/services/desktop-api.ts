@@ -63,6 +63,16 @@ const messages: Partial<Record<AppError['code'], string>> = {
   MEDIA_GENERATION_TIMEOUT: '视频生成超时',
   PROFILE_AVATAR_UPLOAD_FAILED: '头像上传失败，请稍后重试',
   NETWORK_PROXY_APPLY_FAILED: '代理应用失败，已保留原配置',
+  NO_BOUND_PAGE: '当前会话没有绑定的浏览器页面',
+  PAGE_CLOSED: '绑定的浏览器页面已关闭',
+  PAGE_BUSY: '浏览器页面正在被其他操作使用',
+  AUTH_STATE_UNKNOWN: '无法确认页面登录状态，请手动检查',
+  TARGET_AMBIGUOUS: '页面中的目标不明确，请手动操作',
+  DOMAIN_BLOCKED: '当前网站不允许执行此浏览器操作',
+  MANUAL_ACTION_REQUIRED: '此操作需要你在页面中手动确认',
+  PAGE_CHANGED: '页面已变化，请重新检查后继续',
+  UNSUPPORTED_CONTROL: '当前页面控件不受支持，请手动操作',
+  ACTION_LIMIT_EXCEEDED: '浏览器自动操作次数已达上限',
   INTERNAL_ERROR: '操作失败，请稍后重试',
 }
 

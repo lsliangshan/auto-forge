@@ -6,6 +6,7 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  browserActionAuditEntrySchema,
   authSessionSchema,
   authUserSchema,
   authorizationSnapshotSchema,
@@ -509,6 +510,46 @@ describe('cross-process contracts', () => {
         ],
       },
     })).toThrow()
+  })
+
+  it('keeps browser status and audit IPC payloads bounded and redacted', () => {
+    expect(chatBlockSchema.parse({
+      type: 'browser_status', blockId: 'browser_status_1', requestId: 'request_1', bindingId: 'binding_1',
+      siteLabel: '北京市工作居住证', origin: 'https://fw.bjrcgz.gov.cn', state: 'acting',
+      actionSummary: '读取工作居住证状态',
+    })).toMatchObject({ type: 'browser_status', state: 'acting' })
+    expect(chatBlockSchema.safeParse({
+      type: 'browser_status', blockId: 'browser_status_1', requestId: 'request_1', bindingId: 'binding_1',
+      siteLabel: '北京市工作居住证', origin: 'https://fw.bjrcgz.gov.cn?token=secret', state: 'acting',
+    }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({
+      type: 'browser_status', blockId: 'browser_status_1', requestId: 'request_1', bindingId: 'binding_1',
+      siteLabel: '北京市工作居住证', origin: 'https://fw.bjrcgz.gov.cn', state: 'acting',
+      actionSummary: 'x'.repeat(501),
+    }).success).toBe(false)
+
+    expect(browserActionAuditEntrySchema.parse({
+      id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
+      action: 'inspect', targetSummary: '工作居住证信息', risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+    })).toMatchObject({ id: 'audit_1', outcome: 'completed' })
+    expect(browserActionAuditEntrySchema.safeParse({
+      id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
+      action: 'inspect', targetSummary: 'password=secret', risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+    }).success).toBe(false)
+
+    expect(ipcChannels.chatTakeOverBrowser).toBe('chat:take-over-browser')
+    expect(ipcRequestSchemas[ipcChannels.chatTakeOverBrowser].parse({ requestId: 'request_1', bindingId: 'binding_1' }))
+      .toEqual({ requestId: 'request_1', bindingId: 'binding_1' })
+    expect(ipcRequestSchemas[ipcChannels.chatListBrowserAudit].parse({ bindingId: 'binding_1' }))
+      .toEqual({ bindingId: 'binding_1' })
+    expect(ipcRequestSchemas[ipcChannels.settingsClearBrowserData].parse(undefined)).toBeUndefined()
+    expect(ipcResponseSchemas[ipcChannels.chatListBrowserAudit].parse([{
+      id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
+      action: 'inspect', targetSummary: '工作居住证信息', risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+    }])).toHaveLength(1)
+    expect(toSafeAppError({ code: 'PAGE_BUSY', message: 'tab id tab_1' })).toEqual({
+      code: 'PAGE_BUSY', message: expect.any(String),
+    })
   })
 
   it('accepts strict system-owned workflow status and provenance blocks', () => {

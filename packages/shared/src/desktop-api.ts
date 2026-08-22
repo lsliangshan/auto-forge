@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { isBrowserLocator } from './browser-locator.js'
 import { isHttpsUrlPattern } from './https-url-pattern.js'
 import { proxySettingsSchema } from './proxy-settings.js'
+import { appErrorCodeSchema } from './errors.js'
 import {
   chatBlockSchema,
   mediaKindSchema,
@@ -22,6 +23,51 @@ import {
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
+
+const browserAuditOriginSchema = z.string().superRefine((value, context) => {
+  try {
+    const origin = new URL(value)
+    if (origin.protocol !== 'https:'
+      || origin.username !== ''
+      || origin.password !== ''
+      || origin.port !== ''
+      || origin.pathname !== '/'
+      || origin.search !== ''
+      || origin.hash !== ''
+      || origin.origin !== value) {
+      context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
+    }
+  } catch {
+    context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
+  }
+})
+const browserAuditTextSchema = nonEmptyStringSchema.max(500).refine(
+  (value) => !/\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b/i.test(value),
+  { message: 'Browser audit text cannot include sensitive keys' },
+)
+
+export const browserActionAuditEntrySchema = z.object({
+  id: identifierSchema,
+  bindingId: identifierSchema,
+  sequence: z.number().int().positive(),
+  origin: browserAuditOriginSchema,
+  action: browserAuditTextSchema,
+  targetSummary: browserAuditTextSchema,
+  risk: z.enum(['safe_navigation', 'sensitive_read', 'external_action']),
+  outcome: z.enum(['completed', 'blocked', 'failed', 'cancelled', 'handed_off']),
+  errorCode: appErrorCodeSchema.optional(),
+  createdAt: z.number().int().nonnegative(),
+}).strict()
+export type BrowserActionAuditEntry = z.infer<typeof browserActionAuditEntrySchema>
+
+export const takeOverBrowserRequestSchema = z.object({
+  requestId: identifierSchema,
+  bindingId: identifierSchema,
+}).strict()
+export type TakeOverBrowserRequest = z.infer<typeof takeOverBrowserRequestSchema>
+
+export const listBrowserAuditRequestSchema = z.object({ bindingId: identifierSchema }).strict()
+export type ListBrowserAuditRequest = z.infer<typeof listBrowserAuditRequestSchema>
 export const httpsUrlPatternSchema = z.string().refine(isHttpsUrlPattern, { message: 'Expected an HTTPS URL pattern' })
 export const browserLocatorSchema = z.string().refine(isBrowserLocator, { message: 'Expected a browser locator' })
 
@@ -863,6 +909,8 @@ export const ipcChannels = {
   chatDeleteConversation: 'chat:delete-conversation',
   chatSend: 'chat:send',
   chatCancel: 'chat:cancel',
+  chatTakeOverBrowser: 'chat:take-over-browser',
+  chatListBrowserAudit: 'chat:list-browser-audit',
   chatGetGenerationPreferences: 'chat:get-generation-preferences',
   chatUpdateGenerationPreferences: 'chat:update-generation-preferences',
   chatEvent: 'chat:event',
@@ -905,6 +953,7 @@ export const ipcChannels = {
   settingsListProviderModels: 'settings:list-provider-models',
   settingsGetTokenUsage: 'settings:get-token-usage',
   settingsClearLocalData: 'settings:clear-local-data',
+  settingsClearBrowserData: 'settings:clear-browser-data',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
 } as const
@@ -1015,6 +1064,8 @@ export const ipcRequestSchemas = {
   [ipcChannels.chatDeleteConversation]: deleteConversationRequestSchema,
   [ipcChannels.chatSend]: chatSendInputSchema,
   [ipcChannels.chatCancel]: cancelChatRequestSchema,
+  [ipcChannels.chatTakeOverBrowser]: takeOverBrowserRequestSchema,
+  [ipcChannels.chatListBrowserAudit]: listBrowserAuditRequestSchema,
   [ipcChannels.chatGetGenerationPreferences]: generationPreferencesRequestSchema,
   [ipcChannels.chatUpdateGenerationPreferences]: updateGenerationPreferencesRequestSchema,
   [ipcChannels.mediaPickFiles]: mediaImportContextSchema,
@@ -1055,6 +1106,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsListProviderModels]: listProviderModelsRequestSchema,
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
+  [ipcChannels.settingsClearBrowserData]: z.undefined(),
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
@@ -1082,6 +1134,8 @@ export const ipcResponseSchemas = {
   [ipcChannels.chatDeleteConversation]: voidResponseSchema,
   [ipcChannels.chatSend]: requestIdResponseSchema,
   [ipcChannels.chatCancel]: voidResponseSchema,
+  [ipcChannels.chatTakeOverBrowser]: voidResponseSchema,
+  [ipcChannels.chatListBrowserAudit]: z.array(browserActionAuditEntrySchema),
   [ipcChannels.chatGetGenerationPreferences]: conversationGenerationPreferencesSchema,
   [ipcChannels.chatUpdateGenerationPreferences]: conversationGenerationPreferencesSchema,
   [ipcChannels.mediaPickFiles]: z.array(mediaAssetSchema),
@@ -1122,6 +1176,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
+  [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
@@ -1153,6 +1208,8 @@ export interface DesktopAPI {
     deleteConversation(conversationId: string): Promise<void>
     send(input: ChatSendInput): Promise<{ requestId: string }>
     cancel(requestId: string): Promise<void>
+    takeOverBrowser(input: TakeOverBrowserRequest): Promise<void>
+    listBrowserAudit(bindingId: string): Promise<BrowserActionAuditEntry[]>
     getGenerationPreferences(conversationId: string): Promise<ConversationGenerationPreferences>
     updateGenerationPreferences(
       conversationId: string,
@@ -1210,6 +1267,7 @@ export interface DesktopAPI {
     listProviderModels(provider: ModelProviderId, refresh?: boolean): Promise<ModelInfo[]>
     getTokenUsage(): Promise<TokenUsageSnapshot>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
+    clearBrowserData(): Promise<void>
   }
   system: {
     openExternal(url: string): Promise<void>

@@ -77,6 +77,36 @@ export const executionStatusSchema = z.enum([
 
 export type ExecutionStatus = z.infer<typeof executionStatusSchema>
 
+const browserOriginSchema = z.string().superRefine((value, context) => {
+  try {
+    const origin = new URL(value)
+    if (origin.protocol !== 'https:'
+      || origin.username !== ''
+      || origin.password !== ''
+      || origin.port !== ''
+      || origin.pathname !== '/'
+      || origin.search !== ''
+      || origin.hash !== ''
+      || origin.origin !== value) {
+      context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
+    }
+  } catch {
+    context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
+  }
+})
+
+export const browserStatusBlockSchema = z.object({
+  type: z.literal('browser_status'),
+  blockId: identifierSchema,
+  requestId: identifierSchema,
+  bindingId: identifierSchema,
+  siteLabel: nonEmptyStringSchema.max(500),
+  origin: browserOriginSchema,
+  state: z.enum(['inspecting', 'acting', 'awaiting_user', 'completed', 'failed', 'cancelled']),
+  actionSummary: nonEmptyStringSchema.max(500).optional(),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict()
+
 export const chatBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string() }).strict(),
   z.object({ type: z.literal('reasoning_status'), label: z.string().trim().min(1) }).strict(),
@@ -166,6 +196,7 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     code: z.string().trim().min(1),
     message: z.string().trim().min(1),
   }).strict(),
+  browserStatusBlockSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
 ])

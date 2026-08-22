@@ -6,6 +6,7 @@ import {
   capabilitySchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  httpsUrlPatternSchema,
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
   type AppErrorCode,
@@ -64,6 +65,44 @@ export interface ChatRun {
   endedAt?: number
   userId?: string
   provider?: ModelProviderId
+}
+
+export type BrowserPermissionMatrix = Partial<Record<
+  'browser.open' | 'browser.fill' | 'browser.click' | 'browser.url' | 'browser.close',
+  string[]
+>>
+
+export interface BrowserTabBinding {
+  id: string
+  tabId: string
+  userId: string
+  conversationId: string
+  chatRunId?: string
+  executionId?: string
+  workflowId: string
+  workflowVersion: string
+  source: 'installed' | 'development'
+  buildHash?: string
+  securityFingerprint: string
+  permissionMatrix: BrowserPermissionMatrix
+  status: 'active' | 'revoked' | 'closed' | 'stale'
+  terminalReason?: string
+  createdAt: number
+  endedAt?: number
+}
+
+export interface BrowserActionAuditEntry {
+  id: string
+  bindingId: string
+  chatRunId?: string
+  sequence: number
+  origin: string
+  action: string
+  targetSummary: string
+  risk: 'safe_navigation' | 'sensitive_read' | 'external_action'
+  outcome: 'completed' | 'blocked' | 'failed' | 'cancelled' | 'handed_off'
+  errorCode?: AppErrorCode
+  createdAt: number
 }
 
 export type ProviderUsageStatus = 'pending' | 'reported' | 'unknown'
@@ -472,6 +511,74 @@ function parse(value: string | null): unknown | undefined {
 }
 
 const storedIdentifierSchema = z.string().trim().min(1)
+const browserPermissionMatrixSchema = z.object({
+  'browser.open': z.array(httpsUrlPatternSchema).min(1).optional(),
+  'browser.fill': z.array(httpsUrlPatternSchema).min(1).optional(),
+  'browser.click': z.array(httpsUrlPatternSchema).min(1).optional(),
+  'browser.url': z.array(httpsUrlPatternSchema).min(1).optional(),
+  'browser.close': z.array(httpsUrlPatternSchema).min(1).optional(),
+}).strict().refine((matrix) => Object.values(matrix).some((origins) => origins !== undefined), {
+  message: 'A browser permission matrix requires at least one action scope',
+})
+const browserOriginSchema = z.string().superRefine((value, context) => {
+  try {
+    const origin = new URL(value)
+    if (origin.protocol !== 'https:'
+      || origin.username !== ''
+      || origin.password !== ''
+      || origin.port !== ''
+      || origin.pathname !== '/'
+      || origin.search !== ''
+      || origin.hash !== ''
+      || origin.origin !== value) {
+      context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
+    }
+  } catch {
+    context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
+  }
+})
+const auditTextSchema = z.string().trim().min(1).max(500).refine(
+  (value) => !/\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b/i.test(value),
+  { message: 'Audit text cannot include sensitive keys' },
+)
+const browserTabBindingSchema = z.object({
+  id: storedIdentifierSchema,
+  tabId: storedIdentifierSchema,
+  userId: storedIdentifierSchema,
+  conversationId: storedIdentifierSchema,
+  chatRunId: storedIdentifierSchema.optional(),
+  executionId: storedIdentifierSchema.optional(),
+  workflowId: storedIdentifierSchema,
+  workflowVersion: storedIdentifierSchema,
+  source: z.enum(['installed', 'development']),
+  buildHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  securityFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  permissionMatrix: browserPermissionMatrixSchema,
+  status: z.enum(['active', 'revoked', 'closed', 'stale']),
+  terminalReason: auditTextSchema.optional(),
+  createdAt: z.number().int().nonnegative(),
+  endedAt: z.number().int().nonnegative().optional(),
+}).strict().superRefine(({ source, buildHash }, context) => {
+  if (source === 'development' && buildHash === undefined) {
+    context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Development browser bindings require a build hash' })
+  }
+  if (source === 'installed' && buildHash !== undefined) {
+    context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Installed browser bindings cannot include a build hash' })
+  }
+})
+const browserActionAuditSchema = z.object({
+  id: storedIdentifierSchema,
+  bindingId: storedIdentifierSchema,
+  chatRunId: storedIdentifierSchema.optional(),
+  sequence: z.number().int().positive(),
+  origin: browserOriginSchema,
+  action: auditTextSchema,
+  targetSummary: auditTextSchema,
+  risk: z.enum(['safe_navigation', 'sensitive_read', 'external_action']),
+  outcome: z.enum(['completed', 'blocked', 'failed', 'cancelled', 'handed_off']),
+  errorCode: appErrorCodeSchema.optional(),
+  createdAt: z.number().int().nonnegative(),
+}).strict()
 const legacyApprovalBlockSchema = z.object({
   type: z.literal('approval'),
   executionId: storedIdentifierSchema,
@@ -649,6 +756,15 @@ export interface AppRepositories {
   executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[] }
   executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[] }
   permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; list(): PermissionGrant[]; delete(id: string): void }
+  browserTabBindings: {
+    insert(value: BrowserTabBinding): BrowserTabBinding
+    get(id: string): BrowserTabBinding | undefined
+    markActiveStale(endedAt: number): number
+  }
+  browserActionAudits: {
+    insert(value: BrowserActionAuditEntry): BrowserActionAuditEntry
+    list(bindingId: string): BrowserActionAuditEntry[]
+  }
   appSettings: { get(key: string): AppSetting | undefined; set(key: string, value: unknown): AppSetting; delete(key: string): void }
   encryptedSecrets: EncryptedSecretsRepository
 }
@@ -663,6 +779,8 @@ const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS user
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
 const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
+const browserTabBindingColumns = 'id, tab_id AS tabId, user_id AS userId, conversation_id AS conversationId, chat_run_id AS chatRunId, execution_id AS executionId, workflow_id AS workflowId, workflow_version AS workflowVersion, source, build_hash AS buildHash, security_fingerprint AS securityFingerprint, permission_matrix_json AS permissionMatrixJson, status, terminal_reason AS terminalReason, created_at AS createdAt, ended_at AS endedAt'
+const browserActionAuditColumns = 'id, binding_id AS bindingId, chat_run_id AS chatRunId, sequence, origin, action, target_summary AS targetSummary, risk, outcome, error_code AS errorCode, created_at AS createdAt'
 
 interface TokenUsageRow {
   provider: ModelProviderId
@@ -1368,6 +1486,27 @@ function executionFromRow(row: Query): Execution {
 
 function permissionFromRow(row: Query): PermissionGrant {
   return { ...row, scope: parse(row.scopeJson as string) } as PermissionGrant
+}
+
+function browserTabBindingFromRow(row: Query): BrowserTabBinding {
+  const { permissionMatrixJson, ...binding } = row
+  return browserTabBindingSchema.parse({
+    ...binding,
+    chatRunId: row.chatRunId === null ? undefined : row.chatRunId,
+    executionId: row.executionId === null ? undefined : row.executionId,
+    buildHash: row.buildHash === null ? undefined : row.buildHash,
+    terminalReason: row.terminalReason === null ? undefined : row.terminalReason,
+    endedAt: row.endedAt === null ? undefined : row.endedAt,
+    permissionMatrix: parse(permissionMatrixJson as string),
+  })
+}
+
+function browserActionAuditFromRow(row: Query): BrowserActionAuditEntry {
+  return browserActionAuditSchema.parse({
+    ...row,
+    chatRunId: row.chatRunId === null ? undefined : row.chatRunId,
+    errorCode: row.errorCode === null ? undefined : row.errorCode,
+  })
 }
 
 function redactLogMessage(message: string, sensitivePaths: readonly string[]): string {
@@ -2430,6 +2569,61 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       get: (workflowId, workflowVersion, capability, scopeHash) => { const row = one<Query>(database, 'SELECT id, workflow_id AS workflowId, workflow_version AS workflowVersion, capability, scope_json AS scopeJson, scope_hash AS scopeHash, created_at AS createdAt, updated_at AS updatedAt FROM permission_grants WHERE workflow_id = @workflowId AND workflow_version = @workflowVersion AND capability = @capability AND scope_hash = @scopeHash', { workflowId, workflowVersion, capability, scopeHash }); return row && permissionFromRow(row) },
       list: () => many<Query>(database, 'SELECT id, workflow_id AS workflowId, workflow_version AS workflowVersion, capability, scope_json AS scopeJson, scope_hash AS scopeHash, created_at AS createdAt, updated_at AS updatedAt FROM permission_grants ORDER BY created_at DESC, id').map(permissionFromRow),
       delete: (id) => { transaction(database, () => database.prepare('DELETE FROM permission_grants WHERE id = @id').run({ id })) },
+    },
+    browserTabBindings: {
+      insert(value) {
+        const binding = browserTabBindingSchema.parse(value)
+        transaction(database, () => database.prepare(`
+          INSERT INTO browser_tab_bindings (
+            id, tab_id, user_id, conversation_id, chat_run_id, execution_id,
+            workflow_id, workflow_version, source, build_hash, security_fingerprint,
+            permission_matrix_json, status, terminal_reason, created_at, ended_at
+          ) VALUES (
+            @id, @tabId, @userId, @conversationId, @chatRunId, @executionId,
+            @workflowId, @workflowVersion, @source, @buildHash, @securityFingerprint,
+            @permissionMatrixJson, @status, @terminalReason, @createdAt, @endedAt
+          )
+        `).run({
+          ...binding,
+          chatRunId: binding.chatRunId ?? null,
+          executionId: binding.executionId ?? null,
+          buildHash: binding.buildHash ?? null,
+          permissionMatrixJson: JSON.stringify(binding.permissionMatrix),
+          terminalReason: binding.terminalReason ?? null,
+          endedAt: binding.endedAt ?? null,
+        }))
+        return binding
+      },
+      get: (id) => {
+        const row = one<Query>(database, `SELECT ${browserTabBindingColumns} FROM browser_tab_bindings WHERE id = @id`, { id })
+        return row && browserTabBindingFromRow(row)
+      },
+      markActiveStale: (endedAt) => transaction(database, () => database.prepare(`
+        UPDATE browser_tab_bindings
+        SET status = 'stale', ended_at = @endedAt
+        WHERE status = 'active'
+      `).run({ endedAt }).changes),
+    },
+    browserActionAudits: {
+      insert(value) {
+        const audit = browserActionAuditSchema.parse(value)
+        transaction(database, () => database.prepare(`
+          INSERT INTO browser_action_audits (
+            id, binding_id, chat_run_id, sequence, origin, action, target_summary,
+            risk, outcome, error_code, created_at
+          ) VALUES (
+            @id, @bindingId, @chatRunId, @sequence, @origin, @action, @targetSummary,
+            @risk, @outcome, @errorCode, @createdAt
+          )
+        `).run({ ...audit, chatRunId: audit.chatRunId ?? null, errorCode: audit.errorCode ?? null }))
+        return audit
+      },
+      list: (bindingId) => many<Query>(database, `
+        SELECT ${browserActionAuditColumns}
+        FROM browser_action_audits
+        WHERE binding_id = @bindingId
+        ORDER BY sequence
+      `, { bindingId }).map(browserActionAuditFromRow),
     },
     appSettings: {
       get: (key) => { const row = one<Query>(database, 'SELECT key, value_json AS valueJson, updated_at AS updatedAt FROM app_settings WHERE key = @key', { key }); return row && { key: row.key as string, value: parse(row.valueJson as string), updatedAt: row.updatedAt as number } },

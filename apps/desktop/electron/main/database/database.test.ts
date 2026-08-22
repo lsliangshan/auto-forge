@@ -18,6 +18,13 @@ function openTestDatabase() {
   return openAppDatabase(join(directory, 'autoforge.sqlite'))
 }
 
+function openInspectableTestDatabase() {
+  const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-'))
+  temporaryDirectories.push(directory)
+  const path = join(directory, 'autoforge.sqlite')
+  return { database: openAppDatabase(path), path }
+}
+
 function createV1Database() {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-v1-'))
   temporaryDirectories.push(directory)
@@ -232,7 +239,7 @@ describe('openAppDatabase', () => {
   })
 
   it('migrates a fresh database and interrupts abandoned executions', () => {
-    const database = openTestDatabase()
+    const { database, path } = openInspectableTestDatabase()
 
     database.executions.insert({
       id: 'exec_1',
@@ -241,15 +248,81 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(9)
+    expect(database.schemaVersion()).toBe(10)
+    const inspection = new Database(path, { readonly: true })
+    expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
+      .map(({ table, on_delete }) => ({ table, on_delete })))
+      .toEqual(expect.arrayContaining([
+        { table: 'local_users', on_delete: 'CASCADE' },
+        { table: 'conversations', on_delete: 'CASCADE' },
+        { table: 'chat_runs', on_delete: 'SET NULL' },
+        { table: 'executions', on_delete: 'SET NULL' },
+      ]))
+    expect((inspection.prepare('PRAGMA index_list(browser_action_audits)').all() as Array<{ name: string }>).map(({ name }) => name))
+      .toEqual(expect.arrayContaining(['browser_action_audits_binding_sequence_idx']))
+    expect((inspection.prepare('PRAGMA index_list(browser_tab_bindings)').all() as Array<{ name: string }>).map(({ name }) => name))
+      .toEqual(expect.arrayContaining(['browser_tab_bindings_conversation_status_idx']))
+    inspection.close()
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
+  })
+
+  it('persists redacted browser continuation audits and expires active bindings on recovery', () => {
+    const database = openTestDatabase()
+    insertLocalUser(database, 'browser_user', 'BrowserUser')
+    const conversation = database.conversations.insert({
+      id: 'browser_conversation', title: 'Browser continuation', userId: 'browser_user',
+    })
+    const run = database.chatRuns.insert({
+      id: 'browser_run', conversationId: conversation.id, requestId: 'browser_request',
+      model: 'model', status: 'completed', startedAt: 1,
+    })
+    const execution = database.executions.insert({
+      id: 'browser_execution', status: 'completed', workflowId: 'gov.permit', workflowVersion: '1.0.0',
+    })
+
+    const binding = database.browserTabBindings.insert({
+      id: 'binding_1', tabId: 'tab_1', userId: 'browser_user', conversationId: conversation.id,
+      chatRunId: run.id, executionId: execution.id,
+      workflowId: 'gov.permit', workflowVersion: '1.0.0', source: 'installed',
+      securityFingerprint: 'a'.repeat(64),
+      permissionMatrix: { 'browser.open': ['https://fw.bjrcgz.gov.cn/*'] },
+      status: 'active', createdAt: 10,
+    })
+    database.browserActionAudits.insert({
+      id: 'audit_1', bindingId: binding.id, chatRunId: run.id, sequence: 1,
+      origin: 'https://fw.bjrcgz.gov.cn', action: 'inspect', targetSummary: '工作居住证信息',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+    })
+
+    expect(database.browserActionAudits.list(binding.id)).toHaveLength(1)
+    expect(() => database.browserActionAudits.insert({
+      id: 'audit_2', bindingId: binding.id, chatRunId: run.id, sequence: 2,
+      origin: 'https://fw.bjrcgz.gov.cn', action: 'inspect',
+      targetSummary: `身份证号 11010119900101${'x'.repeat(500)}`,
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 12,
+    })).toThrow()
+    expect(() => database.browserActionAudits.insert({
+      id: 'audit_duplicate_sequence', bindingId: binding.id, chatRunId: run.id, sequence: 1,
+      origin: 'https://fw.bjrcgz.gov.cn', action: 'inspect', targetSummary: '重复审计',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 12,
+    })).toThrow()
+    expect(() => database.browserActionAudits.insert({
+      id: 'audit_3', bindingId: binding.id, chatRunId: run.id, sequence: 2,
+      origin: 'https://fw.bjrcgz.gov.cn?token=secret', action: 'inspect', targetSummary: '状态',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 12,
+    })).toThrow()
+
+    database.recoverInterrupted()
+    expect(database.browserTabBindings.get(binding.id)).toMatchObject({ status: 'stale', endedAt: expect.any(Number) })
+    database.conversations.delete(conversation.id)
+    expect(database.browserTabBindings.get(binding.id)).toBeUndefined()
   })
 
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(9)
+    expect(database.schemaVersion()).toBe(10)
     expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
@@ -260,7 +333,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(9)
+    expect(database.schemaVersion()).toBe(10)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -271,7 +344,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(9)
+    expect(database.schemaVersion()).toBe(10)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -291,7 +364,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(9)
+    expect(database.schemaVersion()).toBe(10)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -1132,7 +1205,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(9)
+    expect(database.schemaVersion()).toBe(10)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)

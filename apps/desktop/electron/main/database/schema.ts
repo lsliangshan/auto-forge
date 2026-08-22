@@ -291,3 +291,41 @@ export const localUserRoles = sqliteTable('local_user_roles', {
   `),
   check('local_user_roles_version_check', sql`${table.version} >= 0`),
 ])
+
+export const browserTabBindings = sqliteTable('browser_tab_bindings', {
+  id: text('id').primaryKey(),
+  tabId: text('tab_id').notNull(),
+  userId: text('user_id').notNull().references(() => localUsers.id, { onDelete: 'cascade' }),
+  conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
+  chatRunId: text('chat_run_id').references(() => chatRuns.id, { onDelete: 'set null' }),
+  executionId: text('execution_id').references(() => executions.id, { onDelete: 'set null' }),
+  workflowId: text('workflow_id').notNull(),
+  workflowVersion: text('workflow_version').notNull(),
+  source: text('source').notNull(),
+  buildHash: text('build_hash'),
+  securityFingerprint: text('security_fingerprint').notNull(),
+  permissionMatrixJson: text('permission_matrix_json').notNull(),
+  status: text('status').notNull(),
+  terminalReason: text('terminal_reason'),
+  createdAt: integer('created_at').notNull(),
+  endedAt: integer('ended_at'),
+}, (table) => [
+  index('browser_tab_bindings_conversation_status_idx').on(table.conversationId, table.status, table.createdAt),
+])
+
+export const browserActionAudits = sqliteTable('browser_action_audits', {
+  id: text('id').primaryKey(),
+  bindingId: text('binding_id').notNull().references(() => browserTabBindings.id, { onDelete: 'cascade' }),
+  chatRunId: text('chat_run_id').references(() => chatRuns.id, { onDelete: 'set null' }),
+  sequence: integer('sequence').notNull(),
+  origin: text('origin').notNull(),
+  action: text('action').notNull(),
+  targetSummary: text('target_summary').notNull(),
+  risk: text('risk').notNull(),
+  outcome: text('outcome').notNull(),
+  errorCode: text('error_code'),
+  createdAt: integer('created_at').notNull(),
+}, (table) => [
+  uniqueIndex('browser_action_audits_binding_sequence_unique').on(table.bindingId, table.sequence),
+  index('browser_action_audits_binding_sequence_idx').on(table.bindingId, table.sequence),
+])

@@ -58,6 +58,16 @@ export const appErrorCodeSchema = z.enum([
   'TOOL_CALL_LIMIT',
   'INVALID_OUTPUT',
   'RESULT_TOO_LARGE',
+  'NO_BOUND_PAGE',
+  'PAGE_CLOSED',
+  'PAGE_BUSY',
+  'AUTH_STATE_UNKNOWN',
+  'TARGET_AMBIGUOUS',
+  'DOMAIN_BLOCKED',
+  'MANUAL_ACTION_REQUIRED',
+  'PAGE_CHANGED',
+  'UNSUPPORTED_CONTROL',
+  'ACTION_LIMIT_EXCEEDED',
 ])
 
 export type AppErrorCode = z.infer<typeof appErrorCodeSchema>
@@ -127,6 +137,16 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   TOOL_CALL_LIMIT: 'The workflow reached its tool call limit.',
   INVALID_OUTPUT: 'The workflow produced an invalid result.',
   RESULT_TOO_LARGE: 'The workflow result is too large.',
+  NO_BOUND_PAGE: 'No browser page is bound to this conversation.',
+  PAGE_CLOSED: 'The bound browser page is closed.',
+  PAGE_BUSY: 'The bound browser page is busy.',
+  AUTH_STATE_UNKNOWN: 'The browser authentication state is unknown.',
+  TARGET_AMBIGUOUS: 'The browser target is ambiguous.',
+  DOMAIN_BLOCKED: 'This browser action is not allowed for the current domain.',
+  MANUAL_ACTION_REQUIRED: 'This browser action requires your confirmation.',
+  PAGE_CHANGED: 'The browser page changed. Inspect it again before continuing.',
+  UNSUPPORTED_CONTROL: 'This browser control is not supported.',
+  ACTION_LIMIT_EXCEEDED: 'The browser action limit was reached.',
 }
 
 export function toSafeAppError(error: unknown): AppError {

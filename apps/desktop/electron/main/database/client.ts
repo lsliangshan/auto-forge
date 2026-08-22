@@ -21,6 +21,7 @@ export function openAppDatabase(path: string) {
 
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
+    repositories.browserTabBindings.markActiveStale(endedAt)
     const executions = sqlite.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run(endedAt).changes
     const preservedRequestIds = new Set(
       repositories.mediaGenerationJobs.reconcileInterrupted(endedAt),
