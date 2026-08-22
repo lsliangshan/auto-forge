@@ -522,24 +522,49 @@ describe('agent workflow integration', () => {
     const assistant = app.database.messages.listForConversation('conversation_1')
       .find((message) => message.role === 'assistant')!
     expect(assistant.blocks).toContainEqual(expect.objectContaining({ type: 'text', text: '两个工作流均已完成' }))
-    expect(assistant.blocks.at(-1)).toMatchObject({
+    const persistedExecutions = app.database.executions.list()
+    expect(persistedExecutions).toHaveLength(2)
+    const firstExecution = persistedExecutions.find(({ workflowId }) => workflowId === app.workflow.id)
+    const secondExecution = persistedExecutions.find(({ workflowId }) => workflowId === second.id)
+    expect(firstExecution).toBeDefined()
+    expect(secondExecution).toBeDefined()
+    expect(firstExecution!.status).toBe('completed')
+    expect(secondExecution!.status).toBe('completed')
+    const expectedEntries = [
+      {
+        executionId: firstExecution!.id,
+        workflowId: firstExecution!.workflowId,
+        workflowName: app.workflow.name,
+        workflowVersion: firstExecution!.workflowVersion,
+        source: app.workflow.runtimeIdentity.source,
+        city: '北京',
+        status: firstExecution!.status,
+      },
+      {
+        executionId: secondExecution!.id,
+        workflowId: secondExecution!.workflowId,
+        workflowName: second.name,
+        workflowVersion: secondExecution!.workflowVersion,
+        source: second.runtimeIdentity.source,
+        status: secondExecution!.status,
+      },
+    ]
+    const provenance = assistant.blocks.at(-1)
+    expect(provenance).toStrictEqual({
       type: 'workflow_provenance',
-      entries: [
-        expect.objectContaining({
-          workflowId: app.workflow.id,
-          workflowVersion: '1.0.0',
-          source: 'installed',
-          city: '北京',
-          status: 'completed',
-        }),
-        expect.objectContaining({
-          workflowId: second.id,
-          workflowVersion: '1.0.0',
-          source: 'installed',
-          status: 'completed',
-        }),
-      ],
+      blockId: expect.any(String),
+      entries: expectedEntries,
     })
+    const swappedExecutionIds = [
+      { ...expectedEntries[0], executionId: secondExecution!.id },
+      { ...expectedEntries[1], executionId: firstExecution!.id },
+    ]
+    expect(() => expect(provenance).toStrictEqual({
+      type: 'workflow_provenance',
+      blockId: expect.any(String),
+      entries: swappedExecutionIds,
+    })).toThrow()
+    expect(expectedEntries[1]).not.toHaveProperty('city')
   })
 
   it.each([

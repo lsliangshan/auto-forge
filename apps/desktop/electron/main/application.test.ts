@@ -440,7 +440,8 @@ async function applicationHarness(input: {
       openrouter: { text: 'openrouter/tools' },
     },
   })
-  await installApprovalWorkflow(runtime, 'dynamic workflow', { beijing: true })
+  const installedWorkflow = await installApprovalWorkflow(runtime, 'dynamic workflow', { beijing: true })
+  const authoritativeWorkflow = await runtime.services.workflows.get(installedWorkflow.id, installedWorkflow.version)
 
   const sendToolPrompt = async () => {
     const conversation = await runtime.services.chat.createConversation()
@@ -464,6 +465,7 @@ async function applicationHarness(input: {
     executions: { started: executionStarts, startReserved },
     providerRequests,
     chatEvents,
+    authoritativeWorkflow,
     agent: () => inspectedAgent,
     sendToolPrompt,
     finishRunning(executionId: string) {
@@ -1750,15 +1752,48 @@ describe('createApplicationRuntime', () => {
   it('binds a completed development run to the exact version, build, city, and final provenance', async () => {
     const app = await applicationHarness({ developerMode: true })
     try {
-      const pending = await app.sendToolPrompt()
-      expect(pending.approval).toMatchObject({
-        workflowId: 'local.autoforge.approval-workflow',
-        workflowName: '北京工作居住证',
-        workflowVersion: '1.0.0',
+      expect(app.authoritativeWorkflow).toMatchObject({
+        id: 'local.autoforge.approval-workflow',
+        name: '北京工作居住证',
+        version: '1.0.0',
         source: 'development',
-        buildHash: expect.stringMatching(/^[a-f0-9]{64}$/),
-        city: '北京',
+        cities: ['北京'],
+        runtimeIdentity: {
+          id: 'local.autoforge.approval-workflow',
+          version: '1.0.0',
+          source: 'development',
+          buildHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
       })
+      if (app.authoritativeWorkflow.runtimeIdentity.source !== 'development') {
+        throw new Error('Expected the Registry to select the ready development build')
+      }
+      const expectedWorkflowContext = {
+        workflowId: app.authoritativeWorkflow.runtimeIdentity.id,
+        workflowName: app.authoritativeWorkflow.name,
+        workflowVersion: app.authoritativeWorkflow.runtimeIdentity.version,
+        source: app.authoritativeWorkflow.runtimeIdentity.source,
+        buildHash: app.authoritativeWorkflow.runtimeIdentity.buildHash,
+        city: app.authoritativeWorkflow.cities[0],
+      }
+      const pending = await app.sendToolPrompt()
+      const approvalWorkflowContext = {
+        workflowId: pending.approval.workflowId,
+        workflowName: pending.approval.workflowName,
+        workflowVersion: pending.approval.workflowVersion,
+        source: pending.approval.source,
+        buildHash: pending.approval.buildHash,
+        city: pending.approval.city,
+      }
+      expect(approvalWorkflowContext).toStrictEqual(expectedWorkflowContext)
+      const wrongBuildHash = expectedWorkflowContext.buildHash === '0'.repeat(64)
+        ? '1'.repeat(64)
+        : '0'.repeat(64)
+      expect(wrongBuildHash).toMatch(/^[a-f0-9]{64}$/)
+      expect(() => expect({
+        ...approvalWorkflowContext,
+        buildHash: wrongBuildHash,
+      }).toStrictEqual(expectedWorkflowContext)).toThrow()
       const decision = app.runtime.services.executions.decide({
         executionId: pending.approval.executionId,
         permissionIndex: pending.approval.permissionIndex,
@@ -1772,20 +1807,21 @@ describe('createApplicationRuntime', () => {
       await expect(decision).resolves.toBeUndefined()
       await vi.waitFor(() => expect(app.chatEvents).toContainEqual(expect.objectContaining({
         type: 'block',
-        block: expect.objectContaining({
-          type: 'workflow_provenance',
-          entries: [expect.objectContaining({
-            executionId: pending.approval.executionId,
-            workflowId: pending.approval.workflowId,
-            workflowName: pending.approval.workflowName,
-            workflowVersion: pending.approval.workflowVersion,
-            source: pending.approval.source,
-            buildHash: pending.approval.buildHash,
-            city: pending.approval.city,
-            status: 'completed',
-          })],
-        }),
+        block: expect.objectContaining({ type: 'workflow_provenance' }),
       })))
+      const provenance = [...app.chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+        event.type === 'block'
+        && event.block.type === 'workflow_provenance'
+      ))!.block
+      expect(provenance).toStrictEqual({
+        type: 'workflow_provenance',
+        blockId: expect.any(String),
+        entries: [{
+          executionId: pending.approval.executionId,
+          ...expectedWorkflowContext,
+          status: 'completed',
+        }],
+      })
       expect(JSON.stringify(app.chatEvents)).toContain('工作流处理完成')
     } finally {
       await app.runtime.close()
