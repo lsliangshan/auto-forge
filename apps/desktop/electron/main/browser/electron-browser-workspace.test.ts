@@ -12,6 +12,8 @@ import type { BrowserContinuationBindingInput } from './browser-continuation-typ
 class FakeSession extends EventEmitter {
   readonly setProxy = vi.fn(async () => undefined)
   readonly closeAllConnections = vi.fn(async () => undefined)
+  readonly clearStorageData = vi.fn(async () => undefined)
+  readonly clearCache = vi.fn(async () => undefined)
   readonly setPermissionRequestHandler = vi.fn()
   readonly setPermissionCheckHandler = vi.fn()
 }
@@ -529,14 +531,14 @@ describe('ElectronBrowserWorkspace', () => {
     ['box lookup', 'Page.getLayoutMetrics'],
     ['screenshot capture', 'Page.captureScreenshot'],
   ] as const)('rejects same-origin navigation racing %s', async (kind, navigationCommand) => {
-    let target: FakeWebContents | undefined
     let navigate = false
     const respond = (method: string, params?: unknown) => {
       const input = params as { backendNodeId?: number } | undefined
       if (navigate && method === navigationCommand) {
         navigate = false
-        target!.currentUrl = 'https://www.baidu.com/changed'
-        target!.emit('did-navigate', {}, target!.currentUrl)
+        const target = harness.views[1]!.webContents
+        target.currentUrl = 'https://www.baidu.com/changed'
+        target.emit('did-navigate', {}, target.currentUrl)
       }
       if (method === 'DOM.describeNode') return {
         node: { backendNodeId: input?.backendNodeId, nodeName: 'IMG', attributes: [] },
@@ -559,7 +561,6 @@ describe('ElectronBrowserWorkspace', () => {
     await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
     await harness.workspace.releaseExecution('e1')
     await harness.workspace.acquireContinuation(tab.id, 'agent_run_1')
-    target = harness.views[1]!.webContents
     const request = {
       tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
       expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 11,
@@ -1198,6 +1199,43 @@ describe('ElectronBrowserWorkspace', () => {
     expect(sessions.has(partition)).toBe(true)
     await acquire(workspace, 'exec_2', 'user_1')
     expect(windows).toHaveLength(2)
+  })
+
+  it('closes and clears only one hashed user partition for an explicit browser-data reset', async () => {
+    const { workspace, sessions, views, fromPartition } = createHarness()
+    await acquire(workspace, 'exec_1', 'user_1')
+    await workspace.releaseExecution('exec_1')
+    await acquire(workspace, 'exec_2', 'user_2')
+    await workspace.releaseExecution('exec_2')
+    const userOnePartition = browserPartition('user_1')
+    const userTwoPartition = browserPartition('user_2')
+
+    await workspace.clearUserData('user_1')
+
+    expect(views[1]!.webContents.destroyed).toBe(true)
+    expect(views[2]!.webContents.destroyed).toBe(false)
+    expect(sessions.get(userOnePartition)?.clearStorageData).toHaveBeenCalledOnce()
+    expect(sessions.get(userOnePartition)?.clearCache).toHaveBeenCalledOnce()
+    expect(sessions.get(userTwoPartition)?.clearStorageData).not.toHaveBeenCalled()
+    expect(sessions.get(userTwoPartition)?.clearCache).not.toHaveBeenCalled()
+    expect(sessions.get('autoforge-browser-toolbar')?.clearStorageData).not.toHaveBeenCalled()
+    expect(fromPartition).toHaveBeenCalledWith(userOnePartition)
+    expect([...sessions.keys()]).not.toContain('default')
+  })
+
+  it('refuses to clear a user partition while that user still owns execution or continuation work', async () => {
+    const { workspace, sessions } = createHarness()
+    const tab = await acquire(workspace, 'exec_1', 'user_1')
+
+    await expect(workspace.clearUserData('user_1'))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(sessions.get(browserPartition('user_1'))?.clearStorageData).not.toHaveBeenCalled()
+
+    await workspace.releaseExecution('exec_1')
+    await workspace.acquireContinuation(tab.id, 'agent_run_1')
+    await expect(workspace.clearUserData('user_1'))
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(sessions.get(browserPartition('user_1'))?.clearCache).not.toHaveBeenCalled()
   })
 
   it('invalidates an acquire already creating its first window when reset starts', async () => {

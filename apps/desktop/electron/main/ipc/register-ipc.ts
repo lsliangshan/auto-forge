@@ -158,6 +158,8 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.chatDeleteConversation, (input) => options.services.chat.deleteConversation(input.conversationId))
   register(ipcChannels.chatSend, (input) => options.services.chat.send(input))
   register(ipcChannels.chatCancel, (input) => options.services.chat.cancel(input.requestId))
+  register(ipcChannels.chatTakeOverBrowser, (input) => options.services.chat.takeOverBrowser(input))
+  register(ipcChannels.chatListBrowserAudit, (input) => options.services.chat.listBrowserAudit(input.bindingId))
   register(ipcChannels.chatGetGenerationPreferences, (input) => options.services.chat.getGenerationPreferences(input.conversationId))
   register(ipcChannels.chatUpdateGenerationPreferences, (input) => options.services.chat.updateGenerationPreferences(input.conversationId, input.preferences))
   register(ipcChannels.mediaPickFiles, (input) => options.services.media.pickFiles(input))
@@ -198,6 +200,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsListProviderModels, (input) => options.services.settings.listProviderModels(input.provider, input.refresh))
   register(ipcChannels.settingsGetTokenUsage, () => options.services.settings.getTokenUsage())
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
+  register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 

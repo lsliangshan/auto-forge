@@ -30,7 +30,14 @@ import {
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
 import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
-import type { BrowserWorkspacePort, BrowserWorkspaceTab } from './browser/electron-browser-workspace.js'
+import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
+import type { BrowserContinuationBindingInput } from './browser/browser-continuation-types.js'
+import type { BrowserPageCdpPort } from './browser/browser-page-inspector.js'
+import type {
+  BrowserWorkspacePort,
+  BrowserWorkspaceTab,
+} from './browser/electron-browser-workspace.js'
+import type { BrowserContinuationWorkspacePort } from './agent/browser-continuation-tool-executor.js'
 import { MediaGenerationOrchestrator } from './chat/media-generation-orchestrator.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
@@ -81,7 +88,25 @@ function createNetworkProxy() {
   }
 }
 
-function createBrowserWorkspace(): BrowserWorkspacePort {
+interface ApplicationBrowserWorkspaceTestPort extends BrowserWorkspacePort,
+  BrowserPageCdpPort,
+  BrowserContinuationWorkspacePort {
+  acquireContinuation(tabId: string, runId: string): Promise<void>
+  releaseContinuation(tabId: string, runId: string): Promise<void>
+  closeContinuation(tabId: string): Promise<void>
+  describeContinuation(tabId: string): Promise<{
+    pageLabel: string
+    origin: string
+    lastActiveAt: number
+  } | undefined>
+  clearUserData(userId: string): Promise<void>
+  setContinuationCommandHandlers(handlers: {
+    stop(bindingId: string): Promise<void>
+    takeOver(bindingId: string): Promise<void>
+  }): void
+}
+
+function createBrowserWorkspace(): ApplicationBrowserWorkspaceTestPort {
   let currentUrl = ''
   const tab: BrowserWorkspaceTab = {
     id: 'tab_test',
@@ -97,6 +122,45 @@ function createBrowserWorkspace(): BrowserWorkspacePort {
   return {
     acquire: vi.fn(async () => tab),
     releaseExecution: vi.fn(async () => undefined),
+    setContinuationRegistry: vi.fn(() => undefined),
+    markContinuationBound: vi.fn(),
+    acquireContinuation: vi.fn(async () => undefined),
+    releaseContinuation: vi.fn(async () => undefined),
+    closeContinuation: vi.fn(async () => undefined),
+    getContinuationState: vi.fn(async () => ({
+      origin: 'https://permit.example.gov.cn',
+      url: 'https://permit.example.gov.cn/detail',
+      navigationEpoch: 1,
+    })),
+    performContinuationAction: vi.fn(async () => undefined),
+    focusContinuation: vi.fn(async () => undefined),
+    highlightContinuationTarget: vi.fn(async () => undefined),
+    clearContinuationHighlight: vi.fn(async () => undefined),
+    readAccessibilitySnapshot: vi.fn(async (input) => ({
+      tabId: input.tabId,
+      navigationEpoch: input.expectedNavigationEpoch,
+      origin: input.expectedOrigin,
+      url: input.expectedOrigin,
+      title: 'Permit',
+      frameId: 'frame_main',
+      viewportWidth: 1200,
+      viewportHeight: 800,
+      nodes: [],
+      locatorMatches: [],
+    })),
+    readNode: vi.fn(async () => undefined),
+    getNodeBox: vi.fn(async () => ({
+      x: 0, y: 0, width: 10, height: 10, viewportWidth: 1200, viewportHeight: 800,
+    })),
+    captureNodeScreenshot: vi.fn(async () => 'image'),
+    onPageInvalidated: vi.fn(() => () => undefined),
+    describeContinuation: vi.fn(async () => ({
+      pageLabel: 'permit.example.gov.cn',
+      origin: 'https://permit.example.gov.cn',
+      lastActiveAt: 1_777_000_000_000,
+    })),
+    clearUserData: vi.fn(async () => undefined),
+    setContinuationCommandHandlers: vi.fn(),
     updateProxy: vi.fn(async () => undefined),
     reset: vi.fn(async () => undefined),
     shutdown: vi.fn(async () => undefined),
@@ -333,6 +397,67 @@ async function authenticate(
     challengeId: challenge.challengeId,
     code: '123456',
   })
+}
+
+function capturedContinuationRegistry(
+  workspace: ApplicationBrowserWorkspaceTestPort,
+): BrowserContinuationRegistry {
+  const registration = vi.mocked(workspace.setContinuationRegistry!).mock.calls[0]?.[0]
+  if (!(registration instanceof BrowserContinuationRegistry)) {
+    throw new Error('Application did not install its process-wide continuation registry')
+  }
+  return registration
+}
+
+function continuationBinding(
+  userId: string,
+  conversationId: string,
+  overrides: Partial<BrowserContinuationBindingInput> = {},
+): BrowserContinuationBindingInput {
+  return {
+    tabId: `tab_${conversationId}`,
+    userId,
+    conversationId,
+    chatRunId: `run_${conversationId}`,
+    executionId: `execution_${conversationId}`,
+    workflowId: 'workflow.browser',
+    workflowVersion: '1.0.0',
+    source: 'installed',
+    securityFingerprint: 'a'.repeat(64),
+    permissionMatrix: { 'browser.open': ['https://permit.example.gov.cn/*'] },
+    ...overrides,
+  }
+}
+
+function seedContinuationParents(
+  databasePath: string,
+  binding: BrowserContinuationBindingInput,
+  requestId = `request_${binding.chatRunId}`,
+): void {
+  const database = openAppDatabase(databasePath)
+  if (!database.chatRuns.get(binding.chatRunId)) {
+    database.chatRuns.insert({
+      id: binding.chatRunId,
+      conversationId: binding.conversationId,
+      userId: binding.userId,
+      provider: 'openrouter',
+      requestId,
+      model: 'openrouter/test',
+      status: 'running',
+      startedAt: 1,
+    })
+  }
+  if (!database.executions.get(binding.executionId)) {
+    database.executions.insert({
+      id: binding.executionId,
+      workflowId: binding.workflowId,
+      workflowVersion: binding.workflowVersion,
+      chatRunId: binding.chatRunId,
+      status: 'completed',
+      createdAt: 1,
+    })
+  }
+  database.close()
 }
 
 async function installApprovalWorkflow(
@@ -5220,5 +5345,388 @@ describe('createApplicationRuntime', () => {
     expect(closed).toBe(false)
     finishCleanup()
     await closing
+  })
+
+  it('constructs one process-wide continuation registry and exposes its live catalog to the Agent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-continuation-wiring-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const requests: ModelStreamRequest[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [visionTextModelInfo('openrouter/browser')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request) {
+        requests.push(request)
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      browserWorkspace: workspace,
+      modelProviders: { openrouter: provider },
+    }))
+    const session = await authenticate(runtime, 'BrowserWiring')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const binding = continuationBinding(session.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    const live = registry.bind(binding)
+
+    await runtime.services.chat.send(chatInput(conversation.id, '读取证件有效期'))
+    await vi.waitFor(() => expect(requests).toHaveLength(1))
+
+    expect(requests[0]?.tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining([
+      'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
+    ]))
+    expect(registry.list(session.user.id, conversation.id)).toEqual([live])
+    expect(workspace.setContinuationRegistry).toHaveBeenCalledTimes(1)
+    expect(workspace.onPageInvalidated).toHaveBeenCalledTimes(1)
+    await runtime.close()
+  })
+
+  it('checks exact current user, conversation, request, and live binding before takeover or audit access', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-ownership-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const takeOver = vi.spyOn(AgentOrchestrator.prototype, 'takeOverBrowser').mockResolvedValue(true)
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const alice = await authenticate(runtime, 'AliceBrowser')
+    const aliceConversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    const bob = await authenticate(runtime, 'BobbyBrowser')
+    const bobConversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'AliceBrowser', password: 'password' })
+
+    const registry = capturedContinuationRegistry(workspace)
+    const aliceBinding = continuationBinding(alice.user.id, aliceConversation.id, {
+      tabId: 'tab_alice', chatRunId: 'run_alice', executionId: 'execution_alice',
+    })
+    const bobBinding = continuationBinding(bob.user.id, bobConversation.id, {
+      tabId: 'tab_bob', chatRunId: 'run_bob', executionId: 'execution_bob',
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), aliceBinding, 'request_alice')
+    seedContinuationParents(join(root, 'autoforge.sqlite'), bobBinding, 'request_bob')
+    const liveAlice = registry.bind(aliceBinding)
+    const liveBob = registry.bind(bobBinding)
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.browserActionAudits.insert({
+      id: 'audit_alice', bindingId: liveAlice.bindingId, chatRunId: 'run_alice', sequence: 1,
+      origin: 'https://permit.example.gov.cn', action: 'inspect', targetSummary: 'expiry control',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 2,
+    })
+    database.close()
+
+    await expect(runtime.services.chat.takeOverBrowser({
+      requestId: 'request_alice', bindingId: liveAlice.bindingId,
+    })).resolves.toBeUndefined()
+    expect(takeOver).toHaveBeenCalledWith('request_alice', liveAlice.bindingId)
+
+    const toolbarLease = await registry.acquire(liveAlice.bindingId, {
+      userId: alice.user.id, conversationId: aliceConversation.id, runId: 'run_alice',
+    })
+    const toolbarHandlers = vi.mocked(workspace.setContinuationCommandHandlers).mock.calls[0]?.[0]
+    if (!toolbarHandlers) throw new Error('Application did not register trusted toolbar commands')
+    await toolbarHandlers.takeOver(liveAlice.bindingId)
+    expect(takeOver).toHaveBeenLastCalledWith('request_alice', liveAlice.bindingId)
+    await toolbarLease.release()
+
+    await registry.acquire(liveAlice.bindingId, {
+      userId: alice.user.id, conversationId: aliceConversation.id, runId: 'run_alice',
+    })
+    await registry.markTakenOver(liveAlice.tabId, 'run_alice')
+    expect(takeOver).toHaveBeenLastCalledWith('request_alice', liveAlice.bindingId)
+    await expect(runtime.services.chat.listBrowserAudit(liveAlice.bindingId)).resolves.toEqual([{
+      id: 'audit_alice', bindingId: liveAlice.bindingId, sequence: 1,
+      origin: 'https://permit.example.gov.cn', action: 'inspect', targetSummary: 'expiry control',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 2,
+    }])
+
+    await expect(runtime.services.chat.takeOverBrowser({
+      requestId: 'request_bob', bindingId: liveAlice.bindingId,
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(runtime.services.chat.takeOverBrowser({
+      requestId: 'request_alice', bindingId: liveBob.bindingId,
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(runtime.services.chat.listBrowserAudit(liveBob.bindingId))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    expect(takeOver).toHaveBeenCalledTimes(3)
+    await runtime.close()
+  })
+
+  it('revokes personal continuations and resets visible tabs before one underlying logout without clearing cookies', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-logout-'))
+    directories.push(root)
+    const order: string[] = []
+    const workspace = createBrowserWorkspace()
+    vi.mocked(workspace.closeContinuation).mockImplementation(async () => { order.push('revoke') })
+    vi.mocked(workspace.reset).mockImplementation(async () => { order.push('reset') })
+    const authService = createTestAuthService()
+    vi.spyOn(authService, 'logout').mockImplementation(async () => { order.push('logout') })
+    const runtime = createApplicationRuntime(options(root, { authService, browserWorkspace: workspace }))
+    const session = await authenticate(runtime, 'LogoutBrowser')
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const binding = continuationBinding(session.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    registry.bind(binding)
+
+    await runtime.services.auth.logout()
+
+    expect(order).toEqual(['revoke', 'reset', 'logout'])
+    expect(authService.logout).toHaveBeenCalledOnce()
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    await runtime.close()
+  })
+
+  it('revokes the old account browser identity before an authenticated account switch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-account-switch-'))
+    directories.push(root)
+    const order: string[] = []
+    const workspace = createBrowserWorkspace()
+    vi.mocked(workspace.closeContinuation).mockImplementation(async () => { order.push('revoke') })
+    vi.mocked(workspace.reset).mockImplementation(async () => { order.push('reset') })
+    const authService = createTestAuthService()
+    const verifyOtp = authService.verifyOtp.bind(authService)
+    vi.spyOn(authService, 'verifyOtp').mockImplementation(async (input) => {
+      order.push('auth')
+      return verifyOtp(input)
+    })
+    const runtime = createApplicationRuntime(options(root, { authService, browserWorkspace: workspace }))
+    const alice = await authenticate(runtime, 'SwitchAlice')
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const binding = continuationBinding(alice.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    registry.bind(binding)
+    order.length = 0
+    const challenge = await runtime.services.auth.sendOtp({
+      intent: 'register', channel: 'email', target: 'switch-bob@example.com',
+      account: 'SwitchBobby', password: 'password',
+    })
+
+    const bob = await runtime.services.auth.verifyOtp({ challengeId: challenge.challengeId, code: '123456' })
+
+    expect(bob.user.account).toBe('SwitchBobby')
+    expect(order).toEqual(['revoke', 'reset', 'auth'])
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await runtime.close()
+  })
+
+  it('closes exact conversation continuations before deleting its media and conversation rows', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-delete-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const session = await authenticate(runtime, 'DeleteBrowser')
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const binding = continuationBinding(session.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    registry.bind(binding)
+    vi.mocked(workspace.closeContinuation).mockImplementation(async () => {
+      const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+      expect(inspection.prepare('SELECT COUNT(*) AS count FROM conversations WHERE id = ?')
+        .get(conversation.id)).toEqual({ count: 1 })
+      inspection.close()
+    })
+
+    await runtime.services.chat.deleteConversation(conversation.id)
+
+    expect(workspace.closeContinuation).toHaveBeenCalledWith(binding.tabId)
+    await expect(runtime.services.chat.listConversations()).resolves.toEqual([])
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    await runtime.close()
+  })
+
+  it('revokes exact installed and development bindings when workflow eligibility changes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-workflow-invalidation-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const session = await authenticate(runtime, 'WorkflowBrowser')
+    const conversation = await runtime.services.chat.createConversation()
+    const registry = capturedContinuationRegistry(workspace)
+    const installed = await installApprovalWorkflow(runtime)
+
+    const disabled = continuationBinding(session.user.id, conversation.id, {
+      tabId: 'tab_disabled', chatRunId: 'run_disabled', executionId: 'execution_disabled',
+      workflowId: installed.id, workflowVersion: installed.version,
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), disabled)
+    registry.bind(disabled)
+    await runtime.services.workflows.setEnabled(installed.id, installed.version, false)
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+
+    await runtime.services.workflows.setEnabled(installed.id, installed.version, true)
+    const removed = { ...disabled, tabId: 'tab_removed', chatRunId: 'run_removed', executionId: 'execution_removed' }
+    seedContinuationParents(join(root, 'autoforge.sqlite'), removed)
+    registry.bind(removed)
+    await runtime.services.workflows.remove(installed.id, installed.version)
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+
+    const project = await runtime.services.developer.createProject('Continuation Development')
+    await runtime.services.developer.build(project.id)
+    await runtime.services.settings.update({ developerMode: true })
+    let database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    let storedProject = database.workflowProjects.get(project.id)!
+    database.close()
+    const manifest = storedProject.manifest as { id: string; version: string }
+    const development = continuationBinding(session.user.id, conversation.id, {
+      tabId: 'tab_development', chatRunId: 'run_development', executionId: 'execution_development',
+      workflowId: manifest.id, workflowVersion: manifest.version, source: 'development',
+      buildHash: storedProject.buildHash,
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), development)
+    registry.bind(development)
+    await runtime.services.settings.update({ developerMode: false })
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+
+    await runtime.services.settings.update({ developerMode: true })
+    const beforeRebuild = { ...development, tabId: 'tab_rebuild', chatRunId: 'run_rebuild', executionId: 'execution_rebuild' }
+    seedContinuationParents(join(root, 'autoforge.sqlite'), beforeRebuild)
+    registry.bind(beforeRebuild)
+    await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+      "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+      'export default defineWorkflow({ async run() { return { rebuilt: true } } })',
+    ].join('\n'))
+    await runtime.services.developer.build(project.id)
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    storedProject = database.workflowProjects.get(project.id)!
+    database.close()
+    expect(storedProject.buildHash).not.toBe(beforeRebuild.buildHash)
+    await runtime.close()
+  })
+
+  it('clears only the authenticated user browser data after active execution and lease checks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-clear-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const alice = await authenticate(runtime, 'AliceClear')
+    const aliceConversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    const bob = await authenticate(runtime, 'BobbyClear')
+    const bobConversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'AliceClear', password: 'password' })
+    const registry = capturedContinuationRegistry(workspace)
+    const aliceBinding = continuationBinding(alice.user.id, aliceConversation.id, {
+      tabId: 'tab_alice_clear', chatRunId: 'run_alice_clear', executionId: 'execution_alice_clear',
+    })
+    const bobBinding = continuationBinding(bob.user.id, bobConversation.id, {
+      tabId: 'tab_bob_clear', chatRunId: 'run_bob_clear', executionId: 'execution_bob_clear',
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), aliceBinding)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), bobBinding)
+    const liveAlice = registry.bind(aliceBinding)
+    registry.bind(bobBinding)
+    const lease = await registry.acquire(liveAlice.bindingId, {
+      userId: alice.user.id, conversationId: aliceConversation.id, runId: 'active_clear_run',
+    })
+
+    await expect(runtime.services.settings.clearBrowserData())
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(workspace.clearUserData).not.toHaveBeenCalled()
+    await lease.release()
+
+    await runtime.services.settings.clearBrowserData()
+
+    expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
+    expect(registry.list(alice.user.id, aliceConversation.id)).toEqual([])
+    expect(registry.list(bob.user.id, bobConversation.id)).toHaveLength(1)
+    await runtime.close()
+  })
+
+  it('marks crash-persisted active bindings stale without rehydrating them into the live registry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-stale-'))
+    directories.push(root)
+    const firstWorkspace = createBrowserWorkspace()
+    const first = createApplicationRuntime(options(root, { browserWorkspace: firstWorkspace }))
+    const session = await authenticate(first, 'StaleBrowser')
+    const conversation = await first.services.chat.createConversation()
+    const binding = continuationBinding(session.user.id, conversation.id)
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    capturedContinuationRegistry(firstWorkspace).bind(binding)
+
+    const restartedWorkspace = createBrowserWorkspace()
+    const restarted = createApplicationRuntime(options(root, { browserWorkspace: restartedWorkspace }))
+    await restarted.recover()
+
+    const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    expect(inspection.prepare('SELECT status FROM browser_tab_bindings WHERE tab_id = ?')
+      .get(binding.tabId)).toEqual({ status: 'stale' })
+    inspection.close()
+    expect(capturedContinuationRegistry(restartedWorkspace).list(session.user.id, conversation.id)).toEqual([])
+    await restarted.close()
+    await first.close()
+  })
+
+  it('orders shutdown and continues through continuation failure to browser and database cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-shutdown-'))
+    directories.push(root)
+    const order: string[] = []
+    const continuationError = new Error('continuation shutdown failed')
+    const workspace = createBrowserWorkspace()
+    vi.mocked(workspace.shutdown).mockImplementation(async () => { order.push('browser') })
+    const stopAndDrain = MaintenanceGate.prototype.stopAndDrain
+    vi.spyOn(MaintenanceGate.prototype, 'stopAndDrain').mockImplementation(async function (this: MaintenanceGate) {
+      order.push('drain')
+      await stopAndDrain.call(this)
+    })
+    const runFinished = deferred<void>()
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockImplementationOnce(async () => {
+      await runFinished.promise
+      return { requestId: 'shutdown_request', status: 'cancelled' }
+    })
+    vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockImplementation(async () => {
+      order.push('agent')
+      runFinished.resolve()
+    })
+    vi.spyOn(ExecutionService.prototype, 'shutdown').mockImplementation(async () => { order.push('execution') })
+    vi.spyOn(BrowserContinuationRegistry.prototype, 'shutdown').mockImplementation(async () => {
+      order.push('continuation')
+      throw continuationError
+    })
+    const databaseClose = Database.prototype.close
+    const closeDatabase = vi.spyOn(Database.prototype, 'close').mockImplementation(function (this: Database.Database) {
+      order.push('database')
+      return databaseClose.call(this)
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [modelInfo('openrouter/text', 'Text')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () { yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' } }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      browserWorkspace: workspace,
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime, 'ShutdownBrowser')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/text' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'keep active'))
+    await vi.waitFor(() => expect(AgentOrchestrator.prototype.run).toHaveBeenCalled())
+
+    await expect(runtime.close()).rejects.toBe(continuationError)
+
+    expect(order.indexOf('drain')).toBeLessThan(order.indexOf('agent'))
+    expect(order.indexOf('agent')).toBeLessThan(order.indexOf('execution'))
+    expect(order.indexOf('execution')).toBeLessThan(order.indexOf('continuation'))
+    expect(order.indexOf('continuation')).toBeLessThan(order.indexOf('browser'))
+    expect(order.indexOf('browser')).toBeLessThan(order.indexOf('database'))
+    expect(closeDatabase).toHaveBeenCalled()
   })
 })

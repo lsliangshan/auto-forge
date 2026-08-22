@@ -40,6 +40,8 @@ interface NavigationHistoryPort {
   goForward(): void
 }
 
+type WebContentsListener = (...args: never[]) => void
+
 interface WebContentsPort {
   readonly id: number
   readonly debugger: DebuggerPort
@@ -50,9 +52,9 @@ interface WebContentsPort {
   isDestroyed(): boolean
   close(): void
   reload(): void
-  on(event: string, listener: (...args: any[]) => void): this
-  once(event: string, listener: (...args: any[]) => void): this
-  removeListener(event: string, listener: (...args: any[]) => void): this
+  on(event: string, listener: WebContentsListener): this
+  once(event: string, listener: WebContentsListener): this
+  removeListener(event: string, listener: WebContentsListener): this
   setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void
 }
 
@@ -80,6 +82,8 @@ interface BaseWindowPort {
 interface SessionPort {
   setProxy(config: { mode: 'direct' | 'fixed_servers'; proxyRules?: string; proxyBypassRules?: string }): Promise<void>
   closeAllConnections(): Promise<void>
+  clearStorageData(): Promise<void>
+  clearCache(): Promise<void>
   setPermissionRequestHandler(handler: (
     webContents: unknown,
     permission: string,
@@ -116,7 +120,18 @@ export interface BrowserWorkspaceTab {
 export interface BrowserWorkspaceContinuationRegistryPort {
   bindPopup(parentTabId: string, tabId: string): unknown
   markClosed(tabId: string, reason: AppErrorCode): void
-  markTakenOver(tabId: string, runId: string): void
+  markTakenOver(tabId: string, runId: string): Promise<void> | void
+}
+
+export interface BrowserContinuationCommandHandlers {
+  stop(bindingId: string): Promise<void>
+  takeOver(bindingId: string): Promise<void>
+}
+
+export interface BrowserContinuationDescription {
+  readonly pageLabel: string
+  readonly origin: string
+  readonly lastActiveAt: number
 }
 
 export interface BrowserWorkspacePort {
@@ -127,6 +142,27 @@ export interface BrowserWorkspacePort {
   updateProxy(): Promise<void>
   reset(): Promise<void>
   shutdown(): Promise<void>
+}
+
+export interface ApplicationBrowserWorkspacePort extends BrowserWorkspacePort, BrowserPageCdpPort {
+  acquireContinuation(tabId: string, runId: string): Promise<void>
+  releaseContinuation(tabId: string, runId: string): Promise<void>
+  closeContinuation(tabId: string): Promise<void>
+  getContinuationState(tabId: string, runId: string): Promise<BrowserContinuationPageState>
+  focusContinuation(tabId: string, runId: string): Promise<void>
+  highlightContinuationTarget(
+    tabId: string,
+    ref: string,
+    target: BrowserContinuationResolvedTargetInput,
+  ): Promise<void>
+  clearContinuationHighlight(tabId: string): Promise<void>
+  performContinuationAction(input: BrowserContinuationResolvedTargetInput & {
+    readonly tabId: string
+    readonly action: BrowserAction
+  }): Promise<void>
+  describeContinuation(tabId: string): Promise<BrowserContinuationDescription | undefined>
+  clearUserData(userId: string): Promise<void>
+  setContinuationCommandHandlers(handlers: BrowserContinuationCommandHandlers): void
 }
 
 export interface ElectronBrowserWorkspaceOptions {
@@ -158,6 +194,7 @@ interface TargetTabState {
   activeOperations: number
   syntheticInputOperations: number
   loading: boolean
+  lastActiveAt: number
   closed: boolean
   handle?: BrowserWorkspaceTab
 }
@@ -347,6 +384,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private shuttingDown = false
   private closingViews = false
   private continuationRegistry: BrowserWorkspaceContinuationRegistryPort | undefined
+  private continuationCommandHandlers: BrowserContinuationCommandHandlers | undefined
   private readonly pageInvalidationListeners = new Set<(tabId: string) => void>()
   private readonly highlightedContinuationTabs = new Set<string>()
 
@@ -421,6 +459,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     this.continuationRegistry = registry
   }
 
+  setContinuationCommandHandlers(handlers: BrowserContinuationCommandHandlers): void {
+    this.continuationCommandHandlers = handlers
+  }
+
   markContinuationBound(tabId: string): void {
     const state = this.tabs.get(tabId)
     if (state && state.continuation) state.continuationBound = true
@@ -453,6 +495,22 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       url: state.view.webContents.getURL(),
       navigationEpoch: state.navigationEpoch,
     })
+  }
+
+  async describeContinuation(tabId: string): Promise<BrowserContinuationDescription | undefined> {
+    const state = this.tabs.get(tabId)
+    if (!state || state.closed || !state.continuationBound || state.view.webContents.isDestroyed()) return undefined
+    try {
+      const url = new URL(state.view.webContents.getURL())
+      if (url.protocol !== 'https:' || url.username || url.password) return undefined
+      return Object.freeze({
+        pageLabel: url.hostname,
+        origin: url.origin,
+        lastActiveAt: state.lastActiveAt,
+      })
+    } catch {
+      return undefined
+    }
   }
 
   async focusContinuation(tabId: string, runId: string): Promise<void> {
@@ -703,6 +761,20 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   async closeContinuation(tabId: string): Promise<void> {
     const state = this.tabs.get(tabId)
     if (state) await this.closeTab(state)
+  }
+
+  async clearUserData(userId: string): Promise<void> {
+    if (this.shuttingDown || this.resetOperation) throw failure('CONFLICT')
+    const states = [...this.tabs.values()].filter((state) => state.userId === userId && !state.closed)
+    if (states.some((state) => state.ownerExecutionId
+      || state.ownerContinuationRunId
+      || state.activeOperations > 0)) throw failure('CONFLICT')
+    for (const state of states) await this.closeTab(state)
+    const session = await this.configureSession(browserPartition(userId))
+    await Promise.all([
+      session.clearStorageData(),
+      session.clearCache(),
+    ])
   }
 
   async updateProxy(): Promise<void> {
@@ -969,6 +1041,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       activeOperations: 0,
       syntheticInputOperations: 0,
       loading: false,
+      lastActiveAt: Date.now(),
       closed: false,
     }
     this.tabs.set(state.id, state)
@@ -981,6 +1054,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     }
     const navigationChanged = () => {
       state.navigationEpoch += 1
+      state.lastActiveAt = Date.now()
       this.emitPageInvalidated(state.id)
       renderNavigationMetadata()
     }
@@ -1063,7 +1137,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     if (!runId || (!force && state.syntheticInputOperations > 0)) return
     state.ownerContinuationRunId = undefined
     this.emitPageInvalidated(state.id)
-    this.continuationRegistry?.markTakenOver(state.id, runId)
+    const takenOver = this.continuationRegistry?.markTakenOver(state.id, runId)
+    if (takenOver) void Promise.resolve(takenOver).catch(() => undefined)
   }
 
   private addExecutionTab(executionId: string, state: TargetTabState): void {
@@ -1171,6 +1246,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     if (current && !current.closed && current !== state) window.contentView.removeChildView(current.view)
     if (current !== state) window.contentView.addChildView(state.view)
     this.activeTabId = state.id
+    state.lastActiveAt = Date.now()
     this.layout()
     await this.renderToolbar().catch(() => undefined)
     if (this.window !== window || window.isDestroyed() || state.closed) throw failure('NOT_FOUND')
@@ -1590,13 +1666,15 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       let started = false
       let sameDocument = false
       let settled = false
-      let detectionTimer: ReturnType<typeof setTimeout>
-      let maximumTimer: ReturnType<typeof setTimeout>
+      const timers: {
+        detection?: ReturnType<typeof setTimeout>
+        maximum?: ReturnType<typeof setTimeout>
+      } = {}
       const finish = (error?: AppError) => {
         if (settled) return
         settled = true
-        clearTimeout(detectionTimer)
-        clearTimeout(maximumTimer)
+        if (timers.detection) clearTimeout(timers.detection)
+        if (timers.maximum) clearTimeout(timers.maximum)
         contents.removeListener('did-start-navigation', onStart)
         contents.removeListener('did-stop-loading', onStop)
         contents.removeListener('did-fail-load', onFail)
@@ -1629,8 +1707,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       contents.on('did-fail-load', onFail)
       contents.on('did-navigate-in-page', onInPage)
       contents.on('destroyed', onDestroyed)
-      detectionTimer = setTimeout(() => { if (!started) finish() }, detectionMs)
-      maximumTimer = setTimeout(() => { finish(failure('WORKER_TIMEOUT')) }, 30_000)
+      timers.detection = setTimeout(() => { if (!started) finish() }, detectionMs)
+      timers.maximum = setTimeout(() => { finish(failure('WORKER_TIMEOUT')) }, 30_000)
     })
     return { promise, cancel: () => cancel() }
   }

@@ -79,6 +79,8 @@ function services(): DesktopIpcServices {
       deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'request_1' }),
       cancel: vi.fn(),
+      takeOverBrowser: vi.fn(),
+      listBrowserAudit: vi.fn().mockResolvedValue([]),
       getGenerationPreferences: vi.fn(),
       updateGenerationPreferences: vi.fn(),
     },
@@ -102,6 +104,7 @@ function services(): DesktopIpcServices {
       listProviderModels: vi.fn(async () => []),
       getTokenUsage: vi.fn().mockResolvedValue(emptyUsageSnapshot()),
       clearLocalData: vi.fn(),
+      clearBrowserData: vi.fn(),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
@@ -322,6 +325,67 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.chat.send).not.toHaveBeenCalled()
+  })
+
+  it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {
+    const app = harness()
+
+    await app.invoke(ipcChannels.chatTakeOverBrowser, {
+      requestId: 'request_1', bindingId: 'binding_1',
+    })
+    await app.invoke(ipcChannels.chatListBrowserAudit, { bindingId: 'binding_1' })
+    await app.invoke(ipcChannels.settingsClearBrowserData)
+
+    expect(app.dependencies.chat.takeOverBrowser).toHaveBeenCalledWith({
+      requestId: 'request_1', bindingId: 'binding_1',
+    })
+    expect(app.dependencies.chat.listBrowserAudit).toHaveBeenCalledWith('binding_1')
+    expect(app.dependencies.settings.clearBrowserData).toHaveBeenCalledOnce()
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledTimes(3)
+
+    for (const [channel, input] of [
+      [ipcChannels.chatTakeOverBrowser, { requestId: '', bindingId: 'binding_1' }],
+      [ipcChannels.chatTakeOverBrowser, { requestId: 'request_1', bindingId: 42 }],
+      [ipcChannels.chatTakeOverBrowser, { requestId: 'request_1', bindingId: 'binding_1', extra: true }],
+      [ipcChannels.chatListBrowserAudit, { bindingId: '' }],
+      [ipcChannels.settingsClearBrowserData, { userId: 'user_2' }],
+    ] as const) {
+      await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(app.dependencies.chat.takeOverBrowser).toHaveBeenCalledTimes(1)
+    expect(app.dependencies.chat.listBrowserAudit).toHaveBeenCalledTimes(1)
+    expect(app.dependencies.settings.clearBrowserData).toHaveBeenCalledTimes(1)
+  })
+
+  it('denies anonymous and ownership-failed browser requests without leaking service details', async () => {
+    const app = harness()
+    vi.mocked(app.dependencies.auth.requireSession)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
+
+    await expect(app.invoke(ipcChannels.chatTakeOverBrowser, {
+      requestId: 'request_1', bindingId: 'binding_1',
+    })).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(app.dependencies.chat.takeOverBrowser).not.toHaveBeenCalled()
+
+    vi.mocked(app.dependencies.auth.requireSession)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
+    await expect(app.invoke(ipcChannels.chatListBrowserAudit, { bindingId: 'binding_1' }))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(app.dependencies.chat.listBrowserAudit).not.toHaveBeenCalled()
+
+    vi.mocked(app.dependencies.auth.requireSession)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
+    await expect(app.invoke(ipcChannels.settingsClearBrowserData))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(app.dependencies.settings.clearBrowserData).not.toHaveBeenCalled()
+
+    vi.mocked(app.dependencies.chat.listBrowserAudit)
+      .mockRejectedValueOnce(toSafeAppError({ code: 'NOT_FOUND' }))
+    const denied = await app.invoke(ipcChannels.chatListBrowserAudit, {
+      bindingId: 'binding_foreign',
+    }).catch((error) => error)
+    expect(denied).toMatchObject({ code: 'NOT_FOUND' })
+    expect(JSON.stringify(denied)).not.toContain('binding_foreign')
   })
 
   it('validates and forwards an explicit fixed provider for credential operations', async () => {

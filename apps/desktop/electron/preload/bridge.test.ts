@@ -141,6 +141,24 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.chatListMessages, { conversationId: 'conversation_1' })
   })
 
+  it('maps browser continuation takeover, redacted audit, and explicit data clearing to fixed channels', async () => {
+    const app = harness()
+
+    await app.api.chat.takeOverBrowser({ requestId: 'request_1', bindingId: 'binding_1' })
+    await app.api.chat.listBrowserAudit('binding_1')
+    await app.api.settings.clearBrowserData()
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.chatTakeOverBrowser, {
+      requestId: 'request_1', bindingId: 'binding_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.chatListBrowserAudit, {
+      bindingId: 'binding_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.settingsClearBrowserData, undefined)
+    expect(app.api.chat).not.toHaveProperty('invoke')
+    expect(app.api.settings).not.toHaveProperty('clearStorageData')
+  })
+
   it('lists local projects through a fixed developer channel', async () => {
     const app = harness()
     await app.api.developer.listProjects()

@@ -31,12 +31,16 @@ import {
   createAgentPersistence,
   type AgentRunResult,
 } from './agent/agent-orchestrator.js'
+import { BrowserContinuationCatalog } from './agent/browser-continuation-catalog.js'
+import { BrowserContinuationToolExecutor } from './agent/browser-continuation-tool-executor.js'
 import type { AuthService } from './auth/auth-service.js'
 import { createCloudBaseClientPorts, readCloudBaseAuthConfig } from './auth/cloudbase-auth-port.js'
 import { CloudBaseAuthService } from './auth/cloudbase-auth-service.js'
 import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
-import type { BrowserWorkspacePort } from './browser/electron-browser-workspace.js'
+import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
+import { BrowserPageInspector } from './browser/browser-page-inspector.js'
+import type { ApplicationBrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
@@ -115,6 +119,8 @@ type ApplicationFailureSource =
   | 'media-cancel'
   | 'chat-drain'
   | 'execution-shutdown'
+  | 'continuation-shutdown'
+  | 'browser-shutdown'
   | 'database-close'
 
 interface ApplicationFailureRecord {
@@ -135,7 +141,9 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'media-cancel': 50,
   'chat-drain': 60,
   'execution-shutdown': 70,
-  'database-close': 80,
+  'continuation-shutdown': 80,
+  'browser-shutdown': 90,
+  'database-close': 100,
 }
 
 /** @internal Exported only for direct unit coverage of failure identity semantics. */
@@ -180,7 +188,7 @@ export interface ApplicationRuntimeOptions {
   openExternal(url: string): Promise<void>
   emitChat(event: ChatEvent): void
   emitExecution(event: ExecutionEvent): void
-  browserWorkspace: BrowserWorkspacePort
+  browserWorkspace: ApplicationBrowserWorkspacePort
   applyTheme?(theme: AppSettings['theme']): void
   /** @internal Test-only observation hook for the Main-owned Agent instance. */
   inspectAgent?(agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>): void
@@ -668,10 +676,56 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   }
   const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const policy = new PolicyEngine(database.permissionGrants)
+  const browserContinuations = new BrowserContinuationRegistry({
+    repository: database.browserTabBindings,
+    workspace: options.browserWorkspace,
+    onTakeOver: async ({ binding, runId }) => {
+      const session = await auth.requireSession()
+      const run = database.chatRuns.get(runId)
+      const conversation = database.conversations.get(binding.conversationId)
+      if (!run
+        || !conversation
+        || session.user.id !== binding.userId
+        || conversation.userId !== binding.userId
+        || run.userId !== binding.userId
+        || run.conversationId !== binding.conversationId) throw failure('NOT_FOUND')
+      if (!await agent.takeOverBrowser(run.requestId, binding.bindingId)) throw failure('NOT_FOUND')
+    },
+  })
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
     workspace: options.browserWorkspace,
     currentUserId: async () => (await auth.getSession())?.user.id,
+    continuationRegistry: browserContinuations,
+  })
+  const browserInspector = new BrowserPageInspector(options.browserWorkspace)
+  const browserContinuationExecutor = new BrowserContinuationToolExecutor({
+    registry: browserContinuations,
+    inspector: browserInspector,
+    workspace: options.browserWorkspace,
+    audits: database.browserActionAudits,
+  })
+  const browserContinuationCatalog = new BrowserContinuationCatalog({
+    registry: browserContinuations,
+    describe: async (binding) => {
+      const description = await options.browserWorkspace.describeContinuation(binding.tabId)
+      if (!description) return undefined
+      let workflowLabel = binding.workflowId
+      if (binding.source === 'installed') {
+        workflowLabel = (await registry.get(binding.workflowId, binding.workflowVersion, {
+          developerMode: false,
+        }))?.name ?? workflowLabel
+      } else {
+        const candidates = await Promise.all(database.workflowProjects.list().map((project) => (
+          registry.getDevelopmentProject(project.id)
+        )))
+        workflowLabel = candidates.find((candidate) => candidate?.id === binding.workflowId
+          && candidate.version === binding.workflowVersion
+          && candidate.runtimeIdentity.source === 'development'
+          && candidate.runtimeIdentity.buildHash === binding.buildHash)?.name ?? workflowLabel
+      }
+      return { workflowLabel, ...description }
+    },
   })
   const sourceResolver = createWorkflowExecutionSourceResolver(sourceSelectorVault, {
     repositories: database,
@@ -774,6 +828,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerUsage: database.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
+    browserContinuation: {
+      catalog: browserContinuationCatalog,
+      executor: browserContinuationExecutor,
+    },
   })
   options.inspectAgent?.(agent)
   const persistence = createAgentPersistence(database)
@@ -855,16 +913,83 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return conversation
   }
 
+  const requireOwnedLiveBinding = (bindingId: string, userId: string) => {
+    const live = browserContinuations.get(bindingId)
+    const durable = database.browserTabBindings.get(bindingId)
+    if (!live
+      || !durable
+      || durable.status !== 'active'
+      || live.userId !== userId
+      || durable.userId !== userId
+      || durable.conversationId !== live.conversationId) throw failure('NOT_FOUND')
+    requireOwnedConversation(live.conversationId, userId)
+    return live
+  }
+  const requireOwnedBrowserRun = (requestId: string, conversationId: string, userId: string) => {
+    const run = database.chatRuns.getByRequestId(requestId)
+    if (!run || run.userId !== userId || run.conversationId !== conversationId) throw failure('NOT_FOUND')
+    return run
+  }
+  const takeOverOwnedBrowser = async (
+    requestId: string,
+    bindingId: string,
+    userId: string,
+  ): Promise<void> => {
+    const binding = requireOwnedLiveBinding(bindingId, userId)
+    requireOwnedBrowserRun(requestId, binding.conversationId, userId)
+    if (!await agent.takeOverBrowser(requestId, bindingId)) throw failure('NOT_FOUND')
+  }
+  const currentBrowserRequest = (bindingId: string, userId: string) => {
+    const lease = browserContinuations.currentLease(bindingId)
+    if (!lease || lease.binding.userId !== userId) throw failure('NOT_FOUND')
+    const run = database.chatRuns.get(lease.runId)
+    if (!run || run.userId !== userId || run.conversationId !== lease.binding.conversationId) {
+      throw failure('NOT_FOUND')
+    }
+    return { binding: lease.binding, run }
+  }
+  options.browserWorkspace.setContinuationCommandHandlers({
+    stop: async (bindingId) => {
+      const session = await auth.requireSession()
+      const current = currentBrowserRequest(bindingId, session.user.id)
+      await agent.cancel(current.run.requestId)
+    },
+    takeOver: async (bindingId) => {
+      const session = await auth.requireSession()
+      const current = currentBrowserRequest(bindingId, session.user.id)
+      await takeOverOwnedBrowser(current.run.requestId, current.binding.bindingId, session.user.id)
+    },
+  })
+  const cancelAgentRequestsForUser = async (userId: string): Promise<void> => {
+    const requestIds = [...activeRequests].filter((requestId) => (
+      database.chatRuns.getByRequestId(requestId)?.userId === userId
+    ))
+    const results = await Promise.allSettled(requestIds.map((requestId) => agent.cancel(requestId)))
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failed) throw failed.reason
+  }
+  const resetBrowserIdentity = async (userId: string): Promise<void> => {
+    const failures: unknown[] = []
+    try { await cancelAgentRequestsForUser(userId) } catch (error) { failures.push(error) }
+    try { await browserContinuations.revokeUser(userId, 'CANCELLED') } catch (error) { failures.push(error) }
+    try { await browser.reset() } catch (error) { failures.push(error) }
+    if (failures.length > 0) throw failures[0]
+  }
+  const beforeAuthIdentityChange = async (): Promise<void> => {
+    const current = await auth.getSession()
+    if (current) await resetBrowserIdentity(current.user.id)
+  }
+
   let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
     auth: {
       getSession: () => auth.getSession(),
       refreshAuthorization: () => auth.refreshAuthorization(),
       sendOtp: (input) => auth.sendOtp(input),
-      verifyOtp: (input) => auth.verifyOtp(input),
+      verifyOtp: async (input) => { await beforeAuthIdentityChange(); return auth.verifyOtp(input) },
       cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
-      loginWithPassword: (input) => auth.loginWithPassword(input),
-      logout: () => auth.logout(),
+      loginWithPassword: async (input) => { await beforeAuthIdentityChange(); return auth.loginWithPassword(input) },
+      logout: async () => { await beforeAuthIdentityChange(); await auth.logout() },
       requireSession: () => auth.requireSession(),
     },
     userAdmin: {
@@ -930,10 +1055,20 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const session = await auth.requireSession()
         requireOwnedConversation(conversationId, session.user.id)
         return maintenance.runExclusive(
-          () => [...activeChatWork.values()].some((work) => work.conversationId === conversationId)
-            || database.mediaGenerationJobs.listActive()
-              .some((job) => job.conversationId === conversationId),
-          () => mediaLifecycle.deleteConversation(conversationId),
+          () => [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
+            || mediaGeneration.hasActiveRuns()
+            || database.mediaGenerationJobs.listActive().length > 0
+            || activeExecutions.size > 0
+            || executions.hasActiveExecutions()
+            || browser.hasActiveContexts(),
+          async () => {
+            const requests = [...activeChatWork.entries()]
+              .filter(([, work]) => work.conversationId === conversationId)
+            await Promise.all(requests.map(([requestId]) => agent.cancel(requestId)))
+            await Promise.all(requests.map(([, work]) => work.promise))
+            await browserContinuations.revokeConversation(conversationId, 'CANCELLED')
+            await mediaLifecycle.deleteConversation(conversationId)
+          },
         )
       },
       send: async (input) => {
@@ -1065,6 +1200,28 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           mediaGeneration.cancel(requestId),
         ])
       },
+      takeOverBrowser: async (input) => {
+        const session = await auth.requireSession()
+        await takeOverOwnedBrowser(input.requestId, input.bindingId, session.user.id)
+      },
+      listBrowserAudit: async (bindingId) => {
+        const session = await auth.requireSession()
+        const binding = database.browserTabBindings.get(bindingId)
+        if (!binding || binding.userId !== session.user.id) throw failure('NOT_FOUND')
+        requireOwnedConversation(binding.conversationId, session.user.id)
+        return database.browserActionAudits.list(bindingId).map((audit) => ({
+          id: audit.id,
+          bindingId: audit.bindingId,
+          sequence: audit.sequence,
+          origin: audit.origin,
+          action: audit.action,
+          targetSummary: audit.targetSummary,
+          risk: audit.risk,
+          outcome: audit.outcome,
+          ...(audit.errorCode === undefined ? {} : { errorCode: audit.errorCode }),
+          createdAt: audit.createdAt,
+        }))
+      },
       getGenerationPreferences: async (conversationId) => {
         const session = await auth.requireSession()
         const conversation = requireOwnedConversation(conversationId, session.user.id)
@@ -1160,6 +1317,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       setEnabled: async (id, version, enabled) => {
         if (!database.installedWorkflows.get(id, version)) throw failure('NOT_FOUND')
         registry.setEnabled(id, version, enabled)
+        if (!enabled) {
+          await browserContinuations.revokeWorkflow({
+            workflowId: id, workflowVersion: version, source: 'installed',
+          }, 'WORKFLOW_CHANGED')
+        }
       },
       remove: (id, version) => maintenance.runExclusive(
         () => activeRequests.size > 0
@@ -1167,7 +1329,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           || agent.hasActiveRuns()
           || executions.hasActiveExecutions()
           || browser.hasActiveContexts(),
-        () => projects.removeInstalled(id, version),
+        async () => {
+          await browserContinuations.revokeWorkflow({
+            workflowId: id, workflowVersion: version, source: 'installed',
+          }, 'WORKFLOW_CHANGED')
+          await projects.removeInstalled(id, version)
+        },
       ),
       installProject: async (projectId) => {
         const installed = await projects.install(projectId)
@@ -1203,7 +1370,23 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (!project) throw failure('NOT_FOUND')
         return developerProject(project)
       },
-      build: async (projectId) => developerProject(await projects.build(projectId)),
+      build: async (projectId) => {
+        const previous = database.workflowProjects.get(projectId)
+        const built = await projects.build(projectId)
+        const previousManifest = previous?.manifest as Partial<WorkflowManifest> | undefined
+        if (previous?.buildHash
+          && previousManifest?.id
+          && previousManifest.version
+          && previous.buildHash !== built.buildHash) {
+          await browserContinuations.revokeWorkflow({
+            workflowId: previousManifest.id,
+            workflowVersion: previousManifest.version,
+            source: 'development',
+            buildHash: previous.buildHash,
+          }, 'WORKFLOW_CHANGED')
+        }
+        return developerProject(built)
+      },
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {
         const releaseStart = maintenance.beginStart()
@@ -1309,24 +1492,35 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const candidate = settings.preview(patch)
           const commit = () => {
             const committed = settings.commit(candidate)
-            if (committed.developerMode !== previous.developerMode) {
-              void agent.onDeveloperModeChanged(committed.developerMode).catch((error: unknown) => {
-                recordFailure(error, 'background-chat')
-              })
-            }
             if (committed.theme !== previous.theme) options.applyTheme?.(committed.theme)
             return committed
           }
+          const invalidate = async (committed: AppSettings) => {
+            if (committed.developerMode === previous.developerMode) return
+            try {
+              await agent.onDeveloperModeChanged(committed.developerMode)
+            } catch (error) {
+              recordFailure(error, 'background-chat')
+            }
+            if (!committed.developerMode) {
+              await browserContinuations.revokeDevelopment('WORKFLOW_CHANGED')
+            }
+          }
           if (JSON.stringify(previous.proxy) === JSON.stringify(candidate.proxy)) {
-            return commit()
+            const committed = commit()
+            await invalidate(committed)
+            return committed
           }
           await options.networkProxy.transition(candidate.proxy)
+          let committed: AppSettings
           try {
-            return commit()
+            committed = commit()
           } catch {
             await options.networkProxy.transitionOrFailClosed(previous.proxy)
             throw failure('INTERNAL_ERROR')
           }
+          await invalidate(committed)
+          return committed
         })
         settingsUpdateTail = transaction.then(() => undefined, () => undefined)
         return transaction
@@ -1374,6 +1568,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           },
         )
       },
+      clearBrowserData: async () => {
+        const session = await auth.requireSession()
+        await maintenance.runExclusive(
+          () => activeRequests.size > 0
+            || activeChatWork.size > 0
+            || activeExecutions.size > 0
+            || agent.hasActiveRuns()
+            || browserContinuations.hasActiveLease(session.user.id)
+            || executions.hasActiveExecutions()
+            || browser.hasActiveContexts(),
+          async () => {
+            await browserContinuations.revokeUser(session.user.id, 'CANCELLED')
+            await options.browserWorkspace.clearUserData(session.user.id)
+          },
+        )
+      },
     },
     system: {
       openExternal: async (url) => {
@@ -1416,12 +1626,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ): Promise<void> => {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
         }
-        const admittedStarts = Promise.resolve().then(() => maintenance.stopAndDrain())
+        await capture('admission-drain', () => maintenance.stopAndDrain())
         const reconciliationStopped = Promise.resolve()
           .then(() => providerUsageReconciliationLoop.stop())
           .catch((error: unknown) => { recordFailure(error, 'reconciliation-stop') })
-        await capture('video-stop', () => videoJobs.stop())
-        await capture('admission-drain', () => admittedStarts)
         const cancellations = [...activeRequests].flatMap((requestId) => [
           { source: 'agent-cancel' as const, operation: () => agent.cancel(requestId) },
           { source: 'media-cancel' as const, operation: () => mediaGeneration.cancel(requestId) },
@@ -1432,6 +1640,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         cancellationResults.forEach((result, index) => {
           if (result.status === 'rejected') recordFailure(result.reason, cancellations[index]!.source)
         })
+        await capture('video-stop', () => videoJobs.stop())
         await capture('chat-drain', async () => {
           const results = await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
           for (const result of results) if (result.status === 'rejected') {
@@ -1439,6 +1648,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           }
         })
         await capture('execution-shutdown', () => executions.shutdown())
+        await capture('continuation-shutdown', async () => {
+          try { await browserContinuations.shutdown() } finally { browserInspector.dispose() }
+        })
+        await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped
         await capture('database-close', () => { database.close() })
         const terminalFailure = failureRecorder.select()

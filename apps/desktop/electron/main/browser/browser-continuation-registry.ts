@@ -30,6 +30,10 @@ export interface BrowserContinuationRegistryWorkspace {
 export interface BrowserContinuationRegistryOptions {
   repository: BrowserContinuationBindingRepository
   workspace: BrowserContinuationRegistryWorkspace
+  onTakeOver?(input: {
+    binding: BrowserContinuationBinding
+    runId: string
+  }): Promise<void> | void
   id?: () => string
   now?: () => number
 }
@@ -126,6 +130,24 @@ export class BrowserContinuationRegistry {
     )))
   }
 
+  get(bindingId: string): BrowserContinuationBinding | undefined {
+    return this.bindings.get(bindingId)
+  }
+
+  currentLease(bindingId: string): {
+    binding: BrowserContinuationBinding
+    runId: string
+  } | undefined {
+    const binding = this.bindings.get(bindingId)
+    const runId = this.leaseOwners.get(bindingId)
+    return binding && runId ? Object.freeze({ binding, runId }) : undefined
+  }
+
+  hasActiveLease(userId?: string): boolean {
+    if (userId === undefined) return this.leaseOwners.size > 0
+    return [...this.leaseOwners.keys()].some((bindingId) => this.bindings.get(bindingId)?.userId === userId)
+  }
+
   async acquire(
     bindingId: string,
     input: { userId: string; conversationId: string; runId: string },
@@ -174,10 +196,11 @@ export class BrowserContinuationRegistry {
     })
   }
 
-  markTakenOver(tabId: string, runId: string): void {
+  async markTakenOver(tabId: string, runId: string): Promise<void> {
     const binding = this.bindingsByTab.get(tabId)
     if (binding && this.leaseOwners.get(binding.bindingId) === runId) {
       this.leaseOwners.delete(binding.bindingId)
+      await this.options.onTakeOver?.({ binding, runId })
     }
   }
 
@@ -187,6 +210,21 @@ export class BrowserContinuationRegistry {
 
   revokeUser(userId: string, reason: AppErrorCode): Promise<void> {
     return this.revokeWhere((binding) => binding.userId === userId, reason)
+  }
+
+  revokeWorkflow(
+    input: Pick<BrowserContinuationBinding, 'workflowId' | 'workflowVersion' | 'source'>
+      & Partial<Pick<BrowserContinuationBinding, 'buildHash'>>,
+    reason: AppErrorCode,
+  ): Promise<void> {
+    return this.revokeWhere((binding) => binding.workflowId === input.workflowId
+      && binding.workflowVersion === input.workflowVersion
+      && binding.source === input.source
+      && (input.buildHash === undefined || binding.buildHash === input.buildHash), reason)
+  }
+
+  revokeDevelopment(reason: AppErrorCode): Promise<void> {
+    return this.revokeWhere((binding) => binding.source === 'development', reason)
   }
 
   async revokeBinding(bindingId: string, reason: AppErrorCode): Promise<void> {

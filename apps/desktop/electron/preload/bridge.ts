@@ -80,6 +80,8 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       deleteConversation: (conversationId) => invoke(ipcRenderer, ipcChannels.chatDeleteConversation, { conversationId }),
       send: (input) => invoke(ipcRenderer, ipcChannels.chatSend, input),
       cancel: (requestId) => invoke(ipcRenderer, ipcChannels.chatCancel, { requestId }),
+      takeOverBrowser: (input) => invoke(ipcRenderer, ipcChannels.chatTakeOverBrowser, input),
+      listBrowserAudit: (bindingId) => invoke(ipcRenderer, ipcChannels.chatListBrowserAudit, { bindingId }),
       getGenerationPreferences: (conversationId) => invoke(ipcRenderer, ipcChannels.chatGetGenerationPreferences, { conversationId }),
       updateGenerationPreferences: (conversationId, preferences) => invoke(ipcRenderer, ipcChannels.chatUpdateGenerationPreferences, { conversationId, preferences }),
       onEvent: (listener) => subscribe(ipcRenderer, ipcChannels.chatEvent, (payload) => chatEventSchema.safeParse(payload), listener),
@@ -141,6 +143,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       ),
       getTokenUsage: () => invoke(ipcRenderer, ipcChannels.settingsGetTokenUsage),
       clearLocalData: (scope) => invoke(ipcRenderer, ipcChannels.settingsClearLocalData, { scope }),
+      clearBrowserData: () => invoke(ipcRenderer, ipcChannels.settingsClearBrowserData),
     },
     system: {
       openExternal: (url) => invoke(ipcRenderer, ipcChannels.systemOpenExternal, { url }),
