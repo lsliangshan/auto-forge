@@ -190,13 +190,23 @@ export class BrowserContinuationRegistry {
     if (!binding) return
     const ownerRunId = this.leaseOwners.get(bindingId)
     this.removeLive(binding)
-    this.options.repository.terminate(binding.bindingId, {
-      status: 'revoked', terminalReason: reason, endedAt: this.now(),
-    })
+    const failures: unknown[] = []
+    try {
+      this.options.repository.terminate(binding.bindingId, {
+        status: 'revoked', terminalReason: reason, endedAt: this.now(),
+      })
+    } catch (error) {
+      failures.push(error)
+    }
     if (ownerRunId) {
       await this.options.workspace.releaseContinuation(binding.tabId, ownerRunId).catch(() => undefined)
     }
-    await this.options.workspace.closeContinuation(binding.tabId)
+    try {
+      await this.options.workspace.closeContinuation(binding.tabId)
+    } catch (error) {
+      failures.push(error)
+    }
+    if (failures.length > 0) throw failures[0]
   }
 
   async shutdown(): Promise<void> {

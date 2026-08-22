@@ -58,6 +58,7 @@ class FakeWebContents extends EventEmitter {
     respond: (method: string, params?: unknown) => unknown,
     requireDocumentBeforeDebugger: boolean,
     private readonly beforeLoad?: (url: string) => Promise<void>,
+    private readonly afterLoad?: (url: string) => string | undefined,
   ) {
     super()
     this.debugger = new FakeDebugger(respond, () => this.loaded.length > 0, requireDocumentBeforeDebugger)
@@ -66,8 +67,8 @@ class FakeWebContents extends EventEmitter {
   async loadURL(url: string) {
     this.loaded.push(url)
     await this.beforeLoad?.(url)
-    this.currentUrl = url
-    this.emit('did-navigate', {}, url)
+    this.currentUrl = this.afterLoad?.(url) ?? url
+    this.emit('did-navigate', {}, this.currentUrl)
   }
   getURL() { return this.currentUrl }
   getTitle() { return this.title }
@@ -85,8 +86,11 @@ class FakeView {
     respond: (method: string, params?: unknown) => unknown,
     requireDocumentBeforeDebugger: boolean,
     beforeLoad?: (url: string) => Promise<void>,
+    afterLoad?: (url: string) => string | undefined,
   ) {
-    this.webContents = new FakeWebContents(session, respond, requireDocumentBeforeDebugger, beforeLoad)
+    this.webContents = new FakeWebContents(
+      session, respond, requireDocumentBeforeDebugger, beforeLoad, afterLoad,
+    )
   }
   setBounds(bounds: { x: number; y: number; width: number; height: number }) { this.bounds.push(bounds) }
 }
@@ -111,6 +115,7 @@ function createHarness(
   respond: (method: string, params?: unknown) => unknown = () => ({}),
   requireDocumentBeforeDebugger = false,
   beforeLoad?: (url: string) => Promise<void>,
+  afterLoad?: (url: string) => string | undefined,
 ) {
   const sessions = new Map<string, FakeSession>()
   const views: FakeView[] = []
@@ -123,7 +128,9 @@ function createHarness(
   class ViewConstructor {
     constructor(options: Record<string, unknown> = {}) {
       const partition = String((options.webPreferences as { partition?: string } | undefined)?.partition ?? 'toolbar')
-      const view = new FakeView(options, fromPartition(partition), respond, requireDocumentBeforeDebugger, beforeLoad)
+      const view = new FakeView(
+        options, fromPartition(partition), respond, requireDocumentBeforeDebugger, beforeLoad, afterLoad,
+      )
       views.push(view)
       return view
     }
@@ -312,6 +319,83 @@ describe('ElectronBrowserWorkspace', () => {
     await replacement.release()
   })
 
+  it.each(['back', 'forward', 'reload'] as const)(
+    'releases continuation ownership before toolbar %s mutates the page',
+    async (command) => {
+      const { workspace, views } = createHarness()
+      const input = executionInput()
+      const tab = await workspace.acquire(input)
+      const registry = continuationRegistry(workspace)
+      workspace.setContinuationRegistry(registry)
+      const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+      await workspace.releaseExecution(input.executionId)
+      const lease = await registry.acquire(binding.bindingId, {
+        userId: input.userId, conversationId: input.conversationId!, runId: 'run_toolbar',
+      })
+      const target = views[1]!.webContents
+      if (command === 'back') vi.spyOn(target.navigationHistory, 'canGoBack').mockReturnValue(true)
+      if (command === 'forward') vi.spyOn(target.navigationHistory, 'canGoForward').mockReturnValue(true)
+      const mutation = command === 'back'
+        ? target.navigationHistory.goBack
+        : command === 'forward' ? target.navigationHistory.goForward : target.reload
+      let replacement: ReturnType<typeof registry.acquire> | undefined
+      mutation.mockImplementation(() => {
+        replacement = registry.acquire(binding.bindingId, {
+          userId: input.userId, conversationId: input.conversationId!, runId: 'run_after_toolbar',
+        })
+      })
+
+      const navigation = { preventDefault: vi.fn() }
+      views[0]!.webContents.emit('will-navigate', navigation, `autoforge-browser://${command}`)
+
+      expect(navigation.preventDefault).toHaveBeenCalledOnce()
+      expect(mutation).toHaveBeenCalledOnce()
+      expect(replacement).toBeDefined()
+      const replacementLease = await replacement!
+      expect(replacementLease.ownerRunId).toBe('run_after_toolbar')
+      await lease.release()
+      await replacementLease.release()
+    },
+  )
+
+  it('cancels an in-flight continuation action when toolbar navigation takes over', async () => {
+    const dispatched = deferred<unknown>()
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '继续' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method]
+      ?? (method === 'Input.dispatchMouseEvent' ? dispatched.promise : {})
+    const { workspace, views } = createHarness(respond)
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    await tab.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    await workspace.releaseExecution(input.executionId)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_in_flight',
+    })
+
+    const clicking = tab.click('role=button[name="继续"]', 'https://www.baidu.com')
+    await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+      .toContainEqual(expect.objectContaining({ method: 'Input.dispatchMouseEvent' })))
+    views[0]!.webContents.emit(
+      'will-navigate', { preventDefault: vi.fn() }, 'autoforge-browser://reload',
+    )
+    dispatched.resolve({})
+
+    await expect(clicking).rejects.toMatchObject({ code: 'CANCELLED' })
+    const replacement = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_after_toolbar',
+    })
+    await lease.release()
+    await replacement.release()
+  })
+
   it('inherits a separate binding only for an allowed popup after the parent was bound', async () => {
     const { workspace, views } = createHarness()
     const registry = continuationRegistry(workspace)
@@ -350,6 +434,52 @@ describe('ElectronBrowserWorkspace', () => {
 
     expect(registry.list('user_1', 'conversation_1')).toHaveLength(1)
     expect(views).toHaveLength(2)
+  })
+
+  it('closes an unbound provisional popup when its load rejects', async () => {
+    const popupUrl = 'https://www.baidu.com/load-fails'
+    const { workspace, views } = createHarness(
+      () => ({}), false,
+      async (url) => { if (url === popupUrl) throw new Error('load failed') },
+    )
+    const registry = continuationRegistry(workspace)
+    const bindPopup = vi.spyOn(registry, 'bindPopup')
+    workspace.setContinuationRegistry(registry)
+    const input = executionInput()
+    const parent = await workspace.acquire(input)
+    await parent.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    registry.bind({ ...input, tabId: parent.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(parent.id)
+
+    views[1]!.webContents.windowOpenHandler?.({ url: popupUrl })
+
+    await vi.waitFor(() => expect(views).toHaveLength(3))
+    await vi.waitFor(() => expect(views[2]!.webContents.destroyed).toBe(true))
+    expect(bindPopup).not.toHaveBeenCalled()
+    expect(registry.list(input.userId, input.conversationId!)).toHaveLength(1)
+  })
+
+  it('closes an unbound provisional popup after a post-load redirect leaves its captured patterns', async () => {
+    const popupUrl = 'https://www.baidu.com/redirects'
+    const { workspace, views } = createHarness(
+      () => ({}), false, undefined,
+      (url) => url === popupUrl ? 'https://attacker.example/landing' : undefined,
+    )
+    const registry = continuationRegistry(workspace)
+    const bindPopup = vi.spyOn(registry, 'bindPopup')
+    workspace.setContinuationRegistry(registry)
+    const input = executionInput()
+    const parent = await workspace.acquire(input)
+    await parent.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    registry.bind({ ...input, tabId: parent.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(parent.id)
+
+    views[1]!.webContents.windowOpenHandler?.({ url: popupUrl })
+
+    await vi.waitFor(() => expect(views).toHaveLength(3))
+    await vi.waitFor(() => expect(views[2]!.webContents.destroyed).toBe(true))
+    expect(bindPopup).not.toHaveBeenCalled()
+    expect(registry.list(input.userId, input.conversationId!)).toHaveLength(1)
   })
 
   it('initializes a target document before enabling debugger domains', async () => {

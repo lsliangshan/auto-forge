@@ -631,38 +631,38 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     const continuation = parent.continuation
     if (!continuation || !parent.continuationBound) throw failure('DOMAIN_BLOCKED')
     const child = await this.createTab(continuation)
-    const patterns = continuation.permissionMatrix['browser.open'] ?? []
-    child.popupPatterns = patterns
-    if (parent.ownerExecutionId) {
-      child.ownerExecutionId = parent.ownerExecutionId
-      this.addExecutionTab(parent.ownerExecutionId, child)
-    }
-    const origin = originOf(url)
-    child.allowedOrigins = [origin]
     try {
-      await child.view.webContents.loadURL(url)
-      const current = child.view.webContents.getURL()
-      if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, current))) {
-        throw failure('DOMAIN_BLOCKED')
+      const patterns = continuation.permissionMatrix['browser.open'] ?? []
+      child.popupPatterns = patterns
+      if (parent.ownerExecutionId) {
+        child.ownerExecutionId = parent.ownerExecutionId
+        this.addExecutionTab(parent.ownerExecutionId, child)
       }
-      child.automationOrigins = [originOf(current)]
-    } finally {
-      child.allowedOrigins = undefined
-    }
-    try {
+      const origin = originOf(url)
+      child.allowedOrigins = [origin]
+      try {
+        await child.view.webContents.loadURL(url)
+        const current = child.view.webContents.getURL()
+        if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, current))) {
+          throw failure('DOMAIN_BLOCKED')
+        }
+        child.automationOrigins = [originOf(current)]
+      } finally {
+        child.allowedOrigins = undefined
+      }
       this.continuationRegistry?.bindPopup(parent.id, child.id)
       child.continuationBound = this.continuationRegistry !== undefined
       if (!child.continuationBound) throw failure('PAGE_CLOSED')
+      await this.activate(child)
     } catch (error) {
       await this.closeTab(child)
       throw error
     }
-    await this.activate(child)
   }
 
-  private handleUserTakeover(state: TargetTabState): void {
+  private handleUserTakeover(state: TargetTabState, force = false): void {
     const runId = state.ownerContinuationRunId
-    if (!runId || state.activeOperations > 0) return
+    if (!runId || (!force && state.activeOperations > 0)) return
     state.ownerContinuationRunId = undefined
     this.continuationRegistry?.markTakenOver(state.id, runId)
   }
@@ -829,9 +829,18 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     }
     if (!active || active.closed) return
     const history = active.view.webContents.navigationHistory
-    if (command === 'back' && history.canGoBack()) history.goBack()
-    if (command === 'forward' && history.canGoForward()) history.goForward()
-    if (command === 'reload') active.view.webContents.reload()
+    if (command === 'back' && history.canGoBack()) {
+      this.handleUserTakeover(active, true)
+      history.goBack()
+    }
+    if (command === 'forward' && history.canGoForward()) {
+      this.handleUserTakeover(active, true)
+      history.goForward()
+    }
+    if (command === 'reload') {
+      this.handleUserTakeover(active, true)
+      active.view.webContents.reload()
+    }
   }
 
   private guardNavigation(state: TargetTabState, event: NavigationEvent, url: string): void {

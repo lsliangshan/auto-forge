@@ -209,4 +209,25 @@ describe('BrowserContinuationRegistry', () => {
     expect(test.registry.list(second.userId, second.conversationId)).toEqual([])
     expect(test.closed).toContain(second.tabId)
   })
+
+  it('releases ownership and closes the tab when audit termination fails, then surfaces that first error', async () => {
+    const test = createHarness()
+    const binding = test.registry.bind(bindingInput())
+    await test.registry.acquire(binding.bindingId, {
+      userId: binding.userId, conversationId: binding.conversationId, runId: 'run_2',
+    })
+    const auditError = new Error('audit termination failed')
+    test.repository.terminate.mockImplementationOnce(() => { throw auditError })
+    const closeContinuation = test.workspace.closeContinuation
+    test.workspace.closeContinuation = async (tabId) => {
+      await closeContinuation(tabId)
+      throw new Error('close failed later')
+    }
+
+    await expect(test.registry.revokeBinding(binding.bindingId, 'CANCELLED')).rejects.toBe(auditError)
+
+    expect(test.registry.list(binding.userId, binding.conversationId)).toEqual([])
+    expect(test.owners.has(binding.tabId)).toBe(false)
+    expect(test.closed).toContain(binding.tabId)
+  })
 })
