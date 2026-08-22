@@ -42,7 +42,7 @@ const browserAuditOriginSchema = z.string().superRefine((value, context) => {
   }
 })
 export const browserAuditTextSchema = nonEmptyStringSchema.max(500).refine(
-  (value) => !/(?:\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b|\b(?:file|folder|directory)path\s*[:=]|(?:^|[\s="'(:])\/(?:[^\s/]+\/)*[^\s/]+|\b[A-Za-z]:[\\/]|(?:^|[\s="'(])\\\\[^\\/\s]+[\\/][^\\/\s]+)/i.test(value),
+  (value) => !/(?:\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b|\bfile\s*:|\b(?:file|folder|directory)path\s*[:=]|(?:^|[\s="'(:])\/(?:[^\s/]+\/)*[^\s/]+|\b[A-Za-z]:[\\/]|(?:^|[\s="'(])\\\\[^\\/\s]+[\\/][^\\/\s]+)/i.test(value),
   { message: 'Browser audit text cannot include sensitive keys' },
 )
 

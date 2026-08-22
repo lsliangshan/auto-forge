@@ -541,6 +541,8 @@ describe('cross-process contracts', () => {
       'C:\\Users\\Alice\\secret.txt',
       '\\\\fileserver\\private\\secret.txt',
       'filePath=/tmp/a',
+      'file:///Users/alice/secret.txt',
+      'FILE:///Users/alice/secret.txt',
     ]) {
       expect(browserActionAuditEntrySchema.safeParse({
         id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',

@@ -317,6 +317,8 @@ describe('openAppDatabase', () => {
       'C:\\Users\\Alice\\secret.txt',
       '\\\\fileserver\\private\\secret.txt',
       'filePath=/tmp/a',
+      'file:///Users/alice/secret.txt',
+      'FILE:///Users/alice/secret.txt',
     ].entries()) {
       expect(() => database.browserActionAudits.insert({
         id: `audit_path_${index}`, bindingId: binding.id, chatRunId: run.id, sequence: index + 10,
