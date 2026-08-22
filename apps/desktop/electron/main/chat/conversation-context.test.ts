@@ -31,8 +31,8 @@ describe('conversation context primitives', () => {
       id: 'm1', conversationId: 'c1', role: 'assistant', ordinal: 1, createdAt: 1,
       blocks: [
         { type: 'text', text: '结果如下' },
-        { type: 'workflow_proposal', workflowId: 'browser.search.baidu', workflowName: '百度搜索', args: { keyword: '天气' } },
-        { type: 'execution_result', executionId: 'e1', summary: 'Workflow completed.' },
+        { type: 'workflow_proposal', workflowId: 'browser.search.baidu', workflowName: '百度搜索', args: { path: '/Users/private/query.json' } },
+        { type: 'execution_result', executionId: 'e1', summary: 'Raw result at /Users/private/result.json' },
         { type: 'media', blockId: 'b1', assetId: 'asset-private-id', kind: 'image', purpose: 'output', name: 'weather.png', mimeType: 'image/png', byteSize: 2048, width: 4321, height: 5432, durationMs: 6543 },
       ],
     }
@@ -50,6 +50,36 @@ describe('conversation context primitives', () => {
     expect(body).not.toContain('5432')
     expect(body).not.toContain('6543')
     expect(body).not.toMatch(/base64|\/Users\/|file:\/\/|https?:\/\//i)
+  })
+
+  it('serializes workflow status and provenance without build, input, result, path, or scope data', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'workflow_message', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,
+      blocks: [
+        {
+          type: 'workflow_status', blockId: 'status_1', executionId: 'execution_1',
+          workflowId: 'workflow.secret', workflowName: '安全查询', workflowVersion: '1.2.3',
+          source: 'development', buildHash: 'a'.repeat(64), city: '北京', status: 'completed',
+          executionIndex: 1, executionLimit: 5,
+        },
+        {
+          type: 'workflow_provenance', blockId: 'provenance_1', entries: [{
+            executionId: 'execution_1', workflowId: 'workflow.secret', workflowName: '安全查询',
+            workflowVersion: '1.2.3', source: 'development', buildHash: 'a'.repeat(64),
+            city: '北京', status: 'completed',
+          }],
+        },
+      ],
+    })
+
+    expect(serialized).toEqual({
+      role: 'assistant',
+      content: [
+        '[工作流: 安全查询; 城市: 北京; 状态: completed]',
+        '[已使用工作流: 安全查询; 城市: 北京; 状态: completed]',
+      ].join('\n'),
+    })
+    expect(JSON.stringify(serialized)).not.toMatch(/a{64}|execution_1|workflow\.secret|1\.2\.3|input|result|path|scope/i)
   })
 
   it('omits transient-only history and rejects unknown roles', () => {
@@ -417,6 +447,27 @@ describe('conversation context manager', () => {
       contextLength: 100,
       currentMessage: { role: 'user', content: '当前输入'.repeat(100) },
     }))).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
+    expect(provider.stream).not.toHaveBeenCalled()
+    expect(store.advance).not.toHaveBeenCalled()
+  })
+
+  it('reserves the Main policy prefix before admitting the current message', async () => {
+    const currentMessage = { role: 'user' as const, content: 'current'.repeat(100) }
+    const leadingMessage = { role: 'system' as const, content: 'policy'.repeat(200) }
+    const withoutPolicy = estimateRequestTokens({ messages: [currentMessage], tools: [], currentMedia: [] })
+    const withPolicy = estimateRequestTokens({
+      messages: [leadingMessage, currentMessage], tools: [], currentMedia: [],
+    })
+    const contextLength = Array.from({ length: 20_000 }, (_, index) => index + 1)
+      .find((value) => {
+        const budget = Math.floor(value * 0.60)
+        return withoutPolicy <= budget && budget < withPolicy
+      })!
+    const { manager, provider, store } = contextHarness()
+    const input = prepareInput({ provider, contextLength, currentMessage })
+    Object.assign(input, { leadingMessages: [leadingMessage] })
+
+    await expect(manager.prepare(input)).rejects.toMatchObject({ code: 'CONTEXT_LIMIT_EXCEEDED' })
     expect(provider.stream).not.toHaveBeenCalled()
     expect(store.advance).not.toHaveBeenCalled()
   })

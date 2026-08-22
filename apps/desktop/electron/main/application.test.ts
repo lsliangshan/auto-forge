@@ -2670,6 +2670,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send(chatInput(conversation.id, '第二轮追问'))
     await vi.waitFor(() => expect(captured).toHaveLength(2))
     expect(captured[1]?.messages).toEqual([
+      expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
       { role: 'user', content: '第一轮问题' },
       { role: 'assistant', content: '第一轮回答' },
       { role: 'user', content: '第二轮追问' },
@@ -2678,7 +2679,10 @@ describe('createApplicationRuntime', () => {
     const isolated = await runtime.services.chat.createConversation()
     await runtime.services.chat.send(chatInput(isolated.id, '独立问题'))
     await vi.waitFor(() => expect(captured).toHaveLength(3))
-    expect(captured[2]?.messages).toEqual([{ role: 'user', content: '独立问题' }])
+    expect(captured[2]?.messages).toEqual([
+      expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
+      { role: 'user', content: '独立问题' },
+    ])
     await runtime.close()
   })
 
@@ -3123,18 +3127,21 @@ describe('createApplicationRuntime', () => {
     })
     await vi.waitFor(() => expect(stream).toHaveBeenCalledWith(expect.objectContaining({
       model: 'openrouter/text',
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: 'describe this image' },
-          {
-            type: 'media',
-            kind: 'image',
-            mimeType: 'image/png',
-            dataBase64: png.toString('base64'),
-          },
-        ],
-      }],
+      messages: [
+        expect.objectContaining({ role: 'system', content: expect.stringContaining('AutoForge Main') }),
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe this image' },
+            {
+              type: 'media',
+              kind: 'image',
+              mimeType: 'image/png',
+              dataBase64: png.toString('base64'),
+            },
+          ],
+        },
+      ],
     })))
     expect(JSON.stringify(await runtime.services.chat.listMessages(textConversation.id)))
       .not.toContain(png.toString('base64'))

@@ -220,7 +220,9 @@ describe('agent workflow integration', () => {
       model: 'local-test-model', requestId: 'request_1', providerSnapshot: app.providerSnapshot,
     })
     expect(app.database.messages.listForConversation('conversation_1').find((message) => message.role === 'assistant')?.blocks).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'workflow_proposal' }),
+      expect.objectContaining({
+        type: 'workflow_status', workflowId: app.workflow.id, status: 'awaiting_approval',
+      }),
     ]))
     expect(pending.error).toBeUndefined()
     expect(pending).toMatchObject({ status: 'awaiting_approval' })

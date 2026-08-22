@@ -389,7 +389,13 @@ export class WorkflowToolExecutor {
 
   async start(
     pending: PendingWorkflowTool,
-    input: { userId: string; chatRunId?: string; signal?: AbortSignal; budget: WorkflowToolRunBudget },
+    input: {
+      userId: string
+      chatRunId?: string
+      signal?: AbortSignal
+      budget: WorkflowToolRunBudget
+      beforeStart?: () => ToolError | { kind: 'started'; executionIndex: number }
+    },
   ): Promise<ToolStart> {
     const lifecycle = this.lifecycle.get(pending)
     if (!lifecycle || lifecycle.phase !== 'ready') return toolError('CONFLICT')
@@ -472,6 +478,17 @@ export class WorkflowToolExecutor {
       return toolError('WORKFLOW_CHANGED')
     }
 
+    if (input.beforeStart) {
+      let boundary: ReturnType<NonNullable<typeof input.beforeStart>>
+      try { boundary = input.beforeStart() } catch {
+        this.cleanupPending(pending)
+        return toolError('INTERNAL_ERROR')
+      }
+      if (boundary.kind === 'tool_error') {
+        this.cleanupPending(pending)
+        return boundary
+      }
+    }
     lifecycle.phase = 'starting'
     let startPromise: ReturnType<WorkflowToolExecutionPort['startReserved']>
     try {

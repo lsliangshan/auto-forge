@@ -48,6 +48,7 @@ export interface PrepareConversationContextInput {
   callIdentity: { requestId: string; chatRunId: string; userId: string }
   model: string
   contextLength?: number
+  leadingMessages?: ModelMessage[]
   currentMessage: { role: 'user'; content: string | ModelContentPart[] }
   tools: ModelTool[]
   currentMedia: CurrentMediaMetadata[]
@@ -90,13 +91,19 @@ function serializeBlock(block: ChatBlock): string[] {
     case 'media':
       return [`[历史附件: ${block.kind}; 名称: ${block.name}; MIME: ${block.mimeType}; 大小: ${block.byteSize} bytes]`]
     case 'workflow_proposal':
-      return [`[工作流提议: ${block.workflowName} (${block.workflowId}); 参数: ${safeJson(block.args)}]`]
+      return [`[工作流提议: ${block.workflowName} (${block.workflowId})]`]
     case 'approval':
       return [`[工作流等待权限审批: ${block.workflowId}@${block.workflowVersion}; 能力: ${block.capability}]`]
+    case 'workflow_status':
+      return [`[工作流: ${block.workflowName}; 城市: ${block.city ?? '不限城市'}; 状态: ${block.status}]`]
+    case 'workflow_provenance':
+      return block.entries.map((entry) => (
+        `[已使用工作流: ${entry.workflowName}; 城市: ${entry.city ?? '不限城市'}; 状态: ${entry.status}]`
+      ))
     case 'workflow_execution':
       return [`[工作流执行: ${block.executionId}]`]
     case 'execution_result':
-      return [`[工作流结果: ${block.executionId}; ${block.summary}]`]
+      return [`[工作流结果: ${block.executionId}; 已完成]`]
     case 'error':
       return [`[请求失败: ${block.code}; ${block.message}]`]
     case 'media_generation':
@@ -186,7 +193,7 @@ function requestTokens(
   input: PrepareConversationContextInput,
 ): number {
   return estimateRequestTokens({
-    messages: [...history, input.currentMessage],
+    messages: [...(input.leadingMessages ?? []), ...history, input.currentMessage],
     tools: input.tools,
     currentMedia: input.currentMedia,
   })

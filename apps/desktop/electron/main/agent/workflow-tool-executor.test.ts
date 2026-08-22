@@ -458,6 +458,27 @@ describe('WorkflowToolExecutor', () => {
     expect(test.policy.releaseExecution).toHaveBeenCalledTimes(1)
   })
 
+  it('invokes the loop start hook immediately before transferring execution ownership', async () => {
+    const test = harness()
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+    test.order.length = 0
+
+    await expect(test.executor.start(prepared.pending, {
+      userId: 'user_1',
+      beforeStart: () => {
+        test.order.push('loop-start')
+        return { kind: 'started', executionIndex: 1 }
+      },
+    })).resolves.toMatchObject({ kind: 'started' })
+
+    expect(test.order.slice(-2)).toEqual(['loop-start', 'start'])
+  })
+
   it('rejects live approval metadata drift with an unchanged code hash before start', async () => {
     const test = harness()
     const prepared = await test.executor.prepare({

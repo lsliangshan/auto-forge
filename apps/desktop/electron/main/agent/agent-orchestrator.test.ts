@@ -16,6 +16,7 @@ import {
   type ProviderUsageRepository,
 } from '../database/repositories.js'
 import { createWorkflowSourceSelectorVault } from '../workflows/workflow-source-selector.js'
+import { APPROVAL_EXPIRY_MS, MAX_AGENT_ACTIVE_MS } from './workflow-tool-loop.js'
 
 const workflow: WorkflowDetail = {
   id: 'browser.search.baidu', version: '1.0.0', name: '百度搜索', description: '使用百度搜索',
@@ -670,6 +671,9 @@ describe('AgentOrchestrator', () => {
       callIdentity: { requestId: 'id_1', chatRunId: 'id_3', userId: 'user_1' },
       model: 'model',
       contextLength: 4_096,
+      leadingMessages: [expect.objectContaining({
+        role: 'system', content: expect.stringContaining('AutoForge Main'),
+      })],
       currentMessage: { role: 'user', content: '我的代号是什么？' },
       tools: [{
         type: 'function',
@@ -688,6 +692,7 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(
       expect.objectContaining({
         messages: [
+          expect.objectContaining({ role: 'system', content: expect.stringContaining('AutoForge Main') }),
           { role: 'user', content: '我的代号是青山' },
           { role: 'assistant', content: '已记住' },
           { role: 'user', content: '我的代号是什么？' },
@@ -745,6 +750,7 @@ describe('AgentOrchestrator', () => {
 
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({
       messages: [
+        expect.objectContaining({ role: 'system', content: expect.stringContaining('AutoForge Main') }),
         { role: 'system', content: '内部摘要：用户曾说过青山' },
         { role: 'user', content: '继续' },
       ],
@@ -827,7 +833,10 @@ describe('AgentOrchestrator', () => {
     ])
     expect(JSON.stringify(dependencies.records.users)).not.toContain('AQID')
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({
-      messages: [{ role: 'user', content: modelContent }],
+      messages: [
+        expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
+        { role: 'user', content: modelContent },
+      ],
     }))
   })
 
@@ -966,7 +975,10 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.users).toHaveLength(1)
     expect(dependencies.records.starts).toHaveLength(0)
     expect(dependencies.records.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'block', block: expect.objectContaining({ type: 'workflow_proposal', workflowId: workflow.id }) }),
+      expect.objectContaining({
+        type: 'block',
+        block: expect.objectContaining({ type: 'workflow_status', workflowId: workflow.id, status: 'awaiting_approval' }),
+      }),
       expect.objectContaining({
         type: 'block',
         block: expect.objectContaining({ type: 'approval', workflowId: workflow.id, workflowVersion: workflow.version }),
@@ -1246,6 +1258,7 @@ describe('AgentOrchestrator', () => {
 
     expect(done.status).toBe('completed')
     expect(providerInputs[1]?.messages).toEqual([
+      expect.objectContaining({ role: 'system', content: expect.stringContaining('AutoForge Main') }),
       { role: 'user', content: modelContent },
       expect.objectContaining({ role: 'assistant' }),
       expect.objectContaining({ role: 'tool', tool_call_id: 'call_1' }),
@@ -1680,6 +1693,353 @@ describe('AgentOrchestrator', () => {
 
     finishExecution({ id: pending.executionId!, status: 'completed', result: { ok: true } })
     await expect(first).resolves.toMatchObject({ status: 'completed' })
+    expect(dependencies.records.terminal).toHaveLength(1)
+  })
+
+  it('buffers tool-call preamble, preserves the original call id, and appends authoritative status and provenance', async () => {
+    let finishExecution!: (value: { id: string; status: string; result: unknown }) => void
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const dependencies = harness([])
+    const providerRequests: ModelStreamRequest[] = []
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      providerRequests.push(request)
+      return events(providerRequests.length === 1 ? [
+        { type: 'text_delta', choiceIndex: 0, text: '我来帮你查询' },
+        ...toolTurn,
+      ] : [
+        { type: 'text_delta', choiceIndex: 0, text: '查询完成' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ])
+    })
+    dependencies.executions.startReserved = async (reserved, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reserved.executionId })
+      markStarted()
+      return {
+        id: reserved.executionId,
+        finished: new Promise((resolve) => { finishExecution = resolve }),
+      }
+    }
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'buffered', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))
+    await started
+
+    expect(dependencies.records.events).not.toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'text', text: '我来帮你查询' }),
+    }))
+    finishExecution({ id: 'reserved_1', status: 'completed', result: { title: '晴' } })
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+
+    expect(providerRequests[1]!.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'assistant',
+        tool_calls: [expect.objectContaining({ id: 'call_1' })],
+      }),
+      expect.objectContaining({
+        role: 'tool', tool_call_id: 'call_1', content: expect.stringContaining('UNTRUSTED_WORKFLOW_DATA'),
+      }),
+    ]))
+    const finalBlocks = (dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks
+    expect(finalBlocks).not.toContainEqual(expect.objectContaining({ type: 'text', text: '我来帮你查询' }))
+    expect(finalBlocks).toContainEqual(expect.objectContaining({ type: 'workflow_status', status: 'completed' }))
+    expect(finalBlocks.at(-1)).toMatchObject({
+      type: 'workflow_provenance',
+      entries: [expect.objectContaining({
+        executionId: 'reserved_1', workflowName: '百度搜索', status: 'completed',
+      })],
+    })
+  })
+
+  it('repairs one multi-call response without executing and rejects a repeated parallel call', async () => {
+    const parallel = [
+      toolTurn[0]!,
+      { ...toolTurn[0]!, id: 'call_2', index: 1 } as ProviderStreamEvent,
+      toolTurn[1]!,
+    ]
+    const dependencies = harness([parallel, parallel])
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'parallel', content: '搜索两个内容', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'INVALID_TOOL_SEQUENCE' } })
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    expect(dependencies.records.reservations).toHaveLength(0)
+    expect(dependencies.records.starts).toHaveLength(0)
+    const repairedRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(repairedRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'system', content: expect.stringContaining('一次只能调用一个工作流'),
+    }))
+  })
+
+  it('permits one changed-input read-only retry after failure and rejects a successful duplicate', async () => {
+    const changedTurn: ProviderStreamEvent[] = [
+      { ...toolTurn[0]!, id: 'call_changed', arguments: { input: { keyword: '明日天气' } } } as ProviderStreamEvent,
+      toolTurn[1]!,
+    ]
+    const retry = harness([toolTurn, changedTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '重试成功' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    let retryStart = 0
+    retry.executions.startReserved = async (reservation, input) => {
+      retry.records.starts.push({ ...input, executionId: reservation.executionId })
+      retryStart += 1
+      return {
+        id: reservation.executionId,
+        finished: Promise.resolve(retryStart === 1
+          ? { id: reservation.executionId, status: 'failed', errorCode: 'INTERNAL_ERROR' }
+          : { id: reservation.executionId, status: 'completed', result: { ok: true } }),
+      }
+    }
+    await expect(new AgentOrchestrator(retry).run(textRunInput({
+      conversationId: 'retry', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+    expect(retry.records.starts).toHaveLength(2)
+
+    const duplicate = harness([toolTurn, changedTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '不再重复' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    await expect(new AgentOrchestrator(duplicate).run(textRunInput({
+      conversationId: 'duplicate', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+    expect(duplicate.records.starts).toHaveLength(1)
+    const duplicateRequest = vi.mocked(duplicate.providerInstances.openrouter.stream).mock.calls[2]![0]
+    expect(duplicateRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'tool', tool_call_id: 'call_changed', content: expect.stringContaining('INVALID_TOOL_SEQUENCE'),
+    }))
+  })
+
+  it('removes tools after the fifth sequential start and fails safely before an eleventh decision', async () => {
+    const workflows = Array.from({ length: 5 }, (_, index): WorkflowDetail => ({
+      ...workflow,
+      id: `workflow.${index + 1}`,
+      name: `工作流 ${index + 1}`,
+      codeSha256: String(index + 1).padStart(64, '0'),
+      runtimeIdentity: { id: `workflow.${index + 1}`, version: workflow.version, source: 'installed' },
+      activationExamples: [`执行任务 ${index + 1}`],
+    }))
+    const fiveTurns = workflows.map((_candidate, index): ProviderStreamEvent[] => [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: `call_${index + 1}`,
+        name: `workflow_${index + 1}`, arguments: { input: { keyword: `value_${index + 1}` } },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ])
+    const limit = harness([...fiveTurns, [
+      { type: 'text_delta', choiceIndex: 0, text: '五个结果已汇总' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    limit.workflows.list = async () => workflows
+    const requests: ModelStreamRequest[] = []
+    const turnQueue = [...fiveTurns, [
+      { type: 'text_delta' as const, choiceIndex: 0, text: '五个结果已汇总' },
+      { type: 'finish' as const, choiceIndex: 0, reason: 'stop' },
+    ]]
+    limit.providerInstances.openrouter.stream = vi.fn((request) => {
+      requests.push(request)
+      return events(turnQueue.shift() ?? [])
+    })
+
+    const limited = await new AgentOrchestrator(limit).run(textRunInput({
+      conversationId: 'five', content: '执行五个任务', provider: 'openrouter', model: 'model',
+    }))
+    expect(limit.records.starts).toHaveLength(5)
+    expect(limited).toMatchObject({ status: 'completed' })
+    expect(requests[4]).toHaveProperty('tools')
+    expect(requests[5]).not.toHaveProperty('tools')
+
+    const invalidTurn: ProviderStreamEvent[] = [
+      { ...toolTurn[0]!, arguments: { input: {} } } as ProviderStreamEvent,
+      toolTurn[1]!,
+    ]
+    const decisions = harness(Array.from({ length: 10 }, () => invalidTurn))
+    const exhausted = await new AgentOrchestrator(decisions).run(textRunInput({
+      conversationId: 'ten', content: '反复错误调用', provider: 'openrouter', model: 'model',
+    }))
+    expect(exhausted).toMatchObject({ status: 'failed', error: { code: 'TOOL_CALL_LIMIT' } })
+    expect(decisions.providerInstances.openrouter.stream).toHaveBeenCalledTimes(10)
+    expect(decisions.records.starts).toHaveLength(0)
+  })
+
+  it('enforces the Main policy before history and honors explicit workflow opt-out', async () => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '直接回答' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = vi.fn(async () => { throw new Error('opt-out must skip discovery') })
+    dependencies.history.prepare = vi.fn<ConversationHistoryPort['prepare']>(async () => [
+      { role: 'system', content: '旧摘要提到上海，但与当前问题无关' },
+    ])
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'opt_out', content: '不要调用工作流，只回答概念', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.workflows.list).not.toHaveBeenCalled()
+    expect(dependencies.records.starts).toHaveLength(0)
+    const request = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]![0]
+    expect(request).not.toHaveProperty('tools')
+    expect(request.messages[0]).toEqual(expect.objectContaining({
+      role: 'system', content: expect.stringMatching(/不要调用|明确命名|歧义|当前消息.*城市|不可信|不得声称/),
+    }))
+    expect(request.messages[1]).toEqual({ role: 'system', content: '旧摘要提到上海，但与当前问题无关' })
+  })
+
+  it('rejects an external-action retry before requesting a second approval', async () => {
+    const changedTurn: ProviderStreamEvent[] = [
+      { ...toolTurn[0]!, id: 'call_external_retry', arguments: { input: { keyword: 'changed' } } } as ProviderStreamEvent,
+      toolTurn[1]!,
+    ]
+    const dependencies = harness([toolTurn, changedTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '操作失败且未重试' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    requireChatApproval(dependencies)
+    dependencies.executions.startReserved = async (reservation, input) => {
+      dependencies.records.starts.push({ ...input, executionId: reservation.executionId })
+      return {
+        id: reservation.executionId,
+        finished: Promise.resolve({ id: reservation.executionId, status: 'failed', errorCode: 'INTERNAL_ERROR' }),
+      }
+    }
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run(textRunInput({
+      conversationId: 'external_retry', content: '填写搜索框', provider: 'openrouter', model: 'model',
+    }))
+
+    const result = await orchestrator.resumeApproval({
+      executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once',
+    })
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.records.starts).toHaveLength(1)
+    const approvalBlocks = dependencies.records.events.filter((event) => (
+      typeof event === 'object' && event !== null && 'block' in event
+      && (event as { block?: { type?: string } }).block?.type === 'approval'
+    ))
+    expect(approvalBlocks).toHaveLength(1)
+  })
+
+  it('expires an approval at thirty minutes and pauses active time for a timely approval', async () => {
+    let milliseconds = 0
+    const expired = harness([toolTurn])
+    requireChatApproval(expired)
+    expired.now = () => milliseconds
+    const expiredOrchestrator = new AgentOrchestrator(expired)
+    const pending = await expiredOrchestrator.run(textRunInput({
+      conversationId: 'expired_approval', content: '填写搜索框', provider: 'openrouter', model: 'model',
+    }))
+    milliseconds += APPROVAL_EXPIRY_MS
+
+    await expect(expiredOrchestrator.resumeApproval({
+      executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once',
+    })).resolves.toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } })
+    expect(expired.records.starts).toHaveLength(0)
+    expect(expired.records.terminal).toHaveLength(1)
+
+    milliseconds = 0
+    const timely = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
+    requireChatApproval(timely)
+    timely.now = () => milliseconds
+    const timelyOrchestrator = new AgentOrchestrator(timely)
+    const timelyPending = await timelyOrchestrator.run(textRunInput({
+      conversationId: 'timely_approval', content: '填写搜索框', provider: 'openrouter', model: 'model',
+    }))
+    milliseconds += MAX_AGENT_ACTIVE_MS + 1
+
+    await expect(timelyOrchestrator.resumeApproval({
+      executionId: timelyPending.executionId!, ...externalApprovalIdentity, decision: 'once',
+    })).resolves.toMatchObject({ status: 'completed' })
+    expect(timely.records.starts).toHaveLength(1)
+  })
+
+  it('automatically cancels an expired approval and releases the conversation lock', async () => {
+    let milliseconds = 0
+    let expireApproval!: () => void
+    const dependencies = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
+    requireChatApproval(dependencies)
+    dependencies.now = () => milliseconds
+    Object.assign(dependencies, {
+      setTimer(callback: () => void, delayMs: number) {
+        expect(delayMs).toBe(APPROVAL_EXPIRY_MS)
+        expireApproval = callback
+        return 'approval_timer'
+      },
+      clearTimer: vi.fn(),
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    await expect(orchestrator.run(textRunInput({
+      conversationId: 'automatic_expiry', content: '填写搜索框', provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'awaiting_approval' })
+
+    milliseconds = 60_000
+    await expect(orchestrator.resumeApproval({
+      executionId: 'reserved_1', permissionIndex: 0,
+      scopeHash: 'f'.repeat(64), decision: 'once',
+    })).resolves.toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
+
+    milliseconds = APPROVAL_EXPIRY_MS
+    expireApproval()
+    await vi.waitFor(() => expect(dependencies.records.terminal).toEqual([
+      expect.objectContaining({ status: 'cancelled', errorCode: 'CANCELLED' }),
+    ]))
+    expect(dependencies.records.starts).toHaveLength(0)
+
+    await expect(orchestrator.run(textRunInput({
+      conversationId: 'automatic_expiry', content: '重试', provider: 'openrouter', model: 'model',
+    }))).resolves.not.toMatchObject({ error: { code: 'CONFLICT' } })
+  })
+
+  it('checks active time before a workflow start without consuming a start', async () => {
+    let milliseconds = 0
+    const dependencies = harness([])
+    dependencies.now = () => milliseconds
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
+      yield toolTurn[0]!
+      yield toolTurn[1]!
+      milliseconds += MAX_AGENT_ACTIVE_MS
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'active_timeout', content: '搜索天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'MODEL_PROVIDER_TIMEOUT' } })
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.discards).toHaveLength(1)
+  })
+
+  it('suppresses provider text delivered after whole-run cancellation and finalizes once', async () => {
+    const dependencies = harness([])
+    let providerStarted!: () => void
+    let releaseProvider!: () => void
+    const started = new Promise<void>((resolve) => { providerStarted = resolve })
+    const released = new Promise<void>((resolve) => { releaseProvider = resolve })
+    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
+      providerStarted()
+      await released
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: '取消后的文本' }
+      yield { type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'late_call', name: 'workflow_1', arguments: { input: { keyword: 'late' } } }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'late_cancel', content: '搜索', provider: 'openrouter', model: 'model', requestId: 'late_request',
+    }))
+    await started
+
+    await orchestrator.cancel('late_request')
+    releaseProvider()
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(JSON.stringify(dependencies.records.events)).not.toContain('取消后的文本')
     expect(dependencies.records.terminal).toHaveLength(1)
   })
 })
