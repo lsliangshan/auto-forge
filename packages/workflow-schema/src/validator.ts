@@ -1,6 +1,6 @@
 import Ajv from 'ajv'
 import addFormats from 'ajv-formats'
-import { isHttpsUrlPattern, type ValidationResult } from '@autoforge/shared'
+import { isBrowserLocator, isHttpsUrlPattern, type ValidationResult } from '@autoforge/shared'
 import manifestSchema from '../manifest.schema.json' with { type: 'json' }
 import type { WorkflowManifest } from './manifest.js'
 
@@ -9,6 +9,10 @@ addFormats(ajv)
 ajv.addFormat('https-url-pattern', {
   type: 'string',
   validate: (value: string) => isHttpsUrlPattern(value),
+})
+ajv.addFormat('browser-locator', {
+  type: 'string',
+  validate: (value: string) => isBrowserLocator(value),
 })
 const validate = ajv.compile<WorkflowManifest>(manifestSchema)
 

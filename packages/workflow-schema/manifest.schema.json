@@ -57,7 +57,8 @@
     },
     "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
     "inputSchema": {},
-    "outputSchema": {}
+    "outputSchema": {},
+    "browserContinuation": { "$ref": "#/definitions/browserContinuation" }
   },
   "definitions": {
     "permission": {
@@ -147,6 +148,58 @@
       "type": "object",
       "additionalProperties": false,
       "maxProperties": 0
+    },
+    "browserContinuation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auth": { "$ref": "#/definitions/browserContinuationAuth" },
+        "readableRegions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "browser-locator" }
+        },
+        "manualActions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/browserManualAction" }
+        }
+      }
+    },
+    "browserContinuationAuth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "loginUrls": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "https-url-pattern" }
+        },
+        "loggedIn": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "browser-locator" }
+        },
+        "loggedOut": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "browser-locator" }
+        }
+      }
+    },
+    "browserManualAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locator", "reason"],
+      "properties": {
+        "locator": { "type": "string", "format": "browser-locator" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+      }
     }
   }
 }

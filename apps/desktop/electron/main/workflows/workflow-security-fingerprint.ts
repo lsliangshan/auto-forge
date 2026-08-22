@@ -1,4 +1,10 @@
+import { createHash } from 'node:crypto'
 import type { WorkflowDetail } from '@autoforge/shared'
+
+export type BrowserPermissionMatrix = Readonly<Partial<Record<
+  'browser.open' | 'browser.fill' | 'browser.click' | 'browser.url' | 'browser.close',
+  readonly string[]
+>>>
 
 export function canonicalJson(value: unknown, seen = new WeakSet<object>()): string {
   if (value === null) return 'null'
@@ -24,7 +30,7 @@ export function canonicalJson(value: unknown, seen = new WeakSet<object>()): str
 }
 
 export function workflowSecurityFingerprint(workflow: WorkflowDetail): string {
-  return canonicalJson({
+  return createHash('sha256').update(canonicalJson({
     id: workflow.id,
     version: workflow.version,
     name: workflow.name,
@@ -38,10 +44,23 @@ export function workflowSecurityFingerprint(workflow: WorkflowDetail): string {
     runtimeIdentity: workflow.runtimeIdentity,
     cities: workflow.cities,
     permissions: workflow.permissions,
+    browserContinuation: workflow.browserContinuation,
     activationExamples: workflow.activationExamples,
     activationNegativeExamples: workflow.activationNegativeExamples,
     timeoutMs: workflow.timeoutMs,
     inputSchema: workflow.inputSchema,
     outputSchema: workflow.outputSchema,
-  })
+  })).digest('hex')
+}
+
+export function browserPermissionMatrix(workflow: Pick<WorkflowDetail, 'permissions'>): BrowserPermissionMatrix {
+  const matrix: Record<string, string[]> = {}
+  for (const permission of workflow.permissions) {
+    if (!permission.capability.startsWith('browser.') || !('origins' in permission.scope)) continue
+    matrix[permission.capability] = [...new Set([
+      ...(matrix[permission.capability] ?? []),
+      ...permission.scope.origins,
+    ])].sort()
+  }
+  return Object.freeze(matrix) as BrowserPermissionMatrix
 }

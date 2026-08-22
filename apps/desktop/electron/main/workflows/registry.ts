@@ -48,6 +48,7 @@ function toDetail(workflow: InstalledWorkflow): WorkflowDetail | undefined {
     timeoutMs: manifest.timeoutMs,
     inputSchema: manifest.inputSchema,
     outputSchema: manifest.outputSchema,
+    ...(manifest.browserContinuation === undefined ? {} : { browserContinuation: manifest.browserContinuation }),
   }
 }
 
@@ -109,6 +110,7 @@ export class WorkflowRegistry {
         timeoutMs: manifest.timeoutMs,
         inputSchema: manifest.inputSchema,
         outputSchema: manifest.outputSchema,
+        ...(manifest.browserContinuation === undefined ? {} : { browserContinuation: manifest.browserContinuation }),
       }
     } catch {
       return undefined

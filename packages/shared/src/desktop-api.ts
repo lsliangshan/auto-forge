@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { isBrowserLocator } from './browser-locator.js'
+import { isHttpsUrlPattern } from './https-url-pattern.js'
 import { proxySettingsSchema } from './proxy-settings.js'
 import {
   chatBlockSchema,
@@ -20,6 +22,14 @@ import {
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
+export const httpsUrlPatternSchema = z.string().refine(isHttpsUrlPattern, { message: 'Expected an HTTPS URL pattern' })
+export const browserLocatorSchema = z.string().refine(isBrowserLocator, { message: 'Expected a browser locator' })
+
+function nonEmptyUniqueArraySchema<T extends z.ZodType>(schema: T) {
+  return z.array(schema).min(1).refine((values) => new Set(values.map((value) => JSON.stringify(value))).size === values.length, {
+    message: 'Values must be unique',
+  })
+}
 
 const modalitySchema = z.enum(['text', 'image', 'audio', 'video'])
 
@@ -394,6 +404,19 @@ export type WorkflowRuntimeIdentity = z.infer<typeof workflowRuntimeIdentitySche
 
 const citySchema = nonEmptyStringSchema
 
+export const browserContinuationManifestSchema = z.object({
+  auth: z.object({
+    loginUrls: nonEmptyUniqueArraySchema(httpsUrlPatternSchema).optional(),
+    loggedIn: nonEmptyUniqueArraySchema(browserLocatorSchema).optional(),
+    loggedOut: nonEmptyUniqueArraySchema(browserLocatorSchema).optional(),
+  }).strict().optional(),
+  readableRegions: nonEmptyUniqueArraySchema(browserLocatorSchema).optional(),
+  manualActions: nonEmptyUniqueArraySchema(z.object({
+    locator: browserLocatorSchema,
+    reason: nonEmptyStringSchema.max(500),
+  }).strict()).optional(),
+}).strict()
+
 export const workflowDetailSchema = workflowSummarySchema.extend({
   codeSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   cities: z.array(citySchema).default([]),
@@ -404,6 +427,7 @@ export const workflowDetailSchema = workflowSummarySchema.extend({
   timeoutMs: z.number().int().min(1_000).max(300_000),
   inputSchema: z.unknown(),
   outputSchema: z.unknown(),
+  browserContinuation: browserContinuationManifestSchema.optional(),
 }).superRefine(({ cities, id, version, source, runtimeIdentity }, context) => {
   if (new Set(cities).size !== cities.length) {
     context.addIssue({ code: 'custom', path: ['cities'], message: 'Workflow cities must be unique' })

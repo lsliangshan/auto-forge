@@ -24,6 +24,31 @@ function validManifest() {
 }
 
 describe('validateManifest', () => {
+  it('accepts omitted and bounded browser continuation metadata', () => {
+    expect(validateManifest(validManifest()).valid).toBe(true)
+    expect(validateManifest({
+      ...validManifest(),
+      browserContinuation: {
+        auth: {
+          loginUrls: ['https://sso.example.gov.cn/login/*'],
+          loggedIn: ['role=button[name="退出"]'],
+          loggedOut: ['css=form#login'],
+        },
+        readableRegions: ['role=main'],
+        manualActions: [{ locator: 'role=button[name="正式提交"]', reason: '正式提交必须由用户完成' }],
+      },
+    }).valid).toBe(true)
+  })
+
+  it.each([
+    { browserContinuation: { auth: { loginUrls: ['http://example.com/login'] } } },
+    { browserContinuation: { manualActions: [{ locator: 'text=提交', reason: '提交' }] } },
+    { browserContinuation: { manualActions: [{ locator: 'css=#submit', reason: '' }] } },
+    { browserContinuation: { unknown: true } },
+  ])('rejects unsafe continuation metadata %#', (patch) => {
+    expect(validateManifest({ ...validManifest(), ...patch }).valid).toBe(false)
+  })
+
   it('requires activation examples and browser origin scopes', () => {
     const result = validateManifest({
       id: 'bad',

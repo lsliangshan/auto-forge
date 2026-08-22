@@ -1,5 +1,15 @@
 import type { WorkflowPermission } from '@autoforge/shared'
 
+export interface BrowserContinuationManifest {
+  auth?: {
+    loginUrls?: string[]
+    loggedIn?: string[]
+    loggedOut?: string[]
+  }
+  readableRegions?: string[]
+  manualActions?: Array<{ locator: string; reason: string }>
+}
+
 export interface WorkflowManifest {
   id: string
   version: string
@@ -16,4 +26,5 @@ export interface WorkflowManifest {
   timeoutMs: number
   inputSchema: unknown
   outputSchema: unknown
+  browserContinuation?: BrowserContinuationManifest
 }

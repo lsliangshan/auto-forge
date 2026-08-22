@@ -478,6 +478,39 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('preserves optional browser continuation metadata without synthesizing it for legacy workflows', () => {
+    const legacyWorkflow = {
+      id: 'workflow.example', version: '1.0.0', name: '示例工作流', description: '示例',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'installed' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', cities: [],
+      runtimeIdentity: { id: 'workflow.example', version: '1.0.0', source: 'installed' as const },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: {},
+    }
+    const continuation = {
+      auth: { loginUrls: ['https://sso.example.gov.cn/login/*'], loggedIn: ['role=button[name="退出"]'] },
+      readableRegions: ['role=main'],
+      manualActions: [{ locator: 'role=button[name="正式提交"]', reason: '正式提交必须由用户完成' }],
+    }
+
+    expect(workflowDetailSchema.parse({ ...legacyWorkflow, browserContinuation: continuation }).browserContinuation)
+      .toEqual(continuation)
+    expect(workflowDetailSchema.parse(legacyWorkflow)).not.toHaveProperty('browserContinuation')
+    expect(() => workflowDetailSchema.parse({
+      ...legacyWorkflow,
+      browserContinuation: { manualActions: [{ locator: 'text=提交', reason: '提交' }] },
+    })).toThrow()
+    expect(() => workflowDetailSchema.parse({
+      ...legacyWorkflow,
+      browserContinuation: {
+        manualActions: [
+          { locator: 'role=button[name="正式提交"]', reason: '正式提交必须由用户完成' },
+          { locator: 'role=button[name="正式提交"]', reason: '正式提交必须由用户完成' },
+        ],
+      },
+    })).toThrow()
+  })
+
   it('accepts strict system-owned workflow status and provenance blocks', () => {
     expect(chatBlockSchema.parse({
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',

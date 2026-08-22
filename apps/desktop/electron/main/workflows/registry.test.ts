@@ -158,6 +158,26 @@ afterEach(() => {
 })
 
 describe('WorkflowRegistry', () => {
+  it('propagates browser continuation metadata from installed and development manifests', async () => {
+    const development = readyProject()
+    const browserContinuation = {
+      auth: { loginUrls: ['https://sso.example.gov.cn/login/*'], loggedIn: ['role=button[name="退出"]'] },
+      readableRegions: ['role=main'],
+      manualActions: [{ locator: 'role=button[name="正式提交"]', reason: '正式提交必须由用户完成' }],
+    }
+    development.manifest.browserContinuation = browserContinuation
+    development.project.buildHash = buildFingerprint([
+      { path: 'src/index.ts', contents: Buffer.from(development.source) },
+    ], development.manifest)
+    const { registry } = registryHarness({
+      installed: [installedWorkflow({ manifest: development.manifest })],
+      projects: [development],
+    })
+
+    expect((await registry.list({ developerMode: false }))[0]?.browserContinuation).toEqual(browserContinuation)
+    expect((await registry.getDevelopmentProject(development.project.id))?.browserContinuation).toEqual(browserContinuation)
+  })
+
   it('verifies a matching regular installed artifact fixture', async () => {
     const { registry } = installedRegistryFixture(Buffer.from('export default {}\n'))
 
@@ -182,10 +202,12 @@ describe('WorkflowRegistry', () => {
       projects: [development],
     })
 
-    expect(await registry.list({ developerMode: false })).toMatchObject([
+    const installedOnly = await registry.list({ developerMode: false })
+    expect(installedOnly).toMatchObject([
       { id: 'workflow.same', source: 'installed', cities: [] },
       { id: 'workflow.same', version: '2.0.0', source: 'installed', cities: [] },
     ])
+    expect(installedOnly[0]).not.toHaveProperty('browserContinuation')
     expect(await registry.list({ developerMode: true })).toEqual([
       expect.objectContaining({
         id: 'workflow.same',

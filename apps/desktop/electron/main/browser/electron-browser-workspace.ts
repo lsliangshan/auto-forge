@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { toSafeAppError, type AppError, type AppErrorCode } from '@autoforge/shared'
+import { parseBrowserLocator, toSafeAppError, type AppError, type AppErrorCode } from '@autoforge/shared'
 import type { NetworkProxySnapshot } from '../network/network-proxy-service.js'
 
 interface Rectangle { x: number; y: number; width: number; height: number }
@@ -102,12 +102,6 @@ export interface ElectronBrowserWorkspaceOptions {
   backgroundColor(): string
 }
 
-interface ParsedLocator {
-  kind: 'css' | 'role'
-  value: string
-  name?: string
-}
-
 interface TargetTabState {
   id: string
   userId: string
@@ -128,19 +122,6 @@ interface TargetTabState {
 const toolbarHeight = 52
 const navigationDetectionMs = 500
 const postLoadNavigationDetectionMs = 1_000
-const roles = new Set([
-  'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button', 'caption', 'cell',
-  'checkbox', 'code', 'columnheader', 'combobox', 'complementary', 'contentinfo', 'definition',
-  'deletion', 'dialog', 'directory', 'document', 'emphasis', 'feed', 'figure', 'form', 'generic',
-  'grid', 'gridcell', 'group', 'heading', 'img', 'insertion', 'link', 'list', 'listbox', 'listitem',
-  'log', 'main', 'marquee', 'math', 'meter', 'menu', 'menubar', 'menuitem', 'menuitemcheckbox',
-  'menuitemradio', 'navigation', 'none', 'note', 'option', 'paragraph', 'presentation', 'progressbar',
-  'radio', 'radiogroup', 'region', 'row', 'rowgroup', 'rowheader', 'scrollbar', 'search', 'searchbox',
-  'separator', 'slider', 'spinbutton', 'status', 'strong', 'subscript', 'superscript', 'switch', 'tab',
-  'table', 'tablist', 'tabpanel', 'term', 'textbox', 'time', 'timer', 'toolbar', 'tooltip', 'tree',
-  'treegrid', 'treeitem',
-])
-
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
 }
@@ -163,23 +144,10 @@ function isAbortedNavigation(error: unknown): boolean {
     && error.code === 'ERR_ABORTED'
 }
 
-function parseLocator(locator: string): ParsedLocator {
-  if (locator.startsWith('css=')) {
-    const value = locator.slice(4)
-    if (!value || value.includes('>>')) throw failure('INVALID_INPUT')
-    return { kind: 'css', value }
-  }
-  const match = /^role=([a-z]+)(?:\[name=("(?:[^"\\]|\\.)*")\])?$/.exec(locator)
-  if (!match || !roles.has(match[1]!)) throw failure('INVALID_INPUT')
-  if (!match[2]) return { kind: 'role', value: match[1]! }
-  try {
-    const name = JSON.parse(match[2]) as unknown
-    if (typeof name !== 'string' || !name) throw failure('INVALID_INPUT')
-    return { kind: 'role', value: match[1]!, name }
-  } catch (error) {
-    if (typeof error === 'object' && error !== null && 'code' in error) throw error
-    throw failure('INVALID_INPUT')
-  }
+function parseLocator(locator: string) {
+  const parsed = parseBrowserLocator(locator)
+  if (!parsed) throw failure('INVALID_INPUT')
+  return parsed
 }
 
 function html(value: string): string {

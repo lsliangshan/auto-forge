@@ -1,4 +1,5 @@
 export * from './desktop-api.js'
+export * from './browser-locator.js'
 export * from './errors.js'
 export * from './events.js'
 export * from './https-url-pattern.js'
