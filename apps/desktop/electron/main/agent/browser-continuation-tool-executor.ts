@@ -17,7 +17,6 @@ import {
 } from '../browser/browser-action-guard.js'
 import type {
   BrowserPageInspector,
-  BrowserLivePageContext,
   BrowserResolvedElementReference,
 } from '../browser/browser-page-inspector.js'
 import type { BrowserContinuationRegistry } from '../browser/browser-continuation-registry.js'
@@ -221,17 +220,62 @@ function textSupportsBoolean(requested: boolean, evidence: string): boolean {
   return requested ? positive : negative
 }
 
-function observedPage(
-  page: BrowserContinuationPageState,
-  context: BrowserLivePageContext,
-): string {
-  return JSON.stringify({
-    origin: page.origin,
-    url: page.url,
-    navigationEpoch: page.navigationEpoch,
-    auth: context.auth,
-    semanticFingerprint: context.semanticFingerprint,
-  })
+function normalizedEvidenceText(value: string): string {
+  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+}
+
+function longestSharedText(left: string, right: string): number {
+  let longest = 0
+  let previous = new Array<number>(right.length + 1).fill(0)
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = new Array<number>(right.length + 1).fill(0)
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      if (left[leftIndex - 1] !== right[rightIndex - 1]) continue
+      current[rightIndex] = previous[rightIndex - 1]! + 1
+      longest = Math.max(longest, current[rightIndex]!)
+    }
+    previous = current
+  }
+  return longest
+}
+
+function evidenceRelevantToIntent(node: BrowserSemanticNode, intent: string): boolean {
+  const name = normalizedEvidenceText(node.name)
+  const request = normalizedEvidenceText(intent)
+  if (!name || !request) return false
+  if (request.includes(name) || name.includes(request)) return true
+  return longestSharedText(name, request) >= 3
+}
+
+function relevantEvidenceSet(snapshot: BrowserPageSnapshot, intent: string): Set<string> {
+  return new Set(snapshot.nodes
+    .filter((node) => evidenceRelevantToIntent(node, intent))
+    .map((node) => JSON.stringify({
+      role: node.role,
+      name: node.name,
+      value: node.value,
+      checked: node.checked,
+      selected: node.selected,
+      actions: node.actions,
+    })))
+}
+
+function revealsRelevantEvidence(
+  before: BrowserPageSnapshot,
+  after: BrowserPageSnapshot,
+  intent: string,
+): boolean {
+  const existing = relevantEvidenceSet(before, intent)
+  return [...relevantEvidenceSet(after, intent)].some((evidence) => !existing.has(evidence))
+}
+
+function navigationChanged(
+  before: BrowserContinuationPageState,
+  after: BrowserContinuationPageState,
+): boolean {
+  return before.origin !== after.origin
+    || before.url !== after.url
+    || before.navigationEpoch !== after.navigationEpoch
 }
 
 function targetSummary(target: BrowserSemanticNode | undefined): string {
@@ -412,6 +456,7 @@ export class BrowserContinuationToolExecutor {
       throw failure('PAGE_CHANGED')
     }
     let completedActions = 0
+    let progressSnapshot = snapshot
     for (const rawAction of input.actions) {
       const action = rawAction as BrowserAction
       const target = 'ref' in action && action.ref !== undefined
@@ -479,7 +524,6 @@ export class BrowserContinuationToolExecutor {
             throw error
           }
         }
-        const beforeObservation = observedPage(page, liveBefore)
         state.actionCount += 1
         await this.dependencies.workspace.performContinuationAction({
           tabId: lease.binding.tabId,
@@ -499,8 +543,29 @@ export class BrowserContinuationToolExecutor {
           navigationEpoch: after.navigationEpoch,
           origin: after.origin,
         })
-        if (observedPage(after, liveAfter) === beforeObservation) state.noProgressCount += 1
-        else state.noProgressCount = 0
+        const navigated = navigationChanged(page, after)
+        let revealedRelevantEvidence = false
+        if (!navigated) {
+          const afterSnapshot = await this.dependencies.inspector.inspect({
+            lease,
+            tabId: lease.binding.tabId,
+            navigationEpoch: after.navigationEpoch,
+            origin: after.origin,
+            intent: context.currentUser.text,
+          })
+          if (action.type !== 'focus' && action.type !== 'wait') {
+            revealedRelevantEvidence = revealsRelevantEvidence(
+              progressSnapshot,
+              afterSnapshot,
+              context.currentUser.text,
+            )
+          }
+          progressSnapshot = afterSnapshot
+        }
+        const relevantProgress = action.type !== 'focus' && action.type !== 'wait'
+          && (navigated || revealedRelevantEvidence)
+        if (relevantProgress) state.noProgressCount = 0
+        else state.noProgressCount += 1
         if (state.noProgressCount >= 3) throw failure('ACTION_LIMIT_EXCEEDED')
         if (liveAfter.auth === 'required') {
           try {

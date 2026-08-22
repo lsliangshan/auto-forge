@@ -174,7 +174,21 @@ describe('BrowserContinuationToolExecutor', () => {
   })
 
   it('verifies current user, explicitly referenced history, page, and boolean value sources', async () => {
-    const test = harness()
+    const initial = snapshot()
+    const progressSnapshot = (snapshotId: string, name: string, checked = false) => snapshot({
+      snapshotId,
+      nodes: Object.freeze(initial.nodes.map((node) => Object.freeze(
+        node.ref === 'ref_name' ? { ...node, value: name }
+          : node.ref === 'ref_agree' ? { ...node, checked } : node,
+      ))),
+    })
+    const test = harness({ snapshots: [
+      initial,
+      progressSnapshot('progress_1', '李四'),
+      progressSnapshot('progress_2', '王五'),
+      progressSnapshot('progress_3', '张三'),
+      progressSnapshot('progress_4', '张三', true),
+    ] })
     await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '填写' }, run())
 
     await expect(test.executor.execute('browser_session_act', {
@@ -395,11 +409,12 @@ describe('BrowserContinuationToolExecutor', () => {
   it('enforces 30 actions without resetting the run budget across batches', async () => {
     const test = harness()
     await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '检查' }, run())
-    for (let batch = 0; batch < 3; batch += 1) {
+    for (let batch = 0; batch < 15; batch += 1) {
       await expect(test.executor.execute('browser_session_act', {
         bindingId: 'binding_1', snapshotId: 'snapshot_1',
-        actions: Array.from({ length: 10 }, (_, index) => ({ type: 'wait', milliseconds: 50 + batch * 10 + index })),
-      }, run())).resolves.toEqual({ kind: 'success', data: { completedActions: 10 } })
+        actions: Array.from({ length: 2 }, (_, index) => ({ type: 'wait', milliseconds: 50 + batch * 2 + index })),
+      }, run())).resolves.toEqual({ kind: 'success', data: { completedActions: 2 } })
+      test.executor['runs'].get('agent_run_1')!.noProgressCount = 0
     }
     await expect(test.executor.execute('browser_session_act', {
       bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'focus' }],
@@ -437,6 +452,103 @@ describe('BrowserContinuationToolExecutor', () => {
     }, run())).resolves.toEqual({ kind: 'tool_error', code: 'ACTION_LIMIT_EXCEEDED' })
     expect(test.workspace.performContinuationAction).toHaveBeenCalledTimes(3)
     expect(test.audits.at(-1)).toMatchObject({ action: 'scroll', outcome: 'failed', errorCode: 'ACTION_LIMIT_EXCEEDED' })
+  })
+
+  it.each([
+    { type: 'focus' as const },
+    { type: 'wait' as const, milliseconds: 50 },
+  ])('does not let a successful $type reset prior no-progress', async (action) => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '检查' }, run())
+    test.executor['runs'].get('agent_run_1')!.noProgressCount = 2
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [action],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'ACTION_LIMIT_EXCEEDED' })
+  })
+
+  it('does not let unrelated animation after scroll reset prior no-progress', async () => {
+    const before = snapshot({
+      nodes: Object.freeze([
+        Object.freeze({
+          ref: 'ref_animation', role: 'status', name: '有效活动动画', value: '第 1 帧',
+          enabled: true, actions: [] as const,
+        }),
+      ]),
+    })
+    const after = snapshot({
+      snapshotId: 'snapshot_2',
+      nodes: Object.freeze([
+        Object.freeze({
+          ref: 'ref_animation_2', role: 'status', name: '有效活动动画', value: '第 2 帧',
+          enabled: true, actions: [] as const,
+        }),
+      ]),
+    })
+    const test = harness({ snapshots: [before, after] })
+    const context = run({ currentUser: { messageId: 'message_current', text: '读取证件有效期' } })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: context.currentUser.text,
+    }, context)
+    test.executor['runs'].get('agent_run_1')!.noProgressCount = 2
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'scroll', direction: 'down' }],
+    }, context)).resolves.toEqual({ kind: 'tool_error', code: 'ACTION_LIMIT_EXCEEDED' })
+  })
+
+  it('lets scroll reset no-progress only after revealing user-intent-relevant evidence', async () => {
+    const before = snapshot({ nodes: Object.freeze([]) })
+    const after = snapshot({
+      snapshotId: 'snapshot_2',
+      nodes: Object.freeze([
+        Object.freeze({
+          ref: 'ref_expiry', role: 'text', name: '有效期至', value: '2028-06-30',
+          enabled: true, actions: [] as const,
+        }),
+      ]),
+    })
+    const test = harness({ snapshots: [before, after] })
+    const context = run({ currentUser: { messageId: 'message_current', text: '读取证件有效期' } })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: context.currentUser.text,
+    }, context)
+    test.executor['runs'].get('agent_run_1')!.noProgressCount = 2
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'scroll', direction: 'down' }],
+    }, context)).resolves.toEqual({ kind: 'success', data: { completedActions: 1 } })
+    expect(test.inspector.inspect).toHaveBeenCalledTimes(2)
+    expect(test.executor['runs'].get('agent_run_1')?.noProgressCount).toBe(0)
+  })
+
+  it('does not attribute evidence revealed during wait to a later scroll', async () => {
+    const before = snapshot({ nodes: Object.freeze([]) })
+    const revealedDuringWait = snapshot({
+      snapshotId: 'snapshot_2',
+      nodes: Object.freeze([
+        Object.freeze({
+          ref: 'ref_expiry', role: 'text', name: '有效期至', value: '2028-06-30',
+          enabled: true, actions: [] as const,
+        }),
+      ]),
+    })
+    const unchangedAfterScroll = snapshot({
+      snapshotId: 'snapshot_3', nodes: revealedDuringWait.nodes,
+    })
+    const test = harness({ snapshots: [before, revealedDuringWait, unchangedAfterScroll] })
+    const context = run({ currentUser: { messageId: 'message_current', text: '读取证件有效期' } })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: context.currentUser.text,
+    }, context)
+    test.executor['runs'].get('agent_run_1')!.noProgressCount = 1
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [
+        { type: 'wait', milliseconds: 50 },
+        { type: 'scroll', direction: 'down' },
+      ],
+    }, context)).resolves.toEqual({ kind: 'tool_error', code: 'ACTION_LIMIT_EXCEEDED' })
   })
 
   it('owns terminal, cancellation, takeover, handoff, and error endRun cleanup', async () => {

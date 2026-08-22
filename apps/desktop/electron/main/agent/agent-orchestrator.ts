@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import {
+  appErrorCodeSchema,
   approvalDecisionSchema,
   toSafeAppError,
   type AppError,
@@ -9,6 +10,7 @@ import {
   type ModelProviderId,
   type WorkflowDetail,
 } from '@autoforge/shared'
+import { z } from 'zod'
 import type { PolicyEngine } from '../permissions/policy-engine.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import { addUsd } from '../billing/decimal-usd.js'
@@ -34,6 +36,11 @@ import type {
   BrowserContinuationCatalogSnapshot,
   BrowserContinuationCandidate,
 } from './browser-continuation-catalog.js'
+import type {
+  BrowserAction,
+  BrowserPageSnapshot,
+  BrowserSemanticNode,
+} from '../browser/browser-continuation-types.js'
 import {
   browserSessionActInputSchema,
   browserSessionHandoffInputSchema,
@@ -88,6 +95,84 @@ const EXPLICIT_BROWSER_OPTOUT = /(?:不要|不准|禁止|请勿).{0,12}(?:调用
 const BROWSER_TOOL_NAMES = new Set<BrowserContinuationToolName>([
   'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
 ])
+
+type BrowserMutationType = Extract<BrowserAction['type'], 'navigate' | 'fill' | 'select' | 'check' | 'click'>
+
+interface BrowserAuthorizationEnvelope {
+  readonly inspectIntent: string
+  readonly trustedRequest: string
+  readonly mutationTypes: readonly BrowserMutationType[]
+}
+
+interface BrowserFieldEvidence {
+  readonly snapshotId: string
+  readonly ref: string
+  readonly label: string
+  readonly value: string
+  readonly pageLabel: string
+  readonly origin: string
+  readonly capturedAt: string
+}
+
+const browserSemanticNodeSchema = z.object({
+  ref: z.string().trim().min(1).max(128),
+  role: z.string().trim().min(1).max(80),
+  name: z.string().max(512),
+  value: z.string().max(512).optional(),
+  enabled: z.boolean(),
+  checked: z.boolean().optional(),
+  selected: z.boolean().optional(),
+  actions: z.array(z.enum(['fill', 'select', 'click', 'check', 'scroll'])).max(5),
+}).strict()
+
+const browserPageSnapshotSchema = z.object({
+  snapshotId: z.string().trim().min(1).max(128),
+  bindingId: z.string().trim().min(1).max(128),
+  origin: z.string().trim().min(1).max(2_048),
+  url: z.string().trim().min(1).max(2_048),
+  title: z.string().max(512),
+  capturedAt: z.string().max(64).datetime(),
+  navigationEpoch: z.number().int().nonnegative(),
+  auth: z.enum(['authenticated', 'required', 'unknown']),
+  nodes: z.array(browserSemanticNodeSchema).max(500),
+  cursor: z.string().trim().min(1).max(128).optional(),
+  serializedBytes: z.number().int().nonnegative().max(128 * 1_024),
+}).strict()
+
+const browserRegionImageSchema = z.object({
+  snapshotId: z.string().trim().min(1).max(128),
+  bindingId: z.string().trim().min(1).max(128),
+  origin: z.string().trim().min(1).max(2_048),
+  ref: z.string().trim().min(1).max(128),
+  capturedAt: z.string().max(64).datetime(),
+  mediaType: z.literal('image/png'),
+  width: z.number().positive().max(1_000_000),
+  height: z.number().positive().max(1_000_000),
+  data: z.string().max(8_000_000),
+}).strict()
+
+const browserInspectSuccessSchema = z.object({
+  kind: z.literal('success'),
+  data: z.union([
+    z.object({ trust: z.literal('untrusted_page_data'), snapshot: browserPageSnapshotSchema }).strict(),
+    z.object({ trust: z.literal('untrusted_page_data'), regionImage: browserRegionImageSchema }).strict(),
+  ]),
+}).strict()
+
+const browserActSuccessSchema = z.object({
+  kind: z.literal('success'),
+  data: z.object({ completedActions: z.number().int().nonnegative().max(10) }).strict(),
+}).strict()
+
+const browserHandoffResultSchema = z.object({
+  kind: z.literal('handoff'),
+  code: z.enum(['AUTH_REQUIRED', 'MANUAL_ACTION_REQUIRED', 'UNSUPPORTED_CONTROL']),
+}).strict()
+
+const browserToolErrorResultSchema = z.object({
+  kind: z.literal('tool_error'),
+  code: appErrorCodeSchema,
+}).strict()
 
 export type ProviderStreamEvent = ModelStreamEvent
 
@@ -342,6 +427,12 @@ interface ActiveAgentRun {
   browserStarted: boolean
   browserCleaned: boolean
   browserTerminal: boolean
+  browserRead: boolean
+  browserAuthorization: BrowserAuthorizationEnvelope
+  browserSnapshots: Map<string, BrowserPageSnapshot>
+  browserEvidence: BrowserFieldEvidence[]
+  browserHandoffCode?: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL'
+  browserCleanup?: Promise<void>
   currentUser: BrowserContinuationRunContext['currentUser']
   controller: AbortController
   loop: WorkflowToolLoop
@@ -383,13 +474,126 @@ function explicitBrowserBinding(
   catalog: BrowserContinuationCatalogSnapshot,
 ): string | undefined {
   if (catalog.bindings.size === 1) return catalog.bindings.keys().next().value
-  const matches = [...catalog.bindings.values()].filter((candidate) => [
-    candidate.bindingId,
-    candidate.workflowLabel,
-    candidate.pageLabel,
-    candidate.origin,
-  ].some((label) => content.includes(label)))
+  const candidates = [...catalog.bindings.values()]
+  const labels = candidates.flatMap((candidate) => [candidate.workflowLabel, candidate.pageLabel])
+  const matches = candidates.filter((candidate) => {
+    if (content.includes(candidate.origin)) return true
+    return [candidate.workflowLabel, candidate.pageLabel].some((label) => (
+      content.includes(label)
+      && !labels.some((other) => other !== label && other.includes(label))
+    ))
+  })
   return matches.length === 1 ? matches[0]!.bindingId : undefined
+}
+
+function browserAuthorization(content: string): BrowserAuthorizationEnvelope {
+  const trustedRequest = content.trim().slice(0, 500)
+  const mutationTypes: BrowserMutationType[] = []
+  if (/(?:navigate|go\s+to|visit|open|导航|访问|前往|跳转|打开)/iu.test(trustedRequest)) mutationTypes.push('navigate')
+  if (/(?:\b(?:click|press|open|expand)\b|点击|按下|打开|进入|展开)/iu.test(trustedRequest)) mutationTypes.push('click')
+  if (/(?:\b(?:fill|enter|input)\b|\btype\s+(?:in|into)\b|填写|输入|填入)/iu.test(trustedRequest)) mutationTypes.push('fill')
+  if (/(?:select|choose|选择|选中)/iu.test(trustedRequest)) mutationTypes.push('select')
+  if (/(?:\b(?:uncheck|tick|untick|agree)\b|\bcheck\s+(?:the\s+)?(?:box|checkbox)\b|勾选|取消勾选|取消选中|同意)/iu.test(trustedRequest)) mutationTypes.push('check')
+  return Object.freeze({
+    inspectIntent: trustedRequest,
+    trustedRequest,
+    mutationTypes: Object.freeze(mutationTypes),
+  })
+}
+
+function normalizedTrustedText(value: string): string {
+  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+}
+
+function longestSharedText(left: string, right: string): number {
+  let longest = 0
+  let previous = new Array<number>(right.length + 1).fill(0)
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = new Array<number>(right.length + 1).fill(0)
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      if (left[leftIndex - 1] !== right[rightIndex - 1]) continue
+      current[rightIndex] = previous[rightIndex - 1]! + 1
+      longest = Math.max(longest, current[rightIndex]!)
+    }
+    previous = current
+  }
+  return longest
+}
+
+function trustedRequestNamesTarget(request: string, target: BrowserSemanticNode): boolean {
+  const name = normalizedTrustedText(target.name)
+  return name.length > 0 && normalizedTrustedText(request).includes(name)
+}
+
+function trustedRequestContainsValue(request: string, value: string): boolean {
+  const normalized = normalizedTrustedText(value)
+  return normalized.length > 0 && normalizedTrustedText(request).includes(normalized)
+}
+
+function browserActionAuthorized(
+  envelope: BrowserAuthorizationEnvelope,
+  snapshots: ReadonlyMap<string, BrowserPageSnapshot>,
+  snapshotId: string,
+  action: BrowserAction,
+): boolean {
+  if (action.type === 'focus' || action.type === 'wait' || action.type === 'scroll') return true
+  if (!envelope.mutationTypes.includes(action.type)) return false
+  if (action.type === 'navigate') {
+    try {
+      const origin = new URL(action.url).origin
+      return envelope.trustedRequest.includes(action.url) || envelope.trustedRequest.includes(origin)
+    } catch {
+      return false
+    }
+  }
+  const target = snapshots.get(snapshotId)?.nodes.find((node) => node.ref === action.ref)
+  if (!target || !target.actions.includes(action.type) || !trustedRequestNamesTarget(envelope.trustedRequest, target)) {
+    return false
+  }
+  if (action.type === 'click') return true
+  if (action.type === 'check') {
+    const request = envelope.trustedRequest
+    const negative = /(?:uncheck|untick|取消勾选|取消选中|不要勾选|不勾选)/iu.test(request)
+    const positive = /(?:check|tick|agree|勾选|选中|同意)/iu.test(request) && !negative
+    return action.checked ? positive : negative
+  }
+  return trustedRequestContainsValue(envelope.trustedRequest, action.value)
+}
+
+function strictBrowserToolResult(
+  tool: BrowserContinuationToolName,
+  value: unknown,
+): BrowserContinuationToolResult | undefined {
+  const successSchema = tool === 'browser_session_inspect'
+    ? browserInspectSuccessSchema
+    : tool === 'browser_session_act' ? browserActSuccessSchema : z.never()
+  const parsed = z.union([successSchema, browserHandoffResultSchema, browserToolErrorResultSchema]).safeParse(value)
+  return parsed.success ? parsed.data as BrowserContinuationToolResult : undefined
+}
+
+function relevantEvidence(request: string, evidence: BrowserFieldEvidence): boolean {
+  const trusted = normalizedTrustedText(request)
+  const label = normalizedTrustedText(evidence.label)
+  if (!trusted || label.length < 2) return false
+  if (trusted.includes(label)) return true
+  const latinTerms = evidence.label.toLowerCase().match(/[a-z0-9]{2,}/gu) ?? []
+  if (latinTerms.length > 0) {
+    const requestTerms = new Set(request.toLowerCase().match(/[a-z0-9]{2,}/gu) ?? [])
+    return latinTerms.every((term) => requestTerms.has(term))
+  }
+  return longestSharedText(label, trusted) >= 3
+}
+
+function safeAnswerText(value: string): string {
+  return [...value]
+    .map((character) => {
+      const codePoint = character.codePointAt(0)!
+      return codePoint <= 31 || codePoint === 127 ? ' ' : character
+    })
+    .join('')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, 512)
 }
 
 export class AgentOrchestrator {
@@ -490,6 +694,10 @@ export class AgentOrchestrator {
         browserStarted: false,
         browserCleaned: false,
         browserTerminal: false,
+        browserRead: false,
+        browserAuthorization: browserAuthorization(input.content),
+        browserSnapshots: new Map(),
+        browserEvidence: [],
         currentUser: { messageId: userMessageId, text: input.content },
         controller: new AbortController(),
         loop: new WorkflowToolLoop({ now: this.now }),
@@ -620,14 +828,11 @@ export class AgentOrchestrator {
     if (active.browserBindingId !== undefined && active.browserBindingId !== bindingId) return false
     active.cancelled = true
     active.controller.abort()
-    const browser = this.dependencies.browserContinuation
-    if (browser && active.browserStarted) {
-      await browser.executor.takeOver(active.runId)
-      active.browserCleaned = true
-    }
     active.browserTerminal = true
     const candidate = active.browserCatalog.bindings.get(bindingId)!
     this.updateBrowserStatus(active, candidate, 'cancelled', '用户已接管浏览器页面', 'CANCELLED')
+    if (active.browserStarted) await this.cleanupBrowser(active, 'takeOver')
+    if (active.terminal) return true
     this.finish(active, 'cancelled', appFailure('CANCELLED'))
     return true
   }
@@ -805,11 +1010,12 @@ export class AgentOrchestrator {
         return this.continuePendingTool(active)
       }
       if (finishReason === 'stop') {
-        for (const text of bufferedText) this.appendText(active, text)
+        if (active.browserRead) this.appendText(active, this.browserAnswer(active))
+        else for (const text of bufferedText) this.appendText(active, text)
         this.appendWorkflowProvenance(active)
         return this.terminalize(active, 'completed')
       }
-      for (const text of bufferedText) this.appendText(active, text)
+      if (!active.browserRead) for (const text of bufferedText) this.appendText(active, text)
       if (finishReason === 'tool_calls') return this.terminalize(active, 'failed', appFailure('INVALID_TOOL_SEQUENCE'))
       return this.terminalize(active, 'failed', appFailure('MODEL_PROVIDER_REQUEST_FAILED'))
     }
@@ -880,7 +1086,16 @@ export class AgentOrchestrator {
       )
     }
     const candidate = active.workflows.get(call.name)
-    if (!candidate) return this.terminalize(active, 'failed', appFailure('INVALID_INPUT'))
+    if (!candidate) {
+      if (active.browserStarted) return this.terminalize(active, 'failed', appFailure('INVALID_INPUT'))
+      this.appendToolExchange(active, {
+        callId: call.id,
+        assistantContent,
+        toolName: call.name,
+        arguments: call.arguments,
+      }, { kind: 'tool_error', code: 'INVALID_INPUT' })
+      return this.drive(active)
+    }
     if (!active.loop.canOfferTools()) return this.terminalize(active, 'failed', appFailure('TOOL_CALL_LIMIT'))
     const prepared = await this.workflowTools.prepare({
       candidate,
@@ -969,14 +1184,35 @@ export class AgentOrchestrator {
       this.appendBrowserToolExchange(active, call, assistantContent, { kind: 'tool_error', code: 'CANCELLED' })
       return this.drive(active)
     }
+    let executorInput = parsed.data
+    if (call.name === 'browser_session_inspect') {
+      if (!active.browserAuthorization.inspectIntent) {
+        this.appendBrowserToolExchange(active, call, assistantContent, { kind: 'tool_error', code: 'INVALID_INPUT' })
+        return this.drive(active)
+      }
+      executorInput = {
+        ...browserSessionInspectInputSchema.parse(parsed.data),
+        intent: active.browserAuthorization.inspectIntent,
+      }
+    }
     if (call.name === 'browser_session_act') {
       const actInput = browserSessionActInputSchema.parse(parsed.data)
+      if (!actInput.actions.every((action) => browserActionAuthorized(
+        active.browserAuthorization,
+        active.browserSnapshots,
+        actInput.snapshotId,
+        action as BrowserAction,
+      ))) {
+        this.appendBrowserToolExchange(active, call, assistantContent, { kind: 'tool_error', code: 'INVALID_INPUT' })
+        return this.drive(active)
+      }
       const boundary = active.loop.recordBrowserActions(actInput.actions.length)
       if (boundary.kind === 'failed') {
         active.browserTerminal = true
         if (active.browserStarted) {
-          await browser.executor.endRun(active.runId)
-          active.browserCleaned = true
+          await this.cleanupBrowser(active, 'endRun')
+          const inactive = await this.inactiveBrowserResult(active)
+          if (inactive) return inactive
         }
         this.updateBrowserStatus(active, candidate, 'failed', '网页操作已达到安全上限', boundary.code)
         this.appendBrowserToolExchange(active, call, assistantContent, {
@@ -987,6 +1223,7 @@ export class AgentOrchestrator {
     }
     active.browserBindingId = candidate.bindingId
     active.browserStarted = true
+    if (call.name === 'browser_session_inspect') active.browserRead = true
     this.updateBrowserStatus(
       active,
       candidate,
@@ -997,7 +1234,7 @@ export class AgentOrchestrator {
         ? '正在读取网页'
         : call.name === 'browser_session_act' ? '正在操作网页' : '正在交还网页给用户',
     )
-    const result = await browser.executor.execute(call.name, parsed.data, {
+    const rawResult = await browser.executor.execute(call.name, executorInput, {
       userId: active.userId,
       conversationId: active.conversationId,
       runId: active.runId,
@@ -1005,6 +1242,32 @@ export class AgentOrchestrator {
       referencedHistory: [],
       signal: active.controller.signal,
     })
+    const inactive = await this.inactiveBrowserResult(active)
+    if (inactive) return inactive
+    let result = strictBrowserToolResult(call.name, rawResult)
+    if (result?.kind === 'success' && call.name === 'browser_session_inspect') {
+      const inspectInput = browserSessionInspectInputSchema.parse(executorInput)
+      const data = result.data as {
+        snapshot?: BrowserPageSnapshot
+        regionImage?: { bindingId: string; origin: string }
+      }
+      const inspected = data.snapshot ?? data.regionImage
+      let inspectedOrigin: string | undefined
+      try { inspectedOrigin = inspected && new URL(inspected.origin).origin } catch { /* invalid executor data */ }
+      if (!inspected
+        || inspected.bindingId !== candidate.bindingId
+        || inspected.origin !== candidate.origin
+        || inspectedOrigin !== candidate.origin
+        || (inspectInput.mode === 'region_image') !== Boolean(data.regionImage)) result = undefined
+      else if (data.snapshot) this.rememberBrowserEvidence(active, candidate, data.snapshot)
+    }
+    if (result?.kind === 'success' && call.name === 'browser_session_act'
+      && result.data.completedActions !== browserSessionActInputSchema.parse(executorInput).actions.length) {
+      result = undefined
+    }
+    if (!result) {
+      result = { kind: 'tool_error', code: 'INTERNAL_ERROR' }
+    }
     if (result.kind === 'success') {
       this.updateBrowserStatus(
         active,
@@ -1014,6 +1277,7 @@ export class AgentOrchestrator {
       )
     } else if (result.kind === 'handoff') {
       active.browserTerminal = true
+      active.browserHandoffCode = result.code
       this.updateBrowserStatus(
         active,
         candidate,
@@ -1023,8 +1287,9 @@ export class AgentOrchestrator {
       )
     } else {
       active.browserTerminal = true
-      await browser.executor.endRun(active.runId)
-      active.browserCleaned = true
+      await this.cleanupBrowser(active, 'endRun')
+      const inactiveAfterCleanup = await this.inactiveBrowserResult(active)
+      if (inactiveAfterCleanup) return inactiveAfterCleanup
       this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', result.code)
     }
     this.appendBrowserToolExchange(active, call, assistantContent, result)
@@ -1206,6 +1471,74 @@ export class AgentOrchestrator {
         'END_UNTRUSTED_BROWSER_PAGE_DATA',
       ].join('\n'),
     })
+  }
+
+  private rememberBrowserEvidence(
+    active: ActiveAgentRun,
+    candidate: BrowserContinuationCandidate,
+    snapshot: BrowserPageSnapshot,
+  ): void {
+    active.browserSnapshots.set(snapshot.snapshotId, snapshot)
+    for (const node of snapshot.nodes) {
+      if (node.value === undefined || !node.value.trim() || !node.name.trim()) continue
+      active.browserEvidence.push({
+        snapshotId: snapshot.snapshotId,
+        ref: node.ref,
+        label: node.name,
+        value: node.value,
+        pageLabel: candidate.pageLabel,
+        origin: candidate.origin,
+        capturedAt: snapshot.capturedAt,
+      })
+    }
+  }
+
+  private browserAnswer(active: ActiveAgentRun): string {
+    const matches = active.browserEvidence.filter((evidence) => (
+      relevantEvidence(active.browserAuthorization.trustedRequest, evidence)
+    ))
+    const unique = new Map(matches.map((evidence) => [
+      [evidence.label, evidence.value, evidence.pageLabel, evidence.origin, evidence.capturedAt].join('\u0000'),
+      evidence,
+    ]))
+    if (unique.size === 1) {
+      const evidence = unique.values().next().value!
+      return `${safeAnswerText(evidence.label)}：${safeAnswerText(evidence.value)}`
+        + `（来源：${safeAnswerText(evidence.pageLabel)} / ${evidence.origin}；读取时间：${evidence.capturedAt}）。`
+    }
+    if (active.browserHandoffCode === 'AUTH_REQUIRED') {
+      return '网页需要你先完成登录；目前无法唯一确认请求的字段。'
+    }
+    if (active.browserHandoffCode) {
+      return '网页需要你完成受保护或不支持的操作；目前无法唯一确认请求的字段。'
+    }
+    return '无法从已绑定网页中唯一确认请求的字段；请在可见页面核对后再继续。'
+  }
+
+  private async inactiveBrowserResult(active: ActiveAgentRun): Promise<AgentRunResult | undefined> {
+    if (active.terminal) return active.terminal
+    if (this.activeByRequest.get(active.requestId) === active
+      && !active.cancelled
+      && !active.controller.signal.aborted) return undefined
+    return this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
+  }
+
+  private async cleanupBrowser(
+    active: ActiveAgentRun,
+    cleanup: 'endRun' | 'cancel' | 'takeOver',
+  ): Promise<void> {
+    if (!active.browserStarted || active.browserCleaned || !this.dependencies.browserContinuation) return
+    active.browserTerminal = true
+    if (!active.browserCleanup) {
+      const executor = this.dependencies.browserContinuation.executor
+      active.browserCleanup = (async () => {
+        if (cleanup === 'cancel') await executor.cancel(active.runId)
+        else if (cleanup === 'takeOver') await executor.takeOver(active.runId)
+        else await executor.endRun(active.runId)
+        active.browserCleaned = true
+      })()
+    }
+    await active.browserCleanup
   }
 
   private workflowStatusContext(tool: PendingWorkflowTool): Pick<
@@ -1408,9 +1741,7 @@ export class AgentOrchestrator {
     if (active.browserStarted && !active.browserCleaned && this.dependencies.browserContinuation) {
       active.browserTerminal = true
       try {
-        if (cleanup === 'cancel') await this.dependencies.browserContinuation.executor.cancel(active.runId)
-        else await this.dependencies.browserContinuation.executor.endRun(active.runId)
-        active.browserCleaned = true
+        await this.cleanupBrowser(active, cleanup)
       } catch {
         status = 'failed'
         error = appFailure('INTERNAL_ERROR')
