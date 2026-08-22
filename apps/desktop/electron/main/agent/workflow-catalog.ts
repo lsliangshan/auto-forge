@@ -37,15 +37,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+const singleSchemaKeywords = [
+  'additionalItems', 'additionalProperties', 'contains', 'contentSchema', 'else', 'if', 'items', 'not',
+  'propertyNames', 'then', 'unevaluatedItems', 'unevaluatedProperties',
+]
+const schemaArrayKeywords = ['allOf', 'anyOf', 'oneOf', 'prefixItems']
+const schemaMapKeywords = ['$defs', 'definitions', 'dependentSchemas', 'patternProperties', 'properties']
+
 function hasLocalReference(value: unknown, seen = new Set<object>()): boolean {
-  if (!value || typeof value !== 'object') return false
-  if (seen.has(value)) return false
+  if (!isRecord(value) || seen.has(value)) return false
   seen.add(value)
-  for (const [key, child] of Object.entries(value)) {
-    if ((key === '$ref' || key === '$dynamicRef') && typeof child === 'string' && child.startsWith('#')) return true
-    if (hasLocalReference(child, seen)) return true
+  if ((typeof value.$ref === 'string' && value.$ref.startsWith('#'))
+    || (typeof value.$dynamicRef === 'string' && value.$dynamicRef.startsWith('#'))) return true
+  for (const keyword of singleSchemaKeywords) {
+    if (hasLocalReferenceInSchemaOrArray(value[keyword], seen)) return true
   }
-  return false
+  for (const keyword of schemaArrayKeywords) {
+    if (Array.isArray(value[keyword]) && value[keyword].some((schema) => hasLocalReference(schema, seen))) return true
+  }
+  for (const keyword of schemaMapKeywords) {
+    const schemas = value[keyword]
+    if (isRecord(schemas) && Object.values(schemas).some((schema) => hasLocalReference(schema, seen))) return true
+  }
+  const dependencies = value.dependencies
+  return isRecord(dependencies) && Object.values(dependencies).some((schema) => hasLocalReference(schema, seen))
+}
+
+function hasLocalReferenceInSchemaOrArray(value: unknown, seen: Set<object>): boolean {
+  return Array.isArray(value)
+    ? value.some((schema) => hasLocalReference(schema, seen))
+    : hasLocalReference(value, seen)
 }
 
 function inputSchemaWithBoundary(inputSchema: unknown, toolName: string): unknown {

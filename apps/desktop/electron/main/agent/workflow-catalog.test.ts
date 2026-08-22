@@ -100,4 +100,54 @@ describe('WorkflowCatalog', () => {
     expect(validate({ input: { amount: 1 } })).toBe(true)
     expect(validate({ input: { amount: '1' } })).toBe(false)
   })
+
+  it('does not treat a literal $ref under const as a schema reference', async () => {
+    const literal = { $ref: '#/literal' }
+    const inputSchema = {
+      type: 'object', additionalProperties: false, required: ['marker'],
+      properties: { marker: { const: literal } },
+    }
+    const workflow: WorkflowDetail = { ...beijingWorkflow, cities: [], inputSchema }
+    const [candidate] = await createWorkflowCatalog({
+      workflows: { list: async () => [workflow] },
+      selectorFor: createWorkflowSourceSelectorVault().create,
+    }).create({ developerMode: false })
+    const validate = new Ajv({ strict: false }).compile(candidate!.tool.function.parameters as object)
+
+    expect(candidate!.tool.function.parameters).toEqual({
+      type: 'object', additionalProperties: false, required: ['input'], properties: { input: inputSchema },
+    })
+    expect(validate({ input: { marker: literal } })).toBe(true)
+    expect(validate({ input: { marker: { $ref: '#/other' } } })).toBe(false)
+  })
+
+  it.each([
+    ['nested properties', {
+      type: 'object', $defs: { amount: { type: 'number' } },
+      properties: { payload: { type: 'object', properties: { amount: { $ref: '#/$defs/amount' } } } },
+    }, { payload: { amount: 1 } }, true],
+    ['allOf', {
+      type: 'object', definitions: { amount: { type: 'number' } },
+      allOf: [{ required: ['amount'], properties: { amount: { $ref: '#/definitions/amount' } } }],
+    }, { amount: 1 }, true],
+    ['items', {
+      type: 'array', $defs: { amount: { type: 'number' } }, items: { $ref: '#/$defs/amount' },
+    }, [1], true],
+    ['an existing $id', {
+      $id: 'urn:autoforge:workflow:existing', type: 'object',
+      definitions: { amount: { type: 'number' } },
+      properties: { amount: { $ref: '#/definitions/amount' } },
+    }, { amount: 1 }, false],
+  ] as const)('finds real local references through %s schema positions', async (_kind, inputSchema, validInput, injectsId) => {
+    const workflow: WorkflowDetail = { ...beijingWorkflow, cities: [], inputSchema }
+    const [candidate] = await createWorkflowCatalog({
+      workflows: { list: async () => [workflow] },
+      selectorFor: createWorkflowSourceSelectorVault().create,
+    }).create({ developerMode: false })
+    const schema = (candidate!.tool.function.parameters as { properties: { input: Record<string, unknown> } }).properties.input
+    const validate = new Ajv({ strict: false }).compile(candidate!.tool.function.parameters as object)
+
+    expect(schema.$id).toBe(injectsId ? 'urn:autoforge:workflow-tool:workflow_1:input' : 'urn:autoforge:workflow:existing')
+    expect(validate({ input: validInput })).toBe(true)
+  })
 })
