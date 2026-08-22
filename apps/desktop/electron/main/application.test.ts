@@ -22,6 +22,7 @@ import {
 import {
   createApplicationFailureRecorder,
   createApplicationRuntime,
+  createWorkflowExecutionSourceResolver,
   MaintenanceGate,
   observeAuthService,
 } from './application.js'
@@ -44,6 +45,7 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
+import { createWorkflowSourceSelectorVault } from './workflows/workflow-source-selector.js'
 
 const directories: string[] = []
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
@@ -423,6 +425,79 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('rejects a development selector after its persisted build changes without falling back to an installed duplicate', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const development = {
+      id: 'workflow.same', version: '1.0.0', name: 'Development', description: 'Development build',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'development' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+      runtimeIdentity: { id: 'workflow.same', version: '1.0.0', source: 'development' as const, buildHash: 'b'.repeat(64) },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: { selected: 'development' },
+    }
+    const project = {
+      id: 'project_dev', name: 'Development', rootPath: '/tmp/development', status: 'ready',
+      buildHash: 'b'.repeat(64), manifest: { id: development.id, version: development.version, entryPath: 'dist/index.js', codeSha256: development.codeSha256 },
+      createdAt: 0, updatedAt: 0,
+    }
+    const installedFallback = vi.fn(async () => ({
+      ...development,
+      source: 'installed' as const,
+      runtimeIdentity: { id: development.id, version: development.version, source: 'installed' as const },
+      outputSchema: { selected: 'installed' },
+    }))
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [project] },
+        installedWorkflows: { get: () => ({ manifest: { codeSha256: development.codeSha256 } }) },
+      },
+      registry: {
+        getDevelopmentProject: async () => development,
+        get: installedFallback,
+        verifyIntegrity: async () => ({ valid: true, disabled: false }),
+      },
+    } as never)
+    const selector = vault.create(development)
+
+    await expect(resolver.resolve(development.id, development.version, selector)).resolves.toMatchObject({
+      workflow: { source: 'development', outputSchema: { selected: 'development' } },
+    })
+
+    project.buildHash = 'c'.repeat(64)
+    await expect(resolver.resolve(development.id, development.version, selector)).resolves.toBeUndefined()
+    expect(installedFallback).not.toHaveBeenCalled()
+  })
+
+  it('rejects a development selector when more than one project matches its exact build', async () => {
+    const vault = createWorkflowSourceSelectorVault()
+    const workflow = {
+      id: 'workflow.same', version: '1.0.0', name: 'Development', description: 'Development build',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'development' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', codeSha256: 'a'.repeat(64), cities: [],
+      runtimeIdentity: { id: 'workflow.same', version: '1.0.0', source: 'development' as const, buildHash: 'b'.repeat(64) },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: {},
+    }
+    const project = (id: string) => ({
+      id, name: id, rootPath: `/tmp/${id}`, status: 'ready', buildHash: 'b'.repeat(64),
+      manifest: { id: workflow.id, version: workflow.version, entryPath: 'dist/index.js', codeSha256: workflow.codeSha256 },
+      createdAt: 0, updatedAt: 0,
+    })
+    const resolver = createWorkflowExecutionSourceResolver(vault, {
+      repositories: {
+        workflowProjects: { list: () => [project('project_one'), project('project_two')] },
+        installedWorkflows: { get: () => undefined },
+      },
+      registry: {
+        getDevelopmentProject: async () => workflow,
+        get: async () => undefined,
+        verifyIntegrity: async () => ({ valid: false, disabled: false }),
+      },
+    } as never)
+
+    await expect(resolver.resolve(workflow.id, workflow.version, vault.create(workflow))).resolves.toBeUndefined()
+  })
+
   it('requires the CloudBase role before projecting a login and fails closed on refresh', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-role-'))
     directories.push(root)

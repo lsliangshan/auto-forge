@@ -54,6 +54,7 @@ import { VideoJobRunner } from './chat/video-job-runner.js'
 import { openAppDatabase } from './database/client.js'
 import {
   ProviderUsageConsistencyError,
+  type AppRepositories,
   type Execution,
   type WorkflowProject,
 } from './database/repositories.js'
@@ -77,12 +78,17 @@ import { UserAdminService } from './user-admin/user-admin-service.js'
 import {
   ExecutionService,
   NodeWorkerFactory,
+  type WorkflowExecutionSource,
   type WorkflowExecutionSourceResolver,
-  type WorkflowExecutionSourceSelector,
 } from './workflows/execution-service.js'
 import { validateWorkflowInput } from './workflows/input-validation.js'
 import { WorkflowProjectService } from './workflows/project-service.js'
 import { WorkflowRegistry } from './workflows/registry.js'
+import {
+  createWorkflowSourceSelectorVault,
+  type ExactWorkflowSource,
+  type WorkflowSourceSelectorVault,
+} from './workflows/workflow-source-selector.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
 
 export interface ApplicationPaths {
@@ -452,6 +458,85 @@ async function developerProject(project: WorkflowProject): Promise<DeveloperProj
   }
 }
 
+export interface WorkflowExecutionSourceResolverDependencies {
+  repositories: Pick<AppRepositories, 'workflowProjects' | 'installedWorkflows'>
+  registry: Pick<WorkflowRegistry, 'get' | 'getDevelopmentProject' | 'verifyIntegrity'>
+}
+
+function matchingDevelopmentSource(
+  project: WorkflowProject,
+  workflow: WorkflowDetail | undefined,
+  exact: Extract<ExactWorkflowSource, { source: 'development' }>,
+): WorkflowExecutionSource | undefined {
+  const manifest = project.manifest as Partial<WorkflowManifest> | undefined
+  if (!workflow
+    || project.status !== 'ready'
+    || project.buildHash !== exact.buildHash
+    || manifest?.id !== exact.id
+    || manifest.version !== exact.version
+    || typeof manifest.entryPath !== 'string'
+    || manifest.codeSha256 !== workflow.codeSha256
+    || workflow.id !== exact.id
+    || workflow.version !== exact.version
+    || workflow.source !== 'development'
+    || workflow.runtimeIdentity.source !== 'development'
+    || workflow.runtimeIdentity.buildHash !== exact.buildHash) return undefined
+  return { workflow, rootPath: project.rootPath, entryPath: manifest.entryPath, integrity: workflow.integrity }
+}
+
+export function createWorkflowExecutionSourceResolver(
+  selectors: WorkflowSourceSelectorVault,
+  dependencies: WorkflowExecutionSourceResolverDependencies,
+): WorkflowExecutionSourceResolver {
+  return {
+    async resolve(id, version, selector) {
+      if (selector) {
+        const exact = selectors.inspect(selector)
+        if (!exact || exact.id !== id || exact.version !== version) return undefined
+        if (exact.source === 'development') {
+          const matches = (await Promise.all(dependencies.repositories.workflowProjects.list().map(async (project) => (
+            matchingDevelopmentSource(project, await dependencies.registry.getDevelopmentProject(project.id), exact)
+          )))).filter((source): source is WorkflowExecutionSource => source !== undefined)
+          return matches.length === 1 ? matches[0] : undefined
+        }
+
+        const installed = dependencies.repositories.installedWorkflows.get(id, version)
+        const manifest = installed?.manifest as Partial<WorkflowManifest> | undefined
+        if (!installed
+          || manifest?.id !== exact.id
+          || manifest.version !== exact.version
+          || manifest.codeSha256 !== exact.codeSha256) return undefined
+        const integrity = await dependencies.registry.verifyIntegrity(id, version)
+        const workflow = await dependencies.registry.get(id, version, { developerMode: false })
+        if (!integrity.valid
+          || !workflow
+          || workflow.source !== 'installed'
+          || workflow.runtimeIdentity.source !== 'installed'
+          || workflow.codeSha256 !== exact.codeSha256) return undefined
+        return { workflow, rootPath: installed.installPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
+      }
+
+      const installed = dependencies.repositories.installedWorkflows.get(id, version)
+      if (installed) {
+        const integrity = await dependencies.registry.verifyIntegrity(id, version)
+        const workflow = await dependencies.registry.get(id, version, { developerMode: false })
+        if (!workflow || !integrity.valid) return undefined
+        const manifest = installed.manifest as WorkflowManifest
+        return { workflow, rootPath: installed.installPath, entryPath: manifest.entryPath, integrity: workflow.integrity }
+      }
+      for (const project of dependencies.repositories.workflowProjects.list()) {
+        const manifest = project.manifest as Partial<WorkflowManifest> | undefined
+        if (project.status !== 'ready' || manifest?.id !== id || manifest.version !== version) continue
+        const workflow = await dependencies.registry.getDevelopmentProject(project.id)
+        if (workflow) {
+          return { workflow, rootPath: project.rootPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
+        }
+      }
+      return undefined
+    },
+  }
+}
+
 function workflowId(name: string): string {
   const label = name.normalize('NFKD').toLocaleLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -595,54 +680,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
     return entry.promise
   }
-  const developmentSourceSelectors = new WeakMap<WorkflowExecutionSourceSelector, string>()
-  const selectDevelopmentProject = (projectId: string): WorkflowExecutionSourceSelector => {
-    const selector = Object.freeze({ kind: 'development-project' as const, projectId })
-    developmentSourceSelectors.set(selector, projectId)
-    return selector
-  }
+  const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const policy = new PolicyEngine(database.permissionGrants)
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
     workspace: options.browserWorkspace,
     currentUserId: async () => (await auth.getSession())?.user.id,
   })
-  const sourceResolver: WorkflowExecutionSourceResolver = {
-    async resolve(id, version, selector) {
-      if (selector) {
-        const projectId = developmentSourceSelectors.get(selector)
-        if (!projectId || selector.kind !== 'development-project' || selector.projectId !== projectId) return undefined
-        const project = database.workflowProjects.get(projectId)
-        const workflow = await registry.getDevelopmentProject(projectId)
-        if (!project || !workflow) return undefined
-        const manifest = JSON.parse(await projects.read(projectId, 'workflow.json')) as WorkflowManifest
-        if (manifest.id !== id || manifest.version !== version) return undefined
-        return {
-          workflow,
-          rootPath: project.rootPath,
-          entryPath: String(manifest.entryPath),
-          integrity: workflow.integrity,
-        }
-      }
-      const installed = database.installedWorkflows.get(id, version)
-      if (installed) {
-        const integrity = await registry.verifyIntegrity(id, version)
-        const workflow = await registry.get(id, version, { developerMode: false })
-        if (!workflow || !integrity.valid) return undefined
-        const manifest = installed.manifest as WorkflowManifest
-        return { workflow, rootPath: installed.installPath, entryPath: manifest.entryPath, integrity: workflow.integrity }
-      }
-      for (const project of database.workflowProjects.list()) {
-        const manifest = project.manifest as Partial<WorkflowManifest> | undefined
-        if (project.status !== 'ready' || manifest?.id !== id || manifest.version !== version) continue
-        const workflow = await registry.getDevelopmentProject(project.id)
-        if (workflow) {
-          return { workflow, rootPath: project.rootPath, entryPath: String(manifest.entryPath), integrity: workflow.integrity }
-        }
-      }
-      return undefined
-    },
-  }
+  const sourceResolver = createWorkflowExecutionSourceResolver(sourceSelectorVault, {
+    repositories: database,
+    registry,
+  })
 
   const activeExecutions = new Set<string>()
   const activeRequests = new Set<string>()
@@ -1175,12 +1223,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             if (typeof error === 'object' && error !== null && 'code' in error) throw error
             throw failure('INVALID_INPUT')
           }
+          const workflow = await registry.getDevelopmentProject(projectId)
+          if (!workflow) throw failure('WORKFLOW_INTEGRITY_FAILED')
           const started = await executions.start({
             userId: session.user.id,
             workflowId: manifest.id,
             workflowVersion: manifest.version,
             input,
-            sourceSelector: selectDevelopmentProject(projectId),
+            sourceSelector: sourceSelectorVault.create(workflow),
           })
           void started.finished.catch(() => undefined)
           return { executionId: started.id }

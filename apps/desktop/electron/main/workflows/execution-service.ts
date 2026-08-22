@@ -29,6 +29,7 @@ import type {
   ExecutionStep,
 } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
+import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
 
 const MAX_LINE_BYTES = 1024 * 1024
 
@@ -55,11 +56,6 @@ export interface WorkflowExecutionSourceResolver {
     version: string,
     selector?: WorkflowExecutionSourceSelector,
   ): Promise<WorkflowExecutionSource | undefined>
-}
-
-export interface WorkflowExecutionSourceSelector {
-  readonly kind: 'development-project'
-  readonly projectId: string
 }
 
 export interface TemporaryDirectoryPort {
