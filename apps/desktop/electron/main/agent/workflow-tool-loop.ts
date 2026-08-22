@@ -4,6 +4,7 @@ import { canonicalJson } from '../workflows/workflow-security-fingerprint.js'
 
 export const MAX_WORKFLOW_EXECUTIONS = 5
 export const MAX_MODEL_DECISIONS = 10
+export const MAX_BROWSER_ACTIONS = 30
 export const MAX_AGENT_ACTIVE_MS = 10 * 60_000
 export const APPROVAL_EXPIRY_MS = 30 * 60_000
 
@@ -25,6 +26,7 @@ export class WorkflowToolLoop {
   private readonly startsByIndex = new Map<number, StartedCandidate>()
   private decisions = 0
   private starts = 0
+  private browserActionCount = 0
   private repairedMultipleCalls = false
   private approvalStartedAt: number | undefined
   private pausedMs = 0
@@ -123,6 +125,21 @@ export class WorkflowToolLoop {
 
   workflowExecutions(): number {
     return this.starts
+  }
+
+  recordBrowserActions(count: number):
+    | { kind: 'recorded'; browserActions: number }
+    | LoopFailure {
+    if (!Number.isInteger(count) || count < 1) return { kind: 'failed', code: 'INVALID_INPUT' }
+    if (this.browserActionCount + count > MAX_BROWSER_ACTIONS) {
+      return { kind: 'failed', code: 'ACTION_LIMIT_EXCEEDED' }
+    }
+    this.browserActionCount += count
+    return { kind: 'recorded', browserActions: this.browserActionCount }
+  }
+
+  browserActions(): number {
+    return this.browserActionCount
   }
 
   awaitApproval(): void {

@@ -3,6 +3,7 @@ import type { ModelStreamEvent } from '../chat/model-provider.js'
 import {
   APPROVAL_EXPIRY_MS,
   MAX_AGENT_ACTIVE_MS,
+  MAX_BROWSER_ACTIONS,
   WorkflowToolLoop,
 } from './workflow-tool-loop.js'
 
@@ -46,6 +47,24 @@ describe('WorkflowToolLoop', () => {
       expect(loop.beginDecision()).toEqual({ kind: 'decision', decisionIndex: index })
     }
     expect(loop.beginDecision()).toEqual({ kind: 'failed', code: 'TOOL_CALL_LIMIT' })
+  })
+
+  it('counts browser actions separately from workflow starts and provider decisions', () => {
+    const loop = new WorkflowToolLoop({ now: () => 0 })
+
+    expect(loop.recordBrowserActions(MAX_BROWSER_ACTIONS)).toEqual({
+      kind: 'recorded', browserActions: 30,
+    })
+    expect(loop.recordBrowserActions(1)).toEqual({
+      kind: 'failed', code: 'ACTION_LIMIT_EXCEEDED',
+    })
+    expect(loop.browserActions()).toBe(30)
+    expect(loop.workflowExecutions()).toBe(0)
+    expect(loop.modelDecisions()).toBe(0)
+    expect(loop.startExecution('workflow', false, {})).toEqual({
+      kind: 'started', executionIndex: 1,
+    })
+    expect(loop.beginDecision()).toEqual({ kind: 'decision', decisionIndex: 1 })
   })
 
   it('allows one changed-input read-only retry only after a failed start', () => {

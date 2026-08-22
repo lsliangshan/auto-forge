@@ -85,6 +85,23 @@ describe('conversation context primitives', () => {
     expect(JSON.stringify(serialized)).not.toMatch(/a{64}|execution_1|workflow\.secret|1\.2\.3|input|result|path|scope/i)
   })
 
+  it('serializes browser status as concise provenance without binding or page data', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'browser_message', conversationId: 'c1', role: 'assistant', ordinal: 3, createdAt: 3,
+      blocks: [{
+        type: 'browser_status', blockId: 'status_private_snapshot_77', requestId: 'request_private_88',
+        bindingId: 'binding_private_99', siteLabel: '证件详情',
+        origin: 'https://permit.example.gov.cn', state: 'completed', actionSummary: '已读取证件状态',
+      }],
+    })
+
+    expect(serialized).toEqual({
+      role: 'assistant',
+      content: '[浏览器页面: 证件详情; 来源: https://permit.example.gov.cn; 操作: 已读取证件状态; 状态: completed]',
+    })
+    expect(JSON.stringify(serialized)).not.toMatch(/private_|binding|request|snapshot|audit|ref|filled|dataBase64|page excerpt/i)
+  })
+
   it('omits transient-only history and rejects unknown roles', () => {
     expect(serializeHistoricalMessage({
       id: 'm2', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,

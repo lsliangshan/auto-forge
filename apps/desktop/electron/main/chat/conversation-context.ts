@@ -102,6 +102,8 @@ function serializeBlock(block: ChatBlock): string[] {
       return block.entries.map((entry) => (
         `[已使用工作流: ${entry.workflowName}; 城市: ${entry.city ?? '不限城市'}; 状态: ${entry.status}]`
       ))
+    case 'browser_status':
+      return [`[浏览器页面: ${block.siteLabel}; 来源: ${block.origin}; 操作: ${block.actionSummary ?? '无'}; 状态: ${block.state}]`]
     case 'workflow_execution':
       return [`[工作流执行: ${block.executionId}]`]
     case 'execution_result':
