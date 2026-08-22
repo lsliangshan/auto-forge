@@ -332,6 +332,114 @@ describe('ElectronBrowserWorkspace', () => {
     expect(commands.some(({ method }) => method === 'Runtime.evaluate')).toBe(false)
   })
 
+  it('returns the complete safe AX tree so inspector pagination and late protected descendants remain visible', async () => {
+    const rawNodes = [
+      {
+        nodeId: 'ax_main', backendDOMNodeId: 10, frameId: 'frame_main', ignored: false,
+        role: { value: 'main' }, name: { value: '结果' },
+      },
+      {
+        nodeId: 'ax_image', parentId: 'ax_main', backendDOMNodeId: 11, frameId: 'frame_main', ignored: false,
+        role: { value: 'img' }, name: { value: '结果图' },
+      },
+      ...Array.from({ length: 2_000 }, (_, index) => ({
+        nodeId: `ax_${index + 100}`, parentId: 'ax_main', backendDOMNodeId: index + 100,
+        frameId: 'frame_main', ignored: false, role: { value: 'row' }, name: { value: `结果 ${index}` },
+      })),
+      {
+        nodeId: 'ax_protected', parentId: 'ax_image', backendDOMNodeId: 2_100,
+        frameId: 'frame_main', ignored: false, role: { value: 'textbox' }, name: { value: '银行卡支付' },
+      },
+      {
+        nodeId: 'ax_tail', parentId: 'ax_main', backendDOMNodeId: 2_101,
+        frameId: 'frame_main', ignored: false, role: { value: 'staticText' }, name: { value: '末页公开信息' },
+      },
+    ]
+    const respond = (method: string, params?: unknown) => {
+      const input = params as { backendNodeId?: number } | undefined
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+      if (method === 'Accessibility.getFullAXTree') return { nodes: rawNodes }
+      if (method === 'DOM.describeNode') return {
+        node: { backendNodeId: input?.backendNodeId, nodeName: 'DIV', attributes: [] },
+      }
+      if (method === 'Page.getLayoutMetrics') return {
+        cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 },
+      }
+      return {}
+    }
+    const { workspace } = createHarness(respond)
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'agent_run_1')
+
+    const result = await workspace.readAccessibilitySnapshot({
+      tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, locators: [],
+    })
+
+    expect(result.nodes).toHaveLength(rawNodes.length)
+    expect(result.nodes).toContainEqual(expect.objectContaining({
+      backendNodeId: 2_100, parentAxNodeId: 'ax_image', name: '银行卡支付',
+    }))
+    expect(result.nodes.at(-1)).toMatchObject({ backendNodeId: 2_101, name: '末页公开信息' })
+  })
+
+  it.each([
+    ['node resolution', 'Accessibility.getPartialAXTree'],
+    ['box lookup', 'Page.getLayoutMetrics'],
+    ['screenshot capture', 'Page.captureScreenshot'],
+  ] as const)('rejects same-origin navigation racing %s', async (kind, navigationCommand) => {
+    let target: FakeWebContents | undefined
+    let navigate = false
+    const respond = (method: string, params?: unknown) => {
+      const input = params as { backendNodeId?: number } | undefined
+      if (navigate && method === navigationCommand) {
+        navigate = false
+        target!.currentUrl = 'https://www.baidu.com/changed'
+        target!.emit('did-navigate', {}, target!.currentUrl)
+      }
+      if (method === 'DOM.describeNode') return {
+        node: { backendNodeId: input?.backendNodeId, nodeName: 'IMG', attributes: [] },
+      }
+      if (method === 'Accessibility.getPartialAXTree') return { nodes: [{
+        nodeId: 'ax_image', backendDOMNodeId: input?.backendNodeId, frameId: 'frame_main', ignored: false,
+        role: { value: 'img' }, name: { value: '结果图' },
+      }] }
+      if (method === 'DOM.getBoxModel') return {
+        model: { content: [20, 30, 340, 30, 340, 230, 20, 230] },
+      }
+      if (method === 'Page.getLayoutMetrics') return {
+        cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 },
+      }
+      if (method === 'Page.captureScreenshot') return { data: 'stale-png-data' }
+      return {}
+    }
+    const harness = createHarness(respond)
+    const tab = await harness.workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+    await harness.workspace.releaseExecution('e1')
+    await harness.workspace.acquireContinuation(tab.id, 'agent_run_1')
+    target = harness.views[1]!.webContents
+    const request = {
+      tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 11,
+    }
+    navigate = true
+
+    const operation = kind === 'node resolution'
+      ? harness.workspace.readNode(request)
+      : kind === 'box lookup'
+        ? harness.workspace.getContinuationNodeBox(request)
+        : harness.workspace.captureContinuationNodeScreenshot({
+          ...request,
+          clip: { x: 20, y: 30, width: 320, height: 200 },
+          expectedRole: 'img', expectedName: '结果图', expectedTagName: 'img',
+        })
+
+    await expect(operation).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+  })
+
   it('notifies inspectors and rejects stale adapter reads after navigation and close', async () => {
     const { workspace, views } = createHarness((method) => {
       if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
@@ -468,6 +576,113 @@ describe('ElectronBrowserWorkspace', () => {
     expect(replacement.ownerRunId).toBe('run_3')
     await lease.release()
     await replacement.release()
+  })
+
+  it.each(['read', 'screenshot'] as const)(
+    'lets real user input take over during a pending continuation %s and cancels stale output',
+    async (operation) => {
+      const gate = deferred<unknown>()
+      const respond = (method: string, params?: unknown) => {
+        const input = params as { backendNodeId?: number } | undefined
+        if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+        if (method === 'Accessibility.getFullAXTree') return operation === 'read' ? gate.promise : { nodes: [] }
+        if (method === 'DOM.describeNode') return {
+          node: { backendNodeId: input?.backendNodeId, nodeName: 'IMG', attributes: [] },
+        }
+        if (method === 'Accessibility.getPartialAXTree') return { nodes: [{
+          nodeId: 'ax_image', backendDOMNodeId: input?.backendNodeId, frameId: 'frame_main', ignored: false,
+          role: { value: 'img' }, name: { value: '结果图' },
+        }] }
+        if (method === 'DOM.getBoxModel') return {
+          model: { content: [20, 30, 340, 30, 340, 230, 20, 230] },
+        }
+        if (method === 'Page.getLayoutMetrics') return {
+          cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 },
+        }
+        if (method === 'Page.captureScreenshot') return gate.promise
+        return {}
+      }
+      const { workspace, views } = createHarness(respond)
+      const input = executionInput()
+      const tab = await workspace.acquire(input)
+      await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+      const registry = continuationRegistry(workspace)
+      workspace.setContinuationRegistry(registry)
+      const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+      await workspace.releaseExecution(input.executionId)
+      const lease = await registry.acquire(binding.bindingId, {
+        userId: input.userId, conversationId: input.conversationId!, runId: 'run_reading',
+      })
+      const invalidated = vi.fn()
+      workspace.onPageInvalidated(invalidated)
+      const request = {
+        tabId: tab.id, runId: 'run_reading', expectedOrigin: 'https://www.baidu.com',
+        expectedNavigationEpoch: tab.navigationEpoch,
+      }
+      const pending = operation === 'read'
+        ? workspace.readAccessibilitySnapshot({ ...request, locators: [] })
+        : workspace.captureContinuationNodeScreenshot({
+          ...request, backendNodeId: 11,
+          clip: { x: 20, y: 30, width: 320, height: 200 },
+          expectedRole: 'img', expectedName: '结果图', expectedTagName: 'img',
+        })
+      await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+        .toContainEqual(expect.objectContaining({
+          method: operation === 'read' ? 'Accessibility.getFullAXTree' : 'Page.captureScreenshot',
+        })))
+
+      views[1]!.webContents.emit(
+        operation === 'read' ? 'before-input-event' : 'before-mouse-event', {},
+        operation === 'read' ? { type: 'keyDown', key: 'A' } : { type: 'mouseDown' },
+      )
+      expect(invalidated).toHaveBeenCalledWith(tab.id)
+      expect(lease.isCurrent(binding)).toBe(false)
+      gate.resolve(operation === 'read' ? { nodes: [] } : { data: 'stale-png-data' })
+
+      await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' })
+      const replacement = await registry.acquire(binding.bindingId, {
+        userId: input.userId, conversationId: input.conversationId!, runId: 'run_after_takeover',
+      })
+      expect(replacement.ownerRunId).toBe('run_after_takeover')
+      await lease.release()
+      await replacement.release()
+    },
+  )
+
+  it('does not mistake executor-dispatched pointer input for real user takeover', async () => {
+    const dispatched = deferred<unknown>()
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '继续' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method]
+      ?? (method === 'Input.dispatchMouseEvent' ? dispatched.promise : {})
+    const { workspace, views } = createHarness(respond)
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    await tab.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    await workspace.releaseExecution(input.executionId)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_clicking',
+    })
+
+    const clicking = tab.click('role=button[name="继续"]', 'https://www.baidu.com')
+    await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+      .toContainEqual(expect.objectContaining({ method: 'Input.dispatchMouseEvent' })))
+    views[1]!.webContents.emit('before-mouse-event', {}, { type: 'mouseDown' })
+
+    expect(lease.isCurrent(binding)).toBe(true)
+    await expect(registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_not_takeover',
+    })).rejects.toMatchObject({ code: 'PAGE_BUSY' })
+    dispatched.resolve({})
+    await clicking
+    await lease.release()
   })
 
   it.each(['back', 'forward', 'reload'] as const)(

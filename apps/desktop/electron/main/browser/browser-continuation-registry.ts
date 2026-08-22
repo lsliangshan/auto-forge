@@ -147,6 +147,10 @@ export class BrowserContinuationRegistry {
     return Object.freeze({
       binding,
       ownerRunId: input.runId,
+      isCurrent: (candidate: BrowserContinuationBinding) => !released
+        && candidate === binding
+        && this.bindings.get(bindingId) === binding
+        && this.leaseOwners.get(bindingId) === input.runId,
       release: async () => {
         if (released) return
         released = true

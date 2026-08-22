@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { BrowserContinuationBinding } from './browser-continuation-types.js'
+import type {
+  BrowserContinuationBinding,
+  BrowserContinuationLease,
+} from './browser-continuation-types.js'
+import { BrowserContinuationRegistry } from './browser-continuation-registry.js'
 import {
   BrowserPageInspector,
   type BrowserInspectionNode,
@@ -115,8 +119,16 @@ function input(
   exactBinding = binding(),
   overrides: Record<string, unknown> = {},
 ) {
+  const runId = typeof overrides.runId === 'string' ? overrides.runId : 'agent_run_1'
+  const lease: BrowserContinuationLease = Object.freeze({
+    binding: exactBinding,
+    ownerRunId: runId,
+    isCurrent: (candidate: BrowserContinuationBinding) => candidate === exactBinding,
+    release: async () => undefined,
+  })
   return {
-    runId: 'agent_run_1',
+    lease,
+    runId,
     binding: exactBinding,
     tabId: 'tab_1',
     navigationEpoch: 4,
@@ -125,6 +137,12 @@ function input(
     mode: 'semantic' as const,
     ...overrides,
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
 }
 
 function idSequence(): () => string {
@@ -154,7 +172,7 @@ describe('BrowserPageInspector', () => {
 
     expect(snapshot).toMatchObject({
       bindingId: 'binding_1', origin, navigationEpoch: 4, auth: 'unknown',
-      url: `${origin}/person-platform/detail`, capturedAt: '2026-08-22T16:20:00.000Z',
+      url: origin, capturedAt: '2026-08-22T16:20:00.000Z',
     })
     expect(snapshot.nodes).toContainEqual(expect.objectContaining({
       role: 'textbox', name: '有效期至', value: '2028-06-30', actions: [],
@@ -174,6 +192,50 @@ describe('BrowserPageInspector', () => {
         'role=main',
       ],
     }))
+  })
+
+  it.each([
+    `${origin}/person/alice@example.com`,
+    `${origin}/person/alice%40example.com`,
+    `${origin}/person/alice%2540example.com`,
+    `${origin}/record/deadbeef-dead-4bad-8bad-deadbeefcafe`,
+    `${origin}/record/deadbeef%2Ddead%2D4bad%2D8bad%2Ddeadbeefcafe`,
+    `${origin}/record/deadbeef%252Ddead%252D4bad%252D8bad%252Ddeadbeefcafe`,
+  ])('reduces identity-bearing model URLs to safe origin provenance: %s', async (url) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+    ], { url })
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.url).toBe(origin)
+    expect(JSON.stringify(snapshot)).not.toMatch(/alice|deadbeef|%40|%2540|%2D|%252D/i)
+  })
+
+  it('drops filesystem and identity-bearing text without over-redacting Chinese labels or dates', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '/Users/alice/private.txt'),
+      node(12, 'statictext', 'C:\\Users\\Alice\\private.txt'),
+      node(13, 'statictext', 'alice@example.com'),
+      node(14, 'statictext', 'deadbeef-dead-4bad-8bad-deadbeefcafe'),
+      node(15, 'statictext', 'alice%40example.com'),
+      node(16, 'statictext', 'alice%2540example.com'),
+      node(17, 'statictext', 'deadbeef%2Ddead%2D4bad%2D8bad%2Ddeadbeefcafe'),
+      node(18, 'statictext', 'deadbeef%252Ddead%252D4bad%252D8bad%252Ddeadbeefcafe'),
+      node(19, 'textbox', '有效期至', { value: '2028-06-30' }),
+      node(20, 'statictext', '北京市政务服务'),
+    ], { title: 'file:///Users/alice/private.txt' })
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+    const serialized = JSON.stringify(snapshot)
+
+    expect(snapshot.title).toBe('')
+    expect(snapshot.nodes).toContainEqual(expect.objectContaining({ name: '北京市政务服务' }))
+    expect(snapshot.nodes).toContainEqual(expect.objectContaining({ name: '有效期至', value: '2028-06-30' }))
+    expect(serialized).not.toMatch(/Users|private\.txt|alice|deadbeef|%40|%2540|%2D|%252D/i)
   })
 
   it.each([
@@ -287,6 +349,67 @@ describe('BrowserPageInspector', () => {
     expect(crossOriginActions).toMatchObject({ 姓名: [], 类别: [], 查询: ['click'] })
   })
 
+  it('derives policy only from the actual live registry lease binding', async () => {
+    const registry = new BrowserContinuationRegistry({
+      workspace: {
+        acquireContinuation: vi.fn(async () => undefined),
+        releaseContinuation: vi.fn(async () => undefined),
+        closeContinuation: vi.fn(async () => undefined),
+      },
+      repository: {
+        insert: vi.fn((value) => value),
+        terminate: vi.fn(() => undefined),
+      },
+      id: () => 'binding_1',
+      now: () => 1,
+    })
+    const actualBinding = registry.bind({
+      tabId: 'tab_1', userId: 'user_1', conversationId: 'conversation_1',
+      chatRunId: 'workflow_chat_run_1', executionId: 'execution_1', workflowId: 'workflow.one',
+      workflowVersion: '1.0.0', source: 'installed', securityFingerprint: 'a'.repeat(64),
+      permissionMatrix: {
+        'browser.open': [`${origin}/*`],
+        'browser.click': [`${origin}/*`],
+      },
+      browserContinuation: { readableRegions: ['role=main'] },
+    })
+    const actualLease = await registry.acquire(actualBinding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'agent_run_1',
+    })
+    const replacementBinding = deepFreeze({
+      ...actualBinding,
+      permissionMatrix: {
+        ...actualBinding.permissionMatrix,
+        'browser.fill': [`${origin}/*`],
+      },
+    })
+    const port = new FakeCdpPort([
+      node(10, 'main', '表单', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'textbox', '姓名'),
+      node(12, 'button', '查询'),
+    ])
+    port.page = { ...port.page, locatorMatches: [{ locator: 'role=main', backendNodeIds: [10] }] }
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const independentPolicyInput = {
+      ...input(actualBinding),
+      lease: actualLease,
+      binding: replacementBinding,
+    }
+    const snapshot = await inspector.inspect(independentPolicyInput)
+    expect(Object.fromEntries(snapshot.nodes.map((candidate) => [candidate.name, candidate.actions])))
+      .toMatchObject({ 姓名: [], 查询: ['click'] })
+
+    const replacementLease = Object.freeze({ ...actualLease, binding: replacementBinding })
+    const replacementPolicyInput = {
+      ...input(replacementBinding),
+      lease: replacementLease,
+      binding: replacementBinding,
+    }
+    await expect(inspector.inspect(replacementPolicyInput)).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    await actualLease.release()
+  })
+
   it('paginates under exact byte/node limits with an opaque single-owner cursor', async () => {
     const manyNodes = [
       node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
@@ -311,7 +434,7 @@ describe('BrowserPageInspector', () => {
       ...binding({ readableRegions: ['role=main'] }), bindingId: 'binding_2',
     })
     await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), {
-      binding: otherBinding, cursor: first.cursor,
+      lease: input(otherBinding).lease, cursor: first.cursor,
     }))).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
 
     const second = await inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor }))
@@ -320,6 +443,51 @@ describe('BrowserPageInspector', () => {
     expect(second.serializedBytes).toBeLessThanOrEqual(128 * 1024)
     await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor })))
       .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+  })
+
+  it('claims a cursor atomically so concurrent consumers get exactly one page', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      ...Array.from({ length: 620 }, (_, index) => node(100 + index, 'row', `结果 ${index}`)),
+    ])
+    port.page = { ...port.page, locatorMatches: [{ locator: 'role=main', backendNodeIds: [10] }] }
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const first = await inspector.inspect(input(binding({ readableRegions: ['role=main'] })))
+    const gate = deferred<BrowserPageReadResult>()
+    port.readAccessibilitySnapshot.mockImplementation(async () => gate.promise)
+
+    const competing = [
+      inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor })),
+      inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor })),
+    ]
+    gate.resolve(port.page)
+    const settled = await Promise.allSettled(competing)
+
+    expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = settled.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]!.reason).toMatchObject({ code: 'PAGE_CHANGED' })
+    await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor })))
+      .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+  })
+
+  it('consumes a claimed cursor even when the page revalidation fails', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      ...Array.from({ length: 620 }, (_, index) => node(100 + index, 'row', `结果 ${index}`)),
+    ])
+    port.page = { ...port.page, locatorMatches: [{ locator: 'role=main', backendNodeIds: [10] }] }
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const first = await inspector.inspect(input(binding({ readableRegions: ['role=main'] })))
+    port.readAccessibilitySnapshot.mockRejectedValueOnce(
+      Object.assign(new Error('navigation raced the cursor'), { code: 'PAGE_CHANGED' }),
+    )
+
+    await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor })))
+      .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: first.cursor })))
+      .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(port.readAccessibilitySnapshot).toHaveBeenCalledTimes(2)
   })
 
   it('paginates after exactly 500 short semantic nodes even when the byte budget has room', async () => {
@@ -342,34 +510,62 @@ describe('BrowserPageInspector', () => {
     expect(second.nodes).toHaveLength(121)
   })
 
+  it('preserves pagination and blocks an ancestor image when protection appears beyond the old AX cutoff', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'img', '结果图', { axNodeId: 'ax_result' }),
+      ...Array.from({ length: 2_000 }, (_, index) => node(100 + index, 'row', `结果 ${index}`)),
+      node(2_100, 'statictext', '末页公开信息'),
+      node(2_101, 'textbox', '银行卡支付', { parentAxNodeId: 'ax_result' }),
+    ])
+    port.page = { ...port.page, locatorMatches: [{ locator: 'role=main', backendNodeIds: [10] }] }
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    let page = await inspector.inspect(input(binding({ readableRegions: ['role=main'] })))
+    const exposedNames = [...page.nodes.map((candidate) => candidate.name)]
+    const target = page.nodes.find((candidate) => candidate.name === '结果图')!
+    while (page.cursor) {
+      page = await inspector.inspect(input(binding({ readableRegions: ['role=main'] }), { cursor: page.cursor }))
+      exposedNames.push(...page.nodes.map((candidate) => candidate.name))
+    }
+
+    expect(exposedNames).toContain('末页公开信息')
+    await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), {
+      mode: 'region_image', ref: target.ref, visionSupported: true,
+    }))).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.captureNodeScreenshot).not.toHaveBeenCalled()
+  })
+
   it('invalidates refs on navigation, origin change, tab close, and terminal run cleanup', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '详情', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
       node(11, 'textbox', '有效期至', { value: '2028-06-30' }),
     ])
     const inspector = new BrowserPageInspector(port, { id: idSequence() })
-    const first = await inspector.inspect(input(binding({ readableRegions: ['role=main'] })))
+    const authority = input(binding({ readableRegions: ['role=main'] }))
+    const first = await inspector.inspect(authority)
     const target = first.nodes.find((candidate) => candidate.name === '有效期至')!
 
     await expect(inspector.resolveRef({
-      runId: 'agent_run_1', bindingId: 'binding_1', tabId: 'tab_1', snapshotId: first.snapshotId,
+      lease: authority.lease, tabId: 'tab_1', snapshotId: first.snapshotId,
       navigationEpoch: 5, origin, ref: target.ref,
     })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
     await expect(inspector.resolveRef({
-      runId: 'agent_run_1', bindingId: 'binding_1', tabId: 'tab_1', snapshotId: first.snapshotId,
+      lease: authority.lease, tabId: 'tab_1', snapshotId: first.snapshotId,
       navigationEpoch: 4, origin: 'https://other.example', ref: target.ref,
     })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
 
     port.invalidate()
     await expect(inspector.resolveRef({
-      runId: 'agent_run_1', bindingId: 'binding_1', tabId: 'tab_1', snapshotId: first.snapshotId,
+      lease: authority.lease, tabId: 'tab_1', snapshotId: first.snapshotId,
       navigationEpoch: 4, origin, ref: target.ref,
     })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
 
-    const next = await inspector.inspect(input(binding({ readableRegions: ['role=main'] })))
+    const nextAuthority = input(binding({ readableRegions: ['role=main'] }))
+    const next = await inspector.inspect(nextAuthority)
     inspector.endRun('agent_run_1')
     await expect(inspector.resolveRef({
-      runId: 'agent_run_1', bindingId: 'binding_1', tabId: 'tab_1', snapshotId: next.snapshotId,
+      lease: nextAuthority.lease, tabId: 'tab_1', snapshotId: next.snapshotId,
       navigationEpoch: 4, origin, ref: next.nodes[0]!.ref,
     })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
   })
@@ -416,6 +612,35 @@ describe('BrowserPageInspector', () => {
       mode: 'region_image', ref: target.ref, visionSupported: true,
     }))).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
     expect(port.captureNodeScreenshot).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    {
+      kind: 'payment',
+      parent: node(11, 'group', '银行卡支付', { axNodeId: 'ax_restricted' }),
+      child: node(12, 'img', '银行标志', { parentAxNodeId: 'ax_restricted' }),
+    },
+    {
+      kind: 'authentication',
+      parent: node(11, 'textbox', '账户口令', {
+        axNodeId: 'ax_restricted', dom: { tagName: 'input', inputType: 'password' },
+      }),
+      child: node(12, 'img', '账户标志', { parentAxNodeId: 'ax_restricted' }),
+    },
+  ])('refuses a benign child inside a $kind restricted subtree', async ({ parent, child }) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '详情', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      parent,
+      child,
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const snapshot = await inspector.inspect(input(binding({ readableRegions: ['role=main'] })))
+    const exposed = snapshot.nodes.find((candidate) => candidate.name === child.name)!
+
+    await expect(inspector.inspect(input(binding({ readableRegions: ['role=main'] }), {
+      mode: 'region_image', ref: exposed.ref, visionSupported: true,
+    }))).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.captureNodeScreenshot).not.toHaveBeenCalled()
   })
 
   it.each([

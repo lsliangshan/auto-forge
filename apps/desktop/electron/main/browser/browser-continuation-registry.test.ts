@@ -132,6 +132,8 @@ describe('BrowserContinuationRegistry', () => {
     const lease = await test.registry.acquire(binding.bindingId, {
       userId: binding.userId, conversationId: binding.conversationId, runId: 'chat_run_2',
     })
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(lease.isCurrent(Object.freeze({ ...binding }))).toBe(false)
     await expect(test.registry.acquire(binding.bindingId, {
       userId: binding.userId, conversationId: binding.conversationId, runId: 'chat_run_3',
     })).rejects.toMatchObject({ code: 'PAGE_BUSY' })
@@ -139,6 +141,7 @@ describe('BrowserContinuationRegistry', () => {
 
     await lease.release()
     await lease.release()
+    expect(lease.isCurrent(binding)).toBe(false)
     expect(test.owners.has(binding.tabId)).toBe(false)
   })
 

@@ -7,6 +7,7 @@ import {
 } from '@autoforge/shared'
 import type {
   BrowserContinuationBinding,
+  BrowserContinuationLease,
   BrowserPageSnapshot,
   BrowserRegionImage,
   BrowserSemanticNode,
@@ -95,8 +96,7 @@ export interface BrowserPageCdpPort {
 }
 
 export interface BrowserPageInspectInput {
-  readonly runId: string
-  readonly binding: BrowserContinuationBinding
+  readonly lease: BrowserContinuationLease
   readonly tabId: string
   readonly navigationEpoch: number
   readonly origin: string
@@ -108,8 +108,7 @@ export interface BrowserPageInspectInput {
 }
 
 export interface BrowserRefResolutionInput {
-  readonly runId: string
-  readonly bindingId: string
+  readonly lease: BrowserContinuationLease
   readonly tabId: string
   readonly snapshotId: string
   readonly navigationEpoch: number
@@ -192,6 +191,9 @@ const secretText = /(?:authorization|bearer|cookie|session[-_ ]?(?:id|key|secret
 const chineseIdentity = /\b\d{17}[\dXx]\b|\b\d{15}\b/u
 const longPrivateNumber = /\b\d{8,}\b/u
 const safeDate = /^\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?$/u
+const emailAddress = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/iu
+const uuid = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu
+const filesystemPath = /(?:\bfile\s*:|\b(?:file|folder|directory)path\s*[:=]|(?:^|[\s="'(:])\/(?:[^\s/]+\/)*[^\s/]+|\b[A-Za-z]:[\\/]|(?:^|[\s="'(])\\\\[^\\/\s]+[\\/][^\\/\s]+)/iu
 
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
@@ -208,8 +210,23 @@ function normalizedText(value: string): string {
 }
 
 function sensitiveText(value: string): boolean {
-  if (secretText.test(value) || chineseIdentity.test(value)) return true
-  return !safeDate.test(value) && longPrivateNumber.test(value)
+  let candidate = value
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (secretText.test(candidate)
+      || chineseIdentity.test(candidate)
+      || emailAddress.test(candidate)
+      || uuid.test(candidate)
+      || filesystemPath.test(candidate)
+      || (!safeDate.test(candidate) && longPrivateNumber.test(candidate))) return true
+    try {
+      const decoded = decodeURIComponent(candidate)
+      if (decoded === candidate) break
+      candidate = decoded
+    } catch {
+      break
+    }
+  }
+  return false
 }
 
 function safeText(value: string): string | undefined {
@@ -222,14 +239,7 @@ function safeUrl(value: string, expectedOrigin: string): string {
   try {
     const url = new URL(value)
     if (url.protocol !== 'https:' || url.origin !== expectedOrigin) return expectedOrigin
-    let decodedPath: string
-    try { decodedPath = decodeURIComponent(url.pathname) } catch { return expectedOrigin }
-    if (!safeText(decodedPath)) return expectedOrigin
-    url.username = ''
-    url.password = ''
-    url.search = ''
-    url.hash = ''
-    return url.toString().replace(/\/$/u, url.pathname === '/' ? '' : '/')
+    return expectedOrigin
   } catch {
     return expectedOrigin
   }
@@ -329,8 +339,16 @@ export class BrowserPageInspector {
   }
 
   async resolveRef(input: BrowserRefResolutionInput): Promise<BrowserResolvedElementReference> {
+    const binding = this.liveBinding(input.lease)
     const state = this.refs.get(input.ref)
-    if (!state || !this.sameIdentity(state, input)) throw failure('PAGE_CHANGED')
+    if (!state || !this.sameIdentity(state, {
+      runId: input.lease.ownerRunId,
+      bindingId: binding.bindingId,
+      tabId: input.tabId,
+      snapshotId: input.snapshotId,
+      navigationEpoch: input.navigationEpoch,
+      origin: input.origin,
+    })) throw failure('PAGE_CHANGED')
     let current: BrowserInspectionNode | undefined
     try {
       current = await this.port.readNode({
@@ -357,6 +375,7 @@ export class BrowserPageInspector {
       this.refs.delete(input.ref)
       throw failure('PAGE_CHANGED')
     }
+    this.liveBinding(input.lease)
     return Object.freeze({
       snapshotId: state.snapshotId,
       ref: state.ref,
@@ -378,24 +397,27 @@ export class BrowserPageInspector {
   }
 
   private async captureSemantic(input: BrowserPageInspectInput): Promise<BrowserPageSnapshot> {
-    const locators = this.policyLocators(input.binding)
+    const binding = this.liveBinding(input.lease)
+    const runId = input.lease.ownerRunId
+    const locators = this.policyLocators(binding)
     const page = await this.port.readAccessibilitySnapshot({
       tabId: input.tabId,
-      runId: input.runId,
+      runId,
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
       locators,
     })
+    this.liveBinding(input.lease)
     this.assertPage(input, page)
-    const matchingPatterns = Object.values(input.binding.permissionMatrix).flat()
+    const matchingPatterns = Object.values(binding.permissionMatrix).flat()
     if (!matchingPatterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) {
       throw failure('DOMAIN_BLOCKED')
     }
 
     const mainFrameNodes = page.nodes.filter((node) => node.frameId === undefined || node.frameId === page.frameId)
     const visibleNodes = mainFrameNodes.filter((node) => !node.ignored && !node.dom.hidden)
-    const auth = this.classifyAuth(input.binding, page, visibleNodes)
-    const readable = this.readableNodes(input.binding, page, mainFrameNodes, visibleNodes)
+    const auth = this.classifyAuth(binding, page, visibleNodes)
+    const readable = this.readableNodes(binding, page, mainFrameNodes, visibleNodes)
     const restrictedRegions = this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes)
     const candidates = readable.flatMap((node): SafeCandidate[] => {
       const role = normalizedRole(node.role)
@@ -417,7 +439,7 @@ export class BrowserPageInspector {
         enabled: node.enabled,
         ...(node.checked === undefined ? {} : { checked: node.checked }),
         ...(node.selected === undefined ? {} : { selected: node.selected }),
-        actions: actionsFor(node, role, input.binding, page.url),
+        actions: actionsFor(node, role, binding, page.url),
         imageRestricted: restrictedRegions.has(node.backendNodeId),
         tagName: node.dom.tagName.toLowerCase(),
         ...(node.dom.inputType === undefined ? {} : { inputType: node.dom.inputType.toLowerCase() }),
@@ -426,8 +448,8 @@ export class BrowserPageInspector {
     const snapshotId = this.opaque('snapshot')
     const capturedAt = new Date(this.now()).toISOString()
     return this.pageFromCandidates({
-      runId: input.runId,
-      bindingId: input.binding.bindingId,
+      runId,
+      bindingId: binding.bindingId,
       tabId: input.tabId,
       snapshotId,
       navigationEpoch: input.navigationEpoch,
@@ -442,24 +464,27 @@ export class BrowserPageInspector {
   }
 
   private async nextPage(input: BrowserPageInspectInput): Promise<BrowserPageSnapshot> {
+    const binding = this.liveBinding(input.lease)
+    const runId = input.lease.ownerRunId
     const state = this.cursors.get(input.cursor!)
     if (!state || !this.sameIdentity(state, {
-      runId: input.runId,
-      bindingId: input.binding.bindingId,
+      runId,
+      bindingId: binding.bindingId,
       tabId: input.tabId,
       snapshotId: state?.snapshotId ?? '',
       navigationEpoch: input.navigationEpoch,
       origin: input.origin,
     })) throw failure('PAGE_CHANGED')
+    this.cursors.delete(state.cursor)
     const page = await this.port.readAccessibilitySnapshot({
       tabId: input.tabId,
-      runId: input.runId,
+      runId,
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
-      locators: this.policyLocators(input.binding),
+      locators: this.policyLocators(binding),
     })
+    this.liveBinding(input.lease)
     this.assertPage(input, page)
-    this.cursors.delete(state.cursor)
     return this.pageFromCandidates(state)
   }
 
@@ -583,11 +608,12 @@ export class BrowserPageInspector {
 
   private async captureRegion(input: BrowserPageInspectInput): Promise<BrowserRegionImage> {
     if (!input.visionSupported || !input.ref || input.cursor) throw failure('UNSUPPORTED_CONTROL')
+    const binding = this.liveBinding(input.lease)
+    const runId = input.lease.ownerRunId
     const state = this.refs.get(input.ref)
     if (!state) throw failure('PAGE_CHANGED')
     const resolved = await this.resolveRef({
-      runId: input.runId,
-      bindingId: input.binding.bindingId,
+      lease: input.lease,
       tabId: input.tabId,
       snapshotId: state.snapshotId,
       navigationEpoch: input.navigationEpoch,
@@ -597,18 +623,19 @@ export class BrowserPageInspector {
     if (state.imageRestricted) throw failure('UNSUPPORTED_CONTROL')
     const page = await this.port.readAccessibilitySnapshot({
       tabId: input.tabId,
-      runId: input.runId,
+      runId,
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
-      locators: this.policyLocators(input.binding),
+      locators: this.policyLocators(binding),
     })
+    this.liveBinding(input.lease)
     this.assertPage(input, page)
-    const patterns = Object.values(input.binding.permissionMatrix).flat()
+    const patterns = Object.values(binding.permissionMatrix).flat()
     if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) throw failure('DOMAIN_BLOCKED')
     const mainFrameNodes = page.nodes.filter((node) => node.frameId === undefined || node.frameId === page.frameId)
     const visibleNodes = mainFrameNodes.filter((node) => !node.ignored && !node.dom.hidden)
     const current = visibleNodes.find((node) => node.backendNodeId === state.backendNodeId)
-    const readable = this.readableNodes(input.binding, page, mainFrameNodes, visibleNodes)
+    const readable = this.readableNodes(binding, page, mainFrameNodes, visibleNodes)
     const readableIds = new Set(readable.map((node) => node.backendNodeId))
     if (!current
       || !readableIds.has(current.backendNodeId)
@@ -622,6 +649,7 @@ export class BrowserPageInspector {
       expectedNavigationEpoch: state.navigationEpoch,
       backendNodeId: state.backendNodeId,
     })
+    this.liveBinding(input.lease)
     const values = [box.x, box.y, box.width, box.height, box.viewportWidth, box.viewportHeight]
     const fullPage = ['html', 'body'].includes(current.dom.tagName.toLowerCase())
       || normalizedRole(current.role) === 'document'
@@ -649,6 +677,7 @@ export class BrowserPageInspector {
       expectedTagName: state.tagName,
       ...(state.inputType === undefined ? {} : { expectedInputType: state.inputType }),
     })
+    this.liveBinding(input.lease)
     return Object.freeze({
       snapshotId: state.snapshotId,
       bindingId: state.bindingId,
@@ -663,18 +692,29 @@ export class BrowserPageInspector {
   }
 
   private assertBinding(input: BrowserPageInspectInput): void {
+    const binding = this.liveBinding(input.lease)
     let exactOrigin: string | undefined
     try {
       const url = new URL(input.origin)
       if (url.protocol === 'https:') exactOrigin = url.origin
     } catch { /* rejected below as a safe invalid input */ }
-    if (input.runId.length === 0
-      || input.binding.bindingId === ''
-      || input.binding.tabId !== input.tabId
-      || input.binding.status !== 'active'
+    if (input.lease.ownerRunId.length === 0
+      || binding.bindingId === ''
+      || binding.tabId !== input.tabId
+      || binding.status !== 'active'
       || input.intent.trim().length === 0
       || input.intent.length > 2_000
       || input.origin !== exactOrigin) throw failure('INVALID_INPUT')
+  }
+
+  private liveBinding(lease: BrowserContinuationLease): BrowserContinuationBinding {
+    try {
+      if (!lease.isCurrent(lease.binding)) throw failure('PAGE_CHANGED')
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 'PAGE_CHANGED') throw error
+      throw failure('PAGE_CHANGED')
+    }
+    return lease.binding
   }
 
   private assertPage(input: BrowserPageInspectInput, page: BrowserPageReadResult): void {
@@ -697,6 +737,13 @@ export class BrowserPageInspector {
     visibleNodes: readonly BrowserInspectionNode[],
   ): ReadonlySet<number> {
     const byAxId = new Map(mainFrameNodes.map((node) => [node.axNodeId, node]))
+    const childrenByAxId = new Map<string, BrowserInspectionNode[]>()
+    for (const node of mainFrameNodes) {
+      if (!node.parentAxNodeId) continue
+      const children = childrenByAxId.get(node.parentAxNodeId)
+      if (children) children.push(node)
+      else childrenByAxId.set(node.parentAxNodeId, [node])
+    }
     const restricted = new Set<number>()
     for (const node of visibleNodes.filter(imageRestrictedNode)) {
       let current: BrowserInspectionNode | undefined = node
@@ -706,13 +753,22 @@ export class BrowserPageInspector {
         seen.add(current.axNodeId)
         current = current.parentAxNodeId ? byAxId.get(current.parentAxNodeId) : undefined
       }
+      const descendants = [node]
+      const descendantIds = new Set<string>()
+      while (descendants.length > 0) {
+        const descendant = descendants.pop()!
+        if (descendantIds.has(descendant.axNodeId)) continue
+        descendantIds.add(descendant.axNodeId)
+        restricted.add(descendant.backendNodeId)
+        descendants.push(...(childrenByAxId.get(descendant.axNodeId) ?? []))
+      }
     }
     return restricted
   }
 
   private sameIdentity(
     state: SnapshotIdentity,
-    input: Pick<BrowserRefResolutionInput, 'runId' | 'bindingId' | 'tabId' | 'snapshotId' | 'navigationEpoch' | 'origin'>,
+    input: SnapshotIdentity,
   ): boolean {
     return state.runId === input.runId
       && state.bindingId === input.bindingId

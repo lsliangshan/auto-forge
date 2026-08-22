@@ -153,6 +153,7 @@ interface TargetTabState {
   blockedOrigin?: string
   blockedErrorCode?: AppErrorCode
   activeOperations: number
+  syntheticInputOperations: number
   loading: boolean
   closed: boolean
   handle?: BrowserWorkspaceTab
@@ -449,15 +450,16 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const frameTree = await this.command(state, 'Page.getFrameTree') as {
         frameTree?: { frame?: { id?: string } }
       }
+      this.assertContinuationState(state, input)
       const frameId = frameTree.frameTree?.frame?.id
       if (!frameId) throw failure('PAGE_CHANGED')
       const accessibility = await this.command(state, 'Accessibility.getFullAXTree') as {
         nodes?: AccessibilityNodeResult[]
       }
+      this.assertContinuationState(state, input)
       const rawNodes = (accessibility.nodes ?? [])
         .filter((node) => node.frameId === undefined || node.frameId === frameId)
         .filter((node) => typeof node.nodeId === 'string' && typeof node.backendDOMNodeId === 'number')
-        .slice(0, 2_000)
       const nodes: BrowserInspectionNode[] = []
       for (const rawNode of rawNodes) {
         const backendNodeId = rawNode.backendDOMNodeId!
@@ -466,8 +468,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
           const result = await this.command(state, 'DOM.describeNode', {
             backendNodeId, depth: 0, pierce: false,
           }) as { node?: DescribedDomNode }
+          this.assertContinuationState(state, input)
           described = result.node
         } catch {
+          this.assertContinuationState(state, input)
           this.assertOpen(state)
           continue
         }
@@ -476,12 +480,17 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       }
       const locatorMatches = []
       for (const locator of input.locators) {
+        const backendNodeIds = await this.resolveLocatorMatches(state, locator, rawNodes)
+        this.assertContinuationState(state, input)
         locatorMatches.push({
           locator,
-          backendNodeIds: await this.resolveLocatorMatches(state, locator, rawNodes),
+          backendNodeIds,
         })
       }
-      const viewport = await this.layoutViewport(state)
+      const viewport = await this.layoutViewport(
+        state,
+        () => { this.assertContinuationState(state, input) },
+      )
       return {
         tabId: state.id,
         navigationEpoch: state.navigationEpoch,
@@ -506,8 +515,13 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     return this.restricted(state, [input.expectedOrigin], async () => {
       this.assertContinuationState(state, input)
       try {
-        return await this.readInspectionNode(state, input.backendNodeId)
+        return await this.readInspectionNode(
+          state,
+          input.backendNodeId,
+          () => { this.assertContinuationState(state, input) },
+        )
       } catch {
+        this.assertContinuationState(state, input)
         this.assertOpen(state)
         throw failure('PAGE_CHANGED')
       }
@@ -520,7 +534,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const state = this.continuationState(input)
     return this.restricted(state, [input.expectedOrigin], async () => {
       this.assertContinuationState(state, input)
-      return Object.freeze(await this.nodeBox(state, input.backendNodeId))
+      return Object.freeze(await this.nodeBox(
+        state,
+        input.backendNodeId,
+        () => { this.assertContinuationState(state, input) },
+      ))
     })
   }
 
@@ -536,7 +554,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const state = this.continuationState(input)
     return this.restricted(state, [input.expectedOrigin], async () => {
       this.assertContinuationState(state, input)
-      const currentNode = await this.readInspectionNode(state, input.backendNodeId)
+      const assertCurrent = () => { this.assertContinuationState(state, input) }
+      const currentNode = await this.readInspectionNode(state, input.backendNodeId, assertCurrent)
       if (!currentNode
         || currentNode.ignored
         || currentNode.dom.hidden
@@ -546,7 +565,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
         || currentNode.dom.inputType?.toLowerCase() !== input.expectedInputType) {
         throw failure('PAGE_CHANGED')
       }
-      const current = await this.nodeBox(state, input.backendNodeId)
+      const current = await this.nodeBox(state, input.backendNodeId, assertCurrent)
       if (current.x !== input.clip.x
         || current.y !== input.clip.y
         || current.width !== input.clip.width
@@ -557,6 +576,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
         captureBeyondViewport: false,
         clip: { ...input.clip, scale: 1 },
       }) as { data?: unknown }
+      assertCurrent()
       if (typeof screenshot.data !== 'string' || screenshot.data.length === 0) {
         throw failure('INTERNAL_ERROR')
       }
@@ -690,12 +710,17 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const x = (points[0]! + points[2]! + points[4]! + points[6]!) / 4
       const y = (points[1]! + points[3]! + points[5]! + points[7]!) / 4
       const navigation = this.waitForNavigation(state.view.webContents)
-      await this.command(state, 'Input.dispatchMouseEvent', {
-        type: 'mousePressed', x, y, button: 'left', clickCount: 1,
-      })
-      await this.command(state, 'Input.dispatchMouseEvent', {
-        type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
-      })
+      state.syntheticInputOperations += 1
+      try {
+        await this.command(state, 'Input.dispatchMouseEvent', {
+          type: 'mousePressed', x, y, button: 'left', clickCount: 1,
+        })
+        await this.command(state, 'Input.dispatchMouseEvent', {
+          type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
+        })
+      } finally {
+        state.syntheticInputOperations -= 1
+      }
       await navigation.promise
     })
     await this.renderToolbar().catch(() => undefined)
@@ -749,6 +774,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       continuationBound: false,
       navigationEpoch: 0,
       activeOperations: 0,
+      syntheticInputOperations: 0,
       loading: false,
       closed: false,
     }
@@ -840,7 +866,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
 
   private handleUserTakeover(state: TargetTabState, force = false): void {
     const runId = state.ownerContinuationRunId
-    if (!runId || (!force && state.activeOperations > 0)) return
+    if (!runId || (!force && state.syntheticInputOperations > 0)) return
     state.ownerContinuationRunId = undefined
     this.emitPageInvalidated(state.id)
     this.continuationRegistry?.markTakenOver(state.id, runId)
@@ -1156,13 +1182,16 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private async readInspectionNode(
     state: TargetTabState,
     backendNodeId: number,
+    assertCurrent?: () => void,
   ): Promise<BrowserInspectionNode | undefined> {
     const described = await this.command(state, 'DOM.describeNode', {
       backendNodeId, depth: 0, pierce: false,
     }) as { node?: DescribedDomNode }
+    assertCurrent?.()
     const accessibility = await this.command(state, 'Accessibility.getPartialAXTree', {
       backendNodeId, fetchRelatives: false,
     }) as { nodes?: AccessibilityNodeResult[] }
+    assertCurrent?.()
     const rawNode = accessibility.nodes?.find((node) => node.backendDOMNodeId === backendNodeId)
       ?? accessibility.nodes?.[0]
     if (!rawNode || !described.node) return undefined
@@ -1244,10 +1273,15 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     return Object.freeze([...new Set(backendNodeIds)].slice(0, 2_000))
   }
 
-  private async nodeBox(state: TargetTabState, backendNodeId: number): Promise<BrowserInspectionNodeBox> {
+  private async nodeBox(
+    state: TargetTabState,
+    backendNodeId: number,
+    assertCurrent?: () => void,
+  ): Promise<BrowserInspectionNodeBox> {
     const result = await this.command(state, 'DOM.getBoxModel', { backendNodeId }) as {
       model?: { content?: number[] }
     }
+    assertCurrent?.()
     const points = result.model?.content
     if (!points || points.length !== 8 || points.some((value) => !Number.isFinite(value))) {
       throw failure('PAGE_CHANGED')
@@ -1256,7 +1290,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const ys = [points[1]!, points[3]!, points[5]!, points[7]!]
     const x = Math.min(...xs)
     const y = Math.min(...ys)
-    const viewport = await this.layoutViewport(state)
+    const viewport = await this.layoutViewport(state, assertCurrent)
     return {
       x,
       y,
@@ -1267,11 +1301,15 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     }
   }
 
-  private async layoutViewport(state: TargetTabState): Promise<{ width: number; height: number }> {
+  private async layoutViewport(
+    state: TargetTabState,
+    assertCurrent?: () => void,
+  ): Promise<{ width: number; height: number }> {
     const result = await this.command(state, 'Page.getLayoutMetrics') as {
       cssLayoutViewport?: { clientWidth?: number; clientHeight?: number }
       layoutViewport?: { clientWidth?: number; clientHeight?: number }
     }
+    assertCurrent?.()
     const viewport = result.cssLayoutViewport ?? result.layoutViewport
     if (typeof viewport?.clientWidth !== 'number' || typeof viewport.clientHeight !== 'number') {
       throw failure('PAGE_CHANGED')

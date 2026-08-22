@@ -41,6 +41,7 @@ export interface BrowserContinuationBinding extends BrowserContinuationProvenanc
 export interface BrowserContinuationLease {
   readonly binding: BrowserContinuationBinding
   readonly ownerRunId: string
+  isCurrent(binding: BrowserContinuationBinding): boolean
   release(): Promise<void>
 }
 
