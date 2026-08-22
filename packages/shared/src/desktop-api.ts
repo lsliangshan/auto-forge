@@ -376,14 +376,47 @@ export const workflowSummarySchema = z.object({
 
 export type WorkflowSummary = z.infer<typeof workflowSummarySchema>
 
+export const workflowRuntimeIdentitySchema = z.discriminatedUnion('source', [
+  z.object({
+    id: identifierSchema,
+    version: nonEmptyStringSchema,
+    source: z.literal('installed'),
+  }).strict(),
+  z.object({
+    id: identifierSchema,
+    version: nonEmptyStringSchema,
+    source: z.literal('development'),
+    buildHash: z.string().regex(/^[a-f0-9]{64}$/),
+  }).strict(),
+])
+
+export type WorkflowRuntimeIdentity = z.infer<typeof workflowRuntimeIdentitySchema>
+
+const citySchema = nonEmptyStringSchema
+
 export const workflowDetailSchema = workflowSummarySchema.extend({
   codeSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  cities: z.array(citySchema),
+  runtimeIdentity: workflowRuntimeIdentitySchema,
   permissions: z.array(workflowPermissionSchema),
   activationExamples: z.array(nonEmptyStringSchema),
   activationNegativeExamples: z.array(nonEmptyStringSchema),
   timeoutMs: z.number().int().min(1_000).max(300_000),
   inputSchema: z.unknown(),
   outputSchema: z.unknown(),
+}).superRefine(({ cities, id, version, source, runtimeIdentity }, context) => {
+  if (new Set(cities).size !== cities.length) {
+    context.addIssue({ code: 'custom', path: ['cities'], message: 'Workflow cities must be unique' })
+  }
+  if (runtimeIdentity.id !== id) {
+    context.addIssue({ code: 'custom', path: ['runtimeIdentity', 'id'], message: 'Workflow runtime identity must match the workflow id' })
+  }
+  if (runtimeIdentity.version !== version) {
+    context.addIssue({ code: 'custom', path: ['runtimeIdentity', 'version'], message: 'Workflow runtime identity must match the workflow version' })
+  }
+  if (runtimeIdentity.source !== source) {
+    context.addIssue({ code: 'custom', path: ['runtimeIdentity', 'source'], message: 'Workflow runtime identity must match the workflow source' })
+  }
 })
 
 export type WorkflowDetail = z.infer<typeof workflowDetailSchema>
@@ -403,11 +436,16 @@ export const validationResultSchema = z.object({
 
 export type ValidationResult = z.infer<typeof validationResultSchema>
 
+export const workflowChatAvailabilitySchema = z.enum(['ready', 'not_built', 'unbuilt_changes', 'invalid'])
+
+export type WorkflowChatAvailability = z.infer<typeof workflowChatAvailabilitySchema>
+
 export const developerProjectSchema = z.object({
   id: identifierSchema,
   name: nonEmptyStringSchema,
   rootPath: nonEmptyStringSchema,
   status: z.enum(['new', 'building', 'ready', 'invalid', 'error']),
+  chatAvailability: workflowChatAvailabilitySchema,
   files: z.array(nonEmptyStringSchema),
   directories: z.array(nonEmptyStringSchema),
   updatedAt: timestampSchema,

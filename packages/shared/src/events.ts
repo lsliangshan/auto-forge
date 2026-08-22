@@ -8,6 +8,25 @@ import {
 
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
+const nonEmptyStringSchema = z.string().trim().min(1)
+const workflowSourceSchema = z.enum(['installed', 'development'])
+const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
+
+const workflowBlockContextSchema = z.object({
+  workflowId: identifierSchema,
+  workflowName: nonEmptyStringSchema,
+  workflowVersion: nonEmptyStringSchema,
+  source: workflowSourceSchema,
+  buildHash: buildHashSchema.optional(),
+  city: nonEmptyStringSchema.optional(),
+}).strict().superRefine(({ source, buildHash }, context) => {
+  if (source === 'development' && buildHash === undefined) {
+    context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Development workflows require a build hash' })
+  }
+  if (source === 'installed' && buildHash !== undefined) {
+    context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Installed workflows cannot include a build hash' })
+  }
+})
 
 export const mediaKindSchema = z.enum(['image', 'audio', 'video'])
 export type MediaKind = z.infer<typeof mediaKindSchema>
@@ -60,7 +79,12 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     type: z.literal('approval'),
     executionId: identifierSchema,
     workflowId: identifierSchema,
-    workflowVersion: z.string().trim().min(1),
+    workflowName: nonEmptyStringSchema,
+    workflowVersion: nonEmptyStringSchema,
+    source: workflowSourceSchema,
+    buildHash: buildHashSchema.optional(),
+    city: nonEmptyStringSchema.optional(),
+    actionSummary: nonEmptyStringSchema.max(500),
     permissionIndex: z.number().int().nonnegative(),
     capability: capabilitySchema,
     scope: runtimeCapabilityScopeSchema,
@@ -70,6 +94,26 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
       context.addIssue({ code: 'custom', message: 'Approval scope is invalid for this capability' })
     }
   }),
+  workflowBlockContextSchema.extend({
+    type: z.literal('workflow_status'),
+    blockId: identifierSchema,
+    executionId: identifierSchema,
+    status: executionStatusSchema,
+    executionIndex: z.number().int().positive(),
+    executionLimit: z.number().int().positive(),
+  }).superRefine(({ executionIndex, executionLimit }, context) => {
+    if (executionIndex > executionLimit) {
+      context.addIssue({ code: 'custom', path: ['executionIndex'], message: 'Execution index cannot exceed its limit' })
+    }
+  }),
+  z.object({
+    type: z.literal('workflow_provenance'),
+    blockId: identifierSchema,
+    entries: z.array(workflowBlockContextSchema.extend({
+      executionId: identifierSchema,
+      status: executionStatusSchema,
+    })).min(1),
+  }).strict(),
   z.object({ type: z.literal('workflow_execution'), executionId: identifierSchema }).strict(),
   z.object({
     type: z.literal('execution_result'),

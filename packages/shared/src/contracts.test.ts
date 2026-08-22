@@ -33,6 +33,7 @@ import {
   userAdminUpdateRoleRequestSchema,
   userProfileSchema,
   userProfileUpdateSchema,
+  workflowDetailSchema,
   workflowPermissionSchema,
   workerMessageSchema,
 } from './index'
@@ -423,6 +424,77 @@ describe('cross-process contracts', () => {
     expect(() => mediaAssetSchema.parse({ ...asset, base64: 'c2VjcmV0' })).toThrow()
   })
 
+  it('requires normalized cities and exact workflow runtime identity', () => {
+    const validWorkflowDetail = {
+      id: 'workflow.example', version: '1.0.0', name: '示例工作流', description: '示例',
+      author: 'AutoForge', category: 'test', enabled: true, source: 'installed' as const,
+      integrity: 'valid' as const, updatedAt: '2026-08-22T00:00:00.000Z', cities: [],
+      runtimeIdentity: { id: 'workflow.example', version: '1.0.0', source: 'installed' as const },
+      permissions: [], activationExamples: [], activationNegativeExamples: [], timeoutMs: 30_000,
+      inputSchema: {}, outputSchema: {},
+    }
+
+    expect(workflowDetailSchema.parse({
+      ...validWorkflowDetail,
+      cities: [' 北京 '],
+      runtimeIdentity: {
+        id: validWorkflowDetail.id,
+        version: validWorkflowDetail.version,
+        source: 'development',
+        buildHash: 'a'.repeat(64),
+      },
+      source: 'development',
+    }).cities).toEqual(['北京'])
+
+    expect(() => workflowDetailSchema.parse({
+      ...validWorkflowDetail,
+      cities: ['北京', '北京'],
+    })).toThrow()
+    expect(() => workflowDetailSchema.parse({
+      ...validWorkflowDetail,
+      runtimeIdentity: {
+        id: validWorkflowDetail.id,
+        version: validWorkflowDetail.version,
+        source: 'installed',
+        buildHash: 'a'.repeat(64),
+      },
+    })).toThrow()
+    expect(() => workflowDetailSchema.parse({
+      ...validWorkflowDetail,
+      runtimeIdentity: {
+        id: validWorkflowDetail.id,
+        version: validWorkflowDetail.version,
+        source: 'development',
+        buildHash: 'A'.repeat(64),
+      },
+      source: 'development',
+    })).toThrow()
+    expect(() => workflowDetailSchema.parse({
+      ...validWorkflowDetail,
+      runtimeIdentity: { ...validWorkflowDetail.runtimeIdentity, id: 'workflow.other' },
+    })).toThrow()
+  })
+
+  it('accepts strict system-owned workflow status and provenance blocks', () => {
+    expect(chatBlockSchema.parse({
+      type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
+      workflowId: 'workflow.beijing', workflowName: '北京工作居住证',
+      workflowVersion: '1.0.0', source: 'development', buildHash: 'a'.repeat(64),
+      city: '北京', status: 'running', executionIndex: 1, executionLimit: 5,
+    }).type).toBe('workflow_status')
+    expect(chatBlockSchema.parse({
+      type: 'workflow_provenance', blockId: 'provenance_1',
+      entries: [{ executionId: 'exec_1', workflowId: 'workflow.beijing',
+        workflowName: '北京工作居住证', workflowVersion: '1.0.0',
+        source: 'development', buildHash: 'a'.repeat(64), city: '北京', status: 'completed' }],
+    }).type).toBe('workflow_provenance')
+    expect(() => chatBlockSchema.parse({
+      type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
+      workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
+      source: 'installed', buildHash: 'a'.repeat(64), status: 'running', executionIndex: 1, executionLimit: 5,
+    })).toThrow()
+  })
+
   it('requires exact conversation ownership for public draft removal', () => {
     const schema = ipcRequestSchemas[ipcChannels.mediaRemoveDraft]
     expect(schema.parse({
@@ -533,6 +605,24 @@ describe('cross-process contracts', () => {
   it('recognizes the safe context-limit error code', () => {
     expect(appErrorCodeSchema.parse('CONTEXT_LIMIT_EXCEEDED'))
       .toBe('CONTEXT_LIMIT_EXCEEDED')
+  })
+
+  it('recognizes every safe workflow tool runtime error code', () => {
+    const safeWorkflowToolCodes = [
+      'CITY_REQUIRED',
+      'CITY_NOT_SUPPORTED',
+      'WORKFLOW_CHANGED',
+      'INVALID_TOOL_SEQUENCE',
+      'TOOL_CALL_LIMIT',
+      'INVALID_OUTPUT',
+      'RESULT_TOO_LARGE',
+    ] as const
+
+    expect(safeWorkflowToolCodes.map((code) => appErrorCodeSchema.parse(code))).toEqual(safeWorkflowToolCodes)
+    for (const code of safeWorkflowToolCodes) {
+      expect(toSafeAppError({ code, message: 'RAW_WORKFLOW_ERROR' })).toMatchObject({ code })
+      expect(toSafeAppError({ code, message: 'RAW_WORKFLOW_ERROR' }).message).not.toBe('RAW_WORKFLOW_ERROR')
+    }
   })
 
   it('replaces only the matching media block through a strict block update event', () => {
@@ -817,9 +907,25 @@ describe('cross-process contracts', () => {
 
   it('requires exact pending workflow identity on approval blocks', () => {
     expect(() => chatBlockSchema.parse({
-      type: 'approval', executionId: 'exec_1', permissionIndex: 0,
+      type: 'approval', executionId: 'exec_1', workflowId: 'browser.search.baidu',
+      workflowName: '百度搜索', source: 'installed', actionSummary: '打开百度首页', permissionIndex: 0,
       capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
     })).toThrow()
+  })
+
+  it('requires bound approval context fields', () => {
+    const approval = {
+      type: 'approval' as const, executionId: 'exec_1', workflowId: 'browser.search.baidu',
+      workflowName: '百度搜索', workflowVersion: '1.0.0', source: 'development' as const,
+      buildHash: 'a'.repeat(64), city: '北京', actionSummary: '打开百度首页', permissionIndex: 0,
+      capability: 'browser.open' as const, scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
+    }
+
+    expect(chatBlockSchema.parse(approval)).toMatchObject({
+      workflowName: '百度搜索', source: 'development', city: '北京', actionSummary: '打开百度首页',
+    })
+    expect(chatBlockSchema.safeParse({ ...approval, actionSummary: 'x'.repeat(501) }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...approval, source: 'installed', buildHash: undefined }).success).toBe(true)
   })
   it('requires exact workflow identity for removal', () => {
     expect(ipcRequestSchemas[ipcChannels.workflowsRemove].parse({ id: 'browser.search.baidu', version: '1.0.0' }))
@@ -830,6 +936,7 @@ describe('cross-process contracts', () => {
   it('validates fixed developer entry operations and refreshed project responses', () => {
     const project = {
       id: 'project_1', name: 'Baidu search', rootPath: '/private/project', status: 'new' as const,
+      chatAvailability: 'not_built' as const,
       files: ['src/index.ts', 'workflow.json'], directories: ['src'], updatedAt: '2026-07-19T00:00:00.000Z',
     }
 
@@ -845,6 +952,9 @@ describe('cross-process contracts', () => {
     expect(ipcResponseSchemas[ipcChannels.developerCreateEntry].parse(project)).toEqual(project)
     expect(() => ipcRequestSchemas[ipcChannels.developerCreateEntry].parse({
       projectId: 'project_1', parentPath: '', name: '../escape.ts', kind: 'file',
+    })).toThrow()
+    expect(() => ipcResponseSchemas[ipcChannels.developerCreateEntry].parse({
+      ...project, chatAvailability: 'unknown',
     })).toThrow()
   })
 
@@ -923,7 +1033,8 @@ describe('cross-process contracts', () => {
 
     expect(chatBlockSchema.safeParse({
       type: 'approval', executionId: 'exec_1', workflowId: 'browser.search.baidu',
-      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+      workflowName: '百度搜索', workflowVersion: '1.0.0', source: 'installed', actionSummary: '打开百度首页',
+      permissionIndex: 0, capability: 'browser.open',
       scope: {}, scopeHash: 'a'.repeat(64),
     }).success).toBe(false)
   })
