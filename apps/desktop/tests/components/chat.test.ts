@@ -49,6 +49,23 @@ function workflowStatusBlock(
   }
 }
 
+function browserStatusBlock(
+  state: Extract<ChatBlock, { type: 'browser_status' }>['state'],
+  overrides: Partial<Extract<ChatBlock, { type: 'browser_status' }>> = {},
+) {
+  return {
+    id: 'message_1:browser_status_1',
+    type: 'browser_status' as const,
+    blockId: 'browser_status_1',
+    requestId: 'request_1',
+    bindingId: 'binding_1',
+    siteLabel: '北京人才服务',
+    origin: 'https://fw.bjrcgz.gov.cn',
+    state,
+    ...overrides,
+  }
+}
+
 function workflowProvenanceBlock(
   entries: Extract<ChatBlock, { type: 'workflow_provenance' }>['entries'],
 ) {
@@ -151,6 +168,8 @@ function createEventApi() {
       listMessages: vi.fn().mockResolvedValue([]),
       renameConversation: vi.fn(), deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'req_1' }), cancel: vi.fn(),
+      takeOverBrowser: vi.fn().mockResolvedValue(undefined),
+      listBrowserAudit: vi.fn().mockResolvedValue([]),
       getGenerationPreferences: vi.fn().mockResolvedValue(generationPreferences()),
       updateGenerationPreferences: vi.fn(async (_conversationId, preferences) => preferences),
       onEvent: vi.fn((listener) => { chatListener = listener; return chatUnsubscribe }),
@@ -611,6 +630,118 @@ describe('chat interactions', () => {
     expect(wrapper.text()).toContain('调用完成 北京工作居住证')
     expect(wrapper.get('[data-testid="workflow-status-message"]').text())
       .toBe('执行完成，结果未提供给模型')
+  })
+
+  it('renders the Main-owned browser status and exposes exact stop and takeover actions', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting', { actionSummary: '填写单位信息' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const status = wrapper.get('[data-testid="browser-status"]')
+    expect(status.attributes('aria-live')).toBe('polite')
+    expect(status.text()).toContain('北京人才服务')
+    expect(status.text()).toContain('fw.bjrcgz.gov.cn')
+    expect(wrapper.get('[data-testid="browser-action-summary"]').text()).toBe('填写单位信息')
+    const stop = wrapper.get('[data-testid="stop-browser"]')
+    const takeover = wrapper.get('[data-testid="take-over-browser"]')
+    expect(stop.element.tagName).toBe('BUTTON')
+    expect(takeover.element.tagName).toBe('BUTTON')
+    expect((stop.element as HTMLButtonElement).tabIndex).toBeGreaterThanOrEqual(0)
+    expect((takeover.element as HTMLButtonElement).tabIndex).toBeGreaterThanOrEqual(0)
+
+    await takeover.trigger('click')
+    await flushPromises()
+    expect(api.chat.takeOverBrowser).toHaveBeenCalledWith({
+      requestId: 'request_1', bindingId: 'binding_1',
+    })
+    expect((takeover.element as HTMLButtonElement).disabled).toBe(true)
+
+    const stopWrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting') },
+      global: { plugins: [ElementPlus] },
+    })
+    await stopWrapper.get('[data-testid="stop-browser"]').trigger('click')
+    await flushPromises()
+    expect(api.chat.cancel).toHaveBeenCalledWith('request_1')
+  })
+
+  it('loads chronological redacted browser audit only after explicit expansion', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.chat.listBrowserAudit).mockResolvedValue([
+      {
+        id: 'audit_2', bindingId: 'binding_1', sequence: 2,
+        origin: 'https://fw.bjrcgz.gov.cn', action: '点击下一步', targetSummary: '下一步按钮',
+        risk: 'external_action', outcome: 'blocked', errorCode: 'MANUAL_ACTION_REQUIRED', createdAt: 2,
+      },
+      {
+        id: 'audit_1', bindingId: 'binding_1', sequence: 1,
+        origin: 'https://fw.bjrcgz.gov.cn', action: '<img src=x>填写单位信息',
+        targetSummary: '页面原文：机密内容；值：Secret-Value',
+        risk: 'external_action', outcome: 'completed', createdAt: 1,
+      },
+    ])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting') },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(api.chat.listBrowserAudit).not.toHaveBeenCalled()
+    const details = wrapper.get('[data-testid="browser-audit"]')
+    ;(details.element as HTMLDetailsElement).open = true
+    await details.trigger('toggle')
+    await flushPromises()
+
+    expect(api.chat.listBrowserAudit).toHaveBeenCalledWith('binding_1')
+    const entries = wrapper.findAll('[data-testid="browser-audit-entry"]')
+    expect(entries).toHaveLength(2)
+    expect(entries[0]!.text()).toContain('<img src=x>填写单位信息')
+    expect(entries[0]!.find('img').exists()).toBe(false)
+    expect(entries[0]!.text()).toContain('fw.bjrcgz.gov.cn')
+    expect(entries[0]!.text()).toContain('已完成')
+    expect(entries[1]!.text()).toContain('需要你在页面中手动确认')
+    expect(wrapper.text()).not.toContain('Secret-Value')
+    expect(wrapper.text()).not.toContain('页面原文')
+  })
+
+  it.each([
+    ['awaiting_user', '需要你在浏览器中操作', false],
+    ['completed', '浏览器自动操作已完成', true],
+    ['failed', '浏览器自动操作失败', true],
+    ['cancelled', '浏览器自动操作已停止', true],
+  ] as const)('renders accessible %s browser copy and terminal action state', (state, copy, disabled) => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock(state, state === 'failed' ? { errorCode: 'PAGE_CHANGED' } : {}) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="browser-status"]').text()).toContain(copy)
+    expect((wrapper.get('[data-testid="stop-browser"]').element as HTMLButtonElement).disabled).toBe(disabled)
+    expect((wrapper.get('[data-testid="take-over-browser"]').element as HTMLButtonElement).disabled).toBe(disabled)
+    if (state === 'failed') expect(wrapper.text()).toContain('页面已变化，请重新检查后继续')
+  })
+
+  it('replaces browser status by its Main-owned block id', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const { id: actingId, ...acting } = browserStatusBlock('acting', { actionSummary: '填写单位信息' })
+    const { id: completedId, ...completed } = browserStatusBlock('completed', { actionSummary: '已填写单位信息' })
+    void actingId; void completedId
+
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: acting })
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: completed })
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({
+        id: 'assistant_1:browser_status_1', blockId: 'browser_status_1',
+        state: 'completed', actionSummary: '已填写单位信息',
+      }),
+    ])
   })
 
   it('renders one system provenance entry as an expandable execution link', async () => {

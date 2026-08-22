@@ -275,6 +275,18 @@
             清除会话与执行记录
           </el-button>
         </div>
+        <div class="browser-data-action">
+          <div><strong>浏览器站点数据</strong><small>仅清除 AutoForge 浏览器中的 Cookie、缓存和站点数据，不会删除会话与执行记录。</small></div>
+          <el-button
+            type="danger"
+            plain
+            data-testid="clear-browser-data"
+            :disabled="settings.saving"
+            @click="confirmClearBrowserData"
+          >
+            清除浏览器数据
+          </el-button>
+        </div>
       </section>
       <section
         id="permissions"
@@ -610,6 +622,17 @@ async function confirmClear(scope: 'conversations' | 'executions' | 'all') {
     ElMessage.success('本地数据已清理')
   } catch (error) { if (error !== 'cancel' && error !== 'close') return }
 }
+async function confirmClearBrowserData() {
+  try {
+    await ElMessageBox.confirm(
+      '此操作会清除 AutoForge 浏览器中的 Cookie、缓存和站点数据，站点登录状态将被移除，需要重新登录。会话与执行记录不会被删除。此操作不可撤销。',
+      '清除浏览器数据',
+      { type: 'warning', confirmButtonText: '确认清除', cancelButtonText: '取消' },
+    )
+    await settings.clearBrowserData()
+    ElMessage.success('浏览器数据已清除')
+  } catch (error) { if (error !== 'cancel' && error !== 'close') return }
+}
 const capabilityLabels: Record<PermissionGrant['capability'], string> = {
   'browser.open': '打开网页',
   'browser.fill': '填写网页内容',
@@ -676,6 +699,6 @@ const scopeValues = (scope: PermissionGrant['scope']): string[] => {
 .settings-form { display: grid; gap: 8px; padding-top: 14px; }.settings-form > label, .settings-grid > label, .model-field > label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.settings-form small, .field-message { margin: 0; color: var(--af-text-muted); font-size: 11px; }.settings-form > .el-button { justify-self: start; }.model-field { display: grid; gap: 8px; }
 .proxy-validation-error { color: var(--af-danger); }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding-top: 15px; }.settings-grid label:not(.switch-row) { display: grid; gap: 7px; }.switch-row { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 0; }.model-id { float: right; margin-left: 18px; color: var(--af-text-muted); }
-.danger-zone { border-color: var(--af-danger-border); }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }
+.danger-zone { border-color: var(--af-danger-border); }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }.browser-data-action { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; border-top: 1px solid var(--af-danger-border); padding-top: 15px; }.browser-data-action > div { display: grid; gap: 4px; }.browser-data-action small { color: var(--af-text-muted); font-size: 11px; line-height: 1.5; }
 .grant-list { margin-top: 12px; }.grant-view-tabs :deep(.el-tabs__header) { margin-bottom: 10px; }.grant-filter-bar { display: flex; align-items: end; justify-content: space-between; gap: 16px; border: 1px solid var(--af-border); border-bottom: 0; padding: 10px 12px; background: var(--af-surface-muted); }.grant-filter-bar label { display: grid; width: min(360px, 65%); gap: 5px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; }.grant-result-count { flex: none; padding-bottom: 7px; color: var(--af-text-muted); font-size: 10px; }.grant-table-wrap { overflow-x: auto; border: 1px solid var(--af-border); }.grant-table { width: 100%; min-width: 680px; border-collapse: collapse; table-layout: fixed; background: var(--af-surface); }.grant-table th { padding: 8px 10px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 10px; font-weight: 700; text-align: left; }.grant-table th:last-child { width: 58px; text-align: right; }.grant-table td { border-top: 1px solid var(--af-border); padding: 10px; vertical-align: middle; }.grant-workflow-cell, .grant-capability-cell { width: 23%; }.grant-scope-cell { width: auto; }.grant-action-cell { width: 58px; text-align: right; }.grant-workflow-value, .grant-capability-value { display: grid; gap: 3px; }.grant-workflow-value strong, .grant-capability-value strong { overflow-wrap: anywhere; color: var(--af-graphite); font-size: 11px; }.grant-workflow-value span, .grant-capability-value code { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 10px; }.grant-scope-values { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }.grant-scope-values code { max-width: 100%; overflow-wrap: anywhere; border: 1px solid var(--af-border); border-radius: 4px; padding: 3px 6px; color: var(--af-text); background: var(--af-surface-muted); font-size: 10px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }
 </style>

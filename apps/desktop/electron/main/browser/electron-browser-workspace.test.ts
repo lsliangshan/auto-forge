@@ -864,6 +864,96 @@ describe('ElectronBrowserWorkspace', () => {
     },
   )
 
+  it('renders trusted continuation controls and routes exact live binding commands', async () => {
+    const { workspace, views } = createHarness()
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(tab.id)
+    await workspace.releaseExecution(input.executionId)
+    const handlers = { stop: vi.fn(async () => undefined), takeOver: vi.fn(async () => undefined) }
+    workspace.setContinuationCommandHandlers(handlers)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_toolbar_controls',
+    })
+
+    await vi.waitFor(() => {
+      const document = decodeURIComponent(views[0]!.webContents.loaded.at(-1)!.split(',')[1]!)
+      expect(document).toContain('<span class="automation" aria-live="polite">AI 正在操作</span>')
+      expect(document).toContain(`href="autoforge-browser://continuation/stop/${binding.bindingId}"`)
+      expect(document).toContain(`href="autoforge-browser://continuation/takeover/${binding.bindingId}"`)
+    })
+    expect(views[0]!.options.webPreferences).toMatchObject({ partition: 'autoforge-browser-toolbar' })
+    expect(views[1]!.options.webPreferences).not.toMatchObject({ partition: 'autoforge-browser-toolbar' })
+
+    const stopNavigation = { preventDefault: vi.fn() }
+    views[0]!.webContents.emit(
+      'will-navigate', stopNavigation,
+      `autoforge-browser://continuation/stop/${binding.bindingId}`,
+    )
+    await vi.waitFor(() => expect(handlers.stop).toHaveBeenCalledWith(binding.bindingId))
+    expect(stopNavigation.preventDefault).toHaveBeenCalledOnce()
+
+    views[0]!.webContents.emit(
+      'will-navigate', { preventDefault: vi.fn() },
+      `autoforge-browser://continuation/takeover/${binding.bindingId}`,
+    )
+    await vi.waitFor(() => expect(handlers.takeOver).toHaveBeenCalledWith(binding.bindingId))
+    await lease.release()
+  })
+
+  it('rejects forged, unknown, stale, and ambiguous continuation toolbar commands', async () => {
+    const { workspace, views } = createHarness()
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(tab.id)
+    await workspace.releaseExecution(input.executionId)
+    const handlers = { stop: vi.fn(async () => undefined), takeOver: vi.fn(async () => undefined) }
+    workspace.setContinuationCommandHandlers(handlers)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_toolbar_rejection',
+    })
+    const toolbar = views[0]!.webContents
+
+    toolbar.emit(
+      'will-navigate', { preventDefault: vi.fn() },
+      `autoforge-browser://continuation/stop/${binding.bindingId}`,
+    )
+    await vi.waitFor(() => expect(handlers.stop).toHaveBeenCalledWith(binding.bindingId))
+    handlers.stop.mockClear()
+
+    for (const command of [
+      'autoforge-browser://continuation/stop/binding_999',
+      `autoforge-browser://continuation/stop/${binding.bindingId}/extra`,
+      `autoforge-browser://continuation/stop/${binding.bindingId}?again=1`,
+      `autoforge-browser://continuation/stop/${binding.bindingId}#again`,
+      `autoforge-browser://continuation/stop/${binding.bindingId.replace('_', '%5F')}`,
+      'autoforge-browser://continuation/stop/../binding_1',
+      'autoforge-browser://continuation/stop/%2Fbinding_1',
+      `autoforge-browser://continuation/takeover/${binding.bindingId}/extra`,
+    ]) toolbar.emit('will-navigate', { preventDefault: vi.fn() }, command)
+    views[1]!.webContents.emit(
+      'will-navigate', { preventDefault: vi.fn() },
+      `autoforge-browser://continuation/stop/${binding.bindingId}`,
+    )
+    await Promise.resolve()
+    expect(handlers.stop).not.toHaveBeenCalled()
+    expect(handlers.takeOver).not.toHaveBeenCalled()
+
+    await lease.release()
+    toolbar.emit(
+      'will-navigate', { preventDefault: vi.fn() },
+      `autoforge-browser://continuation/stop/${binding.bindingId}`,
+    )
+    await Promise.resolve()
+    expect(handlers.stop).not.toHaveBeenCalled()
+  })
+
   it('cancels an in-flight continuation action when toolbar navigation takes over', async () => {
     const dispatched = deferred<unknown>()
     const respond = (method: string) => ({

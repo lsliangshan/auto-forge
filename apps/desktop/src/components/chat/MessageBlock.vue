@@ -29,6 +29,10 @@
       v-else-if="block.type === 'workflow_status'"
       :block="block"
     />
+    <BrowserStatusCard
+      v-else-if="block.type === 'browser_status'"
+      :block="block"
+    />
     <WorkflowProvenance
       v-else-if="block.type === 'workflow_provenance'"
       :block="block"
@@ -66,6 +70,7 @@ import { Loading } from '@element-plus/icons-vue'
 import 'highlight.js/styles/github-dark.css'
 import type { UiChatBlock } from '../../stores/chat'
 import ApprovalCard from './ApprovalCard.vue'
+import BrowserStatusCard from './BrowserStatusCard.vue'
 import ExecutionCard from './ExecutionCard.vue'
 import { renderMarkdown } from './markdown'
 import MediaBlock from './MediaBlock.vue'

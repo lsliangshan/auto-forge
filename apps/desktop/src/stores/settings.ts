@@ -298,5 +298,17 @@ export const useSettingsStore = defineStore('settings', {
         this.saving = false
       }
     },
+    async clearBrowserData() {
+      this.saving = true
+      this.error = ''
+      try {
+        await getDesktopApi().settings.clearBrowserData()
+      } catch (error) {
+        this.error = displayError(error, '浏览器数据清除失败')
+        throw error
+      } finally {
+        this.saving = false
+      }
+    },
   },
 })

@@ -119,6 +119,14 @@ export interface BrowserWorkspaceTab {
 
 export interface BrowserWorkspaceContinuationRegistryPort {
   bindPopup(parentTabId: string, tabId: string): unknown
+  list(userId: string, conversationId: string): readonly {
+    bindingId: string
+    tabId: string
+  }[]
+  currentLease(bindingId: string): {
+    binding: { bindingId: string; tabId: string }
+    runId: string
+  } | undefined
   markClosed(tabId: string, reason: AppErrorCode): void
   markTakenOver(tabId: string, runId: string): Promise<void> | void
 }
@@ -303,7 +311,11 @@ function loadingHost(value: string): string {
   catch { return '目标站点' }
 }
 
-function toolbarDocument(tabs: readonly TargetTabState[], activeId: string | undefined): string {
+function toolbarDocument(
+  tabs: readonly TargetTabState[],
+  activeId: string | undefined,
+  automationBindingId: string | undefined,
+): string {
   const active = tabs.find((tab) => tab.id === activeId)
   const tabMarkup = tabs.map((tab) => {
     const title = tab.view.webContents.getTitle() || tab.workflowId
@@ -318,12 +330,24 @@ function toolbarDocument(tabs: readonly TargetTabState[], activeId: string | und
   const loading = !blockedOrigin && active?.loading === true
     ? `<main class="loading" role="status" aria-live="polite"><div class="loading-shell"><div class="connection-orbit" aria-hidden="true"><span class="orbit orbit-outer"></span><span class="orbit orbit-inner"></span><span class="orbit-core"></span></div><div class="loading-copy"><span class="loading-kicker">SECURE SESSION</span><strong>正在连接 <span>${html(host)}</span></strong><small>正在建立受保护的网页会话，请稍候</small><div class="progress-track" aria-hidden="true"><span></span></div><div class="connection-stages" aria-hidden="true"><span class="complete">请求站点</span><i></i><span class="current">建立连接</span><i></i><span>等待响应</span></div></div></div></main>`
     : ''
+  const automation = automationBindingId === undefined
+    ? ''
+    : `<div class="automation-controls"><span class="automation" aria-live="polite">AI 正在操作</span><a href="autoforge-browser://continuation/stop/${html(automationBindingId)}">停止</a><a href="autoforge-browser://continuation/takeover/${html(automationBindingId)}">接管</a></div>`
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>
   :root{color-scheme:light dark;--canvas:#f3f5f8;--surface:#fff;--surface-muted:#f8f9fb;--border:#dfe3e8;--border-strong:#c8ced6;--text:#303640;--muted:#68717d;--accent:#2563eb;--accent-soft:#eaf1ff;--loading-glow:rgb(37 99 235 / 14%);--loading-grid:rgb(104 113 125 / 8%);--loading-track:#d8e0eb}@media(prefers-color-scheme:dark){:root{--canvas:#11151c;--surface:#181d26;--surface-muted:#202630;--border:#343d4c;--border-strong:#4a5565;--text:#dbe4ef;--muted:#aeb8c6;--accent:#6f9cff;--accent-soft:#26354f;--loading-glow:rgb(111 156 255 / 16%);--loading-grid:rgb(174 184 198 / 7%);--loading-track:#303a48}}
-  *{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--text);font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid var(--border);background:var(--surface)}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:var(--surface-muted);border-radius:5px 5px 0 0}.tab.active{background:var(--accent-soft)}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-muted)}.nav a{color:var(--text);text-decoration:none;padding:2px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border)}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:var(--canvas);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  *{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--text);font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid var(--border);background:var(--surface)}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:var(--surface-muted);border-radius:5px 5px 0 0}.tab.active{background:var(--accent-soft)}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-muted)}.nav a{color:var(--text);text-decoration:none;padding:2px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border)}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:var(--canvas);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.automation-controls{display:flex;align-items:center;gap:4px}.automation{padding:2px 6px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-weight:650;white-space:nowrap}
   .loading{position:relative;isolation:isolate;height:calc(100vh - 52px);display:grid;place-items:center;overflow:hidden;background:var(--canvas)}.loading:before{position:absolute;z-index:-1;inset:0;background:radial-gradient(circle at 42% 46%,var(--loading-glow),transparent 31%),linear-gradient(var(--loading-grid) 1px,transparent 1px),linear-gradient(90deg,var(--loading-grid) 1px,transparent 1px);background-size:auto,42px 42px,42px 42px;content:"";mask-image:linear-gradient(to bottom,transparent 5%,#000 32%,#000 68%,transparent 95%)}.loading-shell{display:grid;width:min(520px,calc(100vw - 56px));grid-template-columns:92px minmax(0,1fr);align-items:center;gap:26px;transform:translateY(-5vh)}.connection-orbit{position:relative;width:76px;height:76px}.orbit{position:absolute;border:1px solid var(--border-strong);border-radius:50%}.orbit-outer{inset:0;border-top-color:var(--accent);border-right-color:transparent;animation:orbit-spin 2.6s linear infinite}.orbit-outer:after{position:absolute;top:4px;right:10px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 5px var(--accent-soft);content:""}.orbit-inner{inset:12px;border-bottom-color:var(--accent);border-left-color:transparent;animation:orbit-spin 1.9s linear infinite reverse}.orbit-core{inset:29px;border:0;background:var(--accent);box-shadow:0 0 0 7px var(--accent-soft);animation:core-pulse 1.8s ease-in-out infinite}.loading-copy{display:grid;min-width:0;gap:7px}.loading-kicker{color:var(--accent);font:700 9px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.18em}.loading strong{overflow:hidden;color:var(--text);font-size:18px;font-weight:680;line-height:1.3;text-overflow:ellipsis;white-space:nowrap}.loading strong span{color:var(--accent)}.loading small{color:var(--muted);font-size:11.5px}.progress-track{position:relative;height:3px;margin-top:9px;overflow:hidden;border-radius:2px;background:var(--loading-track)}.progress-track>span{position:absolute;top:0;bottom:0;left:-38%;width:38%;border-radius:inherit;background:var(--accent);box-shadow:0 0 10px var(--accent);animation:progress-travel 1.45s ease-in-out infinite}.connection-stages{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:9.5px;letter-spacing:.02em}.connection-stages span{flex:none}.connection-stages .complete{color:var(--text)}.connection-stages .current{color:var(--accent);font-weight:650}.connection-stages i{height:1px;min-width:18px;flex:1;background:var(--border);transform:translateY(1px)}@keyframes orbit-spin{to{transform:rotate(360deg)}}@keyframes core-pulse{50%{opacity:.55;transform:scale(.78)}}@keyframes progress-travel{50%,100%{left:100%}}@media(max-width:520px){.loading-shell{width:calc(100vw - 36px);grid-template-columns:72px 1fr;gap:18px}.connection-orbit{width:64px;height:64px}.orbit-inner{inset:10px}.orbit-core{inset:25px}.loading strong{font-size:16px}}@media(prefers-reduced-motion:reduce){.orbit,.orbit-core,.progress-track>span{animation:none}.progress-track>span{left:0;width:42%;box-shadow:none}}
   .blocked{height:calc(100vh - 52px);display:grid;place-items:center;padding:28px;background:var(--canvas)}.blocked-card{display:grid;width:min(560px,100%);gap:10px;padding:28px;border:1px solid var(--border);border-left:4px solid #dc2626;border-radius:8px;background:var(--surface);box-shadow:0 18px 44px rgb(0 0 0 / 9%)}.blocked-kicker{color:#dc2626;font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.16em}.blocked strong{font-size:20px}.blocked p,.blocked small{margin:0;color:var(--muted);line-height:1.6}.blocked code{overflow-wrap:anywhere;padding:10px 12px;border-radius:5px;background:var(--surface-muted);color:var(--text);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
-  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div></div></div>${blocked || loading}</body></html>`
+  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div>${automation}</div></div>${blocked || loading}</body></html>`
+}
+
+function parseContinuationToolbarCommand(value: string): {
+  action: 'stop' | 'takeover'
+  bindingId: string
+} | undefined {
+  const match = /^autoforge-browser:\/\/continuation\/(stop|takeover)\/([A-Za-z0-9_-]+)$/u.exec(value)
+  if (!match) return undefined
+  return { action: match[1] as 'stop' | 'takeover', bindingId: match[2]! }
 }
 
 export function browserPartition(userId: string): string {
@@ -476,11 +500,14 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     }
     await this.clearContinuationHighlight(tabId)
     state.ownerContinuationRunId = runId
+    void this.renderToolbar().catch(() => undefined)
   }
 
   async releaseContinuation(tabId: string, runId: string): Promise<void> {
     const state = this.tabs.get(tabId)
-    if (state?.ownerContinuationRunId === runId) state.ownerContinuationRunId = undefined
+    if (state?.ownerContinuationRunId !== runId) return
+    state.ownerContinuationRunId = undefined
+    void this.renderToolbar().catch(() => undefined)
   }
 
   onPageInvalidated(listener: (tabId: string) => void): () => void {
@@ -1285,11 +1312,26 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private async renderToolbar(): Promise<void> {
     const toolbar = this.toolbar
     if (!toolbar || toolbar.webContents.isDestroyed()) return
-    const document = toolbarDocument([...this.tabs.values()].filter((tab) => !tab.closed), this.activeTabId)
+    const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
+    const document = toolbarDocument(
+      [...this.tabs.values()].filter((tab) => !tab.closed),
+      this.activeTabId,
+      active ? this.automationBindingId(active, false) : undefined,
+    )
     await toolbar.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(document)}`)
   }
 
   private async handleToolbarCommand(value: string): Promise<void> {
+    const continuationCommand = parseContinuationToolbarCommand(value)
+    if (continuationCommand) {
+      const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
+      if (!active || this.automationBindingId(active, true) !== continuationCommand.bindingId) return
+      const handlers = this.continuationCommandHandlers
+      if (!handlers) return
+      if (continuationCommand.action === 'stop') await handlers.stop(continuationCommand.bindingId)
+      else await handlers.takeOver(continuationCommand.bindingId)
+      return
+    }
     let command: string
     let id: string | undefined
     try {
@@ -1322,6 +1364,24 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       this.handleUserTakeover(active, true)
       active.view.webContents.reload()
     }
+  }
+
+  private automationBindingId(state: TargetTabState, requireCurrentLease: boolean): string | undefined {
+    const registry = this.continuationRegistry
+    const continuation = state.continuation
+    const ownerRunId = state.ownerContinuationRunId
+    if (!registry || !continuation || !state.continuationBound || !ownerRunId || state.closed) return undefined
+    const binding = registry.list(state.userId, continuation.conversationId)
+      .find((candidate) => candidate.tabId === state.id)
+    if (!binding) return undefined
+    if (!requireCurrentLease) return binding.bindingId
+    const lease = registry.currentLease(binding.bindingId)
+    return lease
+      && lease.binding.bindingId === binding.bindingId
+      && lease.binding.tabId === state.id
+      && lease.runId === ownerRunId
+      ? binding.bindingId
+      : undefined
   }
 
   private guardNavigation(state: TargetTabState, event: NavigationEvent, url: string): void {
