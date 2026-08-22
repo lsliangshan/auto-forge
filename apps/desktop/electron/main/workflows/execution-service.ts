@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { fork as nodeFork, type ChildProcess, type ForkOptions } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
 import { mkdtemp, open, realpath, rm } from 'node:fs/promises'
@@ -33,9 +33,9 @@ import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import { validateWorkflowOutput } from './output-validation.js'
 import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
 import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
+import { MAX_WORKFLOW_ARTIFACT_BYTES, readStableRegularFile } from './artifact-reader.js'
 
 const MAX_LINE_BYTES = 1024 * 1024
-const MAX_WORKFLOW_ARTIFACT_BYTES = 8 * 1024 * 1024
 const STAGED_WORKFLOW_ENTRY = 'workflow-entry.mjs'
 
 type ExecutionRepository = Pick<AppRepositories['executions'], 'insert' | 'get' | 'update'>
@@ -653,44 +653,19 @@ export class ExecutionService {
     if (!expectedDigest || !/^[a-f0-9]{64}$/.test(expectedDigest)) {
       throw this.artifactFailure(source)
     }
-    let handle
     try {
-      handle = await open(path.entryPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
       const canonicalBefore = await realpath(path.entryPath)
       if (canonicalBefore !== path.entryPath || !inside(path.rootPath, canonicalBefore)) {
         throw this.artifactFailure(source)
       }
-      const before = await handle.stat({ bigint: true })
-      if (!before.isFile() || before.size < 0n || before.size > BigInt(MAX_WORKFLOW_ARTIFACT_BYTES)) {
-        throw this.artifactFailure(source)
-      }
-      const contents = Buffer.alloc(Number(before.size))
-      let offset = 0
-      while (offset < contents.length) {
-        const { bytesRead } = await handle.read(contents, offset, contents.length - offset, offset)
-        if (bytesRead === 0) break
-        offset += bytesRead
-      }
-      const extra = Buffer.alloc(1)
-      const extraRead = await handle.read(extra, 0, 1, contents.length)
-      const after = await handle.stat({ bigint: true })
+      const artifact = await readStableRegularFile(path.entryPath, MAX_WORKFLOW_ARTIFACT_BYTES)
       const canonicalAfter = await realpath(path.entryPath)
-      if (offset !== contents.length
-        || extraRead.bytesRead !== 0
-        || canonicalAfter !== canonicalBefore
-        || before.dev !== after.dev
-        || before.ino !== after.ino
-        || before.size !== after.size
-        || before.mtimeNs !== after.mtimeNs
-        || before.ctimeNs !== after.ctimeNs
-        || createHash('sha256').update(contents).digest('hex') !== expectedDigest) {
+      if (canonicalAfter !== canonicalBefore || artifact.sha256 !== expectedDigest) {
         throw this.artifactFailure(source)
       }
-      return contents
+      return artifact.contents
     } catch {
       throw this.artifactFailure(source)
-    } finally {
-      await handle?.close().catch(() => undefined)
     }
   }
 
@@ -730,28 +705,31 @@ export class ExecutionService {
     directory?: string,
   ): Promise<StartedExecution> {
     const status = error.code === 'CANCELLED' ? 'cancelled' : 'failed'
-    const terminal = this.dependencies.repositories.executions.update(executionId, {
-      status,
-      errorCode: error.code,
-      endedAt: Date.now(),
-    })
-    if (!terminal) throw failure('NOT_FOUND')
-    this.emit(statusEvent(executionId, status, error))
     try {
-      this.dependencies.policy.releaseExecution(executionId)
-    } catch {
-      // Cleanup continues even if a policy implementation rejects release.
+      const terminal = this.dependencies.repositories.executions.update(executionId, {
+        status,
+        errorCode: error.code,
+        endedAt: Date.now(),
+      })
+      if (!terminal) throw failure('NOT_FOUND')
+      this.emit(statusEvent(executionId, status, error))
+      try {
+        this.dependencies.policy.releaseExecution(executionId)
+      } catch {
+        // Cleanup continues even if a policy implementation rejects release.
+      }
+      try {
+        await this.dependencies.capability.closeExecution(executionId)
+      } catch {
+        // Pre-active capability cleanup is best effort after the terminal state is durable.
+      }
+      const reservation = this.reservationsById.get(executionId)
+      if (reservation) this.reservationHandles.delete(reservation.handle)
+      this.reservationsById.delete(executionId)
+      return { id: executionId, finished: Promise.resolve(terminal) }
+    } finally {
+      if (directory) await this.removeTemporaryDirectory(directory)
     }
-    try {
-      await this.dependencies.capability.closeExecution(executionId)
-    } catch {
-      // Pre-active capability cleanup is best effort after the terminal state is durable.
-    }
-    if (directory) await this.removeTemporaryDirectory(directory)
-    const reservation = this.reservationsById.get(executionId)
-    if (reservation) this.reservationHandles.delete(reservation.handle)
-    this.reservationsById.delete(executionId)
-    return { id: executionId, finished: Promise.resolve(terminal) }
   }
 
   private async rejectOwnedReservation(record: ReservationRecord, error: AppError): Promise<never> {

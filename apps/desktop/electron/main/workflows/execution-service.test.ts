@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
-import { fork as forkProcess, type ForkOptions } from 'node:child_process'
+import { execFileSync, fork as forkProcess, type ForkOptions } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { closeSync, constants, openSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
@@ -1387,6 +1387,46 @@ describe('ExecutionService', () => {
     }
   })
 
+  it('promptly rejects a FIFO artifact before spawning the Worker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-fifo-'))
+    const entryPath = 'entry.mjs'
+    const entry = join(root, entryPath)
+    execFileSync('mkfifo', [entry])
+    const harness = createHarness({
+      source: {
+        workflow: { ...workflow, codeSha256: createHash('sha256').update('').digest('hex') },
+        rootPath: root,
+        entryPath,
+        integrity: 'valid',
+      },
+    })
+    const starting = harness.start()
+    const outcome = await Promise.race([
+      starting.then((execution) => ({ type: 'resolved' as const, execution })),
+      new Promise<{ type: 'timed-out' }>((resolvePromise) => {
+        setTimeout(() => resolvePromise({ type: 'timed-out' }), 100)
+      }),
+    ])
+
+    try {
+      if (outcome.type === 'timed-out') {
+        const writer = openSync(entry, constants.O_WRONLY | constants.O_NONBLOCK)
+        closeSync(writer)
+        const execution = await starting
+        await execution.finished
+      }
+      expect(outcome.type).toBe('resolved')
+      if (outcome.type === 'resolved') {
+        await expect(outcome.execution.finished).resolves.toMatchObject({
+          status: 'failed', errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+        })
+      }
+      expect(harness.workerFactory.workers.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it.each(['installed', 'development'] as const)(
     'executes verified staged %s bytes when the original becomes an outside symlink after path resolution',
     async (source) => {
@@ -1606,6 +1646,44 @@ describe('ExecutionService', () => {
     expect(harness.workerFactory.workers.size).toBe(0)
     expect(release).toHaveBeenCalledWith(execution.id)
     expect(closedExecution).toBe(execution.id)
+  })
+
+  it.each([
+    ['throws', 'INTERNAL_ERROR', true],
+    ['returns empty', 'NOT_FOUND', false],
+  ] as const)('removes the staged directory once when pre-active terminal persistence %s', async (_case, code, throws) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-pre-active-persistence-'))
+    const executionDirectory = join(root, 'execution')
+    await mkdir(executionDirectory)
+    const remove = vi.fn((path: string) => rm(path, { recursive: true, force: true }))
+    const closeExecution = vi.fn(async () => undefined)
+    const workerFactory = new FakeWorkerFactory(() => { throw new Error('spawn unavailable') })
+    const harness = createHarness({
+      workerFactory,
+      capability: { request: async () => undefined, closeExecution },
+      temporaryDirectories: { create: async () => executionDirectory, remove },
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+    const update = harness.repositories.executions.update
+    harness.repositories.executions.update = (id, value) => {
+      if (value.status === 'failed') {
+        if (throws) throw new Error('database unavailable')
+        return undefined
+      }
+      return update(id, value)
+    }
+
+    try {
+      await expect(harness.start()).rejects.toMatchObject({ code })
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(executionDirectory)
+      expect(workerFactory.workers.size).toBe(0)
+      expect(releaseExecution).toHaveBeenCalledTimes(1)
+      expect(closeExecution).toHaveBeenCalledTimes(1)
+      expect(harness.service.hasActiveExecutions()).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('finishes cleanup when a terminal event listener throws', async () => {

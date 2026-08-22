@@ -1,13 +1,16 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { closeSync, constants, mkdirSync, mkdtempSync, openSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import { openAppDatabase } from '../database/client.js'
 import type { InstalledWorkflow, WorkflowProject } from '../database/repositories.js'
 import { buildFingerprint, WorkflowProjectService } from './project-service.js'
 import { WorkflowRegistry } from './registry.js'
+import { createWorkflowCatalog } from '../agent/workflow-catalog.js'
+import { createWorkflowSourceSelectorVault } from './workflow-source-selector.js'
 
 const temporaryDirectories: string[] = []
 
@@ -73,7 +76,9 @@ function readyProject(overrides: Partial<WorkflowProject> = {}): { project: Work
   }
 }
 
-function registryHarness(input: { installed: InstalledWorkflow[]; projects: ReturnType<typeof readyProject>[] }) {
+type InstalledFixture = InstalledWorkflow & { entryContents?: Buffer }
+
+function registryHarness(input: { installed: InstalledFixture[]; projects: ReturnType<typeof readyProject>[] }) {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-registry-'))
   temporaryDirectories.push(directory)
   const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
@@ -90,11 +95,12 @@ function registryHarness(input: { installed: InstalledWorkflow[]; projects: Retu
     database.workflowProjects.insert({ ...candidate.project, rootPath: root })
   }
 
-  for (const candidate of input.installed) {
+  for (const fixture of input.installed) {
+    const { entryContents, ...candidate } = fixture
     const root = join(directory, 'installed', candidate.workflowId, candidate.version)
     const manifest = candidate.manifest as Record<string, unknown>
     const entryPath = String(manifest.entryPath)
-    const entry = Buffer.from('export default {}\n')
+    const entry = entryContents ?? Buffer.from('export default {}\n')
     mkdirSync(join(root, 'dist'), { recursive: true })
     writeFileSync(join(root, 'workflow.json'), `${JSON.stringify(manifest, null, 2)}\n`)
     writeFileSync(join(root, entryPath), entry)
@@ -104,7 +110,47 @@ function registryHarness(input: { installed: InstalledWorkflow[]; projects: Retu
     ])
   }
 
-  return new WorkflowRegistry(database, projects)
+  return { registry: new WorkflowRegistry(database, projects), directory, database }
+}
+
+function installedRegistryFixture(entryContents: Buffer, extraFileCount = 0) {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), 'autoforge-registry-artifact-'))
+  temporaryDirectories.push(temporaryRoot)
+  const root = realpathSync(temporaryRoot)
+  const manifest = readyProject().manifest
+  manifest.codeSha256 = sha256(entryContents)
+  const entry = join(root, manifest.entryPath)
+  mkdirSync(join(root, 'dist'), { recursive: true })
+  writeFileSync(entry, entryContents)
+  const files = [{
+    workflowId: manifest.id,
+    workflowVersion: manifest.version,
+    path: manifest.entryPath,
+    sha256: sha256(entryContents),
+  }]
+  if (extraFileCount > 0) mkdirSync(join(root, 'extra'))
+  for (let index = 0; index < extraFileCount; index += 1) {
+    const path = `extra/${index}.mjs`
+    writeFileSync(join(root, path), '')
+    files.push({
+      workflowId: manifest.id,
+      workflowVersion: manifest.version,
+      path,
+      sha256: sha256(Buffer.alloc(0)),
+    })
+  }
+  let current = installedWorkflow({ manifest, installPath: root })
+  const registry = new WorkflowRegistry({
+    installedWorkflows: {
+      get: () => current,
+      list: () => [current],
+      upsert: (value: InstalledWorkflow) => { current = value; return value },
+      setEnabled: () => undefined,
+    },
+    workflowFiles: { list: () => files },
+    workflowProjects: { get: () => undefined, list: () => [] },
+  } as never, {} as WorkflowProjectService)
+  return { registry, entry }
 }
 
 afterEach(() => {
@@ -112,6 +158,12 @@ afterEach(() => {
 })
 
 describe('WorkflowRegistry', () => {
+  it('verifies a matching regular installed artifact fixture', async () => {
+    const { registry } = installedRegistryFixture(Buffer.from('export default {}\n'))
+
+    await expect(registry.verifyIntegrity('workflow.same', '1.0.0')).resolves.toEqual({ valid: true, disabled: false })
+  })
+
   it('normalizes missing cities and shadows only the exact installed identity with a ready development build', async () => {
     const development = readyProject({ buildHash: 'b'.repeat(64) })
     development.project.buildHash = buildFingerprint([
@@ -119,7 +171,7 @@ describe('WorkflowRegistry', () => {
     ], development.manifest)
     const installedManifest = { ...development.manifest }
     delete installedManifest.cities
-    const registry = registryHarness({
+    const { registry } = registryHarness({
       installed: [
         installedWorkflow({ manifest: installedManifest }),
         installedWorkflow({
@@ -154,5 +206,63 @@ describe('WorkflowRegistry', () => {
         },
       }),
     ])
+  })
+
+  it('promptly rejects an installed FIFO without advertising a catalog candidate', async () => {
+    const { registry, entry } = installedRegistryFixture(Buffer.from('export default {}\n'))
+    unlinkSync(entry)
+    execFileSync('mkfifo', [entry])
+    const selectorFor = vi.fn(createWorkflowSourceSelectorVault().create)
+    const creating = createWorkflowCatalog({ workflows: registry, selectorFor }).create({ developerMode: false })
+    const outcome = await Promise.race([
+      creating.then((candidates) => ({ type: 'resolved' as const, candidates })),
+      new Promise<{ type: 'timed-out' }>((resolvePromise) => {
+        setTimeout(() => resolvePromise({ type: 'timed-out' }), 100)
+      }),
+    ])
+
+    if (outcome.type === 'timed-out') {
+      const writer = openSync(entry, constants.O_WRONLY | constants.O_NONBLOCK)
+      closeSync(writer)
+      await creating
+    }
+    expect(outcome).toEqual({ type: 'resolved', candidates: [] })
+    expect(selectorFor).not.toHaveBeenCalled()
+  })
+
+  it('rejects an oversized installed artifact even when its stored digest matches', async () => {
+    const entryContents = Buffer.alloc(8 * 1024 * 1024 + 1, 97)
+    const { registry } = installedRegistryFixture(entryContents)
+    const selectorFor = vi.fn(createWorkflowSourceSelectorVault().create)
+
+    const candidates = await createWorkflowCatalog({ workflows: registry, selectorFor }).create({ developerMode: false })
+
+    expect(candidates).toEqual([])
+    expect(selectorFor).not.toHaveBeenCalled()
+  })
+
+  it('rejects a symlinked installed artifact even when its target digest matches', async () => {
+    const contents = Buffer.from('export default {}\n')
+    const { registry, entry } = installedRegistryFixture(contents)
+    const target = `${entry}.target`
+    writeFileSync(target, contents)
+    unlinkSync(entry)
+    symlinkSync(target, entry)
+    const selectorFor = vi.fn(createWorkflowSourceSelectorVault().create)
+
+    const candidates = await createWorkflowCatalog({ workflows: registry, selectorFor }).create({ developerMode: false })
+
+    expect(candidates).toEqual([])
+    expect(selectorFor).not.toHaveBeenCalled()
+  })
+
+  it('rejects an installed integrity set above the bounded file count', async () => {
+    const { registry } = installedRegistryFixture(Buffer.from('export default {}\n'), 512)
+    const selectorFor = vi.fn(createWorkflowSourceSelectorVault().create)
+
+    const candidates = await createWorkflowCatalog({ workflows: registry, selectorFor }).create({ developerMode: false })
+
+    expect(candidates).toEqual([])
+    expect(selectorFor).not.toHaveBeenCalled()
   })
 })

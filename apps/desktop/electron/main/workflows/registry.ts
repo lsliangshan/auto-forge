@@ -1,12 +1,16 @@
 import { createHash } from 'node:crypto'
-import { readFile, realpath } from 'node:fs/promises'
+import { realpath } from 'node:fs/promises'
 import { resolve, sep } from 'node:path'
 import { validateManifest, type WorkflowManifest } from '@autoforge/workflow-schema'
 import type { WorkflowDetail } from '@autoforge/shared'
 import type { AppRepositories, InstalledWorkflow } from '../database/repositories.js'
 import { WorkflowProjectService } from './project-service.js'
+import { MAX_WORKFLOW_ARTIFACT_BYTES, readStableRegularFile } from './artifact-reader.js'
 
 type RegistryRepositories = Pick<AppRepositories, 'workflowProjects' | 'installedWorkflows' | 'workflowFiles'>
+
+export const MAX_INSTALLED_WORKFLOW_FILES = 512
+export const MAX_INSTALLED_WORKFLOW_BYTES = 16 * 1024 * 1024
 
 function sha256(value: Uint8Array): string {
   return createHash('sha256').update(value).digest('hex')
@@ -54,7 +58,9 @@ export class WorkflowRegistry {
   ) {}
 
   async list(options: { developerMode?: boolean } = {}): Promise<WorkflowDetail[]> {
-    await Promise.all(this.repositories.installedWorkflows.list().map((workflow) => this.verifyIntegrity(workflow.workflowId, workflow.version)))
+    for (const workflow of this.repositories.installedWorkflows.list()) {
+      await this.verifyIntegrity(workflow.workflowId, workflow.version)
+    }
     const installed = this.repositories.installedWorkflows.list().map(toDetail).filter((workflow): workflow is WorkflowDetail => workflow !== undefined)
     if (!options.developerMode) return installed
 
@@ -121,19 +127,36 @@ export class WorkflowRegistry {
     const installed = this.repositories.installedWorkflows.get(workflowId, version)
     if (!installed) return { valid: false, disabled: false }
 
-    const root = resolve(installed.installPath)
     const files = this.repositories.workflowFiles.list(workflowId, version)
-    const valid = files.length > 0 && await Promise.all(files.map(async (file) => {
-      const path = resolve(root, file.path)
-      if (path !== root && !path.startsWith(`${root}${sep}`)) return false
-      try {
+    let valid = files.length > 0 && files.length <= MAX_INSTALLED_WORKFLOW_FILES
+    let totalBytes = 0
+    try {
+      const root = await realpath(resolve(installed.installPath))
+      for (const file of valid ? files : []) {
+        const path = resolve(root, file.path)
+        if (path !== root && !path.startsWith(`${root}${sep}`)) {
+          valid = false
+          break
+        }
         const canonical = await realpath(path)
-        if (canonical !== root && !canonical.startsWith(`${root}${sep}`)) return false
-        return sha256(await readFile(canonical)) === file.sha256
-      } catch {
-        return false
+        if (canonical !== path || (canonical !== root && !canonical.startsWith(`${root}${sep}`))) {
+          valid = false
+          break
+        }
+        const artifact = await readStableRegularFile(
+          path,
+          Math.min(MAX_WORKFLOW_ARTIFACT_BYTES, MAX_INSTALLED_WORKFLOW_BYTES - totalBytes),
+        )
+        const canonicalAfter = await realpath(path)
+        totalBytes += artifact.contents.length
+        if (canonicalAfter !== canonical || artifact.sha256 !== file.sha256) {
+          valid = false
+          break
+        }
       }
-    })).then((results) => results.every(Boolean))
+    } catch {
+      valid = false
+    }
 
     if (!valid) {
       this.repositories.installedWorkflows.upsert({ ...installed, enabled: false, integrityStatus: 'failed', updatedAt: Date.now() })
