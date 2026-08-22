@@ -35,6 +35,7 @@ import {
   type ToolError,
   type WorkflowToolExecutionPort,
   type WorkflowToolPolicyPort,
+  type WorkflowToolRunBudget,
 } from './workflow-tool-executor.js'
 
 const MAX_MODEL_TURNS = 8
@@ -205,6 +206,12 @@ export interface AgentOrchestratorDependencies {
   executions: AgentExecutionPort
   createSourceSelector(workflow: WorkflowDetail): WorkflowExecutionSourceSelector
   inspectSource(selector: WorkflowExecutionSourceSelector): ExactWorkflowSource | undefined
+  resolveCurrentWorkflow(
+    selector: WorkflowExecutionSourceSelector,
+    id: string,
+    version: string,
+  ): Promise<WorkflowDetail | undefined>
+  checkRemainingBudgets(input: WorkflowToolRunBudget & { phase: 'prepare' | 'start' }): AppError['code'] | undefined
   history: ConversationHistoryPort
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
@@ -266,6 +273,7 @@ interface ActiveAgentRun {
   workflows: Map<string, WorkflowCandidate>
   controller: AbortController
   modelTurns: number
+  toolExecutions: number
   busy: boolean
   cancelled: boolean
   terminal?: AgentRunResult
@@ -307,6 +315,8 @@ export class AgentOrchestrator {
       policy: dependencies.policy,
       currentDeveloperMode: dependencies.developerMode ?? (() => false),
       inspectSource: dependencies.inspectSource,
+      resolveCurrentWorkflow: dependencies.resolveCurrentWorkflow,
+      checkRemainingBudgets: dependencies.checkRemainingBudgets,
       now: this.now,
     })
   }
@@ -375,6 +385,7 @@ export class AgentOrchestrator {
         workflows: new Map(),
         controller: new AbortController(),
         modelTurns: 0,
+        toolExecutions: 0,
         busy: false,
         cancelled: false,
       }
@@ -622,6 +633,7 @@ export class AgentOrchestrator {
       candidate,
       arguments: call.arguments,
       developerMode: this.dependencies.developerMode?.() ?? false,
+      budget: this.toolBudget(active),
     })
     if (prepared.kind === 'tool_error') {
       this.appendToolExchange(active, {
@@ -686,12 +698,14 @@ export class AgentOrchestrator {
       userId: active.userId,
       chatRunId: active.runId,
       signal: active.controller.signal,
+      budget: this.toolBudget(active),
     })
     if (started.kind === 'tool_error') {
       this.appendToolExchange(active, pending, started)
       this.clearPending(active)
       return this.drive(active)
     }
+    active.toolExecutions += 1
     this.appendBlock(active, { type: 'workflow_execution', executionId: tool.executionId })
     const execution = await started.finished
     if (active.cancelled || execution.status === 'cancelled') return this.finish(active, 'cancelled', appFailure('CANCELLED'))
@@ -747,6 +761,15 @@ export class AgentOrchestrator {
     this.activeByExecution.delete(pending.tool.executionId)
     active.pending = undefined
     active.executionId = undefined
+  }
+
+  private toolBudget(active: ActiveAgentRun): WorkflowToolRunBudget {
+    return {
+      requestId: active.requestId,
+      runId: active.runId,
+      toolExecutions: active.toolExecutions,
+      modelDecisions: active.modelTurns,
+    }
   }
 
   private appendText(active: ActiveAgentRun, text: string): void {

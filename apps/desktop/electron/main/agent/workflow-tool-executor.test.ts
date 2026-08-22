@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ApprovalDecision, WorkflowDetail } from '@autoforge/shared'
+import { estimateTextTokens } from '../chat/conversation-context.js'
 import { scopeHash } from '../permissions/policy-engine.js'
 import type { ExecutionReservation } from '../workflows/execution-service.js'
 import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import type { WorkflowCandidate } from './workflow-catalog.js'
-import { WorkflowToolExecutor } from './workflow-tool-executor.js'
+import {
+  createWorkflowActionSummary,
+  WorkflowToolExecutor,
+  type WorkflowToolRunBudget,
+} from './workflow-tool-executor.js'
 
 const inputSchema = {
   type: 'object', additionalProperties: false, required: ['topic'],
@@ -43,6 +48,7 @@ function harness(options: {
   }
   let developerMode = options.developerMode ?? true
   let budgetCode = options.budgetCode
+  let liveWorkflow: WorkflowDetail | undefined = structuredClone(detail)
   let reservation = 0
   const order: string[] = []
   const executions = {
@@ -70,11 +76,35 @@ function harness(options: {
     policy,
     currentDeveloperMode: vi.fn(() => { order.push('mode'); return developerMode }),
     inspectSource: vi.fn(() => { order.push('source'); return exactSource }),
-    checkRemainingBudgets: vi.fn(() => { order.push('budget'); return budgetCode }),
+    resolveCurrentWorkflow: vi.fn(async () => { order.push('live-source'); return liveWorkflow }),
+    checkRemainingBudgets: vi.fn((budgetInput: WorkflowToolRunBudget & { phase: 'prepare' | 'start' }) => {
+      void budgetInput
+      order.push('budget')
+      return budgetCode
+    }),
     now: vi.fn(() => 1_000),
   }
+  const executor = new WorkflowToolExecutor(dependencies)
+  const budget: WorkflowToolRunBudget = {
+    requestId: 'request_1', runId: 'run_1', toolExecutions: 0, modelDecisions: 1,
+  }
   return {
-    executor: new WorkflowToolExecutor(dependencies),
+    executor: {
+      prepare: (input: Omit<Parameters<WorkflowToolExecutor['prepare']>[0], 'budget'>) => (
+        executor.prepare({ ...input, budget })
+      ),
+      approve: executor.approve.bind(executor),
+      deny: executor.deny.bind(executor),
+      start: (
+        pending: Parameters<WorkflowToolExecutor['start']>[0],
+        input: Omit<Parameters<WorkflowToolExecutor['start']>[1], 'budget'>,
+      ) => (
+        executor.start(pending, { ...input, budget })
+      ),
+      cancel: executor.cancel.bind(executor),
+      toModelResult: executor.toModelResult.bind(executor),
+    },
+    rawExecutor: executor,
     candidate: candidate(detail, selector),
     dependencies,
     executions,
@@ -82,6 +112,7 @@ function harness(options: {
     order,
     setDeveloperMode(value: boolean) { developerMode = value },
     setExactSource(value: ExactWorkflowSource | undefined) { exactSource = value },
+    setLiveWorkflow(value: WorkflowDetail | undefined) { liveWorkflow = value },
     setBudgetCode(value: 'TOOL_CALL_LIMIT' | undefined) { budgetCode = value },
   }
 }
@@ -368,7 +399,7 @@ describe('WorkflowToolExecutor', () => {
 
     expect(test.executions.cancel).toHaveBeenCalledTimes(1)
     await started.finished
-    expect(test.policy.releaseExecution).toHaveBeenCalledTimes(1)
+    expect(test.policy.releaseExecution).not.toHaveBeenCalled()
   })
 
   it('rejects stale approval identity and persistent chat approval without changing lifecycle', async () => {
@@ -425,6 +456,210 @@ describe('WorkflowToolExecutor', () => {
     expect(test.executions.startReserved).not.toHaveBeenCalled()
     expect(test.executions.discardReservation).toHaveBeenCalledTimes(1)
     expect(test.policy.releaseExecution).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects live approval metadata drift with an unchanged code hash before start', async () => {
+    const test = harness()
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+    test.setLiveWorkflow(workflow({ cities: ['北京', '上海'] }))
+
+    await expect(test.executor.start(prepared.pending, { userId: 'user_1' }))
+      .resolves.toEqual({ kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
+    expect(test.dependencies.resolveCurrentWorkflow).toHaveBeenCalledWith(
+      test.candidate.selector, test.candidate.workflow.id, test.candidate.workflow.version,
+    )
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
+  it('rechecks developer mode and exact selector after the live lookup immediately before start', async () => {
+    const development = workflow({
+      source: 'development', codeSha256: undefined,
+      runtimeIdentity: {
+        id: 'local.residence.permit', version: '1.0.0', source: 'development', buildHash: 'b'.repeat(64),
+      },
+    })
+    const exact = {
+      id: development.id, version: development.version, source: 'development' as const, buildHash: 'b'.repeat(64),
+    }
+    const test = harness({ detail: development, exactSource: exact })
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+    test.dependencies.resolveCurrentWorkflow.mockImplementationOnce(async () => {
+      test.setDeveloperMode(false)
+      test.setExactSource(undefined)
+      return development
+    })
+
+    await expect(test.executor.start(prepared.pending, { userId: 'user_1' }))
+      .resolves.toEqual({ kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['input', (pending: Record<string, unknown>) => { pending.input = { topic: '篡改' } }],
+    ['city', (pending: Record<string, unknown>) => { pending.city = '上海' }],
+    ['source', (pending: Record<string, unknown>) => { pending.source = { id: 'other', version: '1.0.0', source: 'installed', codeSha256: 'b'.repeat(64) } }],
+    ['capability', (pending: Record<string, unknown>) => { pending.capability = 'browser.click' }],
+    ['scope', (pending: Record<string, unknown>) => { pending.scope = { origins: ['https://attacker.example'] } }],
+    ['action summary', (pending: Record<string, unknown>) => { pending.actionSummary = '伪造操作' }],
+  ] as const)('fails approval closed after exposed pending %s mutation', async (_field, mutate) => {
+    const permission = { capability: 'browser.fill' as const, scope: { origins: ['https://example.com'] } }
+    const test = harness({ detail: workflow({ permissions: [permission] }) })
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'awaiting_approval') throw new Error('expected approval')
+    const decision = onceDecision(prepared.pending)
+    let blocked = false
+    try { mutate(prepared.pending as unknown as Record<string, unknown>) } catch { blocked = true }
+
+    expect(blocked).toBe(true)
+    expect(Object.isFrozen(prepared.pending)).toBe(true)
+    expect(onceDecision(prepared.pending)).toEqual(decision)
+    expect(test.policy.record).not.toHaveBeenCalled()
+    expect(test.executions.startReserved).not.toHaveBeenCalled()
+  })
+
+  it('binds approval to the current candidate permission scope', async () => {
+    const permission = { capability: 'browser.fill' as const, scope: { origins: ['https://example.com'] } }
+    const test = harness({ detail: workflow({ permissions: [permission] }) })
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'awaiting_approval') throw new Error('expected approval')
+    const decision = onceDecision(prepared.pending)
+    permission.scope.origins[0] = 'https://attacker.example'
+
+    await expect(test.executor.approve(prepared.pending, decision))
+      .resolves.toEqual({ kind: 'tool_error', code: 'CONFLICT' })
+    expect(test.policy.record).not.toHaveBeenCalled()
+  })
+
+  it('passes mandatory run identity, phase, and counters to both budget checks', async () => {
+    const test = harness()
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+    await test.executor.start(prepared.pending, { userId: 'user_1' })
+
+    expect(test.dependencies.checkRemainingBudgets).toHaveBeenNthCalledWith(1, {
+      requestId: 'request_1', runId: 'run_1', toolExecutions: 0, modelDecisions: 1, phase: 'prepare',
+    })
+    expect(test.dependencies.checkRemainingBudgets).toHaveBeenNthCalledWith(2, {
+      requestId: 'request_1', runId: 'run_1', toolExecutions: 0, modelDecisions: 1, phase: 'start',
+    })
+  })
+
+  it('discards and releases an unaccepted reservation when startReserved throws', async () => {
+    const test = harness()
+    test.executions.startReserved.mockRejectedValueOnce(Object.assign(new Error('port rejected'), { code: 'CONFLICT' }))
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+
+    await expect(test.executor.start(prepared.pending, { userId: 'user_1' }))
+      .resolves.toEqual({ kind: 'tool_error', code: 'CONFLICT' })
+    expect(test.executions.discardReservation).toHaveBeenCalledTimes(1)
+    expect(test.policy.releaseExecution).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not release an accepted reservation when a starting port rejects', async () => {
+    const test = harness()
+    test.executions.discardReservation.mockReturnValueOnce(false)
+    test.executions.startReserved.mockRejectedValueOnce(Object.assign(new Error('accepted then rejected'), { code: 'INTERNAL_ERROR' }))
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+
+    await expect(test.executor.start(prepared.pending, { userId: 'user_1' }))
+      .resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
+    expect(test.executions.discardReservation).toHaveBeenCalledTimes(1)
+    expect(test.policy.releaseExecution).not.toHaveBeenCalled()
+    await test.executor.cancel(prepared.pending)
+    expect(test.executions.cancel).toHaveBeenCalledWith('execution_1')
+  })
+
+  it('leaves started grant cleanup exclusively to ExecutionService', async () => {
+    const test = harness()
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+    const started = await test.executor.start(prepared.pending, { userId: 'user_1' })
+    if (started.kind !== 'started') throw new Error('expected started')
+
+    await started.finished
+    expect(test.executions.discardReservation).not.toHaveBeenCalled()
+    expect(test.policy.releaseExecution).not.toHaveBeenCalled()
+  })
+
+  it('fails a mismatched completion id closed without exposing its result', async () => {
+    const test = harness()
+    test.executions.startReserved.mockImplementationOnce(async (reservation) => ({
+      id: reservation.executionId,
+      finished: Promise.resolve({
+        id: 'execution_attacker', status: 'completed', result: { ok: true, secret: 'stolen' }, input: undefined,
+      }),
+    }))
+    const prepared = await test.executor.prepare({
+      candidate: test.candidate,
+      arguments: { resolvedCity: '北京', input: { topic: '居住证' } },
+      developerMode: true,
+    })
+    if (prepared.kind !== 'ready') throw new Error('expected ready')
+    const started = await test.executor.start(prepared.pending, { userId: 'user_1' })
+    if (started.kind !== 'started') throw new Error('expected started')
+
+    await expect(started.finished).resolves.toEqual({
+      id: 'execution_1', status: 'failed', errorCode: 'CONFLICT',
+    })
+  })
+
+  it('bounds summary traversal and fails cyclic, throwing-getter, and proxy values safely', () => {
+    const wide: Record<string, unknown> = {}
+    for (let index = 0; index < 100; index += 1) wide[`key_${index}`] = index
+    const circular: { self?: unknown } = {}
+    circular.self = circular
+    const throwing = Object.defineProperty({}, 'value', {
+      enumerable: true,
+      get() { throw new Error('secret getter value') },
+    })
+    const proxy = new Proxy({}, { ownKeys() { throw new Error('secret proxy value') } })
+
+    const summary = createWorkflowActionSummary(workflow(), 'browser.fill', '北京', wide)
+    expect(summary).toContain('key_11')
+    expect(summary).not.toContain('key_12')
+    expect(createWorkflowActionSummary(workflow(), 'browser.fill', '北京', [circular])).toContain('[circular]')
+    expect(createWorkflowActionSummary(workflow(), 'browser.fill', '北京', throwing)).toContain('[unavailable]')
+    expect(createWorkflowActionSummary(workflow(), 'browser.fill', '北京', proxy)).toContain('[unavailable]')
+    expect([summary,
+      createWorkflowActionSummary(workflow(), 'browser.fill', '北京', throwing),
+      createWorkflowActionSummary(workflow(), 'browser.fill', '北京', proxy),
+    ].join(' ')).not.toMatch(/secret getter value|secret proxy value/)
   })
 
   it('prevents a prepared development tool from starting after developer mode closes', async () => {
@@ -489,6 +724,25 @@ describe('WorkflowToolExecutor', () => {
       .toEqual({ kind: 'tool_error', code: 'RESULT_TOO_LARGE' })
     expect(test.executor.toModelResult({ result: { answer: 'ok' }, contextLength: 128_000 }))
       .toEqual({ kind: 'tool_result', content: '{"answer":"ok"}' })
+  })
+
+  it('accepts exact byte and token result limits and rejects one over with the real estimator', () => {
+    const test = harness()
+    const exactBytes = 'x'.repeat((256 * 1024) - 2)
+    const overBytes = `${exactBytes}x`
+    expect(Buffer.byteLength(JSON.stringify(exactBytes), 'utf8')).toBe(256 * 1024)
+    expect(Buffer.byteLength(JSON.stringify(overBytes), 'utf8')).toBe((256 * 1024) + 1)
+    expect(test.executor.toModelResult({ result: exactBytes, contextLength: 2_000_000 }).kind).toBe('tool_result')
+    expect(test.executor.toModelResult({ result: overBytes, contextLength: 2_000_000 }))
+      .toEqual({ kind: 'tool_error', code: 'RESULT_TOO_LARGE' })
+
+    const exactTokens = 'x'.repeat(28)
+    const overTokens = `${exactTokens}x`
+    expect(estimateTextTokens(JSON.stringify(exactTokens))).toBe(10)
+    expect(estimateTextTokens(JSON.stringify(overTokens))).toBe(11)
+    expect(test.executor.toModelResult({ result: exactTokens, contextLength: 67 }).kind).toBe('tool_result')
+    expect(test.executor.toModelResult({ result: overTokens, contextLength: 67 }))
+      .toEqual({ kind: 'tool_error', code: 'RESULT_TOO_LARGE' })
   })
 
   it('fails closed for undefined, circular, and non-JSON results without exposing error details', () => {

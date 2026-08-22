@@ -761,6 +761,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     executions,
     createSourceSelector: sourceSelectorVault.create,
     inspectSource: sourceSelectorVault.inspect,
+    resolveCurrentWorkflow: async (selector, id, version) => (
+      (await sourceResolver.resolve(id, version, selector))?.workflow
+    ),
+    checkRemainingBudgets: ({ toolExecutions }) => (
+      toolExecutions >= 5 ? 'TOOL_CALL_LIMIT' : undefined
+    ),
     providerUsage: database.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,

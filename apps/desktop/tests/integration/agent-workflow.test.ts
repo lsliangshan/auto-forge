@@ -10,8 +10,9 @@ import {
   type WorkerRequest,
   type WorkflowDetail,
 } from '@autoforge/shared'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentOrchestrator, createAgentPersistence } from '../../electron/main/agent/agent-orchestrator.js'
+import { createWorkflowExecutionSourceResolver } from '../../electron/main/application.js'
 import { OpenRouterProvider } from '../../electron/main/chat/openrouter-provider.js'
 import { openAppDatabase } from '../../electron/main/database/client.js'
 import { PolicyEngine, scopeHash } from '../../electron/main/permissions/policy-engine.js'
@@ -147,16 +148,20 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
   const policy = new PolicyEngine(database.permissionGrants)
   const workers = new IntegrationWorkerFactory()
   const executionEvents: ExecutionEvent[] = []
+  const registry = new WorkflowRegistry(database, {} as never)
+  const sourceSelectorVault = createWorkflowSourceSelectorVault()
+  const liveSourceResolver = createWorkflowExecutionSourceResolver(sourceSelectorVault, {
+    repositories: database,
+    registry,
+  })
   const executionService = new ExecutionService({
     repositories: database,
-    sourceResolver: options.sourceResolver ?? { resolve: async () => ({ workflow, rootPath: directory, entryPath: 'workflow.mjs', integrity: 'valid' }) },
+    sourceResolver: options.sourceResolver ?? liveSourceResolver,
     policy,
     workers,
     capability: { request: async () => ({ opened: true }), closeExecution: async () => undefined },
     emit: (event) => { executionEvents.push(event) },
   })
-  const registry = new WorkflowRegistry(database, {} as never)
-  const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const orchestrator = new AgentOrchestrator({
     workflows: registry,
     persistence: createAgentPersistence(database),
@@ -165,10 +170,14 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
     executions: executionService,
     createSourceSelector: sourceSelectorVault.create,
     inspectSource: sourceSelectorVault.inspect,
+    resolveCurrentWorkflow: async (selector, id, version) => (
+      (await liveSourceResolver.resolve(id, version, selector))?.workflow
+    ),
+    checkRemainingBudgets: () => undefined,
     providerUsage: database.providerUsage,
     emit: () => undefined,
   })
-  return { directory, workflow, database, workers, executionEvents, orchestrator, registry, providerSnapshot }
+  return { directory, workflow, database, workers, executionEvents, orchestrator, registry, policy, providerSnapshot }
 }
 
 describe('agent workflow integration', () => {
@@ -208,6 +217,7 @@ describe('agent workflow integration', () => {
     ]))
     expect(pending.error).toBeUndefined()
     expect(pending).toMatchObject({ status: 'awaiting_approval' })
+    const releaseExecution = vi.spyOn(app.policy, 'releaseExecution')
     const result = await app.orchestrator.resumeApproval({
       executionId: pending.executionId!, permissionIndex: 0,
       scopeHash: scopeHash(permission.scope), decision: 'once',
@@ -247,6 +257,47 @@ describe('agent workflow integration', () => {
     expect(app.database.permissionGrants.get(
       app.workflow.id, app.workflow.version, permission.capability, scopeHash(permission.scope),
     )).toBeUndefined()
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects live Registry manifest metadata drift before execution persistence or Worker start', async () => {
+    let turn = 0
+    const app = await runtime({
+      fetch: async () => {
+        turn += 1
+        if (turn === 1) return response([
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'drift_tool', function: { name: 'workflow_1', arguments: '{"input":{"keyword":"今日天气"}}' } }] }, finish_reason: 'tool_calls' }] },
+          '[DONE]',
+        ])
+        return response([
+          { choices: [{ index: 0, delta: { content: '工作流已变化，未执行' }, finish_reason: 'stop' }] },
+          '[DONE]',
+        ])
+      },
+    })
+    const pending = await app.orchestrator.run({
+      conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
+      userId: 'user_1', userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
+      modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
+      model: 'local-test-model', requestId: 'drift_request', providerSnapshot: app.providerSnapshot,
+    })
+    expect(pending).toMatchObject({ status: 'awaiting_approval' })
+    const installed = app.database.installedWorkflows.get(app.workflow.id, app.workflow.version)!
+    app.database.installedWorkflows.upsert({
+      ...installed,
+      manifest: { ...(installed.manifest as Record<string, unknown>), cities: ['北京'] },
+      updatedAt: 2,
+    })
+
+    const result = await app.orchestrator.resumeApproval({
+      executionId: pending.executionId!, permissionIndex: 0,
+      scopeHash: scopeHash(permission.scope), decision: 'once',
+    })
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(app.database.executions.get(pending.executionId!)).toBeUndefined()
+    expect(app.workers.workers).toHaveLength(0)
+    expect(JSON.stringify(app.database.messages.listForConversation('conversation_1'))).toContain('工作流已变化，未执行')
   })
 
   it('cancels a real execution service start blocked before active registration', async () => {
@@ -271,6 +322,7 @@ describe('agent workflow integration', () => {
       ]),
     })
     appDirectory = app.directory
+    const releaseExecution = vi.spyOn(app.policy, 'releaseExecution')
     const pending = await app.orchestrator.run({
       conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
       userId: 'user_1',
@@ -292,6 +344,7 @@ describe('agent workflow integration', () => {
     await expect(resuming).resolves.toMatchObject({ status: 'cancelled' })
     expect(app.workers.workers).toHaveLength(0)
     expect(app.database.executions.get(pending.executionId!)).toMatchObject({ status: 'cancelled', errorCode: 'CANCELLED' })
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(app.database.messages.listForConversation('conversation_1').find((message) => message.role === 'assistant')!.blocks)).not.toContain('真实执行完成')
   })
 })

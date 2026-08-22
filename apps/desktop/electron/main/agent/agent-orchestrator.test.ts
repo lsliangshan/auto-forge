@@ -57,6 +57,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     users: unknown[]
     runs: unknown[]
     starts: unknown[]
+    reservations: unknown[]
     decisions: unknown[]
     discards: unknown[]
     events: unknown[]
@@ -72,6 +73,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     users: [] as unknown[],
     runs: [] as unknown[],
     starts: [] as unknown[],
+    reservations: [] as unknown[],
     decisions: [] as unknown[],
     discards: [] as unknown[],
     events: [] as unknown[],
@@ -88,6 +90,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
   currentProviderInstances = providerInstances
   const history = { prepare: vi.fn<ConversationHistoryPort['prepare']>(async () => []) }
   const sourceSelectorVault = createWorkflowSourceSelectorVault()
+  const workflows = { list: async () => [workflow] }
   const providerUsage = {
     start: vi.fn((...args: unknown[]) => {
       records.order.push('usage.start')
@@ -113,14 +116,18 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
   return {
     records,
     providerInstances,
-    workflows: { list: async () => [workflow] },
+    workflows,
     policy: {
       evaluate: vi.fn(() => ({ allowed: false, requiresApproval: true })),
       record: vi.fn((value) => { records.decisions.push(value); return value as never }),
       releaseExecution: vi.fn(() => undefined),
     },
     executions: {
-      reserve: () => ({ executionId: `reserved_${++reservation}` }),
+      reserve: () => {
+        const reserved = { executionId: `reserved_${++reservation}` }
+        records.reservations.push(reserved)
+        return reserved
+      },
       discardReservation: (reserved) => { records.discards.push(reserved); return true },
       startReserved: async (reserved, input) => {
         records.starts.push({ ...input, executionId: reserved.executionId })
@@ -130,6 +137,10 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     },
     createSourceSelector: sourceSelectorVault.create,
     inspectSource: sourceSelectorVault.inspect,
+    resolveCurrentWorkflow: async (_selector, id, version) => (
+      (await workflows.list()).find((candidate) => candidate.id === id && candidate.version === version)
+    ),
+    checkRemainingBudgets: () => undefined,
     persistence: {
       persistUser(value) { records.users.push(value); return { ordinal: records.users.length } },
       createRun(value) { records.runs.push(value) },
@@ -196,6 +207,30 @@ function textRunInput(
 }
 
 describe('AgentOrchestrator', () => {
+  it('passes depleted run-scoped tool budgets through the executor before reserve or start', async () => {
+    const dependencies = harness([
+      toolTurn,
+      [
+        { type: 'text_delta', choiceIndex: 0, text: '已安全停止工具执行' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    const checkRemainingBudgets = vi.fn(() => 'TOOL_CALL_LIMIT' as const)
+    Object.assign(dependencies, { checkRemainingBudgets })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'conversation_budget', content: '使用百度搜索今日天气', provider: 'openrouter',
+      model: 'openrouter/model', requestId: 'request_budget',
+    }))
+
+    expect(result).toMatchObject({ requestId: 'request_budget', status: 'completed' })
+    expect(checkRemainingBudgets).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'request_budget', phase: 'prepare', toolExecutions: 0,
+    }))
+    expect(dependencies.records.reservations).toHaveLength(0)
+    expect(dependencies.records.starts).toHaveLength(0)
+  })
+
   it('uses one supplied credential snapshot for context compression and every normal turn', async () => {
     const dependencies = harness([])
     const stream = vi.fn(() => events([
@@ -1586,6 +1621,8 @@ describe('AgentOrchestrator', () => {
 
   it('allows only one resume continuation for the same approval', async () => {
     let finishExecution!: (value: { id: string; status: string; result: unknown }) => void
+    let markStartEntered!: () => void
+    const startEntered = new Promise<void>((resolve) => { markStartEntered = resolve })
     const dependencies = harness([toolTurn, [
       { type: 'text_delta', choiceIndex: 0, text: '完成' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
@@ -1593,6 +1630,7 @@ describe('AgentOrchestrator', () => {
     requireChatApproval(dependencies)
     dependencies.executions.startReserved = async (reserved, input) => {
       dependencies.records.starts.push({ ...input, executionId: reserved.executionId })
+      markStartEntered()
       return {
         id: reserved.executionId,
         finished: new Promise((resolve) => { finishExecution = resolve }),
@@ -1602,6 +1640,7 @@ describe('AgentOrchestrator', () => {
     const pending = await orchestrator.run(textRunInput({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' }))
 
     const first = orchestrator.resumeApproval({ executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once' })
+    await startEntered
     const second = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once' })
     expect(second).toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
     expect(dependencies.records.starts).toHaveLength(1)
