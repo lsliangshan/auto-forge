@@ -825,6 +825,72 @@ describe('ElectronBrowserWorkspace', () => {
     await lease.release()
   })
 
+  it('repaints the trusted toolbar without automation controls after real target-content takeover', async () => {
+    const { workspace, views } = createHarness()
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(tab.id)
+    await workspace.releaseExecution(input.executionId)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_real_user',
+    })
+    const toolbar = views[0]!.webContents
+    await vi.waitFor(() => expect(decodeURIComponent(toolbar.loaded.at(-1)!.split(',')[1]!))
+      .toContain('autoforge-browser://continuation/stop/binding_1'))
+    const loadCount = toolbar.loaded.length
+
+    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
+
+    expect(lease.isCurrent(binding)).toBe(false)
+    await vi.waitFor(() => expect(toolbar.loaded.length).toBeGreaterThan(loadCount))
+    const document = decodeURIComponent(toolbar.loaded.at(-1)!.split(',')[1]!)
+    expect(document).not.toContain('class="automation-controls"')
+    expect(document).not.toContain('autoforge-browser://continuation/stop/')
+    expect(document).not.toContain('autoforge-browser://continuation/takeover/')
+    await lease.release()
+  })
+
+  it('swallows a rejected takeover repaint without restoring continuation authority', async () => {
+    let rejectToolbar = false
+    let rejectedRepaints = 0
+    const { workspace, views } = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (rejectToolbar && url.startsWith('data:text/html')) {
+          rejectedRepaints += 1
+          throw new Error('toolbar renderer unavailable')
+        }
+      },
+    )
+    const input = executionInput()
+    const tab = await workspace.acquire(input)
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(tab.id)
+    await workspace.releaseExecution(input.executionId)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_repaint_failure',
+    })
+    await vi.waitFor(() => expect(views[0]!.webContents.loaded.length).toBeGreaterThan(1))
+    rejectToolbar = true
+
+    views[1]!.webContents.emit('before-mouse-event', {}, { type: 'mouseDown' })
+
+    expect(lease.isCurrent(binding)).toBe(false)
+    await vi.waitFor(() => expect(rejectedRepaints).toBe(1))
+    expect(registry.currentLease(binding.bindingId)).toBeUndefined()
+    const replacement = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_after_repaint_failure',
+    })
+    expect(replacement.ownerRunId).toBe('run_after_repaint_failure')
+    await lease.release()
+    await replacement.release()
+  })
+
   it.each(['back', 'forward', 'reload'] as const)(
     'releases continuation ownership before toolbar %s mutates the page',
     async (command) => {

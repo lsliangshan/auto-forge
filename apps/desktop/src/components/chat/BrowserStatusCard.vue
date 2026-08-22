@@ -95,6 +95,13 @@ const auditEntries = ref<BrowserActionAuditEntry[]>([])
 const auditLoading = ref(false)
 const auditLoaded = ref(false)
 const auditError = ref('')
+let identityGeneration = 0
+
+interface AsyncIdentity {
+  generation: number
+  requestId: string
+  bindingId: string
+}
 
 const statusLabel = computed(() => ({
   inspecting: 'AI 正在读取网页',
@@ -113,6 +120,7 @@ const statusError = computed(() => actionError.value
   || (props.block.errorCode ? displayError({ code: props.block.errorCode }) : ''))
 
 watch(() => [props.block.requestId, props.block.bindingId], () => {
+  identityGeneration += 1
   actionBusy.value = false
   actionSettled.value = false
   actionError.value = ''
@@ -120,23 +128,40 @@ watch(() => [props.block.requestId, props.block.bindingId], () => {
   auditLoading.value = false
   auditLoaded.value = false
   auditError.value = ''
-})
+}, { flush: 'sync' })
+
+function captureIdentity(): AsyncIdentity {
+  return {
+    generation: identityGeneration,
+    requestId: props.block.requestId,
+    bindingId: props.block.bindingId,
+  }
+}
+
+function isCurrent(identity: AsyncIdentity): boolean {
+  return identity.generation === identityGeneration
+    && identity.requestId === props.block.requestId
+    && identity.bindingId === props.block.bindingId
+}
 
 async function runAction(action: 'stop' | 'takeover') {
   if (actionsDisabled.value) return
+  const identity = captureIdentity()
   actionBusy.value = true
   actionError.value = ''
   try {
-    if (action === 'stop') await getDesktopApi().chat.cancel(props.block.requestId)
+    if (action === 'stop') await getDesktopApi().chat.cancel(identity.requestId)
     else await getDesktopApi().chat.takeOverBrowser({
-      requestId: props.block.requestId,
-      bindingId: props.block.bindingId,
+      requestId: identity.requestId,
+      bindingId: identity.bindingId,
     })
+    if (!isCurrent(identity)) return
     actionSettled.value = true
   } catch (error) {
+    if (!isCurrent(identity)) return
     actionError.value = displayError(error, action === 'stop' ? '停止失败' : '接管失败')
   } finally {
-    actionBusy.value = false
+    if (isCurrent(identity)) actionBusy.value = false
   }
 }
 
@@ -144,16 +169,20 @@ async function loadAudit(event: { currentTarget: unknown }) {
   const details = event.currentTarget
   if (!details || typeof details !== 'object' || !('open' in details) || details.open !== true
     || auditLoaded.value || auditLoading.value) return
+  const identity = captureIdentity()
   auditLoading.value = true
   auditError.value = ''
   try {
-    const entries = await getDesktopApi().chat.listBrowserAudit(props.block.bindingId)
+    const entries = await getDesktopApi().chat.listBrowserAudit(identity.bindingId)
+    if (!isCurrent(identity)) return
     auditEntries.value = [...entries].sort((left, right) => left.sequence - right.sequence)
+    if (!isCurrent(identity)) return
     auditLoaded.value = true
   } catch (error) {
+    if (!isCurrent(identity)) return
     auditError.value = displayError(error, '操作记录加载失败')
   } finally {
-    auditLoading.value = false
+    if (isCurrent(identity)) auditLoading.value = false
   }
 }
 

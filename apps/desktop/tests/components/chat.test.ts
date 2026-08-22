@@ -6,6 +6,7 @@ import ElementPlus from 'element-plus'
 import {
   appSettingsSchema,
   type ApprovalDecision,
+  type BrowserActionAuditEntry,
   type ChatBlock,
   type ChatEvent,
   type ConversationGenerationPreferences,
@@ -123,6 +124,13 @@ function mediaAsset(id: string, kind: MediaAsset['kind'] = 'image'): MediaAsset 
     name: `${id}.${kind === 'image' ? 'png' : kind === 'audio' ? 'mp3' : 'mp4'}`,
     byteSize: 1024,
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
 }
 
 function modelInfo(id: string, outputs: ModelInfo['outputModalities']): ModelInfo {
@@ -705,6 +713,107 @@ describe('chat interactions', () => {
     expect(entries[1]!.text()).toContain('需要你在页面中手动确认')
     expect(wrapper.text()).not.toContain('Secret-Value')
     expect(wrapper.text()).not.toContain('页面原文')
+  })
+
+  it('discards an old audit resolution without clearing or replacing the new identity load', async () => {
+    const { api } = createEventApi()
+    const oldAudit = deferred<BrowserActionAuditEntry[]>()
+    const newAudit = deferred<BrowserActionAuditEntry[]>()
+    vi.mocked(api.chat.listBrowserAudit)
+      .mockReturnValueOnce(oldAudit.promise)
+      .mockReturnValueOnce(newAudit.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting') },
+      global: { plugins: [ElementPlus] },
+    })
+    const details = wrapper.get('[data-testid="browser-audit"]')
+    ;(details.element as HTMLDetailsElement).open = true
+    await details.trigger('toggle')
+    await wrapper.setProps({
+      block: browserStatusBlock('acting', { requestId: 'request_2', bindingId: 'binding_2' }),
+    })
+    await details.trigger('toggle')
+    expect(api.chat.listBrowserAudit).toHaveBeenNthCalledWith(1, 'binding_1')
+    expect(api.chat.listBrowserAudit).toHaveBeenNthCalledWith(2, 'binding_2')
+
+    oldAudit.resolve([{
+      id: 'old_audit', bindingId: 'binding_1', sequence: 1,
+      origin: 'https://old.example.cn', action: '旧请求操作', targetSummary: '旧目标',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 1,
+    }])
+    await flushPromises()
+    expect(wrapper.text()).toContain('正在加载操作记录…')
+    expect(wrapper.text()).not.toContain('旧请求操作')
+
+    newAudit.resolve([{
+      id: 'new_audit', bindingId: 'binding_2', sequence: 1,
+      origin: 'https://new.example.cn', action: '新请求操作', targetSummary: '新目标',
+      risk: 'safe_navigation', outcome: 'completed', createdAt: 2,
+    }])
+    await flushPromises()
+    expect(wrapper.text()).toContain('新请求操作')
+    expect(wrapper.text()).not.toContain('旧请求操作')
+  })
+
+  it('does not let an old takeover success settle a replacement action', async () => {
+    const { api } = createEventApi()
+    const oldTakeover = deferred<void>()
+    const newTakeover = deferred<void>()
+    vi.mocked(api.chat.takeOverBrowser)
+      .mockReturnValueOnce(oldTakeover.promise)
+      .mockReturnValueOnce(newTakeover.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting') },
+      global: { plugins: [ElementPlus] },
+    })
+    await wrapper.get('[data-testid="take-over-browser"]').trigger('click')
+    await wrapper.setProps({
+      block: browserStatusBlock('acting', { requestId: 'request_2', bindingId: 'binding_2' }),
+    })
+    await wrapper.get('[data-testid="take-over-browser"]').trigger('click')
+    oldTakeover.resolve()
+    await flushPromises()
+    expect(api.chat.takeOverBrowser).toHaveBeenNthCalledWith(2, {
+      requestId: 'request_2', bindingId: 'binding_2',
+    })
+
+    newTakeover.reject({ code: 'PAGE_CHANGED', message: 'replacement failed safely' })
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('页面已变化，请重新检查后继续')
+    expect((wrapper.get('[data-testid="take-over-browser"]').element as HTMLButtonElement).disabled)
+      .toBe(false)
+  })
+
+  it('does not let an old cancel failure clear or overwrite a replacement action', async () => {
+    const { api } = createEventApi()
+    const oldCancel = deferred<void>()
+    const newCancel = deferred<void>()
+    vi.mocked(api.chat.cancel)
+      .mockReturnValueOnce(oldCancel.promise)
+      .mockReturnValueOnce(newCancel.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting') },
+      global: { plugins: [ElementPlus] },
+    })
+    await wrapper.get('[data-testid="stop-browser"]').trigger('click')
+    await wrapper.setProps({
+      block: browserStatusBlock('acting', { requestId: 'request_2', bindingId: 'binding_2' }),
+    })
+    await wrapper.get('[data-testid="stop-browser"]').trigger('click')
+    oldCancel.reject({ code: 'PAGE_CHANGED', message: 'old request failed' })
+    await flushPromises()
+
+    expect(api.chat.cancel).toHaveBeenNthCalledWith(2, 'request_2')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect((wrapper.get('[data-testid="stop-browser"]').element as HTMLButtonElement).disabled)
+      .toBe(true)
+    newCancel.resolve()
+    await flushPromises()
+    expect((wrapper.get('[data-testid="stop-browser"]').element as HTMLButtonElement).disabled)
+      .toBe(true)
   })
 
   it.each([

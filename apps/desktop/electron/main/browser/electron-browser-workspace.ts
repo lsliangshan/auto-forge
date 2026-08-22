@@ -1164,6 +1164,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     if (!runId || (!force && state.syntheticInputOperations > 0)) return
     state.ownerContinuationRunId = undefined
     this.emitPageInvalidated(state.id)
+    void this.renderToolbar().catch(() => undefined)
     const takenOver = this.continuationRegistry?.markTakenOver(state.id, runId)
     if (takenOver) void Promise.resolve(takenOver).catch(() => undefined)
   }
