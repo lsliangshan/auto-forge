@@ -611,6 +611,21 @@ describe('developer workbench', () => {
     expect(raw.developer.run).toHaveBeenCalledWith({ projectId: 'project_1', input: {} })
   })
 
+  it('shows a semantic workflow input validation error without queueing an execution', async () => {
+    const { api, raw } = createApi()
+    raw.developer.run.mockResolvedValueOnce({ validationError: '搜索关键词不能为空' } as never)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    await store.selectFile('workflow.json')
+
+    await store.runDebug()
+
+    expect(store.debugStatus).toBe('failed')
+    expect(store.debugError).toBe('搜索关键词不能为空')
+    expect(store.debugExecutionId).toBe('')
+  })
+
   it('initializes required booleans and preserves enum values with distinct JSON types', async () => {
     const { api, raw } = createApi()
     const manifest = JSON.parse(await raw.developer.readFile('project_1', 'workflow.json')) as Record<string, unknown>
@@ -836,6 +851,25 @@ describe('developer workbench', () => {
     expect(raw.developer.run).toHaveBeenCalledWith({ projectId: project.id, input: { keyword: 'captured', nested: { value: 'captured' } } })
     expect(raw.executions.cancel).toHaveBeenCalledWith('exec_late')
     expect(store.debugExecutionId).toBe('')
+    expect(store.debugStatus).toBe('idle')
+  })
+
+  it('ignores a validation error returned after its debug run becomes stale', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
+    raw.developer.listProjects.mockResolvedValue([project, second])
+    let resolveRun!: (value: { validationError: string }) => void
+    raw.developer.run.mockReturnValueOnce(new Promise((resolve) => { resolveRun = resolve }) as never)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const run = store.runDebug()
+    await vi.waitFor(() => expect(raw.developer.run).toHaveBeenCalled())
+    await store.selectProject(second.id)
+    resolveRun({ validationError: '搜索关键词不能为空' })
+    await run
+
+    expect(store.debugError).toBe('')
     expect(store.debugStatus).toBe('idle')
   })
 })

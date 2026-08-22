@@ -25,7 +25,6 @@ import {
   type WorkflowSummary,
 } from '@autoforge/shared'
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
-import Ajv, { type AnySchema } from 'ajv'
 import {
   AgentOrchestrator,
   createAgentPersistence,
@@ -80,6 +79,7 @@ import {
   type WorkflowExecutionSourceResolver,
   type WorkflowExecutionSourceSelector,
 } from './workflows/execution-service.js'
+import { validateWorkflowInput } from './workflows/input-validation.js'
 import { WorkflowProjectService } from './workflows/project-service.js'
 import { WorkflowRegistry } from './workflows/registry.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
@@ -1159,8 +1159,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const built = await projects.build(projectId)
           const manifest = built.manifest as WorkflowManifest
           try {
-            const validateInput = new Ajv({ allErrors: true, strict: false }).compile(manifest.inputSchema as AnySchema)
-            if (!validateInput(input)) throw failure('INVALID_INPUT')
+            const inputValidation = validateWorkflowInput(manifest.inputSchema, input)
+            if (!inputValidation.valid) return { validationError: inputValidation.message }
           } catch (error) {
             if (typeof error === 'object' && error !== null && 'code' in error) throw error
             throw failure('INVALID_INPUT')

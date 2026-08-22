@@ -495,6 +495,39 @@ describe('ElectronBrowserWorkspace', () => {
     expect(denied.preventDefault).toHaveBeenCalledOnce()
   })
 
+  it('waits for a delayed first-load redirect before resolving browser.open', async () => {
+    vi.useFakeTimers()
+    try {
+      const { workspace, views } = createHarness()
+      const tab = await acquire(workspace, 'exec_1')
+      const target = views[1]!.webContents
+      const initialUrl = 'https://fw.bjrcgz.gov.cn/person-platform/#/person-platform/overview'
+      const loginUrl = 'https://bjt.beijing.gov.cn/renzheng/open/login/goUserLogin'
+      vi.spyOn(target, 'loadURL').mockImplementationOnce(async (url) => {
+        target.loaded.push(url)
+        target.currentUrl = url
+      })
+      let settled = false
+
+      const opening = tab.open(initialUrl, [
+        'https://fw.bjrcgz.gov.cn',
+        'https://bjt.beijing.gov.cn',
+      ]).finally(() => { settled = true })
+      while (!target.loaded.includes(initialUrl)) await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(500)
+
+      expect(settled).toBe(false)
+      target.currentUrl = loginUrl
+      target.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+      target.emit('did-stop-loading')
+
+      await opening
+      expect(await tab.url()).toBe(loginUrl)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('resolves exact CSS and accessibility locators and drives fill and click through CDP', async () => {
     const respond = (method: string) => ({
       'DOM.getDocument': { root: { nodeId: 1 } },
@@ -592,8 +625,11 @@ describe('ElectronBrowserWorkspace', () => {
       } as Record<string, unknown>)[method] ?? {}
       const { workspace, views } = createHarness(respond)
       const tab = await acquire(workspace, 'exec_1')
-      await tab.open('https://www.baidu.com', ['https://www.baidu.com'])
       const target = views[1]!.webContents
+      const opening = tab.open('https://www.baidu.com', ['https://www.baidu.com'])
+      while (!target.loaded.includes('https://www.baidu.com')) await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1_000)
+      await opening
 
       const clicking = tab.click('role=button[name="提交"]', 'https://www.baidu.com')
       while (!target.debugger.commands.some(({ method }) => method === 'Input.dispatchMouseEvent')) {

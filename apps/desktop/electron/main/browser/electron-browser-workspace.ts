@@ -126,6 +126,7 @@ interface TargetTabState {
 
 const toolbarHeight = 52
 const navigationDetectionMs = 500
+const postLoadNavigationDetectionMs = 1_000
 const roles = new Set([
   'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button', 'caption', 'cell',
   'checkbox', 'code', 'columnheader', 'combobox', 'complementary', 'contentinfo', 'definition',
@@ -377,6 +378,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
         }
         await navigation.promise
       }
+      await this.waitForNavigation(state.view.webContents, postLoadNavigationDetectionMs).promise
     })
     await this.renderToolbar().catch(() => undefined)
   }
@@ -761,7 +763,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     return [...matches][0]!
   }
 
-  private waitForNavigation(contents: WebContentsPort): { promise: Promise<void>; cancel(): void } {
+  private waitForNavigation(
+    contents: WebContentsPort,
+    detectionMs = navigationDetectionMs,
+  ): { promise: Promise<void>; cancel(): void } {
     let cancel: () => void = () => undefined
     const promise = new Promise<void>((resolve, reject) => {
       let started = false
@@ -806,7 +811,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
       contents.on('did-fail-load', onFail)
       contents.on('did-navigate-in-page', onInPage)
       contents.on('destroyed', onDestroyed)
-      detectionTimer = setTimeout(() => { if (!started) finish() }, navigationDetectionMs)
+      detectionTimer = setTimeout(() => { if (!started) finish() }, detectionMs)
       maximumTimer = setTimeout(() => { finish(failure('WORKER_TIMEOUT')) }, 30_000)
     })
     return { promise, cancel: () => cancel() }
