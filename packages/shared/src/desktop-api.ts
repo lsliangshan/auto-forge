@@ -422,6 +422,13 @@ export const developerRunInputSchema = z.object({
 
 export type DeveloperRunInput = z.infer<typeof developerRunInputSchema>
 
+export const developerRunResultSchema = z.union([
+  z.object({ executionId: identifierSchema }).strict(),
+  z.object({ validationError: nonEmptyStringSchema.max(500) }).strict(),
+])
+
+export type DeveloperRunResult = z.infer<typeof developerRunResultSchema>
+
 export const executionQuerySchema = z.object({
   status: z.enum([
     'queued', 'awaiting_approval', 'running', 'completed', 'failed', 'cancelled', 'interrupted',
@@ -992,7 +999,6 @@ export const ipcRequestSchemas = {
 
 const voidResponseSchema = z.void()
 const requestIdResponseSchema = z.object({ requestId: identifierSchema }).strict()
-const executionIdResponseSchema = z.object({ executionId: identifierSchema }).strict()
 
 export const ipcResponseSchemas = {
   [ipcChannels.authGetSession]: authSessionSchema.nullable(),
@@ -1039,7 +1045,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.developerDeleteEntry]: developerProjectSchema,
   [ipcChannels.developerBuildProject]: developerProjectSchema,
   [ipcChannels.developerValidate]: validationResultSchema,
-  [ipcChannels.developerRun]: executionIdResponseSchema,
+  [ipcChannels.developerRun]: developerRunResultSchema,
   [ipcChannels.executionsList]: z.array(executionSummarySchema),
   [ipcChannels.executionsGet]: executionDetailSchema,
   [ipcChannels.executionsDecide]: voidResponseSchema,
@@ -1120,7 +1126,7 @@ export interface DesktopAPI {
     deleteEntry(projectId: string, relativePath: string): Promise<DeveloperProject>
     build(projectId: string): Promise<DeveloperProject>
     validate(projectId: string): Promise<ValidationResult>
-    run(input: DeveloperRunInput): Promise<{ executionId: string }>
+    run(input: DeveloperRunInput): Promise<DeveloperRunResult>
   }
   executions: {
     list(query?: ExecutionQuery): Promise<ExecutionSummary[]>

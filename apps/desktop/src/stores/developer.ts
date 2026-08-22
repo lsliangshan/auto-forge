@@ -482,11 +482,19 @@ export const useDeveloperStore = defineStore('developer', {
         if (!isCurrent()) return
         this._applyValidation(validation)
         if (!validation.valid) { this.debugStatus = 'idle'; this.debugError = '项目校验未通过。'; return }
-        const { executionId } = await getDesktopApi().developer.run({ projectId, input })
+        const runResult = await getDesktopApi().developer.run({ projectId, input })
         if (!isCurrent()) {
-          try { await getDesktopApi().executions.cancel(executionId) } catch { /* A stale execution may already be terminal. */ }
+          if ('executionId' in runResult) {
+            try { await getDesktopApi().executions.cancel(runResult.executionId) } catch { /* A stale execution may already be terminal. */ }
+          }
           return
         }
+        if ('validationError' in runResult) {
+          this.debugStatus = 'failed'
+          this.debugError = runResult.validationError
+          return
+        }
+        const { executionId } = runResult
         this.debugExecutionId = executionId
         this.debugStatus = 'queued'
         for (const event of state.pendingEvents) if (event.executionId === executionId) this._applyExecutionEvent(event)

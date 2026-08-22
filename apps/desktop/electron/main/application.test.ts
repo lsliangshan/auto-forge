@@ -7,6 +7,7 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  developerRunResultSchema,
   toSafeAppError,
   type AppError,
   type AuthCredentials,
@@ -3755,6 +3756,309 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('returns the titled first input validation error without starting an execution', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-input-error-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    await authenticate(runtime)
+    const project = await runtime.services.developer.createProject('Input Validation')
+    const manifest = JSON.parse(
+      await runtime.services.developer.readFile(project.id, 'workflow.json'),
+    ) as Record<string, unknown>
+    manifest.inputSchema = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['keyword'],
+      properties: {
+        keyword: { type: 'string', title: '搜索关键词', minLength: 1 },
+      },
+    }
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+
+    await expect(runtime.services.developer.run({ projectId: project.id, input: { keyword: '' } }))
+      .resolves.toEqual({ validationError: '搜索关键词不能为空' })
+    expect(await runtime.services.executions.list()).toEqual([])
+
+    await runtime.close()
+  })
+
+  it.each([
+    {
+      name: 'missing required property',
+      inputSchema: { type: 'object', required: ['keyword'], properties: { keyword: { type: 'string', title: '搜索关键词' } } },
+      input: {},
+      expected: '搜索关键词不能为空',
+    },
+    {
+      name: 'field name fallback instead of parent title',
+      inputSchema: { type: 'object', title: '调试参数', required: ['keyword'], properties: { keyword: { type: 'string' } } },
+      input: {},
+      expected: 'keyword不能为空',
+    },
+    {
+      name: 'first of multiple errors',
+      inputSchema: {
+        type: 'object',
+        required: ['keyword', 'region'],
+        properties: {
+          keyword: { type: 'string', title: '搜索关键词' },
+          region: { type: 'string', title: '地区' },
+        },
+      },
+      input: {},
+      expected: '搜索关键词不能为空',
+    },
+    {
+      name: 'local reference title',
+      inputSchema: {
+        type: 'object',
+        properties: { amount: { $ref: '#/$defs/amount' } },
+        $defs: { amount: { type: 'number', title: '金额' } },
+      },
+      input: { amount: 'invalid' },
+      expected: '金额必须是数字',
+    },
+    {
+      name: 'required local reference title',
+      inputSchema: {
+        type: 'object',
+        required: ['amount'],
+        properties: { amount: { $ref: '#/$defs/amount' } },
+        $defs: { amount: { type: 'number', title: '金额' } },
+      },
+      input: {},
+      expected: '金额不能为空',
+    },
+    {
+      name: 'pattern property title',
+      inputSchema: {
+        type: 'object',
+        patternProperties: { '^x-': { type: 'number', title: '扩展值' } },
+      },
+      input: { 'x-value': 'invalid' },
+      expected: '扩展值必须是数字',
+    },
+    {
+      name: 'combinator parent title',
+      inputSchema: {
+        type: 'object',
+        properties: { value: { title: '值', anyOf: [{ type: 'number' }, { type: 'boolean' }] } },
+      },
+      input: { value: 'invalid' },
+      expected: '值必须是数字',
+    },
+    {
+      name: 'minimum string length',
+      inputSchema: { type: 'object', properties: { keyword: { type: 'string', title: '搜索关键词', minLength: 2 } } },
+      input: { keyword: 'a' },
+      expected: '搜索关键词长度不能少于 2 个字符',
+    },
+    {
+      name: 'maximum string length',
+      inputSchema: { type: 'object', properties: { keyword: { type: 'string', title: '搜索关键词', maxLength: 2 } } },
+      input: { keyword: 'abc' },
+      expected: '搜索关键词长度不能超过 2 个字符',
+    },
+    {
+      name: 'string format',
+      inputSchema: { type: 'object', properties: { email: { type: 'string', title: '邮箱', format: 'email' } } },
+      input: { email: 'invalid' },
+      expected: '邮箱格式不正确',
+    },
+    {
+      name: 'string pattern',
+      inputSchema: { type: 'object', properties: { code: { type: 'string', title: '编码', pattern: '^[A-Z]+$' } } },
+      input: { code: 'abc' },
+      expected: '编码格式不正确',
+    },
+    {
+      name: 'minimum number',
+      inputSchema: { type: 'object', properties: { age: { type: 'number', title: '年龄', minimum: 18 } } },
+      input: { age: 17 },
+      expected: '年龄不能小于 18',
+    },
+    {
+      name: 'maximum number',
+      inputSchema: { type: 'object', properties: { age: { type: 'number', title: '年龄', maximum: 120 } } },
+      input: { age: 121 },
+      expected: '年龄不能大于 120',
+    },
+    {
+      name: 'exclusive minimum number',
+      inputSchema: { type: 'object', properties: { age: { type: 'number', title: '年龄', exclusiveMinimum: 18 } } },
+      input: { age: 18 },
+      expected: '年龄必须大于 18',
+    },
+    {
+      name: 'exclusive maximum number',
+      inputSchema: { type: 'object', properties: { age: { type: 'number', title: '年龄', exclusiveMaximum: 120 } } },
+      input: { age: 120 },
+      expected: '年龄必须小于 120',
+    },
+    {
+      name: 'number multiple',
+      inputSchema: { type: 'object', properties: { count: { type: 'number', title: '数量', multipleOf: 5 } } },
+      input: { count: 12 },
+      expected: '数量必须是 5 的倍数',
+    },
+    {
+      name: 'integer type',
+      inputSchema: { type: 'object', properties: { count: { type: 'integer', title: '数量' } } },
+      input: { count: 1.5 },
+      expected: '数量必须是整数',
+    },
+    {
+      name: 'enum value',
+      inputSchema: { type: 'object', properties: { region: { type: 'string', title: '地区', enum: ['北京', '上海'] } } },
+      input: { region: '杭州' },
+      expected: '地区必须选择允许的值',
+    },
+    {
+      name: 'constant value',
+      inputSchema: { type: 'object', properties: { region: { type: 'string', title: '地区', const: '上海' } } },
+      input: { region: '北京' },
+      expected: '地区必须选择允许的值',
+    },
+    {
+      name: 'additional property',
+      inputSchema: { type: 'object', title: '参数', additionalProperties: false, properties: {} },
+      input: { extra: true },
+      expected: 'extra是不支持的字段',
+    },
+    {
+      name: 'minimum array items',
+      inputSchema: { type: 'object', properties: { tags: { type: 'array', title: '标签', minItems: 2 } } },
+      input: { tags: ['a'] },
+      expected: '标签至少需要 2 项',
+    },
+    {
+      name: 'maximum array items',
+      inputSchema: { type: 'object', properties: { tags: { type: 'array', title: '标签', maxItems: 1 } } },
+      input: { tags: ['a', 'b'] },
+      expected: '标签最多允许 1 项',
+    },
+    {
+      name: 'unique array items',
+      inputSchema: { type: 'object', properties: { tags: { type: 'array', title: '标签', uniqueItems: true } } },
+      input: { tags: ['a', 'a'] },
+      expected: '标签不能包含重复项',
+    },
+    {
+      name: 'minimum object properties',
+      inputSchema: { type: 'object', properties: { contact: { type: 'object', title: '联系方式', minProperties: 1 } } },
+      input: { contact: {} },
+      expected: '联系方式至少需要 1 个字段',
+    },
+    {
+      name: 'maximum object properties',
+      inputSchema: { type: 'object', properties: { contact: { type: 'object', title: '联系方式', maxProperties: 1 } } },
+      input: { contact: { phone: '1', email: 'a' } },
+      expected: '联系方式最多允许 1 个字段',
+    },
+    {
+      name: 'nested property',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          address: {
+            type: 'object',
+            properties: { postcode: { type: 'string', title: '邮编', minLength: 5 } },
+          },
+        },
+      },
+      input: { address: { postcode: '12' } },
+      expected: '邮编长度不能少于 5 个字符',
+    },
+    {
+      name: 'nested field fallback instead of parent title',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          address: {
+            type: 'object',
+            title: '地址',
+            properties: { postcode: { type: 'string', minLength: 5 } },
+          },
+        },
+      },
+      input: { address: { postcode: '12' } },
+      expected: 'postcode长度不能少于 5 个字符',
+    },
+    {
+      name: 'nested array property',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { code: { type: 'string', title: '条目编码', minLength: 3 } },
+            },
+          },
+        },
+      },
+      input: { items: [{ code: 'a' }] },
+      expected: '条目编码长度不能少于 3 个字符',
+    },
+    {
+      name: 'safe fallback',
+      inputSchema: { type: 'object', properties: { token: { title: '令牌', not: { const: 'secret' } } } },
+      input: { token: 'secret' },
+      expected: '令牌输入无效',
+    },
+    {
+      name: 'blank field name fallback',
+      inputSchema: { type: 'object', required: ['   '], properties: { '   ': { type: 'string' } } },
+      input: {},
+      expected: '输入内容不能为空',
+    },
+  ])('formats the first $name validation error', async ({ inputSchema, input, expected }) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-input-keyword-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    await authenticate(runtime)
+    const project = await runtime.services.developer.createProject('Input Keyword')
+    const manifest = JSON.parse(
+      await runtime.services.developer.readFile(project.id, 'workflow.json'),
+    ) as Record<string, unknown>
+    manifest.inputSchema = inputSchema
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+
+    await expect(runtime.services.developer.run({ projectId: project.id, input }))
+      .resolves.toEqual({ validationError: expected })
+    expect(await runtime.services.executions.list()).toEqual([])
+
+    await runtime.close()
+  })
+
+  it('bounds fallback field names to the developer run IPC response contract', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-workflow-input-long-field-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+
+    await authenticate(runtime)
+    const project = await runtime.services.developer.createProject('Long Input Field')
+    const manifest = JSON.parse(
+      await runtime.services.developer.readFile(project.id, 'workflow.json'),
+    ) as Record<string, unknown>
+    const field = 'x'.repeat(600)
+    manifest.inputSchema = {
+      type: 'object',
+      required: [field],
+      properties: { [field]: { type: 'string' } },
+    }
+    await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+
+    const result = await runtime.services.developer.run({ projectId: project.id, input: {} })
+    expect(developerRunResultSchema.safeParse(result).success).toBe(true)
+    expect(result).toEqual({ validationError: `${'x'.repeat(100)}不能为空` })
+
+    await runtime.close()
+  })
+
   it('composes real persistence-backed DesktopAPI services and recovers before use', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-'))
     directories.push(root)
@@ -3827,7 +4131,7 @@ describe('createApplicationRuntime', () => {
     }
     await runtime.services.developer.writeFile(longNameProject.id, 'workflow.json', JSON.stringify(manifest))
     await expect(runtime.services.developer.run({ projectId: longNameProject.id, input: {} }))
-      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+      .resolves.toEqual({ validationError: 'keyword不能为空' })
     await runtime.services.system.openExternal('https://example.com/')
     expect(openExternal).toHaveBeenCalledWith('https://example.com/')
 
@@ -4014,7 +4318,9 @@ describe('createApplicationRuntime', () => {
         "export default defineWorkflow({ async run(ctx) { await ctx.browser.open('https://example.com/path'); return { ok: true } } })",
       ].join('\n'))
 
-      const { executionId } = await runtime.services.developer.run({ projectId: project.id, input: {} })
+      const runResult = await runtime.services.developer.run({ projectId: project.id, input: {} })
+      if (!('executionId' in runResult)) throw new Error(runResult.validationError)
+      const { executionId } = runResult
       await vi.waitFor(() => {
         expect(executionEvents.some((event) => event.type === 'approval_required'
           && event.executionId === executionId)).toBe(true)
@@ -4093,7 +4399,9 @@ describe('createApplicationRuntime', () => {
     await runtime.services.developer.build(installedProject.id)
     await runtime.services.workflows.installProject(installedProject.id)
 
-    const { executionId } = await runtime.services.developer.run({ projectId: selectedProject.id, input: {} })
+    const runResult = await runtime.services.developer.run({ projectId: selectedProject.id, input: {} })
+    if (!('executionId' in runResult)) throw new Error(runResult.validationError)
+    const { executionId } = runResult
     let execution = await runtime.services.executions.get(executionId)
     for (let attempt = 0; attempt < 100 && !['completed', 'failed', 'cancelled'].includes(execution.status); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10))

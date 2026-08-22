@@ -848,6 +848,12 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('accepts a semantic developer input validation result', () => {
+    const result = { validationError: '搜索关键词不能为空' }
+
+    expect(ipcResponseSchemas[ipcChannels.developerRun].safeParse(result).success).toBe(true)
+  })
+
   it('requires a conversation identity when reading persisted messages', () => {
     expect(ipcRequestSchemas[ipcChannels.chatListMessages].parse({ conversationId: 'conversation_1' }))
       .toEqual({ conversationId: 'conversation_1' })
