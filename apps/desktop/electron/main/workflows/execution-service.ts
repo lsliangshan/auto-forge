@@ -30,6 +30,7 @@ import type {
 } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
 import { validateWorkflowOutput } from './output-validation.js'
+import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
 import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
 
 const MAX_LINE_BYTES = 1024 * 1024
@@ -145,6 +146,7 @@ export interface AgentAuthorizedPermissionBinding {
 }
 
 export interface AgentExecutionAuthorization {
+  readonly workflowFingerprint: string
   readonly permissions: readonly AgentAuthorizedPermissionBinding[]
 }
 
@@ -257,7 +259,10 @@ function snapshotAgentAuthorization(
       scopeHash: permission.scopeHash,
     })
   })
-  return Object.freeze({ permissions: Object.freeze(permissions) })
+  return Object.freeze({
+    workflowFingerprint: authorization.workflowFingerprint,
+    permissions: Object.freeze(permissions),
+  })
 }
 
 function agentAuthorizationMatchesWorkflow(
@@ -437,11 +442,16 @@ export class ExecutionService {
       checkCancelled()
       if (!source) throw failure('NOT_FOUND')
       workflow = source.workflow
-      if (input.agentAuthorization && !agentAuthorizationMatchesWorkflow(input.agentAuthorization, workflow)) {
-        throw failure('CAPABILITY_SCOPE_DENIED')
-      }
       entryPath = await this.resolveEntryPath(input, source, checkCancelled)
       checkCancelled()
+      if (input.agentAuthorization) {
+        if (input.agentAuthorization.workflowFingerprint !== workflowSecurityFingerprint(workflow)) {
+          throw failure('WORKFLOW_CHANGED')
+        }
+        if (!agentAuthorizationMatchesWorkflow(input.agentAuthorization, workflow)) {
+          throw failure('CAPABILITY_SCOPE_DENIED')
+        }
+      }
       directory = await this.temporaryDirectories.create()
       checkCancelled()
       const nonce = randomUUID()

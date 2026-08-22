@@ -744,6 +744,7 @@ describe('WorkflowToolExecutor', () => {
         workflowVersion: test.candidate.workflow.version, input: { topic: '居住证' },
         chatRunId: 'run_1', sourceSelector: test.candidate.selector,
         agentAuthorization: {
+          workflowFingerprint: expect.any(String),
           permissions: [{
             permissionIndex: 0,
             ...permission,

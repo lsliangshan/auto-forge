@@ -20,6 +20,7 @@ import {
   type WorkflowWorkerFactory,
 } from './execution-service.js'
 import { createWorkflowExecutionSourceResolver } from '../application.js'
+import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
 import { createWorkflowSourceSelectorVault } from './workflow-source-selector.js'
 
 class FakeWorker extends EventEmitter implements WorkflowWorker {
@@ -209,6 +210,7 @@ function agentStartInput(
     input: { query: 'weather' },
     sourceSelector,
     agentAuthorization: {
+      workflowFingerprint: workflowSecurityFingerprint(selectedWorkflow),
       permissions: selectedWorkflow.permissions.map((permission, permissionIndex) => ({
         permissionIndex,
         capability: permission.capability,

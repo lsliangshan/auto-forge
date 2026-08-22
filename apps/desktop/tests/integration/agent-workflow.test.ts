@@ -315,6 +315,77 @@ describe('agent workflow integration', () => {
     },
   )
 
+  it.each([
+    ['input schema', (workflow: WorkflowDetail): WorkflowDetail => ({
+      ...workflow,
+      inputSchema: { type: 'object', required: ['changed'], properties: { changed: { type: 'boolean' } } },
+    })],
+    ['output schema', (workflow: WorkflowDetail): WorkflowDetail => ({
+      ...workflow,
+      outputSchema: { type: 'object', required: ['changed'], properties: { changed: { type: 'boolean' } } },
+    })],
+    ['cities', (workflow: WorkflowDetail): WorkflowDetail => ({ ...workflow, cities: ['北京'] })],
+    ['name', (workflow: WorkflowDetail): WorkflowDetail => ({ ...workflow, name: '已变更的工作流' })],
+    ['timeout', (workflow: WorkflowDetail): WorkflowDetail => ({ ...workflow, timeoutMs: 45_000 })],
+  ] as const)('rejects service-side %s drift after the executor live check', async (_field, mutate) => {
+    let resolverEntered!: () => void
+    let releaseResolver!: () => void
+    const entered = new Promise<void>((resolvePromise) => { resolverEntered = resolvePromise })
+    const gate = new Promise<void>((resolvePromise) => { releaseResolver = resolvePromise })
+    let serviceWorkflow!: WorkflowDetail
+    let appDirectory = ''
+    let turn = 0
+    const app = await runtime({
+      sourceResolver: {
+        resolve: async () => {
+          resolverEntered()
+          await gate
+          return {
+            workflow: serviceWorkflow,
+            rootPath: appDirectory,
+            entryPath: 'workflow.mjs',
+            integrity: 'valid',
+          }
+        },
+      },
+      fetch: async () => {
+        turn += 1
+        if (turn === 1) return response([
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'service_race_tool', function: { name: 'workflow_1', arguments: '{"input":{"keyword":"今日天气"}}' } }] }, finish_reason: 'tool_calls' }] },
+          '[DONE]',
+        ])
+        return response([
+          { choices: [{ index: 0, delta: { content: '工作流在启动前发生变更' }, finish_reason: 'stop' }] },
+          '[DONE]',
+        ])
+      },
+    })
+    appDirectory = app.directory
+    serviceWorkflow = app.workflow
+    const pending = await app.orchestrator.run({
+      conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter',
+      userId: 'user_1', userBlocks: [{ type: 'text', text: '使用百度搜索今日天气' }],
+      modelContent: '使用百度搜索今日天气', assetIds: [], currentMedia: [], allowTools: true,
+      model: 'local-test-model', requestId: 'service_race_request', providerSnapshot: app.providerSnapshot,
+    })
+    const releaseExecution = vi.spyOn(app.policy, 'releaseExecution')
+    const resuming = app.orchestrator.resumeApproval({
+      executionId: pending.executionId!, permissionIndex: 0,
+      scopeHash: scopeHash(permission.scope), decision: 'once',
+    })
+    await entered
+
+    serviceWorkflow = mutate(app.workflow)
+    releaseResolver()
+
+    await expect(resuming).resolves.toMatchObject({ status: 'completed' })
+    expect(app.database.executions.get(pending.executionId!)).toMatchObject({
+      status: 'failed', errorCode: 'WORKFLOW_CHANGED',
+    })
+    expect(app.workers.workers).toHaveLength(0)
+    expect(releaseExecution).toHaveBeenCalledTimes(1)
+  })
+
   it('cancels a real execution service start blocked before active registration', async () => {
     let release!: () => void
     let resolverEntered!: () => void

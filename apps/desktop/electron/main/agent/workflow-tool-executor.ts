@@ -20,6 +20,7 @@ import type {
   ExactWorkflowSource,
   WorkflowExecutionSourceSelector,
 } from '../workflows/workflow-source-selector.js'
+import { canonicalJson, workflowSecurityFingerprint } from '../workflows/workflow-security-fingerprint.js'
 import { classifyCapability } from './capability-risk.js'
 import type { WorkflowCandidate } from './workflow-catalog.js'
 
@@ -185,52 +186,6 @@ function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
   return Object.freeze(value)
 }
 
-function stableJson(value: unknown, seen = new WeakSet<object>()): string {
-  if (value === null) return 'null'
-  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError('Non-finite JSON number')
-    return JSON.stringify(value)
-  }
-  if (typeof value !== 'object') throw new TypeError('Non-JSON value')
-  if (seen.has(value)) throw new TypeError('Circular JSON value')
-  seen.add(value)
-  try {
-    if (Array.isArray(value)) return `[${value.map((child) => stableJson(child, seen)).join(',')}]`
-    const values: string[] = []
-    for (const key of Object.keys(value).sort()) {
-      const child = (value as Record<string, unknown>)[key]
-      if (child !== undefined) values.push(`${JSON.stringify(key)}:${stableJson(child, seen)}`)
-    }
-    return `{${values.join(',')}}`
-  } finally {
-    seen.delete(value)
-  }
-}
-
-function workflowSecurityFingerprint(workflow: WorkflowDetail): string {
-  return stableJson({
-    id: workflow.id,
-    version: workflow.version,
-    name: workflow.name,
-    description: workflow.description,
-    author: workflow.author,
-    category: workflow.category,
-    enabled: workflow.enabled,
-    source: workflow.source,
-    integrity: workflow.integrity,
-    codeSha256: workflow.codeSha256,
-    runtimeIdentity: workflow.runtimeIdentity,
-    cities: workflow.cities,
-    permissions: workflow.permissions,
-    activationExamples: workflow.activationExamples,
-    activationNegativeExamples: workflow.activationNegativeExamples,
-    timeoutMs: workflow.timeoutMs,
-    inputSchema: workflow.inputSchema,
-    outputSchema: workflow.outputSchema,
-  })
-}
-
 function candidateSnapshot(candidate: WorkflowCandidate): WorkflowCandidate {
   return Object.freeze({
     ...candidate,
@@ -331,7 +286,7 @@ export class WorkflowToolExecutor {
       validatedInput = structuredClone(parsed.input)
       const validation = validateWorkflowInput(input.candidate.workflow.inputSchema, validatedInput)
       if (!validation.valid) return toolError('INVALID_INPUT', validation.message.slice(0, 500))
-      inputFingerprint = stableJson(validatedInput)
+      inputFingerprint = canonicalJson(validatedInput)
     } catch {
       return toolError('INVALID_INPUT')
     }
@@ -364,7 +319,7 @@ export class WorkflowToolExecutor {
       reservation,
       executionId: reservation.executionId,
       source: sourceSnapshot,
-      sourceFingerprint: stableJson(sourceSnapshot),
+      sourceFingerprint: canonicalJson(sourceSnapshot),
       city: parsed.city,
       input: inputSnapshot,
       inputFingerprint,
@@ -528,6 +483,7 @@ export class WorkflowToolExecutor {
         ...(input.chatRunId === undefined ? {} : { chatRunId: input.chatRunId }),
         sourceSelector: binding.candidate.selector,
         agentAuthorization: Object.freeze({
+          workflowFingerprint: binding.candidateFingerprint,
           permissions: Object.freeze(binding.candidate.workflow.permissions.map((permission, permissionIndex) => (
             Object.freeze({
               permissionIndex,
@@ -687,8 +643,8 @@ export class WorkflowToolExecutor {
         || pending.executionId !== binding.executionId
         || pending.city !== binding.city
         || pending.preparedAt !== binding.preparedAt
-        || stableJson(pending.source) !== binding.sourceFingerprint
-        || stableJson(pending.input) !== binding.inputFingerprint
+        || canonicalJson(pending.source) !== binding.sourceFingerprint
+        || canonicalJson(pending.input) !== binding.inputFingerprint
         || pending.permissionIndex !== lifecycle.permissionIndex
         || binding.candidateReference.selector !== binding.candidate.selector
         || workflowSecurityFingerprint(binding.candidateReference.workflow) !== binding.candidateFingerprint) return false

@@ -1619,7 +1619,7 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.close()).rejects.toBe(consistencyError)
   })
 
-  it('never routes an Agent-owned approval to the legacy decision path after a resume conflict', async () => {
+  it('rejects Agent-owned invalid and stale approvals without legacy fallback', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-routing-'))
     directories.push(root)
     const chatEvents: ChatEvent[] = []
@@ -1661,12 +1661,9 @@ describe('createApplicationRuntime', () => {
       const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
         event.type === 'block' && event.block.type === 'approval'
       ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
-      vi.spyOn(AgentOrchestrator.prototype, 'resumeApproval').mockResolvedValueOnce({
-        requestId: 'request_conflict', status: 'failed', error: toSafeAppError({ code: 'CONFLICT' }),
-      })
       const legacyDecision = vi.spyOn(ExecutionService.prototype, 'decide').mockResolvedValueOnce(undefined)
 
-      await runtime.services.executions.decide({
+      await expect(runtime.services.executions.decide({
         executionId: approval.executionId,
         permissionIndex: approval.permissionIndex,
         scopeHash: approval.scopeHash,
@@ -1675,7 +1672,14 @@ describe('createApplicationRuntime', () => {
         workflowVersion: approval.workflowVersion,
         capability: approval.capability,
         scope: approval.scope,
-      })
+      })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+      await expect(runtime.services.executions.decide({
+        executionId: approval.executionId,
+        permissionIndex: approval.permissionIndex,
+        scopeHash: 'b'.repeat(64),
+        decision: 'once',
+      })).rejects.toMatchObject({ code: 'CONFLICT' })
 
       expect(legacyDecision).not.toHaveBeenCalled()
     } finally {
