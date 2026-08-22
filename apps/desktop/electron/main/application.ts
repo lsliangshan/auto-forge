@@ -760,6 +760,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     policy,
     executions,
     createSourceSelector: sourceSelectorVault.create,
+    inspectSource: sourceSelectorVault.inspect,
     providerUsage: database.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,

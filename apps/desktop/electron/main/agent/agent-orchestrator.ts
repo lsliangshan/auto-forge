@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import Ajv from 'ajv'
 import {
   approvalDecisionSchema,
   toSafeAppError,
@@ -10,9 +9,8 @@ import {
   type ModelProviderId,
   type WorkflowDetail,
 } from '@autoforge/shared'
-import { scopeHash, type PolicyEngine, type PermissionRecord, type PermissionRequest } from '../permissions/policy-engine.js'
-import type { ExecutionReservation, ExecutionStartInput, StartedExecution } from '../workflows/execution-service.js'
-import type { WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
+import type { PolicyEngine } from '../permissions/policy-engine.js'
+import type { ExactWorkflowSource, WorkflowExecutionSourceSelector } from '../workflows/workflow-source-selector.js'
 import { addUsd } from '../billing/decimal-usd.js'
 import { trackProviderStream } from '../billing/provider-usage-stream.js'
 import {
@@ -31,6 +29,13 @@ import type {
 import type { ConversationHistoryPort, CurrentMediaMetadata } from '../chat/conversation-context.js'
 import { createWorkflowCatalog, type WorkflowCandidate } from './workflow-catalog.js'
 import { WorkflowRouter, type WorkflowRoutingRequest } from './workflow-router.js'
+import {
+  WorkflowToolExecutor,
+  type PendingWorkflowTool,
+  type ToolError,
+  type WorkflowToolExecutionPort,
+  type WorkflowToolPolicyPort,
+} from './workflow-tool-executor.js'
 
 const MAX_MODEL_TURNS = 8
 
@@ -44,22 +49,9 @@ export interface AgentWorkflowPort {
   list(options?: { developerMode?: boolean }): Promise<WorkflowDetail[]>
 }
 
-export interface AgentPolicyPort {
-  evaluate(request: PermissionRequest): { allowed: boolean; requiresApproval: boolean }
-  record(record: PermissionRecord): unknown
-  releaseExecution(executionId: string): void
-}
+export type AgentPolicyPort = WorkflowToolPolicyPort
 
-export interface AgentExecutionPort {
-  reserve(): ExecutionReservation
-  discardReservation(reservation: ExecutionReservation): boolean
-  startReserved(
-    reservation: ExecutionReservation,
-    input: ExecutionStartInput,
-    signal?: AbortSignal,
-  ): Promise<StartedExecution | { id: string; finished: Promise<{ id: string; status: string; result?: unknown; errorCode?: string }> }>
-  cancel(executionId: string): Promise<void>
-}
+export type AgentExecutionPort = WorkflowToolExecutionPort
 
 export interface PersistUserInput {
   messageId: string
@@ -212,6 +204,7 @@ export interface AgentOrchestratorDependencies {
   policy: AgentPolicyPort | Pick<PolicyEngine, 'evaluate' | 'record' | 'releaseExecution'>
   executions: AgentExecutionPort
   createSourceSelector(workflow: WorkflowDetail): WorkflowExecutionSourceSelector
+  inspectSource(selector: WorkflowExecutionSourceSelector): ExactWorkflowSource | undefined
   history: ConversationHistoryPort
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   emit: (event: ChatEvent) => void
@@ -246,18 +239,16 @@ export interface AgentRunResult {
   error?: AppError
 }
 
-interface PendingTool {
+interface ToolExchange {
   callId: string
   assistantContent: string
-  workflow: WorkflowDetail
-  sourceSelector: WorkflowExecutionSourceSelector
   toolName: string
-  resolvedCity?: string
-  args: unknown
-  executionId: string
-  reservation: ExecutionReservation
-  reservationStarted: boolean
-  permissionIndex: number
+  tool?: PendingWorkflowTool
+  arguments?: unknown
+}
+
+interface PendingTool extends ToolExchange {
+  tool: PendingWorkflowTool
 }
 
 interface ActiveAgentRun {
@@ -268,6 +259,7 @@ interface ActiveAgentRun {
   providerSnapshot: ModelProviderSnapshot
   userId: string
   model: string
+  contextLength?: number
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]
@@ -299,23 +291,24 @@ function asAppError(error: unknown): AppError {
   return appFailure('INTERNAL_ERROR')
 }
 
-function samePermission(
-  left: WorkflowDetail['permissions'][number],
-  right: Extract<ApprovalDecision, { decision: 'always' }>,
-): boolean {
-  return left.capability === right.capability && scopeHash(left.scope) === scopeHash(right.scope)
-}
-
 export class AgentOrchestrator {
   private readonly activeByRequest = new Map<string, ActiveAgentRun>()
   private readonly activeByExecution = new Map<string, ActiveAgentRun>()
   private readonly activeByConversation = new Map<string, string>()
   private readonly id: () => string
   private readonly now: () => number
+  private readonly workflowTools: WorkflowToolExecutor
 
   constructor(private readonly dependencies: AgentOrchestratorDependencies) {
     this.id = dependencies.id ?? randomUUID
     this.now = dependencies.now ?? Date.now
+    this.workflowTools = new WorkflowToolExecutor({
+      executions: dependencies.executions,
+      policy: dependencies.policy,
+      currentDeveloperMode: dependencies.developerMode ?? (() => false),
+      inspectSource: dependencies.inspectSource,
+      now: this.now,
+    })
   }
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
@@ -375,6 +368,7 @@ export class AgentOrchestrator {
         providerSnapshot,
         userId: input.userId,
         model: input.model,
+        ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
         blocks: [],
         messages: [],
         tools: [],
@@ -440,37 +434,16 @@ export class AgentOrchestrator {
     if (!active || !active.pending || active.terminal) return this.failedResult(active?.requestId ?? '', 'CONFLICT')
     if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
     const pending = active.pending
-    const permission = pending.workflow.permissions[pending.permissionIndex]
-    if (!permission) return this.finish(active, 'failed', appFailure('CONFLICT'))
-    const expectedScopeHash = scopeHash(permission.scope)
-    if (parsed.data.permissionIndex !== pending.permissionIndex || parsed.data.scopeHash !== expectedScopeHash) {
-      return this.failedResult(active.requestId, 'CONFLICT')
+    const result = parsed.data.decision === 'deny'
+      ? await this.workflowTools.deny(pending.tool, parsed.data)
+      : await this.workflowTools.approve(pending.tool, parsed.data)
+    if (result.kind === 'tool_error') {
+      if (result.code === 'CONFLICT' || result.code === 'INVALID_INPUT') {
+        return this.failedResult(active.requestId, result.code)
+      }
+      this.appendToolExchange(active, pending, result)
+      this.clearPending(active)
     }
-
-    if (parsed.data.decision === 'deny') {
-      return this.finish(active, 'failed', appFailure('PERMISSION_DENIED'))
-    }
-    if (parsed.data.decision === 'always' && (
-      parsed.data.workflowId !== pending.workflow.id
-      || parsed.data.workflowVersion !== pending.workflow.version
-      || !samePermission(permission, parsed.data)
-    )) {
-      return this.failedResult(active.requestId, 'INVALID_INPUT')
-    }
-
-    try {
-      this.dependencies.policy.record({
-        executionId: pending.executionId,
-        workflowId: pending.workflow.id,
-        workflowVersion: pending.workflow.version,
-        capability: permission.capability,
-        scope: permission.scope,
-        decision: parsed.data.decision,
-      })
-    } catch (error) {
-      return this.finish(active, 'failed', asAppError(error))
-    }
-    pending.permissionIndex += 1
     return this.driveExclusive(active)
   }
 
@@ -479,9 +452,7 @@ export class AgentOrchestrator {
     if (!active || active.terminal) return
     active.cancelled = true
     active.controller.abort()
-    if (active.executionId) {
-      try { await this.dependencies.executions.cancel(active.executionId) } catch { /* terminal chat cancellation remains authoritative */ }
-    }
+    if (active.pending) await this.workflowTools.cancel(active.pending.tool)
     if (!active.terminal) this.finish(active, 'cancelled', appFailure('CANCELLED'))
   }
 
@@ -578,7 +549,7 @@ export class AgentOrchestrator {
 
       if (toolCalls.length === 1) {
         if (finishReason !== 'tool_calls') return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-        const result = this.prepareTool(active, toolCalls[0]!, assistantContent)
+        const result = await this.prepareTool(active, toolCalls[0]!, assistantContent)
         if (result) return result
         return this.continuePendingTool(active)
       }
@@ -640,115 +611,142 @@ export class AgentOrchestrator {
     }
   }
 
-  private prepareTool(
+  private async prepareTool(
     active: ActiveAgentRun,
     call: Extract<ModelStreamEvent, { type: 'tool_call' }>,
     assistantContent: string,
-  ): AgentRunResult | undefined {
+  ): Promise<AgentRunResult | undefined> {
     const candidate = active.workflows.get(call.name)
     if (!candidate) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-    const workflow = candidate.workflow
-    try {
-      const validate = new Ajv({ allErrors: true, strict: false }).compile(candidate.tool.function.parameters as object)
-      if (!validate(call.arguments)) return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-    } catch {
-      return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
+    const prepared = await this.workflowTools.prepare({
+      candidate,
+      arguments: call.arguments,
+      developerMode: this.dependencies.developerMode?.() ?? false,
+    })
+    if (prepared.kind === 'tool_error') {
+      this.appendToolExchange(active, {
+        callId: call.id,
+        assistantContent,
+        toolName: candidate.toolName,
+        arguments: call.arguments,
+      }, prepared)
+      return this.drive(active)
     }
-    if (typeof call.arguments !== 'object' || call.arguments === null || !('input' in call.arguments)) {
-      return this.finish(active, 'failed', appFailure('INVALID_INPUT'))
-    }
-    const argumentsWithInput = call.arguments as { input: unknown; resolvedCity?: string }
-    const reservation = this.dependencies.executions.reserve()
-    const executionId = reservation.executionId
+    const executionId = prepared.pending.executionId
     active.pending = {
       callId: call.id,
       assistantContent,
-      workflow,
-      sourceSelector: candidate.selector,
       toolName: candidate.toolName,
-      ...(argumentsWithInput.resolvedCity === undefined ? {} : { resolvedCity: argumentsWithInput.resolvedCity }),
-      args: argumentsWithInput.input,
-      executionId,
-      reservation,
-      reservationStarted: false,
-      permissionIndex: 0,
+      tool: prepared.pending,
     }
     active.executionId = executionId
     this.activeByExecution.set(executionId, active)
     this.appendBlock(active, {
-      type: 'workflow_proposal', workflowId: workflow.id, workflowName: workflow.name, args: call.arguments,
+      type: 'workflow_proposal',
+      workflowId: candidate.workflow.id,
+      workflowName: candidate.workflow.name,
+      args: call.arguments,
     })
     return undefined
   }
 
   private async continuePendingTool(active: ActiveAgentRun): Promise<AgentRunResult> {
     const pending = active.pending!
-    while (pending.permissionIndex < pending.workflow.permissions.length) {
-      const permission = pending.workflow.permissions[pending.permissionIndex]!
-      const evaluation = this.dependencies.policy.evaluate({
-        executionId: pending.executionId,
-        workflowId: pending.workflow.id,
-        workflowVersion: pending.workflow.version,
-        capability: permission.capability,
-        scope: permission.scope,
-      })
-      if (!evaluation.allowed) {
-        const permissionScopeHash = scopeHash(permission.scope)
-        const last = active.blocks.at(-1)
-        if (last?.type !== 'approval'
-          || last.executionId !== pending.executionId
-          || last.permissionIndex !== pending.permissionIndex
-          || last.scopeHash !== permissionScopeHash) {
-          this.appendBlock(active, {
-            type: 'approval',
-            executionId: pending.executionId,
-            workflowId: pending.workflow.id,
-            workflowName: pending.workflow.name,
-            workflowVersion: pending.workflow.version,
-            source: pending.workflow.source,
-            actionSummary: `${pending.workflow.name}: ${permission.capability}`,
-            permissionIndex: pending.permissionIndex,
-            capability: permission.capability,
-            scope: permission.scope,
-            scopeHash: permissionScopeHash,
-          })
-        }
-        return { requestId: active.requestId, status: 'awaiting_approval', executionId: pending.executionId }
+    const tool = pending.tool
+    if (tool.capability !== undefined
+      && tool.scope !== undefined
+      && tool.scopeHash !== undefined
+      && tool.actionSummary !== undefined) {
+      const last = active.blocks.at(-1)
+      if (last?.type !== 'approval'
+        || last.executionId !== tool.executionId
+        || last.permissionIndex !== tool.permissionIndex
+        || last.scopeHash !== tool.scopeHash) {
+        const source = tool.source
+        this.appendBlock(active, {
+          type: 'approval',
+          executionId: tool.executionId,
+          workflowId: tool.candidate.workflow.id,
+          workflowName: tool.candidate.workflow.name,
+          workflowVersion: tool.candidate.workflow.version,
+          source: source.source,
+          ...(source.source === 'development' ? { buildHash: source.buildHash } : {}),
+          ...(tool.city === undefined ? {} : { city: tool.city }),
+          actionSummary: tool.actionSummary,
+          permissionIndex: tool.permissionIndex,
+          capability: tool.capability,
+          scope: tool.scope,
+          scopeHash: tool.scopeHash,
+        })
       }
-      pending.permissionIndex += 1
+      return { requestId: active.requestId, status: 'awaiting_approval', executionId: tool.executionId }
     }
 
-    this.appendBlock(active, { type: 'workflow_execution', executionId: pending.executionId })
-    pending.reservationStarted = true
-    const started = await this.dependencies.executions.startReserved(pending.reservation, {
+    const started = await this.workflowTools.start(tool, {
       userId: active.userId,
-      workflowId: pending.workflow.id,
-      workflowVersion: pending.workflow.version,
-      input: pending.args,
       chatRunId: active.runId,
-      sourceSelector: pending.sourceSelector,
-    }, active.controller.signal)
-    if (started.id !== pending.executionId) throw appFailure('CONFLICT')
+      signal: active.controller.signal,
+    })
+    if (started.kind === 'tool_error') {
+      this.appendToolExchange(active, pending, started)
+      this.clearPending(active)
+      return this.drive(active)
+    }
+    this.appendBlock(active, { type: 'workflow_execution', executionId: tool.executionId })
     const execution = await started.finished
     if (active.cancelled || execution.status === 'cancelled') return this.finish(active, 'cancelled', appFailure('CANCELLED'))
-    if (execution.status !== 'completed') return this.finish(active, 'failed', toSafeAppError({ code: execution.errorCode ?? 'INTERNAL_ERROR' }))
+    const modelResult = execution.status === 'completed'
+      ? this.workflowTools.toModelResult({
+          result: execution.result,
+          ...(active.contextLength === undefined ? {} : { contextLength: active.contextLength }),
+        })
+      : this.workflowTools.toModelResult({
+          error: { code: execution.errorCode ?? 'INTERNAL_ERROR' },
+          ...(active.contextLength === undefined ? {} : { contextLength: active.contextLength }),
+        })
+    if (execution.status === 'completed') {
+      this.appendBlock(active, {
+        type: 'execution_result', executionId: tool.executionId, summary: 'Workflow completed.',
+      })
+    }
+    this.appendToolExchange(active, pending, modelResult)
+    this.clearPending(active)
+    return this.drive(active)
+  }
 
-    this.appendBlock(active, {
-      type: 'execution_result', executionId: pending.executionId, summary: 'Workflow completed.',
+  private appendToolExchange(
+    active: ActiveAgentRun,
+    exchange: ToolExchange,
+    result: ToolError | { kind: 'tool_result'; content: string },
+  ): void {
+    const toolArguments = exchange.arguments ?? (exchange.tool ? {
+      ...(exchange.tool.city === undefined ? {} : { resolvedCity: exchange.tool.city }),
+      input: exchange.tool.input,
+    } : {})
+    let serializedArguments = '{}'
+    try { serializedArguments = JSON.stringify(toolArguments) ?? '{}' } catch { /* Provider arguments originated as JSON. */ }
+    active.messages.push({
+      role: 'assistant',
+      content: exchange.assistantContent || null,
+      tool_calls: [{
+        id: exchange.callId,
+        type: 'function',
+        function: { name: exchange.toolName, arguments: serializedArguments },
+      }],
     })
     active.messages.push({
-      role: 'assistant', content: pending.assistantContent || null,
-      tool_calls: [{ id: pending.callId, type: 'function', function: { name: pending.toolName, arguments: JSON.stringify({
-        ...(pending.resolvedCity === undefined ? {} : { resolvedCity: pending.resolvedCity }), input: pending.args,
-      }) } }],
+      role: 'tool',
+      tool_call_id: exchange.callId,
+      content: result.kind === 'tool_result' ? result.content : JSON.stringify(result),
     })
-    active.messages.push({
-      role: 'tool', tool_call_id: pending.callId, content: JSON.stringify(execution.result ?? null),
-    })
-    this.activeByExecution.delete(pending.executionId)
+  }
+
+  private clearPending(active: ActiveAgentRun): void {
+    const pending = active.pending
+    if (!pending) return
+    this.activeByExecution.delete(pending.tool.executionId)
     active.pending = undefined
     active.executionId = undefined
-    return this.drive(active)
   }
 
   private appendText(active: ActiveAgentRun, text: string): void {
@@ -815,11 +813,8 @@ export class AgentOrchestrator {
       this.activeByConversation.delete(active.conversationId)
     }
     if (active.pending) {
-      this.activeByExecution.delete(active.pending.executionId)
-      if (!active.pending.reservationStarted) {
-        try { this.dependencies.executions.discardReservation(active.pending.reservation) } catch { /* terminal persistence remains authoritative */ }
-      }
-      try { this.dependencies.policy.releaseExecution(active.pending.executionId) } catch { /* terminal persistence remains authoritative */ }
+      this.activeByExecution.delete(active.pending.tool.executionId)
+      void this.workflowTools.cancel(active.pending.tool)
     }
     if (errorBlock) {
       this.safeEmit({

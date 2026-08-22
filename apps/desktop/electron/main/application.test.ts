@@ -341,7 +341,7 @@ async function installApprovalWorkflow(
   Object.assign(manifest, {
     id: 'local.autoforge.approval-workflow',
     version: '1.0.0',
-    permissions: [{ capability: 'browser.open', scope: { origins: ['https://example.com'] } }],
+    permissions: [{ capability: 'browser.fill', scope: { origins: ['https://example.com'] } }],
     activationExamples: [activation],
     inputSchema: { type: 'object', additionalProperties: false },
   })

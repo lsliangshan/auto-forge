@@ -34,7 +34,7 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
 })
 
-const permission = { capability: 'browser.open' as const, scope: { origins: ['https://www.baidu.com'] } }
+const permission = { capability: 'browser.fill' as const, scope: { origins: ['https://www.baidu.com'] } }
 
 function detail(codeSha256: string): WorkflowDetail & { entryPath: string; codeSha256: string } {
   return {
@@ -75,7 +75,7 @@ class IntegrationWorker extends EventEmitter implements WorkflowWorker {
             this.stdout.write(`${JSON.stringify({ type: 'ready', executionId: request.executionId })}\n`)
             this.stdout.write(`${JSON.stringify({
               type: 'capability_request', requestId: 'capability_1',
-              request: { ...permission, arguments: { url: 'https://www.baidu.com' } },
+              request: { ...permission, arguments: { locator: '#query', value: '今日天气' } },
             })}\n`)
           })
         }
@@ -164,6 +164,7 @@ async function runtime(options: { sourceResolver?: WorkflowExecutionSourceResolv
     policy,
     executions: executionService,
     createSourceSelector: sourceSelectorVault.create,
+    inspectSource: sourceSelectorVault.inspect,
     providerUsage: database.providerUsage,
     emit: () => undefined,
   })
@@ -208,9 +209,8 @@ describe('agent workflow integration', () => {
     expect(pending.error).toBeUndefined()
     expect(pending).toMatchObject({ status: 'awaiting_approval' })
     const result = await app.orchestrator.resumeApproval({
-      executionId: pending.executionId!, permissionIndex: 0, scopeHash: scopeHash(permission.scope), decision: 'always',
-      workflowId: app.workflow.id, workflowVersion: app.workflow.version,
-      capability: permission.capability, scope: permission.scope,
+      executionId: pending.executionId!, permissionIndex: 0,
+      scopeHash: scopeHash(permission.scope), decision: 'once',
     })
 
     expect(app.database.executions.get(pending.executionId!)).toMatchObject({ status: 'completed' })
@@ -244,12 +244,9 @@ describe('agent workflow integration', () => {
         apiKeyFingerprint: app.providerSnapshot.apiKeyFingerprint,
       }),
     ])
-    expect(app.database.permissionGrants.get(app.workflow.id, app.workflow.version, permission.capability, scopeHash(permission.scope))).toMatchObject({
-      workflowId: app.workflow.id,
-      workflowVersion: app.workflow.version,
-      capability: permission.capability,
-      scope: permission.scope,
-    })
+    expect(app.database.permissionGrants.get(
+      app.workflow.id, app.workflow.version, permission.capability, scopeHash(permission.scope),
+    )).toBeUndefined()
   })
 
   it('cancels a real execution service start blocked before active registration', async () => {

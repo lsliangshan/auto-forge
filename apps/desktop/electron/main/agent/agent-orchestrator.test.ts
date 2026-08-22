@@ -115,9 +115,9 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
     providerInstances,
     workflows: { list: async () => [workflow] },
     policy: {
-      evaluate: () => ({ allowed: false, requiresApproval: true }),
-      record: (value) => { records.decisions.push(value); return value as never },
-      releaseExecution: () => undefined,
+      evaluate: vi.fn(() => ({ allowed: false, requiresApproval: true })),
+      record: vi.fn((value) => { records.decisions.push(value); return value as never }),
+      releaseExecution: vi.fn(() => undefined),
     },
     executions: {
       reserve: () => ({ executionId: `reserved_${++reservation}` }),
@@ -129,6 +129,7 @@ function harness(turns: ProviderStreamEvent[][]): AgentOrchestratorDependencies 
       cancel: async () => undefined,
     },
     createSourceSelector: sourceSelectorVault.create,
+    inspectSource: sourceSelectorVault.inspect,
     persistence: {
       persistUser(value) { records.users.push(value); return { ordinal: records.users.length } },
       createRun(value) { records.runs.push(value) },
@@ -162,7 +163,18 @@ const toolTurn: ProviderStreamEvent[] = [
   { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1', name: 'workflow_1', arguments: { input: { keyword: '今日天气' } } },
   { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
 ]
-const approvalIdentity = { permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope) }
+const approvalWorkflow: WorkflowDetail = {
+  ...workflow,
+  permissions: [{ capability: 'browser.fill', scope: { origins: ['https://www.baidu.com'] } }],
+}
+const externalApprovalIdentity = {
+  permissionIndex: 0,
+  scopeHash: scopeHash(approvalWorkflow.permissions[0]!.scope),
+}
+
+function requireChatApproval(dependencies: AgentOrchestratorDependencies): void {
+  dependencies.workflows.list = async () => [approvalWorkflow]
+}
 
 function textRunInput(
   input: Pick<AgentRunInput, 'conversationId' | 'content' | 'provider' | 'model'> & Pick<Partial<AgentRunInput>, 'requestId'>,
@@ -514,7 +526,7 @@ describe('AgentOrchestrator', () => {
       { type: 'generation', id: 'generation_paid' },
       { type: 'usage', inputTokens: 2, outputTokens: 1, totalTokens: 3, costUsd: '0.04' },
       ...toolTurn,
-    ]])
+    ], [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
     dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
     dependencies.executions.startReserved = async (reservation) => ({
       id: reservation.executionId,
@@ -529,12 +541,14 @@ describe('AgentOrchestrator', () => {
       requestId: 'request_local_failure',
     }))
 
-    expect(result).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } })
+    expect(result).toMatchObject({ status: 'completed' })
     expect(dependencies.providerUsage.report).toHaveBeenCalledWith(
       'agent:request_local_failure:turn:0',
       expect.objectContaining({ costUsd: '0.04', generationId: 'generation_paid' }),
     )
-    expect(dependencies.providerUsage.markUnknown).not.toHaveBeenCalled()
+    expect(dependencies.providerUsage.markUnknown).toHaveBeenCalledWith(
+      'agent:request_local_failure:turn:1', 100,
+    )
   })
 
   it('marks a costless OpenRouter turn unknown after binding its generation identity', async () => {
@@ -908,6 +922,7 @@ describe('AgentOrchestrator', () => {
 
   it('persists the user first and pauses before starting an approval-gated workflow', async () => {
     const dependencies = harness([toolTurn])
+    requireChatApproval(dependencies)
     const orchestrator = new AgentOrchestrator(dependencies)
 
     const result = await orchestrator.run(textRunInput({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model' }))
@@ -924,11 +939,137 @@ describe('AgentOrchestrator', () => {
     ]))
   })
 
+  it('auto-grants safe navigation and starts through the workflow executor without approval', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '搜索完成' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'safe_navigation', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.starts).toHaveLength(1)
+    expect(dependencies.policy.record).toHaveBeenCalledWith(expect.objectContaining({
+      executionId: expect.any(String), capability: 'browser.open', decision: 'once',
+    }))
+    expect(dependencies.policy.evaluate).not.toHaveBeenCalled()
+    expect(dependencies.records.events).not.toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'approval' }),
+    }))
+  })
+
+  it('returns semantic input failure to the model without reserving or starting', async () => {
+    const invalidToolTurn: ProviderStreamEvent[] = [
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_invalid', name: 'workflow_1', arguments: { input: {} } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]
+    const dependencies = harness([invalidToolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '请补充关键词' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const providerInputs: ModelStreamRequest[] = []
+    const turns = [invalidToolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '请补充关键词' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]] satisfies ProviderStreamEvent[][]
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      providerInputs.push(request)
+      return events(turns.shift() ?? [])
+    })
+    const reserve = vi.spyOn(dependencies.executions, 'reserve')
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'invalid_input', content: '搜索', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(reserve).not.toHaveBeenCalled()
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(providerInputs[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'tool', tool_call_id: 'call_invalid', content: expect.stringContaining('INVALID_INPUT') }),
+    ]))
+  })
+
+  it('continues after chat denial with a safe permission result and releases the reservation', async () => {
+    const externalWorkflow: WorkflowDetail = {
+      ...workflow,
+      permissions: [{ capability: 'browser.fill', scope: { origins: ['https://www.baidu.com'] } }],
+    }
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '已取消操作' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => [externalWorkflow]
+    const providerInputs: ModelStreamRequest[] = []
+    const turns = [toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '已取消操作' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]] satisfies ProviderStreamEvent[][]
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      providerInputs.push(request)
+      return events(turns.shift() ?? [])
+    })
+    const release = vi.spyOn(dependencies.policy, 'releaseExecution')
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run(textRunInput({
+      conversationId: 'denial', content: '填写搜索框', provider: 'openrouter', model: 'model',
+    }))
+
+    const result = await orchestrator.resumeApproval({
+      executionId: pending.executionId!,
+      permissionIndex: 0,
+      scopeHash: scopeHash(externalWorkflow.permissions[0]!.scope),
+      decision: 'deny',
+    })
+
+    expect(result.status).toBe('completed')
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.discards).toHaveLength(1)
+    expect(release).toHaveBeenCalledTimes(1)
+    expect(providerInputs[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'tool', content: expect.stringContaining('PERMISSION_DENIED') }),
+    ]))
+  })
+
+  it('keeps an oversized completed workflow result out of the next model request', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '结果过大' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.executions.startReserved = async (reservation) => ({
+      id: reservation.executionId,
+      finished: Promise.resolve({ id: reservation.executionId, status: 'completed', result: '汉'.repeat(100_000) }),
+    })
+    const providerInputs: ModelStreamRequest[] = []
+    const turns = [toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '结果过大' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]] satisfies ProviderStreamEvent[][]
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      providerInputs.push(request)
+      return events(turns.shift() ?? [])
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({ conversationId: 'large_result', content: '搜索', provider: 'openrouter', model: 'model' }),
+      contextLength: 128_000,
+    })
+
+    expect(result.status).toBe('completed')
+    expect(providerInputs[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'tool', content: expect.stringContaining('RESULT_TOO_LARGE') }),
+    ]))
+    expect(JSON.stringify(providerInputs[1])).not.toContain('汉汉汉汉汉汉汉汉')
+  })
+
   it('validates approval and tool arguments, then returns the result with the original tool call id', async () => {
     const dependencies = harness([toolTurn, [
       { type: 'text_delta', choiceIndex: 0, text: '搜索结果：天气晴' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
+    requireChatApproval(dependencies)
     const providerInputs: unknown[] = []
     dependencies.providerInstances.openrouter.stream = vi.fn((input) => { providerInputs.push(input); return events((providerInputs.length === 1 ? toolTurn : [
       { type: 'text_delta', choiceIndex: 0, text: '搜索结果：天气晴' },
@@ -937,7 +1078,7 @@ describe('AgentOrchestrator', () => {
     const orchestrator = new AgentOrchestrator(dependencies)
     const pending = await orchestrator.run(textRunInput({ conversationId: 'conversation_1', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model' }))
 
-    const done = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
+    const done = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once' })
 
     expect(done.status).toBe('completed')
     expect(dependencies.records.starts).toHaveLength(1)
@@ -998,6 +1139,7 @@ describe('AgentOrchestrator', () => {
 
   it('keeps the first normalized media message unchanged across a tool follow-up', async () => {
     const dependencies = harness([])
+    requireChatApproval(dependencies)
     const providerInputs: Array<Parameters<AgentProviderPort['stream']>[0]> = []
     dependencies.providerInstances.openrouter.stream = vi.fn((input) => {
       providerInputs.push(input)
@@ -1030,7 +1172,7 @@ describe('AgentOrchestrator', () => {
     })
     const done = await orchestrator.resumeApproval({
       executionId: pending.executionId!,
-      ...approvalIdentity,
+      ...externalApprovalIdentity,
       decision: 'once',
     })
 
@@ -1046,6 +1188,7 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([toolTurn, [
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
+    requireChatApproval(dependencies)
     const original = dependencies.providerInstances.deepseek
     const replacement: AgentProviderPort = { stream: vi.fn(() => events([])) }
     const orchestrator = new AgentOrchestrator(dependencies)
@@ -1057,78 +1200,72 @@ describe('AgentOrchestrator', () => {
       model: 'deepseek-v4-pro',
     }))
     dependencies.providerInstances.deepseek = replacement
-    await orchestrator.resumeApproval({
+    const result = await orchestrator.resumeApproval({
       executionId: pending.executionId!,
-      ...approvalIdentity,
+      ...externalApprovalIdentity,
       decision: 'once',
     })
 
+    expect(result.status).toBe('completed')
     expect(original.stream).toHaveBeenCalledTimes(2)
     expect(replacement.stream).not.toHaveBeenCalled()
   })
 
   it('binds always approval to the exact manifest permission and deny never starts execution', async () => {
     const mismatchDependencies = harness([toolTurn])
+    requireChatApproval(mismatchDependencies)
     const mismatchOrchestrator = new AgentOrchestrator(mismatchDependencies)
     const mismatchPending = await mismatchOrchestrator.run(textRunInput({ conversationId: 'c1', content: '搜索', provider: 'openrouter', model: 'm' }))
     const mismatch = await mismatchOrchestrator.resumeApproval({
-      executionId: mismatchPending.executionId!, ...approvalIdentity, decision: 'always', workflowId: workflow.id,
-      workflowVersion: workflow.version, capability: 'browser.open', scope: { origins: ['https://example.com'] },
+      executionId: mismatchPending.executionId!, ...externalApprovalIdentity, decision: 'always', workflowId: workflow.id,
+      workflowVersion: workflow.version, capability: 'browser.fill', scope: { origins: ['https://example.com'] },
     })
     expect(mismatch).toMatchObject({ status: 'failed', error: { code: 'INVALID_INPUT' } })
     expect(mismatchDependencies.records.decisions).toHaveLength(0)
     expect(mismatchDependencies.records.starts).toHaveLength(0)
 
-    const denyDependencies = harness([toolTurn])
+    const denyDependencies = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
+    requireChatApproval(denyDependencies)
     const denyOrchestrator = new AgentOrchestrator(denyDependencies)
     const denyPending = await denyOrchestrator.run(textRunInput({ conversationId: 'c2', content: '搜索', provider: 'openrouter', model: 'm' }))
-    const denied = await denyOrchestrator.resumeApproval({ executionId: denyPending.executionId!, ...approvalIdentity, decision: 'deny' })
-    expect(denied).toMatchObject({ status: 'failed', error: { code: 'PERMISSION_DENIED' } })
+    const denied = await denyOrchestrator.resumeApproval({ executionId: denyPending.executionId!, ...externalApprovalIdentity, decision: 'deny' })
+    expect(denied).toMatchObject({ status: 'completed' })
     expect(denyDependencies.records.starts).toHaveLength(0)
     expect(denyDependencies.records.terminal).toHaveLength(1)
     expect(denyDependencies.records.discards).toHaveLength(1)
   })
 
-  it('terminalizes and discards an unstarted reservation when policy recording throws', async () => {
-    const dependencies = harness([toolTurn])
+  it('returns a safe tool error and discards an unstarted reservation when policy recording throws', async () => {
+    const dependencies = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
+    requireChatApproval(dependencies)
     dependencies.policy.record = () => { throw new Error('policy unavailable') }
     const orchestrator = new AgentOrchestrator(dependencies)
     const pending = await orchestrator.run(textRunInput({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' }))
 
     const result = await orchestrator.resumeApproval({
-      executionId: pending.executionId!, ...approvalIdentity, decision: 'once',
+      executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once',
     })
 
-    expect(result).toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } })
+    expect(result).toMatchObject({ status: 'completed' })
     expect(dependencies.records.starts).toHaveLength(0)
     expect(dependencies.records.discards).toHaveLength(1)
-    expect(dependencies.records.terminal).toHaveLength(1)
+    expect(dependencies.records.terminal).toEqual([expect.objectContaining({ status: 'completed' })])
   })
 
-  it.each(['once', 'always'] as const)('identifies and emits each missing permission across %s then once approval', async (firstDecision) => {
-    const secondPermission = { capability: 'browser.fill' as const, scope: { origins: ['https://www.baidu.com'] } }
-    const twoPermissionWorkflow = { ...workflow, permissions: [workflow.permissions[0]!, secondPermission] }
+  it('identifies and emits each missing permission one at a time', async () => {
+    const firstPermission = { capability: 'browser.fill' as const, scope: { origins: ['https://www.baidu.com'] } }
+    const secondPermission = { capability: 'browser.click' as const, scope: { origins: ['https://www.baidu.com'] } }
+    const twoPermissionWorkflow = { ...workflow, permissions: [firstPermission, secondPermission] }
     const dependencies = harness([toolTurn, [
       { type: 'text_delta', choiceIndex: 0, text: '完成' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => [twoPermissionWorkflow]
-    dependencies.policy.evaluate = (request) => ({
-      allowed: dependencies.records.decisions.some((record) => {
-        const value = record as { capability: string; scope: unknown }
-        return value.capability === request.capability && JSON.stringify(value.scope) === JSON.stringify(request.scope)
-      }),
-      requiresApproval: true,
-    })
     const orchestrator = new AgentOrchestrator(dependencies)
     const first = await orchestrator.run(textRunInput({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' }))
 
-    const second = await orchestrator.resumeApproval(firstDecision === 'always' ? {
-      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope),
-      decision: 'always', workflowId: workflow.id, workflowVersion: workflow.version,
-      capability: workflow.permissions[0]!.capability, scope: workflow.permissions[0]!.scope,
-    } : {
-      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope), decision: 'once',
+    const second = await orchestrator.resumeApproval({
+      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(firstPermission.scope), decision: 'once',
     })
 
     expect(second).toMatchObject({ status: 'awaiting_approval', executionId: first.executionId })
@@ -1137,18 +1274,10 @@ describe('AgentOrchestrator', () => {
       .map((event) => (event as { block?: unknown }).block)
       .filter((block): block is { type: string; permissionIndex: number; scopeHash: string; capability: string } => Boolean(block) && (block as { type?: string }).type === 'approval')
     expect(approvals.map((block) => block.permissionIndex)).toEqual([0, 1])
-    expect(approvals.map((block) => block.capability)).toEqual(['browser.open', 'browser.fill'])
-    if (firstDecision === 'always') {
-      expect(dependencies.records.decisions[0]).toMatchObject({
-        workflowId: workflow.id,
-        workflowVersion: workflow.version,
-        capability: workflow.permissions[0]!.capability,
-        scope: workflow.permissions[0]!.scope,
-      })
-    }
+    expect(approvals.map((block) => block.capability)).toEqual(['browser.fill', 'browser.click'])
 
     const stale = await orchestrator.resumeApproval({
-      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(workflow.permissions[0]!.scope), decision: 'once',
+      executionId: first.executionId!, permissionIndex: 0, scopeHash: scopeHash(firstPermission.scope), decision: 'once',
     })
     expect(stale).toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
     expect(dependencies.records.starts).toHaveLength(0)
@@ -1362,6 +1491,7 @@ describe('AgentOrchestrator', () => {
         { type: 'finish', choiceIndex: 0, reason: 'stop' },
       ],
     ])
+    requireChatApproval(dependencies)
     const error = new ProviderUsageConsistencyError()
     vi.mocked(dependencies.providerUsage.report).mockImplementation(() => { throw error })
     const orchestrator = new AgentOrchestrator(dependencies)
@@ -1375,7 +1505,7 @@ describe('AgentOrchestrator', () => {
 
     await expect(orchestrator.resumeApproval({
       executionId: pending.executionId!,
-      ...approvalIdentity,
+      ...externalApprovalIdentity,
       decision: 'once',
     })).rejects.toBe(error)
 
@@ -1442,6 +1572,7 @@ describe('AgentOrchestrator', () => {
 
   it('cancels an approval-gated agent run by its execution identity', async () => {
     const dependencies = harness([toolTurn])
+    requireChatApproval(dependencies)
     const orchestrator = new AgentOrchestrator(dependencies)
     const pending = await orchestrator.run(textRunInput({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' }))
 
@@ -1459,6 +1590,7 @@ describe('AgentOrchestrator', () => {
       { type: 'text_delta', choiceIndex: 0, text: '完成' },
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
+    requireChatApproval(dependencies)
     dependencies.executions.startReserved = async (reserved, input) => {
       dependencies.records.starts.push({ ...input, executionId: reserved.executionId })
       return {
@@ -1469,8 +1601,8 @@ describe('AgentOrchestrator', () => {
     const orchestrator = new AgentOrchestrator(dependencies)
     const pending = await orchestrator.run(textRunInput({ conversationId: 'c', content: '搜索', provider: 'openrouter', model: 'm' }))
 
-    const first = orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
-    const second = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...approvalIdentity, decision: 'once' })
+    const first = orchestrator.resumeApproval({ executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once' })
+    const second = await orchestrator.resumeApproval({ executionId: pending.executionId!, ...externalApprovalIdentity, decision: 'once' })
     expect(second).toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
     expect(dependencies.records.starts).toHaveLength(1)
 
