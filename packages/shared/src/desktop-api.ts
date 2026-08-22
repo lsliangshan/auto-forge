@@ -396,7 +396,7 @@ const citySchema = nonEmptyStringSchema
 
 export const workflowDetailSchema = workflowSummarySchema.extend({
   codeSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
-  cities: z.array(citySchema),
+  cities: z.array(citySchema).default([]),
   runtimeIdentity: workflowRuntimeIdentitySchema,
   permissions: z.array(workflowPermissionSchema),
   activationExamples: z.array(nonEmptyStringSchema),

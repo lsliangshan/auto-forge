@@ -445,6 +445,9 @@ describe('cross-process contracts', () => {
       },
       source: 'development',
     }).cities).toEqual(['北京'])
+    const workflowWithoutCities = { ...validWorkflowDetail }
+    Reflect.deleteProperty(workflowWithoutCities, 'cities')
+    expect(workflowDetailSchema.parse(workflowWithoutCities).cities).toEqual([])
 
     expect(() => workflowDetailSchema.parse({
       ...validWorkflowDetail,
@@ -492,6 +495,11 @@ describe('cross-process contracts', () => {
       type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
       workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
       source: 'installed', buildHash: 'a'.repeat(64), status: 'running', executionIndex: 1, executionLimit: 5,
+    })).toThrow()
+    expect(() => chatBlockSchema.parse({
+      type: 'workflow_status', blockId: 'status_1', executionId: 'exec_1',
+      workflowId: 'workflow.beijing', workflowName: '北京工作居住证', workflowVersion: '1.0.0',
+      source: 'installed', status: 'running', executionIndex: 6, executionLimit: 6,
     })).toThrow()
   })
 
@@ -926,6 +934,8 @@ describe('cross-process contracts', () => {
     })
     expect(chatBlockSchema.safeParse({ ...approval, actionSummary: 'x'.repeat(501) }).success).toBe(false)
     expect(chatBlockSchema.safeParse({ ...approval, source: 'installed', buildHash: undefined }).success).toBe(true)
+    expect(chatBlockSchema.safeParse({ ...approval, buildHash: undefined }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...approval, source: 'installed' }).success).toBe(false)
   })
   it('requires exact workflow identity for removal', () => {
     expect(ipcRequestSchemas[ipcChannels.workflowsRemove].parse({ id: 'browser.search.baidu', version: '1.0.0' }))

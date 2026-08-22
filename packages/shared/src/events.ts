@@ -89,9 +89,15 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     capability: capabilitySchema,
     scope: runtimeCapabilityScopeSchema,
     scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
-  }).strict().superRefine(({ capability, scope }, context) => {
+  }).strict().superRefine(({ capability, scope, source, buildHash }, context) => {
     if (!runtimeCapabilityPermissionSchema.safeParse({ capability, scope }).success) {
       context.addIssue({ code: 'custom', message: 'Approval scope is invalid for this capability' })
+    }
+    if (source === 'development' && buildHash === undefined) {
+      context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Development workflows require a build hash' })
+    }
+    if (source === 'installed' && buildHash !== undefined) {
+      context.addIssue({ code: 'custom', path: ['buildHash'], message: 'Installed workflows cannot include a build hash' })
     }
   }),
   workflowBlockContextSchema.extend({
@@ -100,7 +106,7 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     executionId: identifierSchema,
     status: executionStatusSchema,
     executionIndex: z.number().int().positive(),
-    executionLimit: z.number().int().positive(),
+    executionLimit: z.number().int().positive().max(5),
   }).superRefine(({ executionIndex, executionLimit }, context) => {
     if (executionIndex > executionLimit) {
       context.addIssue({ code: 'custom', path: ['executionIndex'], message: 'Execution index cannot exceed its limit' })
