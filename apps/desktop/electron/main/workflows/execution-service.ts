@@ -29,6 +29,7 @@ import type {
   ExecutionStep,
 } from '../database/repositories.js'
 import { PolicyEngine, scopeHash } from '../permissions/policy-engine.js'
+import { validateWorkflowOutput } from './output-validation.js'
 import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
 
 const MAX_LINE_BYTES = 1024 * 1024
@@ -663,6 +664,10 @@ export class ExecutionService {
         await this.handleCapabilityRequest(active, message.requestId, message.request)
         return
       case 'result':
+        if (!validateWorkflowOutput(active.workflow.outputSchema, message.output).valid) {
+          await this.finish(active.id, 'failed', failure('INVALID_OUTPUT'), message.output)
+          return
+        }
         await this.finish(active.id, 'completed', undefined, message.output)
         return
       case 'error':

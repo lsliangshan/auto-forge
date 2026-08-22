@@ -590,6 +590,40 @@ describe('ExecutionService', () => {
     expect(harness.repositories.records.get(execution.id)).toMatchObject({ status: 'completed', result: { title: 'weather' } })
   })
 
+  it('persists invalid Worker output as failed without a completed terminal event', async () => {
+    const harness = createHarness({
+      source: {
+        workflow: {
+          ...workflow,
+          outputSchema: {
+            type: 'object',
+            required: ['title'],
+            properties: { title: { type: 'string' } },
+          },
+        },
+        rootPath: trustedRootPath,
+        entryPath: 'workers/workflow-runner.ts',
+        integrity: 'valid',
+      },
+    })
+    const execution = await harness.start()
+    const worker = harness.workerFactory.workers.get(execution.id)!
+    worker.respond({ type: 'ready', executionId: execution.id })
+    worker.respond({ type: 'result', output: { title: 42 } })
+
+    await expect(execution.finished).resolves.toMatchObject({
+      status: 'failed', errorCode: 'INVALID_OUTPUT', result: { title: 42 },
+    })
+    expect(harness.repositories.records.get(execution.id)).toMatchObject({
+      status: 'failed', errorCode: 'INVALID_OUTPUT', result: { title: 42 },
+    })
+    expect(harness.events.filter((event) => event.type === 'status' && [
+      'completed', 'failed', 'cancelled',
+    ].includes(event.status))).toMatchObject([{ status: 'failed', error: { code: 'INVALID_OUTPUT' } }])
+    expect(harness.events.some((event) => event.type === 'result')).toBe(false)
+    expect(worker.killed).toBe(true)
+  })
+
   it('emits exact identity for a later manifest permission and rejects an out-of-order decision', async () => {
     const fillPermission = { capability: 'browser.fill' as const, scope: capabilityRequest.scope }
     const twoPermissionWorkflow = { ...workflow, permissions: [workflow.permissions[0]!, fillPermission] }
