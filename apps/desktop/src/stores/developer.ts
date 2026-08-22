@@ -368,13 +368,24 @@ export const useDeveloperStore = defineStore('developer', {
     async _persistSnapshot(key: string, snapshot: { content: string; version: number; projectVersion: number }) {
       const buffer = this.files[key]
       if (!buffer) return
+      const isCurrent = () => (this._projectVersions[buffer.projectId] ?? 0) === snapshot.projectVersion
+        && buffer.version === snapshot.version
+        && this.selectedProjectId === buffer.projectId
       if (buffer.version === snapshot.version) buffer.saveState = 'saving'
       try {
-        await getDesktopApi().developer.writeFile(buffer.projectId, buffer.path, snapshot.content)
-        const validation = await getDesktopApi().developer.validate(buffer.projectId)
-        if ((this._projectVersions[buffer.projectId] ?? 0) === snapshot.projectVersion
-          && buffer.version === snapshot.version
-          && this.selectedProjectId === buffer.projectId) {
+        const api = getDesktopApi()
+        await api.developer.writeFile(buffer.projectId, buffer.path, snapshot.content)
+        const validation = await api.developer.validate(buffer.projectId)
+        let project: DeveloperProject | undefined
+        if (isCurrent() && ['workflow.json', 'src/index.ts'].includes(buffer.path)) {
+          try {
+            project = (await api.developer.listProjects()).find(({ id }) => id === buffer.projectId)
+          } catch (error) {
+            if (isCurrent()) this.error = displayError(error, '项目状态刷新失败')
+          }
+        }
+        if (isCurrent()) {
+          if (project) this._upsertProject(project)
           this._applyValidation(validation)
           buffer.saveState = 'saved'
         } else if (buffer.version !== snapshot.version) buffer.saveState = 'dirty'

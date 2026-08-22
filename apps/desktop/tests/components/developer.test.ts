@@ -204,6 +204,70 @@ describe('developer workbench', () => {
     expect(raw.developer.build).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['new', 'unbuilt_changes', true, '有未构建修改，暂不可用于聊天'],
+    ['invalid', 'invalid', false, '项目无效，暂不可用于聊天'],
+  ] as const)('refreshes authoritative %s availability after saving an entry input', async (
+    status,
+    chatAvailability,
+    valid,
+    message,
+  ) => {
+    const { api, raw } = createApi()
+    raw.developer.listProjects
+      .mockResolvedValueOnce([project])
+      .mockResolvedValueOnce([{ ...project, status, chatAvailability }])
+    raw.developer.validate.mockResolvedValue({
+      valid,
+      diagnostics: valid ? [] : [{ path: 'src/index.ts', message: 'invalid source', severity: 'error' }],
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(CodeEditor)
+    await wrapper.vm.$nextTick()
+
+    monacoHarness.change('export default 2')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => expect(raw.developer.listProjects).toHaveBeenCalledTimes(2))
+    await wrapper.vm.$nextTick()
+
+    expect(store.selectedProject?.chatAvailability).toBe(chatAvailability)
+    expect(store.chatAvailabilityMessage).toBe(message)
+    expect(wrapper.get('[data-testid="chat-availability"]').text()).toBe(message)
+    expect(raw.developer.build).not.toHaveBeenCalled()
+  })
+
+  it('ignores a late project refresh after the saved project selection changes', async () => {
+    const { api, raw } = createApi()
+    const second = { ...project, id: 'project_2', name: 'Second project', rootPath: '/private/second' }
+    let resolveRefresh!: (projects: DeveloperProject[]) => void
+    raw.developer.listProjects
+      .mockResolvedValueOnce([project, second])
+      .mockReturnValueOnce(new Promise((resolve) => { resolveRefresh = resolve }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useDeveloperStore()
+    await store.loadProjects()
+    const wrapper = mount(CodeEditor)
+    await wrapper.vm.$nextTick()
+
+    monacoHarness.change('export default 2')
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.waitFor(() => expect(raw.developer.listProjects).toHaveBeenCalledTimes(2))
+    await store.selectProject(second.id)
+    resolveRefresh([
+      { ...project, status: 'new', chatAvailability: 'unbuilt_changes' },
+      { ...second, name: 'stale second', status: 'invalid', chatAvailability: 'invalid' },
+    ])
+    await store.flushPendingSaves()
+
+    expect(store.selectedProjectId).toBe(second.id)
+    expect(store.selectedProject?.name).toBe(second.name)
+    expect(store.selectedProject?.chatAvailability).toBe('ready')
+    expect(store.projects.find(({ id }) => id === project.id)?.chatAvailability).toBe('ready')
+    expect(raw.developer.build).not.toHaveBeenCalled()
+  })
+
   it('creates Monaco after the initial file read finishes', async () => {
     const { api, raw } = createApi()
     let resolveSource!: (content: string) => void
