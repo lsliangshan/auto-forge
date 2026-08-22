@@ -9,6 +9,7 @@ import {
   BrowserContinuationToolExecutor,
   type BrowserContinuationRunContext,
 } from './browser-continuation-tool-executor.js'
+import type { BrowserResolvedElementReference } from '../browser/browser-page-inspector.js'
 
 function binding(): BrowserContinuationBinding {
   return Object.freeze({
@@ -48,7 +49,11 @@ function run(overrides: Partial<BrowserContinuationRunContext> = {}): BrowserCon
   }
 }
 
-function harness(options: { snapshots?: BrowserPageSnapshot[]; now?: () => number } = {}) {
+function harness(options: {
+  snapshots?: BrowserPageSnapshot[]
+  now?: () => number
+  stableSemantics?: boolean
+} = {}) {
   const liveBinding = binding()
   let current = true
   const release = vi.fn(async () => { current = false })
@@ -59,13 +64,28 @@ function harness(options: { snapshots?: BrowserPageSnapshot[]; now?: () => numbe
     release,
   })
   const snapshots = [...(options.snapshots ?? [snapshot()])]
+  let semanticRead = 0
+  const semanticFingerprint = () => options.stableSemantics ? 'stable_page' : `page_${++semanticRead}`
   const inspector = {
     inspect: vi.fn(async () => snapshots.shift() ?? snapshot()),
-    resolveRef: vi.fn(async (input: { ref: string; snapshotId: string }) => {
+    resolveRef: vi.fn(async (input: { ref: string; snapshotId: string }): Promise<BrowserResolvedElementReference> => {
       const candidate = snapshot().nodes.find((node) => node.ref === input.ref)
       if (!candidate || input.snapshotId !== 'snapshot_1') throw { code: 'PAGE_CHANGED' }
-      return { snapshotId: input.snapshotId, ref: input.ref, backendNodeId: input.ref === 'ref_submit' ? 99 : 10, role: candidate.role, name: candidate.name }
+      return {
+        snapshotId: input.snapshotId,
+        ref: input.ref,
+        backendNodeId: input.ref === 'ref_submit' ? 99 : 10,
+        role: candidate.role,
+        name: candidate.name,
+        auth: 'authenticated' as const,
+        semanticFingerprint: semanticFingerprint(),
+        targetContext: {},
+      }
     }),
+    currentPageContext: vi.fn(async () => ({
+      auth: 'authenticated' as const,
+      semanticFingerprint: semanticFingerprint(),
+    })),
     endRun: vi.fn(),
   }
   const state = { origin: 'https://service.example', url: 'https://service.example/form', navigationEpoch: 1 }
@@ -141,7 +161,7 @@ describe('BrowserContinuationToolExecutor', () => {
 
     expect(result).toEqual({ kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' })
     expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
-    expect(test.workspace.focusContinuation).toHaveBeenCalledWith('tab_1')
+    expect(test.workspace.focusContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1')
     expect(test.workspace.highlightContinuationTarget).toHaveBeenCalledWith(
       'tab_1', 'ref_submit', expect.objectContaining({ backendNodeId: 99 }),
     )
@@ -166,6 +186,86 @@ describe('BrowserContinuationToolExecutor', () => {
       ],
     }, run())).resolves.toEqual({ kind: 'success', data: { completedActions: 4 } })
     expect(test.workspace.performContinuationAction).toHaveBeenCalledTimes(4)
+  })
+
+  it('uses live target semantics and auth so benign-looking final controls never dispatch', async () => {
+    const semanticFinal = harness()
+    await semanticFinal.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '保存' }, run())
+    semanticFinal.inspector.resolveRef.mockResolvedValueOnce({
+      snapshotId: 'snapshot_1', ref: 'ref_save', backendNodeId: 10, role: 'button', name: '保存草稿',
+      auth: 'authenticated', semanticFingerprint: 'before',
+      targetContext: {
+        formOwned: true, expectedNavigation: true, inputType: 'submit', nearbyLabels: ['确认并提交申请'],
+      },
+    })
+
+    await expect(semanticFinal.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'click', ref: 'ref_save' }],
+    }, run())).resolves.toEqual({ kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' })
+    expect(semanticFinal.workspace.performContinuationAction).not.toHaveBeenCalled()
+
+    const liveAuth = harness()
+    await liveAuth.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '保存' }, run())
+    liveAuth.inspector.resolveRef.mockResolvedValueOnce({
+      snapshotId: 'snapshot_1', ref: 'ref_save', backendNodeId: 10, role: 'button', name: '保存草稿',
+      auth: 'required', semanticFingerprint: 'before', targetContext: { nearbyLabels: ['登录后继续'] },
+    })
+    await expect(liveAuth.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'click', ref: 'ref_save' }],
+    }, run())).resolves.toEqual({ kind: 'handoff', code: 'AUTH_REQUIRED' })
+    expect(liveAuth.workspace.performContinuationAction).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { text: '不同意须知', checked: true },
+    { text: '不要勾选同意须知', checked: true },
+    { text: '勾选同意须知，但不要勾选同意须知', checked: true },
+  ])('rejects ambiguous or negated boolean evidence: $text', async ({ text, checked }) => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '填写' }, run({
+      currentUser: { messageId: 'message_current', text },
+    }))
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [
+        { type: 'check', ref: 'ref_agree', checked, source: { kind: 'current_user' } },
+      ],
+    }, run({ currentUser: { messageId: 'message_current', text } }))).resolves.toEqual({
+      kind: 'tool_error', code: 'INVALID_INPUT',
+    })
+    expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
+  })
+
+  it('rejects invalid calendar dates but preserves explicitly quoted values', async () => {
+    const invalidDate = harness()
+    const invalidContext = run({ currentUser: { messageId: 'message_current', text: '办理日期：2026-02-31' } })
+    await invalidDate.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '填写' }, invalidContext)
+    await expect(invalidDate.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [
+        { type: 'fill', ref: 'ref_name', value: '2026-02-31', source: { kind: 'current_user' } },
+      ],
+    }, invalidContext)).resolves.toEqual({ kind: 'tool_error', code: 'INVALID_INPUT' })
+    expect(invalidDate.workspace.performContinuationAction).not.toHaveBeenCalled()
+
+    const quoted = harness()
+    const quotedContext = run({ currentUser: { messageId: 'message_current', text: '姓名：“李四”' } })
+    await quoted.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '填写' }, quotedContext)
+    await expect(quoted.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [
+        { type: 'fill', ref: 'ref_name', value: '李四', source: { kind: 'current_user' } },
+      ],
+    }, quotedContext)).resolves.toEqual({ kind: 'success', data: { completedActions: 1 } })
+  })
+
+  it('does not treat a requested value as evidence-delimited inside its negation', async () => {
+    const test = harness()
+    const context = run({ currentUser: { messageId: 'message_current', text: '办理意见：不同意' } })
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '填写' }, context)
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [
+        { type: 'fill', ref: 'ref_name', value: '同意', source: { kind: 'current_user' } },
+      ],
+    }, context)).resolves.toEqual({ kind: 'tool_error', code: 'INVALID_INPUT' })
+    expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
   })
 
   it('rejects invented or unreferenced values before dispatch and redacts entered/page text from audit', async () => {
@@ -202,6 +302,69 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.release).toHaveBeenCalledOnce()
     expect(test.inspector.endRun).toHaveBeenCalledWith('agent_run_1')
     expect(test.audits.at(-1)).toMatchObject({ action: 'click', outcome: 'failed', errorCode: 'PAGE_CHANGED' })
+  })
+
+  it('counts a dispatched action before post-dispatch failure and terminally rejects same-run retry', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '保存' }, run())
+    let countAtFailedAudit: number | undefined
+    test.workspace.performContinuationAction.mockRejectedValueOnce({ code: 'PAGE_CHANGED' })
+    test.executor['dependencies'].audits.insert = vi.fn((entry: BrowserActionAuditEntry) => {
+      test.audits.push(entry)
+      if (entry.action === 'click' && entry.outcome === 'failed') {
+        countAtFailedAudit = test.executor['runs'].get('agent_run_1')?.actionCount
+      }
+      return entry
+    })
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'click', ref: 'ref_save' }],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+    expect(countAtFailedAudit).toBe(1)
+    expect(test.inspector.endRun).toHaveBeenCalledWith('agent_run_1')
+    expect(test.release).toHaveBeenCalledOnce()
+
+    await expect(test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '重试',
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(test.executor['dependencies'].registry.acquire).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { phase: 'resolve', code: 'PAGE_CHANGED' as const },
+    { phase: 'focus', code: 'PAGE_CLOSED' as const },
+    { phase: 'highlight', code: 'PAGE_CHANGED' as const },
+    { phase: 'release', code: 'PAGE_BUSY' as const },
+  ])('records exactly one failed explicit handoff audit when $phase fails', async ({ phase, code }) => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '提交' }, run())
+    if (phase === 'resolve') test.inspector.resolveRef.mockRejectedValueOnce({ code })
+    if (phase === 'focus') test.workspace.focusContinuation.mockRejectedValueOnce({ code })
+    if (phase === 'highlight') test.workspace.highlightContinuationTarget.mockRejectedValueOnce({ code })
+    if (phase === 'release') test.release.mockRejectedValueOnce({ code })
+
+    await expect(test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action', ref: 'ref_submit',
+    }, run())).resolves.toEqual({ kind: 'tool_error', code })
+    expect(test.audits.filter(({ action }) => action === 'handoff')).toEqual([
+      expect.objectContaining({ outcome: 'failed', errorCode: code }),
+    ])
+  })
+
+  it('does not report a guard-triggered handoff until focus and highlight succeed', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '提交' }, run())
+    test.workspace.highlightContinuationTarget.mockRejectedValueOnce({ code: 'PAGE_CHANGED' })
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'click', ref: 'ref_submit' }],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+    expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
+    expect(test.audits.slice(1)).toEqual([
+      expect.objectContaining({ action: 'click', outcome: 'failed', errorCode: 'PAGE_CHANGED' }),
+      expect.objectContaining({ action: 'handoff', outcome: 'failed', errorCode: 'PAGE_CHANGED' }),
+    ])
+    expect(test.audits.some(({ outcome }) => outcome === 'handed_off')).toBe(false)
   })
 
   it('rechecks the exact action capability after dispatch and stops a cancelled suffix', async () => {
@@ -261,6 +424,19 @@ describe('BrowserContinuationToolExecutor', () => {
       bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{ type: 'focus' }],
     }, run())).resolves.toEqual({ kind: 'tool_error', code: 'ACTION_LIMIT_EXCEEDED' })
     expect(timed.workspace.performContinuationAction).not.toHaveBeenCalled()
+  })
+
+  it('stops alternating actions on the exact third unchanged semantic cycle', async () => {
+    const test = harness({ stableSemantics: true })
+    await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '检查' }, run())
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [
+        { type: 'focus' }, { type: 'wait', milliseconds: 50 }, { type: 'scroll', direction: 'down' },
+      ],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'ACTION_LIMIT_EXCEEDED' })
+    expect(test.workspace.performContinuationAction).toHaveBeenCalledTimes(3)
+    expect(test.audits.at(-1)).toMatchObject({ action: 'scroll', outcome: 'failed', errorCode: 'ACTION_LIMIT_EXCEEDED' })
   })
 
   it('owns terminal, cancellation, takeover, handoff, and error endRun cleanup', async () => {

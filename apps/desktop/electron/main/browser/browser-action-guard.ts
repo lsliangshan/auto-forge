@@ -7,17 +7,12 @@ import {
 import type { BrowserPermissionMatrix } from '../workflows/workflow-security-fingerprint.js'
 import type {
   BrowserAction,
+  BrowserActionTargetContext,
   BrowserContinuationPolicy,
   BrowserPageSnapshot,
   BrowserSemanticNode,
 } from './browser-continuation-types.js'
-
-export interface BrowserActionTargetContext {
-  readonly formOwned?: boolean
-  readonly nearbyLabels?: readonly string[]
-  readonly inputType?: string
-  readonly expectedNavigation?: boolean
-}
+export type { BrowserActionTargetContext } from './browser-continuation-types.js'
 
 export interface BrowserActionGuardContext {
   readonly origin: string
@@ -73,6 +68,7 @@ function actionSupported(action: BrowserAction, target: BrowserSemanticNode | un
 }
 
 function exactManualAction(context: BrowserActionGuardContext): boolean {
+  if (context.targetContext?.manualAction !== undefined) return context.targetContext.manualAction
   const configured = context.browserContinuation?.manualActions ?? []
   if (configured.length === 0 || !context.target) return false
   return configured.some(({ locator }) => {

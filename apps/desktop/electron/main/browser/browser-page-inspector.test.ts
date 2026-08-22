@@ -570,6 +570,63 @@ describe('BrowserPageInspector', () => {
     })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
   })
 
+  it('reclassifies live auth and target semantics without exposing Main-only context', async () => {
+    const exactBinding = deepFreeze({
+      ...binding({
+        auth: { loggedOut: ['css=form#login'] },
+        readableRegions: ['role=main'],
+        manualActions: [{ locator: 'css=#confirm', reason: '人工确认' }],
+      }),
+      permissionMatrix: {
+        'browser.open': [`${origin}/*`],
+        'browser.click': [`${origin}/*`],
+      },
+    })
+    const port = new FakeCdpPort([
+      node(10, 'main', '申请', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'form', '申请表单', { axNodeId: 'ax_form' }),
+      node(12, 'statictext', '确认并提交申请', { parentAxNodeId: 'ax_form' }),
+      node(13, 'button', '保存草稿', {
+        parentAxNodeId: 'ax_form', dom: { tagName: 'button', inputType: 'submit' },
+      }),
+      node(14, 'form', '登录', { axNodeId: 'ax_login' }),
+    ])
+    port.page = {
+      ...port.page,
+      locatorMatches: [
+        { locator: 'role=main', backendNodeIds: [10] },
+        { locator: 'css=form#login', backendNodeIds: [] },
+        { locator: 'css=#confirm', backendNodeIds: [13] },
+      ],
+    }
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const authority = input(exactBinding)
+    const snapshot = await inspector.inspect(authority)
+    const target = snapshot.nodes.find((candidate) => candidate.name === '保存草稿')!
+    expect(JSON.stringify(snapshot)).not.toMatch(/targetContext|semanticFingerprint|backendNodeId/u)
+
+    port.page = {
+      ...port.page,
+      locatorMatches: port.page.locatorMatches.map((entry) => (
+        entry.locator === 'css=form#login' ? { ...entry, backendNodeIds: [14] } : entry
+      )),
+    }
+    await expect(inspector.resolveRef({
+      lease: authority.lease, tabId: 'tab_1', snapshotId: snapshot.snapshotId,
+      navigationEpoch: 4, origin, ref: target.ref,
+    })).resolves.toMatchObject({
+      auth: 'required',
+      semanticFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      targetContext: {
+        formOwned: true,
+        inputType: 'submit',
+        expectedNavigation: true,
+        manualAction: true,
+        nearbyLabels: expect.arrayContaining(['确认并提交申请']),
+      },
+    })
+  })
+
   it('captures only a current safe bounded node for a vision-capable model', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '详情', { axNodeId: 'ax_main', parentAxNodeId: undefined }),

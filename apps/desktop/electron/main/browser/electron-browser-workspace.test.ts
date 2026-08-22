@@ -218,7 +218,7 @@ describe('ElectronBrowserWorkspace', () => {
     await workspace.releaseExecution('e1')
     await workspace.acquireContinuation(tab.id, 'agent_run_1')
 
-    await workspace.focusContinuation(tab.id)
+    await workspace.focusContinuation(tab.id, 'agent_run_1')
     await workspace.highlightContinuationTarget(tab.id, 'ref_submit', {
       runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
       expectedNavigationEpoch: tab.navigationEpoch, backendNodeId: 99,
@@ -236,6 +236,53 @@ describe('ElectronBrowserWorkspace', () => {
       method === 'Runtime.callFunctionOn' || method === 'Runtime.evaluate'
         || method === 'Input.dispatchMouseEvent'
     ))).toBe(false)
+  })
+
+  it('refuses to focus a tab for an obsolete continuation run', async () => {
+    const { workspace, windows } = createHarness(() => ({}))
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/form', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'run_old')
+    await workspace.releaseContinuation(tab.id, 'run_old')
+    await workspace.acquireContinuation(tab.id, 'run_new')
+    windows[0]!.focus.mockClear()
+
+    await expect(workspace.focusContinuation(tab.id, 'run_old')).rejects.toMatchObject({ code: 'PAGE_BUSY' })
+    expect(windows[0]!.focus).not.toHaveBeenCalled()
+    await workspace.focusContinuation(tab.id, 'run_new')
+    expect(windows[0]!.focus).toHaveBeenCalledOnce()
+  })
+
+  it('rechecks the exact continuation run after an async focus race', async () => {
+    const gate = deferred<void>()
+    let blockToolbar = false
+    let toolbarBlocked = false
+    const { workspace, windows } = createHarness(
+      () => ({}),
+      false,
+      async (url) => {
+        if (blockToolbar && url.startsWith('data:text/html')) {
+          toolbarBlocked = true
+          await gate.promise
+        }
+      },
+    )
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/form', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'run_old')
+    windows[0]!.focus.mockClear()
+    blockToolbar = true
+
+    const focusing = workspace.focusContinuation(tab.id, 'run_old')
+    await vi.waitFor(() => { expect(toolbarBlocked).toBe(true) })
+    await workspace.releaseContinuation(tab.id, 'run_old')
+    await workspace.acquireContinuation(tab.id, 'run_new')
+    gate.resolve()
+
+    await expect(focusing).rejects.toMatchObject({ code: 'CANCELLED' })
+    expect(windows[0]!.focus).not.toHaveBeenCalled()
   })
 
   it('hides an Overlay highlight when navigation races target highlighting', async () => {

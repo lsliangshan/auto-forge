@@ -75,6 +75,14 @@ export interface BrowserContinuationResolvedTargetInput {
   readonly expectedName?: string
 }
 
+export interface BrowserActionTargetContext {
+  readonly formOwned?: boolean
+  readonly nearbyLabels?: readonly string[]
+  readonly inputType?: string
+  readonly expectedNavigation?: boolean
+  readonly manualAction?: boolean
+}
+
 export interface BrowserSemanticNode {
   readonly ref: string
   readonly role: string

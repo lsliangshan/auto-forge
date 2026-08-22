@@ -17,6 +17,7 @@ import {
 } from '../browser/browser-action-guard.js'
 import type {
   BrowserPageInspector,
+  BrowserLivePageContext,
   BrowserResolvedElementReference,
 } from '../browser/browser-page-inspector.js'
 import type { BrowserContinuationRegistry } from '../browser/browser-continuation-registry.js'
@@ -103,7 +104,7 @@ export interface BrowserContinuationWorkspacePort {
     readonly tabId: string
     readonly action: BrowserAction
   }): Promise<void>
-  focusContinuation(tabId: string): Promise<void>
+  focusContinuation(tabId: string, runId: string): Promise<void>
   highlightContinuationTarget(
     tabId: string,
     ref: string,
@@ -119,7 +120,7 @@ interface BrowserActionAuditRepository {
 
 interface BrowserContinuationToolExecutorDependencies {
   readonly registry: Pick<BrowserContinuationRegistry, 'acquire'>
-  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'resolveRef' | 'endRun'>
+  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'resolveRef' | 'currentPageContext' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
   readonly audits: BrowserActionAuditRepository
   readonly guard?: BrowserActionGuard
@@ -134,9 +135,8 @@ interface ActiveRunState {
   lease?: BrowserContinuationLease
   actionCount: number
   noProgressCount: number
-  lastProgressSignature?: string
-  repeatedActionCount: number
-  lastActionSignature?: string
+  inspectionNoProgressCount: number
+  lastInspectionSignature?: string
   nextAuditSequence?: number
   readonly snapshots: Map<string, BrowserPageSnapshot>
 }
@@ -169,39 +169,26 @@ function pageSignature(value: BrowserPageSnapshot | BrowserRegionImage): string 
   })
 }
 
-function actionSignature(action: BrowserAction): string {
-  switch (action.type) {
-    case 'fill':
-    case 'select':
-      return `${action.type}:${action.ref}:${action.value}`
-    case 'check':
-      return `${action.type}:${action.ref}:${action.checked}`
-    case 'click':
-      return `${action.type}:${action.ref}`
-    case 'navigate': {
-      const url = new URL(action.url)
-      return `${action.type}:${url.origin}${url.pathname}`
-    }
-    case 'scroll':
-      return `${action.type}:${action.ref ?? 'page'}:${action.direction}`
-    case 'wait':
-      return `${action.type}:${action.milliseconds}`
-    case 'focus':
-      return action.type
-  }
-}
-
 function trimmedText(value: string): string {
   return value.trim()
 }
 
+function validCalendarDate(year: number, month: number, day: number): boolean {
+  if (year < 1 || year > 9_999 || month < 1 || month > 12 || day < 1) return false
+  const days = [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28,
+    31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return day <= days[month - 1]!
+}
+
 function normalizedIsoDates(value: string): readonly string[] {
   const dates: string[] = []
-  const pattern = /(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?/gu
+  const delimiter = `[\\s:：,，.。;；、!?！？'"“”‘’()（）]`
+  const pattern = new RegExp(`(?:^|${delimiter})(\\d{4})[-/.年](\\d{1,2})[-/.月](\\d{1,2})(?:日)?(?=$|${delimiter})`, 'gu')
   for (const match of value.matchAll(pattern)) {
     const month = Number(match[2])
     const day = Number(match[3])
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+    const year = Number(match[1])
+    if (validCalendarDate(year, month, day)) {
       dates.push(`${match[1]}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`)
     }
   }
@@ -212,16 +199,39 @@ function textSupportsValue(requested: string, evidence: string): boolean {
   const candidate = trimmedText(requested)
   const source = trimmedText(evidence)
   if (!candidate) return false
-  return source.includes(candidate)
-    || (/^\d{4}-\d{2}-\d{2}$/u.test(candidate) && normalizedIsoDates(source).includes(candidate))
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(candidate)) {
+    const [year, month, day] = candidate.split('-').map(Number)
+    return validCalendarDate(year!, month!, day!) && normalizedIsoDates(source).includes(candidate)
+  }
+  if (source === candidate) return true
+  const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  const delimiter = `[\\s:：,，.。;；、!?！？'"“”‘’()（）\\[\\]{}]`
+  return new RegExp(`(?:^|${delimiter})${escaped}(?=$|${delimiter})`, 'u').test(source)
 }
 
 function textSupportsBoolean(requested: boolean, evidence: string): boolean {
   const normalized = trimmedText(evidence).toLowerCase()
-  return requested
-    ? /(?:^|[\s：:，,。；;])(是|同意|勾选|选中|true|yes)(?:$|[\s，,。；;])/iu.test(normalized)
-      || /勾选.{0,40}同意/iu.test(normalized)
-    : /(?:^|[\s：:，,。；;])(否|不同意|取消勾选|不选中|false|no)(?:$|[\s，,。；;])/iu.test(normalized)
+  const delimiter = `[\\s:：,，.。;；、!?！？'"“”‘’()（）]`
+  const negative = /不同意|不要勾选|请勿勾选|不勾选|取消勾选|不要选中|不选中/iu.test(normalized)
+    || new RegExp(`(?:^|${delimiter})(?:否|false|no)(?=$|${delimiter})`, 'iu').test(normalized)
+  const positive = new RegExp(`(?:^|${delimiter})(?:是|true|yes)(?=$|${delimiter})`, 'iu').test(normalized)
+    || new RegExp(`(?:^|${delimiter})(?:请)?勾选.{0,20}同意(?:须知|条款|协议)?(?=$|${delimiter})`, 'iu').test(normalized)
+    || new RegExp(`(?:^|${delimiter})同意(?:须知|条款|协议)?(?=$|${delimiter})`, 'iu').test(normalized)
+  if (positive === negative) return false
+  return requested ? positive : negative
+}
+
+function observedPage(
+  page: BrowserContinuationPageState,
+  context: BrowserLivePageContext,
+): string {
+  return JSON.stringify({
+    origin: page.origin,
+    url: page.url,
+    navigationEpoch: page.navigationEpoch,
+    auth: context.auth,
+    semanticFingerprint: context.semanticFingerprint,
+  })
 }
 
 function targetSummary(target: BrowserSemanticNode | undefined): string {
@@ -265,7 +275,7 @@ export class BrowserContinuationToolExecutor {
     } catch (error) {
       const safe = toSafeAppError(error)
       state = this.runs.get(context.runId)!
-      if (state) await this.cleanupAuthority(state)
+      if (state) await this.terminate(state)
       return { kind: 'tool_error', code: safe.code }
     }
   }
@@ -303,7 +313,7 @@ export class BrowserContinuationToolExecutor {
       startedAt: this.now(),
       actionCount: 0,
       noProgressCount: 0,
-      repeatedActionCount: 0,
+      inspectionNoProgressCount: 0,
       snapshots: new Map(),
     }
     this.runs.set(context.runId, state)
@@ -353,12 +363,14 @@ export class BrowserContinuationToolExecutor {
         })
       this.assertActive(state, context)
       const signature = pageSignature(result)
-      state.repeatedActionCount = 0
-      state.lastActionSignature = undefined
-      state.noProgressCount = signature === state.lastProgressSignature ? state.noProgressCount + 1 : 1
-      state.lastProgressSignature = signature
+      const changed = state.lastInspectionSignature !== undefined && signature !== state.lastInspectionSignature
+      state.inspectionNoProgressCount = signature === state.lastInspectionSignature
+        ? state.inspectionNoProgressCount + 1
+        : 1
+      state.lastInspectionSignature = signature
+      if (changed) state.noProgressCount = 0
       if (isPageSnapshot(result)) state.snapshots.set(result.snapshotId, result)
-      if (state.noProgressCount >= 3) {
+      if (state.inspectionNoProgressCount >= 3) {
         this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'failed', 'ACTION_LIMIT_EXCEEDED')
         audited = true
         throw failure('ACTION_LIMIT_EXCEEDED')
@@ -426,15 +438,22 @@ export class BrowserContinuationToolExecutor {
             ref: target.ref,
           })
           : undefined
+        const liveBefore = resolved ?? await this.dependencies.inspector.currentPageContext({
+          lease,
+          tabId: lease.binding.tabId,
+          navigationEpoch: page.navigationEpoch,
+          origin: page.origin,
+        })
         normalized = this.verifyValue(action, context, state)
         const decision = this.guard.decide({
           origin: page.origin,
           url: page.url,
           action: normalized,
           target,
-          auth: snapshot.auth,
+          auth: liveBefore.auth,
           snapshotFresh: true,
           permissionMatrix: lease.binding.permissionMatrix,
+          ...(resolved === undefined ? {} : { targetContext: resolved.targetContext }),
           ...(lease.binding.browserContinuation === undefined ? {} : { browserContinuation: lease.binding.browserContinuation }),
         })
         if (decision.kind === 'blocked') {
@@ -443,10 +462,25 @@ export class BrowserContinuationToolExecutor {
           throw failure(decision.code)
         }
         if (decision.kind === 'handoff') {
-          this.auditAction(state, context, page.origin, normalized, target, 'handed_off', decision.code)
-          audited = true
-          return this.performHandoff(state, context, page, target, resolved, decision)
+          try {
+            const result = await this.performHandoff(
+              state, context, page, target, resolved, decision, { action: normalized, target },
+            )
+            audited = true
+            return result
+          } catch (error) {
+            const safe = toSafeAppError(error)
+            this.auditAction(state, context, page.origin, normalized, target, 'failed', safe.code)
+            this.audit(
+              state, context, page.origin, 'handoff', targetSummary(target),
+              'external_action', 'failed', safe.code,
+            )
+            audited = true
+            throw error
+          }
         }
+        const beforeObservation = observedPage(page, liveBefore)
+        state.actionCount += 1
         await this.dependencies.workspace.performContinuationAction({
           tabId: lease.binding.tabId,
           runId: context.runId,
@@ -456,13 +490,37 @@ export class BrowserContinuationToolExecutor {
           ...(resolved === undefined ? {} : { expectedRole: resolved.role, expectedName: resolved.name }),
           action: normalized,
         })
-        state.actionCount += 1
-        completedActions += 1
-        state.noProgressCount = 0
-        state.lastProgressSignature = undefined
         this.assertActive(state, context)
         const after = await this.dependencies.workspace.getContinuationState(lease.binding.tabId, context.runId)
         if (!this.postActionAllowed(normalized, lease, after)) throw failure('DOMAIN_BLOCKED')
+        const liveAfter = await this.dependencies.inspector.currentPageContext({
+          lease,
+          tabId: lease.binding.tabId,
+          navigationEpoch: after.navigationEpoch,
+          origin: after.origin,
+        })
+        if (observedPage(after, liveAfter) === beforeObservation) state.noProgressCount += 1
+        else state.noProgressCount = 0
+        if (state.noProgressCount >= 3) throw failure('ACTION_LIMIT_EXCEEDED')
+        if (liveAfter.auth === 'required') {
+          try {
+            const result = await this.performHandoff(
+              state, context, after, undefined, undefined,
+              { kind: 'handoff', code: 'AUTH_REQUIRED' }, { action: normalized, target },
+            )
+            audited = true
+            return result
+          } catch (error) {
+            const safe = toSafeAppError(error)
+            this.auditAction(state, context, page.origin, normalized, target, 'failed', safe.code)
+            this.audit(
+              state, context, after.origin, 'handoff', 'page', 'external_action', 'failed', safe.code,
+            )
+            audited = true
+            throw error
+          }
+        }
+        completedActions += 1
         this.auditAction(state, context, page.origin, normalized, target, 'completed')
         audited = true
       } catch (error) {
@@ -488,22 +546,31 @@ export class BrowserContinuationToolExecutor {
     const page = await this.dependencies.workspace.getContinuationState(lease.binding.tabId, context.runId)
     let target: BrowserSemanticNode | undefined
     let resolved: BrowserResolvedElementReference | undefined
-    if (input.ref) {
-      for (const snapshot of state.snapshots.values()) {
-        target = snapshot.nodes.find((node) => node.ref === input.ref)
-        if (target) {
-          resolved = await this.dependencies.inspector.resolveRef({
-            lease, tabId: lease.binding.tabId, snapshotId: snapshot.snapshotId,
-            navigationEpoch: page.navigationEpoch, origin: page.origin, ref: input.ref,
-          })
-          break
+    try {
+      if (input.ref) {
+        for (const snapshot of state.snapshots.values()) {
+          target = snapshot.nodes.find((node) => node.ref === input.ref)
+          if (target) {
+            resolved = await this.dependencies.inspector.resolveRef({
+              lease, tabId: lease.binding.tabId, snapshotId: snapshot.snapshotId,
+              navigationEpoch: page.navigationEpoch, origin: page.origin, ref: input.ref,
+            })
+            break
+          }
         }
+        if (!target || !resolved) throw failure('PAGE_CHANGED')
       }
-      if (!target || !resolved) throw failure('PAGE_CHANGED')
+      const code = input.reason === 'login' ? 'AUTH_REQUIRED'
+        : input.reason === 'unsupported_control' ? 'UNSUPPORTED_CONTROL' : 'MANUAL_ACTION_REQUIRED'
+      return await this.performHandoff(state, context, page, target, resolved, { kind: 'handoff', code })
+    } catch (error) {
+      const safe = toSafeAppError(error)
+      this.audit(
+        state, context, page.origin, 'handoff', targetSummary(target),
+        'external_action', safe.code === 'CANCELLED' ? 'cancelled' : 'failed', safe.code,
+      )
+      throw error
     }
-    const code = input.reason === 'login' ? 'AUTH_REQUIRED'
-      : input.reason === 'unsupported_control' ? 'UNSUPPORTED_CONTROL' : 'MANUAL_ACTION_REQUIRED'
-    return this.performHandoff(state, context, page, target, resolved, { kind: 'handoff', code })
   }
 
   private async performHandoff(
@@ -513,9 +580,10 @@ export class BrowserContinuationToolExecutor {
     target: BrowserSemanticNode | undefined,
     resolved: BrowserResolvedElementReference | undefined,
     decision: Extract<BrowserActionDecision, { kind: 'handoff' }>,
+    trigger?: { readonly action: BrowserAction; readonly target: BrowserSemanticNode | undefined },
   ): Promise<BrowserContinuationToolResult> {
     const lease = state.lease!
-    await this.dependencies.workspace.focusContinuation(lease.binding.tabId)
+    await this.dependencies.workspace.focusContinuation(lease.binding.tabId, context.runId)
     if (target && resolved) {
       await this.dependencies.workspace.highlightContinuationTarget(
         lease.binding.tabId,
@@ -530,11 +598,16 @@ export class BrowserContinuationToolExecutor {
         },
       )
     }
+    await this.cleanupAuthority(state, true, false)
+    if (trigger) {
+      this.auditAction(
+        state, context, page.origin, trigger.action, trigger.target, 'handed_off', decision.code,
+      )
+    }
     this.audit(
       state, context, page.origin, 'handoff', targetSummary(target),
       'external_action', 'handed_off', decision.code,
     )
-    await this.cleanupAuthority(state, true)
     this.runs.delete(context.runId)
     this.terminalRuns.add(context.runId)
     return { kind: 'handoff', code: decision.code }
@@ -590,15 +663,11 @@ export class BrowserContinuationToolExecutor {
 
   private assertActionBudget(
     state: ActiveRunState,
-    action: BrowserAction,
+    _action: BrowserAction,
     context: BrowserContinuationRunContext,
   ): void {
     this.assertActive(state, context)
     if (state.actionCount >= 30) throw failure('ACTION_LIMIT_EXCEEDED')
-    const signature = actionSignature(action)
-    state.repeatedActionCount = signature === state.lastActionSignature ? state.repeatedActionCount + 1 : 1
-    state.lastActionSignature = signature
-    if (state.repeatedActionCount >= 3) throw failure('ACTION_LIMIT_EXCEEDED')
   }
 
   private auditAction(
@@ -644,14 +713,27 @@ export class BrowserContinuationToolExecutor {
     })
   }
 
-  private async cleanupAuthority(state: ActiveRunState, preserveHighlight = false): Promise<void> {
+  private async terminate(state: ActiveRunState): Promise<void> {
+    await this.cleanupAuthority(state)
+    this.runs.delete(state.runId)
+    this.terminalRuns.add(state.runId)
+  }
+
+  private async cleanupAuthority(
+    state: ActiveRunState,
+    preserveHighlight = false,
+    suppressReleaseError = true,
+  ): Promise<void> {
     const lease = state.lease
-    state.lease = undefined
     state.snapshots.clear()
     this.dependencies.inspector.endRun(state.runId)
     if (!preserveHighlight && lease) {
       await this.dependencies.workspace.clearContinuationHighlight(lease.binding.tabId).catch(() => undefined)
     }
-    if (lease) await lease.release().catch(() => undefined)
+    if (lease) {
+      if (suppressReleaseError) await lease.release().catch(() => undefined)
+      else await lease.release()
+    }
+    state.lease = undefined
   }
 }

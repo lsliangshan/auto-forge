@@ -455,10 +455,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     })
   }
 
-  async focusContinuation(tabId: string): Promise<void> {
-    const state = this.tabs.get(tabId)
-    if (!state || !state.ownerContinuationRunId) throw failure('CANCELLED')
-    await this.activate(state)
+  async focusContinuation(tabId: string, runId: string): Promise<void> {
+    const state = this.continuationState({ tabId, runId })
+    await this.activate(state, runId)
   }
 
   async highlightContinuationTarget(
@@ -1161,8 +1160,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     return session
   }
 
-  private async activate(state: TargetTabState): Promise<void> {
+  private async activate(state: TargetTabState, continuationRunId?: string): Promise<void> {
     this.assertOpen(state)
+    if (continuationRunId !== undefined && state.ownerContinuationRunId !== continuationRunId) {
+      throw failure('CANCELLED')
+    }
     const window = this.window
     if (!window || window.isDestroyed()) throw failure('NOT_FOUND')
     const current = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
@@ -1172,6 +1174,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     this.layout()
     await this.renderToolbar().catch(() => undefined)
     if (this.window !== window || window.isDestroyed() || state.closed) throw failure('NOT_FOUND')
+    if (continuationRunId !== undefined && state.ownerContinuationRunId !== continuationRunId) {
+      throw failure('CANCELLED')
+    }
     window.show()
     window.focus()
   }

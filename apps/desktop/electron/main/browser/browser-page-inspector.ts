@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   matchesHttpsUrlPattern,
   toSafeAppError,
@@ -8,6 +8,7 @@ import {
 import type {
   BrowserContinuationBinding,
   BrowserContinuationLease,
+  BrowserActionTargetContext,
   BrowserPageSnapshot,
   BrowserRegionImage,
   BrowserSemanticNode,
@@ -116,12 +117,27 @@ export interface BrowserRefResolutionInput {
   readonly ref: string
 }
 
+export interface BrowserPageContextInput {
+  readonly lease: BrowserContinuationLease
+  readonly tabId: string
+  readonly navigationEpoch: number
+  readonly origin: string
+}
+
+export interface BrowserLivePageContext {
+  readonly auth: BrowserPageSnapshot['auth']
+  readonly semanticFingerprint: string
+}
+
 export interface BrowserResolvedElementReference {
   readonly snapshotId: string
   readonly ref: string
   readonly backendNodeId: number
   readonly role: string
   readonly name: string
+  readonly auth: BrowserPageSnapshot['auth']
+  readonly semanticFingerprint: string
+  readonly targetContext: BrowserActionTargetContext
 }
 
 interface InspectorOptions {
@@ -349,19 +365,8 @@ export class BrowserPageInspector {
       navigationEpoch: input.navigationEpoch,
       origin: input.origin,
     })) throw failure('PAGE_CHANGED')
-    let current: BrowserInspectionNode | undefined
-    try {
-      current = await this.port.readNode({
-        tabId: state.tabId,
-        runId: state.runId,
-        expectedOrigin: state.origin,
-        expectedNavigationEpoch: state.navigationEpoch,
-        backendNodeId: state.backendNodeId,
-      })
-    } catch (error) {
-      this.invalidateTab(state.tabId)
-      throw error
-    }
+    const { page, visibleNodes, auth, semanticFingerprint } = await this.readLivePageContext(input)
+    const current = visibleNodes.find((node) => node.backendNodeId === state.backendNodeId)
     if (!current
       || current.ignored
       || current.dom.hidden
@@ -382,7 +387,15 @@ export class BrowserPageInspector {
       backendNodeId: state.backendNodeId,
       role: state.role,
       name: state.name,
+      auth,
+      semanticFingerprint,
+      targetContext: this.targetContext(binding, page, visibleNodes, current),
     })
+  }
+
+  async currentPageContext(input: BrowserPageContextInput): Promise<BrowserLivePageContext> {
+    const { auth, semanticFingerprint } = await this.readLivePageContext(input)
+    return Object.freeze({ auth, semanticFingerprint })
   }
 
   endRun(runId: string): void {
@@ -729,7 +742,99 @@ export class BrowserPageInspector {
       ...(policy?.auth?.loggedIn ?? []),
       ...(policy?.auth?.loggedOut ?? []),
       ...(policy?.readableRegions ?? []),
+      ...(policy?.manualActions ?? []).map(({ locator }) => locator),
     ])
+  }
+
+  private async readLivePageContext(input: BrowserPageContextInput): Promise<{
+    readonly page: BrowserPageReadResult
+    readonly visibleNodes: readonly BrowserInspectionNode[]
+    readonly auth: BrowserPageSnapshot['auth']
+    readonly semanticFingerprint: string
+  }> {
+    const binding = this.liveBinding(input.lease)
+    const page = await this.port.readAccessibilitySnapshot({
+      tabId: input.tabId,
+      runId: input.lease.ownerRunId,
+      expectedOrigin: input.origin,
+      expectedNavigationEpoch: input.navigationEpoch,
+      locators: this.policyLocators(binding),
+    })
+    this.liveBinding(input.lease)
+    this.assertPage({ ...input, intent: 'live action validation' }, page)
+    const patterns = Object.values(binding.permissionMatrix).flat()
+    if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) throw failure('DOMAIN_BLOCKED')
+    const visibleNodes = page.nodes.filter((node) => (
+      (node.frameId === undefined || node.frameId === page.frameId) && !node.ignored && !node.dom.hidden
+    ))
+    return Object.freeze({
+      page,
+      visibleNodes,
+      auth: this.classifyAuth(binding, page, visibleNodes),
+      semanticFingerprint: this.semanticFingerprint(page, visibleNodes),
+    })
+  }
+
+  private semanticFingerprint(
+    page: BrowserPageReadResult,
+    visibleNodes: readonly BrowserInspectionNode[],
+  ): string {
+    const bounded = visibleNodes.slice(0, maxSemanticNodes).map((node) => ({
+      role: normalizedRole(node.role),
+      name: safeText(node.name) ?? '',
+      value: node.value === undefined ? undefined : safeText(node.value),
+      enabled: node.enabled,
+      checked: node.checked,
+      selected: node.selected,
+      tagName: node.dom.tagName.toLowerCase(),
+      inputType: node.dom.inputType?.toLowerCase(),
+    }))
+    return createHash('sha256').update(JSON.stringify({
+      origin: page.origin, url: safeUrl(page.url, page.origin), nodes: bounded,
+    })).digest('hex')
+  }
+
+  private targetContext(
+    binding: BrowserContinuationBinding,
+    page: BrowserPageReadResult,
+    visibleNodes: readonly BrowserInspectionNode[],
+    target: BrowserInspectionNode,
+  ): BrowserActionTargetContext {
+    const byAxId = new Map(visibleNodes.map((node) => [node.axNodeId, node]))
+    const ancestors: BrowserInspectionNode[] = []
+    let current = target.parentAxNodeId ? byAxId.get(target.parentAxNodeId) : undefined
+    const seen = new Set<string>()
+    while (current && !seen.has(current.axNodeId)) {
+      ancestors.push(current)
+      seen.add(current.axNodeId)
+      current = current.parentAxNodeId ? byAxId.get(current.parentAxNodeId) : undefined
+    }
+    const formOwned = ancestors.some((node) => (
+      normalizedRole(node.role) === 'form' || node.dom.tagName.toLowerCase() === 'form'
+    ))
+    const siblings = visibleNodes.filter((node) => (
+      node.backendNodeId !== target.backendNodeId && node.parentAxNodeId === target.parentAxNodeId
+    ))
+    const nearbyLabels = [...siblings, ...ancestors]
+      .map((node) => safeText(node.name))
+      .filter((value): value is string => value !== undefined)
+      .slice(0, 16)
+    const inputType = target.dom.inputType?.toLowerCase()
+    const role = normalizedRole(target.role)
+    const expectedNavigation = inputType === 'submit'
+      || inputType === 'image'
+      || (formOwned && (role === 'button' || role === 'link'))
+    const manualLocators = new Set((binding.browserContinuation?.manualActions ?? []).map(({ locator }) => locator))
+    const manualAction = page.locatorMatches.some(({ locator, backendNodeIds }) => (
+      manualLocators.has(locator) && backendNodeIds.includes(target.backendNodeId)
+    ))
+    return Object.freeze({
+      formOwned,
+      nearbyLabels: Object.freeze(nearbyLabels),
+      ...(inputType === undefined ? {} : { inputType }),
+      expectedNavigation,
+      manualAction,
+    })
   }
 
   private restrictedRegionBackendIds(
