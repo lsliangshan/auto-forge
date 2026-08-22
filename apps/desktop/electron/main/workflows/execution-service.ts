@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { fork as nodeFork, type ChildProcess, type ForkOptions } from 'node:child_process'
-import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
@@ -34,6 +35,8 @@ import { workflowSecurityFingerprint } from './workflow-security-fingerprint.js'
 import type { WorkflowExecutionSourceSelector } from './workflow-source-selector.js'
 
 const MAX_LINE_BYTES = 1024 * 1024
+const MAX_WORKFLOW_ARTIFACT_BYTES = 8 * 1024 * 1024
+const STAGED_WORKFLOW_ENTRY = 'workflow-entry.mjs'
 
 type ExecutionRepository = Pick<AppRepositories['executions'], 'insert' | 'get' | 'update'>
 type ExecutionLogRepository = Pick<AppRepositories['executionLogs'], 'insert'>
@@ -195,6 +198,11 @@ interface ActiveExecution {
   resolveFinished: (execution: Execution) => void
   rejectFinished: (error: AppError) => void
   finishing?: Promise<void>
+}
+
+interface ResolvedArtifactPath {
+  rootPath: string
+  entryPath: string
 }
 
 export interface ExecutionServiceDependencies {
@@ -442,7 +450,7 @@ export class ExecutionService {
       checkCancelled()
       if (!source) throw failure('NOT_FOUND')
       workflow = source.workflow
-      entryPath = await this.resolveEntryPath(input, source, checkCancelled)
+      const artifactPath = await this.resolveEntryPath(input, source, checkCancelled)
       checkCancelled()
       if (input.agentAuthorization) {
         if (input.agentAuthorization.workflowFingerprint !== workflowSecurityFingerprint(workflow)) {
@@ -452,7 +460,11 @@ export class ExecutionService {
           throw failure('CAPABILITY_SCOPE_DENIED')
         }
       }
+      const artifact = await this.readVerifiedArtifact(source, artifactPath)
+      checkCancelled()
       directory = await this.temporaryDirectories.create()
+      checkCancelled()
+      entryPath = await this.stageVerifiedArtifact(source, directory, artifact)
       checkCancelled()
       const nonce = randomUUID()
       worker = await this.dependencies.workers.spawn({
@@ -605,7 +617,7 @@ export class ExecutionService {
     input: ExecutionStartInput,
     source: WorkflowExecutionSource,
     checkCancelled: () => void = () => undefined,
-  ): Promise<string> {
+  ): Promise<ResolvedArtifactPath> {
     if (source.workflow.id !== input.workflowId
       || source.workflow.version !== input.workflowVersion
       || !source.workflow.enabled
@@ -621,9 +633,94 @@ export class ExecutionService {
       const entry = await realpath(resolve(root, source.entryPath))
       checkCancelled()
       if (!inside(root, entry)) throw failure('WORKFLOW_INTEGRITY_FAILED')
-      return entry
+      return { rootPath: root, entryPath: entry }
     } catch {
       throw failure('WORKFLOW_INTEGRITY_FAILED')
+    }
+  }
+
+  private artifactFailure(source: WorkflowExecutionSource): AppError {
+    return failure(source.workflow.source === 'development'
+      ? 'WORKFLOW_CHANGED'
+      : 'WORKFLOW_INTEGRITY_FAILED')
+  }
+
+  private async readVerifiedArtifact(
+    source: WorkflowExecutionSource,
+    path: ResolvedArtifactPath,
+  ): Promise<Buffer> {
+    const expectedDigest = source.workflow.codeSha256
+    if (!expectedDigest || !/^[a-f0-9]{64}$/.test(expectedDigest)) {
+      throw this.artifactFailure(source)
+    }
+    let handle
+    try {
+      handle = await open(path.entryPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+      const canonicalBefore = await realpath(path.entryPath)
+      if (canonicalBefore !== path.entryPath || !inside(path.rootPath, canonicalBefore)) {
+        throw this.artifactFailure(source)
+      }
+      const before = await handle.stat({ bigint: true })
+      if (!before.isFile() || before.size < 0n || before.size > BigInt(MAX_WORKFLOW_ARTIFACT_BYTES)) {
+        throw this.artifactFailure(source)
+      }
+      const contents = Buffer.alloc(Number(before.size))
+      let offset = 0
+      while (offset < contents.length) {
+        const { bytesRead } = await handle.read(contents, offset, contents.length - offset, offset)
+        if (bytesRead === 0) break
+        offset += bytesRead
+      }
+      const extra = Buffer.alloc(1)
+      const extraRead = await handle.read(extra, 0, 1, contents.length)
+      const after = await handle.stat({ bigint: true })
+      const canonicalAfter = await realpath(path.entryPath)
+      if (offset !== contents.length
+        || extraRead.bytesRead !== 0
+        || canonicalAfter !== canonicalBefore
+        || before.dev !== after.dev
+        || before.ino !== after.ino
+        || before.size !== after.size
+        || before.mtimeNs !== after.mtimeNs
+        || before.ctimeNs !== after.ctimeNs
+        || createHash('sha256').update(contents).digest('hex') !== expectedDigest) {
+        throw this.artifactFailure(source)
+      }
+      return contents
+    } catch {
+      throw this.artifactFailure(source)
+    } finally {
+      await handle?.close().catch(() => undefined)
+    }
+  }
+
+  private async stageVerifiedArtifact(
+    source: WorkflowExecutionSource,
+    directory: string,
+    contents: Buffer,
+  ): Promise<string> {
+    const entryPath = join(directory, STAGED_WORKFLOW_ENTRY)
+    let handle
+    try {
+      handle = await open(
+        entryPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      )
+      let offset = 0
+      while (offset < contents.length) {
+        const { bytesWritten } = await handle.write(contents, offset, contents.length - offset, offset)
+        if (bytesWritten === 0) throw this.artifactFailure(source)
+        offset += bytesWritten
+      }
+      await handle.sync()
+      const stored = await handle.stat()
+      if (!stored.isFile() || stored.size !== contents.length) throw this.artifactFailure(source)
+      return entryPath
+    } catch {
+      throw this.artifactFailure(source)
+    } finally {
+      await handle?.close().catch(() => undefined)
     }
   }
 

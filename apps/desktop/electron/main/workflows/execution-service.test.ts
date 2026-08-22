@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events'
 import { fork as forkProcess, type ForkOptions } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import type { ApprovalDecision, ExecutionEvent, WorkerCapabilityRequest, WorkerRequest, WorkerResponse, WorkflowDetail } from '@autoforge/shared'
@@ -29,6 +31,7 @@ class FakeWorker extends EventEmitter implements WorkflowWorker {
   readonly stderr = new PassThrough()
   killed = false
   readonly requests: WorkerRequest[] = []
+  loadedEntry?: Buffer
   private input = ''
 
   constructor() {
@@ -38,7 +41,10 @@ class FakeWorker extends EventEmitter implements WorkflowWorker {
       const lines = this.input.split('\n')
       this.input = lines.pop() ?? ''
       for (const line of lines) {
-        if (line) this.requests.push(workerRequestSchema.parse(JSON.parse(line)))
+        if (!line) continue
+        const request = workerRequestSchema.parse(JSON.parse(line))
+        this.requests.push(request)
+        if (request.type === 'start') this.loadedEntry = readFileSync(request.entryPath)
       }
     })
   }
@@ -58,7 +64,14 @@ class FakeWorkerFactory implements WorkflowWorkerFactory {
   readonly workers = new Map<string, FakeWorker>()
   readonly specifications: Array<{ executionId: string; cwd: string; env: NodeJS.ProcessEnv }> = []
 
+  constructor(
+    private readonly beforeSpawn: (
+      specification: Parameters<WorkflowWorkerFactory['spawn']>[0],
+    ) => Promise<void> | void = () => undefined,
+  ) {}
+
   async spawn(specification: Parameters<WorkflowWorkerFactory['spawn']>[0]): Promise<WorkflowWorker> {
+    await this.beforeSpawn(specification)
     const worker = new FakeWorker()
     this.workers.set(specification.executionId, worker)
     this.specifications.push({ executionId: specification.executionId, cwd: specification.cwd, env: specification.env })
@@ -122,7 +135,9 @@ const workflow: WorkflowDetail = {
   source: 'installed',
   integrity: 'valid',
   updatedAt: new Date(0).toISOString(),
-  codeSha256: 'a'.repeat(64),
+  codeSha256: createHash('sha256')
+    .update(readFileSync(fileURLToPath(new URL('../../workers/workflow-runner.ts', import.meta.url))))
+    .digest('hex'),
   cities: [],
   runtimeIdentity: { id: 'browser.search.baidu', version: '1.0.0', source: 'installed' },
   permissions: [{ capability: 'browser.open', scope: { origins: ['https://www.baidu.com'] } }],
@@ -156,9 +171,10 @@ function createHarness(options: {
     create(): Promise<string>
     remove(path: string): Promise<void>
   }
+  workerFactory?: FakeWorkerFactory
 } = {}) {
   const repositories = createRepositories()
-  const workerFactory = new FakeWorkerFactory()
+  const workerFactory = options.workerFactory ?? new FakeWorkerFactory()
   const permissionRepository = createPermissionRepository()
   const policy = new PolicyEngine(permissionRepository)
   const events: ExecutionEvent[] = []
@@ -1233,9 +1249,11 @@ describe('ExecutionService', () => {
     } as never)
     const worker = harness.workerFactory.workers.get(execution.id)!
 
-    expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({
-      entryPath: join(trustedRootPath, 'workers/workflow-runner.ts'),
-    })
+    const stagedPath = join(harness.workerFactory.specifications[0]!.cwd, 'workflow-entry.mjs')
+    expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({ entryPath: stagedPath })
+    expect(await readFile(stagedPath)).toEqual(
+      await readFile(join(trustedRootPath, 'workers/workflow-runner.ts')),
+    )
     await harness.service.cancel(execution.id)
   })
 
@@ -1259,6 +1277,295 @@ describe('ExecutionService', () => {
     expect(harness.workerFactory.workers.size).toBe(0)
   })
 
+  it.each([
+    ['installed', 'WORKFLOW_INTEGRITY_FAILED'],
+    ['development', 'WORKFLOW_CHANGED'],
+  ] as const)('fails a changed %s artifact before a Worker becomes active', async (source, errorCode) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-digest-race-'))
+    const entryPath = 'dist/index.mjs'
+    const original = 'export default { async run() { return "original" } }'
+    const changed = 'export default { async run() { return "changed" } }'
+    await mkdir(join(root, 'dist'))
+    await writeFile(join(root, entryPath), original)
+    const selected: WorkflowDetail = {
+      ...workflow,
+      source,
+      codeSha256: createHash('sha256').update(original).digest('hex'),
+      runtimeIdentity: source === 'installed'
+        ? { id: workflow.id, version: workflow.version, source }
+        : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+    }
+    const harness = createHarness({
+      timeoutMs: 10,
+      sourceResolver: {
+        resolve: async () => {
+          await writeFile(join(root, entryPath), changed)
+          return { workflow: selected, rootPath: root, entryPath, integrity: 'valid' }
+        },
+      },
+    })
+    const releaseExecution = vi.spyOn(harness.policy, 'releaseExecution')
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode })
+      expect(harness.workerFactory.workers.size).toBe(0)
+      expect(harness.service.hasActiveExecutions()).toBe(false)
+      expect(releaseExecution).toHaveBeenCalledTimes(1)
+      expect(releaseExecution).toHaveBeenCalledWith(execution.id)
+      expect(JSON.stringify(harness.events)).not.toContain(root)
+      expect(JSON.stringify(harness.events)).not.toContain(changed)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['installed', 'WORKFLOW_INTEGRITY_FAILED'],
+    ['development', 'WORKFLOW_INTEGRITY_FAILED'],
+  ] as const)('rejects a final-component symlink swap before reading a %s artifact', async (source, errorCode) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-preread-symlink-'))
+    const project = join(root, 'project')
+    const entryPath = 'dist/index.mjs'
+    const entry = join(project, entryPath)
+    const outside = join(root, 'outside.mjs')
+    const original = 'export default { async run() { return "verified" } }'
+    await mkdir(join(project, 'dist'), { recursive: true })
+    await writeFile(entry, original)
+    await writeFile(outside, original)
+    const selected: WorkflowDetail = {
+      ...workflow,
+      source,
+      codeSha256: createHash('sha256').update(original).digest('hex'),
+      runtimeIdentity: source === 'installed'
+        ? { id: workflow.id, version: workflow.version, source }
+        : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+    }
+    const harness = createHarness({
+      sourceResolver: {
+        resolve: async () => {
+          await unlink(entry)
+          await symlink(outside, entry)
+          return { workflow: selected, rootPath: project, entryPath, integrity: 'valid' }
+        },
+      },
+    })
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({ status: 'failed', errorCode })
+      expect(harness.workerFactory.workers.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['a directory', async (root: string, entry: string) => mkdir(entry), '0'.repeat(64)],
+    ['an oversized file', async (_root: string, entry: string) => writeFile(entry, Buffer.alloc(8 * 1024 * 1024 + 1)), createHash('sha256').update(Buffer.alloc(8 * 1024 * 1024 + 1)).digest('hex')],
+  ] as const)('rejects %s before spawning the Worker', async (_case, createEntry, codeSha256) => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-invalid-entry-'))
+    const entryPath = 'entry.mjs'
+    await createEntry(root, join(root, entryPath))
+    const harness = createHarness({
+      source: {
+        workflow: { ...workflow, codeSha256 },
+        rootPath: root,
+        entryPath,
+        integrity: 'valid',
+      },
+    })
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({
+        status: 'failed', errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+      })
+      expect(harness.workerFactory.workers.size).toBe(0)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['installed', 'development'] as const)(
+    'executes verified staged %s bytes when the original becomes an outside symlink after path resolution',
+    async (source) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-symlink-race-'))
+      const project = join(root, 'project')
+      const executionDirectory = join(root, 'execution')
+      const entryPath = 'dist/index.mjs'
+      const entry = join(project, entryPath)
+      const outside = join(root, 'outside.mjs')
+      const original = 'export default { async run() { return "verified" } }'
+      const replacement = 'export default { async run() { return "outside" } }'
+      await mkdir(join(project, 'dist'), { recursive: true })
+      await mkdir(executionDirectory)
+      await writeFile(entry, original)
+      await writeFile(outside, replacement)
+      const selected: WorkflowDetail = {
+        ...workflow,
+        source,
+        codeSha256: createHash('sha256').update(original).digest('hex'),
+        runtimeIdentity: source === 'installed'
+          ? { id: workflow.id, version: workflow.version, source }
+          : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+      }
+      const harness = createHarness({
+        source: { workflow: selected, rootPath: project, entryPath, integrity: 'valid' },
+        temporaryDirectories: {
+          create: async () => {
+            await unlink(entry)
+            await symlink(outside, entry)
+            return executionDirectory
+          },
+          remove: (path) => rm(path, { recursive: true, force: true }),
+        },
+      })
+
+      try {
+        const execution = await harness.start()
+        const worker = harness.workerFactory.workers.get(execution.id)!
+        const start = worker.requests.find((request) => request.type === 'start')
+        if (!start || start.type !== 'start') throw new Error('Expected Worker start')
+        expect(start.entryPath.startsWith(`${executionDirectory}${sep}`)).toBe(true)
+        expect(worker.loadedEntry?.toString('utf8')).toBe(original)
+        expect(harness.repositories.records.get(execution.id)).toMatchObject({
+          workflowId: selected.id,
+          workflowVersion: selected.version,
+        })
+        worker.respond({ type: 'ready', executionId: execution.id })
+        worker.respond({ type: 'result', output: { source } })
+        await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(['installed', 'development'] as const)(
+    'keeps staged %s bytes immutable when the original changes before Worker input',
+    async (source) => {
+      const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-stage-race-'))
+      const entryPath = 'dist/index.mjs'
+      const entry = join(root, entryPath)
+      const original = 'export default { async run() { return "staged" } }'
+      const replacement = 'export default { async run() { return "mutated" } }'
+      await mkdir(join(root, 'dist'))
+      await writeFile(entry, original)
+      const selected: WorkflowDetail = {
+        ...workflow,
+        source,
+        codeSha256: createHash('sha256').update(original).digest('hex'),
+        runtimeIdentity: source === 'installed'
+          ? { id: workflow.id, version: workflow.version, source }
+          : { id: workflow.id, version: workflow.version, source, buildHash: 'b'.repeat(64) },
+      }
+      const workerFactory = new FakeWorkerFactory(async () => { await writeFile(entry, replacement) })
+      const harness = createHarness({
+        source: { workflow: selected, rootPath: root, entryPath, integrity: 'valid' },
+        workerFactory,
+      })
+
+      try {
+        const execution = await harness.start()
+        const worker = workerFactory.workers.get(execution.id)!
+        const start = worker.requests.find((request) => request.type === 'start')
+        if (!start || start.type !== 'start') throw new Error('Expected Worker start')
+        const cwd = workerFactory.specifications[0]!.cwd
+        expect(start.entryPath.startsWith(`${cwd}${sep}`)).toBe(true)
+        expect(worker.loadedEntry?.toString('utf8')).toBe(original)
+        expect(await readFile(entry, 'utf8')).toBe(replacement)
+        worker.respond({ type: 'ready', executionId: execution.id })
+        worker.respond({ type: 'result', output: { source } })
+        await expect(execution.finished).resolves.toMatchObject({ status: 'completed' })
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('cleans an execution directory once and never spawns when exclusive staging fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-stage-failure-'))
+    const entryPath = 'dist/index.mjs'
+    const entry = join(root, entryPath)
+    const executionDirectory = join(root, 'execution')
+    const original = 'export default { async run() { return "verified" } }'
+    await mkdir(join(root, 'dist'))
+    await mkdir(executionDirectory)
+    await writeFile(entry, original)
+    await writeFile(join(executionDirectory, 'workflow-entry.mjs'), 'occupied')
+    const remove = vi.fn((path: string) => rm(path, { recursive: true, force: true }))
+    const harness = createHarness({
+      timeoutMs: 10,
+      source: {
+        workflow: {
+          ...workflow,
+          codeSha256: createHash('sha256').update(original).digest('hex'),
+        },
+        rootPath: root,
+        entryPath,
+        integrity: 'valid',
+      },
+      temporaryDirectories: { create: async () => executionDirectory, remove },
+    })
+
+    try {
+      const execution = await harness.start()
+      await expect(execution.finished).resolves.toMatchObject({
+        status: 'failed',
+        errorCode: 'WORKFLOW_INTEGRITY_FAILED',
+      })
+      expect(harness.workerFactory.workers.size).toBe(0)
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(executionDirectory)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('cleans the staged execution directory once when cancellation wins before staging', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-artifact-stage-cancel-'))
+    const executionDirectory = join(root, 'execution')
+    await mkdir(executionDirectory)
+    let entered!: () => void
+    const creating = new Promise<void>((resolvePromise) => { entered = resolvePromise })
+    let releaseCreate!: () => void
+    const createGate = new Promise<void>((resolvePromise) => { releaseCreate = resolvePromise })
+    const remove = vi.fn((path: string) => rm(path, { recursive: true, force: true }))
+    const harness = createHarness({
+      temporaryDirectories: {
+        create: async () => {
+          entered()
+          await createGate
+          return executionDirectory
+        },
+        remove,
+      },
+    })
+    const reservation = harness.service.reserve()
+    const starting = harness.service.startReserved(reservation, {
+      userId: 'user_1', workflowId: workflow.id, workflowVersion: workflow.version,
+      input: {}, sourceSelector: harness.sourceSelector,
+    })
+
+    try {
+      await creating
+      const cancelling = harness.service.cancel(reservation.executionId)
+      releaseCreate()
+      const execution = await starting
+      await cancelling
+      await expect(execution.finished).resolves.toMatchObject({
+        status: 'cancelled', errorCode: 'CANCELLED',
+      })
+      expect(harness.workerFactory.workers.size).toBe(0)
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(remove).toHaveBeenCalledWith(executionDirectory)
+    } finally {
+      releaseCreate()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it.each(['installed', 'development'] as const)('runs a valid %s source resolved inside its root', async (source) => {
     const harness = createHarness({
       source: {
@@ -1272,7 +1579,7 @@ describe('ExecutionService', () => {
     const worker = harness.workerFactory.workers.get(execution.id)!
 
     expect(worker.requests.find((request) => request.type === 'start')).toMatchObject({
-      entryPath: join(trustedRootPath, 'workers/workflow-runner.ts'),
+      entryPath: join(harness.workerFactory.specifications[0]!.cwd, 'workflow-entry.mjs'),
     })
     await harness.service.cancel(execution.id)
   })
@@ -1304,14 +1611,15 @@ describe('ExecutionService', () => {
   it('finishes cleanup when a terminal event listener throws', async () => {
     let closed = false
     let removed = ''
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-event-test-'))
     const harness = createHarness({
       capability: {
         request: async () => undefined,
         closeExecution: async () => { closed = true },
       },
       temporaryDirectories: {
-        create: async () => '/tmp/autoforge-event-test',
-        remove: async (path) => { removed = path },
+        create: async () => directory,
+        remove: async (path) => { removed = path; await rm(path, { recursive: true, force: true }) },
       },
       emit: (event) => {
         if (event.type === 'status' && event.status === 'completed') throw new Error('renderer listener failed')
@@ -1333,7 +1641,7 @@ describe('ExecutionService', () => {
     expect(release).toHaveBeenCalledWith(execution.id)
     expect(closed).toBe(true)
     expect(worker.killed).toBe(true)
-    expect(removed).toBe('/tmp/autoforge-event-test')
+    expect(removed).toBe(directory)
   })
 
   it.each([
@@ -1342,14 +1650,15 @@ describe('ExecutionService', () => {
   ] as const)('rejects finished and completes cleanup when terminal persistence %s', async (_case, code, throws) => {
     let closed = false
     let removed = false
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-persistence-test-'))
     const harness = createHarness({
       capability: {
         request: async () => undefined,
         closeExecution: async () => { closed = true },
       },
       temporaryDirectories: {
-        create: async () => '/tmp/autoforge-persistence-test',
-        remove: async () => { removed = true },
+        create: async () => directory,
+        remove: async (path) => { removed = true; await rm(path, { recursive: true, force: true }) },
       },
     })
     const update = harness.repositories.executions.update
