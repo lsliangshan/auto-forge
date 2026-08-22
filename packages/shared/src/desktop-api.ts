@@ -41,8 +41,8 @@ const browserAuditOriginSchema = z.string().superRefine((value, context) => {
     context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
   }
 })
-const browserAuditTextSchema = nonEmptyStringSchema.max(500).refine(
-  (value) => !/\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b/i.test(value),
+export const browserAuditTextSchema = nonEmptyStringSchema.max(500).refine(
+  (value) => !/(?:\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b|\b(?:file|folder|directory)path\s*[:=]|(?:^|[\s="'(:])\/(?:[^\s/]+\/)*[^\s/]+|\b[A-Za-z]:[\\/]|(?:^|[\s="'(])\\\\[^\\/\s]+[\\/][^\\/\s]+)/i.test(value),
   { message: 'Browser audit text cannot include sensitive keys' },
 )
 

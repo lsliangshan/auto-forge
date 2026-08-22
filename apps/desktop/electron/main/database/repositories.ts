@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3'
 import { z } from 'zod'
 import {
   appErrorCodeSchema,
+  browserAuditTextSchema,
   capabilitySchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
@@ -537,10 +538,7 @@ const browserOriginSchema = z.string().superRefine((value, context) => {
     context.addIssue({ code: 'custom', message: 'A canonical HTTPS origin is required' })
   }
 })
-const auditTextSchema = z.string().trim().min(1).max(500).refine(
-  (value) => !/\b(?:authorization|cookie|set-cookie|password|token|api[_-]?key|path)\b/i.test(value),
-  { message: 'Audit text cannot include sensitive keys' },
-)
+const auditTextSchema = browserAuditTextSchema
 const browserTabBindingSchema = z.object({
   id: storedIdentifierSchema,
   tabId: storedIdentifierSchema,

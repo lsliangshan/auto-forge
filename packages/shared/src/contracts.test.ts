@@ -536,6 +536,17 @@ describe('cross-process contracts', () => {
       id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
       action: 'inspect', targetSummary: 'password=secret', risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
     }).success).toBe(false)
+    for (const path of [
+      '/Users/alice/secret.txt',
+      'C:\\Users\\Alice\\secret.txt',
+      '\\\\fileserver\\private\\secret.txt',
+      'filePath=/tmp/a',
+    ]) {
+      expect(browserActionAuditEntrySchema.safeParse({
+        id: 'audit_1', bindingId: 'binding_1', sequence: 1, origin: 'https://fw.bjrcgz.gov.cn',
+        action: 'inspect', targetSummary: path, risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+      }).success).toBe(false)
+    }
 
     expect(ipcChannels.chatTakeOverBrowser).toBe('chat:take-over-browser')
     expect(ipcRequestSchemas[ipcChannels.chatTakeOverBrowser].parse({ requestId: 'request_1', bindingId: 'binding_1' }))

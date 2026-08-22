@@ -312,6 +312,22 @@ describe('openAppDatabase', () => {
       origin: 'https://fw.bjrcgz.gov.cn?token=secret', action: 'inspect', targetSummary: '状态',
       risk: 'sensitive_read', outcome: 'completed', createdAt: 12,
     })).toThrow()
+    for (const [index, path] of [
+      '/Users/alice/secret.txt',
+      'C:\\Users\\Alice\\secret.txt',
+      '\\\\fileserver\\private\\secret.txt',
+      'filePath=/tmp/a',
+    ].entries()) {
+      expect(() => database.browserActionAudits.insert({
+        id: `audit_path_${index}`, bindingId: binding.id, chatRunId: run.id, sequence: index + 10,
+        origin: 'https://fw.bjrcgz.gov.cn', action: index === 3 ? path : 'inspect',
+        targetSummary: index === 3 ? '状态' : path,
+        risk: 'sensitive_read', outcome: 'completed', createdAt: 12,
+      })).toThrow()
+    }
+    expect(() => database.browserTabBindings.insert({
+      ...binding, id: 'binding_path_reason', status: 'closed', terminalReason: 'filePath=/tmp/a',
+    })).toThrow()
 
     database.recoverInterrupted()
     expect(database.browserTabBindings.get(binding.id)).toMatchObject({ status: 'stale', endedAt: expect.any(Number) })
