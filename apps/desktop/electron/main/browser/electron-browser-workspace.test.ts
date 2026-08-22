@@ -459,6 +459,33 @@ describe('ElectronBrowserWorkspace', () => {
     expect(target.windowOpenHandler?.({ url: 'https://example.com/' })).toEqual({ action: 'deny' })
   })
 
+  it('covers a blank target page with the blocked redirect origin and a rebuild hint', async () => {
+    const { workspace, views, windows } = createHarness()
+    const tab = await acquire(workspace, 'exec_1', 'user_1', 'workflow.beijing')
+    await tab.open('https://fw.bjrcgz.gov.cn/person-platform/', [
+      'https://fw.bjrcgz.gov.cn',
+      'https://bjt.beijing.gov.cn',
+    ])
+    const toolbar = views[0]!
+    const target = views[1]!.webContents
+    const denied = { preventDefault: vi.fn() }
+
+    target.emit(
+      'will-redirect',
+      denied,
+      'https://portal.bjt.beijing.gov.cn/p/login/login.html?secret=private',
+    )
+
+    expect(denied.preventDefault).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(toolbar.bounds.at(-1)?.height).toBe(800))
+    const blockedDocument = decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!)
+    expect(blockedDocument).toContain('已阻止未授权跳转')
+    expect(blockedDocument).toContain('https://portal.bjt.beijing.gov.cn')
+    expect(blockedDocument).toContain('添加该精确域名并重新构建')
+    expect(blockedDocument).not.toContain('secret=private')
+    expect(windows[0]!.children.at(-1)).toBe(toolbar)
+  })
+
   it('allows an approved cross-origin redirect and waits for its replacement navigation', async () => {
     const { workspace, views } = createHarness()
     const tab = await acquire(workspace, 'exec_1')

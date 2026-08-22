@@ -582,6 +582,21 @@ describe('chat interactions', () => {
     expect(wrapper.find('[data-testid="open-workflow-execution"]').exists()).toBe(true)
   })
 
+  it('localizes a capability scope failure without exposing the internal English summary', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('failed', {
+        executionAvailable: true,
+        errorCode: 'CAPABILITY_SCOPE_DENIED',
+        errorSummary: 'The requested capability scope is not allowed.',
+      }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="workflow-status-message"]').text())
+      .toBe('工作流尝试访问未授权的网站，请检查工作流权限并重新构建')
+    expect(wrapper.text()).not.toContain('The requested capability scope is not allowed.')
+  })
+
   it('shows the authoritative oversized-result notice without changing completed status', () => {
     const wrapper = mount(MessageBlock, {
       props: {

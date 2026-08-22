@@ -39,6 +39,7 @@
 <script setup lang="ts">
 import type { ChatBlock } from '@autoforge/shared'
 import { computed } from 'vue'
+import { displayError } from '../../services/desktop-api'
 import { useExecutionStore } from '../../stores/execution'
 
 type WorkflowStatusBlock = Extract<ChatBlock, { type: 'workflow_status' }>
@@ -61,6 +62,8 @@ const statusTone = computed(() => props.block.status === 'completed'
     : ['queued', 'awaiting_approval', 'running'].includes(props.block.status) ? 'warning' : '')
 const statusMessage = computed(() => props.block.errorCode === 'RESULT_TOO_LARGE'
   ? '执行完成，结果未提供给模型'
+  : props.block.errorCode === 'CAPABILITY_SCOPE_DENIED'
+    ? displayError({ code: props.block.errorCode })
   : props.block.errorSummary ?? '')
 </script>
 

@@ -118,6 +118,7 @@ interface TargetTabState {
   automationOrigins?: readonly string[]
   allowedOrigins?: readonly string[]
   navigationViolation?: AppError
+  blockedOrigin?: string
   activeOperations: number
   loading: boolean
   closed: boolean
@@ -199,14 +200,19 @@ function toolbarDocument(tabs: readonly TargetTabState[], activeId: string | und
   }).join('')
   const address = active && !active.view.webContents.isDestroyed() ? active.view.webContents.getURL() : ''
   const host = loadingHost(address)
-  const loading = active?.loading === true
+  const blockedOrigin = active?.blockedOrigin
+  const blocked = blockedOrigin
+    ? `<main class="blocked" role="alert"><div class="blocked-card"><span class="blocked-kicker">SECURITY BLOCK</span><strong>已阻止未授权跳转</strong><p>工作流尝试访问未在精确权限范围内的网站：</p><code>${html(blockedOrigin)}</code><small>请在工作流权限中添加该精确域名并重新构建后重试。</small></div></main>`
+    : ''
+  const loading = !blockedOrigin && active?.loading === true
     ? `<main class="loading" role="status" aria-live="polite"><div class="loading-shell"><div class="connection-orbit" aria-hidden="true"><span class="orbit orbit-outer"></span><span class="orbit orbit-inner"></span><span class="orbit-core"></span></div><div class="loading-copy"><span class="loading-kicker">SECURE SESSION</span><strong>正在连接 <span>${html(host)}</span></strong><small>正在建立受保护的网页会话，请稍候</small><div class="progress-track" aria-hidden="true"><span></span></div><div class="connection-stages" aria-hidden="true"><span class="complete">请求站点</span><i></i><span class="current">建立连接</span><i></i><span>等待响应</span></div></div></div></main>`
     : ''
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>
   :root{color-scheme:light dark;--canvas:#f3f5f8;--surface:#fff;--surface-muted:#f8f9fb;--border:#dfe3e8;--border-strong:#c8ced6;--text:#303640;--muted:#68717d;--accent:#2563eb;--accent-soft:#eaf1ff;--loading-glow:rgb(37 99 235 / 14%);--loading-grid:rgb(104 113 125 / 8%);--loading-track:#d8e0eb}@media(prefers-color-scheme:dark){:root{--canvas:#11151c;--surface:#181d26;--surface-muted:#202630;--border:#343d4c;--border-strong:#4a5565;--text:#dbe4ef;--muted:#aeb8c6;--accent:#6f9cff;--accent-soft:#26354f;--loading-glow:rgb(111 156 255 / 16%);--loading-grid:rgb(174 184 198 / 7%);--loading-track:#303a48}}
   *{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--text);font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid var(--border);background:var(--surface)}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:var(--surface-muted);border-radius:5px 5px 0 0}.tab.active{background:var(--accent-soft)}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-muted)}.nav a{color:var(--text);text-decoration:none;padding:2px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border)}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:var(--canvas);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .loading{position:relative;isolation:isolate;height:calc(100vh - 52px);display:grid;place-items:center;overflow:hidden;background:var(--canvas)}.loading:before{position:absolute;z-index:-1;inset:0;background:radial-gradient(circle at 42% 46%,var(--loading-glow),transparent 31%),linear-gradient(var(--loading-grid) 1px,transparent 1px),linear-gradient(90deg,var(--loading-grid) 1px,transparent 1px);background-size:auto,42px 42px,42px 42px;content:"";mask-image:linear-gradient(to bottom,transparent 5%,#000 32%,#000 68%,transparent 95%)}.loading-shell{display:grid;width:min(520px,calc(100vw - 56px));grid-template-columns:92px minmax(0,1fr);align-items:center;gap:26px;transform:translateY(-5vh)}.connection-orbit{position:relative;width:76px;height:76px}.orbit{position:absolute;border:1px solid var(--border-strong);border-radius:50%}.orbit-outer{inset:0;border-top-color:var(--accent);border-right-color:transparent;animation:orbit-spin 2.6s linear infinite}.orbit-outer:after{position:absolute;top:4px;right:10px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 5px var(--accent-soft);content:""}.orbit-inner{inset:12px;border-bottom-color:var(--accent);border-left-color:transparent;animation:orbit-spin 1.9s linear infinite reverse}.orbit-core{inset:29px;border:0;background:var(--accent);box-shadow:0 0 0 7px var(--accent-soft);animation:core-pulse 1.8s ease-in-out infinite}.loading-copy{display:grid;min-width:0;gap:7px}.loading-kicker{color:var(--accent);font:700 9px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.18em}.loading strong{overflow:hidden;color:var(--text);font-size:18px;font-weight:680;line-height:1.3;text-overflow:ellipsis;white-space:nowrap}.loading strong span{color:var(--accent)}.loading small{color:var(--muted);font-size:11.5px}.progress-track{position:relative;height:3px;margin-top:9px;overflow:hidden;border-radius:2px;background:var(--loading-track)}.progress-track>span{position:absolute;top:0;bottom:0;left:-38%;width:38%;border-radius:inherit;background:var(--accent);box-shadow:0 0 10px var(--accent);animation:progress-travel 1.45s ease-in-out infinite}.connection-stages{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:9.5px;letter-spacing:.02em}.connection-stages span{flex:none}.connection-stages .complete{color:var(--text)}.connection-stages .current{color:var(--accent);font-weight:650}.connection-stages i{height:1px;min-width:18px;flex:1;background:var(--border);transform:translateY(1px)}@keyframes orbit-spin{to{transform:rotate(360deg)}}@keyframes core-pulse{50%{opacity:.55;transform:scale(.78)}}@keyframes progress-travel{50%,100%{left:100%}}@media(max-width:520px){.loading-shell{width:calc(100vw - 36px);grid-template-columns:72px 1fr;gap:18px}.connection-orbit{width:64px;height:64px}.orbit-inner{inset:10px}.orbit-core{inset:25px}.loading strong{font-size:16px}}@media(prefers-reduced-motion:reduce){.orbit,.orbit-core,.progress-track>span{animation:none}.progress-track>span{left:0;width:42%;box-shadow:none}}
-  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div></div></div>${loading}</body></html>`
+  .blocked{height:calc(100vh - 52px);display:grid;place-items:center;padding:28px;background:var(--canvas)}.blocked-card{display:grid;width:min(560px,100%);gap:10px;padding:28px;border:1px solid var(--border);border-left:4px solid #dc2626;border-radius:8px;background:var(--surface);box-shadow:0 18px 44px rgb(0 0 0 / 9%)}.blocked-kicker{color:#dc2626;font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.16em}.blocked strong{font-size:20px}.blocked p,.blocked small{margin:0;color:var(--muted);line-height:1.6}.blocked code{overflow-wrap:anywhere;padding:10px 12px;border-radius:5px;background:var(--surface-muted);color:var(--text);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div></div></div>${blocked || loading}</body></html>`
 }
 
 export function browserPartition(userId: string): string {
@@ -597,12 +603,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (!window || window.isDestroyed() || !toolbar) return
     const bounds = window.getContentBounds()
     const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
-    const loading = active?.loading === true
-    toolbar.setBounds({ x: 0, y: 0, width: bounds.width, height: loading ? bounds.height : toolbarHeight })
+    const coveringTarget = active?.loading === true || active?.blockedOrigin !== undefined
+    toolbar.setBounds({ x: 0, y: 0, width: bounds.width, height: coveringTarget ? bounds.height : toolbarHeight })
     if (active && !active.closed) {
       active.view.setBounds({ x: 0, y: toolbarHeight, width: bounds.width, height: Math.max(0, bounds.height - toolbarHeight) })
     }
-    if (loading) {
+    if (coveringTarget) {
       window.contentView.removeChildView(toolbar)
       window.contentView.addChildView(toolbar)
     }
@@ -656,7 +662,18 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     if (restrictedOrigins && !restrictedOrigins.includes(origin)) {
       event.preventDefault()
       state.navigationViolation = failure('CAPABILITY_SCOPE_DENIED')
+      this.setBlockedOrigin(state, origin)
+      return
     }
+    this.setBlockedOrigin(state, undefined)
+  }
+
+  private setBlockedOrigin(state: TargetTabState, origin: string | undefined): void {
+    if (state.closed || state.blockedOrigin === origin) return
+    state.blockedOrigin = origin
+    if (state.id !== this.activeTabId) return
+    this.layout()
+    void this.renderToolbar().catch(() => undefined)
   }
 
   private async restricted<T>(
@@ -675,6 +692,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort {
     state.activeOperations += 1
     state.allowedOrigins = [...allowedOrigins]
     state.navigationViolation = undefined
+    this.setBlockedOrigin(state, undefined)
     try {
       let result!: T
       let problem: unknown

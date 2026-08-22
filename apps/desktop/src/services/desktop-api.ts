@@ -33,6 +33,7 @@ const messages: Partial<Record<AppError['code'], string>> = {
   REQUEST_ID_CONFLICT: '本次角色修改请求与已完成请求冲突',
   SERVICE_UNAVAILABLE: '用户角色服务暂时不可用，请稍后重试',
   CANCELLED: '操作已取消',
+  CAPABILITY_SCOPE_DENIED: '工作流尝试访问未授权的网站，请检查工作流权限并重新构建',
   INVALID_INPUT: '输入内容无效',
   NOT_FOUND: '请求的内容不存在',
   CONFLICT: '内容已被其他操作更新，请刷新后重试',
