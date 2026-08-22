@@ -1,7 +1,10 @@
+import { createHash } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import { z } from 'zod'
 import {
   appErrorCodeSchema,
+  capabilitySchema,
+  capabilityScopeSchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
   type AppErrorCode,
@@ -467,6 +470,62 @@ function parse(value: string | null): unknown | undefined {
   return value === null ? undefined : JSON.parse(value)
 }
 
+const storedIdentifierSchema = z.string().trim().min(1)
+const legacyApprovalBlockSchema = z.object({
+  type: z.literal('approval'),
+  executionId: storedIdentifierSchema,
+  workflowId: storedIdentifierSchema,
+  workflowVersion: storedIdentifierSchema,
+  permissionIndex: z.number().int().nonnegative(),
+  capability: capabilitySchema,
+  scope: capabilityScopeSchema,
+  scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict()
+
+function storedBlocks(value: string): unknown[] | undefined {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return Array.isArray(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function upgradedLegacyApproval(
+  messageId: string,
+  index: number,
+  value: unknown,
+): Extract<ChatBlock, { type: 'approval' }> | undefined {
+  const legacy = legacyApprovalBlockSchema.safeParse(value)
+  if (!legacy.success) return undefined
+  const blockId = `legacy_approval_${createHash('sha256')
+    .update(JSON.stringify([messageId, index, legacy.data.executionId]))
+    .digest('hex')}`
+  const needsOrigins = legacy.data.capability.startsWith('browser.')
+    || legacy.data.capability === 'network.fetch'
+  const needsPaths = legacy.data.capability.startsWith('filesystem.')
+  const scope = needsOrigins
+    ? 'origins' in legacy.data.scope ? legacy.data.scope : { origins: ['https://invalid.invalid'] }
+    : needsPaths
+      ? 'paths' in legacy.data.scope ? legacy.data.scope : { paths: ['[historical scope unavailable]'] }
+      : {}
+  const upgraded = chatBlockSchema.safeParse({
+    ...legacy.data,
+    scope,
+    blockId,
+    state: 'invalidated',
+    workflowName: legacy.data.workflowId.slice(0, 500),
+    source: 'installed',
+    actionSummary: '历史权限审批已失效',
+  })
+  return upgraded.success && upgraded.data.type === 'approval' ? upgraded.data : undefined
+}
+
+function storedApproval(value: unknown): Extract<ChatBlock, { type: 'approval' }> | undefined {
+  const parsed = chatBlockSchema.safeParse(value)
+  return parsed.success && parsed.data.type === 'approval' ? parsed.data : undefined
+}
+
 function transaction<T>(database: SqliteDatabase, operation: () => T): T {
   return database.transaction(operation)()
 }
@@ -504,6 +563,9 @@ export interface AppRepositories {
     listBeforeOrdinal(conversationId: string, beforeOrdinal: number): Message[]
     update(id: string, value: Partial<Pick<Message, 'blocks' | 'executionId'>>): Message | undefined
     replaceBlock(messageId: string, blockId: string, replacement: unknown): Message
+    upgradeLegacyApprovals(): number
+    invalidatePendingAgentApprovals(): number
+    hasAgentApproval(executionId: string): boolean
     failInterruptedMediaGenerations(): number
   }
   conversationContexts: {
@@ -1382,6 +1444,59 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
           if (!stored) throw new Error('Message not found')
           return messageFromRow(stored)
         })
+      },
+      upgradeLegacyApprovals() {
+        return transaction(database, () => {
+          let upgraded = 0
+          for (const row of many<Query>(database, "SELECT id, blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
+            const blocks = storedBlocks(row.blocksJson as string)
+            if (!blocks) continue
+            let changed = false
+            for (const [index, block] of blocks.entries()) {
+              if (chatBlockSchema.safeParse(block).success) continue
+              const replacement = upgradedLegacyApproval(row.id as string, index, block)
+              if (!replacement) continue
+              blocks[index] = replacement
+              upgraded += 1
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
+          }
+          return upgraded
+        })
+      },
+      invalidatePendingAgentApprovals() {
+        return transaction(database, () => {
+          let invalidated = 0
+          for (const row of many<Query>(database, "SELECT id, blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
+            const blocks = storedBlocks(row.blocksJson as string)
+            if (!blocks) continue
+            let changed = false
+            for (const [index, block] of blocks.entries()) {
+              const approval = storedApproval(block)
+              if (!approval || approval.state !== 'pending') continue
+              blocks[index] = { ...approval, state: 'invalidated' }
+              invalidated += 1
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
+          }
+          return invalidated
+        })
+      },
+      hasAgentApproval(executionId) {
+        for (const row of many<Query>(database, "SELECT blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
+          const blocks = storedBlocks(row.blocksJson as string)
+          if (!blocks) continue
+          if (blocks.some((block) => storedApproval(block)?.executionId === executionId)) return true
+        }
+        return false
       },
       failInterruptedMediaGenerations() {
         return transaction(database, () => {

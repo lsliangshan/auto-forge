@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -7,6 +7,7 @@ import {
   authCredentialsSchema,
   authOtpRequestSchema,
   authOtpVerificationSchema,
+  chatBlockSchema,
   developerRunResultSchema,
   toSafeAppError,
   type AppError,
@@ -2044,6 +2045,75 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('recovers a crash-persisted Agent approval and never routes its stale decision manually', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-crash-'))
+    const restartedRoot = await mkdtemp(join(tmpdir(), 'autoforge-application-agent-approval-restart-'))
+    directories.push(root, restartedRoot)
+    const chatEvents: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield {
+          type: 'tool_call' as const, choiceIndex: 0, index: 0,
+          id: 'call_crash_approval', name: 'workflow_1', arguments: { input: {} },
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime, 'RestartApproval')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { text: 'openrouter/tools' },
+      },
+    })
+    await installApprovalWorkflow(runtime)
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, 'approval workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({ type: 'approval', state: 'pending' }),
+    })))
+    const approval = chatEvents.find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+      event.type === 'block' && event.block.type === 'approval'
+    ))!.block
+    if (approval.type !== 'approval') throw new Error('Expected pending approval')
+    await copyFile(join(root, 'autoforge.sqlite'), join(restartedRoot, 'autoforge.sqlite'))
+    await runtime.close()
+
+    const restarted = createApplicationRuntime(options(restartedRoot))
+    await restarted.recover()
+    await authenticate(restarted, 'RestartApproval')
+    const recovered = (await restarted.services.chat.listMessages(conversation.id))
+      .flatMap((message) => message.blocks)
+      .find((block) => block.type === 'approval')
+    expect(chatBlockSchema.parse(recovered)).toMatchObject({
+      type: 'approval', blockId: approval.blockId, executionId: approval.executionId,
+      state: 'invalidated',
+    })
+    const manualDecision = vi.spyOn(ExecutionService.prototype, 'decide').mockResolvedValue(undefined)
+    await expect(restarted.services.executions.decide({
+      executionId: approval.executionId,
+      permissionIndex: approval.permissionIndex,
+      scopeHash: approval.scopeHash,
+      decision: 'once',
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(manualDecision).not.toHaveBeenCalled()
+
+    await expect(restarted.services.executions.decide({
+      executionId: 'manual_execution', permissionIndex: 0,
+      scopeHash: 'b'.repeat(64), decision: 'once',
+    })).resolves.toBeUndefined()
+    expect(manualDecision).toHaveBeenCalledTimes(1)
+    await restarted.close()
+  })
+
   it('gives a latched consistency error priority over later shutdown failures', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-consistency-priority-'))
     directories.push(root)
@@ -3040,6 +3110,73 @@ describe('createApplicationRuntime', () => {
       expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
       { role: 'user', content: '独立问题' },
     ])
+    await runtime.close()
+  })
+
+  it('loads, persists, and safely continues a conversation with an exact legacy approval block', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-legacy-approval-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    const seedDatabase = openAppDatabase(databasePath)
+    seedDatabase.conversations.insert({ id: 'legacy_approval_conversation', title: 'Legacy approval' })
+    seedDatabase.messages.insert({
+      id: 'legacy_approval_message', conversationId: 'legacy_approval_conversation',
+      role: 'assistant', blocks: [], createdAt: 1,
+    })
+    seedDatabase.close()
+    const legacyApproval = {
+      type: 'approval', executionId: 'legacy_execution_secret', workflowId: 'legacy.workflow',
+      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'filesystem.write',
+      scope: { paths: ['/Users/private/legacy-secret.txt'] }, scopeHash: 'a'.repeat(64),
+    }
+    const seed = new Database(databasePath)
+    seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run(JSON.stringify([legacyApproval]), 'legacy_approval_message')
+    seed.close()
+    const captured: ModelStreamRequest[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/context', 'Context'), contextLength: 128_000 }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request) {
+        captured.push(request)
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '已继续' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime, 'LegacyApproval')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/context' } },
+    })
+    expect(await runtime.services.chat.listConversations()).toContainEqual(expect.objectContaining({
+      id: 'legacy_approval_conversation',
+    }))
+    const listed = await runtime.services.chat.listMessages('legacy_approval_conversation')
+    const approval = listed[0]?.blocks[0]
+    expect(chatBlockSchema.parse(approval)).toMatchObject({
+      type: 'approval', state: 'invalidated', source: 'installed',
+      workflowId: 'legacy.workflow', workflowName: 'legacy.workflow',
+      actionSummary: '历史权限审批已失效',
+    })
+    const persisted = new Database(databasePath, { readonly: true })
+    expect(JSON.parse((persisted.prepare('SELECT blocks_json AS blocksJson FROM messages WHERE id = ?')
+      .get('legacy_approval_message') as { blocksJson: string }).blocksJson)[0]).toMatchObject({
+      state: 'invalidated', actionSummary: '历史权限审批已失效',
+    })
+    persisted.close()
+
+    await runtime.services.chat.send(chatInput('legacy_approval_conversation', '继续处理'))
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    expect(captured[0]?.messages).toEqual(expect.arrayContaining([
+      { role: 'assistant', content: '[工作流权限审批状态: invalidated; legacy.workflow@1.0.0; 能力: filesystem.write]' },
+      { role: 'user', content: '继续处理' },
+    ]))
+    expect(JSON.stringify(captured[0])).not.toMatch(
+      /legacy_execution_secret|legacy_approval_|\/Users\/private|legacy-secret|aaaaaaaaaaaaaaaa/,
+    )
     await runtime.close()
   })
 

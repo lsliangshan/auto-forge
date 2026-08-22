@@ -17,6 +17,7 @@ export function openAppDatabase(path: string) {
   const localAuth = createLocalAuthRepository(sqlite)
   const userProfiles = createUserProfileRepository(sqlite)
   const cloudBaseIdentities = createCloudBaseIdentityRepository(sqlite)
+  repositories.messages.upgradeLegacyApprovals()
 
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
@@ -40,6 +41,7 @@ export function openAppDatabase(path: string) {
       if (preservedRequestIds.has(run.requestId)) continue
       chatRuns += failRun.run({ id: run.id, endedAt }).changes
     }
+    repositories.messages.invalidatePendingAgentApprovals()
     repositories.messages.failInterruptedMediaGenerations()
     return { executions, chatRuns }
   })()

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { sql } from 'drizzle-orm'
-import { authAccountSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
+import { authAccountSchema, chatBlockSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
 import { ProviderUsageConsistencyError } from './repositories.js'
@@ -844,6 +844,46 @@ describe('openAppDatabase', () => {
     }
   })
 
+  it('invalidates persisted pending Agent approvals while tolerating unrelated malformed blocks', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'approval_recovery_conversation', title: 'Approval recovery' })
+    const approval = {
+      type: 'approval', blockId: 'approval_pending', state: 'pending',
+      executionId: 'execution_approval_recovery', workflowId: 'workflow.recovery',
+      workflowName: 'Recovery workflow', workflowVersion: '1.0.0', source: 'installed',
+      actionSummary: '恢复前待审批操作', permissionIndex: 0, capability: 'filesystem.write',
+      scope: { paths: ['/Users/private/recovery.txt'] }, scopeHash: 'a'.repeat(64),
+    }
+    database.messages.insert({
+      id: 'approval_recovery_message', conversationId: 'approval_recovery_conversation',
+      role: 'assistant', createdAt: 1,
+      blocks: [
+        approval,
+        { type: 'malformed_unrelated', rawSecret: 'must remain isolated' },
+        { ...approval, blockId: 'approval_already_denied', executionId: 'execution_denied', state: 'denied' },
+      ],
+    })
+    database.executions.insert({
+      id: 'execution_approval_recovery', status: 'awaiting_approval',
+      workflowId: 'workflow.recovery', workflowVersion: '1.0.0',
+    })
+    database.chatRuns.insert({
+      id: 'run_approval_recovery', conversationId: 'approval_recovery_conversation',
+      requestId: 'request_approval_recovery', model: 'model', status: 'awaiting_approval', startedAt: 1,
+    })
+
+    expect(database.recoverInterrupted()).toEqual({ executions: 1, chatRuns: 1 })
+    expect(database.executions.get('execution_approval_recovery')).toMatchObject({ status: 'interrupted' })
+    expect(database.chatRuns.get('run_approval_recovery')).toMatchObject({ status: 'failed' })
+    expect(database.messages.get('approval_recovery_message')?.blocks).toEqual([
+      { ...approval, state: 'invalidated' },
+      { type: 'malformed_unrelated', rawSecret: 'must remain isolated' },
+      { ...approval, blockId: 'approval_already_denied', executionId: 'execution_denied', state: 'denied' },
+    ])
+    expect(database.messages.hasAgentApproval('execution_approval_recovery')).toBe(true)
+    expect(database.messages.hasAgentApproval('manual_execution')).toBe(false)
+  })
+
   it('persists JSON message blocks in chronological order and cascades deletion', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'conversation_1', title: 'First conversation' })
@@ -867,6 +907,62 @@ describe('openAppDatabase', () => {
 
     database.conversations.delete('conversation_1')
     expect(database.messages.listForConversation('conversation_1')).toEqual([])
+  })
+
+  it('upgrades only the exact strict legacy approval shape to a stable disabled block', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-legacy-approval-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    const database = openAppDatabase(path)
+    database.conversations.insert({ id: 'legacy_approval_conversation', title: 'Legacy approval' })
+    database.messages.insert({
+      id: 'legacy_approval_message', conversationId: 'legacy_approval_conversation', role: 'assistant',
+      blocks: [], createdAt: 1,
+    })
+    database.messages.insert({
+      id: 'near_legacy_approval_message', conversationId: 'legacy_approval_conversation', role: 'assistant',
+      blocks: [], createdAt: 2,
+    })
+    database.close()
+    const legacyApproval = {
+      type: 'approval', executionId: 'legacy_execution', workflowId: 'legacy.workflow',
+      workflowVersion: '1.0.0', permissionIndex: 0, capability: 'browser.open',
+      scope: {}, scopeHash: 'a'.repeat(64),
+    }
+    const seed = new Database(path)
+    seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run(JSON.stringify([legacyApproval]), 'legacy_approval_message')
+    seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
+      .run(JSON.stringify([{ ...legacyApproval, unexpected: true }]), 'near_legacy_approval_message')
+    seed.close()
+
+    const upgraded = openAppDatabase(path)
+    const block = upgraded.messages.get('legacy_approval_message')?.blocks[0]
+    expect(chatBlockSchema.parse(block)).toMatchObject({
+      type: 'approval', state: 'invalidated', executionId: 'legacy_execution',
+      workflowId: 'legacy.workflow', workflowName: 'legacy.workflow', workflowVersion: '1.0.0',
+      source: 'installed', actionSummary: '历史权限审批已失效', permissionIndex: 0,
+      capability: 'browser.open', scope: { origins: ['https://invalid.invalid'] },
+      scopeHash: 'a'.repeat(64),
+    })
+    if (!block || typeof block !== 'object' || !('blockId' in block) || typeof block.blockId !== 'string') {
+      throw new Error('Expected upgraded approval identity')
+    }
+    const blockId = block.blockId
+    expect(blockId).not.toMatch(/legacy_execution|legacy\.workflow|private|secret/)
+    expect(chatBlockSchema.safeParse(upgraded.messages.get('near_legacy_approval_message')?.blocks[0]).success)
+      .toBe(false)
+    upgraded.close()
+
+    const reopened = openAppDatabase(path)
+    expect(reopened.messages.get('legacy_approval_message')?.blocks[0]).toMatchObject({ blockId })
+    const persisted = new Database(path, { readonly: true })
+    expect(JSON.parse((persisted.prepare('SELECT blocks_json AS blocksJson FROM messages WHERE id = ?')
+      .get('legacy_approval_message') as { blocksJson: string }).blocksJson)[0]).toMatchObject({
+      blockId, state: 'invalidated', actionSummary: '历史权限审批已失效',
+    })
+    persisted.close()
+    reopened.close()
   })
 
   it('persists media ownership and generation preferences with the Task 1 schema', () => {

@@ -1100,11 +1100,11 @@ describe('chat interactions', () => {
     ])
   })
 
-  it('keeps a terminal approval disabled after transcript reload', async () => {
+  it('keeps a recovered invalidated approval disabled after transcript reload', async () => {
     const { api } = createEventApi()
     vi.mocked(api.chat.listMessages).mockResolvedValue([{
       id: 'assistant_1', conversationId: 'conv_1', role: 'assistant',
-      blocks: [approvalBlock({ state: 'expired' })],
+      blocks: [approvalBlock({ state: 'invalidated' })],
       createdAt: '2026-08-22T00:00:00.000Z',
     }])
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -1117,7 +1117,7 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe('审批已过期')
+    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe('审批已失效')
     expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
   })
 

@@ -512,7 +512,7 @@ export class AgentOrchestrator {
       }
       this.clearApprovalTimer(active)
       active.loop.resumeApproval()
-      this.updateApprovalState(active, pending, parsed.data.decision === 'deny' ? 'denied' : 'approved')
+      this.updateApprovalState(active, pending, parsed.data.decision === 'deny' ? 'denied' : 'invalidated')
       this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed', result)
       this.appendToolExchange(active, pending, result)
       this.clearPending(active)

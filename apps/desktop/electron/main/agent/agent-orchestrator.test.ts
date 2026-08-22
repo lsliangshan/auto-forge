@@ -1512,6 +1512,13 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.starts).toHaveLength(0)
     expect(dependencies.records.discards).toHaveLength(1)
     expect(dependencies.records.terminal).toEqual([expect.objectContaining({ status: 'completed' })])
+    expect((dependencies.records.terminal[0] as { blocks: unknown[] }).blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'approval', state: 'invalidated' }),
+      expect.objectContaining({
+        type: 'workflow_status', status: 'failed',
+        errorCode: 'INTERNAL_ERROR', errorSummary: 'Unexpected application error',
+      }),
+    ]))
   })
 
   it('identifies and emits each missing permission one at a time', async () => {

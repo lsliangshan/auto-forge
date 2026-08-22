@@ -1270,6 +1270,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       decide: async (decision) => {
         const agentOwned = agent.recognizesExecution(decision.executionId)
+          || database.messages.hasAgentApproval(decision.executionId)
         let result
         try {
           result = await agent.resumeApproval(decision)
