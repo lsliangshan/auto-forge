@@ -179,6 +179,19 @@ const approvalWorkflow: WorkflowDetail = {
   ...workflow,
   permissions: [{ capability: 'browser.fill', scope: { origins: ['https://www.baidu.com'] } }],
 }
+const developmentApprovalWorkflow: WorkflowDetail = {
+  ...approvalWorkflow,
+  id: 'local.development.approval',
+  name: '开发审批工作流',
+  source: 'development',
+  codeSha256: 'd'.repeat(64),
+  runtimeIdentity: {
+    id: 'local.development.approval',
+    version: approvalWorkflow.version,
+    source: 'development',
+    buildHash: 'e'.repeat(64),
+  },
+}
 const externalApprovalIdentity = {
   permissionIndex: 0,
   scopeHash: scopeHash(approvalWorkflow.permissions[0]!.scope),
@@ -1959,41 +1972,73 @@ describe('AgentOrchestrator', () => {
     expect(timely.records.starts).toHaveLength(1)
   })
 
-  it('automatically cancels an expired approval and releases the conversation lock', async () => {
-    let milliseconds = 0
-    let expireApproval!: () => void
+  it('turns a pending development approval into WORKFLOW_CHANGED when developer mode closes', async () => {
+    let developerMode = true
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '开发工作流已失效' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async ({ developerMode: includeDevelopment } = {}) => (
+      includeDevelopment ? [developmentApprovalWorkflow] : [workflow]
+    )
+    dependencies.developerMode = () => developerMode
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const pending = await orchestrator.run(textRunInput({
+      conversationId: 'mode_transition', content: '运行开发工作流', provider: 'openrouter', model: 'model',
+    }))
+
+    developerMode = false
+    const transition = orchestrator as AgentOrchestrator & {
+      onDeveloperModeChanged?: (enabled: boolean) => void
+    }
+    transition.onDeveloperModeChanged?.(false)
+
+    await vi.waitFor(() => expect(dependencies.records.terminal).toHaveLength(1))
+    expect(pending).toMatchObject({ status: 'awaiting_approval', executionId: 'reserved_1' })
+    expect(dependencies.records.starts).toHaveLength(0)
+    expect(dependencies.records.discards).toHaveLength(1)
+    expect(dependencies.policy.releaseExecution).toHaveBeenCalledTimes(1)
+    expect(orchestrator.ownsExecution('reserved_1')).toBe(false)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    const request = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(request.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'tool', content: expect.stringContaining('WORKFLOW_CHANGED') }),
+    ]))
+  })
+
+  it('automatically cancels an expired approval and releases all pending ownership once', async () => {
+    vi.useFakeTimers()
     const dependencies = harness([toolTurn, [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]])
     requireChatApproval(dependencies)
-    dependencies.now = () => milliseconds
-    Object.assign(dependencies, {
-      setTimer(callback: () => void, delayMs: number) {
-        expect(delayMs).toBe(APPROVAL_EXPIRY_MS)
-        expireApproval = callback
-        return 'approval_timer'
-      },
-      clearTimer: vi.fn(),
-    })
-    const orchestrator = new AgentOrchestrator(dependencies)
-    await expect(orchestrator.run(textRunInput({
-      conversationId: 'automatic_expiry', content: '填写搜索框', provider: 'openrouter', model: 'model',
-    }))).resolves.toMatchObject({ status: 'awaiting_approval' })
+    dependencies.now = () => Date.now()
+    try {
+      const orchestrator = new AgentOrchestrator(dependencies)
+      await expect(orchestrator.run(textRunInput({
+        conversationId: 'automatic_expiry', content: '填写搜索框', provider: 'openrouter', model: 'model',
+      }))).resolves.toMatchObject({ status: 'awaiting_approval' })
 
-    milliseconds = 60_000
-    await expect(orchestrator.resumeApproval({
-      executionId: 'reserved_1', permissionIndex: 0,
-      scopeHash: 'f'.repeat(64), decision: 'once',
-    })).resolves.toMatchObject({ status: 'failed', error: { code: 'CONFLICT' } })
+      await vi.advanceTimersByTimeAsync(APPROVAL_EXPIRY_MS)
 
-    milliseconds = APPROVAL_EXPIRY_MS
-    expireApproval()
-    await vi.waitFor(() => expect(dependencies.records.terminal).toEqual([
-      expect.objectContaining({ status: 'cancelled', errorCode: 'CANCELLED' }),
-    ]))
-    expect(dependencies.records.starts).toHaveLength(0)
+      expect(dependencies.records.terminal).toEqual([
+        expect.objectContaining({ status: 'cancelled', errorCode: 'CANCELLED' }),
+      ])
+      expect(dependencies.records.starts).toHaveLength(0)
+      expect(dependencies.records.discards).toHaveLength(1)
+      expect(dependencies.policy.releaseExecution).toHaveBeenCalledTimes(1)
+      expect(orchestrator.ownsExecution('reserved_1')).toBe(false)
+      expect(dependencies.records.events.filter((event) => (
+        typeof event === 'object' && event !== null && 'type' in event
+        && (event as { type: string; status?: string }).type === 'status'
+        && (event as { status?: string }).status === 'cancelled'
+      ))).toHaveLength(1)
 
-    await expect(orchestrator.run(textRunInput({
-      conversationId: 'automatic_expiry', content: '重试', provider: 'openrouter', model: 'model',
-    }))).resolves.not.toMatchObject({ error: { code: 'CONFLICT' } })
+      await expect(orchestrator.run(textRunInput({
+        conversationId: 'automatic_expiry', content: '重试', provider: 'openrouter', model: 'model',
+      }))).resolves.not.toMatchObject({ error: { code: 'CONFLICT' } })
+      expect(dependencies.records.terminal).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('checks active time before a workflow start without consuming a start', async () => {

@@ -35,7 +35,7 @@ import { VideoJobRunner } from './chat/video-job-runner.js'
 import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from './chat/model-provider.js'
 import type { CredentialBoundModelProvider } from './chat/model-provider-registry.js'
 import { openAppDatabase } from './database/client.js'
-import { ProviderUsageConsistencyError } from './database/repositories.js'
+import { ProviderUsageConsistencyError, type Execution } from './database/repositories.js'
 import {
   NetworkProxyService,
   type NetworkProxyPort,
@@ -352,6 +352,113 @@ async function installApprovalWorkflow(
   ].join('\n'))
   await runtime.services.developer.build(project.id)
   return runtime.services.workflows.installProject(project.id)
+}
+
+async function applicationHarness(input: { developerMode: boolean }) {
+  const root = await mkdtemp(join(tmpdir(), 'autoforge-application-dynamic-workflow-'))
+  directories.push(root)
+  const providerRequests: ModelStreamRequest[] = []
+  const chatEvents: ChatEvent[] = []
+  const executionStarts: Array<{ executionId: string; input: unknown }> = []
+  const runningCompletion = deferred<Execution>()
+  let inspectedAgent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'> | undefined
+  const startReserved = vi.spyOn(ExecutionService.prototype, 'startReserved')
+    .mockImplementation(async (reservation, startInput) => {
+      executionStarts.push({ executionId: reservation.executionId, input: startInput })
+      return { id: reservation.executionId, finished: runningCompletion.promise }
+    })
+  const provider = snapshotProvider('openrouter', {
+    listModels: vi.fn(async () => [{
+      ...modelInfo('openrouter/tools', 'Tools'),
+      supportsTools: true,
+    }]),
+    validateCredential: vi.fn(async () => ({ valid: true })),
+    stream: vi.fn(async function* (request: ModelStreamRequest) {
+      providerRequests.push(request)
+      if (request.messages.some((message) => message.role === 'tool')) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '工作流处理完成' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        return
+      }
+      yield {
+        type: 'tool_call' as const,
+        choiceIndex: 0,
+        index: 0,
+        id: `call_${providerRequests.length}`,
+        name: 'workflow_1',
+        arguments: { input: {} },
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+    }),
+  })
+  const runtimeOptions = options(root, {
+    modelProviders: { openrouter: provider },
+    emitChat: (event) => { chatEvents.push(event) },
+  })
+  Object.assign(runtimeOptions, {
+    inspectAgent: (agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>) => {
+      inspectedAgent = agent
+    },
+  })
+  const runtime = createApplicationRuntime(runtimeOptions)
+  await authenticate(runtime)
+  await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+  await runtime.services.settings.update({
+    activeProvider: 'openrouter',
+    developerMode: input.developerMode,
+    defaultModels: {
+      deepseek: { text: 'deepseek-v4-flash' },
+      openrouter: { text: 'openrouter/tools' },
+    },
+  })
+  await installApprovalWorkflow(runtime, 'dynamic workflow')
+
+  const sendToolPrompt = async () => {
+    const conversation = await runtime.services.chat.createConversation()
+    const sent = await runtime.services.chat.send(chatInput(conversation.id, 'dynamic workflow'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'block',
+      conversationId: conversation.id,
+      block: expect.objectContaining({ type: 'approval' }),
+    })))
+    const approval = [...chatEvents].reverse().find((event): event is Extract<ChatEvent, { type: 'block' }> => (
+      event.type === 'block'
+      && event.conversationId === conversation.id
+      && event.block.type === 'approval'
+    ))!.block as Extract<Extract<ChatEvent, { type: 'block' }>['block'], { type: 'approval' }>
+    return { ...sent, approval, conversation }
+  }
+
+  return {
+    runtime,
+    settings: runtime.services.settings,
+    executions: { started: executionStarts, startReserved },
+    providerRequests,
+    chatEvents,
+    agent: () => inspectedAgent,
+    sendToolPrompt,
+    finishRunning(executionId: string) {
+      const started = executionStarts.find((execution) => execution.executionId === executionId)!
+      const startInput = started.input as {
+        workflowId: string
+        workflowVersion: string
+        input: unknown
+        chatRunId?: string
+      }
+      runningCompletion.resolve({
+        id: executionId,
+        workflowId: startInput.workflowId,
+        workflowVersion: startInput.workflowVersion,
+        ...(startInput.chatRunId === undefined ? {} : { chatRunId: startInput.chatRunId }),
+        status: 'completed',
+        input: startInput.input,
+        result: { ok: true },
+        createdAt: 0,
+        startedAt: 0,
+        endedAt: 1,
+      })
+    },
+  }
 }
 
 function modelInfo(id: string, name: string): ModelInfo {
@@ -1556,6 +1663,54 @@ describe('createApplicationRuntime', () => {
       })
     } finally {
       database.close()
+    }
+  })
+
+  it('invalidates a pending development call when mode closes but retains installed tools', async () => {
+    const app = await applicationHarness({ developerMode: true })
+    try {
+      const pending = await app.sendToolPrompt()
+      expect(pending.approval.source).toBe('development')
+
+      await app.settings.update({ developerMode: false })
+
+      await vi.waitFor(() => expect(app.providerRequests.at(-1)?.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'tool', content: expect.stringContaining('WORKFLOW_CHANGED') }),
+      ])))
+      expect(app.executions.started).toHaveLength(0)
+      expect(app.agent()?.ownsExecution(pending.approval.executionId)).toBe(false)
+
+      const installed = await app.sendToolPrompt()
+      expect(installed.approval).toMatchObject({
+        workflowId: 'local.autoforge.approval-workflow',
+        source: 'installed',
+      })
+    } finally {
+      await app.runtime.close()
+    }
+  })
+
+  it('lets a running development Worker finish after mode closes and excludes development later', async () => {
+    const app = await applicationHarness({ developerMode: true })
+    try {
+      const pending = await app.sendToolPrompt()
+      const decision = app.runtime.services.executions.decide({
+        executionId: pending.approval.executionId,
+        permissionIndex: pending.approval.permissionIndex,
+        scopeHash: pending.approval.scopeHash,
+        decision: 'once',
+      })
+      await vi.waitFor(() => expect(app.executions.started).toHaveLength(1))
+
+      await app.settings.update({ developerMode: false })
+      expect(app.agent()?.ownsExecution(pending.approval.executionId)).toBe(true)
+      app.finishRunning(pending.approval.executionId)
+      await expect(decision).resolves.toBeUndefined()
+
+      const installed = await app.sendToolPrompt()
+      expect(installed.approval.source).toBe('installed')
+    } finally {
+      await app.runtime.close()
     }
   })
 

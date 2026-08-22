@@ -182,6 +182,8 @@ export interface ApplicationRuntimeOptions {
   emitExecution(event: ExecutionEvent): void
   browserWorkspace: BrowserWorkspacePort
   applyTheme?(theme: AppSettings['theme']): void
+  /** @internal Test-only observation hook for the Main-owned Agent instance. */
+  inspectAgent?(agent: Pick<AgentOrchestrator, 'ownsExecution' | 'hasActiveRuns'>): void
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
 }
@@ -771,6 +773,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
   })
+  options.inspectAgent?.(agent)
   const persistence = createAgentPersistence(database)
   const mediaGeneration = new MediaGenerationOrchestrator({
     providers: providerRegistry,
@@ -1303,6 +1306,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           const candidate = settings.preview(patch)
           const commit = () => {
             const committed = settings.commit(candidate)
+            if (committed.developerMode !== previous.developerMode) {
+              agent.onDeveloperModeChanged(committed.developerMode)
+            }
             if (committed.theme !== previous.theme) options.applyTheme?.(committed.theme)
             return committed
           }

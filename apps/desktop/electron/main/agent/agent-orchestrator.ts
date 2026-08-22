@@ -546,6 +546,19 @@ export class AgentOrchestrator {
     return this.activeByRequest.size > 0
   }
 
+  onDeveloperModeChanged(enabled: boolean): void {
+    if (enabled) return
+    for (const active of this.activeByRequest.values()) {
+      const pending = active.pending
+      if (!pending
+        || pending.tool.source.source !== 'development'
+        || pending.executionIndex !== undefined
+        || active.terminal
+        || active.busy) continue
+      void this.invalidatePendingDevelopment(active)
+    }
+  }
+
   private async driveExclusive(active: ActiveAgentRun): Promise<AgentRunResult> {
     if (active.busy) return this.failedResult(active.requestId, 'CONFLICT')
     active.busy = true
@@ -559,6 +572,29 @@ export class AgentOrchestrator {
       if (active.terminal) return active.terminal
       if (active.cancelled || active.controller.signal.aborted) return this.finish(active, 'cancelled', appFailure('CANCELLED'))
       return this.finish(active, 'failed', asAppError(error))
+    } finally {
+      active.busy = false
+    }
+  }
+
+  private async invalidatePendingDevelopment(active: ActiveAgentRun): Promise<void> {
+    if (active.busy || active.terminal) return
+    const pending = active.pending
+    if (!pending
+      || pending.tool.source.source !== 'development'
+      || pending.executionIndex !== undefined) return
+    active.busy = true
+    try {
+      this.clearApprovalTimer(active)
+      if (active.loop.awaitingApproval()) active.loop.resumeApproval()
+      await this.workflowTools.cancel(pending.tool)
+      if (active.terminal || active.pending !== pending) return
+      this.updateWorkflowStatus(active, pending, 'failed')
+      this.appendToolExchange(active, pending, { kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
+      this.clearPending(active)
+      await this.drive(active)
+    } catch (error) {
+      if (!active.terminal) this.finish(active, 'failed', asAppError(error))
     } finally {
       active.busy = false
     }
