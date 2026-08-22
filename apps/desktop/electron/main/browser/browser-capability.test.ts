@@ -148,7 +148,9 @@ describe('BrowserCapabilityService', () => {
     expect(failed.workspace.markContinuationBound).not.toHaveBeenCalled()
 
     const manual = createHarness()
-    const { conversationId: _conversationId, chatRunId: _chatRunId, ...manualContext } = context
+    const manualContext = { ...context }
+    delete manualContext.conversationId
+    delete manualContext.chatRunId
     await manual.service.open(manualContext, 'https://www.baidu.com', baiduScope)
 
     expect(manual.continuationRegistry.bind).not.toHaveBeenCalled()

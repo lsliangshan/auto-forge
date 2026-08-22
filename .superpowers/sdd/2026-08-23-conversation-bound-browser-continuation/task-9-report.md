@@ -91,3 +91,75 @@ Added a deterministic HTTPS permit fixture, a test-only Electron Main entrypoint
 ## Explicit manual pending item
 
 The user-assisted Beijing portal smoke was **not performed and is not claimed as passed**. It remains the one explicit manual pending item because it requires the user to log in privately and observe the visible production chain, actual permit field/source/read time, draft stop-before-submit behavior, cross-conversation denial, and redacted durable rows.
+
+## Fix Round 1: independent-review remediation
+
+### Corrections to the initial report
+
+This section supersedes the initial scenario count and boundary classifications above. The deterministic Electron suite now has **19** cases, not 17. The original injection E2E case exercised the real Main inspector/guard boundary but did not drive the attempted authority escalation through Renderer chat and the Agent; it is now honestly named as a direct Main-boundary final-action test, and a separate provider-driven Renderer case covers the missing path. Likewise, cases that seed a continuation through the test harness remain direct setup of a real Registry/Workspace boundary; they are not described as workflow-origin coverage. A new case creates, builds, installs, selects, and runs a workflow through the ordinary workflow tool, Worker, `ExecutionService`, capability service, approval, continuation binding, Renderer/Preload/IPC/Application/Agent, and real CDP path.
+
+The Electron logout case proves the visible pages close and the per-user partition cookie survives. Exact cleanup ordering belongs to the Application integration test `revokes personal continuations and resets visible tabs before one underlying logout without clearing cookies`, which asserts `['revoke', 'reset', 'logout']`. The Electron clear-data case proves the active test user's cookie is removed. Multi-user partition scope and active execution/lease checks belong to the Application test `clears only the authenticated user browser data after active execution and lease checks`. These properties are no longer attributed to observations the Electron fixture cannot make.
+
+### TDD RED evidence
+
+- Draft mutation: the new DOM/payload assertion first failed because the harness had no `tabFieldValue` command (`Unknown browser continuation E2E command: tabFieldValue`). The fixture also began with the requested replacement value, so it could not prove a mutation.
+- Provider-driven injection: the new Renderer-chat test first failed because the harness snapshot had no `providerAttempts`; the prior result fields were constants returned by the direct scenario rather than evidence from the invoked Agent path.
+- Workflow-origin and visible controls: the new test first failed waiting for visible `需要授权` because no workflow had been installed or run. After the normal workflow existed, the first real run established that safe `browser.open`/`browser.url` are auto-authorized and that the external `browser.click` capability is the single visible approval boundary; the assertion was corrected to that actual contract.
+- Protected highlight: the first pass completed automatically because the workflow did not request `browser.click`. Adding that exact permission caused the real final-action guard to hand off and highlight instead of clicking. A proposed DOM-focus assertion was removed after tracing the real implementation: the Workspace focuses the BrowserWindow and renders an overlay; it does not mutate DOM focus. The harness records only after the real `highlightContinuationTarget` resolves.
+- ABI lifecycle: `pnpm run pretest:e2e:browser-continuation` first failed with `ERR_PNPM_NO_SCRIPT`. The exact lifecycle script was then added.
+- Lint: root lint before remediation reported 11 errors and 328 warnings. The six feature-introduced errors were reproduced before their minimal fixes: two unused destructures in the capability test, two unused mock parameters in the execution test, and the inspector's control-regex and constant-loop rules.
+
+### GREEN evidence and commands
+
+- `pnpm run pretest:e2e:browser-continuation` — PASS; it ran desktop `prepare:native-electron` and independently probed `better-sqlite3` as compatible with Electron 43.1.1.
+- `pnpm test:e2e:browser-continuation` — PASS, **19/19** in 52.2 seconds. Its captured output begins with the exact native-Electron pretest before the shared/Renderer/test-entry builds and `_electron.launch`.
+- Focused real-Electron Main/Agent/Application command over capability, inspector, guard, execution service, orchestrator, and Application tests — PASS, **6 files / 389 tests**.
+- `pnpm --filter @autoforge/shared build` — PASS.
+- `pnpm --filter @autoforge/workflow-schema build` — PASS.
+- `pnpm exec vitest run packages/workflow-schema/src/validator.test.ts packages/shared/src/contracts.test.ts` — PASS, **2 files / 89 tests**.
+- `pnpm test` — PASS, **88 files / 2242 tests**; its native-Electron preparation also passed.
+- `pnpm typecheck` — PASS for all workspace projects.
+- Focused ESLint over all changed TypeScript E2E, fixture, capability-test, inspector, and execution-test files — PASS with no output.
+- `pnpm lint` — expected baseline failure, now **5 errors / 328 warnings**. All five errors are the unchanged DOM globals in `apps/desktop/src/components/ContextSidebar.vue` at lines 270, 274, 287, and twice at 306. `git diff --exit-code e45cb32f575a0a0759e8e321ee119dbaa561db0b -- apps/desktop/src/components/ContextSidebar.vue` exits 0, proving that file is byte-identical to the pre-feature base. No error remains in a Task 1–9 feature file.
+- `pnpm build` — PASS. The only messages of note are the same two third-party VueUse misplaced `/* #__PURE__ */` annotation warnings.
+- `git diff --check` — PASS with no output.
+
+### Corrected 19-scenario mapping
+
+1. Renderer/Agent continuation from a seeded exact binding reads the authenticated expiry and visibly includes the canonical source plus ISO read time; no submit.
+2. A real provider request in another conversation is non-vacuously observed, has no continuation-inspect tool, and cannot disturb the owner's binding.
+3. Login is handed to the user; the manual click changes fixture authentication but causes no provider request or answer until a new user message.
+4. Direct Main inspector/executor coverage starts from `原聘用单位（未修改）`, fills the new employer, observes the real DOM value, captures the exact `/draft` request payload, and keeps submit at zero until the explicit test-user click.
+5. Direct Main inspector/executor coverage returns `PAGE_CHANGED` after dynamic node replacement.
+6. Direct Registry lifecycle coverage closes and durably revokes the exact page on workflow-version change.
+7. A real allowed popup produces two live bindings with the same conversation, workflow id/version, installed provenance, and security fingerprint.
+8. Direct guarded execution rejects the schema-valid disallowed-origin navigation and leaves the original URL unchanged.
+9. Direct guarded execution returns `PAGE_CLOSED` for the exact stale target.
+10. Direct Registry/executor lease coverage returns `PAGE_BUSY` for the exact occupied target.
+11. Direct takeover cancels the exact lease and prevents subsequent automation.
+12. Direct guarded execution completes exactly 30 actions and rejects action 31 with `ACTION_LIMIT_EXCEEDED`.
+13. Real Application conversation deletion closes its exact pages and removes live bindings.
+14. Real Application logout/relogin closes browser pages while preserving the test user's partition cookie; exact ordering is asserted by the named Application test above.
+15. Real Application explicit data-clear removes the active test user's partition cookie; multi-user scoping is asserted by the named Application test above.
+16. Real SQLite binding/audit/message projections contain no fixture employer, injection text, Cookie text, or expiry in binding/audit rows.
+17. Direct Main final-action boundary returns `MANUAL_ACTION_REQUIRED` and leaves submission at zero.
+18. Renderer chat delivers real inspected page data to the deterministic provider, which then makes five actual attempts: three unoffered tool names (new tab, file upload, raw CDP) and two offered, schema-valid actions (disallowed-origin navigation and final click). The Agent dispatches only five real inspect calls; tab count, binding count, URL, file-selection count, and submission count remain unchanged.
+19. A normally installed workflow runs through Worker/`ExecutionService`/capability approval and creates the binding; subsequent visible Renderer chat traverses Preload/IPC/Application/Agent/CDP. The UI proves the permission approval, AI-reading indicator, Stop, Takeover, protected-target highlight/handoff, and redacted audit expansion. Submission remains zero.
+
+### Injection, context-retention, and security review
+
+- The five provider attempts are generated only after parsing the actual `UNTRUSTED_BROWSER_PAGE_DATA` tool result. Offered fixed tools pass their normal Zod input schemas; unoffered names still pass the provider event's generic tool-name contract and are rejected by Agent authority checks before executor dispatch. Assertions read the recorded provider events and wrapped real executor calls, not predetermined result constants.
+- Unit coverage rejects injected unoffered open-tab/upload/raw-CDP calls and injected new-origin/final-click actions. Application integration coverage confirms ordinary safe page data exists in the current provider run only, then the next turn contains only the final answer and schema-bounded safe browser-status summary; injection/private/ephemeral page data, private URL, snapshot id, and backend node id are absent from the next context and durable rows.
+- The installed E2E workflow declares only `browser.open`, `browser.url`, and `browser.click` for the exact fixture origin. It adds no Worker SDK method. The provider still receives only inspect/act/handoff; no tab, file, raw-CDP, arbitrary-evaluate, upload/download, watcher, cross-conversation attach, or automated final-submit production surface was added.
+- The only production-source edit in this fix round is a behavior-preserving rewrite inside the inspector to satisfy the two feature lint rules. The remaining changes are tests, the test-only Electron entrypoint/fixture, and the exact E2E lifecycle script. Test-only prototype instrumentation runs only in the un-packaged `.e2e` entrypoint.
+- Repository search finds fixture private values only in test sources and the approved plan. The E2E durable-row assertions and Application retention test prove those values are not written to binding/audit/message stores except for the intentionally safe final answer content already covered by the original report.
+
+### Deviations and remaining concern
+
+- Root lint is still nonzero because of the five pre-feature `ContextSidebar.vue` DOM-global errors. They were not hidden, globally disabled, or opportunistically changed; the full command outcome and exact baseline proof are recorded above. All feature-diff TypeScript is lint-clean.
+- Several scenarios deliberately use direct Main-boundary setup because they target exact Registry, lease, guard, or lifecycle conditions. Only scenario 19 is claimed as normal workflow-origin full-chain coverage; scenarios 1–3 and 18 traverse Renderer/Agent after a directly seeded binding.
+- No automated security or functional concern remains after this fix round. The one release item still pending is the user-assisted Beijing portal smoke.
+
+### Explicit manual pending item after Fix Round 1
+
+The user-assisted Beijing portal smoke was **not performed and is not claimed as passed**. It remains the sole explicit manual item because it requires the user to enter private login credentials and personally observe the actual Beijing portal's visible login, source/read-time, draft stop-before-submit, takeover, cross-conversation denial, and durable-row redaction chain.

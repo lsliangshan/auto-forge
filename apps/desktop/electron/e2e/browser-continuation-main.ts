@@ -41,7 +41,10 @@ import type {
   ModelStreamRequest,
 } from '../main/chat/model-provider.js'
 import { BrowserContinuationRegistry } from '../main/browser/browser-continuation-registry.js'
-import type { BrowserContinuationBindingInput } from '../main/browser/browser-continuation-types.js'
+import type {
+  BrowserContinuationBinding,
+  BrowserContinuationBindingInput,
+} from '../main/browser/browser-continuation-types.js'
 import { BrowserPageInspector } from '../main/browser/browser-page-inspector.js'
 import { ElectronBrowserWorkspace } from '../main/browser/electron-browser-workspace.js'
 import { openAppDatabase } from '../main/database/client.js'
@@ -145,9 +148,25 @@ interface CapturedProviderRequest {
   serialized: string
 }
 
+interface CapturedProviderAttempt {
+  conversationId: string
+  name: string
+  arguments: unknown
+  offered: boolean
+  afterInspectedPageData: boolean
+}
+
 const providerRequests: CapturedProviderRequest[] = []
-const forbiddenOperations: string[] = []
+const providerAttempts: CapturedProviderAttempt[] = []
+const executorCalls: Array<{ conversationId: string; name: string }> = []
+const highlightEvents: Array<{ conversationId: string; tabId: string; ref: string }> = []
 let continuationRegistry: BrowserContinuationRegistry | undefined
+
+const realBrowserToolExecute = BrowserContinuationToolExecutor.prototype.execute
+BrowserContinuationToolExecutor.prototype.execute = async function (tool, rawInput, runContext) {
+  executorCalls.push({ conversationId: runContext.conversationId, name: tool })
+  return realBrowserToolExecute.call(this, tool, rawInput, runContext)
+}
 
 function latestConversationId(): string {
   const database = new Database(databasePath, { readonly: true })
@@ -173,6 +192,36 @@ function lastToolContent(request: ModelStreamRequest): string | undefined {
   return message?.role === 'tool' ? message.content : undefined
 }
 
+function currentUserText(request: ModelStreamRequest): string {
+  const message = [...request.messages].reverse().find((candidate) => candidate.role === 'user')
+  if (!message || message.role !== 'user') return ''
+  if (typeof message.content === 'string') return message.content
+  return message.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+}
+
+function inspectedSnapshot(request: ModelStreamRequest): {
+  snapshotId: string
+  nodes: Array<{ ref: string; name: string }>
+} | undefined {
+  const content = lastToolContent(request)
+  if (!content?.includes('UNTRUSTED_BROWSER_PAGE_DATA')) return undefined
+  const serialized = content.split('\n').find((line) => line.startsWith('{"kind":'))
+  if (!serialized) return undefined
+  try {
+    const parsed = JSON.parse(serialized) as {
+      kind?: string
+      data?: { snapshot?: { snapshotId?: string; nodes?: Array<{ ref?: string; name?: string }> } }
+    }
+    const snapshot = parsed.data?.snapshot
+    if (parsed.kind !== 'success' || !snapshot?.snapshotId || !Array.isArray(snapshot.nodes)) return undefined
+    const nodes = snapshot.nodes
+      .filter((node): node is { ref: string; name: string } => typeof node.ref === 'string' && typeof node.name === 'string')
+    return { snapshotId: snapshot.snapshotId, nodes }
+  } catch {
+    return undefined
+  }
+}
+
 function bindingIdFromRequest(request: ModelStreamRequest, conversationId: string): string | undefined {
   const offered = request.tools?.find((tool) => tool.function.name === 'browser_session_inspect')
   const properties = offered?.function.parameters as {
@@ -189,7 +238,6 @@ function validateScriptedTool(
   input: unknown,
 ): unknown {
   if (!request.tools?.some((tool) => tool.function.name === name)) {
-    forbiddenOperations.push(`unoffered:${name}`)
     throw new Error(`Deterministic provider attempted an unoffered tool: ${name}`)
   }
   if (name === 'browser_session_inspect') return browserSessionInspectInputSchema.parse(input)
@@ -208,6 +256,31 @@ function toolCall(
   }
 }
 
+function attemptedToolCall(
+  request: ModelStreamRequest,
+  conversationId: string,
+  name: string,
+  input: unknown,
+): ModelStreamEvent {
+  if (!/^[a-z][a-z0-9_]{0,127}$/u.test(name)) throw new Error(`Invalid deterministic tool name: ${name}`)
+  const offered = request.tools?.some((tool) => tool.function.name === name) ?? false
+  let parsedInput = input
+  if (offered && name === 'browser_session_inspect') parsedInput = browserSessionInspectInputSchema.parse(input)
+  if (offered && name === 'browser_session_act') parsedInput = browserSessionActInputSchema.parse(input)
+  if (offered && name === 'browser_session_handoff') parsedInput = browserSessionHandoffInputSchema.parse(input)
+  providerAttempts.push({
+    conversationId,
+    name,
+    arguments: structuredClone(parsedInput),
+    offered,
+    afterInspectedPageData: inspectedSnapshot(request) !== undefined,
+  })
+  return {
+    type: 'tool_call', choiceIndex: 0, index: 0, id: `e2e_attempt_${randomUUID()}`,
+    name, arguments: parsedInput,
+  }
+}
+
 const deterministicProvider: CredentialBoundModelProvider = {
   async listModels() {
     return [{
@@ -219,10 +292,26 @@ const deterministicProvider: CredentialBoundModelProvider = {
   async validateCredential() { return { valid: true } },
   async *stream(request: ModelStreamRequest) {
     const conversationId = latestConversationId()
+    const userText = currentUserText(request)
     providerRequests.push({
       conversationId,
       serialized: JSON.stringify({ messages: request.messages, tools: request.tools }),
     })
+    const previousTool = lastToolName(request)
+    const workflowTool = request.tools?.find((tool) => tool.function.name.startsWith('workflow_'))
+    if (userText.includes('E2E_WORKFLOW_OPEN') && !previousTool && workflowTool) {
+      yield {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: `e2e_workflow_${randomUUID()}`,
+        name: workflowTool.function.name, arguments: { input: {} },
+      }
+      yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+      return
+    }
+    if (userText.includes('E2E_WORKFLOW_OPEN') && previousTool?.startsWith('workflow_')) {
+      yield { type: 'text_delta', choiceIndex: 0, text: '工作流已通过正常执行链打开页面。' }
+      yield { type: 'finish', choiceIndex: 0, reason: 'stop' }
+      return
+    }
     if (!request.tools?.some((tool) => offeredBrowserTools.includes(tool.function.name as typeof offeredBrowserTools[number]))) {
       yield { type: 'text_delta', choiceIndex: 0, text: '未找到当前会话可继续的页面。' }
       yield { type: 'finish', choiceIndex: 0, reason: 'stop' }
@@ -230,7 +319,6 @@ const deterministicProvider: CredentialBoundModelProvider = {
     }
     const bindingId = bindingIdFromRequest(request, conversationId)
     if (!bindingId) throw new Error('No exact continuation binding was offered')
-    const previousTool = lastToolName(request)
     if (!previousTool) {
       yield toolCall(request, 'browser_session_inspect', { bindingId, intent: '读取证件有效期' })
       yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
@@ -240,6 +328,49 @@ const deterministicProvider: CredentialBoundModelProvider = {
       const payload = lastToolContent(request) ?? ''
       if (payload.includes('"auth":"required"')) {
         yield toolCall(request, 'browser_session_handoff', { bindingId, reason: 'login' })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
+      const page = inspectedSnapshot(request)
+      if (!page) throw new Error('The deterministic provider did not receive a real inspected snapshot')
+      const finalRef = page.nodes.find((node) => /正式提交/iu.test(node.name))?.ref
+      if (userText.includes('E2E_INJECT_OPEN_TAB')) {
+        yield attemptedToolCall(request, conversationId, 'browser_session_open_tab', {
+          bindingId, url: 'https://attacker.example/open',
+        })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
+      if (userText.includes('E2E_INJECT_UPLOAD_FILE')) {
+        yield attemptedToolCall(request, conversationId, 'browser_session_upload_file', {
+          bindingId, ref: finalRef ?? 'missing_ref', path: '/private/e2e.txt',
+        })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
+      if (userText.includes('E2E_INJECT_RAW_CDP')) {
+        yield attemptedToolCall(request, conversationId, 'browser_session_raw_cdp', {
+          bindingId, method: 'Network.getAllCookies', params: {},
+        })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
+      if (userText.includes('E2E_INJECT_DISALLOWED_ORIGIN')) {
+        yield attemptedToolCall(request, conversationId, 'browser_session_act', {
+          bindingId,
+          snapshotId: page.snapshotId,
+          actions: [{ type: 'navigate', url: `${disallowedOrigin}/landing` }],
+        })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
+      if (userText.includes('E2E_INJECT_FINAL_CLICK') || userText.includes('E2E_PROTECTED_HIGHLIGHT')) {
+        if (!finalRef) throw new Error('The real inspected snapshot did not contain the final control')
+        yield attemptedToolCall(request, conversationId, 'browser_session_act', {
+          bindingId,
+          snapshotId: page.snapshotId,
+          actions: [{ type: 'click', ref: finalRef }],
+        })
         yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
         return
       }
@@ -269,6 +400,19 @@ let disposeIpc: (() => void) | undefined
 let agentState: { hasActiveRuns(): boolean } | undefined
 const busyRuns = new Map<string, string>()
 
+interface InspectionPause {
+  promise: Promise<void>
+  release(): void
+}
+
+let inspectionPause: InspectionPause | undefined
+
+function newInspectionPause(): InspectionPause {
+  let release!: () => void
+  const promise = new Promise<void>((resolve) => { release = resolve })
+  return { promise, release }
+}
+
 const networkProxy = new NetworkProxyService({
   setProxy: (config) => session.defaultSession.setProxy(config),
   closeAllConnections: () => session.defaultSession.closeAllConnections(),
@@ -290,6 +434,26 @@ function registry(): BrowserContinuationRegistry {
   const candidate = (workspace as unknown as { continuationRegistry?: unknown }).continuationRegistry
   if (!(candidate instanceof BrowserContinuationRegistry)) throw new Error('Real continuation registry is unavailable')
   return candidate
+}
+
+const realReadAccessibilitySnapshot = workspace.readAccessibilitySnapshot.bind(workspace)
+workspace.readAccessibilitySnapshot = async (input) => {
+  const snapshot = await realReadAccessibilitySnapshot(input)
+  const pause = inspectionPause
+  if (pause) {
+    await pause.promise
+    if (inspectionPause === pause) inspectionPause = undefined
+  }
+  return snapshot
+}
+
+const realHighlightContinuationTarget = workspace.highlightContinuationTarget.bind(workspace)
+workspace.highlightContinuationTarget = async (tabId, ref, target) => {
+  await realHighlightContinuationTarget(tabId, ref, target)
+  const binding = [...(registry() as unknown as {
+    bindings: Map<string, BrowserContinuationBinding>
+  }).bindings.values()].find((candidate) => candidate.tabId === tabId)
+  if (binding) highlightEvents.push({ conversationId: binding.conversationId, tabId, ref })
 }
 
 function emit(channel: string, value: unknown): void {
@@ -426,12 +590,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
         bindingId, snapshotId: page.snapshotId,
         actions: [{ type: 'click', ref: findRef(page, /正式提交/iu) }],
       }, current)
-      return {
-        code: resultCode(acted),
-        offeredTools: [...offeredBrowserTools],
-        forbiddenOperations: [...forbiddenOperations],
-        openTabs: [...targets().values()].filter((target) => !target.closed).length,
-      }
+      return { code: resultCode(acted) }
     }
     return { code: 'INVALID_INPUT' }
   } finally {
@@ -523,6 +682,8 @@ async function clickFixture(selector: string, tabId?: string): Promise<void> {
 }
 
 async function resetScenario(): Promise<void> {
+  inspectionPause?.release()
+  inspectionPause = undefined
   for (const [bindingId, runId] of busyRuns) {
     const binding = registry().get(bindingId)
     if (binding) await workspace.releaseContinuation(binding.tabId, runId)
@@ -531,7 +692,9 @@ async function resetScenario(): Promise<void> {
   await registry().revokeUser(userId, 'CANCELLED')
   await workspace.clearUserData(userId)
   providerRequests.splice(0)
-  forbiddenOperations.splice(0)
+  providerAttempts.splice(0)
+  executorCalls.splice(0)
+  highlightEvents.splice(0)
   const conversations = await runtime!.services.chat.listConversations()
   for (const conversation of conversations) await runtime!.services.chat.deleteConversation(conversation.id)
 }
@@ -560,6 +723,50 @@ function durableRows(conversationId: string): { bindings: string; audits: string
   }
 }
 
+async function installFixtureWorkflow(): Promise<void> {
+  if (!runtime) throw new Error('Application runtime is unavailable')
+  const project = await runtime.services.developer.createProject('E2E Browser Continuation')
+  const manifest = JSON.parse(
+    await runtime.services.developer.readFile(project.id, 'workflow.json'),
+  ) as Record<string, unknown>
+  Object.assign(manifest, {
+    id: 'e2e.browser.workflow',
+    version: '1.0.0',
+    name: 'E2E 工作居住证',
+    description: '通过真实工作流执行链打开确定性证件页面',
+    category: 'testing',
+    activationExamples: ['运行工作居住证完整链路'],
+    activationNegativeExamples: ['只解释工作居住证概念'],
+    permissions: [
+      { capability: 'browser.open', scope: { origins: [fixtureOrigin] } },
+      { capability: 'browser.url', scope: { origins: [fixtureOrigin] } },
+      { capability: 'browser.click', scope: { origins: [fixtureOrigin] } },
+    ],
+    browserContinuation: {
+      auth: {
+        loginUrls: [`${fixtureOrigin}/login`],
+        loggedIn: ['role=button[name="退出"]'],
+        loggedOut: ['css=#manual-login'],
+      },
+      readableRegions: ['role=main'],
+      manualActions: [
+        { locator: 'css=#final-submit', reason: '正式提交必须由用户完成' },
+        { locator: 'css=#file-control', reason: '附件上传必须由用户完成' },
+        { locator: 'css=#signature-control', reason: '签名必须由用户完成' },
+        { locator: 'css=#payment-control', reason: '付款必须由用户完成' },
+      ],
+    },
+    inputSchema: { type: 'object', additionalProperties: false },
+  })
+  await runtime.services.developer.writeFile(project.id, 'workflow.json', `${JSON.stringify(manifest, null, 2)}\n`)
+  await runtime.services.developer.writeFile(project.id, 'src/index.ts', [
+    "import { defineWorkflow } from '@autoforge/workflow-sdk'",
+    `export default defineWorkflow({ async run(ctx) { await ctx.browser.open(${JSON.stringify(`${fixtureOrigin}/authenticate`)}); return { opened: true } } })`,
+  ].join('\n'))
+  await runtime.services.developer.build(project.id)
+  await runtime.services.workflows.installProject(project.id)
+}
+
 async function dispatch(name: string, input: Record<string, unknown>): Promise<unknown> {
   if (!runtime) throw new Error('Application runtime is unavailable')
   if (name === 'resetScenario') return resetScenario()
@@ -576,12 +783,43 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
   }
   if (name === 'seedBinding') return seedBinding(input)
   if (name === 'userClick') return clickFixture(String(input.selector), input.tabId ? String(input.tabId) : undefined)
+  if (name === 'tabFieldValue') {
+    const target = targets().get(String(input.tabId))
+    if (!target || target.closed || target.view.webContents.isDestroyed()) throw new Error('Fixture tab is unavailable')
+    const selector = JSON.stringify(String(input.selector))
+    return target.view.webContents.executeJavaScript<string>(`(() => {
+      const element = document.querySelector(${selector});
+      return element instanceof HTMLInputElement ? element.value : '';
+    })()`)
+  }
+  if (name === 'pauseNextInspection') {
+    if (inspectionPause) throw new Error('An inspection pause is already armed')
+    inspectionPause = newInspectionPause()
+    return
+  }
+  if (name === 'releaseInspection') {
+    inspectionPause?.release()
+    return
+  }
   if (name === 'directScenario') return directScenario(input)
   if (name === 'snapshot') return {
     openTabs: [...targets().values()].filter((target) => !target.closed).length,
     activeBindings: (registry() as unknown as { bindings: Map<string, unknown> }).bindings.size,
     providerRequests: structuredClone(providerRequests),
-    forbiddenOperations: [...forbiddenOperations],
+    providerAttempts: structuredClone(providerAttempts),
+    executorCalls: structuredClone(executorCalls),
+    bindingDetails: [...(registry() as unknown as {
+      bindings: Map<string, BrowserContinuationBinding>
+    }).bindings.values()].map((binding) => ({
+      bindingId: binding.bindingId,
+      tabId: binding.tabId,
+      conversationId: binding.conversationId,
+      workflowId: binding.workflowId,
+      workflowVersion: binding.workflowVersion,
+      source: binding.source,
+      securityFingerprint: binding.securityFingerprint,
+    })),
+    highlightEvents: structuredClone(highlightEvents),
   }
   if (name === 'tabState') {
     const target = targets().get(String(input.tabId))
@@ -679,6 +917,7 @@ async function initialize(): Promise<void> {
     defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/e2e-browser' } },
     proxy: { enabled: true, httpsProxy: fixtureProxy, bypassDomains: [] },
   })
+  await installFixtureWorkflow()
   await workspace.updateProxy()
   await protocol.handle('autoforge-media', createMediaProtocolHandler(runtime.mediaAssets))
 

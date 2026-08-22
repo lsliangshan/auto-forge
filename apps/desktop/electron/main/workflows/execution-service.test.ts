@@ -743,9 +743,13 @@ describe('ExecutionService', () => {
       },
     }
     const request = vi.fn(async (
-      _context: CapabilityContext,
-      _request: WorkerCapabilityRequest,
-    ) => ({ ok: true }))
+      capabilityContext: CapabilityContext,
+      workerRequest: WorkerCapabilityRequest,
+    ) => {
+      void capabilityContext
+      void workerRequest
+      return { ok: true }
+    })
     const harness = createHarness({
       capability: { request, closeExecution: vi.fn(async () => undefined) },
       source: {

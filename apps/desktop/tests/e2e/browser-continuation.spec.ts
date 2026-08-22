@@ -15,7 +15,24 @@ interface HarnessSnapshot {
   openTabs: number
   activeBindings: number
   providerRequests: Array<{ conversationId: string; serialized: string }>
-  forbiddenOperations: string[]
+  providerAttempts: Array<{
+    conversationId: string
+    name: string
+    arguments: unknown
+    offered: boolean
+    afterInspectedPageData: boolean
+  }>
+  executorCalls: Array<{ conversationId: string; name: string }>
+  bindingDetails: Array<{
+    bindingId: string
+    tabId: string
+    conversationId: string
+    workflowId: string
+    workflowVersion: string
+    source: string
+    securityFingerprint: string
+  }>
+  highlightEvents: Array<{ conversationId: string; tabId: string; ref: string }>
 }
 
 async function command<T>(
@@ -41,9 +58,13 @@ async function createConversation(page: Page, app: ElectronApplication): Promise
 }
 
 async function sendChat(page: Page, app: ElectronApplication, conversationId: string, text: string): Promise<void> {
+  await submitChat(page, text)
+  await command(app, 'waitForIdle', { conversationId })
+}
+
+async function submitChat(page: Page, text: string): Promise<void> {
   await page.getByRole('textbox', { name: '消息内容' }).fill(text)
   await page.getByTestId('send-message').click()
-  await command(app, 'waitForIdle', { conversationId })
 }
 
 async function seed(
@@ -102,18 +123,31 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await sendChat(page, electronApp, conversationId, '我的工作居住证“有效期至”是什么')
 
     await expect(page.getByText('有效期至：2028-06-30')).toBeVisible()
+    await expect(page.getByText(/来源：permit\.autoforge\.test \/ https:\/\/permit\.autoforge\.test；读取时间：\d{4}-\d{2}-\d{2}T/)).toBeVisible()
     expect(await fixture.snapshot()).toMatchObject({ authenticated: true, finalSubmissions: 0 })
   })
 
   test('does not offer another conversation the bound page', async () => {
     const owner = await createConversation(page, electronApp)
-    await seed(electronApp, owner, '/details')
+    const ownerBinding = await seed(electronApp, owner, '/details')
+    expect(await command<HarnessSnapshot>(electronApp, 'snapshot')).toMatchObject({
+      activeBindings: 1,
+      bindingDetails: [expect.objectContaining({
+        bindingId: ownerBinding.bindingId,
+        conversationId: owner,
+      })],
+    })
     const other = await createConversation(page, electronApp)
     await sendChat(page, electronApp, other, '读取另一个会话的证件有效期')
 
     const requests = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests
       .filter((request) => request.conversationId === other)
+    expect(requests.length).toBeGreaterThan(0)
     expect(requests.every(({ serialized }) => !serialized.includes('browser_session_inspect'))).toBe(true)
+    expect(await command<HarnessSnapshot>(electronApp, 'snapshot')).toMatchObject({
+      activeBindings: 1,
+      bindingDetails: [expect.objectContaining({ conversationId: owner })],
+    })
     await expect(page.getByText('2028-06-30')).toHaveCount(0)
   })
 
@@ -124,7 +158,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(page.getByText('需要你在浏览器中操作')).toBeVisible()
     await expect(page.getByText('网页需要你先完成登录')).toBeVisible()
 
+    const beforeLoginClick = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
     await command(electronApp, 'userClick', { selector: '#manual-login' })
+    await expect.poll(async () => (await fixture.snapshot()).authenticated).toBe(true)
+    await page.waitForTimeout(500)
+    expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests).toHaveLength(beforeLoginClick)
+    await expect(page.getByText('有效期至：2028-06-30')).toHaveCount(0)
     await sendChat(page, electronApp, conversationId, '我已登录，请继续读取证件“有效期至”')
     await expect(page.getByText('有效期至：2028-06-30')).toBeVisible()
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
@@ -139,7 +178,15 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })
 
     expect(result).toMatchObject({ code: 'OK', completedActions: 2 })
-    expect(await fixture.snapshot()).toMatchObject({ draftSaves: 1, finalSubmissions: 0 })
+    expect(await command<string>(electronApp, 'tabFieldValue', {
+      tabId: binding.tabId, selector: '#employer',
+    })).toBe('北京网聘信息技术有限公司')
+    expect(await fixture.snapshot()).toMatchObject({
+      employer: '北京网聘信息技术有限公司',
+      lastDraftPayload: '北京网聘信息技术有限公司',
+      draftSaves: 1,
+      finalSubmissions: 0,
+    })
     await command(electronApp, 'userClick', { selector: '#final-submit' })
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 1 })
   })
@@ -169,8 +216,26 @@ test.describe.serial('conversation-bound browser continuation', () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details')
     await command(electronApp, 'userClick', { tabId: binding.tabId, selector: '#allowed-popup' })
-    await expect.poll(() => command<HarnessSnapshot>(electronApp, 'snapshot'))
-      .toMatchObject({ activeBindings: 2, openTabs: 2 })
+    await expect.poll(() => command<HarnessSnapshot>(electronApp, 'snapshot')).toMatchObject({
+      activeBindings: 2,
+      openTabs: 2,
+      bindingDetails: [
+        expect.objectContaining({
+          conversationId,
+          workflowId: 'e2e.browser.continuation',
+          workflowVersion: '1.0.0',
+          source: 'installed',
+          securityFingerprint: 'e'.repeat(64),
+        }),
+        expect.objectContaining({
+          conversationId,
+          workflowId: 'e2e.browser.continuation',
+          workflowVersion: '1.0.0',
+          source: 'installed',
+          securityFingerprint: 'e'.repeat(64),
+        }),
+      ],
+    })
   })
 
   test('blocks navigation to a disallowed HTTPS origin', async () => {
@@ -269,25 +334,110 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(durable.messages).not.toMatch(/北京网聘|忽略系统规则|Cookie/i)
   })
 
-  test('page injection cannot add a tool, origin, tab, file operation, raw CDP call, or final click', async () => {
+  test('Main boundary hands a protected final action to the user without clicking it', async () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details')
-    const result = await command<{
-      code: string
-      offeredTools: string[]
-      forbiddenOperations: string[]
-      openTabs: number
-    }>(electronApp, 'directScenario', {
+    const result = await command<{ code: string }>(electronApp, 'directScenario', {
       name: 'injection', bindingId: binding.bindingId,
       userText: '只读取证件有效期，不要操作页面',
     })
 
-    expect(result).toMatchObject({
-      code: 'MANUAL_ACTION_REQUIRED',
-      offeredTools: ['browser_session_inspect', 'browser_session_act', 'browser_session_handoff'],
-      forbiddenOperations: [],
-      openTabs: 1,
+    expect(result).toMatchObject({ code: 'MANUAL_ACTION_REQUIRED' })
+    expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
+  })
+
+  test('Renderer chat and the deterministic provider cannot turn inspected injection text into new authority', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    const binding = await seed(electronApp, conversationId, '/details')
+    const cases = [
+      ['E2E_INJECT_OPEN_TAB', 'browser_session_open_tab'],
+      ['E2E_INJECT_UPLOAD_FILE', 'browser_session_upload_file'],
+      ['E2E_INJECT_RAW_CDP', 'browser_session_raw_cdp'],
+      ['E2E_INJECT_DISALLOWED_ORIGIN', 'browser_session_act'],
+      ['E2E_INJECT_FINAL_CLICK', 'browser_session_act'],
+    ] as const
+
+    for (const [marker] of cases) {
+      await sendChat(page, electronApp, conversationId, `只读取证件有效期，不要操作页面 ${marker}`)
+    }
+
+    const snapshot = await command<HarnessSnapshot>(electronApp, 'snapshot')
+    const attempts = snapshot.providerAttempts.filter((attempt) => attempt.conversationId === conversationId)
+    expect(attempts).toHaveLength(cases.length)
+    expect(attempts.map(({ name }) => name)).toEqual(cases.map(([, name]) => name))
+    expect(attempts.every(({ afterInspectedPageData }) => afterInspectedPageData)).toBe(true)
+    expect(attempts.slice(0, 3).every(({ offered }) => !offered)).toBe(true)
+    expect(attempts.slice(3).every(({ offered }) => offered)).toBe(true)
+    expect(attempts[3]!.arguments).toEqual(expect.objectContaining({
+      actions: [{ type: 'navigate', url: `${fixture.disallowedOrigin}/landing` }],
+    }))
+    expect(attempts[4]!.arguments).toEqual(expect.objectContaining({
+      actions: [expect.objectContaining({ type: 'click' })],
+    }))
+    expect(snapshot.executorCalls.filter(({ conversationId: owner }) => owner === conversationId)
+      .map(({ name }) => name)).toEqual(Array.from({ length: cases.length }, () => 'browser_session_inspect'))
+    expect(snapshot.openTabs).toBe(1)
+    expect(snapshot.activeBindings).toBe(1)
+    expect((await command<{ url: string }>(electronApp, 'tabState', { tabId: binding.tabId })).url)
+      .toBe(`${fixture.origin}/details`)
+    expect(await fixture.snapshot()).toMatchObject({ fileSelections: 0, finalSubmissions: 0 })
+  })
+
+  test('normal workflow origin drives the complete chain and visible browser controls', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    await submitChat(page, '运行工作居住证完整链路 E2E_WORKFLOW_OPEN')
+    await expect(page.getByText('需要授权').last()).toBeVisible()
+    await page.getByTestId('approve-once').last().click()
+    await command(electronApp, 'waitForIdle', { conversationId })
+    await expect(page.getByText(/调用完成.*E2E 工作居住证/).last()).toBeVisible()
+
+    const originated = await command<HarnessSnapshot>(electronApp, 'snapshot')
+    expect(originated).toMatchObject({
+      activeBindings: 1,
+      bindingDetails: [expect.objectContaining({
+        conversationId,
+        workflowId: 'e2e.browser.workflow',
+        workflowVersion: '1.0.0',
+        source: 'installed',
+      })],
     })
+
+    await sendChat(page, electronApp, conversationId, '请点击正式提交 E2E_PROTECTED_HIGHLIGHT')
+    const highlighted = await command<HarnessSnapshot>(electronApp, 'snapshot')
+    expect(highlighted.providerAttempts).toContainEqual(expect.objectContaining({
+      conversationId,
+      name: 'browser_session_act',
+      offered: true,
+      afterInspectedPageData: true,
+    }))
+    const protectedCard = page.getByTestId('browser-status').last()
+    await expect(protectedCard.getByText('需要你在浏览器中操作')).toBeVisible()
+    expect(highlighted.highlightEvents).toContainEqual(expect.objectContaining({ conversationId }))
+    await protectedCard.getByText('查看操作记录').click()
+    await expect(protectedCard.getByTestId('browser-audit-entry')).toHaveCount(3)
+    await expect(protectedCard).toContainText('https://permit.autoforge.test')
+    await expect(protectedCard).toContainText('已交由你操作')
+    await expect(protectedCard).not.toContainText('2028-06-30')
+
+    await command(electronApp, 'pauseNextInspection')
+    await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_STOP')
+    const stopCard = page.getByTestId('browser-status').last()
+    await expect(stopCard.getByText('AI 正在读取网页')).toBeVisible()
+    await stopCard.getByTestId('stop-browser').click()
+    await expect(stopCard.getByTestId('stop-browser')).toBeDisabled()
+    await command(electronApp, 'releaseInspection')
+    await command(electronApp, 'waitForIdle', { conversationId })
+    await expect(stopCard.getByText('浏览器自动操作已停止')).toBeVisible()
+
+    await command(electronApp, 'pauseNextInspection')
+    await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_TAKEOVER')
+    const takeoverCard = page.getByTestId('browser-status').last()
+    await expect(takeoverCard.getByText('AI 正在读取网页')).toBeVisible()
+    await takeoverCard.getByTestId('take-over-browser').click()
+    await expect(takeoverCard.getByTestId('take-over-browser')).toBeDisabled()
+    await command(electronApp, 'releaseInspection')
+    await command(electronApp, 'waitForIdle', { conversationId })
+    await expect(takeoverCard.getByText('浏览器自动操作已停止')).toBeVisible()
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
   })
 })

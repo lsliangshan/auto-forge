@@ -222,7 +222,10 @@ function normalizedRole(value: string): string {
 }
 
 function normalizedText(value: string): string {
-  return value.replaceAll(/[\u0000-\u001f\u007f]/g, ' ').replaceAll(/\s+/g, ' ').trim()
+  return [...value].map((character) => {
+    const codePoint = character.codePointAt(0)!
+    return codePoint <= 31 || codePoint === 127 ? ' ' : character
+  }).join('').replaceAll(/\s+/g, ' ').trim()
 }
 
 function sensitiveText(value: string): boolean {
@@ -322,13 +325,14 @@ function actionsFor(
 
 function fixedSerializedBytes(snapshot: Omit<BrowserPageSnapshot, 'serializedBytes'>): BrowserPageSnapshot {
   let serializedBytes = 0
-  let result: BrowserPageSnapshot
-  do {
-    result = Object.freeze({ ...snapshot, serializedBytes })
-    const next = Buffer.byteLength(JSON.stringify(result), 'utf8')
-    if (next === serializedBytes) return result
+  let result = Object.freeze({ ...snapshot, serializedBytes })
+  let next = Buffer.byteLength(JSON.stringify(result), 'utf8')
+  while (next !== serializedBytes) {
     serializedBytes = next
-  } while (true)
+    result = Object.freeze({ ...snapshot, serializedBytes })
+    next = Buffer.byteLength(JSON.stringify(result), 'utf8')
+  }
+  return result
 }
 
 export class BrowserPageInspector {
