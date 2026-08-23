@@ -44,6 +44,7 @@ import { BrowserContinuationRegistry } from '../main/browser/browser-continuatio
 import type {
   BrowserContinuationBinding,
   BrowserContinuationBindingInput,
+  BrowserContinuationLease,
 } from '../main/browser/browser-continuation-types.js'
 import { BrowserPageInspector } from '../main/browser/browser-page-inspector.js'
 import { ElectronBrowserWorkspace } from '../main/browser/electron-browser-workspace.js'
@@ -416,6 +417,10 @@ type TargetState = {
   id: string
   closed: boolean
   blockedErrorCode?: string
+  blockedOrigin?: string
+  loading?: boolean
+  allowedOrigins?: readonly string[]
+  ownerContinuationRunId?: string
   view: { webContents: {
     getURL(): string
     isDestroyed(): boolean
@@ -436,6 +441,7 @@ type AttachedTerminal = 'normal' | 'failure' | 'handoff' | 'destroy'
 type ObservedTarget = {
   tabId: string
   view: WebContentsView
+  runId?: string
   terminal?: AttachedTerminal
   terminalFinished?: boolean
 }
@@ -447,6 +453,35 @@ const attachedTerminalScenarios = new Map<string, {
   terminal: AttachedTerminal
   result: Promise<Record<string, unknown>>
 }>()
+type RepaintSurface = 'loading' | 'blocked'
+type ToolbarRepaintGate = {
+  waitForStart(): Promise<void>
+  waitForComplete(): Promise<void>
+  release(): void
+  restore(): void
+  pending(): boolean
+}
+type OwnedRepaintScenario = {
+  bindingId: string
+  tabId: string
+  targetView: WebContentsView
+  runId: string
+  lease: BrowserContinuationLease
+  surface: RepaintSurface
+  gate: ToolbarRepaintGate
+}
+const ownedRepaintScenarios = new Map<string, OwnedRepaintScenario>()
+type ShieldLossScenario = {
+  bindingId: string
+  tabId: string
+  targetView: WebContentsView
+  runId: string
+  shield?: WebContentsView
+  destroyed: boolean
+  result: Promise<Record<string, unknown>>
+}
+const shieldLossScenarios = new Map<string, ShieldLossScenario>()
+let resetWorkspaceAfterShieldLoss = false
 
 interface InspectionPause {
   promise: Promise<void>
@@ -459,6 +494,51 @@ function newInspectionPause(): InspectionPause {
   let release!: () => void
   const promise = new Promise<void>((resolve) => { release = resolve })
   return { promise, release }
+}
+
+function waitBounded(promise: Promise<void>, message: string): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<void>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error(message)), 5_000)
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout)
+  })
+}
+
+function createToolbarRepaintGate(toolbar: WebContentsView): ToolbarRepaintGate {
+  const contents = toolbar.webContents
+  const originalLoadURL = contents.loadURL.bind(contents)
+  let intercepted = false
+  let repaintPending = false
+  let release!: () => void
+  let started!: () => void
+  let completed!: () => void
+  const released = new Promise<void>((resolve) => { release = resolve })
+  const repaintStarted = new Promise<void>((resolve) => { started = resolve })
+  const repaintCompleted = new Promise<void>((resolve) => { completed = resolve })
+  contents.loadURL = async (url: string) => {
+    if (intercepted) return originalLoadURL(url)
+    intercepted = true
+    repaintPending = true
+    started()
+    await released
+    try {
+      return await originalLoadURL(url)
+    } finally {
+      repaintPending = false
+      completed()
+    }
+  }
+  return {
+    waitForStart: () => repaintStarted,
+    waitForComplete: () => repaintCompleted,
+    release,
+    restore: () => { contents.loadURL = originalLoadURL },
+    pending: () => repaintPending,
+  }
 }
 
 const networkProxy = new NetworkProxyService({
@@ -509,11 +589,16 @@ function emit(channel: string, value: unknown): void {
   mainWindow.webContents.send(channel, value)
 }
 
-function context(bindingId: string, conversationId: string, userText: string): BrowserContinuationRunContext {
+function context(
+  bindingId: string,
+  conversationId: string,
+  userText: string,
+  runId = `direct_${randomUUID()}`,
+): BrowserContinuationRunContext {
   return {
     userId,
     conversationId,
-    runId: `direct_${randomUUID()}`,
+    runId,
     currentUser: { messageId: `message_${randomUUID()}`, text: userText },
   }
 }
@@ -540,7 +625,12 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
   const bindingId = String(input.bindingId)
   const binding = registry().get(bindingId)
   if (!binding) return { code: 'PAGE_CLOSED' }
-  const current = context(bindingId, binding.conversationId, String(input.userText ?? ''))
+  const current = context(
+    bindingId,
+    binding.conversationId,
+    String(input.userText ?? ''),
+    typeof input.runId === 'string' ? input.runId : undefined,
+  )
   const database = openAppDatabase(databasePath)
   database.chatRuns.insert({
     id: current.runId,
@@ -597,7 +687,13 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
       return { code: resultCode(limited), completedActions }
     }
     const inspected = await inspect()
-    if (inspected.kind !== 'success') return { code: resultCode(inspected) }
+    if (inspected.kind !== 'success') {
+      const pending = input.verifyPendingCancellation === true ? await inspect() : undefined
+      return {
+        code: resultCode(inspected),
+        ...(pending === undefined ? {} : { pendingCode: resultCode(pending) }),
+      }
+    }
     const page = snapshotFrom(inspected)
     if (input.name === 'inspect') return { code: 'OK' }
     if (input.name === 'disallowed') {
@@ -711,9 +807,48 @@ async function clickFixture(selector: string, tabId?: string): Promise<void> {
   throw new Error(`Fixture selector is unavailable: ${selector}`)
 }
 
+type WorkspaceInternals = {
+  window?: BaseWindow
+  toolbar?: WebContentsView
+  inputShield?: WebContentsView
+  inputShieldAttached?: boolean
+  setLoading(state: TargetState, loading: boolean): void
+  setBlockedOrigin(state: TargetState, origin: string | undefined, code?: string): void
+  click(state: TargetState, locator: string, allowedOrigin: string): Promise<void>
+}
+
+function workspaceInternals(): WorkspaceInternals {
+  return workspace as unknown as WorkspaceInternals
+}
+
+async function finishOwnedRepaintScenario(scenario: OwnedRepaintScenario): Promise<void> {
+  const target = targets().get(scenario.tabId)
+  const internals = workspaceInternals()
+  try {
+    if (target && target.view === scenario.targetView) {
+      if (scenario.surface === 'loading') internals.setLoading(target, false)
+      else internals.setBlockedOrigin(target, undefined)
+    }
+    await scenario.lease.release()
+  } finally {
+    scenario.gate.release()
+    scenario.gate.restore()
+    ownedRepaintScenarios.forEach((candidate, scenarioId) => {
+      if (candidate === scenario) ownedRepaintScenarios.delete(scenarioId)
+    })
+  }
+}
+
 async function resetScenario(): Promise<void> {
   inspectionPause?.release()
   inspectionPause = undefined
+  if (resetWorkspaceAfterShieldLoss) {
+    await workspace.reset()
+    resetWorkspaceAfterShieldLoss = false
+  }
+  for (const scenario of [...ownedRepaintScenarios.values()]) await finishOwnedRepaintScenario(scenario)
+  ownedRepaintScenarios.clear()
+  shieldLossScenarios.clear()
   for (const [bindingId, runId] of busyRuns) {
     const binding = registry().get(bindingId)
     if (binding) await workspace.releaseContinuation(binding.tabId, runId)
@@ -749,6 +884,17 @@ function durableRows(conversationId: string): { bindings: string; audits: string
         'SELECT role, blocks_json FROM messages WHERE conversation_id = ?',
       ).all(conversationId)),
     }
+  } finally {
+    database.close()
+  }
+}
+
+function durableBindingTerminalReason(bindingId: string): string | undefined {
+  const database = new Database(databasePath, { readonly: true })
+  try {
+    return (database.prepare(
+      'SELECT terminal_reason AS terminalReason FROM browser_tab_bindings WHERE id = ?',
+    ).get(bindingId) as { terminalReason?: string } | undefined)?.terminalReason
   } finally {
     database.close()
   }
@@ -885,6 +1031,138 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       attachedTerminalScenarios.delete(scenarioId)
     }
   }
+  if (name === 'startOwnedRepaintScenario') {
+    const bindingId = String(input.bindingId)
+    const surface = String(input.surface)
+    if (surface !== 'loading' && surface !== 'blocked') throw new Error('Unsupported owned repaint surface')
+    const binding = registry().get(bindingId)
+    const target = binding ? targets().get(binding.tabId) : undefined
+    const internals = workspaceInternals()
+    if (!binding || !target || !internals.toolbar) throw new Error('Owned repaint target is unavailable')
+    const runId = `repaint_${randomUUID()}`
+    const lease = await registry().acquire(bindingId, { userId, conversationId: binding.conversationId, runId })
+    const targetView = target.view as unknown as WebContentsView
+    const scenarioId = `repaint_${randomUUID()}`
+    const scenario: OwnedRepaintScenario = {
+      bindingId,
+      tabId: binding.tabId,
+      targetView,
+      runId,
+      lease,
+      surface,
+      gate: createToolbarRepaintGate(internals.toolbar),
+    }
+    observedTargets.set(bindingId, { tabId: binding.tabId, view: targetView, runId })
+    ownedRepaintScenarios.set(scenarioId, scenario)
+    try {
+      if (surface === 'loading') internals.setLoading(target, true)
+      else internals.setBlockedOrigin(target, disallowedOrigin, 'DOMAIN_BLOCKED')
+      await waitBounded(scenario.gate.waitForStart(), 'Trusted toolbar repaint did not begin')
+      return scenarioId
+    } catch (error) {
+      await finishOwnedRepaintScenario(scenario)
+      throw error
+    }
+  }
+  if (name === 'releaseOwnedRepaint') {
+    const scenario = ownedRepaintScenarios.get(String(input.scenarioId))
+    if (!scenario) throw new Error('Owned repaint scenario is unavailable')
+    scenario.gate.release()
+    await waitBounded(scenario.gate.waitForComplete(), 'Trusted toolbar repaint did not complete')
+    return
+  }
+  if (name === 'finishOwnedRepaintScenario') {
+    const scenario = ownedRepaintScenarios.get(String(input.scenarioId))
+    if (!scenario) throw new Error('Owned repaint scenario is unavailable')
+    await finishOwnedRepaintScenario(scenario)
+    return
+  }
+  if (name === 'startShieldLossScenario') {
+    if (inspectionPause) throw new Error('An inspection pause is already armed')
+    const bindingId = String(input.bindingId)
+    const binding = registry().get(bindingId)
+    const target = binding ? targets().get(binding.tabId) : undefined
+    if (!binding || !target) throw new Error('Shield-loss target is unavailable')
+    const runId = `shield_loss_${randomUUID()}`
+    const scenarioId = `shield_loss_${randomUUID()}`
+    observedTargets.set(bindingId, { tabId: binding.tabId, view: target.view as unknown as WebContentsView, runId })
+    inspectionPause = newInspectionPause()
+    shieldLossScenarios.set(scenarioId, {
+      bindingId,
+      tabId: binding.tabId,
+      targetView: target.view as unknown as WebContentsView,
+      runId,
+      destroyed: false,
+      result: directScenario({
+        name: 'inspect',
+        bindingId,
+        runId,
+        verifyPendingCancellation: true,
+        userText: 'input shield loss',
+      }),
+    })
+    return scenarioId
+  }
+  if (name === 'destroyExactShield') {
+    const scenario = shieldLossScenarios.get(String(input.scenarioId))
+    if (!scenario?.shield) throw new Error('Exact active-lease shield is unavailable')
+    const target = targets().get(scenario.tabId)
+    const lease = registry().currentLease(scenario.bindingId)
+    if (!target || target.view !== scenario.targetView || target.ownerContinuationRunId !== scenario.runId
+      || !lease || lease.binding.tabId !== scenario.tabId || lease.runId !== scenario.runId) {
+      throw new Error('Exact active shield-loss lease is no longer current')
+    }
+    scenario.shield.webContents.once('destroyed', () => { scenario.destroyed = true })
+    scenario.shield.webContents.close()
+    resetWorkspaceAfterShieldLoss = true
+    return
+  }
+  if (name === 'shieldLossState') {
+    const scenario = shieldLossScenarios.get(String(input.scenarioId))
+    if (!scenario?.shield) throw new Error('Shield-loss scenario is unavailable')
+    const internals = workspaceInternals()
+    const children = internals.window?.contentView.children ?? []
+    const target = targets().get(scenario.tabId)
+    const binding = registry().get(scenario.bindingId)
+    const lease = registry().currentLease(scenario.bindingId)
+    return {
+      exactShieldDestroyed: scenario.destroyed,
+      exactShieldNativeChild: children.includes(scenario.shield),
+      inputShieldAttached: internals.inputShieldAttached === true,
+      replacementShieldPresent: internals.inputShield !== undefined,
+      bindingPresent: binding !== undefined,
+      durableBindingTerminalReason: durableBindingTerminalReason(scenario.bindingId),
+      leaseCurrent: lease?.binding.tabId === scenario.tabId && lease.runId === scenario.runId,
+      targetOwnerCurrent: target?.ownerContinuationRunId === scenario.runId,
+      exactTargetPresent: target?.view === scenario.targetView,
+      exactTargetNativeChild: children.includes(scenario.targetView),
+    }
+  }
+  if (name === 'finishShieldLossScenario') {
+    const scenarioId = String(input.scenarioId)
+    const scenario = shieldLossScenarios.get(scenarioId)
+    if (!scenario) throw new Error('Shield-loss scenario is unavailable')
+    try {
+      inspectionPause?.release()
+      return await scenario.result
+    } finally {
+      shieldLossScenarios.delete(scenarioId)
+    }
+  }
+  if (name === 'toolbarContinuationClick') {
+    const bindingId = String(input.bindingId)
+    const action = String(input.action)
+    if (action !== 'stop' && action !== 'takeover') throw new Error('Unsupported toolbar continuation action')
+    const toolbar = workspaceInternals().toolbar
+    if (!toolbar || toolbar.webContents.isDestroyed()) throw new Error('Trusted toolbar is unavailable')
+    const href = `autoforge-browser://continuation/${action}/${bindingId}`
+    return toolbar.webContents.executeJavaScript(`(() => {
+      const anchor = [...document.querySelectorAll('a')].find((candidate) => candidate.href === ${JSON.stringify(href)});
+      if (!(anchor instanceof HTMLAnchorElement)) return false;
+      anchor.click();
+      return true;
+    })()`, true)
+  }
   if (name === 'snapshot') return {
     openTabs: [...targets().values()].filter((target) => !target.closed).length,
     activeBindings: (registry() as unknown as { bindings: Map<string, unknown> }).bindings.size,
@@ -918,13 +1196,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       observedTarget = { tabId: binding.tabId, view: target.view as unknown as WebContentsView }
       observedTargets.set(bindingId, observedTarget)
     }
-    const internals = workspace as unknown as {
-      window?: BaseWindow
-      toolbar?: WebContentsView
-      inputShield?: WebContentsView
-      inputShieldAttached?: boolean
-      click(state: TargetState, locator: string, allowedOrigin: string): Promise<void>
-    }
+    const internals = workspaceInternals()
     const toolbar = internals.toolbar
     const shield = internals.inputShield
     const window = internals.window
@@ -935,7 +1207,6 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       [toolbar, 'toolbar'],
     ])
     for (const { view } of observedTargets.values()) views.set(view, 'target')
-    if (!children.includes(toolbar)) throw new Error('The trusted toolbar must remain a native child')
     if (children.some((view) => !views.has(view as WebContentsView))) {
       throw new Error('Unexpected native child view in browser continuation workspace')
     }
@@ -946,6 +1217,19 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const targetNativeChild = targetStateMatchesCachedView
       && cachedTargetView !== undefined
       && children.includes(cachedTargetView)
+    const lease = registry().currentLease(bindingId)
+    const leaseCurrent = lease !== undefined
+      && lease.binding.tabId === observedTarget?.tabId
+      && (observedTarget?.runId === undefined || lease.runId === observedTarget.runId)
+    const ownerMatchesLease = target !== undefined
+      && lease !== undefined
+      && target.ownerContinuationRunId === lease.runId
+    const attached = children.includes(shield)
+    for (const scenario of shieldLossScenarios.values()) {
+      if (scenario.bindingId === bindingId && scenario.runId === lease?.runId && attached) {
+        scenario.shield ??= shield
+      }
+    }
     if (observedTarget?.terminal && observedTarget.terminal !== 'destroy'
       && (!targetStateMatchesCachedView || !targetNativeChild)) {
       throw new Error('Non-destruction terminal target must remain the cached native child')
@@ -954,7 +1238,6 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       && (target !== undefined || children.includes(observedTarget.view))) {
       throw new Error('Destroyed terminal target must not remain in workspace state or native children')
     }
-    const attached = children.includes(shield)
     if (attached !== internals.inputShieldAttached) {
       throw new Error('Input shield attachment state disagrees with native child membership')
     }
@@ -972,6 +1255,10 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       targetPresent: target !== undefined,
       targetStateMatchesCachedView,
       targetNativeChild,
+      leaseCurrent,
+      ownerMatchesLease,
+      toolbarRepaintPending: [...ownedRepaintScenarios.values()]
+        .some((scenario) => scenario.bindingId === bindingId && scenario.gate.pending()),
       attached,
       loaded: shield.webContents.getURL().startsWith('data:text/html'),
       order,

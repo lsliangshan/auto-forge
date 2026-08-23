@@ -39,6 +39,9 @@ interface NativeInputShieldState {
   targetPresent: boolean
   targetStateMatchesCachedView: boolean
   targetNativeChild: boolean
+  leaseCurrent: boolean
+  ownerMatchesLease: boolean
+  toolbarRepaintPending: boolean
   attached: boolean
   loaded: boolean
   order: string[]
@@ -58,6 +61,19 @@ interface NativeInputShieldState {
   targetEventsAfterShieldInput: number
   directCdpTargetEvents: number
   attachedAfterInput: boolean
+}
+
+interface ShieldLossState {
+  exactShieldDestroyed: boolean
+  exactShieldNativeChild: boolean
+  inputShieldAttached: boolean
+  replacementShieldPresent: boolean
+  bindingPresent: boolean
+  durableBindingTerminalReason?: string
+  leaseCurrent: boolean
+  targetOwnerCurrent: boolean
+  exactTargetPresent: boolean
+  exactTargetNativeChild: boolean
 }
 
 async function command<T>(
@@ -386,6 +402,93 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })).resolves.toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
   })
 
+  test('keeps the exact owned stack during loading and blocked toolbar repaints', async () => {
+    for (const surface of ['loading', 'blocked'] as const) {
+      const conversationId = await createConversation(page, electronApp)
+      const binding = await seed(electronApp, conversationId, '/details')
+      const scenarioId = await command<string>(electronApp, 'startOwnedRepaintScenario', {
+        bindingId: binding.bindingId,
+        surface,
+      })
+
+      const pending = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+        bindingId: binding.bindingId,
+      })
+      expect(pending).toMatchObject({
+        attached: true,
+        targetStateMatchesCachedView: true,
+        targetNativeChild: true,
+        leaseCurrent: true,
+        ownerMatchesLease: true,
+        toolbarRepaintPending: true,
+        order: ['target', 'shield', 'toolbar'],
+      })
+      expect(pending.shieldBounds).toEqual(pending.targetBounds)
+      expect(pending.toolbarBounds.height).toBe(pending.shieldBounds.y + pending.shieldBounds.height)
+
+      await command(electronApp, 'releaseOwnedRepaint', { scenarioId })
+      const repainted = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+        bindingId: binding.bindingId,
+      })
+      expect(repainted).toMatchObject({
+        attached: true,
+        targetStateMatchesCachedView: true,
+        targetNativeChild: true,
+        leaseCurrent: true,
+        ownerMatchesLease: true,
+        toolbarRepaintPending: false,
+        order: ['target', 'shield', 'toolbar'],
+      })
+      expect(repainted.shieldBounds).toEqual(repainted.targetBounds)
+      expect(repainted.toolbarBounds.height).toBe(repainted.shieldBounds.y + repainted.shieldBounds.height)
+
+      await command(electronApp, 'finishOwnedRepaintScenario', { scenarioId })
+      await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+        bindingId: binding.bindingId,
+      })).resolves.toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
+    }
+  })
+
+  test('fails closed when the exact active-lease shield is destroyed', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    const binding = await seed(electronApp, conversationId, '/details')
+    const scenarioId = await command<string>(electronApp, 'startShieldLossScenario', {
+      bindingId: binding.bindingId,
+    })
+    await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: binding.bindingId,
+    })).toMatchObject({
+      attached: true,
+      targetStateMatchesCachedView: true,
+      targetNativeChild: true,
+      leaseCurrent: true,
+      ownerMatchesLease: true,
+      order: ['target', 'shield', 'toolbar'],
+    })
+
+    await command(electronApp, 'destroyExactShield', { scenarioId })
+    await expect.poll(() => command<ShieldLossState>(electronApp, 'shieldLossState', {
+      scenarioId,
+    })).toMatchObject({
+      exactShieldDestroyed: true,
+      exactShieldNativeChild: false,
+      inputShieldAttached: false,
+      replacementShieldPresent: false,
+      bindingPresent: false,
+      durableBindingTerminalReason: 'PAGE_CLOSED',
+      leaseCurrent: false,
+      targetOwnerCurrent: false,
+      exactTargetPresent: true,
+      exactTargetNativeChild: true,
+    })
+    const draftSaves = (await fixture.snapshot()).draftSaves
+    await command(electronApp, 'userPageOperation', { tabId: binding.tabId, selector: '#save-draft' })
+    await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(draftSaves + 1)
+    await expect(command<{ code: string; pendingCode: string }>(electronApp, 'finishShieldLossScenario', {
+      scenarioId,
+    })).resolves.toMatchObject({ code: 'PAGE_CHANGED', pendingCode: 'CANCELLED' })
+  })
+
   test('detaches the native shield after normal completion, failure, handoff, and active target destruction', async () => {
     const outcomes = [
       ['normal', 'OK'],
@@ -602,8 +705,10 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
     })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
-    await stopCard.getByTestId('stop-browser').click()
-    await expect(stopCard.getByTestId('stop-browser')).toBeDisabled()
+    await expect(command<boolean>(electronApp, 'toolbarContinuationClick', {
+      bindingId: continuationBinding.bindingId,
+      action: 'stop',
+    })).resolves.toBe(true)
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
     })).toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
@@ -623,8 +728,10 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
     })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
-    await takeoverCard.getByTestId('take-over-browser').click()
-    await expect(takeoverCard.getByTestId('take-over-browser')).toBeDisabled()
+    await expect(command<boolean>(electronApp, 'toolbarContinuationClick', {
+      bindingId: continuationBinding.bindingId,
+      action: 'takeover',
+    })).resolves.toBe(true)
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
     })).toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
