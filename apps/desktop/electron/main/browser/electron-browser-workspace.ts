@@ -1123,8 +1123,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     view.webContents.on('before-input-event', () => {
       void this.handleUserTakeover(state).catch(() => undefined)
     })
-    view.webContents.on('before-mouse-event', () => {
-      void this.handleUserTakeover(state).catch(() => undefined)
+    view.webContents.on('before-mouse-event', (event: NavigationEvent) => {
+      if (state.ownerContinuationRunId && state.syntheticInputOperations === 0) event.preventDefault()
     })
     view.webContents.on('render-process-gone', () => {
       if (!view.webContents.isDestroyed()) view.webContents.close()
