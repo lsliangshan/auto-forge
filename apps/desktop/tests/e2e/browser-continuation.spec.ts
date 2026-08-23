@@ -591,6 +591,11 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(stopCard.getByText('浏览器自动操作已停止')).toBeVisible()
+    const stopDraftSaves = (await fixture.snapshot()).draftSaves
+    await command(electronApp, 'userPageOperation', {
+      tabId: continuationBinding.tabId, selector: '#save-draft',
+    })
+    await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(stopDraftSaves + 1)
 
     await command(electronApp, 'pauseNextInspection')
     await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_TAKEOVER')
@@ -607,6 +612,11 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(takeoverCard.getByText('浏览器自动操作已停止')).toBeVisible()
+    const takeoverDraftSaves = (await fixture.snapshot()).draftSaves
+    await command(electronApp, 'userPageOperation', {
+      tabId: continuationBinding.tabId, selector: '#save-draft',
+    })
+    await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(takeoverDraftSaves + 1)
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
   })
 })

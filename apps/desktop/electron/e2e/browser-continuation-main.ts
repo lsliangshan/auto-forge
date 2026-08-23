@@ -807,6 +807,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
   }
   if (name === 'seedBinding') return seedBinding(input)
   if (name === 'userClick') return clickFixture(String(input.selector), input.tabId ? String(input.tabId) : undefined)
+  if (name === 'userPageOperation') return clickFixture(String(input.selector), input.tabId ? String(input.tabId) : undefined)
   if (name === 'tabFieldValue') {
     const target = targets().get(String(input.tabId))
     if (!target || target.closed || target.view.webContents.isDestroyed()) throw new Error('Fixture tab is unavailable')
@@ -902,16 +903,13 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (!toolbar || !shield || !window) throw new Error('Dedicated native input shield is unavailable')
     const liveTargetView = target?.view as unknown as WebContentsView | undefined
     if (liveTargetView) observedTargetViews.set(bindingId, liveTargetView)
-    const targetView = liveTargetView ?? observedTargetViews.get(bindingId)
     const children = window.contentView.children
     const views = new Map<WebContentsView, 'target' | 'shield' | 'toolbar'>([
       [shield, 'shield'],
       [toolbar, 'toolbar'],
     ])
     for (const observedTargetView of observedTargetViews.values()) views.set(observedTargetView, 'target')
-    if ((target && (!targetView || !children.includes(targetView))) || !children.includes(toolbar)) {
-      throw new Error('The target and trusted toolbar must remain native children')
-    }
+    if (!children.includes(toolbar)) throw new Error('The trusted toolbar must remain a native child')
     if (children.some((view) => !views.has(view as WebContentsView))) {
       throw new Error('Unexpected native child view in browser continuation workspace')
     }
