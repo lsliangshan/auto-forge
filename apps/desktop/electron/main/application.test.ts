@@ -3519,7 +3519,7 @@ describe('createApplicationRuntime', () => {
     expect(JSON.stringify(agentRequests(captured)[2]!.messages)).not.toContain('2028-06-30')
 
     await runtime.services.chat.send(chatInput(conversation.id, '只总结上次安全结果'))
-    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(4))
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(5))
     const followUpContext = JSON.stringify(agentRequests(captured)[3]!.messages)
     expect(followUpContext).toContain('有效期至：2028-06-30')
     expect(followUpContext).toContain('[浏览器页面: permit.example.gov.cn; 来源: https://permit.example.gov.cn;')
@@ -3527,6 +3527,9 @@ describe('createApplicationRuntime', () => {
     expect(followUpContext).not.toContain(privateValue)
     expect(followUpContext).not.toContain(ephemeralPageData)
     expect(followUpContext).not.toMatch(/UNTRUSTED_BROWSER_PAGE_DATA|snapshotId|backendNodeId|identity=private/)
+    const followUpRoute = JSON.stringify(agentRequests(captured)[4]!.messages)
+    expect(followUpRoute).toContain('只总结上次安全结果')
+    expect(followUpRoute).not.toMatch(/2028-06-30|110101199001010000|本次运行临时页面说明/)
 
     const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
     try {
@@ -5689,11 +5692,14 @@ describe('createApplicationRuntime', () => {
     const live = registry.bind(binding)
 
     await runtime.services.chat.send(chatInput(conversation.id, '读取证件有效期'))
-    await vi.waitFor(() => expect(requests).toHaveLength(1))
+    await vi.waitFor(() => expect(requests).toHaveLength(2))
 
     expect(requests[0]?.tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining([
       'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
     ]))
+    expect(requests[1]?.tools?.map((tool) => tool.function.name)).toEqual([
+      'report_browser_continuation_route',
+    ])
     expect(registry.list(session.user.id, conversation.id)).toEqual([live])
     expect(workspace.setContinuationRegistry).toHaveBeenCalledTimes(1)
     expect(workspace.onPageInvalidated).toHaveBeenCalledTimes(1)

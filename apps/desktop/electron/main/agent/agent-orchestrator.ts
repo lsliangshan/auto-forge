@@ -36,6 +36,7 @@ import type {
   BrowserContinuationCatalogSnapshot,
   BrowserContinuationCandidate,
 } from './browser-continuation-catalog.js'
+import { routeBrowserContinuationRequest } from './browser-continuation-router.js'
 import type {
   BrowserAction,
   BrowserPageSnapshot,
@@ -1057,6 +1058,42 @@ export class AgentOrchestrator {
         return this.continuePendingTool(active)
       }
       if (finishReason === 'stop') {
+        if (!active.browserRead && !active.browserTerminal && active.browserCatalog.bindings.size > 0) {
+          const route = await routeBrowserContinuationRequest({
+            trustedRequest: active.browserAuthorization.trustedRequest,
+            candidates: [...active.browserCatalog.bindings.values()].map((candidate) => ({
+              bindingId: candidate.bindingId,
+              workflowLabel: candidate.workflowLabel,
+              pageLabel: candidate.pageLabel,
+              origin: candidate.origin,
+            })),
+            providerSnapshot: active.providerSnapshot,
+            providerUsage: this.dependencies.providerUsage,
+            model: active.model,
+            userId: active.userId,
+            requestId: active.requestId,
+            chatRunId: active.runId,
+            signal: active.controller.signal,
+            id: this.id,
+            now: this.now,
+          })
+          if (route.usage) this.addUsage(active, route.usage)
+          if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+          if (route.bindingId !== null) {
+            active.browserExplicitBindingId = route.bindingId
+            return this.executeBrowserTool(active, {
+              type: 'tool_call',
+              choiceIndex: 0,
+              index: 0,
+              id: this.id(),
+              name: 'browser_session_inspect',
+              arguments: {
+                bindingId: route.bindingId,
+                intent: active.browserAuthorization.inspectIntent,
+              },
+            }, '')
+          }
+        }
         if (active.browserRead) this.appendText(active, await this.browserAnswer(active))
         else for (const text of bufferedText) this.appendText(active, text)
         this.appendWorkflowProvenance(active)

@@ -3544,6 +3544,77 @@ describe('AgentOrchestrator', () => {
     expect(terminal).not.toContain('证件编号：202111127927')
   })
 
+  it('recovers a direct personal-data refusal by routing to and inspecting the bound page', async () => {
+    const refusal = '抱歉，我无法查询您的个人证件号码。'
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: refusal },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'browser_route_call',
+        name: 'report_browser_continuation_route', arguments: { bindingId: 'binding_1' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'field_match_call',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => inspectedPrivateFields([
+        { ref: 'ref_number', label: '证件号码', value: '430722******8715' },
+      ]),
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的证件号码是？',
+      provider: 'openrouter', model: 'model', requestId: 'browser_route_recovery',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).toHaveBeenCalledOnce()
+    expect(browser.executor.execute).toHaveBeenCalledWith(
+      'browser_session_inspect',
+      { bindingId: 'binding_1', intent: '我的证件号码是？' },
+      expect.any(Object),
+    )
+    const routeRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(JSON.stringify(routeRequest.messages)).toContain('证件详情')
+    expect(JSON.stringify(routeRequest.messages)).not.toContain('430722******8715')
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('证件号码：430722******8715')
+    expect(terminal).not.toContain(refusal)
+  })
+
+  it('keeps an unrelated direct answer when the isolated browser route selects no page', async () => {
+    const answer = '二进制使用 0 和 1 表示数值。'
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: answer },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'browser_no_route_call',
+        name: 'report_browser_continuation_route', arguments: { bindingId: null },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies)
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '什么是二进制？',
+      provider: 'openrouter', model: 'model', requestId: 'browser_route_unrelated',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).not.toHaveBeenCalled()
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(answer)
+  })
+
   it('fails closed when AI says a related browser label is not the requested attribute', async () => {
     const dependencies = harness([[
       {
