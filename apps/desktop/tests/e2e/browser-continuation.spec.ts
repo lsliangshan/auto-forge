@@ -35,28 +35,18 @@ interface HarnessSnapshot {
   highlightEvents: Array<{ conversationId: string; tabId: string; ref: string }>
 }
 
-interface InputShieldProbe {
+interface NativeInputShieldState {
+  attached: boolean
+  loaded: boolean
+  order: string[]
+  shieldBounds: { x: number; y: number; width: number; height: number }
   toolbarBounds: { x: number; y: number; width: number; height: number }
   targetBounds: { x: number; y: number; width: number; height: number }
-  toolbarTopmost: boolean
-  toolbarBackground: string
-  hitSurface?: TrustedToolbarHitSurface
-  shieldMouseEvents: number
-  targetMouseEvents: number
-  targetCdpMouseEvents: number
-}
-
-interface TrustedToolbarHitSurface {
-  pointerEvents: string
-  backgroundAlpha: number
-  width: number
-  height: number
-  containsPoint: boolean
-}
-
-interface TrustedToolbarSurfaceState {
-  toolbarBounds: { x: number; y: number; width: number; height: number }
-  surface?: TrustedToolbarHitSurface
+  documentAlpha: number
+  documentAlphaGreaterThanZero: boolean
+  shieldEventCount: number
+  targetEventsAfterShieldInput: number
+  directCdpTargetEvents: number
 }
 
 async function command<T>(
@@ -331,51 +321,47 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })).resolves.toMatchObject({ code: 'CANCELLED', takenOver: true })
   })
 
-  test('uses the transparent trusted toolbar shield while CDP still targets the owned page', async () => {
+  test('dedicated native input shield attaches above the target during an active continuation and detaches on release', async () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details')
+
+    const before = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: binding.bindingId,
+    })
+    expect(before).toMatchObject({
+      attached: false,
+      loaded: true,
+      order: ['target', 'toolbar'],
+      shieldBounds: { x: 0, y: 52 },
+      toolbarBounds: { x: 0, y: 0, width: 1280, height: 52 },
+      targetBounds: { x: 0, y: 52, width: 1280 },
+    })
+
     await command(electronApp, 'holdBusy', { bindingId: binding.bindingId })
 
-    const shield = await command<InputShieldProbe>(electronApp, 'shieldProbe', { bindingId: binding.bindingId })
+    const owned = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: binding.bindingId,
+      probeInput: true,
+    })
 
-    expect(shield).toMatchObject({
+    expect(owned).toMatchObject({
+      attached: true,
+      order: ['target', 'shield', 'toolbar'],
+      shieldBounds: { x: 0, y: 52 },
       toolbarBounds: { x: 0, y: 0, width: 1280 },
       targetBounds: { x: 0, y: 52, width: 1280 },
-      toolbarTopmost: true,
-      toolbarBackground: 'rgba(0, 0, 0, 0)',
-      shieldMouseEvents: 1,
-      targetMouseEvents: 0,
-      targetCdpMouseEvents: 1,
+      documentAlphaGreaterThanZero: true,
+      shieldEventCount: 1,
+      targetEventsAfterShieldInput: 0,
+      directCdpTargetEvents: 1,
     })
-    expect(shield.toolbarBounds.height).toBe(shield.targetBounds.y + shield.targetBounds.height)
+    expect(owned.documentAlpha).toBeLessThanOrEqual(0.004)
+    expect(owned.shieldBounds).toEqual(owned.targetBounds)
 
     await command(electronApp, 'releaseBusy', { bindingId: binding.bindingId })
-  })
-
-  test('keeps a pre-rendered composited hit surface ready for synchronous ownership expansion', async () => {
-    const conversationId = await createConversation(page, electronApp)
-    const binding = await seed(electronApp, conversationId, '/details')
-
-    const before = await command<TrustedToolbarSurfaceState>(electronApp, 'shieldSurfaceState')
-    expect(before.toolbarBounds).toMatchObject({ x: 0, y: 0, width: 1280, height: 52 })
-    expect(before.surface).toMatchObject({ pointerEvents: 'auto' })
-    expect(before.surface?.backgroundAlpha).toBeGreaterThan(0)
-    expect(before.surface?.backgroundAlpha).toBeLessThanOrEqual(0.004)
-
-    await command(electronApp, 'holdBusy', { bindingId: binding.bindingId })
-    const owned = await command<InputShieldProbe>(electronApp, 'shieldProbe', { bindingId: binding.bindingId })
-
-    expect(owned.hitSurface).toMatchObject({
-      pointerEvents: 'auto',
-      containsPoint: true,
-      width: owned.targetBounds.width,
-      height: owned.targetBounds.height,
-    })
-    expect(owned.hitSurface?.backgroundAlpha).toBeGreaterThan(0)
-    expect(owned.hitSurface?.backgroundAlpha).toBeLessThanOrEqual(0.004)
-    expect(owned.targetCdpMouseEvents).toBe(1)
-
-    await command(electronApp, 'releaseBusy', { bindingId: binding.bindingId })
+    await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: binding.bindingId,
+    })).resolves.toMatchObject({ attached: false, order: ['target', 'toolbar'] })
   })
 
   test('stops after exactly thirty continuation actions', async () => {
@@ -507,6 +493,8 @@ test.describe.serial('conversation-bound browser continuation', () => {
         source: 'installed',
       })],
     })
+    const continuationBinding = originated.bindingDetails.find(({ conversationId: owner }) => owner === conversationId)
+    if (!continuationBinding) throw new Error('The normal workflow did not create a continuation binding')
 
     await sendChat(page, electronApp, conversationId, '请点击正式提交 E2E_PROTECTED_HIGHLIGHT')
     const highlighted = await command<HarnessSnapshot>(electronApp, 'snapshot')
@@ -531,6 +519,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(stopCard.getByText('AI 正在读取网页')).toBeVisible()
     await stopCard.getByTestId('stop-browser').click()
     await expect(stopCard.getByTestId('stop-browser')).toBeDisabled()
+    await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: continuationBinding.bindingId,
+    })).toMatchObject({ attached: false, order: ['target', 'toolbar'] })
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(stopCard.getByText('浏览器自动操作已停止')).toBeVisible()
@@ -541,6 +532,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(takeoverCard.getByText('AI 正在读取网页')).toBeVisible()
     await takeoverCard.getByTestId('take-over-browser').click()
     await expect(takeoverCard.getByTestId('take-over-browser')).toBeDisabled()
+    await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: continuationBinding.bindingId,
+    })).toMatchObject({ attached: false, order: ['target', 'toolbar'] })
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(takeoverCard.getByText('浏览器自动操作已停止')).toBeVisible()

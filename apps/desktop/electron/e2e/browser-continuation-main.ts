@@ -425,14 +425,6 @@ type TargetState = {
   }; getBounds(): { x: number; y: number; width: number; height: number } }
 }
 
-interface TrustedToolbarHitSurface {
-  pointerEvents: string
-  backgroundAlpha: number
-  width: number
-  height: number
-  containsPoint: boolean
-}
-
 let mainWindow: BrowserWindow | null = null
 let runtime: Runtime | undefined
 let disposeIpc: (() => void) | undefined
@@ -844,41 +836,65 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (!target || target.closed) return { url: '', blockedErrorCode: 'PAGE_CLOSED' }
     return { url: target.view.webContents.getURL(), blockedErrorCode: target.blockedErrorCode }
   }
-  if (name === 'shieldSurfaceState') {
-    const internals = workspace as unknown as { toolbar?: WebContentsView }
-    const toolbar = internals.toolbar
-    if (!toolbar) throw new Error('Trusted toolbar shield is unavailable')
-    return {
-      toolbarBounds: toolbar.getBounds(),
-      surface: await toolbar.webContents.executeJavaScript(`
-        (() => {
-          const surface = document.querySelector('[data-autoforge-input-shield]')
-          if (!(surface instanceof HTMLElement)) return undefined
-          const style = getComputedStyle(surface)
-          const alpha = Number((style.backgroundColor.match(/rgba?\\([^,]+,[^,]+,[^,]+(?:,\\s*([^)]+))?\\)/)?.[1]) ?? 1)
-          const bounds = surface.getBoundingClientRect()
-          return {
-            pointerEvents: style.pointerEvents,
-            backgroundAlpha: alpha,
-            width: bounds.width,
-            height: bounds.height,
-            containsPoint: surface.contains(document.elementFromPoint(24, 96)),
-          }
-        })()
-      `) as TrustedToolbarHitSurface | undefined,
-    }
-  }
-  if (name === 'shieldProbe') {
+  if (name === 'nativeInputShieldState') {
     const binding = registry().get(String(input.bindingId))
     const target = binding ? targets().get(binding.tabId) : undefined
     const internals = workspace as unknown as {
       window?: BaseWindow
       toolbar?: WebContentsView
+      inputShield?: WebContentsView
+      inputShieldAttached?: boolean
       click(state: TargetState, locator: string, allowedOrigin: string): Promise<void>
     }
     const toolbar = internals.toolbar
+    const shield = internals.inputShield
     const window = internals.window
-    if (!target || !toolbar || !window) throw new Error('Trusted toolbar shield is unavailable')
+    if (!target || !toolbar || !shield || !window) throw new Error('Dedicated native input shield is unavailable')
+    const targetView = target.view as unknown as WebContentsView
+    const children = window.contentView.children
+    const views = new Map<WebContentsView, 'target' | 'shield' | 'toolbar'>([
+      [targetView, 'target'],
+      [shield, 'shield'],
+      [toolbar, 'toolbar'],
+    ])
+    if (!children.includes(targetView) || !children.includes(toolbar)) {
+      throw new Error('The target and trusted toolbar must remain native children')
+    }
+    if (children.some((view) => !views.has(view as WebContentsView))) {
+      throw new Error('Unexpected native child view in browser continuation workspace')
+    }
+    const attached = children.includes(shield)
+    if (attached !== internals.inputShieldAttached) {
+      throw new Error('Input shield attachment state disagrees with native child membership')
+    }
+    const order = children.map((view) => views.get(view as WebContentsView))
+    if (order.some((view): view is undefined => view === undefined)) {
+      throw new Error('Browser continuation view identity could not be resolved')
+    }
+    const documentAlpha = await shield.webContents.executeJavaScript(`
+      (() => {
+        const values = getComputedStyle(document.body).backgroundColor.match(/[0-9.]+/g)
+        return values?.length === 4 ? Number(values[3]) : 1
+      })()
+    `) as number
+    const state = {
+      attached,
+      loaded: shield.webContents.getURL().startsWith('data:text/html'),
+      order,
+      shieldBounds: shield.getBounds(),
+      toolbarBounds: toolbar.getBounds(),
+      targetBounds: target.view.getBounds(),
+      documentAlpha,
+      documentAlphaGreaterThanZero: documentAlpha > 0,
+    }
+    if (!input.probeInput) {
+      return {
+        ...state,
+        shieldEventCount: 0,
+        targetEventsAfterShieldInput: 0,
+        directCdpTargetEvents: 0,
+      }
+    }
     let shieldMouseEvents = 0
     let targetMouseEvents = 0
     let resolveShieldMouse!: () => void
@@ -887,45 +903,26 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const targetCdpMouse = new Promise<void>((resolve) => { resolveTargetCdpMouse = resolve })
     const onShieldMouse = () => { shieldMouseEvents += 1; resolveShieldMouse() }
     const onTargetMouse = () => { targetMouseEvents += 1; resolveTargetCdpMouse() }
-    toolbar.webContents.once('before-mouse-event', onShieldMouse)
+    shield.webContents.once('before-mouse-event', onShieldMouse)
     target.view.webContents.once('before-mouse-event', onTargetMouse)
     try {
       window.focus()
-      toolbar.webContents.sendInputEvent({ type: 'mouseDown', x: 24, y: 96, button: 'left', clickCount: 1 })
+      // This targets the selected shield WebContents directly; it is not an OS-native hit-test assertion.
+      shield.webContents.sendInputEvent({ type: 'mouseDown', x: 24, y: 24, button: 'left', clickCount: 1 })
       await shieldMouse
       const targetMouseEventsAfterShield = targetMouseEvents
+      // CDP targets the selected page WebContents directly and intentionally bypasses the native shield.
       const clicking = internals.click(target, 'css=#progress-save', fixtureOrigin)
       await targetCdpMouse
       await clicking
       return {
-        toolbarBounds: toolbar.getBounds(),
-        targetBounds: target.view.getBounds(),
-        toolbarTopmost: window.contentView.children.at(-1) === toolbar,
-        toolbarBackground: String(await toolbar.webContents.executeJavaScript(
-          'getComputedStyle(document.body).backgroundColor',
-        )),
-        hitSurface: await toolbar.webContents.executeJavaScript(`
-          (() => {
-            const surface = document.querySelector('[data-autoforge-input-shield]')
-            if (!(surface instanceof HTMLElement)) return undefined
-            const style = getComputedStyle(surface)
-            const alpha = Number((style.backgroundColor.match(/rgba?\\([^,]+,[^,]+,[^,]+(?:,\\s*([^)]+))?\\)/)?.[1]) ?? 1)
-            const bounds = surface.getBoundingClientRect()
-            return {
-              pointerEvents: style.pointerEvents,
-              backgroundAlpha: alpha,
-              width: bounds.width,
-              height: bounds.height,
-              containsPoint: surface.contains(document.elementFromPoint(24, 96)),
-            }
-          })()
-        `) as TrustedToolbarHitSurface | undefined,
-        shieldMouseEvents,
-        targetMouseEvents: targetMouseEventsAfterShield,
-        targetCdpMouseEvents: targetMouseEvents - targetMouseEventsAfterShield,
+        ...state,
+        shieldEventCount: shieldMouseEvents,
+        targetEventsAfterShieldInput: targetMouseEventsAfterShield,
+        directCdpTargetEvents: targetMouseEvents - targetMouseEventsAfterShield,
       }
     } finally {
-      toolbar.webContents.removeListener('before-mouse-event', onShieldMouse)
+      shield.webContents.removeListener('before-mouse-event', onShieldMouse)
       target.view.webContents.removeListener('before-mouse-event', onTargetMouse)
     }
   }
