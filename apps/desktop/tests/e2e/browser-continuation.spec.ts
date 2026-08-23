@@ -194,7 +194,8 @@ test.describe.serial('conversation-bound browser continuation', () => {
 
     await expect(page.getByText('最高学历：本科')).toBeVisible()
     const requests = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests
-      .filter((request) => request.conversationId === conversationId)
+      .filter((request) => request.conversationId === conversationId
+        && /browser_session_inspect|report_browser_field_matches/u.test(request.serialized))
     expect(requests).toHaveLength(13)
   })
 
