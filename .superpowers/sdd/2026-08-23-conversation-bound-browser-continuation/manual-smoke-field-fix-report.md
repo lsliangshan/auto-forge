@@ -78,3 +78,56 @@
 The change adds no new tool, permission, origin, selector, persistent page-data channel, or action authority. It does not special-case the Beijing hostname or hardcode any production date. It only creates a structured value from already-readable display text when the frozen user intent and conservative field grammar both agree.
 
 The user-assisted Beijing portal smoke has **not** been re-run by this automated fix and must be repeated on the real visible page. Acceptance should confirm that the actual displayed label/date is returned with source and read time, that unrelated page fields are absent from the durable conversation, and that no final action is performed.
+
+## Fix Round 1: narrow typed static evidence
+
+### Independent RED evidence
+
+1. Typed-value and durable-answer RED:
+
+   ```text
+   Test Files  2 failed (2)
+   Tests       8 failed | 190 passed (198)
+   ```
+
+   The former bounded-scalar fallback projected business prose, instruction-like prose, an arbitrary `.io` domain, an AWS `AKIA...` access-key shape, a formatted phone number, and a contact name as values. The real Inspector-to-Orchestrator integration therefore became ambiguous instead of producing the one safe expiry answer. An ISO date-time also failed to structure because the old delimiter count treated its time colons as field-delimiter spam.
+
+2. Raw-role RED:
+
+   ```text
+   BrowserPageInspector > does not project an InlineTextBox date as static field evidence
+   1 failed | 62 passed
+   ```
+
+   Normalizing `InlineTextBox` to `statictext` before the projection gate allowed a layout fragment to become evidence.
+
+3. Unicode pre-normalization RED:
+
+   ```text
+   BrowserPageInspector > drops a static field containing a Unicode $case before normalization
+   2 failed | 67 passed
+   ```
+
+   Trailing U+2028 and U+2029 were collapsed/trimmed as whitespace, leaving a valid-looking date value. Mixed U+2028/U+2029 instructions, zero-width U+200B, and bidi U+202E cases were added to the same boundary suite.
+
+### GREEN contract and security analysis
+
+- Static display evidence now has a narrow typed whitelist only: a calendar-valid `YYYY-MM-DD`, a calendar/time/UTC-offset-valid ISO date-time, or a pair of valid ISO dates separated by `至`, `到`, `~`, `～`, or `–`. There is no arbitrary short-scalar or prose fallback.
+- A field is considered for structuring only when the raw AX role is exactly `StaticText`. `InlineTextBox` remains a safe semantic name-only node and can never supply evidence.
+- Raw `StaticText` containing Unicode categories `Cc`, `Cf`, `Zl`, or `Zp` is discarded before `safeText` or whitespace normalization. This rejects C0/C1 controls, line/paragraph separators, zero-width format characters, and bidi controls rather than allowing them to join or conceal content.
+- Existing label/value length caps, `safeText`/`sensitiveText`, sensitive labels, prompt-instruction rejection, and the frozen inspect-intent relevance check remain fail-closed. Invalid but relevant label/value pairs are discarded, so arbitrary prose, names/contact data, phone/private-number shapes, all URLs/domains, paths, identity data, and credential/key/token shapes cannot become evidence or enter the provider tool snapshot through this new path.
+- ASCII time colons are accepted only when the entire value matches the typed date-time grammar. Repeated field delimiters and mixed trailing content remain invalid.
+- The Agent integration again yields exactly one Main-owned `工作居住证有效期：2028-06-30` answer with source and read time, ignores provider prose, and excludes all rejected raw field text from terminal state and simulated next-turn context. The only persisted page-derived value is the intentionally persisted final assistant answer. The existing two-matching-values case remains ambiguous.
+- Pagination, serialized-size enforcement, opaque run-local refs/cursors, durable-context exclusion, final-action protection, and injection authority remain unchanged.
+
+### Fix Round 1 verification
+
+- Focused Inspector + Orchestrator GREEN: `2 files / 205 tests passed`.
+- Changed-file ESLint: exit 0, zero errors/warnings.
+- Full native-aware unit suite: `88 files / 2363 tests passed`.
+- Full typecheck: PASS.
+- Full production build: PASS; only the two pre-existing VueUse annotation warnings were emitted.
+- Real Electron browser-continuation E2E: `19/19 passed` in 53.5 seconds. The Renderer static-expiry case passed and the final-action/injection cases remained blocked.
+- `git diff --check`: PASS.
+
+The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 1.

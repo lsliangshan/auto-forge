@@ -229,12 +229,12 @@ const emailAddress = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/iu
 const uuid = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu
 const filesystemPath = /(?:\bfile\s*:|\b(?:file|folder|directory)path\s*[:=]|(?:^|[\s="'(:])\/(?:[^\s/]+\/)*[^\s/]+|\b[A-Za-z]:[\\/]|(?:^|[\s="'(])\\\\[^\\/\s]+[\\/][^\\/\s]+)/iu
 const staticFieldLabel = /^[\p{L}\p{N}][\p{L}\p{N}\s（）()·_-]*$/u
-const staticFieldValue = /^[\p{L}\p{N}][\p{L}\p{N}\s（）()·_.-]*$/u
 const sensitiveStaticFieldLabel = /(?:authorization|bearer|cookie|credential|password|passcode|pin|secret|session|token|api[-_ ]?key|access[-_ ]?key|refresh[-_ ]?key|密码|口令|密钥|秘钥|令牌|验证码|校验码|动态码|身份证|身份号码|证件号码|社会保障号|银行卡|信用卡|借记卡|姓名|住址|地址|手机号|联系电话|邮箱|电子邮件)/iu
-const credentialLikeValue = /(?:^|\s)(?:sk|pk|ghp|github_pat|xox[baprs]|AKIA)[-_][A-Za-z0-9._-]{8,}(?:$|\s)/u
-const urlLikeText = /(?:https?:\/\/|www\.|\b[a-z0-9-]+\.(?:com|cn|gov|net|org)\b)/iu
 const instructionLikeText = /(?:(?:忽略|无视|覆盖|绕过).{0,16}(?:系统|策略|指令|提示)|(?:调用|使用|新增|添加|执行|提交|发送|上传|删除).{0,16}(?:工具|字段|数据|内容|请求)|(?:ignore|disregard|override|bypass).{0,24}(?:system|policy|prompt|instruction)|(?:call|invoke|add|submit|send|upload|delete).{0,24}(?:tool|field|data|content|request))/iu
-const proseLikeText = /(?:^(?:本|该).{2,40}(?:为|是|将于|已于)|(?:请|需要|应当|必须|点击|查看|继续|前往|按照|根据|如果|然后|否则).{2,}|^(?:this|the).{2,80}(?:is|will|was)|(?:please|must|should|click|view|continue|visit|follow|according|if|then|otherwise).{2,})/iu
+const isoStaticDate = /^(\d{4})-(\d{2})-(\d{2})$/u
+const isoStaticDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|[+-](\d{2}):(\d{2}))$/u
+const isoStaticDateRange = /^(\d{4}-\d{2}-\d{2})\s*(?:至|到|~|～|–)\s*(\d{4}-\d{2}-\d{2})$/u
+const unsafeStaticFieldRawText = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
@@ -253,11 +253,35 @@ function normalizedText(value: string): string {
   }).join('').replaceAll(/\s+/g, ' ').trim()
 }
 
-function containsControlText(value: string): boolean {
-  return [...value].some((character) => {
-    const codePoint = character.codePointAt(0)!
-    return codePoint <= 31 || codePoint === 127
-  })
+function validIsoStaticDate(value: string): boolean {
+  const match = isoStaticDate.exec(value)
+  if (!match) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  if (year < 1 || month < 1 || month > 12 || day < 1) return false
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return day <= days[month - 1]!
+}
+
+function safeStaticDateValue(value: string): boolean {
+  if (validIsoStaticDate(value)) return true
+  const range = isoStaticDateRange.exec(value)
+  if (range) return validIsoStaticDate(range[1]!) && validIsoStaticDate(range[2]!)
+  const dateTime = isoStaticDateTime.exec(value)
+  if (!dateTime || !validIsoStaticDate(dateTime[1]!)) return false
+  const hour = Number(dateTime[2])
+  const minute = Number(dateTime[3])
+  const second = Number(dateTime[4] ?? '0')
+  const offsetHour = Number(dateTime[5] ?? '0')
+  const offsetMinute = Number(dateTime[6] ?? '0')
+  return hour <= 23
+    && minute <= 59
+    && second <= 59
+    && offsetHour <= 14
+    && offsetMinute <= 59
+    && (offsetHour !== 14 || offsetMinute === 0)
 }
 
 function sensitiveText(value: string): boolean {
@@ -295,15 +319,14 @@ function structuredStaticField(
   rawText: string,
   intent: string,
 ): StructuredStaticField | null | undefined {
+  if (unsafeStaticFieldRawText.test(rawText)) return null
   const safeOriginal = safeText(rawText)
   if (!safeOriginal) return null
   if (instructionLikeText.test(safeOriginal) || sensitiveStaticFieldLabel.test(safeOriginal.split(/[:：]/u)[0] ?? '')) {
     return null
   }
-  if (containsControlText(rawText)) return undefined
-  const delimiters = [...rawText.matchAll(/[:：]/gu)]
-  if (delimiters.length !== 1) return undefined
-  const delimiter = delimiters[0]!
+  const delimiter = /[:：]/u.exec(rawText)
+  if (!delimiter || rawText.slice(delimiter.index + delimiter[0].length).includes('：')) return undefined
   const label = normalizedText(rawText.slice(0, delimiter.index))
   const value = normalizedText(rawText.slice(delimiter.index + delimiter[0].length))
   if (!label || !value
@@ -314,13 +337,10 @@ function structuredStaticField(
   if (!safeLabel || !safeValue
     || sensitiveStaticFieldLabel.test(safeLabel)
     || sensitiveText(`${safeLabel}: ${safeValue}`)
-    || credentialLikeValue.test(safeValue)
-    || urlLikeText.test(safeValue)
-    || instructionLikeText.test(safeValue)
-    || proseLikeText.test(safeValue)) return null
-  if (!staticFieldLabel.test(safeLabel)
-    || (!safeDate.test(safeValue) && !staticFieldValue.test(safeValue))) return undefined
+    || instructionLikeText.test(safeValue)) return null
+  if (!staticFieldLabel.test(safeLabel)) return undefined
   if (!relevantValue(safeLabel, intent)) return undefined
+  if (!safeStaticDateValue(safeValue)) return null
   return Object.freeze({ name: safeLabel, value: safeValue })
 }
 
@@ -543,7 +563,7 @@ export class BrowserPageInspector {
     const candidates = readable.flatMap((node): SafeCandidate[] => {
       const role = normalizedRole(node.role)
       if (!semanticRoles.has(role) || authNode(node)) return []
-      const staticField = role === 'statictext' ? structuredStaticField(node.name, input.intent) : undefined
+      const staticField = node.role === 'StaticText' ? structuredStaticField(node.name, input.intent) : undefined
       if (staticField === null) return []
       const name = staticField?.name ?? safeText(node.name)
       if (!name) return []
