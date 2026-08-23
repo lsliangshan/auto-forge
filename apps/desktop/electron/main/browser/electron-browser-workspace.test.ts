@@ -953,7 +953,7 @@ describe('ElectronBrowserWorkspace', () => {
 
   it('attaches a dedicated native input shield for the full continuation lease', async () => {
     const harness = createHarness()
-    const { workspace, views, windows } = harness
+    const { views, windows } = harness
     const { binding, registry } = await bindIdleContinuation(harness)
 
     const lease = await registry.acquire(binding.bindingId, {
