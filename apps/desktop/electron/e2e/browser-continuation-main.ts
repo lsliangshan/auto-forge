@@ -913,6 +913,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (children.some((view) => !views.has(view as WebContentsView))) {
       throw new Error('Unexpected native child view in browser continuation workspace')
     }
+    const targetNativeChild = target !== undefined && liveTargetView !== undefined && children.includes(liveTargetView)
     const attached = children.includes(shield)
     if (attached !== internals.inputShieldAttached) {
       throw new Error('Input shield attachment state disagrees with native child membership')
@@ -929,6 +930,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     `) as number
     const state = {
       targetPresent: target !== undefined,
+      targetNativeChild,
       attached,
       loaded: shield.webContents.getURL().startsWith('data:text/html'),
       order,

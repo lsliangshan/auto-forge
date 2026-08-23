@@ -37,6 +37,7 @@ interface HarnessSnapshot {
 
 interface NativeInputShieldState {
   targetPresent: boolean
+  targetNativeChild: boolean
   attached: boolean
   loaded: boolean
   order: string[]
@@ -340,6 +341,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(before).toMatchObject({
       attached: false,
       targetPresent: true,
+      targetNativeChild: true,
       loaded: true,
       order: ['target', 'toolbar'],
       shieldBounds: { x: 0, y: 52 },
@@ -356,6 +358,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
 
     expect(owned).toMatchObject({
       attached: true,
+      targetNativeChild: true,
       order: ['target', 'shield', 'toolbar'],
       shieldBounds: { x: 0, y: 52 },
       toolbarBounds: { x: 0, y: 0, width: 1280, height: 52 },
@@ -379,7 +382,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await command(electronApp, 'releaseBusy', { bindingId: binding.bindingId })
     await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: binding.bindingId,
-    })).resolves.toMatchObject({ attached: false, order: ['target', 'toolbar'] })
+    })).resolves.toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
   })
 
   test('detaches the native shield after normal completion, failure, handoff, and active target destruction', async () => {
@@ -398,13 +401,13 @@ test.describe.serial('conversation-bound browser continuation', () => {
       })
       await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
         bindingId: binding.bindingId,
-      })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
+      })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
       await expect(command<{ code: string }>(electronApp, 'finishAttachedTerminalScenario', {
         scenarioId,
       })).resolves.toMatchObject({ code })
       await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
         bindingId: binding.bindingId,
-      })).resolves.toMatchObject({ attached: false, order: ['target', 'toolbar'] })
+      })).resolves.toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
       const draftSavesBefore = (await fixture.snapshot()).draftSaves
       await command(electronApp, 'userClick', { tabId: binding.tabId, selector: '#save-draft' })
       await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(draftSavesBefore + 1)
@@ -418,12 +421,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: binding.bindingId,
-    })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
+    })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
     await command(electronApp, 'finishAttachedTerminalScenario', { scenarioId })
     const destroyed = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: binding.bindingId,
     })
-    expect(destroyed).toMatchObject({ targetPresent: false, attached: false })
+    expect(destroyed).toMatchObject({ targetPresent: false, targetNativeChild: false, attached: false })
     expect(destroyed.order).not.toContain('shield')
   })
 
@@ -582,12 +585,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(stopCard.getByText('AI 正在读取网页')).toBeVisible()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
-    })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
+    })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
     await stopCard.getByTestId('stop-browser').click()
     await expect(stopCard.getByTestId('stop-browser')).toBeDisabled()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
-    })).toMatchObject({ attached: false, order: ['target', 'toolbar'] })
+    })).toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(stopCard.getByText('浏览器自动操作已停止')).toBeVisible()
@@ -603,12 +606,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(takeoverCard.getByText('AI 正在读取网页')).toBeVisible()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
-    })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
+    })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
     await takeoverCard.getByTestId('take-over-browser').click()
     await expect(takeoverCard.getByTestId('take-over-browser')).toBeDisabled()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
-    })).toMatchObject({ attached: false, order: ['target', 'toolbar'] })
+    })).toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(takeoverCard.getByText('浏览器自动操作已停止')).toBeVisible()
