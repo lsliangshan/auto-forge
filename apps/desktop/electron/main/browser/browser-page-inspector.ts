@@ -269,6 +269,34 @@ const requestScopedCertificateNumberLabels: ReadonlySet<string> = new Set([
 ])
 const requestScopedCertificateNumber = /^[A-Z0-9][A-Z0-9./_-]{5,30}[A-Z0-9]$/iu
 const explicitCertificateNumberRequest = /(?:证件|证书|居住证|工作居住证)(?:的)?(?:编号|号码)/u
+const requestScopedEducationLabels: ReadonlySet<string> = new Set([
+  '学历',
+  '最高学历',
+  '文化程度',
+  '学位',
+  '最高学位',
+])
+const requestScopedEducationValues: ReadonlySet<string> = new Set([
+  '小学',
+  '初中',
+  '普通高中',
+  '高中',
+  '中专',
+  '职高',
+  '技校',
+  '大学专科',
+  '大专',
+  '专科',
+  '大学本科',
+  '本科',
+  '研究生',
+  '硕士研究生',
+  '博士研究生',
+  '学士',
+  '硕士',
+  '博士',
+])
+const explicitEducationRequest = /(?:学历|学位|文化程度)/u
 
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
@@ -377,6 +405,11 @@ function structuredStaticField(
     && requestScopedCertificateNumber.test(value)
     && !chineseIdentity.test(value)
     && !instructionLikeText.test(value)) {
+    return Object.freeze({ name: safeLabel, value })
+  }
+  if (requestScopedEducationLabels.has(safeLabel.toLowerCase())
+    && explicitEducationRequest.test(normalizedText(intent))
+    && requestScopedEducationValues.has(value.toLowerCase())) {
     return Object.freeze({ name: safeLabel, value })
   }
   const safeOriginal = safeText(rawText)

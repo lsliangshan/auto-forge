@@ -197,6 +197,14 @@ function lastToolContent(request: ModelStreamRequest): string | undefined {
   return message?.role === 'tool' ? message.content : undefined
 }
 
+function toolCallCount(request: ModelStreamRequest, name: string): number {
+  return request.messages.reduce((count, message) => (
+    message.role === 'assistant'
+      ? count + (message.tool_calls?.filter((call) => call.function.name === name).length ?? 0)
+      : count
+  ), 0)
+}
+
 function currentUserText(request: ModelStreamRequest): string {
   const message = [...request.messages].reverse().find((candidate) => candidate.role === 'user')
   if (!message || message.role !== 'user') return ''
@@ -326,6 +334,15 @@ const deterministicProvider: CredentialBoundModelProvider = {
     }
     const bindingId = bindingIdFromRequest(request, conversationId)
     if (!bindingId) throw new Error('No exact continuation binding was offered')
+    if (userText.includes('E2E_BROWSER_DECISIONS_11')) {
+      if (toolCallCount(request, 'browser_session_inspect') < 11) {
+        yield toolCall(request, 'browser_session_inspect', { bindingId, intent: '读取学历' })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+      } else {
+        yield { type: 'finish', choiceIndex: 0, reason: 'stop' }
+      }
+      return
+    }
     if (!previousTool) {
       yield toolCall(request, 'browser_session_inspect', { bindingId, intent: '读取证件有效期' })
       yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }

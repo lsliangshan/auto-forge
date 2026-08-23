@@ -34,9 +34,13 @@ export class WorkflowToolLoop {
     this.startedAt = options.now()
   }
 
-  beginDecision(): { kind: 'decision'; decisionIndex: number } | LoopFailure {
+  beginDecision(options: { browserContinuationActive?: boolean } = {}):
+    | { kind: 'decision'; decisionIndex: number }
+    | LoopFailure {
     if (this.activeExpired()) return { kind: 'failed', code: 'MODEL_PROVIDER_TIMEOUT' }
-    if (this.decisions >= MAX_MODEL_DECISIONS) return { kind: 'failed', code: 'TOOL_CALL_LIMIT' }
+    if (this.decisions >= MAX_MODEL_DECISIONS && !options.browserContinuationActive) {
+      return { kind: 'failed', code: 'TOOL_CALL_LIMIT' }
+    }
     this.decisions += 1
     return { kind: 'decision', decisionIndex: this.decisions }
   }

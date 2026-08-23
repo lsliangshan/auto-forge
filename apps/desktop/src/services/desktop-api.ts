@@ -47,6 +47,7 @@ const messages: Partial<Record<AppError['code'], string>> = {
   MODEL_PROVIDER_RATE_LIMITED: '供应商请求过于频繁，请稍后重试',
   MODEL_PROVIDER_TIMEOUT: '供应商响应超时，请稍后重试',
   MODEL_PROVIDER_UNAVAILABLE: '供应商或所选模型暂时不可用，请稍后重试',
+  TOOL_CALL_LIMIT: '工作流工具调用次数已达上限',
   MODEL_PROVIDER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
   OPENROUTER_REQUEST_FAILED: '大模型供应商请求失败，请稍后重试',
   CONTEXT_LIMIT_EXCEEDED: '当前输入和会话上下文超出模型限制，请缩短输入或新建会话',

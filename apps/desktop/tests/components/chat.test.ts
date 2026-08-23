@@ -1258,6 +1258,7 @@ describe('chat interactions', () => {
     ['MODEL_PROVIDER_RATE_LIMITED', '供应商请求过于频繁，请稍后重试'],
     ['MODEL_PROVIDER_TIMEOUT', '供应商响应超时，请稍后重试'],
     ['MODEL_PROVIDER_UNAVAILABLE', '供应商或所选模型暂时不可用，请稍后重试'],
+    ['TOOL_CALL_LIMIT', '工作流工具调用次数已达上限'],
   ] as const)('maps %s to its safe localized message', (code, message) => {
     expect(displayError({ code, message: 'unsafe provider details' })).toBe(message)
   })

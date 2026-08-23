@@ -2965,6 +2965,52 @@ describe('AgentOrchestrator', () => {
     expect(finalRequest.tools?.map((tool) => tool.function.name)).toContain('browser_session_act')
   })
 
+  it('continues active browser inspection beyond ten provider decisions', async () => {
+    const inspectTurn = (index: number): ProviderStreamEvent[] => [{
+      type: 'tool_call', choiceIndex: 0, index: 0, id: `inspect_call_${index}`,
+      name: 'browser_session_inspect', arguments: {
+        bindingId: 'binding_1', intent: '读取学历',
+      },
+    }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }]
+    const dependencies = harness([
+      ...Array.from({ length: 11 }, (_value, index) => inspectTurn(index + 1)),
+      [
+        { type: 'text_delta', choiceIndex: 0, text: '最高学历：本科。' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    dependencies.workflows.list = async () => []
+    let inspectionIndex = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => {
+        inspectionIndex += 1
+        const capturedAt = `2026-04-08T00:00:${String(inspectionIndex).padStart(2, '0')}.000Z`
+        return inspectedSnapshot([
+          { ref: `ref_education_${inspectionIndex}`, role: 'text', name: '最高学历', value: '本科', enabled: true, actions: [] },
+        ], {
+          snapshot: {
+            snapshotId: `snapshot_${inspectionIndex}`, bindingId: 'binding_1',
+            origin: 'https://permit.example.gov.cn', url: 'https://permit.example.gov.cn/detail',
+            title: '证件详情', capturedAt, navigationEpoch: 1, auth: 'authenticated',
+            nodes: [
+              { ref: `ref_education_${inspectionIndex}`, role: 'text', name: '最高学历', value: '本科', enabled: true, actions: [] },
+            ],
+            serializedBytes: 1_000,
+          },
+        })
+      },
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的学历是什么', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(result.status).toBe('completed')
+    expect(browser.executor.execute).toHaveBeenCalledTimes(11)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(12)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('最高学历：本科')
+  })
+
   it.each([
     { name: 'provider failure', browserResult: { kind: 'success' as const, data: { completedActions: 0 } }, code: 'MODEL_PROVIDER_REQUEST_FAILED' },
     { name: 'leased tool failure', browserResult: { kind: 'tool_error' as const, code: 'PAGE_CHANGED' as const }, code: undefined },

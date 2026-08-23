@@ -173,6 +173,28 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(await fixture.snapshot()).toMatchObject({ authenticated: true, finalSubmissions: 0 })
   })
 
+  test('reads an explicitly requested authenticated education field', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    await seed(electronApp, conversationId, '/details')
+
+    await sendChat(page, electronApp, conversationId, '我的学历是什么')
+
+    await expect(page.getByText('最高学历：本科')).toBeVisible()
+    expect(await fixture.snapshot()).toMatchObject({ authenticated: true, finalSubmissions: 0 })
+  })
+
+  test('continues browser decisions beyond ten in the real chat chain', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    await seed(electronApp, conversationId, '/details')
+
+    await sendChat(page, electronApp, conversationId, '我的学历是什么 E2E_BROWSER_DECISIONS_11')
+
+    await expect(page.getByText('最高学历：本科')).toBeVisible()
+    const requests = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests
+      .filter((request) => request.conversationId === conversationId)
+    expect(requests).toHaveLength(12)
+  })
+
   test('does not offer another conversation the bound page', async () => {
     const owner = await createConversation(page, electronApp)
     const ownerBinding = await seed(electronApp, owner, '/details')

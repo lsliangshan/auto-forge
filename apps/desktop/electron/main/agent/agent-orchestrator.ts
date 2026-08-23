@@ -617,6 +617,8 @@ function relevantEvidence(request: string, evidence: BrowserFieldEvidence): bool
   const label = normalizedTrustedText(evidence.label)
   if (!trusted || label.length < 2) return false
   if (trusted.includes(label)) return true
+  if (/(?:学历|学位|文化程度)/u.test(trusted)
+    && /^(?:学历|最高学历|文化程度|学位|最高学位)$/u.test(label)) return true
   const latinTerms = evidence.label.toLowerCase().match(/[a-z0-9]{2,}/gu) ?? []
   if (latinTerms.length > 0) {
     const requestTerms = new Set(request.toLowerCase().match(/[a-z0-9]{2,}/gu) ?? [])
@@ -984,7 +986,7 @@ export class AgentOrchestrator {
     if (active.pending) return this.continuePendingTool(active)
 
     while (!active.terminal) {
-      const decision = active.loop.beginDecision()
+      const decision = active.loop.beginDecision({ browserContinuationActive: active.browserStarted })
       if (decision.kind === 'failed') return this.terminalize(active, 'failed', appFailure(decision.code))
       const operationKey = `agent:${active.requestId}:turn:${decision.decisionIndex - 1}`
       const toolCalls: Array<Extract<ModelStreamEvent, { type: 'tool_call' }>> = []
@@ -1568,10 +1570,12 @@ export class AgentOrchestrator {
     const matches = active.browserEvidence.filter((evidence) => (
       relevantEvidence(active.browserAuthorization.trustedRequest, evidence)
     ))
-    const unique = new Map(matches.map((evidence) => [
-      [evidence.label, evidence.value, evidence.pageLabel, evidence.origin, evidence.capturedAt].join('\u0000'),
-      evidence,
-    ]))
+    const unique = new Map<string, BrowserFieldEvidence>()
+    for (const evidence of matches) {
+      const key = [evidence.label, evidence.value, evidence.pageLabel, evidence.origin].join('\u0000')
+      const previous = unique.get(key)
+      if (!previous || evidence.capturedAt > previous.capturedAt) unique.set(key, evidence)
+    }
     if (unique.size === 1) {
       const evidence = unique.values().next().value!
       return `${safeAnswerText(evidence.label)}：${safeAnswerText(evidence.value)}`

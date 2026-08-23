@@ -335,9 +335,10 @@ interface BrowserSessionHandoffInput {
 An `act` call contains at most ten actions. Main validates and executes them
 sequentially, rechecking the tab and origin before and after every action. It
 stops at the first failure and never executes the remaining suffix. Batching
-keeps ordinary form filling within the existing ten-decision Agent loop without
-weakening per-action checks. Browser actions have no cumulative per-run count
-limit; user cancellation and the existing Agent lifecycle remain authoritative.
+reduces provider round trips without weakening per-action checks. Browser actions
+and decisions after the first admitted browser operation have no cumulative
+per-run count limit; user cancellation and the existing Agent lifecycle remain
+authoritative.
 
 No tool accepts CSS, JavaScript, coordinates, a URL outside a bounded navigation
 action, a raw CDP method, another conversation ID, cookies, storage keys, HTTP
@@ -372,12 +373,12 @@ OTP values, CAPTCHA images, unrelated frames, and arbitrary screenshot pixels.
 Password/OTP/CAPTCHA controls are represented only as the presence of a manual
 authentication requirement.
 
-An exact visible certificate serial such as `证件编号` may be projected only
-when the trusted current-user request explicitly asks for a certificate number.
-The label and value use closed grammars, Chinese national identity-number shapes
-remain blocked, and the projected value follows the same run-local provider-only
-path as other page evidence. Audit rows and raw tool-result persistence remain
-redacted.
+An exact visible certificate serial such as `证件编号`, or a closed education
+value such as `最高学历：本科`, may be projected only when the trusted current-user
+request explicitly asks for that field category. Labels and values use closed
+grammars, Chinese national identity-number shapes remain blocked, and projected
+values follow the same run-local provider-only path as other page evidence.
+Audit rows and raw tool-result persistence remain redacted.
 
 `region_image` is available only when semantic inspection is insufficient, the
 selected model accepts image input, and `ref` identifies one visible safe
@@ -560,7 +561,8 @@ Each continuation run has these per-operation and lifecycle limits:
 - ten actions in one `browser_session_act` batch;
 - five minutes of active browser-tool time;
 - 128 KiB and 500 semantic nodes per model-visible snapshot;
-- the existing ten provider decision limit for the Agent loop.
+- ten provider decisions before any browser continuation is admitted; after the
+  first admitted browser operation, no cumulative decision-count limit.
 
 There is no cumulative browser-action count limit and repeated equivalent
 inspections do not terminate browser authority. Waiting for the user is not part

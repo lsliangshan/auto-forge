@@ -20,7 +20,7 @@
 - The Agent may perform only reversible navigation/draft actions. Formal submit, confirmation, signature, payment, publication, delete, withdrawal, logout, files, credentials, OTP, and CAPTCHA require user handoff.
 - Raw page snapshots, region images, opaque element references, and model tool results are run-local and must not enter messages, summaries, diagnostics, execution logs, or audit rows.
 - Keep normal site cookies in the hashed user partition on logout; close all tabs and revoke all bindings first. Only the explicit “清除浏览器数据” action clears site data.
-- Keep the existing ten provider-decision limit; browser actions have no cumulative per-run count limit, while each batch remains capped at ten actions, active browser-tool time remains five minutes, and each snapshot remains capped at 128 KiB/500 nodes.
+- Keep the ten provider-decision limit until a browser continuation is admitted; after the first browser operation, browser decisions and actions have no cumulative count limit. Each action batch remains capped at ten actions, active browser-tool time remains five minutes, and each snapshot remains capped at 128 KiB/500 nodes.
 - Build changed `@autoforge/shared` and `@autoforge/workflow-schema` packages before desktop/root typecheck to avoid stale workspace `dist`.
 - Do not modify unrelated code or broaden the workflow Worker SDK beyond this design.
 
@@ -851,7 +851,8 @@ it('keeps raw page results out of persisted conversation blocks', async () => {
 Add tests for multiple bindings/`TARGET_AMBIGUOUS`, current-run-created binding
 not appearing until next turn, model without tool support, explicit tool opt-out,
 prompt-injection text failing to alter tools/origins/policy, login handoff, final
-answer field/source/time, cancellation, and the existing ten-decision limit.
+answer field/source/time, cancellation, the pre-browser ten-decision limit, and
+unbounded decisions after browser continuation begins.
 
 - [ ] **Step 2: Run focused Agent tests and verify failure**
 
@@ -882,8 +883,10 @@ require the model to clarify rather than use map order.
 Extend `ActiveAgentRun` with a frozen browser catalog and per-run browser budget.
 In `prepareTool`, dispatch by exact fixed browser tool name before looking up
 `active.workflows`; unknown names remain `INVALID_INPUT`. Keep workflow
-execution count at five and provider decision count at ten. Browser actions
-remain separately counted for diagnostics but have no cumulative limit.
+execution count at five and the pre-browser provider decision limit at ten.
+Browser actions remain separately counted for diagnostics but have no cumulative
+limit. Once an admitted browser operation starts, later provider decisions also
+have no cumulative count limit and remain bounded by active time and cancellation.
 
 Append browser tool calls/results only to `active.messages`. Add/update one
 system-owned `browser_status` block in `active.blocks`; never append raw snapshot
