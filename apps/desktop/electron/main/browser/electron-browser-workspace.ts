@@ -245,6 +245,7 @@ interface DescribedDomNode {
 }
 
 const toolbarHeight = 52
+const toolbarPartition = 'autoforge-browser-toolbar'
 const navigationDetectionMs = 500
 const postLoadNavigationDetectionMs = 1_000
 function failure(code: AppErrorCode): AppError {
@@ -350,10 +351,17 @@ function toolbarDocument(
     : `<div class="automation-controls"><span class="automation" aria-live="polite">AI 正在操作</span><a href="autoforge-browser://continuation/stop/${html(automationBindingId)}">停止</a><a href="autoforge-browser://continuation/takeover/${html(automationBindingId)}">接管</a></div>`
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>
   :root{color-scheme:light dark;--canvas:#f3f5f8;--surface:#fff;--surface-muted:#f8f9fb;--border:#dfe3e8;--border-strong:#c8ced6;--text:#303640;--muted:#68717d;--accent:#2563eb;--accent-soft:#eaf1ff;--loading-glow:rgb(37 99 235 / 14%);--loading-grid:rgb(104 113 125 / 8%);--loading-track:#d8e0eb}@media(prefers-color-scheme:dark){:root{--canvas:#11151c;--surface:#181d26;--surface-muted:#202630;--border:#343d4c;--border-strong:#4a5565;--text:#dbe4ef;--muted:#aeb8c6;--accent:#6f9cff;--accent-soft:#26354f;--loading-glow:rgb(111 156 255 / 16%);--loading-grid:rgb(174 184 198 / 7%);--loading-track:#303a48}}
-  *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;background:transparent}body{color:var(--text);font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}.input-shield{position:fixed;z-index:0;inset:52px 0 0;pointer-events:auto;background:rgb(0 0 0 / 0.004)}.bar,.loading,.blocked{position:relative;z-index:1}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid var(--border);background:var(--surface)}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:var(--surface-muted);border-radius:5px 5px 0 0}.tab.active{background:var(--accent-soft)}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-muted)}.nav a{color:var(--text);text-decoration:none;padding:2px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border)}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:var(--canvas);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.automation-controls{display:flex;align-items:center;gap:4px}.automation{padding:2px 6px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-weight:650;white-space:nowrap}
+  *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;background:transparent}body{color:var(--text);font:12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}.bar,.loading,.blocked{position:relative;z-index:1}.bar{height:52px;display:grid;grid-template-rows:26px 26px;border-bottom:1px solid var(--border);background:var(--surface)}.tabs{display:flex;gap:3px;align-items:end;padding:3px 6px 0;overflow:hidden}.tab{display:flex;min-width:80px;max-width:190px;background:var(--surface-muted);border-radius:5px 5px 0 0}.tab.active{background:var(--accent-soft)}.tab a{color:inherit;text-decoration:none;padding:4px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tab a:first-child{flex:1}.tab .close{flex:none}.nav{display:flex;align-items:center;gap:4px;padding:2px 6px;background:var(--surface-muted)}.nav a{color:var(--text);text-decoration:none;padding:2px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border)}.address{flex:1;min-width:0;padding:3px 8px;border-radius:4px;background:var(--canvas);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.automation-controls{display:flex;align-items:center;gap:4px}.automation{padding:2px 6px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-weight:650;white-space:nowrap}
   .loading{position:relative;isolation:isolate;height:calc(100vh - 52px);display:grid;place-items:center;overflow:hidden;background:var(--canvas)}.loading:before{position:absolute;z-index:-1;inset:0;background:radial-gradient(circle at 42% 46%,var(--loading-glow),transparent 31%),linear-gradient(var(--loading-grid) 1px,transparent 1px),linear-gradient(90deg,var(--loading-grid) 1px,transparent 1px);background-size:auto,42px 42px,42px 42px;content:"";mask-image:linear-gradient(to bottom,transparent 5%,#000 32%,#000 68%,transparent 95%)}.loading-shell{display:grid;width:min(520px,calc(100vw - 56px));grid-template-columns:92px minmax(0,1fr);align-items:center;gap:26px;transform:translateY(-5vh)}.connection-orbit{position:relative;width:76px;height:76px}.orbit{position:absolute;border:1px solid var(--border-strong);border-radius:50%}.orbit-outer{inset:0;border-top-color:var(--accent);border-right-color:transparent;animation:orbit-spin 2.6s linear infinite}.orbit-outer:after{position:absolute;top:4px;right:10px;width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 5px var(--accent-soft);content:""}.orbit-inner{inset:12px;border-bottom-color:var(--accent);border-left-color:transparent;animation:orbit-spin 1.9s linear infinite reverse}.orbit-core{inset:29px;border:0;background:var(--accent);box-shadow:0 0 0 7px var(--accent-soft);animation:core-pulse 1.8s ease-in-out infinite}.loading-copy{display:grid;min-width:0;gap:7px}.loading-kicker{color:var(--accent);font:700 9px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.18em}.loading strong{overflow:hidden;color:var(--text);font-size:18px;font-weight:680;line-height:1.3;text-overflow:ellipsis;white-space:nowrap}.loading strong span{color:var(--accent)}.loading small{color:var(--muted);font-size:11.5px}.progress-track{position:relative;height:3px;margin-top:9px;overflow:hidden;border-radius:2px;background:var(--loading-track)}.progress-track>span{position:absolute;top:0;bottom:0;left:-38%;width:38%;border-radius:inherit;background:var(--accent);box-shadow:0 0 10px var(--accent);animation:progress-travel 1.45s ease-in-out infinite}.connection-stages{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:9.5px;letter-spacing:.02em}.connection-stages span{flex:none}.connection-stages .complete{color:var(--text)}.connection-stages .current{color:var(--accent);font-weight:650}.connection-stages i{height:1px;min-width:18px;flex:1;background:var(--border);transform:translateY(1px)}@keyframes orbit-spin{to{transform:rotate(360deg)}}@keyframes core-pulse{50%{opacity:.55;transform:scale(.78)}}@keyframes progress-travel{50%,100%{left:100%}}@media(max-width:520px){.loading-shell{width:calc(100vw - 36px);grid-template-columns:72px 1fr;gap:18px}.connection-orbit{width:64px;height:64px}.orbit-inner{inset:10px}.orbit-core{inset:25px}.loading strong{font-size:16px}}@media(prefers-reduced-motion:reduce){.orbit,.orbit-core,.progress-track>span{animation:none}.progress-track>span{left:0;width:42%;box-shadow:none}}
   .blocked{height:calc(100vh - 52px);display:grid;place-items:center;padding:28px;background:var(--canvas)}.blocked-card{display:grid;width:min(560px,100%);gap:10px;padding:28px;border:1px solid var(--border);border-left:4px solid #dc2626;border-radius:8px;background:var(--surface);box-shadow:0 18px 44px rgb(0 0 0 / 9%)}.blocked-kicker{color:#dc2626;font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.16em}.blocked strong{font-size:20px}.blocked p,.blocked small{margin:0;color:var(--muted);line-height:1.6}.blocked code{overflow-wrap:anywhere;padding:10px 12px;border-radius:5px;background:var(--surface-muted);color:var(--text);font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
-  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div>${automation}</div></div><div class="input-shield" data-autoforge-input-shield aria-hidden="true"></div>${blocked || loading}</body></html>`
+  </style></head><body><div class="bar"><div class="tabs">${tabMarkup}</div><div class="nav"><a href="autoforge-browser://back">←</a><a href="autoforge-browser://forward">→</a><a href="autoforge-browser://reload">↻</a><div class="address">${html(address)}</div>${automation}</div></div>${blocked || loading}</body></html>`
+}
+
+function inputShieldDocument(): string {
+  return '<!doctype html><html><head><meta charset="utf-8">'
+    + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'
+    + '<style>html,body{width:100%;height:100%;margin:0;overflow:hidden;'
+    + 'background:rgb(0 0 0 / 0.004)}</style></head><body aria-hidden="true"></body></html>'
 }
 
 function parseContinuationToolbarCommand(value: string): {
@@ -411,6 +419,9 @@ class ElectronBrowserTab implements BrowserWorkspaceTab {
 export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPageCdpPort {
   private window: BaseWindowPort | undefined
   private toolbar: WebContentsViewPort | undefined
+  private inputShield: WebContentsViewPort | undefined
+  private inputShieldCreation: Promise<void> | undefined
+  private inputShieldAttached = false
   private activeTabId: string | undefined
   private readonly tabs = new Map<string, TargetTabState>()
   private readonly executions = new Map<string, Set<TargetTabState>>()
@@ -514,6 +525,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       throw failure('PAGE_BUSY')
     }
     await this.clearContinuationHighlight(tabId)
+    await this.ensureInputShield()
+    if (state.closed || state.view.webContents.isDestroyed()) throw failure('PAGE_CLOSED')
     state.ownerContinuationRunId = runId
     this.layout()
     void this.renderToolbar().catch(() => undefined)
@@ -1123,11 +1136,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     view.webContents.on('did-navigate-in-page', navigationChanged)
     view.webContents.on('did-start-loading', () => { this.setLoading(state, true) })
     view.webContents.on('did-stop-loading', () => { this.setLoading(state, false) })
-    view.webContents.on('before-input-event', () => {
-      void this.handleUserTakeover(state, true).catch(() => undefined)
+    view.webContents.on('before-input-event', (event: NavigationEvent) => {
+      if (state.ownerContinuationRunId) event.preventDefault()
     })
-    view.webContents.on('before-mouse-event', () => {
-      void this.handleUserTakeover(state).catch(() => undefined)
+    view.webContents.on('before-mouse-event', (event: NavigationEvent) => {
+      if (state.ownerContinuationRunId && state.syntheticInputOperations === 0) event.preventDefault()
     })
     view.webContents.on('render-process-gone', () => {
       if (!view.webContents.isDestroyed()) view.webContents.close()
@@ -1227,7 +1240,6 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   }
 
   private async createWindow(): Promise<void> {
-    const toolbarPartition = 'autoforge-browser-toolbar'
     await this.configureSession(toolbarPartition)
     const window = new this.options.BaseWindow({
       width: 1280, height: 820, minWidth: 900, minHeight: 600,
@@ -1250,10 +1262,6 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       void this.handleToolbarCommand(url).catch(() => undefined)
     })
     toolbar.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-    toolbar.webContents.on('before-input-event', () => {
-      const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
-      if (active) void this.handleUserTakeover(active, true).catch(() => undefined)
-    })
     window.contentView.addChildView(toolbar)
     window.on('resize', () => this.layout())
     window.on('closed', () => {
@@ -1261,6 +1269,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       if (this.window === window) {
         this.window = undefined
         this.toolbar = undefined
+        this.inputShield = undefined
+        this.inputShieldCreation = undefined
+        this.inputShieldAttached = false
       }
     })
     this.window = window
@@ -1269,6 +1280,54 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     await this.renderToolbar()
     if (this.window !== window || window.isDestroyed()) throw failure('NOT_FOUND')
     window.show()
+  }
+
+  private ensureInputShield(): Promise<void> {
+    if (this.inputShieldCreation) return this.inputShieldCreation
+    if (this.inputShield && !this.inputShield.webContents.isDestroyed()) return Promise.resolve()
+    this.inputShield = undefined
+    const creation = this.createInputShield()
+    this.inputShieldCreation = creation
+    void creation.finally(() => {
+      if (this.inputShieldCreation === creation) this.inputShieldCreation = undefined
+    }).catch(() => undefined)
+    return creation
+  }
+
+  private async createInputShield(): Promise<void> {
+    const window = this.window
+    if (!window || window.isDestroyed() || this.shuttingDown) throw failure('PAGE_CLOSED')
+    const shield = new this.options.WebContentsView({
+      webPreferences: {
+        partition: toolbarPartition,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+        webviewTag: false,
+      },
+    })
+    const documentUrl = `data:text/html;charset=utf-8,${encodeURIComponent(inputShieldDocument())}`
+    let loadingInitialDocument = true
+    shield.setBackgroundColor('rgba(0, 0, 0, 0.004)')
+    shield.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    shield.webContents.on('will-navigate', (event: NavigationEvent, url: string) => {
+      if (loadingInitialDocument && url === documentUrl) return
+      event.preventDefault()
+    })
+    shield.webContents.on('before-mouse-event', (event: NavigationEvent) => event.preventDefault())
+    shield.webContents.on('before-input-event', (event: NavigationEvent) => event.preventDefault())
+    this.inputShield = shield
+    try {
+      await shield.webContents.loadURL(documentUrl)
+      loadingInitialDocument = false
+      if (this.window !== window || window.isDestroyed() || this.shuttingDown
+        || this.inputShield !== shield) throw failure('PAGE_CLOSED')
+    } catch (error) {
+      if (!shield.webContents.isDestroyed()) shield.webContents.close()
+      if (this.inputShield === shield) this.inputShield = undefined
+      throw error
+    }
   }
 
   private configureSession(partition: string): Promise<SessionPort> {
@@ -1330,11 +1389,31 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
     const coveringTarget = active?.loading === true || active?.blockedOrigin !== undefined
     const shieldingTarget = !coveringTarget && active?.ownerContinuationRunId !== undefined
-    toolbar.setBounds({ x: 0, y: 0, width: bounds.width, height: coveringTarget || shieldingTarget ? bounds.height : toolbarHeight })
+    toolbar.setBounds({
+      x: 0, y: 0, width: bounds.width,
+      height: coveringTarget ? bounds.height : toolbarHeight,
+    })
     if (active && !active.closed) {
       active.view.setBounds({ x: 0, y: toolbarHeight, width: bounds.width, height: Math.max(0, bounds.height - toolbarHeight) })
     }
-    if (coveringTarget || shieldingTarget) {
+    this.inputShield?.setBounds({
+      x: 0, y: toolbarHeight, width: bounds.width,
+      height: Math.max(0, bounds.height - toolbarHeight),
+    })
+    if (shieldingTarget && this.inputShield) {
+      if (!this.inputShieldAttached) {
+        window.contentView.addChildView(this.inputShield)
+        this.inputShieldAttached = true
+      }
+      window.contentView.removeChildView(toolbar)
+      window.contentView.addChildView(toolbar)
+      return
+    }
+    if (this.inputShieldAttached && this.inputShield) {
+      window.contentView.removeChildView(this.inputShield)
+      this.inputShieldAttached = false
+    }
+    if (coveringTarget) {
       window.contentView.removeChildView(toolbar)
       window.contentView.addChildView(toolbar)
     }
@@ -1915,6 +1994,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
         if (!state.view.webContents.isDestroyed()) state.view.webContents.close()
       }
       if (this.toolbar && !this.toolbar.webContents.isDestroyed()) this.toolbar.webContents.close()
+      if (this.inputShield && !this.inputShield.webContents.isDestroyed()) {
+        this.inputShield.webContents.close()
+      }
+      this.inputShield = undefined
+      this.inputShieldCreation = undefined
+      this.inputShieldAttached = false
       this.tabs.clear()
       this.executions.clear()
       this.activeTabId = undefined
@@ -1930,6 +2015,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       if (this.window === window) {
         this.window = undefined
         this.toolbar = undefined
+        this.inputShield = undefined
+        this.inputShieldCreation = undefined
+        this.inputShieldAttached = false
       }
       return
     }

@@ -213,6 +213,17 @@ function continuationRegistry(workspace: ElectronBrowserWorkspace) {
   })
 }
 
+async function bindIdleContinuation(harness: ReturnType<typeof createHarness>) {
+  const input = executionInput()
+  const tab = await harness.workspace.acquire(input)
+  const registry = continuationRegistry(harness.workspace)
+  harness.workspace.setContinuationRegistry(registry)
+  const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+  harness.workspace.markContinuationBound(tab.id)
+  await harness.workspace.releaseExecution(input.executionId)
+  return { input, tab, registry, binding }
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((done) => { resolve = done })
@@ -802,7 +813,7 @@ describe('ElectronBrowserWorkspace', () => {
   })
 
   it('keeps workflow and continuation ownership exclusive and releases takeover synchronously', async () => {
-    const { workspace, views } = createHarness()
+    const { workspace } = createHarness()
     const tab = await workspace.acquire(executionInput())
     const registry = continuationRegistry(workspace)
     workspace.setContinuationRegistry(registry)
@@ -819,112 +830,52 @@ describe('ElectronBrowserWorkspace', () => {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_3',
     })).rejects.toMatchObject({ code: 'PAGE_BUSY' })
 
-    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
+    await lease.release()
     const replacement = await registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_3',
     })
 
     expect(replacement.ownerRunId).toBe('run_3')
-    await lease.release()
     await replacement.release()
   })
 
-  it.each(['read', 'screenshot'] as const)(
-    'keeps a pending continuation %s running while the trusted toolbar owns pointer space',
-    async (operation) => {
-      const gate = deferred<unknown>()
-      const respond = (method: string, params?: unknown) => {
-        const input = params as { backendNodeId?: number } | undefined
-        if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
-        if (method === 'Accessibility.getFullAXTree') return operation === 'read' ? gate.promise : { nodes: [] }
-        if (method === 'DOM.describeNode') return {
-          node: { backendNodeId: input?.backendNodeId, nodeName: 'IMG', attributes: [] },
-        }
-        if (method === 'Accessibility.getPartialAXTree') return { nodes: [{
-          nodeId: 'ax_image', backendDOMNodeId: input?.backendNodeId, frameId: 'frame_main', ignored: false,
-          role: { value: 'img' }, name: { value: '结果图' },
-        }] }
-        if (method === 'DOM.getBoxModel') return {
-          model: { content: [20, 30, 340, 30, 340, 230, 20, 230] },
-        }
-        if (method === 'Page.getLayoutMetrics') return {
-          cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 },
-        }
-        if (method === 'Page.captureScreenshot') return gate.promise
-        return {}
-      }
-      const { workspace, views, windows } = createHarness(respond)
-      const input = executionInput()
-      const tab = await workspace.acquire(input)
-      await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
-      const registry = continuationRegistry(workspace)
-      workspace.setContinuationRegistry(registry)
-      const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
-      await workspace.releaseExecution(input.executionId)
-      const lease = await registry.acquire(binding.bindingId, {
-        userId: input.userId, conversationId: input.conversationId!, runId: 'run_reading',
-      })
-      const invalidated = vi.fn()
-      workspace.onPageInvalidated(invalidated)
-      const request = {
-        tabId: tab.id, runId: 'run_reading', expectedOrigin: 'https://www.baidu.com',
-        expectedNavigationEpoch: tab.navigationEpoch,
-      }
-      const pending = operation === 'read'
-        ? workspace.readAccessibilitySnapshot({ ...request, locators: [] })
-        : workspace.captureContinuationNodeScreenshot({
-          ...request, backendNodeId: 11,
-          clip: { x: 20, y: 30, width: 320, height: 200 },
-          expectedRole: 'img', expectedName: '结果图', expectedTagName: 'img',
-        })
-      await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
-        .toContainEqual(expect.objectContaining({
-          method: operation === 'read' ? 'Accessibility.getFullAXTree' : 'Page.captureScreenshot',
-        })))
+  it('attaches a dedicated native input shield for the full continuation lease', async () => {
+    const harness = createHarness()
+    const { workspace, views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
 
-      expect(invalidated).not.toHaveBeenCalled()
-      expect(lease.isCurrent(binding)).toBe(true)
-      expect(views[0]!.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
-      expect(windows[0]!.children.at(-1)).toBe(views[0])
-      expect(views[0]!.backgroundColors).toContain('#00000000')
-      gate.resolve(operation === 'read' ? { nodes: [] } : { data: 'stale-png-data' })
-
-      if (operation === 'read') await expect(pending).resolves.toMatchObject({ tabId: tab.id })
-      else await expect(pending).resolves.toBe('stale-png-data')
-      await lease.release()
-    },
-  )
-
-  it('keeps the transparent trusted toolbar above an idle owned continuation tab', async () => {
-    const { workspace, views, windows } = createHarness()
-    const input = executionInput()
-    const tab = await workspace.acquire(input)
-    const registry = continuationRegistry(workspace)
-    workspace.setContinuationRegistry(registry)
-    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
-    workspace.markContinuationBound(tab.id)
-    await workspace.releaseExecution(input.executionId)
     const lease = await registry.acquire(binding.bindingId, {
-      userId: input.userId, conversationId: input.conversationId!, runId: 'run_idle',
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_shielded',
     })
-    const toolbar = views[0]!
-    await vi.waitFor(() => expect(decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!))
-      .toContain(`autoforge-browser://continuation/stop/${binding.bindingId}`))
-    const toolbarLoads = toolbar.webContents.loaded.length
-    const invalidated = vi.fn()
-    workspace.onPageInvalidated(invalidated)
-    expect(invalidated).not.toHaveBeenCalled()
+
+    const [toolbar, target, shield] = views
+    expect(shield).toBeDefined()
+    expect(shield).not.toBe(toolbar)
+    expect(shield).not.toBe(target)
+    expect(shield?.bounds.at(-1)).toEqual({ x: 0, y: 52, width: 1200, height: 748 })
+    expect(shield?.backgroundColors).toContain('rgba(0, 0, 0, 0.004)')
+    expect(shield?.options.webPreferences).toMatchObject({
+      partition: 'autoforge-browser-toolbar',
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      webviewTag: false,
+    })
+    expect(shield?.webContents.windowOpenHandler?.({ url: 'https://attacker.example/' }))
+      .toEqual({ action: 'deny' })
+    const shieldNavigation = { preventDefault: vi.fn() }
+    shield?.webContents.emit('will-navigate', shieldNavigation, 'https://attacker.example/')
+    expect(shieldNavigation.preventDefault).toHaveBeenCalledOnce()
+    expect(windows[0]?.children).toEqual([target, shield, toolbar])
     expect(lease.isCurrent(binding)).toBe(true)
-    expect(toolbar.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
-    expect(windows[0]!.children.at(-1)).toBe(views[0])
-    expect(views[0]!.backgroundColors).toContain('#00000000')
-    expect(toolbar.webContents.loaded.length).toBeGreaterThanOrEqual(toolbarLoads)
-    expect(decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!))
-      .toContain(`autoforge-browser://continuation/takeover/${binding.bindingId}`)
+    expect(toolbar?.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 52 })
+    const toolbarHtml = decodeURIComponent(toolbar!.webContents.loaded.at(-1)!.split(',')[1]!)
+    expect(toolbarHtml).not.toContain('data-autoforge-input-shield')
     await lease.release()
   })
 
-  it('cancels a pending executor-dispatched pointer action after target keyboard takeover', async () => {
+  it('swallows shield and leaked target input without cancelling pending CDP work', async () => {
     const dispatched = deferred<unknown>()
     const respond = (method: string) => ({
       'DOM.getDocument': { root: { nodeId: 1 } },
@@ -945,117 +896,156 @@ describe('ElectronBrowserWorkspace', () => {
     const lease = await registry.acquire(binding.bindingId, {
       userId: input.userId, conversationId: input.conversationId!, runId: 'run_clicking',
     })
+    const [, target, shield] = views
+    expect(shield).toBeDefined()
+    const invalidated = vi.fn()
+    workspace.onPageInvalidated(invalidated)
+    const targetPointer = vi.fn()
+    const targetKeyboard = vi.fn()
+    target!.webContents.on('before-mouse-event', targetPointer)
+    target!.webContents.on('before-input-event', targetKeyboard)
 
     const clicking = tab.click('role=button[name="继续"]', 'https://www.baidu.com')
-    await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+    await vi.waitFor(() => expect(target!.webContents.debugger.commands)
       .toContainEqual(expect.objectContaining({ method: 'Input.dispatchMouseEvent' })))
-    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
+    const shieldPointer = { preventDefault: vi.fn() }
+    const shieldKeyboard = { preventDefault: vi.fn() }
+    shield!.webContents.emit('before-mouse-event', shieldPointer, { type: 'mouseDown' })
+    shield!.webContents.emit('before-input-event', shieldKeyboard, { type: 'keyDown', key: 'A' })
 
-    expect(lease.isCurrent(binding)).toBe(false)
+    expect(shieldPointer.preventDefault).toHaveBeenCalledOnce()
+    expect(shieldKeyboard.preventDefault).toHaveBeenCalledOnce()
+    expect(targetPointer).not.toHaveBeenCalled()
+    expect(targetKeyboard).not.toHaveBeenCalled()
+    expect(invalidated).not.toHaveBeenCalled()
+    expect(lease.isCurrent(binding)).toBe(true)
+
+    const syntheticPointer = { preventDefault: vi.fn() }
+    target!.webContents.emit('before-mouse-event', syntheticPointer, { type: 'mouseDown' })
+    expect(syntheticPointer.preventDefault).not.toHaveBeenCalled()
+
     dispatched.resolve({})
-    await expect(clicking).rejects.toMatchObject({ code: 'CANCELLED' })
+    await expect(clicking).resolves.toBeUndefined()
+
+    const leakedPointer = { preventDefault: vi.fn() }
+    const leakedKeyboard = { preventDefault: vi.fn() }
+    target!.webContents.emit('before-mouse-event', leakedPointer, { type: 'mouseDown' })
+    target!.webContents.emit('before-input-event', leakedKeyboard, { type: 'keyDown', key: 'A' })
+    expect(leakedPointer.preventDefault).toHaveBeenCalledOnce()
+    expect(leakedKeyboard.preventDefault).toHaveBeenCalledOnce()
+    expect(invalidated).not.toHaveBeenCalled()
+    expect(lease.isCurrent(binding)).toBe(true)
     await lease.release()
   })
 
-  it('removes the shield through the public trusted-toolbar takeover command', async () => {
-    const { workspace, views } = createHarness()
-    const input = executionInput()
-    const tab = await workspace.acquire(input)
-    const registry = continuationRegistry(workspace)
-    workspace.setContinuationRegistry(registry)
-    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
-    workspace.markContinuationBound(tab.id)
-    await workspace.releaseExecution(input.executionId)
+  it('detaches the shield synchronously for lease release and public toolbar takeover', async () => {
+    const harness = createHarness()
+    const { workspace, views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_release',
+    })
+    const [toolbar, target, shield] = views
+
+    const releasing = lease.release()
+    expect(windows[0]?.children).toEqual([target, toolbar])
+    await releasing
+
+    const replacement = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_takeover',
+    })
+    expect(windows[0]?.children).toEqual([target, shield, toolbar])
+    expect(views).toHaveLength(3)
+    expect(shield?.webContents.loaded).toHaveLength(1)
     const handlers = {
       stop: vi.fn(async () => undefined),
-      takeOver: vi.fn(async () => { await lease.release() }),
+      takeOver: vi.fn(async () => { await replacement.release() }),
     }
     workspace.setContinuationCommandHandlers(handlers)
-    const lease = await registry.acquire(binding.bindingId, {
-      userId: input.userId, conversationId: input.conversationId!, runId: 'run_explicit_takeover',
-    })
-    const toolbar = views[0]!
-    expect(toolbar.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
     const navigation = { preventDefault: vi.fn() }
 
-    toolbar.webContents.emit(
+    toolbar!.webContents.emit(
       'will-navigate', navigation, `autoforge-browser://continuation/takeover/${binding.bindingId}`,
     )
 
-    await vi.waitFor(() => expect(handlers.takeOver).toHaveBeenCalledWith(binding.bindingId))
     expect(navigation.preventDefault).toHaveBeenCalledOnce()
-    expect(toolbar.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 52 })
-    await lease.release()
+    expect(handlers.takeOver).toHaveBeenCalledWith(binding.bindingId)
+    expect(windows[0]?.children).toEqual([target, toolbar])
+    await vi.waitFor(() => expect(replacement.isCurrent(binding)).toBe(false))
   })
 
-  it.each(['target', 'shield'] as const)(
-    'repaints the trusted toolbar without automation controls after %s keyboard takeover',
-    async (inputTarget) => {
-    const { workspace, views } = createHarness()
-    const input = executionInput()
-    const tab = await workspace.acquire(input)
-    const registry = continuationRegistry(workspace)
-    workspace.setContinuationRegistry(registry)
-    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
-    workspace.markContinuationBound(tab.id)
-    await workspace.releaseExecution(input.executionId)
-    const lease = await registry.acquire(binding.bindingId, {
-      userId: input.userId, conversationId: input.conversationId!, runId: 'run_real_user',
-    })
-    const toolbar = views[0]!.webContents
-    await vi.waitFor(() => expect(decodeURIComponent(toolbar.loaded.at(-1)!.split(',')[1]!))
-      .toContain('autoforge-browser://continuation/stop/binding_1'))
-    const loadCount = toolbar.loaded.length
-
-    const view = inputTarget === 'target' ? views[1]! : views[0]!
-    view.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
-
-    expect(lease.isCurrent(binding)).toBe(false)
-    await vi.waitFor(() => expect(toolbar.loaded.length).toBeGreaterThan(loadCount))
-    const document = decodeURIComponent(toolbar.loaded.at(-1)!.split(',')[1]!)
-    expect(document).not.toContain('class="automation-controls"')
-    expect(document).not.toContain('autoforge-browser://continuation/stop/')
-    expect(document).not.toContain('autoforge-browser://continuation/takeover/')
-    await lease.release()
-    },
-  )
-
-  it('swallows a rejected takeover repaint without restoring continuation authority', async () => {
-    let rejectToolbar = false
-    let rejectedRepaints = 0
-    const { workspace, views } = createHarness(
+  it('deduplicates concurrent input-shield creation across continuation tabs', async () => {
+    const shieldLoad = deferred<void>()
+    const harness = createHarness(
       () => ({}), false,
       async (url) => {
-        if (rejectToolbar && url.startsWith('data:text/html')) {
-          rejectedRepaints += 1
-          throw new Error('toolbar renderer unavailable')
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          await shieldLoad.promise
         }
       },
     )
-    const input = executionInput()
-    const tab = await workspace.acquire(input)
+    const { workspace, views } = harness
     const registry = continuationRegistry(workspace)
     workspace.setContinuationRegistry(registry)
-    const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
-    workspace.markContinuationBound(tab.id)
-    await workspace.releaseExecution(input.executionId)
-    const lease = await registry.acquire(binding.bindingId, {
-      userId: input.userId, conversationId: input.conversationId!, runId: 'run_repaint_failure',
+    const firstInput = executionInput()
+    const first = await workspace.acquire(firstInput)
+    const firstBinding = registry.bind({
+      ...firstInput, tabId: first.id,
+    } as BrowserContinuationBindingInput)
+    await workspace.releaseExecution(firstInput.executionId)
+    const secondInput = executionInput({
+      executionId: 'e2', chatRunId: 'chat_run_2', workflowId: 'workflow.two',
     })
-    await vi.waitFor(() => expect(views[0]!.webContents.loaded.length).toBeGreaterThan(1))
-    rejectToolbar = true
+    const second = await workspace.acquire(secondInput)
+    const secondBinding = registry.bind({
+      ...secondInput, tabId: second.id,
+    } as BrowserContinuationBindingInput)
+    await workspace.releaseExecution(secondInput.executionId)
 
-    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
-
-    expect(lease.isCurrent(binding)).toBe(false)
-    await vi.waitFor(() => expect(rejectedRepaints).toBe(1))
-    expect(registry.currentLease(binding.bindingId)).toBeUndefined()
-    const replacement = await registry.acquire(binding.bindingId, {
-      userId: input.userId, conversationId: input.conversationId!, runId: 'run_after_repaint_failure',
+    const firstLease = registry.acquire(firstBinding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_first',
     })
-    expect(replacement.ownerRunId).toBe('run_after_repaint_failure')
-    await lease.release()
-    await replacement.release()
+    const secondLease = registry.acquire(secondBinding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_second',
+    })
+    await vi.waitFor(() => expect(views).toHaveLength(4))
+    const shield = views[3]!
+    expect(shield.webContents.loaded).toHaveLength(1)
+
+    shieldLoad.resolve()
+    const leases = await Promise.all([firstLease, secondLease])
+
+    expect(views).toHaveLength(4)
+    await leases[0].release()
+    await leases[1].release()
+  })
+
+  it('closes an input shield whose window is replaced while its document loads', async () => {
+    const shieldLoad = deferred<void>()
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          await shieldLoad.promise
+        }
+      },
+    )
+    const { workspace, views } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+
+    const acquiring = registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_stale',
+    })
+    await vi.waitFor(() => expect(views).toHaveLength(3))
+    const staleShield = views[2]!
+    const resetting = workspace.reset()
+    shieldLoad.resolve()
+
+    await resetting
+    await expect(acquiring).rejects.toMatchObject({ code: 'PAGE_CLOSED' })
+    expect(staleShield.webContents.destroyed).toBe(true)
   })
 
   it.each(['back', 'forward', 'reload'] as const)(
