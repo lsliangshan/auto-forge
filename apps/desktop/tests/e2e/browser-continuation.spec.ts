@@ -36,6 +36,7 @@ interface HarnessSnapshot {
 }
 
 interface NativeInputShieldState {
+  targetPresent: boolean
   attached: boolean
   loaded: boolean
   order: string[]
@@ -44,9 +45,17 @@ interface NativeInputShieldState {
   targetBounds: { x: number; y: number; width: number; height: number }
   documentAlpha: number
   documentAlphaGreaterThanZero: boolean
-  shieldEventCount: number
+  shieldPointerEvents: number
+  shieldPointerBlocked: boolean
+  shieldKeyboardEvents: number
+  shieldKeyboardBlocked: boolean
+  targetPointerEvents: number
+  targetPointerBlocked: boolean
+  targetKeyboardEvents: number
+  targetKeyboardBlocked: boolean
   targetEventsAfterShieldInput: number
   directCdpTargetEvents: number
+  attachedAfterInput: boolean
 }
 
 async function command<T>(
@@ -330,6 +339,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })
     expect(before).toMatchObject({
       attached: false,
+      targetPresent: true,
       loaded: true,
       order: ['target', 'toolbar'],
       shieldBounds: { x: 0, y: 52 },
@@ -348,12 +358,20 @@ test.describe.serial('conversation-bound browser continuation', () => {
       attached: true,
       order: ['target', 'shield', 'toolbar'],
       shieldBounds: { x: 0, y: 52 },
-      toolbarBounds: { x: 0, y: 0, width: 1280 },
+      toolbarBounds: { x: 0, y: 0, width: 1280, height: 52 },
       targetBounds: { x: 0, y: 52, width: 1280 },
       documentAlphaGreaterThanZero: true,
-      shieldEventCount: 1,
+      shieldPointerEvents: 1,
+      shieldPointerBlocked: true,
+      shieldKeyboardEvents: 1,
+      shieldKeyboardBlocked: true,
+      targetPointerEvents: 1,
+      targetPointerBlocked: true,
+      targetKeyboardEvents: 1,
+      targetKeyboardBlocked: true,
       targetEventsAfterShieldInput: 0,
       directCdpTargetEvents: 1,
+      attachedAfterInput: true,
     })
     expect(owned.documentAlpha).toBeLessThanOrEqual(0.004)
     expect(owned.shieldBounds).toEqual(owned.targetBounds)
@@ -362,6 +380,51 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: binding.bindingId,
     })).resolves.toMatchObject({ attached: false, order: ['target', 'toolbar'] })
+  })
+
+  test('detaches the native shield after normal completion, failure, handoff, and active target destruction', async () => {
+    const outcomes = [
+      ['normal', 'OK'],
+      ['failure', 'DOMAIN_BLOCKED'],
+      ['handoff', 'AUTH_REQUIRED'],
+    ] as const
+
+    for (const [terminal, code] of outcomes) {
+      const conversationId = await createConversation(page, electronApp)
+      const binding = await seed(electronApp, conversationId, '/details')
+      const scenarioId = await command<string>(electronApp, 'startAttachedTerminalScenario', {
+        bindingId: binding.bindingId,
+        terminal,
+      })
+      await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+        bindingId: binding.bindingId,
+      })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
+      await expect(command<{ code: string }>(electronApp, 'finishAttachedTerminalScenario', {
+        scenarioId,
+      })).resolves.toMatchObject({ code })
+      await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+        bindingId: binding.bindingId,
+      })).resolves.toMatchObject({ attached: false, order: ['target', 'toolbar'] })
+      const draftSavesBefore = (await fixture.snapshot()).draftSaves
+      await command(electronApp, 'userClick', { tabId: binding.tabId, selector: '#save-draft' })
+      await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(draftSavesBefore + 1)
+    }
+
+    const conversationId = await createConversation(page, electronApp)
+    const binding = await seed(electronApp, conversationId, '/details')
+    const scenarioId = await command<string>(electronApp, 'startAttachedTerminalScenario', {
+      bindingId: binding.bindingId,
+      terminal: 'destroy',
+    })
+    await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: binding.bindingId,
+    })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
+    await command(electronApp, 'finishAttachedTerminalScenario', { scenarioId })
+    const destroyed = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: binding.bindingId,
+    })
+    expect(destroyed).toMatchObject({ targetPresent: false, attached: false })
+    expect(destroyed.order).not.toContain('shield')
   })
 
   test('stops after exactly thirty continuation actions', async () => {
@@ -517,6 +580,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_STOP')
     const stopCard = page.getByTestId('browser-status').last()
     await expect(stopCard.getByText('AI 正在读取网页')).toBeVisible()
+    await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: continuationBinding.bindingId,
+    })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
     await stopCard.getByTestId('stop-browser').click()
     await expect(stopCard.getByTestId('stop-browser')).toBeDisabled()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
@@ -530,6 +596,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_TAKEOVER')
     const takeoverCard = page.getByTestId('browser-status').last()
     await expect(takeoverCard.getByText('AI 正在读取网页')).toBeVisible()
+    await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
+      bindingId: continuationBinding.bindingId,
+    })).toMatchObject({ attached: true, order: ['target', 'shield', 'toolbar'] })
     await takeoverCard.getByTestId('take-over-browser').click()
     await expect(takeoverCard.getByTestId('take-over-browser')).toBeDisabled()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {

@@ -419,8 +419,9 @@ type TargetState = {
   view: { webContents: {
     getURL(): string
     isDestroyed(): boolean
-    once(event: string, listener: () => void): void
-    removeListener(event: string, listener: () => void): void
+    once(event: string, listener: (event: { defaultPrevented?: boolean }) => void): void
+    removeListener(event: string, listener: (event: { defaultPrevented?: boolean }) => void): void
+    sendInputEvent(event: { type: string; x?: number; y?: number; button?: string; clickCount?: number; keyCode?: string }): void
     executeJavaScript<T>(script: string, userGesture?: boolean): Promise<T>
   }; getBounds(): { x: number; y: number; width: number; height: number } }
 }
@@ -431,6 +432,12 @@ let disposeIpc: (() => void) | undefined
 let agentState: { hasActiveRuns(): boolean } | undefined
 let fixtureWorkflowProjectId: string | undefined
 const busyRuns = new Map<string, string>()
+const observedTargetViews = new Map<string, WebContentsView>()
+const attachedTerminalScenarios = new Map<string, {
+  bindingId: string
+  terminal: 'normal' | 'failure' | 'handoff' | 'destroy'
+  result: Promise<Record<string, unknown>>
+}>()
 
 interface InspectionPause {
   promise: Promise<void>
@@ -616,6 +623,12 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
       }, current)
       return { code: resultCode(acted) }
     }
+    if (input.name === 'handoff') {
+      const handedOff = await executor.execute('browser_session_handoff', {
+        bindingId, reason: 'login',
+      }, current)
+      return { code: resultCode(handedOff) }
+    }
     return { code: 'INVALID_INPUT' }
   } finally {
     runActive = false
@@ -697,6 +710,7 @@ async function resetScenario(): Promise<void> {
     if (binding) await workspace.releaseContinuation(binding.tabId, runId)
   }
   busyRuns.clear()
+  observedTargetViews.clear()
   await registry().revokeUser(userId, 'CANCELLED')
   await workspace.clearUserData(userId)
   providerRequests.splice(0)
@@ -812,6 +826,41 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     return
   }
   if (name === 'directScenario') return directScenario(input)
+  if (name === 'startAttachedTerminalScenario') {
+    if (inspectionPause) throw new Error('An inspection pause is already armed')
+    const bindingId = String(input.bindingId)
+    const terminal = String(input.terminal)
+    if (terminal !== 'normal' && terminal !== 'failure' && terminal !== 'handoff' && terminal !== 'destroy') {
+      throw new Error(`Unsupported attached terminal scenario: ${terminal}`)
+    }
+    inspectionPause = newInspectionPause()
+    const scenarioId = `terminal_${randomUUID()}`
+    const scenario = terminal === 'normal' ? 'inspect'
+      : terminal === 'failure' ? 'disallowed'
+        : terminal === 'handoff' ? 'handoff'
+          : 'inspect'
+    attachedTerminalScenarios.set(scenarioId, {
+      bindingId,
+      terminal,
+      result: directScenario({ name: scenario, bindingId, userText: `attached terminal ${terminal}` }),
+    })
+    return scenarioId
+  }
+  if (name === 'finishAttachedTerminalScenario') {
+    const scenarioId = String(input.scenarioId)
+    const scenario = attachedTerminalScenarios.get(scenarioId)
+    if (!scenario) throw new Error('Attached terminal scenario is unavailable')
+    try {
+      if (scenario.terminal === 'destroy') {
+        const binding = registry().get(scenario.bindingId)
+        if (binding) await workspace.closeContinuation(binding.tabId)
+      }
+      inspectionPause?.release()
+      return await scenario.result
+    } finally {
+      attachedTerminalScenarios.delete(scenarioId)
+    }
+  }
   if (name === 'snapshot') return {
     openTabs: [...targets().values()].filter((target) => !target.closed).length,
     activeBindings: (registry() as unknown as { bindings: Map<string, unknown> }).bindings.size,
@@ -839,6 +888,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
   if (name === 'nativeInputShieldState') {
     const binding = registry().get(String(input.bindingId))
     const target = binding ? targets().get(binding.tabId) : undefined
+    const bindingId = String(input.bindingId)
     const internals = workspace as unknown as {
       window?: BaseWindow
       toolbar?: WebContentsView
@@ -849,15 +899,17 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const toolbar = internals.toolbar
     const shield = internals.inputShield
     const window = internals.window
-    if (!target || !toolbar || !shield || !window) throw new Error('Dedicated native input shield is unavailable')
-    const targetView = target.view as unknown as WebContentsView
+    if (!toolbar || !shield || !window) throw new Error('Dedicated native input shield is unavailable')
+    const liveTargetView = target?.view as unknown as WebContentsView | undefined
+    if (liveTargetView) observedTargetViews.set(bindingId, liveTargetView)
+    const targetView = liveTargetView ?? observedTargetViews.get(bindingId)
     const children = window.contentView.children
     const views = new Map<WebContentsView, 'target' | 'shield' | 'toolbar'>([
-      [targetView, 'target'],
       [shield, 'shield'],
       [toolbar, 'toolbar'],
     ])
-    if (!children.includes(targetView) || !children.includes(toolbar)) {
+    for (const observedTargetView of observedTargetViews.values()) views.set(observedTargetView, 'target')
+    if ((target && (!targetView || !children.includes(targetView))) || !children.includes(toolbar)) {
       throw new Error('The target and trusted toolbar must remain native children')
     }
     if (children.some((view) => !views.has(view as WebContentsView))) {
@@ -878,52 +930,111 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       })()
     `) as number
     const state = {
+      targetPresent: target !== undefined,
       attached,
       loaded: shield.webContents.getURL().startsWith('data:text/html'),
       order,
       shieldBounds: shield.getBounds(),
       toolbarBounds: toolbar.getBounds(),
-      targetBounds: target.view.getBounds(),
+      ...(target ? { targetBounds: target.view.getBounds() } : {}),
       documentAlpha,
       documentAlphaGreaterThanZero: documentAlpha > 0,
     }
-    if (!input.probeInput) {
+    if (!input.probeInput || !target) {
       return {
         ...state,
-        shieldEventCount: 0,
+        shieldPointerEvents: 0,
+        shieldPointerBlocked: false,
+        shieldKeyboardEvents: 0,
+        shieldKeyboardBlocked: false,
+        targetPointerEvents: 0,
+        targetPointerBlocked: false,
+        targetKeyboardEvents: 0,
+        targetKeyboardBlocked: false,
         targetEventsAfterShieldInput: 0,
         directCdpTargetEvents: 0,
       }
     }
-    let shieldMouseEvents = 0
-    let targetMouseEvents = 0
-    let resolveShieldMouse!: () => void
-    let resolveTargetCdpMouse!: () => void
-    const shieldMouse = new Promise<void>((resolve) => { resolveShieldMouse = resolve })
-    const targetCdpMouse = new Promise<void>((resolve) => { resolveTargetCdpMouse = resolve })
-    const onShieldMouse = () => { shieldMouseEvents += 1; resolveShieldMouse() }
-    const onTargetMouse = () => { targetMouseEvents += 1; resolveTargetCdpMouse() }
-    shield.webContents.once('before-mouse-event', onShieldMouse)
-    target.view.webContents.once('before-mouse-event', onTargetMouse)
+    let shieldPointerEvents = 0
+    let shieldPointerBlocked = false
+    let shieldKeyboardEvents = 0
+    let shieldKeyboardBlocked = false
+    let targetPointerEvents = 0
+    let targetPointerBlocked = false
+    let targetKeyboardEvents = 0
+    let targetKeyboardBlocked = false
+    let resolveShieldPointer!: () => void
+    let resolveShieldKeyboard!: () => void
+    let resolveTargetPointer!: () => void
+    let resolveTargetKeyboard!: () => void
+    const shieldPointer = new Promise<void>((resolve) => { resolveShieldPointer = resolve })
+    const shieldKeyboard = new Promise<void>((resolve) => { resolveShieldKeyboard = resolve })
+    const targetPointer = new Promise<void>((resolve) => { resolveTargetPointer = resolve })
+    const targetKeyboard = new Promise<void>((resolve) => { resolveTargetKeyboard = resolve })
+    const onShieldPointer = (event: { defaultPrevented?: boolean }) => {
+      shieldPointerEvents += 1
+      shieldPointerBlocked = event.defaultPrevented === true
+      resolveShieldPointer()
+    }
+    const onShieldKeyboard = (event: { defaultPrevented?: boolean }) => {
+      shieldKeyboardEvents += 1
+      shieldKeyboardBlocked = event.defaultPrevented === true
+      resolveShieldKeyboard()
+    }
+    const onTargetPointer = (event: { defaultPrevented?: boolean }) => {
+      targetPointerEvents += 1
+      targetPointerBlocked = event.defaultPrevented === true
+      resolveTargetPointer()
+    }
+    const onTargetKeyboard = (event: { defaultPrevented?: boolean }) => {
+      targetKeyboardEvents += 1
+      targetKeyboardBlocked = event.defaultPrevented === true
+      resolveTargetKeyboard()
+    }
+    shield.webContents.once('before-mouse-event', onShieldPointer)
+    shield.webContents.once('before-input-event', onShieldKeyboard)
+    target.view.webContents.once('before-mouse-event', onTargetPointer)
+    target.view.webContents.once('before-input-event', onTargetKeyboard)
     try {
       window.focus()
       // This targets the selected shield WebContents directly; it is not an OS-native hit-test assertion.
       shield.webContents.sendInputEvent({ type: 'mouseDown', x: 24, y: 24, button: 'left', clickCount: 1 })
-      await shieldMouse
-      const targetMouseEventsAfterShield = targetMouseEvents
+      await shieldPointer
+      shield.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'A' })
+      await shieldKeyboard
+      const targetEventsAfterShieldInput = targetPointerEvents + targetKeyboardEvents
+      // This targets the selected target WebContents directly; it is not an OS-native hit-test assertion.
+      target.view.webContents.sendInputEvent({ type: 'mouseDown', x: 24, y: 24, button: 'left', clickCount: 1 })
+      await targetPointer
+      target.view.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'A' })
+      await targetKeyboard
       // CDP targets the selected page WebContents directly and intentionally bypasses the native shield.
+      let resolveTargetCdpPointer!: () => void
+      const targetCdpPointer = new Promise<void>((resolve) => { resolveTargetCdpPointer = resolve })
+      const onTargetCdpPointer = () => resolveTargetCdpPointer()
+      target.view.webContents.once('before-mouse-event', onTargetCdpPointer)
       const clicking = internals.click(target, 'css=#progress-save', fixtureOrigin)
-      await targetCdpMouse
+      await targetCdpPointer
       await clicking
       return {
         ...state,
-        shieldEventCount: shieldMouseEvents,
-        targetEventsAfterShieldInput: targetMouseEventsAfterShield,
-        directCdpTargetEvents: targetMouseEvents - targetMouseEventsAfterShield,
+        shieldPointerEvents,
+        shieldPointerBlocked,
+        shieldKeyboardEvents,
+        shieldKeyboardBlocked,
+        targetPointerEvents,
+        targetPointerBlocked,
+        targetKeyboardEvents,
+        targetKeyboardBlocked,
+        targetEventsAfterShieldInput,
+        directCdpTargetEvents: 1,
+        attachedAfterInput: window.contentView.children.includes(shield) && internals.inputShieldAttached === true,
       }
     } finally {
-      shield.webContents.removeListener('before-mouse-event', onShieldMouse)
-      target.view.webContents.removeListener('before-mouse-event', onTargetMouse)
+      shield.webContents.removeListener('before-mouse-event', onShieldPointer)
+      shield.webContents.removeListener('before-input-event', onShieldKeyboard)
+      target.view.webContents.removeListener('before-mouse-event', onTargetPointer)
+      target.view.webContents.removeListener('before-input-event', onTargetKeyboard)
     }
   }
   if (name === 'closeTab') return workspace.closeContinuation(String(input.tabId))
