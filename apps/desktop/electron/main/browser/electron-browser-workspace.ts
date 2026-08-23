@@ -527,6 +527,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     await this.clearContinuationHighlight(tabId)
     await this.ensureInputShield()
     if (state.closed || state.view.webContents.isDestroyed()) throw failure('PAGE_CLOSED')
+    if (state.ownerExecutionId || state.ownerContinuationRunId || state.activeOperations > 0) {
+      throw failure('PAGE_BUSY')
+    }
     state.ownerContinuationRunId = runId
     this.layout()
     void this.renderToolbar().catch(() => undefined)
@@ -1962,6 +1965,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private handleDestroyed(state: TargetTabState): void {
     if (state.closed) return
     state.closed = true
+    if (this.activeTabId === state.id) {
+      state.ownerContinuationRunId = undefined
+      this.layout()
+    }
     this.highlightedContinuationTabs.delete(state.id)
     this.emitPageInvalidated(state.id)
     this.tabs.delete(state.id)

@@ -839,6 +839,73 @@ describe('ElectronBrowserWorkspace', () => {
     await replacement.release()
   })
 
+  it.each(['read', 'screenshot'] as const)(
+    'keeps a pending continuation %s running below the dedicated input shield',
+    async (operation) => {
+      const gate = deferred<unknown>()
+      const respond = (method: string, params?: unknown) => {
+        const input = params as { backendNodeId?: number } | undefined
+        if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+        if (method === 'Accessibility.getFullAXTree') return operation === 'read' ? gate.promise : { nodes: [] }
+        if (method === 'DOM.describeNode') return {
+          node: { backendNodeId: input?.backendNodeId, nodeName: 'IMG', attributes: [] },
+        }
+        if (method === 'Accessibility.getPartialAXTree') return { nodes: [{
+          nodeId: 'ax_image', backendDOMNodeId: input?.backendNodeId, frameId: 'frame_main', ignored: false,
+          role: { value: 'img' }, name: { value: '结果图' },
+        }] }
+        if (method === 'DOM.getBoxModel') return {
+          model: { content: [20, 30, 340, 30, 340, 230, 20, 230] },
+        }
+        if (method === 'Page.getLayoutMetrics') return {
+          cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 },
+        }
+        if (method === 'Page.captureScreenshot') return gate.promise
+        return {}
+      }
+      const { workspace, views, windows } = createHarness(respond)
+      const input = executionInput()
+      const tab = await workspace.acquire(input)
+      await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+      const registry = continuationRegistry(workspace)
+      workspace.setContinuationRegistry(registry)
+      const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+      await workspace.releaseExecution(input.executionId)
+      const lease = await registry.acquire(binding.bindingId, {
+        userId: input.userId, conversationId: input.conversationId!, runId: 'run_reading',
+      })
+      const invalidated = vi.fn()
+      workspace.onPageInvalidated(invalidated)
+      const request = {
+        tabId: tab.id, runId: 'run_reading', expectedOrigin: 'https://www.baidu.com',
+        expectedNavigationEpoch: tab.navigationEpoch,
+      }
+      const pending = operation === 'read'
+        ? workspace.readAccessibilitySnapshot({ ...request, locators: [] })
+        : workspace.captureContinuationNodeScreenshot({
+          ...request, backendNodeId: 11,
+          clip: { x: 20, y: 30, width: 320, height: 200 },
+          expectedRole: 'img', expectedName: '结果图', expectedTagName: 'img',
+        })
+      await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+        .toContainEqual(expect.objectContaining({
+          method: operation === 'read' ? 'Accessibility.getFullAXTree' : 'Page.captureScreenshot',
+        })))
+
+      const [toolbar, target, shield] = views
+      expect(invalidated).not.toHaveBeenCalled()
+      expect(lease.isCurrent(binding)).toBe(true)
+      expect(windows[0]!.children).toEqual([target, shield, toolbar])
+      expect(toolbar!.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 52 })
+      expect(shield!.bounds.at(-1)).toEqual({ x: 0, y: 52, width: 1200, height: 748 })
+      gate.resolve(operation === 'read' ? { nodes: [] } : { data: 'stale-png-data' })
+
+      if (operation === 'read') await expect(pending).resolves.toMatchObject({ tabId: tab.id })
+      else await expect(pending).resolves.toBe('stale-png-data')
+      await lease.release()
+    },
+  )
+
   it('attaches a dedicated native input shield for the full continuation lease', async () => {
     const harness = createHarness()
     const { workspace, views, windows } = harness
@@ -871,7 +938,9 @@ describe('ElectronBrowserWorkspace', () => {
     expect(lease.isCurrent(binding)).toBe(true)
     expect(toolbar?.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 52 })
     const toolbarHtml = decodeURIComponent(toolbar!.webContents.loaded.at(-1)!.split(',')[1]!)
+    const shieldHtml = decodeURIComponent(shield!.webContents.loaded[0]!.split(',')[1]!)
     expect(toolbarHtml).not.toContain('data-autoforge-input-shield')
+    expect(shieldHtml).toContain('background:rgb(0 0 0 / 0.004)')
     await lease.release()
   })
 
@@ -1021,6 +1090,73 @@ describe('ElectronBrowserWorkspace', () => {
     await leases[1].release()
   })
 
+  it('allows exactly one same-binding continuation to claim a tab while the shield loads', async () => {
+    const shieldLoad = deferred<void>()
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          await shieldLoad.promise
+        }
+      },
+    )
+    const { views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+
+    const first = registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_first',
+    })
+    await vi.waitFor(() => expect(views).toHaveLength(3))
+    const second = registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_second',
+    })
+    shieldLoad.resolve()
+
+    const results = await Promise.allSettled([first, second])
+    const fulfilled = results.filter((result) => result.status === 'fulfilled')
+    const rejected = results.filter((result) => result.status === 'rejected')
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]).toMatchObject({ reason: { code: 'PAGE_BUSY' } })
+    const lease = fulfilled[0]!.value
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(windows[0]!.children).toEqual([views[1], views[2], views[0]])
+    await lease.release()
+  })
+
+  it('returns PAGE_BUSY when workflow ownership is claimed while the shield loads', async () => {
+    const shieldLoad = deferred<void>()
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          await shieldLoad.promise
+        }
+      },
+    )
+    const { workspace, views, windows } = harness
+    const { tab, binding, registry } = await bindIdleContinuation(harness)
+    const continuation = registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_continuation',
+    })
+    await vi.waitFor(() => expect(views).toHaveLength(3))
+
+    const workflow = await workspace.acquire(executionInput({
+      executionId: 'e2', chatRunId: 'chat_run_2',
+    }))
+    expect(workflow.id).toBe(tab.id)
+    shieldLoad.resolve()
+
+    await expect(continuation).rejects.toMatchObject({ code: 'PAGE_BUSY' })
+    expect(registry.currentLease(binding.bindingId)).toBeUndefined()
+    expect(windows[0]!.children).toContain(views[0])
+    expect(windows[0]!.children).toContain(views[1])
+    expect(windows[0]!.children).not.toContain(views[2])
+    await workspace.releaseExecution('e2')
+  })
+
   it('closes an input shield whose window is replaced while its document loads', async () => {
     const shieldLoad = deferred<void>()
     const harness = createHarness(
@@ -1046,6 +1182,24 @@ describe('ElectronBrowserWorkspace', () => {
     await resetting
     await expect(acquiring).rejects.toMatchObject({ code: 'PAGE_CLOSED' })
     expect(staleShield.webContents.destroyed).toBe(true)
+  })
+
+  it('detaches the input shield synchronously when the leased active target crashes', async () => {
+    const harness = createHarness()
+    const { views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_crashed',
+    })
+    const [toolbar, target, shield] = views
+    expect(windows[0]!.children).toEqual([target, shield, toolbar])
+
+    target!.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+
+    expect(target!.webContents.destroyed).toBe(true)
+    expect(windows[0]!.children).toEqual([target, toolbar])
+    expect(lease.isCurrent(binding)).toBe(false)
+    await lease.release()
   })
 
   it.each(['back', 'forward', 'reload'] as const)(
