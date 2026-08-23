@@ -432,10 +432,19 @@ let disposeIpc: (() => void) | undefined
 let agentState: { hasActiveRuns(): boolean } | undefined
 let fixtureWorkflowProjectId: string | undefined
 const busyRuns = new Map<string, string>()
-const observedTargetViews = new Map<string, WebContentsView>()
+type AttachedTerminal = 'normal' | 'failure' | 'handoff' | 'destroy'
+type ObservedTarget = {
+  tabId: string
+  view: WebContentsView
+  terminal?: AttachedTerminal
+  terminalFinished?: boolean
+}
+const observedTargets = new Map<string, ObservedTarget>()
 const attachedTerminalScenarios = new Map<string, {
   bindingId: string
-  terminal: 'normal' | 'failure' | 'handoff' | 'destroy'
+  tabId: string
+  targetView: WebContentsView
+  terminal: AttachedTerminal
   result: Promise<Record<string, unknown>>
 }>()
 
@@ -710,7 +719,7 @@ async function resetScenario(): Promise<void> {
     if (binding) await workspace.releaseContinuation(binding.tabId, runId)
   }
   busyRuns.clear()
-  observedTargetViews.clear()
+  observedTargets.clear()
   await registry().revokeUser(userId, 'CANCELLED')
   await workspace.clearUserData(userId)
   providerRequests.splice(0)
@@ -834,6 +843,11 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (terminal !== 'normal' && terminal !== 'failure' && terminal !== 'handoff' && terminal !== 'destroy') {
       throw new Error(`Unsupported attached terminal scenario: ${terminal}`)
     }
+    const binding = registry().get(bindingId)
+    const target = binding ? targets().get(binding.tabId) : undefined
+    if (!binding || !target) throw new Error('Attached terminal target is unavailable')
+    const targetView = target.view as unknown as WebContentsView
+    observedTargets.set(bindingId, { tabId: binding.tabId, view: targetView, terminal })
     inspectionPause = newInspectionPause()
     const scenarioId = `terminal_${randomUUID()}`
     const scenario = terminal === 'normal' ? 'inspect'
@@ -842,6 +856,8 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
           : 'inspect'
     attachedTerminalScenarios.set(scenarioId, {
       bindingId,
+      tabId: binding.tabId,
+      targetView,
       terminal,
       result: directScenario({ name: scenario, bindingId, userText: `attached terminal ${terminal}` }),
     })
@@ -852,13 +868,20 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const scenario = attachedTerminalScenarios.get(scenarioId)
     if (!scenario) throw new Error('Attached terminal scenario is unavailable')
     try {
+      const target = observedTargets.get(scenario.bindingId)
+      if (!target || target.tabId !== scenario.tabId || target.view !== scenario.targetView) {
+        throw new Error('Attached terminal target cache changed unexpectedly')
+      }
       if (scenario.terminal === 'destroy') {
-        const binding = registry().get(scenario.bindingId)
-        if (binding) await workspace.closeContinuation(binding.tabId)
+        await workspace.closeContinuation(scenario.tabId)
       }
       inspectionPause?.release()
       return await scenario.result
     } finally {
+      if (scenario.terminal === 'destroy') {
+        const target = observedTargets.get(scenario.bindingId)
+        if (target) target.terminalFinished = true
+      }
       attachedTerminalScenarios.delete(scenarioId)
     }
   }
@@ -887,9 +910,14 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     return { url: target.view.webContents.getURL(), blockedErrorCode: target.blockedErrorCode }
   }
   if (name === 'nativeInputShieldState') {
-    const binding = registry().get(String(input.bindingId))
-    const target = binding ? targets().get(binding.tabId) : undefined
     const bindingId = String(input.bindingId)
+    let observedTarget = observedTargets.get(bindingId)
+    const binding = observedTarget ? undefined : registry().get(bindingId)
+    const target = targets().get(observedTarget?.tabId ?? binding?.tabId ?? '')
+    if (!observedTarget && binding && target) {
+      observedTarget = { tabId: binding.tabId, view: target.view as unknown as WebContentsView }
+      observedTargets.set(bindingId, observedTarget)
+    }
     const internals = workspace as unknown as {
       window?: BaseWindow
       toolbar?: WebContentsView
@@ -901,19 +929,31 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const shield = internals.inputShield
     const window = internals.window
     if (!toolbar || !shield || !window) throw new Error('Dedicated native input shield is unavailable')
-    const liveTargetView = target?.view as unknown as WebContentsView | undefined
-    if (liveTargetView) observedTargetViews.set(bindingId, liveTargetView)
     const children = window.contentView.children
     const views = new Map<WebContentsView, 'target' | 'shield' | 'toolbar'>([
       [shield, 'shield'],
       [toolbar, 'toolbar'],
     ])
-    for (const observedTargetView of observedTargetViews.values()) views.set(observedTargetView, 'target')
+    for (const { view } of observedTargets.values()) views.set(view, 'target')
     if (!children.includes(toolbar)) throw new Error('The trusted toolbar must remain a native child')
     if (children.some((view) => !views.has(view as WebContentsView))) {
       throw new Error('Unexpected native child view in browser continuation workspace')
     }
-    const targetNativeChild = target !== undefined && liveTargetView !== undefined && children.includes(liveTargetView)
+    const cachedTargetView = observedTarget?.view
+    const targetStateMatchesCachedView = target !== undefined
+      && cachedTargetView !== undefined
+      && target.view === cachedTargetView
+    const targetNativeChild = targetStateMatchesCachedView
+      && cachedTargetView !== undefined
+      && children.includes(cachedTargetView)
+    if (observedTarget?.terminal && observedTarget.terminal !== 'destroy'
+      && (!targetStateMatchesCachedView || !targetNativeChild)) {
+      throw new Error('Non-destruction terminal target must remain the cached native child')
+    }
+    if (observedTarget?.terminal === 'destroy' && observedTarget.terminalFinished
+      && (target !== undefined || children.includes(observedTarget.view))) {
+      throw new Error('Destroyed terminal target must not remain in workspace state or native children')
+    }
     const attached = children.includes(shield)
     if (attached !== internals.inputShieldAttached) {
       throw new Error('Input shield attachment state disagrees with native child membership')
@@ -930,6 +970,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     `) as number
     const state = {
       targetPresent: target !== undefined,
+      targetStateMatchesCachedView,
       targetNativeChild,
       attached,
       loaded: shield.webContents.getURL().startsWith('data:text/html'),

@@ -37,6 +37,7 @@ interface HarnessSnapshot {
 
 interface NativeInputShieldState {
   targetPresent: boolean
+  targetStateMatchesCachedView: boolean
   targetNativeChild: boolean
   attached: boolean
   loaded: boolean
@@ -401,13 +402,23 @@ test.describe.serial('conversation-bound browser continuation', () => {
       })
       await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
         bindingId: binding.bindingId,
-      })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
+      })).toMatchObject({
+        attached: true,
+        targetStateMatchesCachedView: true,
+        targetNativeChild: true,
+        order: ['target', 'shield', 'toolbar'],
+      })
       await expect(command<{ code: string }>(electronApp, 'finishAttachedTerminalScenario', {
         scenarioId,
       })).resolves.toMatchObject({ code })
       await expect(command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
         bindingId: binding.bindingId,
-      })).resolves.toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
+      })).resolves.toMatchObject({
+        attached: false,
+        targetStateMatchesCachedView: true,
+        targetNativeChild: true,
+        order: ['target', 'toolbar'],
+      })
       const draftSavesBefore = (await fixture.snapshot()).draftSaves
       await command(electronApp, 'userClick', { tabId: binding.tabId, selector: '#save-draft' })
       await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(draftSavesBefore + 1)
@@ -426,7 +437,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     const destroyed = await command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: binding.bindingId,
     })
-    expect(destroyed).toMatchObject({ targetPresent: false, targetNativeChild: false, attached: false })
+    expect(destroyed).toMatchObject({
+      targetPresent: false,
+      targetStateMatchesCachedView: false,
+      targetNativeChild: false,
+      attached: false,
+    })
     expect(destroyed.order).not.toContain('shield')
   })
 
