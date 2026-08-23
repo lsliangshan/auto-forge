@@ -228,13 +228,36 @@ const safeDate = /^\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?$/u
 const emailAddress = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/iu
 const uuid = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu
 const filesystemPath = /(?:\bfile\s*:|\b(?:file|folder|directory)path\s*[:=]|(?:^|[\s="'(:])\/(?:[^\s/]+\/)*[^\s/]+|\b[A-Za-z]:[\\/]|(?:^|[\s="'(])\\\\[^\\/\s]+[\\/][^\\/\s]+)/iu
-const staticFieldLabel = /^[\p{L}\p{N}][\p{L}\p{N}\s（）()·_-]*$/u
 const sensitiveStaticFieldLabel = /(?:authorization|bearer|cookie|credential|password|passcode|pin|secret|session|token|api[-_ ]?key|access[-_ ]?key|refresh[-_ ]?key|密码|口令|密钥|秘钥|令牌|验证码|校验码|动态码|身份证|身份号码|证件号码|社会保障号|银行卡|信用卡|借记卡|姓名|住址|地址|手机号|联系电话|邮箱|电子邮件)/iu
 const instructionLikeText = /(?:(?:忽略|无视|覆盖|绕过).{0,16}(?:系统|策略|指令|提示)|(?:调用|使用|新增|添加|执行|提交|发送|上传|删除).{0,16}(?:工具|字段|数据|内容|请求)|(?:ignore|disregard|override|bypass).{0,24}(?:system|policy|prompt|instruction)|(?:call|invoke|add|submit|send|upload|delete).{0,24}(?:tool|field|data|content|request))/iu
 const isoStaticDate = /^(\d{4})-(\d{2})-(\d{2})$/u
 const isoStaticDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|[+-](\d{2}):(\d{2}))$/u
 const isoStaticDateRange = /^(\d{4}-\d{2}-\d{2})\s*(?:至|到|~|～|–)\s*(\d{4}-\d{2}-\d{2})$/u
 const unsafeStaticFieldRawText = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const staticDateLabels: ReadonlySet<string> = new Set([
+  '有效期',
+  '有效期至',
+  '证件有效期',
+  '工作居住证有效期',
+  '到期日',
+  '到期日期',
+  '截止日期',
+  '签发日期',
+  '生效日期',
+  '申请日期',
+  'expiry date',
+  'expiration date',
+  'date of expiry',
+  'valid until',
+  'valid through',
+  'expires on',
+  'issue date',
+  'date of issue',
+  'effective date',
+  'application date',
+  'deadline date',
+  'validity period',
+])
 
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
@@ -320,26 +343,27 @@ function structuredStaticField(
   intent: string,
 ): StructuredStaticField | null | undefined {
   if (unsafeStaticFieldRawText.test(rawText)) return null
+  const delimiter = /[:：]/u.exec(rawText)
+  if (!delimiter) return undefined
   const safeOriginal = safeText(rawText)
   if (!safeOriginal) return null
   if (instructionLikeText.test(safeOriginal) || sensitiveStaticFieldLabel.test(safeOriginal.split(/[:：]/u)[0] ?? '')) {
     return null
   }
-  const delimiter = /[:：]/u.exec(rawText)
-  if (!delimiter || rawText.slice(delimiter.index + delimiter[0].length).includes('：')) return undefined
+  if (rawText.slice(delimiter.index + delimiter[0].length).includes('：')) return null
   const label = normalizedText(rawText.slice(0, delimiter.index))
   const value = normalizedText(rawText.slice(delimiter.index + delimiter[0].length))
   if (!label || !value
     || [...label].length > maxStaticFieldLabelLength
-    || [...value].length > maxStaticFieldValueLength) return undefined
+    || [...value].length > maxStaticFieldValueLength) return null
   const safeLabel = safeText(label)
   const safeValue = safeText(value)
   if (!safeLabel || !safeValue
     || sensitiveStaticFieldLabel.test(safeLabel)
     || sensitiveText(`${safeLabel}: ${safeValue}`)
     || instructionLikeText.test(safeValue)) return null
-  if (!staticFieldLabel.test(safeLabel)) return undefined
-  if (!relevantValue(safeLabel, intent)) return undefined
+  if (!staticDateLabels.has(safeLabel.toLowerCase())) return null
+  if (!relevantValue(safeLabel, intent)) return null
   if (!safeStaticDateValue(safeValue)) return null
   return Object.freeze({ name: safeLabel, value: safeValue })
 }

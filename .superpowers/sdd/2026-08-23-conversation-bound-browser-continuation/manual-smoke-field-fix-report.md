@@ -131,3 +131,40 @@ The user-assisted Beijing portal smoke has **not** been re-run by this automated
 - `git diff --check`: PASS.
 
 The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 1.
+
+## Fix Round 2: closed static-date labels
+
+### RED evidence
+
+The expanded Inspector-to-Orchestrator suite failed at both boundaries before the production change:
+
+```text
+Test Files  2 failed (2)
+Tests       13 failed | 198 passed (211)
+```
+
+- The broad field-label grammar accepted the exact requested malicious suffix cases: a name, formatted phone number, repeated date, and AWS access-key shape appended to `工作居住证有效期`. The relevance bigram still matched, so each valid date became evidence.
+- A domain label failed structuring but crossed the semantic boundary through the name-only fallback.
+- Unrelated date fields, colon-bearing prose, and malformed colon pairs likewise survived as raw name-only page text.
+- The real Inspector snapshot consequently contained multiple matching values, and the Orchestrator returned the ambiguity response instead of the one Main-owned expiry answer.
+
+### GREEN contract and security analysis
+
+- Static date labels are now an exact, case-normalized closed set. It includes the two observed real labels (`有效期至` and `工作居住证有效期`), the bounded Chinese date variants specified in review, and narrowly enumerated English expiry/issue/effective/application/deadline equivalents.
+- Arbitrary CJK or alphanumeric prefixes/suffixes cannot match. Names, phones, digits, domains, credential shapes, and repeated dates in the label are rejected even when they contain the same relevance bigrams as an allowed label.
+- For raw `StaticText`, absence of a colon still returns the ordinary safe untrusted semantic name. Once an ASCII or Chinese colon is present, every failed label, value, length, sensitivity, instruction, relevance, or delimiter check drops the entire node instead of falling back to the raw combined name.
+- Calendar-valid ISO date, date-time, and date-range value types from Fix Round 1 remain unchanged. ASCII colons internal to a valid typed date-time remain accepted; delimiter spam or mixed trailing content remains invalid and is dropped.
+- The provider tool snapshot contains the one allowed observed field only. All invalid label/value pairs are absent, not merely value-less. The terminal answer and next-turn durable context contain only the intentionally persisted Main-owned answer with source and read time; provider prose and rejected raw page content remain excluded.
+- The existing two-valid-values ambiguity behavior, exact raw `StaticText` role gate, Unicode pre-normalization rejection, pagination, serialized-size enforcement, run-local refs, injection defenses, and protected final-action boundary are unchanged.
+
+### Fix Round 2 verification
+
+- Focused Inspector + Orchestrator: `2 files / 228 tests passed`.
+- Changed-file ESLint: exit 0, zero errors/warnings.
+- Full native-aware unit suite: `88 files / 2386 tests passed`.
+- Full typecheck: PASS.
+- Full production build: PASS; only the two pre-existing VueUse annotation warnings were emitted.
+- Real Electron browser-continuation E2E: `19/19 passed` in 53.6 seconds. Renderer returned the static expiry without submission; injection and protected final-action cases remained blocked.
+- `git diff --check`: PASS.
+
+The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 2.
