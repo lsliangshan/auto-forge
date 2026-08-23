@@ -276,7 +276,7 @@ const staticCertificateNumberLabels: ReadonlySet<string> = new Set([
   '居住证编号',
   '工作居住证编号',
 ])
-const safeCertificateNumberValue = /^[A-Z0-9][A-Z0-9./_-]{5,30}[A-Z0-9]$/iu
+const safeCertificateNumberValue = /^[A-Z0-9][A-Z0-9*＊•●./_-]{5,30}[A-Z0-9]$/iu
 const staticCertificateTypeLabels: ReadonlySet<string> = new Set([
   '证件类型',
   '证件种类',

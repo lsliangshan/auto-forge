@@ -446,6 +446,18 @@ describe('BrowserPageInspector', () => {
     expectPrivateStaticField(inspector, snapshot, '证件编号', '123456789012')
   })
 
+  it('keeps a masked certificate number as private static evidence', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '个人信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'StaticText', '证件号码：430722******8715'),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input(binding(), { intent: '我的证件号码是多少' }))
+
+    expectPrivateStaticField(inspector, snapshot, '证件号码', '430722******8715')
+  })
+
   it('keeps private field evidence out of the model-visible semantic snapshot', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),

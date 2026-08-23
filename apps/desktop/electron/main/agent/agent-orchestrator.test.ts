@@ -3512,7 +3512,7 @@ describe('AgentOrchestrator', () => {
     ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'semantic_match_call',
-        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_2'] },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ]])
@@ -3520,6 +3520,7 @@ describe('AgentOrchestrator', () => {
     attachBrowserContinuation(dependencies, {
       execute: async () => inspectedPrivateFields([
         { ref: 'ref_number', label: '证件编号', value: '202111127927' },
+        { ref: 'ref_identity_number', label: '证件号码', value: '430722******8715' },
         { ref: 'ref_type', label: '证件类型', value: '身份证' },
       ]),
     })
@@ -3532,13 +3533,15 @@ describe('AgentOrchestrator', () => {
     const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
     expect(JSON.stringify(matcherRequest.messages)).toContain('我的证件号码是多少')
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件编号')
+    expect(JSON.stringify(matcherRequest.messages)).toContain('证件号码')
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件类型')
-    expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/202111127927|身份证/u)
+    expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/202111127927|430722\*{6}8715|身份证/u)
     const toolMessage = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
       .messages.find(({ role }) => role === 'tool')
-    expect(String(toolMessage?.content)).not.toMatch(/202111127927|身份证/u)
-    expect(JSON.stringify(dependencies.records.terminal.at(-1)))
-      .toContain('证件编号：202111127927')
+    expect(String(toolMessage?.content)).not.toMatch(/202111127927|430722\*{6}8715|身份证/u)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('证件号码：430722******8715')
+    expect(terminal).not.toContain('证件编号：202111127927')
   })
 
   it('fails closed when AI says a related browser label is not the requested attribute', async () => {
@@ -3695,7 +3698,7 @@ describe('AgentOrchestrator', () => {
     )
   })
 
-  it('keeps two real structured static values ambiguous instead of trusting provider prose', async () => {
+  it('uses the model-selected best match when multiple structured fields are semantically related', async () => {
     const inspected = await inspectedStaticFields([
       '有效期至：2028-06-30',
       '工作居住证有效期：2029-07-01',
@@ -3713,7 +3716,7 @@ describe('AgentOrchestrator', () => {
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'two_static_match',
         name: 'report_browser_field_matches',
-        arguments: { matchingCandidateIds: ['candidate_1', 'candidate_2'] },
+        arguments: { matchingCandidateIds: ['candidate_2'] },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ]])
@@ -3735,8 +3738,8 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(matcherRequest.messages)).toContain('工作居住证有效期')
     expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/2028-06-30|2029-07-01/u)
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
-    expect(terminal).toContain('无法从已绑定网页中唯一确认请求的字段')
-    expect(terminal).not.toMatch(/2028-06-30|2029-07-01|唯一答案/)
+    expect(terminal).toContain('工作居住证有效期：2029-07-01')
+    expect(terminal).not.toMatch(/2028-06-30|唯一答案/)
   })
 
   it('rejects unexpected executor result properties before they reach provider or durable state', async () => {

@@ -38,7 +38,8 @@ function harness(events: readonly ModelStreamEvent[], streamError?: unknown) {
     trustedRequest,
     candidates: [
       { id: 'candidate_1', label: '证件编号' },
-      { id: 'candidate_2', label: '证件类型' },
+      { id: 'candidate_2', label: '证件号码' },
+      { id: 'candidate_3', label: '证件类型' },
     ],
     providerSnapshot,
     providerUsage,
@@ -54,26 +55,34 @@ function harness(events: readonly ModelStreamEvent[], streamError?: unknown) {
 }
 
 describe('matchBrowserFieldSemantics', () => {
-  it('lets the model semantically match a differently worded field label without receiving values', async () => {
+  it('lets the model select the single best semantic match without receiving values', async () => {
     const usage = { type: 'usage', inputTokens: 12, outputTokens: 3, totalTokens: 15, costUsd: '0.001' } as const
     const test = harness([
-      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1', name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] } },
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'call_1', name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_2'] } },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
       usage,
     ])
 
     await expect(test.run()).resolves.toEqual({
-      matchingCandidateIds: ['candidate_1'],
+      matchingCandidateIds: ['candidate_2'],
       usage,
     })
     const request = test.stream.mock.calls[0]![0]
     expect(request.messages).toHaveLength(2)
     expect(JSON.stringify(request.messages)).toContain('我的证件号码是多少')
     expect(JSON.stringify(request.messages)).toContain('证件编号')
+    expect(JSON.stringify(request.messages)).toContain('证件号码')
     expect(JSON.stringify(request.messages)).toContain('证件类型')
     expect(JSON.stringify(request.messages)).not.toMatch(/202111127927|身份证/u)
     expect(request.tools).toEqual([expect.objectContaining({
-      function: expect.objectContaining({ name: 'report_browser_field_matches' }),
+      function: expect.objectContaining({
+        name: 'report_browser_field_matches',
+        parameters: expect.objectContaining({
+          properties: expect.objectContaining({
+            matchingCandidateIds: expect.objectContaining({ maxItems: 1 }),
+          }),
+        }),
+      }),
     })])
   })
 
@@ -89,6 +98,7 @@ describe('matchBrowserFieldSemantics', () => {
   it.each([
     ['unknown candidate', { matchingCandidateIds: ['candidate_missing'] }, 'tool_calls', false],
     ['duplicate candidate', { matchingCandidateIds: ['candidate_1', 'candidate_1'] }, 'tool_calls', false],
+    ['multiple candidates', { matchingCandidateIds: ['candidate_1', 'candidate_2'] }, 'tool_calls', false],
     ['unknown key', { matchingCandidateIds: ['candidate_1'], explanation: 'trust me' }, 'tool_calls', false],
     ['wrong finish reason', { matchingCandidateIds: ['candidate_1'] }, 'stop', false],
     ['authoritative prose', { matchingCandidateIds: ['candidate_1'] }, 'tool_calls', true],
