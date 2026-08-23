@@ -107,4 +107,54 @@ describe('BrowserContinuationCatalog', () => {
     expect(snapshot.bindings.size).toBe(0)
     expect(snapshot.tools).toEqual([])
   })
+
+  it('refreshes one exact still-eligible binding from its authoritative live page description', async () => {
+    const { catalog, descriptions } = harness()
+    descriptions.set('binding_1', {
+      workflowLabel: '证件查询', pageLabel: '续期帮助',
+      origin: 'https://renew.example.gov.cn', lastActiveAt: 1_775_520_002_000,
+    })
+
+    await expect(catalog.refresh({
+      userId: 'user_1', conversationId: 'conversation_1', bindingId: 'binding_1',
+    })).resolves.toEqual({
+      bindingId: 'binding_1', workflowLabel: '证件查询', workflowVersion: '1.2.3',
+      pageLabel: '续期帮助', origin: 'https://renew.example.gov.cn', lastActiveAt: 1_775_520_002_000,
+    })
+    await expect(catalog.refresh({
+      userId: 'user_2', conversationId: 'conversation_1', bindingId: 'binding_1',
+    })).resolves.toBeUndefined()
+    await expect(catalog.refresh({
+      userId: 'user_1', conversationId: 'conversation_2', bindingId: 'binding_1',
+    })).resolves.toBeUndefined()
+  })
+
+  it('admits a canonical HTTPS origin with an explicit non-default port', async () => {
+    const { catalog, descriptions } = harness()
+    descriptions.set('binding_1', {
+      workflowLabel: '证件查询', pageLabel: '证件详情',
+      origin: 'https://permit.example.gov.cn:8443', lastActiveAt: 1_775_520_000_000,
+    })
+
+    const snapshot = await catalog.create({ userId: 'user_1', conversationId: 'conversation_1' })
+
+    expect(snapshot.bindings.get('binding_1')?.origin).toBe('https://permit.example.gov.cn:8443')
+  })
+
+  it.each([
+    'http://permit.example.gov.cn:8443',
+    'https://user@permit.example.gov.cn:8443',
+    'https://permit.example.gov.cn:8443/path',
+    'https://permit.example.gov.cn:99999',
+  ])('rejects an unsafe or non-canonical candidate origin: %s', async (origin) => {
+    const { catalog, descriptions } = harness()
+    descriptions.set('binding_1', {
+      workflowLabel: '证件查询', pageLabel: '证件详情',
+      origin, lastActiveAt: 1_775_520_000_000,
+    })
+
+    const snapshot = await catalog.create({ userId: 'user_1', conversationId: 'conversation_1' })
+
+    expect(snapshot.bindings.has('binding_1')).toBe(false)
+  })
 })

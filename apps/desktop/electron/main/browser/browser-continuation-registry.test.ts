@@ -151,6 +151,29 @@ describe('BrowserContinuationRegistry', () => {
     expect(test.owners.has(binding.tabId)).toBe(false)
   })
 
+  it('retains lease ownership when workspace release fails and permits an exact retry', async () => {
+    const test = createHarness()
+    const binding = test.registry.bind(bindingInput())
+    const lease = await test.registry.acquire(binding.bindingId, {
+      userId: binding.userId, conversationId: binding.conversationId, runId: 'run_retry',
+    })
+    const underlyingRelease = test.workspace.releaseContinuation.bind(test.workspace)
+    const release = vi.spyOn(test.workspace, 'releaseContinuation')
+      .mockRejectedValueOnce(new Error('release failed'))
+      .mockImplementation(underlyingRelease)
+
+    await expect(lease.release()).rejects.toThrow('release failed')
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(test.registry.currentLease(binding.bindingId)).toEqual({ binding, runId: 'run_retry' })
+    expect(test.owners.get(binding.tabId)).toBe('run_retry')
+
+    await expect(lease.release()).resolves.toBeUndefined()
+    expect(lease.isCurrent(binding)).toBe(false)
+    expect(test.registry.currentLease(binding.bindingId)).toBeUndefined()
+    expect(test.owners.has(binding.tabId)).toBe(false)
+    expect(release).toHaveBeenCalledTimes(2)
+  })
+
   it('revokes ineligible bindings before catalog admission or lease acquisition', async () => {
     const test = createHarness()
     const binding = test.registry.bind(bindingInput())

@@ -335,7 +335,7 @@ export interface AgentOrchestratorDependencies {
   history: ConversationHistoryPort
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   browserContinuation?: {
-    catalog: Pick<BrowserContinuationCatalog, 'create'>
+    catalog: Pick<BrowserContinuationCatalog, 'create' | 'refresh'>
     executor: Pick<BrowserContinuationToolExecutor, 'execute' | 'endRun' | 'cancel' | 'takeOver'>
   }
   emit: (event: ChatEvent) => void
@@ -407,6 +407,7 @@ interface ActiveAgentRun {
   workflowCatalogTools: ModelTool[]
   workflows: Map<string, WorkflowCandidate>
   browserCatalog: BrowserContinuationCatalogSnapshot
+  browserCandidate?: BrowserContinuationCandidate
   browserExplicitBindingId?: string
   browserBindingId?: string
   browserStatusBlockId?: string
@@ -638,6 +639,7 @@ function safeAnswerText(value: string): string {
 
 export class AgentOrchestrator {
   private readonly activeByRequest = new Map<string, ActiveAgentRun>()
+  private readonly activeByRun = new Map<string, ActiveAgentRun>()
   private readonly activeByExecution = new Map<string, ActiveAgentRun>()
   private readonly recognizedExecutionIds = new Set<string>()
   private readonly activeByConversation = new Map<string, string>()
@@ -747,6 +749,7 @@ export class AgentOrchestrator {
         cancelled: false,
       }
       this.activeByRequest.set(requestId, active)
+      this.activeByRun.set(runId, active)
       const workflowToolsAllowed = input.allowTools && !EXPLICIT_WORKFLOW_OPTOUT.test(input.content)
       const browserToolsAllowed = input.allowTools && !EXPLICIT_BROWSER_OPTOUT.test(input.content)
       if (browserToolsAllowed && this.dependencies.browserContinuation) {
@@ -872,7 +875,9 @@ export class AgentOrchestrator {
       || !active.browserStarted
       || active.browserTerminal
       || active.browserBindingId !== bindingId) return false
-    const candidate = active.browserCatalog.bindings.get(bindingId)
+    const candidate = active.browserCandidate?.bindingId === bindingId
+      ? active.browserCandidate
+      : active.browserCatalog.bindings.get(bindingId)
     if (!candidate) return false
     active.cancelled = true
     active.controller.abort()
@@ -899,6 +904,11 @@ export class AgentOrchestrator {
 
   hasActiveRuns(): boolean {
     return this.activeByRequest.size > 0
+  }
+
+  ownsBrowserRun(runId: string): boolean {
+    const active = this.activeByRun.get(runId)
+    return active !== undefined && !active.terminal
   }
 
   async onDeveloperModeChanged(enabled: boolean): Promise<void> {
@@ -1213,11 +1223,14 @@ export class AgentOrchestrator {
       this.appendBrowserToolExchange(active, call, assistantContent, { kind: 'tool_error', code: 'INVALID_INPUT' })
       return this.drive(active)
     }
-    const candidate = active.browserCatalog.bindings.get(parsed.data.bindingId)
-    if (!candidate) {
+    const admittedCandidate = active.browserCatalog.bindings.get(parsed.data.bindingId)
+    if (!admittedCandidate) {
       this.appendBrowserToolExchange(active, call, assistantContent, { kind: 'tool_error', code: 'INVALID_INPUT' })
       return this.drive(active)
     }
+    let candidate = active.browserCandidate?.bindingId === admittedCandidate.bindingId
+      ? active.browserCandidate
+      : admittedCandidate
     if (active.browserCatalog.bindings.size > 1
       && active.browserExplicitBindingId !== candidate.bindingId) {
       this.appendBrowserToolExchange(active, call, assistantContent, { kind: 'tool_error', code: 'TARGET_AMBIGUOUS' })
@@ -1266,6 +1279,7 @@ export class AgentOrchestrator {
       }
     }
     active.browserBindingId = candidate.bindingId
+    active.browserCandidate = candidate
     active.browserStarted = true
     if (call.name === 'browser_session_inspect') active.browserRead = true
     this.updateBrowserStatus(
@@ -1304,6 +1318,21 @@ export class AgentOrchestrator {
     if (result?.kind === 'success' && call.name === 'browser_session_act'
       && result.data.completedActions !== browserSessionActInputSchema.parse(executorInput).actions.length) {
       result = undefined
+    }
+    if (result?.kind === 'success' && call.name === 'browser_session_act') {
+      const actions = browserSessionActInputSchema.parse(executorInput).actions
+      if (actions.some((action) => action.type === 'navigate')) {
+        const refreshed = await browser.catalog.refresh({
+          userId: active.userId,
+          conversationId: active.conversationId,
+          bindingId: candidate.bindingId,
+        })
+        if (!refreshed || refreshed.workflowVersion !== admittedCandidate.workflowVersion) result = undefined
+        else {
+          candidate = refreshed
+          active.browserCandidate = refreshed
+        }
+      }
     }
     if (!result) {
       result = { kind: 'tool_error', code: 'INTERNAL_ERROR' }
@@ -1774,7 +1803,9 @@ export class AgentOrchestrator {
     if (active.terminal) return active.terminal
     const candidate = active.browserBindingId === undefined
       ? undefined
-      : active.browserCatalog.bindings.get(active.browserBindingId)
+      : active.browserCandidate?.bindingId === active.browserBindingId
+        ? active.browserCandidate
+        : active.browserCatalog.bindings.get(active.browserBindingId)
     if (active.browserStarted && !active.browserCleaned && this.dependencies.browserContinuation) {
       active.browserTerminal = true
       try {
@@ -1851,6 +1882,7 @@ export class AgentOrchestrator {
     }
     active.terminal = result
     this.activeByRequest.delete(active.requestId)
+    this.activeByRun.delete(active.runId)
     if (this.activeByConversation.get(active.conversationId) === active.requestId) {
       this.activeByConversation.delete(active.conversationId)
     }

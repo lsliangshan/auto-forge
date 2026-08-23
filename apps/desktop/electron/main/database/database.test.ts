@@ -296,6 +296,21 @@ describe('openAppDatabase', () => {
     })
 
     expect(database.browserActionAudits.list(binding.id)).toHaveLength(1)
+    expect(database.browserActionAudits.insert({
+      id: 'audit_port', bindingId: binding.id, chatRunId: run.id, sequence: 100,
+      origin: 'https://fw.bjrcgz.gov.cn:8443', action: 'inspect', targetSummary: '显式端口状态',
+      risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+    }).origin).toBe('https://fw.bjrcgz.gov.cn:8443')
+    for (const [index, origin] of [
+      'http://fw.bjrcgz.gov.cn:8443',
+      'https://user@fw.bjrcgz.gov.cn:8443',
+    ].entries()) {
+      expect(() => database.browserActionAudits.insert({
+        id: `audit_invalid_origin_${index}`, bindingId: binding.id, chatRunId: run.id, sequence: 101 + index,
+        origin, action: 'inspect', targetSummary: '非安全来源',
+        risk: 'sensitive_read', outcome: 'completed', createdAt: 11,
+      })).toThrow()
+    }
     expect(() => database.browserActionAudits.insert({
       id: 'audit_2', bindingId: binding.id, chatRunId: run.id, sequence: 2,
       origin: 'https://fw.bjrcgz.gov.cn', action: 'inspect',
@@ -970,13 +985,18 @@ describe('openAppDatabase', () => {
         model: 'model', status, startedAt: 1,
       })
     }
-    const status = (blockId: string, requestId: string, state: 'inspecting' | 'acting' | 'awaiting_user' | 'completed') => ({
+    const status = (
+      blockId: string,
+      requestId: string,
+      state: 'inspecting' | 'acting' | 'awaiting_user' | 'completed',
+      origin = 'https://example.test',
+    ) => ({
       type: 'browser_status' as const,
       blockId,
       requestId,
       bindingId: 'binding_browser_recovery',
       siteLabel: '恢复测试站点',
-      origin: 'https://example.test',
+      origin,
       state,
       actionSummary: '恢复前状态',
     })
@@ -987,6 +1007,7 @@ describe('openAppDatabase', () => {
       createdAt: 1,
       blocks: [
         status('block_inspecting', 'request_browser_inspecting', 'inspecting'),
+        status('block_explicit_port', 'request_browser_inspecting', 'inspecting', 'https://example.test:8443'),
         status('block_acting', 'request_browser_acting', 'acting'),
         status('block_handoff', 'request_browser_inspecting', 'awaiting_user'),
         status('block_completed', 'request_browser_acting', 'completed'),
@@ -999,6 +1020,12 @@ describe('openAppDatabase', () => {
     expect(database.messages.get('message_browser_status_recovery')?.blocks).toEqual([
       {
         ...status('block_inspecting', 'request_browser_inspecting', 'inspecting'),
+        state: 'failed',
+        actionSummary: '应用已重启，浏览器自动操作已中断',
+        errorCode: 'INTERNAL_ERROR',
+      },
+      {
+        ...status('block_explicit_port', 'request_browser_inspecting', 'inspecting', 'https://example.test:8443'),
         state: 'failed',
         actionSummary: '应用已重启，浏览器自动操作已中断',
         errorCode: 'INTERNAL_ERROR',

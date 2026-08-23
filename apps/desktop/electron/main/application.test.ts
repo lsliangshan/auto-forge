@@ -5811,13 +5811,14 @@ describe('createApplicationRuntime', () => {
     })
     const cancelling = runtime.services.chat.cancel(racing.requestId)
     await vi.waitFor(() => expect(releaseDidStart).toBe(true))
-    expect(registry.currentLease(racing.live.bindingId)).toBeUndefined()
+    expect(registry.currentLease(racing.live.bindingId)?.runId).toBe(racing.run.id)
     const takeover = runtime.services.chat.takeOverBrowser({
       requestId: racing.requestId, bindingId: racing.live.bindingId,
     })
     completeRelease.resolve()
     await expect(takeover).rejects.toMatchObject({ code: 'NOT_FOUND' })
     await cancelling
+    expect(registry.currentLease(racing.live.bindingId)).toBeUndefined()
     releaseInspectors[1]!.resolve()
     await vi.waitFor(() => {
       const database = openAppDatabase(join(root, 'autoforge.sqlite'))
@@ -6101,6 +6102,54 @@ describe('createApplicationRuntime', () => {
     storedProject = database.workflowProjects.get(project.id)!
     database.close()
     expect(storedProject.buildHash).not.toBe(beforeRebuild.buildHash)
+    await runtime.close()
+  })
+
+  it('revokes old development authority before a rebuild mutates its build output', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-rebuild-gate-'))
+    directories.push(root)
+    let shouldBlock = false
+    let enterCommit!: () => void
+    let releaseCommit!: () => void
+    const commitEntered = new Promise<void>((resolve) => { enterCommit = resolve })
+    const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve })
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, {
+      browserWorkspace: workspace,
+      projectServiceOptions: {
+        beforeBuildCommit: async () => {
+          if (!shouldBlock) return
+          enterCommit()
+          await commitGate
+        },
+      },
+    }))
+    const session = await authenticate(runtime, 'RebuildGate')
+    const conversation = await runtime.services.chat.createConversation()
+    const project = await runtime.services.developer.createProject('Rebuild Gate')
+    await runtime.services.developer.build(project.id)
+    await runtime.services.settings.update({ developerMode: true })
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    const stored = database.workflowProjects.get(project.id)!
+    database.close()
+    const manifest = stored.manifest as { id: string; version: string }
+    const binding = continuationBinding(session.user.id, conversation.id, {
+      tabId: 'tab_rebuild_gate', chatRunId: 'run_rebuild_gate', executionId: 'execution_rebuild_gate',
+      workflowId: manifest.id, workflowVersion: manifest.version, source: 'development',
+      buildHash: stored.buildHash,
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
+    const registry = capturedContinuationRegistry(workspace)
+    registry.bind(binding)
+    shouldBlock = true
+
+    const rebuilding = runtime.services.developer.build(project.id)
+    await commitEntered
+
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    expect(workspace.closeContinuation).toHaveBeenCalledWith(binding.tabId)
+    releaseCommit()
+    await rebuilding
     await runtime.close()
   })
 

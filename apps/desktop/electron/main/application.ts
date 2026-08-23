@@ -681,6 +681,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   }
   const sourceSelectorVault = createWorkflowSourceSelectorVault()
   const policy = new PolicyEngine(database.permissionGrants)
+  const developmentRebuilds = new Map<string, number>()
   const browserContinuations = new BrowserContinuationRegistry({
     repository: database.browserTabBindings,
     workspace: options.browserWorkspace,
@@ -694,7 +695,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (!settings.get().developerMode || !binding.buildHash) return false
         const matches = (await Promise.all(database.workflowProjects.list().map(async (project) => {
           const manifest = project.manifest as Partial<WorkflowManifest> | undefined
-          if (project.status !== 'ready'
+          if (developmentRebuilds.has(project.id)
+            || project.status !== 'ready'
             || project.buildHash !== binding.buildHash
             || manifest?.id !== binding.workflowId
             || manifest.version !== binding.workflowVersion) return undefined
@@ -731,6 +733,29 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (!await agent.takeOverBrowser(run.requestId, binding.bindingId, runId)) throw failure('NOT_FOUND')
     },
   })
+  const finishDevelopmentRebuild = (projectId: string): void => {
+    const remaining = (developmentRebuilds.get(projectId) ?? 1) - 1
+    if (remaining > 0) developmentRebuilds.set(projectId, remaining)
+    else developmentRebuilds.delete(projectId)
+  }
+  const beginDevelopmentRebuild = async (projectId: string): Promise<void> => {
+    developmentRebuilds.set(projectId, (developmentRebuilds.get(projectId) ?? 0) + 1)
+    const previous = database.workflowProjects.get(projectId)
+    const manifest = previous?.manifest as Partial<WorkflowManifest> | undefined
+    try {
+      if (previous?.buildHash && manifest?.id && manifest.version) {
+        await browserContinuations.revokeWorkflow({
+          workflowId: manifest.id,
+          workflowVersion: manifest.version,
+          source: 'development',
+          buildHash: previous.buildHash,
+        }, 'WORKFLOW_CHANGED')
+      }
+    } catch (error) {
+      finishDevelopmentRebuild(projectId)
+      throw error
+    }
+  }
   const browser = new BrowserCapabilityService({
     authorization: new PolicyEngineBrowserAuthorization(policy),
     workspace: options.browserWorkspace,
@@ -738,11 +763,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     continuationRegistry: browserContinuations,
   })
   const browserInspector = new BrowserPageInspector(options.browserWorkspace)
+  let isBrowserRunActive: (runId: string) => boolean = () => false
   const browserContinuationExecutor = new BrowserContinuationToolExecutor({
     registry: browserContinuations,
     inspector: browserInspector,
     workspace: options.browserWorkspace,
     audits: database.browserActionAudits,
+    isRunActive: (runId) => isBrowserRunActive(runId),
   })
   const browserContinuationCatalog = new BrowserContinuationCatalog({
     registry: browserContinuations,
@@ -872,6 +899,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       executor: browserContinuationExecutor,
     },
   })
+  isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
   const persistence = createAgentPersistence(database)
   const mediaGeneration = new MediaGenerationOrchestrator({
@@ -1417,36 +1445,24 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return developerProject(project)
       },
       build: async (projectId) => {
-        const previous = database.workflowProjects.get(projectId)
-        const built = await projects.build(projectId)
-        const previousManifest = previous?.manifest as Partial<WorkflowManifest> | undefined
-        if (previous?.buildHash
-          && previousManifest?.id
-          && previousManifest.version) {
-          await browserContinuations.revokeWorkflow({
-            workflowId: previousManifest.id,
-            workflowVersion: previousManifest.version,
-            source: 'development',
-            buildHash: previous.buildHash,
-          }, 'WORKFLOW_CHANGED')
+        await beginDevelopmentRebuild(projectId)
+        try {
+          return developerProject(await projects.build(projectId))
+        } finally {
+          finishDevelopmentRebuild(projectId)
         }
-        return developerProject(built)
       },
       validate: (projectId) => projects.validate(projectId),
       run: async ({ projectId, input }) => {
         const releaseStart = maintenance.beginStart()
         try {
           const session = await auth.requireSession()
-          const previous = database.workflowProjects.get(projectId)
-          const built = await projects.build(projectId)
-          const previousManifest = previous?.manifest as Partial<WorkflowManifest> | undefined
-          if (previous?.buildHash && previousManifest?.id && previousManifest.version) {
-            await browserContinuations.revokeWorkflow({
-              workflowId: previousManifest.id,
-              workflowVersion: previousManifest.version,
-              source: 'development',
-              buildHash: previous.buildHash,
-            }, 'WORKFLOW_CHANGED')
+          await beginDevelopmentRebuild(projectId)
+          let built: WorkflowProject
+          try {
+            built = await projects.build(projectId)
+          } finally {
+            finishDevelopmentRebuild(projectId)
           }
           const manifest = built.manifest as WorkflowManifest
           try {

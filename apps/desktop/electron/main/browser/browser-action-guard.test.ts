@@ -69,6 +69,8 @@ describe('BrowserActionGuard', () => {
 
   it.each([
     '/logout',
+    '/log-out',
+    '/sign-out',
     '/account/delete',
     '/permit/withdraw',
     '/change/confirm',
@@ -76,6 +78,12 @@ describe('BrowserActionGuard', () => {
     '/pay?operation=payment',
     '/bank/transfer',
     '/checkout',
+    '/deleteAccount',
+    '/confirmPayment',
+    '/initiatePayment',
+    '/bankTransfer',
+    '/createOrder',
+    '/%EF%BC%A4%EF%BC%A5%EF%BC%AC%EF%BC%A5%EF%BC%B4%EF%BC%A5',
   ])('hands protected same-origin navigation off: %s', (path) => {
     expect(guard.decide(context({
       action: {

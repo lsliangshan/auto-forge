@@ -535,8 +535,10 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
     startedAt: Date.now(),
   })
   const inspector = new BrowserPageInspector(workspace)
+  let runActive = true
   const executor = new BrowserContinuationToolExecutor({
     registry: registry(), inspector, workspace, audits: database.browserActionAudits,
+    isRunActive: (runId) => runActive && runId === current.runId,
   })
   const inspect = () => executor.execute('browser_session_inspect', {
     bindingId, intent: current.currentUser.text,
@@ -546,6 +548,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
       const initial = await inspect()
       if (initial.kind !== 'success') return { code: resultCode(initial), takenOver: false }
       await executor.takeOver(current.runId)
+      runActive = false
       const after = await inspect()
       return { code: resultCode(after), takenOver: true }
     }
@@ -613,6 +616,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
     }
     return { code: 'INVALID_INPUT' }
   } finally {
+    runActive = false
     await executor.endRun(current.runId)
     inspector.dispose()
     database.close()

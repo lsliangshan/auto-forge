@@ -120,6 +120,7 @@ interface BrowserContinuationToolExecutorDependencies {
   readonly guard?: BrowserActionGuard
   readonly id?: () => string
   readonly now?: () => number
+  readonly isRunActive: (runId: string) => boolean
   readonly terminalRunLimit?: number
   readonly terminalRunTtlMs?: number
 }
@@ -294,7 +295,9 @@ export class BrowserContinuationToolExecutor {
     rawInput: unknown,
     context: BrowserContinuationRunContext,
   ): Promise<BrowserContinuationToolResult> {
-    if (this.isTerminalRun(context.runId)) return { kind: 'tool_error', code: 'CANCELLED' }
+    if (!this.runAdmitted(context.runId) || this.isTerminalRun(context.runId)) {
+      return { kind: 'tool_error', code: 'CANCELLED' }
+    }
     if (tool !== 'browser_session_inspect'
       && tool !== 'browser_session_act'
       && tool !== 'browser_session_handoff') {
@@ -395,6 +398,7 @@ export class BrowserContinuationToolExecutor {
         ...(context.signal === undefined ? {} : { signal: context.signal }),
       }
       const result = await this.dependencies.inspector.inspect(common)
+      await lease.assertEligible()
       this.assertActive(state, context)
       const signature = pageSignature(result)
       const changed = state.lastInspectionSignature !== undefined && signature !== state.lastInspectionSignature
@@ -553,6 +557,8 @@ export class BrowserContinuationToolExecutor {
             intent: context.currentUser.text,
             ...(context.signal === undefined ? {} : { signal: context.signal }),
           })
+          await lease.assertEligible()
+          this.assertActive(state, context)
           if (action.type !== 'focus' && action.type !== 'wait') {
             revealedRelevantEvidence = revealsRelevantEvidence(
               progressSnapshot,
@@ -665,7 +671,7 @@ export class BrowserContinuationToolExecutor {
         },
       )
     }
-    await this.cleanupAuthority(state, true, false)
+    await this.cleanupAuthority(state, true)
     if (trigger) {
       this.auditAction(
         state, context, page.origin, trigger.action, trigger.target, 'handed_off', decision.code,
@@ -825,6 +831,14 @@ export class BrowserContinuationToolExecutor {
     return true
   }
 
+  private runAdmitted(runId: string): boolean {
+    try {
+      return this.dependencies.isRunActive(runId)
+    } catch {
+      return false
+    }
+  }
+
   private rememberTerminalRun(runId: string): void {
     this.pruneTerminalRuns()
     this.terminalRuns.delete(runId)
@@ -846,7 +860,6 @@ export class BrowserContinuationToolExecutor {
   private async cleanupAuthority(
     state: ActiveRunState,
     preserveHighlight = false,
-    suppressReleaseError = true,
   ): Promise<void> {
     const lease = state.lease
     state.snapshots.clear()
@@ -855,8 +868,7 @@ export class BrowserContinuationToolExecutor {
       await this.dependencies.workspace.clearContinuationHighlight(lease.binding.tabId).catch(() => undefined)
     }
     if (lease) {
-      if (suppressReleaseError) await lease.release().catch(() => undefined)
-      else await lease.release()
+      await lease.release()
     }
     state.lease = undefined
   }

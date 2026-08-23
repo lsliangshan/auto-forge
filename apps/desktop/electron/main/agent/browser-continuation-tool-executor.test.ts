@@ -55,6 +55,7 @@ function harness(options: {
   stableSemantics?: boolean
   terminalRunLimit?: number
   terminalRunTtlMs?: number
+  isRunActive?: (runId: string) => boolean
 } = {}) {
   const liveBinding = binding()
   let current = true
@@ -110,6 +111,7 @@ function harness(options: {
     },
     id: (() => { let id = 0; return () => `audit_${++id}` })(),
     now: options.now ?? (() => 1_000),
+    isRunActive: options.isRunActive ?? (() => true),
     ...(options.terminalRunLimit === undefined ? {} : { terminalRunLimit: options.terminalRunLimit }),
     ...(options.terminalRunTtlMs === undefined ? {} : { terminalRunTtlMs: options.terminalRunTtlMs }),
   })
@@ -161,6 +163,53 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.audits).toEqual([expect.objectContaining({
       sequence: 1, action: 'inspect', targetSummary: 'page', risk: 'sensitive_read', outcome: 'completed',
     })])
+  })
+
+  it('rechecks development eligibility after a hung inspection before admitting its snapshot', async () => {
+    let finishInspection!: (value: BrowserPageSnapshot) => void
+    const inspection = new Promise<BrowserPageSnapshot>((resolve) => { finishInspection = resolve })
+    const test = harness()
+    test.inspector.inspect.mockImplementationOnce(async () => inspection)
+    const pending = test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '读取表单',
+    }, run())
+    await vi.waitFor(() => expect(test.inspector.inspect).toHaveBeenCalledOnce())
+    vi.mocked(test.lease.assertEligible).mockRejectedValueOnce({ code: 'WORKFLOW_CHANGED' })
+
+    finishInspection(snapshot())
+
+    await expect(pending).resolves.toEqual({ kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
+    expect(test.executor['runs'].has('agent_run_1')).toBe(false)
+    expect(test.release).toHaveBeenCalledOnce()
+  })
+
+  it('rechecks development eligibility immediately before mutation after a hung action lookup', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '保存草稿',
+    }, run())
+    let finishResolve!: (value: BrowserResolvedElementReference) => void
+    const targetLookup = new Promise<BrowserResolvedElementReference>((resolve) => {
+      finishResolve = resolve
+    })
+    test.inspector.resolveRef.mockImplementationOnce(async () => targetLookup)
+    const pending = test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1',
+      actions: [{ type: 'click', ref: 'ref_save' }],
+    }, run())
+    await vi.waitFor(() => expect(test.inspector.resolveRef).toHaveBeenCalledOnce())
+    vi.mocked(test.lease.assertEligible).mockRejectedValue({ code: 'WORKFLOW_CHANGED' })
+
+    finishResolve({
+      snapshotId: 'snapshot_1', ref: 'ref_save', backendNodeId: 10,
+      role: 'button', name: '保存草稿', auth: 'authenticated',
+      semanticFingerprint: 'before-rebuild', targetContext: {},
+    })
+
+    await expect(pending).resolves.toEqual({ kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
+    expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
+    expect(test.executor['runs'].has('agent_run_1')).toBe(false)
+    expect(test.release).toHaveBeenCalledOnce()
   })
 
   it('hands a protected final action off with focus and Overlay highlight but zero mutation', async () => {
@@ -656,6 +705,48 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(terminal.inspector.endRun).toHaveBeenCalledWith('agent_run_1')
     expect(terminal.release).toHaveBeenCalledOnce()
   })
+
+  it.each(['endRun', 'cancel', 'takeOver'] as const)(
+    'propagates %s lease-release failure while retaining retryable authority state',
+    async (method) => {
+      const test = harness()
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '检查',
+      }, run())
+      test.release.mockRejectedValueOnce(new Error('release failed'))
+
+      await expect(test.executor[method]('agent_run_1')).rejects.toThrow('release failed')
+      expect(test.executor['runs'].has('agent_run_1')).toBe(true)
+      expect(test.lease.isCurrent(test.lease.binding)).toBe(true)
+
+      await expect(test.executor[method]('agent_run_1')).resolves.toBeUndefined()
+      expect(test.release).toHaveBeenCalledTimes(2)
+      expect(test.executor['runs'].has('agent_run_1')).toBe(false)
+    },
+  )
+
+  it.each(['eviction', 'expiry'] as const)(
+    'rejects a valid late inspect through Main run admission after tombstone %s without reacquiring',
+    async (mode) => {
+      let now = 1_000
+      const activeRuns = new Set<string>()
+      const test = harness({
+        now: () => now,
+        terminalRunLimit: 1,
+        terminalRunTtlMs: 10,
+        isRunActive: (runId) => activeRuns.has(runId),
+      })
+      await test.executor.endRun('ended_run')
+      if (mode === 'eviction') await test.executor.endRun('newer_run')
+      else now = 1_011
+
+      await expect(test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: 'late inspect',
+      }, run({ runId: 'ended_run' }))).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+      expect(test.executor['dependencies'].registry.acquire).not.toHaveBeenCalled()
+      expect(test.executor['runs'].has('ended_run')).toBe(false)
+    },
+  )
 
   it('bounds late-call tombstones by deterministic TTL and LRU eviction', async () => {
     let now = 1_000

@@ -328,20 +328,29 @@ function attachCombinedBrowserContinuation(
   dependencies: AgentOrchestratorDependencies,
   nodes: BrowserSemanticNode[],
   hrefs: Readonly<Record<string, string | undefined>> = {},
+  isRunActive: (runId: string) => boolean = () => true,
 ) {
-  const binding = continuationBinding()
-  const snapshot: BrowserPageSnapshot = Object.freeze({
-    snapshotId: 'snapshot_1', bindingId: binding.bindingId,
-    origin: 'https://permit.example.gov.cn', url: 'https://permit.example.gov.cn/detail',
-    title: '证件详情', capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1,
-    auth: 'authenticated', nodes: Object.freeze(nodes), serializedBytes: 1_000,
+  const binding = continuationBinding({
+    permissionMatrix: {
+      'browser.open': [
+        'https://permit.example.gov.cn/*',
+        'https://renew.example.gov.cn/*',
+      ],
+    },
   })
   let current = true
   let state = {
-    origin: snapshot.origin,
-    url: snapshot.url,
-    navigationEpoch: snapshot.navigationEpoch,
+    origin: 'https://permit.example.gov.cn',
+    url: 'https://permit.example.gov.cn/detail',
+    navigationEpoch: 1,
   }
+  const snapshot = (): BrowserPageSnapshot => Object.freeze({
+    snapshotId: 'snapshot_1', bindingId: binding.bindingId,
+    origin: state.origin, url: state.url,
+    title: state.origin === 'https://renew.example.gov.cn' ? '续期帮助' : '证件详情',
+    capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: state.navigationEpoch,
+    auth: 'authenticated', nodes: Object.freeze(nodes), serializedBytes: 1_000,
+  })
   const release = vi.fn(async () => { current = false })
   const acquire = vi.fn(async (_bindingId: string, input: { runId: string }) => {
     const lease: BrowserContinuationLease = Object.freeze({
@@ -354,14 +363,15 @@ function attachCombinedBrowserContinuation(
     return lease
   })
   const inspector = {
-    inspect: vi.fn(async () => snapshot),
+    inspect: vi.fn(async () => snapshot()),
     resolveRef: vi.fn(async (input: { ref: string; snapshotId: string }): Promise<BrowserResolvedElementReference> => {
-      const node = snapshot.nodes.find((candidate) => candidate.ref === input.ref)
-      if (!node || input.snapshotId !== snapshot.snapshotId) throw { code: 'PAGE_CHANGED' }
+      const inspected = snapshot()
+      const node = inspected.nodes.find((candidate) => candidate.ref === input.ref)
+      if (!node || input.snapshotId !== inspected.snapshotId) throw { code: 'PAGE_CHANGED' }
       return {
-        snapshotId: snapshot.snapshotId,
+        snapshotId: inspected.snapshotId,
         ref: node.ref,
-        backendNodeId: snapshot.nodes.indexOf(node) + 1,
+        backendNodeId: inspected.nodes.indexOf(node) + 1,
         role: node.role,
         name: node.name,
         auth: 'authenticated',
@@ -396,16 +406,18 @@ function attachCombinedBrowserContinuation(
     },
     id: (() => { let id = 0; return () => `combined_audit_${++id}` })(),
     now: () => 1_000,
+    isRunActive,
   })
   const catalog = new BrowserContinuationCatalog({
     registry: { listEligible: async () => [binding] },
     describe: async () => ({
-      workflowLabel: '证件查询', pageLabel: '证件详情',
-      origin: snapshot.origin, lastActiveAt: binding.createdAt,
+      workflowLabel: '证件查询',
+      pageLabel: state.origin === 'https://renew.example.gov.cn' ? '续期帮助' : '证件详情',
+      origin: state.origin, lastActiveAt: binding.createdAt,
     }),
   })
   Object.assign(dependencies, { browserContinuation: { catalog, executor } })
-  return { executor, workspace, inspector, release }
+  return { catalog, executor, workspace, inspector, release, acquire }
 }
 
 describe('AgentOrchestrator', () => {
@@ -2954,6 +2966,77 @@ describe('AgentOrchestrator', () => {
     )
   })
 
+  it('propagates a real executor release failure as INTERNAL_ERROR and permits cleanup retry', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'real_cleanup_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取状态' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已读取。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const combined = attachCombinedBrowserContinuation(dependencies, [])
+    combined.release.mockRejectedValueOnce(new Error('release failed'))
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取状态', provider: 'openrouter', model: 'model',
+      requestId: 'real_cleanup_request',
+    }))).resolves.toMatchObject({ status: 'failed', error: { code: 'INTERNAL_ERROR' } })
+    expect(combined.executor['runs'].has('id_2')).toBe(true)
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({
+        type: 'browser_status', state: 'failed', actionSummary: '网页操作清理失败',
+        errorCode: 'INTERNAL_ERROR',
+      }),
+    )
+
+    await expect(combined.executor.endRun('id_2')).resolves.toBeUndefined()
+    expect(combined.release).toHaveBeenCalledTimes(2)
+    expect(combined.executor['runs'].has('id_2')).toBe(false)
+  })
+
+  it('issues live-run admission from the bounded Orchestrator lifecycle after tombstone loss', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'admitted_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取状态' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已读取。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const owner: { orchestrator?: AgentOrchestrator } = {}
+    const combined = attachCombinedBrowserContinuation(
+      dependencies,
+      [],
+      {},
+      (runId) => owner.orchestrator?.ownsBrowserRun(runId) ?? false,
+    )
+    const orchestrator = new AgentOrchestrator(dependencies)
+    owner.orchestrator = orchestrator
+
+    await expect(orchestrator.run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取状态', provider: 'openrouter', model: 'model',
+      requestId: 'admitted_request',
+    }))).resolves.toMatchObject({ status: 'completed' })
+    combined.executor['terminalRuns'].clear()
+
+    await expect(combined.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: 'late inspect',
+    }, {
+      userId: 'user_1', conversationId: 'browser_conversation', runId: 'id_2',
+      currentUser: { messageId: 'late_message', text: '读取状态' },
+    })).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(combined.acquire).toHaveBeenCalledOnce()
+    expect(orchestrator.ownsBrowserRun('id_2')).toBe(false)
+    expect(orchestrator['activeByRun'].size).toBe(0)
+  })
+
   it.each(['chat cancellation', 'user takeover'] as const)('releases browser authority on %s', async (mode) => {
     const dependencies = harness([])
     dependencies.workflows.list = async () => []
@@ -3527,6 +3610,15 @@ describe('AgentOrchestrator', () => {
     { name: 'delete', url: 'https://permit.example.gov.cn/account/delete' },
     { name: 'withdraw', url: 'https://permit.example.gov.cn/apply/withdraw' },
     { name: 'confirm', url: 'https://permit.example.gov.cn/payment/confirm' },
+    { name: 'camel-case delete', url: 'https://permit.example.gov.cn/deleteAccount' },
+    { name: 'camel-case confirmation', url: 'https://permit.example.gov.cn/confirmPayment' },
+    { name: 'concatenated payment initiation', url: 'https://permit.example.gov.cn/initiatePayment' },
+    { name: 'camel-case bank transfer', url: 'https://permit.example.gov.cn/bankTransfer' },
+    { name: 'camel-case order creation', url: 'https://permit.example.gov.cn/createOrder' },
+    {
+      name: 'percent-encoded fullwidth delete',
+      url: 'https://permit.example.gov.cn/%EF%BC%A4%EF%BC%A5%EF%BC%AC%EF%BC%A5%EF%BC%B4%EF%BC%A5',
+    },
   ])('hands off a deceptively named injected same-origin $name link at the combined guard boundary', async ({ url }) => {
     const dependencies = harness([[
       {
@@ -3585,6 +3677,12 @@ describe('AgentOrchestrator', () => {
     'https://permit.example.gov.cn/account/delete',
     'https://permit.example.gov.cn/apply/withdraw',
     'https://permit.example.gov.cn/payment/confirm',
+    'https://permit.example.gov.cn/deleteAccount',
+    'https://permit.example.gov.cn/confirmPayment',
+    'https://permit.example.gov.cn/initiatePayment',
+    'https://permit.example.gov.cn/bankTransfer',
+    'https://permit.example.gov.cn/createOrder',
+    'https://permit.example.gov.cn/%EF%BC%A4%EF%BC%A5%EF%BC%AC%EF%BC%A5%EF%BC%B4%EF%BC%A5',
   ])('hands off an explicitly supplied protected destination at the combined guard boundary: %s', async (url) => {
     const content = `打开 ${url}`
     const dependencies = harness([[
@@ -3679,6 +3777,103 @@ describe('AgentOrchestrator', () => {
     expect(combined.release).toHaveBeenCalledOnce()
     expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
       expect.objectContaining({ type: 'browser_status', state: 'completed' }),
+    )
+  })
+
+  it('adopts an allowed cross-origin destination before the next inspect and status update', async () => {
+    const destination = 'https://renew.example.gov.cn/help'
+    const content = `打开 ${destination} 并读取页面状态`
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cross_origin_inspect_a',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: content },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cross_origin_navigate_b',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1',
+          actions: [{ type: 'navigate', url: destination, source: { kind: 'current_user' } }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cross_origin_inspect_b',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: content },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已打开续期帮助并读取状态。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const combined = attachCombinedBrowserContinuation(dependencies, [])
+    const catalogRefresh = vi.spyOn(combined.catalog, 'refresh')
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content, provider: 'openrouter', model: 'model',
+      requestId: 'combined_cross_origin_allowed',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(combined.workspace.performContinuationAction).toHaveBeenCalledOnce()
+    expect(combined.inspector.inspect).toHaveBeenCalledTimes(2)
+    expect(catalogRefresh).toHaveBeenCalledWith({
+      userId: 'user_1', conversationId: 'browser_conversation', bindingId: 'binding_1',
+    })
+    const finalRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[3]![0]
+    expect(finalRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'tool', tool_call_id: 'cross_origin_inspect_b',
+      content: expect.stringContaining('https://renew.example.gov.cn'),
+    }))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({
+        type: 'browser_status', siteLabel: '续期帮助', origin: 'https://renew.example.gov.cn', state: 'completed',
+      }),
+    )
+  })
+
+  it('keeps a disallowed cross-origin destination outside the immutable binding matrix', async () => {
+    const destination = 'https://blocked.example.gov.cn/help'
+    const content = `打开 ${destination}`
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'blocked_origin_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: content },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'blocked_origin_navigate',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1',
+          actions: [{ type: 'navigate', url: destination, source: { kind: 'current_user' } }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '未访问超出授权范围的站点。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const combined = attachCombinedBrowserContinuation(dependencies, [])
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content, provider: 'openrouter', model: 'model',
+      requestId: 'combined_cross_origin_blocked',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(combined.workspace.performContinuationAction).not.toHaveBeenCalled()
+    const finalRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
+    expect(finalRequest.messages).toContainEqual(expect.objectContaining({
+      role: 'tool', tool_call_id: 'blocked_origin_navigate',
+      content: expect.stringContaining('DOMAIN_BLOCKED'),
+    }))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({
+        type: 'browser_status', origin: 'https://permit.example.gov.cn', state: 'failed', errorCode: 'DOMAIN_BLOCKED',
+      }),
     )
   })
 

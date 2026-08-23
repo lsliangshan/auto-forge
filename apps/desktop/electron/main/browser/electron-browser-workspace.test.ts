@@ -10,6 +10,7 @@ import { BrowserContinuationRegistry } from './browser-continuation-registry.js'
 import type { BrowserContinuationBindingInput } from './browser-continuation-types.js'
 import {
   MAX_BROWSER_INSPECTION_LOCATOR_MATCHES,
+  MAX_BROWSER_INSPECTION_RAW_BYTES,
   MAX_BROWSER_INSPECTION_RAW_NODES,
 } from './browser-page-inspector.js'
 
@@ -525,6 +526,40 @@ describe('ElectronBrowserWorkspace', () => {
 
     expect(views[1]!.webContents.debugger.commands.some(({ method }) => (
       method === 'DOM.describeNode'
+    ))).toBe(false)
+  })
+
+  it('rejects the whole inspection when cumulative raw CDP responses exceed four MiB in describeNode', async () => {
+    const oversizedAttribute = 'x'.repeat(MAX_BROWSER_INSPECTION_RAW_BYTES + 1)
+    const test = createHarness((method, params) => {
+      const input = params as { backendNodeId?: number } | undefined
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [{
+        nodeId: 'ax_main', backendDOMNodeId: 10, frameId: 'frame_main', ignored: false,
+        role: { value: 'main' }, name: { value: '结果' },
+      }] }
+      if (method === 'DOM.describeNode') return {
+        node: {
+          backendNodeId: input?.backendNodeId, nodeName: 'DIV',
+          attributes: ['data-oversized', oversizedAttribute],
+        },
+      }
+      if (method === 'Page.getLayoutMetrics') {
+        return { cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 } }
+      }
+      return {}
+    })
+    const tab = await test.workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+    await test.workspace.releaseExecution('e1')
+    await test.workspace.acquireContinuation(tab.id, 'agent_run_raw_bytes')
+
+    await expect(test.workspace.readAccessibilitySnapshot({
+      tabId: tab.id, runId: 'agent_run_raw_bytes', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, locators: [],
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+    expect(test.views[1]!.webContents.debugger.commands.some(({ method }) => (
+      method === 'Page.getLayoutMetrics'
     ))).toBe(false)
   })
 

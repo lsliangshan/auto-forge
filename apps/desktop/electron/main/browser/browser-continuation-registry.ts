@@ -185,6 +185,7 @@ export class BrowserContinuationRegistry {
     }
     this.leaseOwners.set(bindingId, input.runId)
     let released = false
+    let releasePending: Promise<void> | undefined
     return Object.freeze({
       binding,
       ownerRunId: input.runId,
@@ -202,10 +203,22 @@ export class BrowserContinuationRegistry {
       },
       release: async () => {
         if (released) return
-        released = true
-        if (this.leaseOwners.get(bindingId) !== input.runId) return
-        this.leaseOwners.delete(bindingId)
-        await this.options.workspace.releaseContinuation(binding.tabId, input.runId)
+        if (!releasePending) {
+          releasePending = (async () => {
+            if (this.leaseOwners.get(bindingId) !== input.runId) {
+              released = true
+              return
+            }
+            await this.options.workspace.releaseContinuation(binding.tabId, input.runId)
+            if (this.leaseOwners.get(bindingId) === input.runId) this.leaseOwners.delete(bindingId)
+            released = true
+          })()
+        }
+        try {
+          await releasePending
+        } finally {
+          releasePending = undefined
+        }
       },
     })
   }

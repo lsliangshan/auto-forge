@@ -192,3 +192,136 @@ A non-gating diagnostic `pnpm --filter @autoforge/workflow-schema test` still re
 - Historical values require restatement in the current request. This is deliberately conservative until a stable, Main-owned historical-message-reference contract can bind the user's current intent.
 - Agent vision/region screenshots are deliberately not offered. Supporting them later requires a Main-owned model-vision capability and ephemeral media transport that is excluded from durable context.
 - The user-assisted Beijing portal smoke was **not performed and is not claimed as passed**. It remains pending because it requires the user to enter private credentials and personally verify the real portal's login, source/read-time, draft stop-before-submit, takeover, cross-conversation denial, and durable redaction behavior.
+
+## Residual Remediation (Ruling 19)
+
+This section records the controller-verified remediation of the final re-review residuals against `5af0005edab09117bb81267b2ced17ce6cb9d86d`. It supersedes the earlier verification counts where the suite grew.
+
+### 1. Lexical navigation bypasses
+
+RED:
+
+- The combined Guard/Orchestrator run initially produced `18 failed / 155 passed`: camel-case or concatenated `deleteAccount`, `confirmPayment`, `initiatePayment`, `bankTransfer`, and `createOrder`, plus percent-encoded fullwidth `ＤＥＬＥＴＥ`, reached the unsafe allowed/dispatch path for current-user and deceptively labelled page-link sources.
+- A later regression check caught the first tokenizer revision allowing the pre-existing hyphenated `/log-out` and `/sign-out` equivalents (`2 failed / 43 skipped`).
+
+GREEN:
+
+- Destination text is NFKC-normalized after every bounded percent-decode step, camel-case boundaries are tokenized before lowercasing, separator-split terms are compacted, and protected/mutation terms are recognized inside concatenated route segments. Greek/Cyrillic confusable route text fails closed to manual handoff.
+- Combined Orchestrator -> executor -> Guard -> Workspace tests prove zero Workspace dispatch for all added deceptive-link and exact-current-user cases. Existing exact safe user URL and fresh inspected-link controls still dispatch once, and action-category negation behavior remains green.
+- The restored `/log-out` and `/sign-out` cases pass after compact token matching.
+
+### 2. Development rebuild TOCTOU
+
+RED:
+
+- Two focused executor tests returned success after eligibility changed during a deferred inspection and deferred action-target lookup; the snapshot could be admitted and the action could proceed.
+- The real Electron Application test observed the old development binding still live when the project build reached its pre-commit mutation gate.
+
+GREEN:
+
+- Application marks the exact project as rebuilding and revokes the previous development workflow id/version/build identity before `projects.build` starts. A reference-counted rebuild barrier keeps overlapping build/run operations ineligible until each exits, including failures.
+- Executor reasserts lease eligibility immediately after every inspection, before snapshot admission/evidence/counter updates, after post-action inspection, and immediately before the state counter and Workspace mutation boundary. Rebuild races return `WORKFLOW_CHANGED`, release the lease, remove run state, and do not dispatch a mutation.
+- The focused executor race cases and real Electron pre-build revocation test pass.
+
+### 3. Cumulative raw CDP byte budget
+
+RED:
+
+- A small AX tree followed by a `DOM.describeNode` response larger than 4 MiB returned a snapshot instead of `ACTION_LIMIT_EXCEEDED`.
+
+GREEN:
+
+- One shared inspection budget now accounts the UTF-8 JSON byte size of every successful raw CDP response, including frame tree, AX, locator, describe-node, and layout calls. Unserializable responses and a cumulative total above 4 MiB reject the whole inspection.
+- The previous second serialization of the AX node array was removed; node count remains independently bounded.
+- Four focused raw-budget/fan-out/deadline/cancellation cases pass, including the oversized describe-node case and the assertion that no later layout/partial snapshot is produced.
+
+### 4. Release failure propagation and retry
+
+RED:
+
+- Registry cleared ownership before a failing Workspace release; executor `endRun`, `cancel`, and `takeOver` resolved despite release rejection; the real executor-through-Orchestrator run reported completion.
+
+GREEN:
+
+- Registry keeps the exact lease owner current until `releaseContinuation` succeeds, shares an in-flight release attempt, and preserves retry state on rejection.
+- Executor terminal cleanup propagates release rejection and removes its lease/run/tombstone bookkeeping only after successful cleanup. Each terminal method is covered by fail-then-retry tests.
+- The real Orchestrator path terminalizes the run and browser card as `failed/INTERNAL_ERROR` with `网页操作清理失败`; a subsequent exact executor cleanup retry succeeds without an unhandled rejection.
+- The pre-existing cancellation race expectation was updated to assert that authority truthfully remains live while release is pending and disappears only after release completion.
+
+### 5. Main-owned live-run admission
+
+RED:
+
+- After deterministic tombstone capacity eviction or TTL expiry, a syntactically valid late inspect recreated executor run state and reacquired the binding. The combined Orchestrator case made a second Registry acquisition.
+
+GREEN:
+
+- Every executor call now requires a Main-owned `isRunActive(runId)` predicate before parsing, state creation, or acquisition; predicate errors fail closed. TTL/LRU tombstones remain defense in depth, not the authority root.
+- Orchestrator tracks only currently active run ids, exposes `ownsBrowserRun`, and deletes the entry at terminal finish. Application wires that bounded live predicate into the executor; direct E2E scenarios explicitly scope their one current run.
+- Eviction, expiry, and combined Orchestrator late-call cases return `CANCELLED`, never reacquire, and leave both active-run maps empty.
+
+### 6. Allowed cross-origin continuation
+
+RED:
+
+- Catalog had no exact refresh operation, and Orchestrator retained origin A after a successful permission-matrix-allowed A -> B navigation. A following B inspection was therefore rejected against the frozen A candidate.
+
+GREEN:
+
+- Catalog `refresh` re-lists eligibility for the exact user/conversation/binding and derives a fresh bounded candidate from the authoritative live page description.
+- After a successful navigate action, Orchestrator requires that refresh, preserves the admitted binding/version identity, adopts only the new page label/origin, and uses it for strict inspection validation, status, evidence, takeover, and terminalization. The executor continues to enforce the immutable binding permission matrix.
+- The combined A -> allowed B -> inspect B case reaches two inspections and completes with B's label/origin in provider data and durable status. The paired disallowed origin remains `DOMAIN_BLOCKED` with zero Workspace dispatch.
+- Focused catalog/Orchestrator result: `3 passed / 135 skipped`.
+
+### 7. Canonical HTTPS origins with explicit ports
+
+RED:
+
+- Catalog and shared browser status/audit schemas rejected `https://...:8443`; real database audit insertion failed, and restart recovery left a port-bearing persisted browser status nonterminal because it could not parse it.
+- Focused source-contract result was `2 failed / 77 skipped`; the real Electron database boundary was `2 failed / 99 skipped`.
+
+GREEN:
+
+- Catalog, shared browser-status and audit IPC schemas, and the database audit parser accept a canonical non-default HTTPS origin such as `https://fw.bjrcgz.gov.cn:8443`.
+- Canonical equality still rejects default-port aliases, and tests explicitly reject non-HTTPS, userinfo, path-bearing, and invalid-port origins. URL-pattern permission matching remains the authority check.
+- Focused source contracts are `6 passed / 73 skipped`; real Electron persisted audit/recovery contracts are `2 passed / 99 skipped`.
+
+### Residual changed interfaces
+
+- `BrowserContinuationToolExecutorDependencies`: added required Main-owned `isRunActive(runId)` admission.
+- `AgentOrchestrator`: added bounded live-run ownership and `ownsBrowserRun(runId)`.
+- `BrowserContinuationCatalog`: added exact-owner `refresh({ userId, conversationId, bindingId })`.
+- Orchestrator active browser state now retains the refreshed live candidate separately from the immutable admission catalog.
+- Inspection command budget now includes cumulative raw response bytes.
+- Lease release semantics are completion-driven: ownership and executor run state remain retryable until Workspace release succeeds.
+- Browser status/audit origin contracts now permit canonical non-default HTTPS ports.
+
+### Residual security analysis
+
+- Lexical route hardening is an independent second gate after exact current-user/fresh-link authorization. Encodings, compatibility glyphs, camel case, concatenation, and common confusable scripts cannot turn protected GET semantics into ordinary navigation.
+- Development build mutation cannot begin while old authority is still eligible; both catalog/acquisition and already-held leases observe the rebuild barrier. Post-read and pre-mutation assertions close the identified read/action races.
+- Raw-byte limits apply before semantic projection and across all CDP responses, so moving oversized hostile content from AX into a describe-node or locator response does not evade the cap.
+- A release failure cannot create an authority/status split: lease ownership stays live and retryable, while Orchestrator reports a terminal internal failure rather than success.
+- Late-call rejection does not depend on remembering unbounded run ids. The bounded Orchestrator live set positively admits only a currently owned run.
+- Cross-origin refresh changes descriptive live page state only. It cannot change binding id/version or the immutable permission matrix, and disallowed destinations remain blocked inside the executor/Guard boundary.
+- Explicit ports do not broaden URL acceptance beyond canonical HTTPS origins: credentials, non-HTTPS protocols, paths, queries, fragments, malformed ports, and non-canonical spellings remain rejected.
+
+### Residual verification
+
+- Complete impacted real-Electron Main/security suite: `8 files / 546 tests passed`.
+- Shared and workflow-schema builds: PASS; focused shared/schema contracts: `3 files / 139 tests passed`.
+- Full unit suite: `88 files / 2328 tests passed`; native Electron `better-sqlite3` compatibility probe passed first.
+- Full typecheck: PASS for shared, workflow SDK, workflow schema, desktop Main, and Renderer.
+- Full production build: PASS; only the same two third-party VueUse misplaced `/* #__PURE__ */` warnings were emitted.
+- Full real Electron continuation E2E: `19/19 passed` in 53.1 seconds. Draft automation still asserts `finalSubmissions: 0`, followed by `1` only after the explicit Playwright user click.
+- Feature-diff ESLint: exit 0, `0 errors / 4 warnings`; warnings remain only in the pre-existing feature change to `SettingsView.vue`.
+- Root ESLint: expected baseline exit 1, exactly `333 problems (5 errors, 328 warnings)`. All five errors remain the byte-identical pre-feature `ContextSidebar.vue` DOM globals; its diff from `e45cb32f...` is empty.
+- `git diff --check`: PASS.
+- Production Main/Preload/Renderer/package search contains no `finalSubmissions`, E2E Main entry, or E2E-only marker. Those identifiers remain test-only.
+
+### Residual remaining concerns
+
+- No Critical, Important, or requested Minor residual remains open in the automated boundary.
+- Greek/Cyrillic confusable-route detection intentionally prefers manual handoff when semantics are uncertain; this can require an extra user click rather than risking a hidden mutation.
+- The five existing `ContextSidebar.vue` lint errors remain explicit baseline debt and were not suppressed or edited.
+- The Beijing portal smoke remains **pending, was not performed, and is not claimed**. It still requires user-owned credentials and manual acceptance.

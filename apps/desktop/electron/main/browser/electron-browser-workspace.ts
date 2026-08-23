@@ -30,6 +30,7 @@ interface InspectionCommandBudget {
   readonly signal?: AbortSignal
   readonly deadlineAt: number
   calls: number
+  bytes: number
 }
 
 const maxBrowserInspectionCdpCalls = 2_048
@@ -660,6 +661,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
         Date.now() + maxBrowserInspectionDurationMs,
       ),
       calls: 0,
+      bytes: 0,
     }
     const result = await this.restricted(state, [input.expectedOrigin], async () => {
       this.assertContinuationState(state, input)
@@ -674,12 +676,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       }
       this.assertContinuationState(state, input)
       const allRawNodes = accessibility.nodes ?? []
-      let rawBytes = Number.POSITIVE_INFINITY
-      if (allRawNodes.length <= MAX_BROWSER_INSPECTION_RAW_NODES) {
-        try { rawBytes = Buffer.byteLength(JSON.stringify(allRawNodes), 'utf8') } catch { /* fail below */ }
-      }
-      if (allRawNodes.length > MAX_BROWSER_INSPECTION_RAW_NODES
-        || rawBytes > MAX_BROWSER_INSPECTION_RAW_BYTES) throw failure('ACTION_LIMIT_EXCEEDED')
+      if (allRawNodes.length > MAX_BROWSER_INSPECTION_RAW_NODES) throw failure('ACTION_LIMIT_EXCEEDED')
       const rawNodes = allRawNodes
         .filter((node) => node.frameId === undefined || node.frameId === frameId)
         .filter((node) => typeof node.nodeId === 'string' && typeof node.backendDOMNodeId === 'number')
@@ -1746,7 +1743,20 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       budget.signal?.addEventListener('abort', onAbort, { once: true })
       if (budget.signal?.aborted) onAbort()
       void operation.then(
-        (value) => { finish({ value }) },
+        (value) => {
+          let serialized: string | undefined
+          try { serialized = JSON.stringify(value) } catch { /* fail closed below */ }
+          if (serialized === undefined) {
+            finish({ error: failure('ACTION_LIMIT_EXCEEDED') })
+            return
+          }
+          budget.bytes += Buffer.byteLength(serialized, 'utf8')
+          if (budget.bytes > MAX_BROWSER_INSPECTION_RAW_BYTES) {
+            finish({ error: failure('ACTION_LIMIT_EXCEEDED') })
+            return
+          }
+          finish({ value })
+        },
         (error) => { finish({ error }) },
       )
     })

@@ -83,7 +83,6 @@ const browserOriginSchema = z.string().superRefine((value, context) => {
     if (origin.protocol !== 'https:'
       || origin.username !== ''
       || origin.password !== ''
-      || origin.port !== ''
       || origin.pathname !== '/'
       || origin.search !== ''
       || origin.hash !== ''

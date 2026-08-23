@@ -66,7 +66,7 @@ function canonicalHttpsOrigin(value: string): string | undefined {
   try {
     const url = new URL(value)
     if (url.protocol !== 'https:'
-      || url.username || url.password || url.port
+      || url.username || url.password
       || url.pathname !== '/' || url.search || url.hash
       || url.origin !== value) return undefined
     return value
@@ -210,6 +210,21 @@ function toolsFor(candidates: readonly BrowserContinuationCandidate[]): readonly
 
 export class BrowserContinuationCatalog {
   constructor(private readonly dependencies: BrowserContinuationCatalogDependencies) {}
+
+  async refresh(input: {
+    readonly userId: string
+    readonly conversationId: string
+    readonly bindingId: string
+  }): Promise<BrowserContinuationCandidate | undefined> {
+    const binding = (await this.dependencies.registry.listEligible(input.userId, input.conversationId)).find((candidate) => (
+      candidate.bindingId === input.bindingId
+      && candidate.userId === input.userId
+      && candidate.conversationId === input.conversationId
+    ))
+    if (!binding) return undefined
+    const description = await this.dependencies.describe(binding)
+    return description && candidateFrom(binding, structuredClone(description))
+  }
 
   async create(input: {
     readonly userId: string
