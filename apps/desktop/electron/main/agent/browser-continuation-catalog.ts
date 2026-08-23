@@ -20,7 +20,7 @@ export interface BrowserContinuationCatalogSnapshot {
 }
 
 interface BrowserContinuationCatalogDependencies {
-  readonly registry: Pick<BrowserContinuationRegistry, 'list'>
+  readonly registry: Pick<BrowserContinuationRegistry, 'listEligible'>
   readonly describe: (
     binding: BrowserContinuationBinding,
   ) => Promise<BrowserContinuationPageDescription | undefined>
@@ -117,11 +117,6 @@ function valueSourceSchema() {
       { type: 'object', properties: { kind: { const: 'current_user' } }, required: ['kind'], additionalProperties: false },
       {
         type: 'object', properties: {
-          kind: { const: 'history' }, messageId: { type: 'string', minLength: 1, maxLength: 128 },
-        }, required: ['kind', 'messageId'], additionalProperties: false,
-      },
-      {
-        type: 'object', properties: {
           kind: { const: 'page' }, snapshotId: { type: 'string', minLength: 1, maxLength: 128 },
           ref: { type: 'string', minLength: 1, maxLength: 128 },
         }, required: ['kind', 'snapshotId', 'ref'], additionalProperties: false,
@@ -148,8 +143,8 @@ function actionSchema() {
       },
       {
         type: 'object', properties: {
-          type: { const: 'navigate' }, url: { type: 'string', minLength: 1, maxLength: 2_048 },
-        }, required: ['type', 'url'], additionalProperties: false,
+          type: { const: 'navigate' }, url: { type: 'string', minLength: 1, maxLength: 2_048 }, source,
+        }, required: ['type', 'url', 'source'], additionalProperties: false,
       },
       {
         type: 'object', properties: {
@@ -179,8 +174,6 @@ function toolsFor(candidates: readonly BrowserContinuationCandidate[]): readonly
         parameters: {
           type: 'object', properties: {
             bindingId, intent: { type: 'string', minLength: 1, maxLength: 500 },
-            mode: { type: 'string', enum: ['semantic', 'region_image'] },
-            ref: { type: 'string', minLength: 1, maxLength: 128 },
             cursor: { type: 'string', minLength: 1, maxLength: 128 },
           }, required: ['bindingId', 'intent'], additionalProperties: false,
         },
@@ -222,7 +215,7 @@ export class BrowserContinuationCatalog {
     readonly userId: string
     readonly conversationId: string
   }): Promise<BrowserContinuationCatalogSnapshot> {
-    const listed = this.dependencies.registry.list(input.userId, input.conversationId).filter((binding) => (
+    const listed = (await this.dependencies.registry.listEligible(input.userId, input.conversationId)).filter((binding) => (
       binding.userId === input.userId && binding.conversationId === input.conversationId
     ))
     const candidates = (await Promise.all(listed.map(async (binding) => {

@@ -26,7 +26,6 @@ import type {
   BrowserContinuationPageState,
   BrowserContinuationResolvedTargetInput,
   BrowserPageSnapshot,
-  BrowserRegionImage,
   BrowserSemanticNode,
   BrowserValueSource,
 } from '../browser/browser-continuation-types.js'
@@ -48,7 +47,6 @@ const httpsUrl = z.string().trim().min(1).max(2_048).superRefine((value, context
 
 const valueSourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('current_user') }).strict(),
-  z.object({ kind: z.literal('history'), messageId: identifier }).strict(),
   z.object({ kind: z.literal('page'), snapshotId: identifier, ref }).strict(),
 ])
 
@@ -57,7 +55,7 @@ const actionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('select'), ref, value: boundedText, source: valueSourceSchema }).strict(),
   z.object({ type: z.literal('click'), ref }).strict(),
   z.object({ type: z.literal('check'), ref, checked: z.boolean(), source: valueSourceSchema }).strict(),
-  z.object({ type: z.literal('navigate'), url: httpsUrl }).strict(),
+  z.object({ type: z.literal('navigate'), url: httpsUrl, source: valueSourceSchema }).strict(),
   z.object({ type: z.literal('scroll'), ref: ref.optional(), direction: z.enum(['up', 'down']) }).strict(),
   z.object({ type: z.literal('wait'), milliseconds: z.number().int().min(50).max(2_000) }).strict(),
   z.object({ type: z.literal('focus') }).strict(),
@@ -66,8 +64,6 @@ const actionSchema = z.discriminatedUnion('type', [
 export const browserSessionInspectInputSchema = z.object({
   bindingId: identifier,
   intent: z.string().trim().min(1).max(500),
-  mode: z.enum(['semantic', 'region_image']).optional(),
-  ref: ref.optional(),
   cursor: identifier.optional(),
 }).strict()
 
@@ -93,7 +89,6 @@ export interface BrowserContinuationRunContext {
   readonly conversationId: string
   readonly runId: string
   readonly currentUser: { readonly messageId: string; readonly text: string }
-  readonly referencedHistory: readonly { readonly messageId: string; readonly text: string }[]
   readonly signal?: AbortSignal
 }
 
@@ -125,6 +120,8 @@ interface BrowserContinuationToolExecutorDependencies {
   readonly guard?: BrowserActionGuard
   readonly id?: () => string
   readonly now?: () => number
+  readonly terminalRunLimit?: number
+  readonly terminalRunTtlMs?: number
 }
 
 interface ActiveRunState {
@@ -149,14 +146,7 @@ function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
 }
 
-function isPageSnapshot(value: BrowserPageSnapshot | BrowserRegionImage): value is BrowserPageSnapshot {
-  return 'nodes' in value
-}
-
-function pageSignature(value: BrowserPageSnapshot | BrowserRegionImage): string {
-  if (!isPageSnapshot(value)) return JSON.stringify({
-    kind: 'region_image', origin: value.origin, ref: value.ref, width: value.width, height: value.height,
-  })
+function pageSignature(value: BrowserPageSnapshot): string {
   return JSON.stringify({
     origin: value.origin,
     auth: value.auth,
@@ -286,13 +276,17 @@ export class BrowserContinuationToolExecutor {
   private readonly guard: BrowserActionGuard
   private readonly id: () => string
   private readonly now: () => number
+  private readonly terminalRunLimit: number
+  private readonly terminalRunTtlMs: number
   private readonly runs = new Map<string, ActiveRunState>()
-  private readonly terminalRuns = new Set<string>()
+  private readonly terminalRuns = new Map<string, number>()
 
   constructor(private readonly dependencies: BrowserContinuationToolExecutorDependencies) {
     this.guard = dependencies.guard ?? new BrowserActionGuard()
     this.id = dependencies.id ?? randomUUID
     this.now = dependencies.now ?? Date.now
+    this.terminalRunLimit = Math.max(1, dependencies.terminalRunLimit ?? 4_096)
+    this.terminalRunTtlMs = Math.max(1, dependencies.terminalRunTtlMs ?? 30 * 60 * 1_000)
   }
 
   async execute(
@@ -300,7 +294,7 @@ export class BrowserContinuationToolExecutor {
     rawInput: unknown,
     context: BrowserContinuationRunContext,
   ): Promise<BrowserContinuationToolResult> {
-    if (this.terminalRuns.has(context.runId)) return { kind: 'tool_error', code: 'CANCELLED' }
+    if (this.isTerminalRun(context.runId)) return { kind: 'tool_error', code: 'CANCELLED' }
     if (tool !== 'browser_session_inspect'
       && tool !== 'browser_session_act'
       && tool !== 'browser_session_handoff') {
@@ -328,7 +322,7 @@ export class BrowserContinuationToolExecutor {
     const state = this.runs.get(runId)
     if (state) await this.cleanupAuthority(state)
     this.runs.delete(runId)
-    this.terminalRuns.add(runId)
+    this.rememberTerminalRun(runId)
   }
 
   async cancel(runId: string): Promise<void> {
@@ -386,6 +380,7 @@ export class BrowserContinuationToolExecutor {
     context: BrowserContinuationRunContext,
   ): Promise<BrowserContinuationToolResult> {
     const lease = await this.lease(state, context)
+    await lease.assertEligible()
     this.assertActive(state, context)
     const page = await this.dependencies.workspace.getContinuationState(lease.binding.tabId, context.runId)
     let audited = false
@@ -396,15 +391,10 @@ export class BrowserContinuationToolExecutor {
         navigationEpoch: page.navigationEpoch,
         origin: page.origin,
         intent: input.intent,
-        ...(input.ref === undefined ? {} : { ref: input.ref }),
         ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
       }
-      const result = input.mode === 'region_image'
-        ? await this.dependencies.inspector.inspect({ ...common, mode: 'region_image' })
-        : await this.dependencies.inspector.inspect({
-          ...common,
-          ...(input.mode === undefined ? {} : { mode: input.mode }),
-        })
+      const result = await this.dependencies.inspector.inspect(common)
       this.assertActive(state, context)
       const signature = pageSignature(result)
       const changed = state.lastInspectionSignature !== undefined && signature !== state.lastInspectionSignature
@@ -413,7 +403,7 @@ export class BrowserContinuationToolExecutor {
         : 1
       state.lastInspectionSignature = signature
       if (changed) state.noProgressCount = 0
-      if (isPageSnapshot(result)) state.snapshots.set(result.snapshotId, result)
+      state.snapshots.set(result.snapshotId, result)
       if (state.inspectionNoProgressCount >= 3) {
         this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'failed', 'ACTION_LIMIT_EXCEEDED')
         audited = true
@@ -425,7 +415,7 @@ export class BrowserContinuationToolExecutor {
         kind: 'success',
         data: Object.freeze({
           trust: 'untrusted_page_data',
-          ...(isPageSnapshot(result) ? { snapshot: result } : { regionImage: result }),
+          snapshot: result,
         }),
       }
     } catch (error) {
@@ -446,6 +436,7 @@ export class BrowserContinuationToolExecutor {
     context: BrowserContinuationRunContext,
   ): Promise<BrowserContinuationToolResult> {
     const lease = await this.lease(state, context)
+    await lease.assertEligible()
     const snapshot = state.snapshots.get(input.snapshotId)
     if (!snapshot) {
       const page = await this.dependencies.workspace.getContinuationState(lease.binding.tabId, context.runId)
@@ -459,9 +450,12 @@ export class BrowserContinuationToolExecutor {
     let progressSnapshot = snapshot
     for (const rawAction of input.actions) {
       const action = rawAction as BrowserAction
-      const target = 'ref' in action && action.ref !== undefined
-        ? snapshot.nodes.find((node) => node.ref === action.ref)
-        : undefined
+      const targetRef = action.type === 'navigate' && action.source.kind === 'page'
+        ? action.source.ref
+        : 'ref' in action ? action.ref : undefined
+      const target = targetRef === undefined
+        ? undefined
+        : snapshot.nodes.find((node) => node.ref === targetRef)
       let page: BrowserContinuationPageState = {
         origin: snapshot.origin, url: snapshot.url, navigationEpoch: snapshot.navigationEpoch,
       }
@@ -469,6 +463,7 @@ export class BrowserContinuationToolExecutor {
       let audited = false
       try {
         this.assertActionBudget(state, action, context)
+        await lease.assertEligible()
         page = await this.dependencies.workspace.getContinuationState(lease.binding.tabId, context.runId)
         if (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch) {
           throw failure('PAGE_CHANGED')
@@ -481,6 +476,7 @@ export class BrowserContinuationToolExecutor {
             navigationEpoch: page.navigationEpoch,
             origin: page.origin,
             ref: target.ref,
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
           })
           : undefined
         const liveBefore = resolved ?? await this.dependencies.inspector.currentPageContext({
@@ -488,8 +484,9 @@ export class BrowserContinuationToolExecutor {
           tabId: lease.binding.tabId,
           navigationEpoch: page.navigationEpoch,
           origin: page.origin,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
         })
-        normalized = this.verifyValue(action, context, state)
+        normalized = this.verifyAction(action, context, state, resolved)
         const decision = this.guard.decide({
           origin: page.origin,
           url: page.url,
@@ -524,6 +521,7 @@ export class BrowserContinuationToolExecutor {
             throw error
           }
         }
+        await lease.assertEligible()
         state.actionCount += 1
         await this.dependencies.workspace.performContinuationAction({
           tabId: lease.binding.tabId,
@@ -542,6 +540,7 @@ export class BrowserContinuationToolExecutor {
           tabId: lease.binding.tabId,
           navigationEpoch: after.navigationEpoch,
           origin: after.origin,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
         })
         const navigated = navigationChanged(page, after)
         let revealedRelevantEvidence = false
@@ -552,6 +551,7 @@ export class BrowserContinuationToolExecutor {
             navigationEpoch: after.navigationEpoch,
             origin: after.origin,
             intent: context.currentUser.text,
+            ...(context.signal === undefined ? {} : { signal: context.signal }),
           })
           if (action.type !== 'focus' && action.type !== 'wait') {
             revealedRelevantEvidence = revealsRelevantEvidence(
@@ -619,6 +619,7 @@ export class BrowserContinuationToolExecutor {
             resolved = await this.dependencies.inspector.resolveRef({
               lease, tabId: lease.binding.tabId, snapshotId: snapshot.snapshotId,
               navigationEpoch: page.navigationEpoch, origin: page.origin, ref: input.ref,
+              ...(context.signal === undefined ? {} : { signal: context.signal }),
             })
             break
           }
@@ -648,6 +649,7 @@ export class BrowserContinuationToolExecutor {
     trigger?: { readonly action: BrowserAction; readonly target: BrowserSemanticNode | undefined },
   ): Promise<BrowserContinuationToolResult> {
     const lease = state.lease!
+    await lease.assertEligible()
     await this.dependencies.workspace.focusContinuation(lease.binding.tabId, context.runId)
     if (target && resolved) {
       await this.dependencies.workspace.highlightContinuationTarget(
@@ -674,15 +676,30 @@ export class BrowserContinuationToolExecutor {
       'external_action', 'handed_off', decision.code,
     )
     this.runs.delete(context.runId)
-    this.terminalRuns.add(context.runId)
+    this.rememberTerminalRun(context.runId)
     return { kind: 'handoff', code: decision.code }
   }
 
-  private verifyValue(
+  private verifyAction(
     action: BrowserAction,
     context: BrowserContinuationRunContext,
     state: ActiveRunState,
+    resolved: BrowserResolvedElementReference | undefined,
   ): BrowserAction {
+    if (action.type === 'navigate') {
+      const destination = this.canonicalCurrentUserUrl(action.url)
+      if (!destination) throw failure('INVALID_INPUT')
+      if (action.source.kind === 'current_user') {
+        if (!this.currentUserUrls(context.currentUser.text).has(destination)) throw failure('INVALID_INPUT')
+      } else if (!resolved
+        || action.source.snapshotId !== resolved.snapshotId
+        || action.source.ref !== resolved.ref
+        || resolved.role !== 'link'
+        || resolved.targetContext.href !== destination) {
+        throw failure('INVALID_INPUT')
+      }
+      return Object.freeze({ ...action, url: destination })
+    }
     if (action.type !== 'fill' && action.type !== 'select' && action.type !== 'check') return action
     const evidence = this.sourceEvidence(action.source, context, state)
     const supported = action.type === 'check'
@@ -713,17 +730,32 @@ export class BrowserContinuationToolExecutor {
     state: ActiveRunState,
   ): string | boolean {
     if (source.kind === 'current_user') return context.currentUser.text
-    if (source.kind === 'history') {
-      const message = context.referencedHistory.find(({ messageId }) => messageId === source.messageId)
-      if (!message) throw failure('INVALID_INPUT')
-      return message.text
-    }
     const snapshot = state.snapshots.get(source.snapshotId)
     const node = snapshot?.nodes.find((candidate) => candidate.ref === source.ref)
     if (!snapshot || !node) throw failure('INVALID_INPUT')
     if (node.value !== undefined) return node.value
     if (node.checked !== undefined) return node.checked
     throw failure('INVALID_INPUT')
+  }
+
+  private canonicalCurrentUserUrl(value: string): string | undefined {
+    try {
+      const url = new URL(value)
+      if (url.protocol !== 'https:' || url.username || url.password) return undefined
+      return url.href
+    } catch {
+      return undefined
+    }
+  }
+
+  private currentUserUrls(text: string): ReadonlySet<string> {
+    const urls = new Set<string>()
+    for (const match of text.matchAll(/https:\/\/[^\s<>"'“”‘’（）()[\]{}，。；！？]+/giu)) {
+      const candidate = match[0].replace(/[.,;!?，。；！？）)\]}]+$/gu, '')
+      const canonical = this.canonicalCurrentUserUrl(candidate)
+      if (canonical) urls.add(canonical)
+    }
+    return urls
   }
 
   private assertActionBudget(
@@ -781,7 +813,34 @@ export class BrowserContinuationToolExecutor {
   private async terminate(state: ActiveRunState): Promise<void> {
     await this.cleanupAuthority(state)
     this.runs.delete(state.runId)
-    this.terminalRuns.add(state.runId)
+    this.rememberTerminalRun(state.runId)
+  }
+
+  private isTerminalRun(runId: string): boolean {
+    this.pruneTerminalRuns()
+    const expiresAt = this.terminalRuns.get(runId)
+    if (expiresAt === undefined) return false
+    this.terminalRuns.delete(runId)
+    this.terminalRuns.set(runId, expiresAt)
+    return true
+  }
+
+  private rememberTerminalRun(runId: string): void {
+    this.pruneTerminalRuns()
+    this.terminalRuns.delete(runId)
+    this.terminalRuns.set(runId, this.now() + this.terminalRunTtlMs)
+    while (this.terminalRuns.size > this.terminalRunLimit) {
+      const oldest = this.terminalRuns.keys().next().value
+      if (oldest === undefined) break
+      this.terminalRuns.delete(oldest)
+    }
+  }
+
+  private pruneTerminalRuns(): void {
+    const now = this.now()
+    for (const [runId, expiresAt] of this.terminalRuns) {
+      if (expiresAt <= now) this.terminalRuns.delete(runId)
+    }
   }
 
   private async cleanupAuthority(

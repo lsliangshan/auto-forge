@@ -510,6 +510,12 @@ describe('cross-process contracts', () => {
         ],
       },
     })).toThrow()
+    expect(() => workflowDetailSchema.parse({
+      ...legacyWorkflow,
+      browserContinuation: {
+        readableRegions: Array.from({ length: 33 }, (_, index) => `css=#region-${index}`),
+      },
+    })).toThrow()
   })
 
   it('keeps browser status and audit IPC payloads bounded and redacted', () => {

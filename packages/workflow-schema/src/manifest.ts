@@ -1,5 +1,7 @@
 import type { WorkflowPermission } from '@autoforge/shared'
 
+export const BROWSER_CONTINUATION_ARRAY_LIMIT = 32
+
 export interface BrowserContinuationManifest {
   auth?: {
     loginUrls?: string[]

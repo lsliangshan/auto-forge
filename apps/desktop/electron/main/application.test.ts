@@ -19,6 +19,7 @@ import {
   type ExecutionEvent,
   type ModelInfo,
   type ProxySettings,
+  type WorkflowDetail,
 } from '@autoforge/shared'
 import {
   createApplicationFailureRecorder,
@@ -53,6 +54,10 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
+import {
+  browserPermissionMatrix,
+  workflowSecurityFingerprint,
+} from './workflows/workflow-security-fingerprint.js'
 import { createWorkflowSourceSelectorVault } from './workflows/workflow-source-selector.js'
 
 const directories: string[] = []
@@ -429,6 +434,25 @@ function continuationBinding(
   }
 }
 
+function eligibleContinuationBinding(
+  userId: string,
+  conversationId: string,
+  workflow: WorkflowDetail,
+  overrides: Partial<BrowserContinuationBindingInput> = {},
+): BrowserContinuationBindingInput {
+  return continuationBinding(userId, conversationId, {
+    workflowId: workflow.id,
+    workflowVersion: workflow.version,
+    source: workflow.source,
+    ...(workflow.runtimeIdentity.source === 'development'
+      ? { buildHash: workflow.runtimeIdentity.buildHash }
+      : {}),
+    securityFingerprint: workflowSecurityFingerprint(workflow),
+    permissionMatrix: browserPermissionMatrix(workflow),
+    ...overrides,
+  })
+}
+
 function seedContinuationParents(
   databasePath: string,
   binding: BrowserContinuationBindingInput,
@@ -463,7 +487,11 @@ function seedContinuationParents(
 async function installApprovalWorkflow(
   runtime: ReturnType<typeof createApplicationRuntime>,
   activation = 'approval workflow',
-  options: { beijing?: boolean } = {},
+  options: {
+    beijing?: boolean
+    browserContinuation?: WorkflowDetail['browserContinuation']
+    permissions?: WorkflowDetail['permissions']
+  } = {},
 ) {
   const project = await runtime.services.developer.createProject('Approval Workflow')
   const manifest = JSON.parse(
@@ -477,7 +505,11 @@ async function installApprovalWorkflow(
       description: '办理北京工作居住证',
       cities: ['北京'],
     } : {}),
-    permissions: [{ capability: 'browser.fill', scope: { origins: ['https://example.com'] } }],
+    permissions: options.permissions
+      ?? [{ capability: 'browser.fill', scope: { origins: ['https://example.com'] } }],
+    ...(options.browserContinuation === undefined
+      ? {}
+      : { browserContinuation: options.browserContinuation }),
     activationExamples: [activation],
     inputSchema: { type: 'object', additionalProperties: false },
   })
@@ -3283,13 +3315,16 @@ describe('createApplicationRuntime', () => {
       defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser-context' } },
     })
     const conversation = await runtime.services.chat.createConversation()
-    const input = continuationBinding(session.user.id, conversation.id, {
-      tabId: 'tab_test',
+    const workflow = await installApprovalWorkflow(runtime, 'browser context', {
       browserContinuation: { readableRegions: ['role=main'] },
-      permissionMatrix: {
-        'browser.open': ['https://permit.example.gov.cn/*'],
-        'browser.url': ['https://permit.example.gov.cn/*'],
-      },
+      permissions: [
+        { capability: 'browser.open', scope: { origins: ['https://permit.example.gov.cn/*'] } },
+        { capability: 'browser.url', scope: { origins: ['https://permit.example.gov.cn/*'] } },
+      ],
+    })
+    const input = eligibleContinuationBinding(session.user.id, conversation.id, workflow, {
+      tabId: 'tab_test',
+      browserContinuation: workflow.browserContinuation,
     })
     seedContinuationParents(join(root, 'autoforge.sqlite'), input)
     bindingId = capturedContinuationRegistry(workspace).bind(input).bindingId
@@ -5491,8 +5526,9 @@ describe('createApplicationRuntime', () => {
       defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser' } },
     })
     const conversation = await runtime.services.chat.createConversation()
+    const workflow = await installApprovalWorkflow(runtime)
     const registry = capturedContinuationRegistry(workspace)
-    const binding = continuationBinding(session.user.id, conversation.id)
+    const binding = eligibleContinuationBinding(session.user.id, conversation.id, workflow)
     seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
     const live = registry.bind(binding)
 
@@ -5521,12 +5557,13 @@ describe('createApplicationRuntime', () => {
     const bobConversation = await runtime.services.chat.createConversation()
     await runtime.services.auth.logout()
     await runtime.services.auth.loginWithPassword({ account: 'AliceBrowser', password: 'password' })
+    const workflow = await installApprovalWorkflow(runtime)
 
     const registry = capturedContinuationRegistry(workspace)
-    const aliceBinding = continuationBinding(alice.user.id, aliceConversation.id, {
+    const aliceBinding = eligibleContinuationBinding(alice.user.id, aliceConversation.id, workflow, {
       tabId: 'tab_alice', chatRunId: 'run_alice', executionId: 'execution_alice',
     })
-    const bobBinding = continuationBinding(bob.user.id, bobConversation.id, {
+    const bobBinding = eligibleContinuationBinding(bob.user.id, bobConversation.id, workflow, {
       tabId: 'tab_bob', chatRunId: 'run_bob', executionId: 'execution_bob',
     })
     seedContinuationParents(join(root, 'autoforge.sqlite'), aliceBinding, 'request_alice')
@@ -5611,12 +5648,13 @@ describe('createApplicationRuntime', () => {
       defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser' } },
     })
     const registry = capturedContinuationRegistry(workspace)
+    const workflow = await installApprovalWorkflow(runtime)
     const runs: Array<{ requestId: string; runId: string }> = []
     const leases: Array<{ release(): Promise<void> }> = []
 
     for (let index = 0; index < 3; index += 1) {
       const conversation = await runtime.services.chat.createConversation()
-      const binding = continuationBinding(session.user.id, conversation.id, {
+      const binding = eligibleContinuationBinding(session.user.id, conversation.id, workflow, {
         tabId: `tab_catalog_${index}`,
         chatRunId: `parent_run_catalog_${index}`,
         executionId: `parent_execution_catalog_${index}`,
@@ -5723,10 +5761,11 @@ describe('createApplicationRuntime', () => {
       defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/browser' } },
     })
     const registry = capturedContinuationRegistry(workspace)
+    const workflow = await installApprovalWorkflow(runtime)
 
     const startActiveRun = async (index: number) => {
       const conversation = await runtime.services.chat.createConversation()
-      const binding = continuationBinding(session.user.id, conversation.id, {
+      const binding = eligibleContinuationBinding(session.user.id, conversation.id, workflow, {
         tabId: `tab_active_${index}`,
         chatRunId: `parent_run_active_${index}`,
         executionId: `parent_execution_active_${index}`,
@@ -5867,7 +5906,8 @@ describe('createApplicationRuntime', () => {
     })
     const conversation = await runtime.services.chat.createConversation()
     const registry = capturedContinuationRegistry(workspace)
-    const binding = continuationBinding(session.user.id, conversation.id)
+    const workflow = await installApprovalWorkflow(runtime)
+    const binding = eligibleContinuationBinding(session.user.id, conversation.id, workflow)
     seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
     registry.bind(binding)
     const sent = await runtime.services.chat.send(chatInput(conversation.id, '保持请求活跃'))
@@ -6064,6 +6104,64 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('revokes same-version reinstalls and rejects stale fingerprints or tampered installed runtimes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-runtime-revalidation-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+    const session = await authenticate(runtime, 'RuntimeRevalidation')
+    const conversation = await runtime.services.chat.createConversation()
+    const installed = await installApprovalWorkflow(runtime)
+    const [project] = await runtime.services.developer.listProjects()
+    if (!project) throw new Error('Expected the installed source project')
+    const registry = capturedContinuationRegistry(workspace)
+
+    const reusable = eligibleContinuationBinding(session.user.id, conversation.id, installed, {
+      tabId: 'tab_reinstall', chatRunId: 'run_reinstall', executionId: 'execution_reinstall',
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), reusable)
+    registry.bind(reusable)
+    await expect(registry.listEligible(session.user.id, conversation.id)).resolves.toHaveLength(1)
+
+    await runtime.services.workflows.remove(installed.id, installed.version)
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    expect(workspace.closeContinuation).toHaveBeenCalledWith('tab_reinstall')
+
+    const betweenInstalls = eligibleContinuationBinding(session.user.id, conversation.id, installed, {
+      tabId: 'tab_between_installs', chatRunId: 'run_between_installs',
+      executionId: 'execution_between_installs',
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), betweenInstalls)
+    registry.bind(betweenInstalls)
+    const reinstalled = await runtime.services.workflows.installProject(project.id)
+    expect(registry.list(session.user.id, conversation.id)).toEqual([])
+    expect(workspace.closeContinuation).toHaveBeenCalledWith('tab_between_installs')
+
+    const staleFingerprint = eligibleContinuationBinding(session.user.id, conversation.id, reinstalled, {
+      tabId: 'tab_stale_fingerprint', chatRunId: 'run_stale_fingerprint',
+      executionId: 'execution_stale_fingerprint', securityFingerprint: 'f'.repeat(64),
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), staleFingerprint)
+    registry.bind(staleFingerprint)
+    await expect(registry.listEligible(session.user.id, conversation.id)).resolves.toEqual([])
+    expect(workspace.closeContinuation).toHaveBeenCalledWith('tab_stale_fingerprint')
+
+    const tampered = eligibleContinuationBinding(session.user.id, conversation.id, reinstalled, {
+      tabId: 'tab_tampered', chatRunId: 'run_tampered', executionId: 'execution_tampered',
+    })
+    seedContinuationParents(join(root, 'autoforge.sqlite'), tampered)
+    registry.bind(tampered)
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    const stored = database.installedWorkflows.get(reinstalled.id, reinstalled.version)!
+    const manifest = stored.manifest as { entryPath: string }
+    database.close()
+    await writeFile(join(stored.installPath, manifest.entryPath), 'tampered runtime bytes')
+
+    await expect(registry.listEligible(session.user.id, conversation.id)).resolves.toEqual([])
+    expect(workspace.closeContinuation).toHaveBeenCalledWith('tab_tampered')
+    await runtime.close()
+  })
+
   it('clears only the authenticated user browser data after active execution and lease checks', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-clear-'))
     directories.push(root)
@@ -6076,11 +6174,12 @@ describe('createApplicationRuntime', () => {
     const bobConversation = await runtime.services.chat.createConversation()
     await runtime.services.auth.logout()
     await runtime.services.auth.loginWithPassword({ account: 'AliceClear', password: 'password' })
+    const workflow = await installApprovalWorkflow(runtime)
     const registry = capturedContinuationRegistry(workspace)
-    const aliceBinding = continuationBinding(alice.user.id, aliceConversation.id, {
+    const aliceBinding = eligibleContinuationBinding(alice.user.id, aliceConversation.id, workflow, {
       tabId: 'tab_alice_clear', chatRunId: 'run_alice_clear', executionId: 'execution_alice_clear',
     })
-    const bobBinding = continuationBinding(bob.user.id, bobConversation.id, {
+    const bobBinding = eligibleContinuationBinding(bob.user.id, bobConversation.id, workflow, {
       tabId: 'tab_bob_clear', chatRunId: 'run_bob_clear', executionId: 'execution_bob_clear',
     })
     seedContinuationParents(join(root, 'autoforge.sqlite'), aliceBinding)

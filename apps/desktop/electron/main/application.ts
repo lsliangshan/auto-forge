@@ -89,6 +89,11 @@ import { validateWorkflowInput } from './workflows/input-validation.js'
 import { WorkflowProjectService, type WorkflowProjectServiceOptions } from './workflows/project-service.js'
 import { WorkflowRegistry } from './workflows/registry.js'
 import {
+  browserPermissionMatrix,
+  canonicalJson,
+  workflowSecurityFingerprint,
+} from './workflows/workflow-security-fingerprint.js'
+import {
   createWorkflowSourceSelectorVault,
   type ExactWorkflowSource,
   type WorkflowSourceSelectorVault,
@@ -679,6 +684,40 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const browserContinuations = new BrowserContinuationRegistry({
     repository: database.browserTabBindings,
     workspace: options.browserWorkspace,
+    isEligible: async (binding) => {
+      let workflow: WorkflowDetail | undefined
+      if (binding.source === 'installed') {
+        const integrity = await registry.verifyIntegrity(binding.workflowId, binding.workflowVersion)
+        if (!integrity.valid || integrity.disabled) return false
+        workflow = await registry.get(binding.workflowId, binding.workflowVersion, { developerMode: false })
+      } else {
+        if (!settings.get().developerMode || !binding.buildHash) return false
+        const matches = (await Promise.all(database.workflowProjects.list().map(async (project) => {
+          const manifest = project.manifest as Partial<WorkflowManifest> | undefined
+          if (project.status !== 'ready'
+            || project.buildHash !== binding.buildHash
+            || manifest?.id !== binding.workflowId
+            || manifest.version !== binding.workflowVersion) return undefined
+          return registry.getDevelopmentProject(project.id)
+        }))).filter((candidate): candidate is WorkflowDetail => candidate !== undefined)
+        if (matches.length !== 1) return false
+        workflow = matches[0]
+      }
+      if (!workflow) return false
+      const exactRuntimeIdentity = binding.source === 'installed'
+        ? workflow.source === 'installed'
+          && workflow.runtimeIdentity.source === 'installed'
+        : workflow.source === 'development'
+          && workflow.runtimeIdentity.source === 'development'
+          && workflow.runtimeIdentity.buildHash === binding.buildHash
+      return exactRuntimeIdentity
+        && workflow.enabled
+        && workflow.integrity === 'valid'
+        && workflow.id === binding.workflowId
+        && workflow.version === binding.workflowVersion
+        && workflowSecurityFingerprint(workflow) === binding.securityFingerprint
+        && canonicalJson(browserPermissionMatrix(workflow)) === canonicalJson(binding.permissionMatrix)
+    },
     onTakeOver: async ({ binding, runId }) => {
       const session = await auth.requireSession()
       const run = database.chatRuns.get(runId)
@@ -1340,6 +1379,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       ),
       installProject: async (projectId) => {
         const installed = await projects.install(projectId)
+        await browserContinuations.revokeWorkflow({
+          workflowId: installed.workflowId,
+          workflowVersion: installed.version,
+          source: 'installed',
+        }, 'WORKFLOW_CHANGED')
         const workflow = await registry.get(installed.workflowId, installed.version)
         if (!workflow) throw failure('INTERNAL_ERROR')
         return workflow
@@ -1378,8 +1422,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const previousManifest = previous?.manifest as Partial<WorkflowManifest> | undefined
         if (previous?.buildHash
           && previousManifest?.id
-          && previousManifest.version
-          && previous.buildHash !== built.buildHash) {
+          && previousManifest.version) {
           await browserContinuations.revokeWorkflow({
             workflowId: previousManifest.id,
             workflowVersion: previousManifest.version,
@@ -1394,7 +1437,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const releaseStart = maintenance.beginStart()
         try {
           const session = await auth.requireSession()
+          const previous = database.workflowProjects.get(projectId)
           const built = await projects.build(projectId)
+          const previousManifest = previous?.manifest as Partial<WorkflowManifest> | undefined
+          if (previous?.buildHash && previousManifest?.id && previousManifest.version) {
+            await browserContinuations.revokeWorkflow({
+              workflowId: previousManifest.id,
+              workflowVersion: previousManifest.version,
+              source: 'development',
+              buildHash: previous.buildHash,
+            }, 'WORKFLOW_CHANGED')
+          }
           const manifest = built.manifest as WorkflowManifest
           try {
             const inputValidation = validateWorkflowInput(manifest.inputSchema, input)

@@ -21,6 +21,7 @@ export interface BrowserInspectionDomSummary {
   readonly hidden?: boolean
   readonly readOnly?: boolean
   readonly contentEditable?: boolean
+  readonly href?: string
 }
 
 export interface BrowserInspectionNode {
@@ -61,6 +62,8 @@ interface BrowserPageReadInput {
   readonly expectedOrigin: string
   readonly expectedNavigationEpoch: number
   readonly locators: readonly string[]
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
 }
 
 interface BrowserNodeReadInput {
@@ -69,6 +72,8 @@ interface BrowserNodeReadInput {
   readonly expectedOrigin: string
   readonly expectedNavigationEpoch: number
   readonly backendNodeId: number
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
 }
 
 export interface BrowserInspectionNodeBox {
@@ -106,6 +111,7 @@ export interface BrowserPageInspectInput {
   readonly ref?: string
   readonly cursor?: string
   readonly visionSupported?: boolean
+  readonly signal?: AbortSignal
 }
 
 export interface BrowserRefResolutionInput {
@@ -115,6 +121,7 @@ export interface BrowserRefResolutionInput {
   readonly navigationEpoch: number
   readonly origin: string
   readonly ref: string
+  readonly signal?: AbortSignal
 }
 
 export interface BrowserPageContextInput {
@@ -122,6 +129,7 @@ export interface BrowserPageContextInput {
   readonly tabId: string
   readonly navigationEpoch: number
   readonly origin: string
+  readonly signal?: AbortSignal
 }
 
 export interface BrowserLivePageContext {
@@ -143,6 +151,7 @@ export interface BrowserResolvedElementReference {
 interface InspectorOptions {
   readonly id?: () => string
   readonly now?: () => number
+  readonly inspectionTimeoutMs?: number
 }
 
 interface SafeCandidate {
@@ -157,6 +166,7 @@ interface SafeCandidate {
   readonly imageRestricted: boolean
   readonly tagName: string
   readonly inputType?: string
+  readonly href?: string
 }
 
 interface SnapshotIdentity {
@@ -186,6 +196,12 @@ const maxSerializedBytes = 128 * 1024
 const maxSemanticNodes = 500
 const maxImagePixels = 1_000_000
 const maxTextLength = 512
+export const MAX_BROWSER_INSPECTION_RAW_NODES = 1_500
+export const MAX_BROWSER_INSPECTION_RAW_BYTES = 4 * 1024 * 1024
+export const MAX_BROWSER_INSPECTION_LOCATOR_MATCHES = 256
+const maxBrowserInspectionTotalLocatorMatches = 2_048
+const maxBrowserInspectionPolicyLocators = 128
+const defaultInspectionTimeoutMs = 5_000
 
 const semanticRoles = new Set([
   'article', 'banner', 'button', 'cell', 'checkbox', 'combobox', 'complementary', 'contentinfo',
@@ -264,6 +280,17 @@ function safeUrl(value: string, expectedOrigin: string): string {
   }
 }
 
+function safeHref(value: string | undefined, pageUrl: string): string | undefined {
+  if (!value) return undefined
+  try {
+    const url = new URL(value, pageUrl)
+    if (url.protocol !== 'https:' || url.username || url.password) return undefined
+    return url.href
+  } catch {
+    return undefined
+  }
+}
+
 function authNode(node: BrowserInspectionNode): boolean {
   const role = normalizedRole(node.role)
   const type = node.dom.inputType?.toLowerCase()
@@ -338,6 +365,7 @@ function fixedSerializedBytes(snapshot: Omit<BrowserPageSnapshot, 'serializedByt
 export class BrowserPageInspector {
   private readonly id: () => string
   private readonly now: () => number
+  private readonly inspectionTimeoutMs: number
   private readonly refs = new Map<string, RefState>()
   private readonly cursors = new Map<string, CursorState>()
   private readonly unsubscribeInvalidation: () => void
@@ -345,6 +373,7 @@ export class BrowserPageInspector {
   constructor(private readonly port: BrowserPageCdpPort, options: InspectorOptions = {}) {
     this.id = options.id ?? randomUUID
     this.now = options.now ?? Date.now
+    this.inspectionTimeoutMs = Math.max(1, options.inspectionTimeoutMs ?? defaultInspectionTimeoutMs)
     this.unsubscribeInvalidation = port.onPageInvalidated((tabId) => { this.invalidateTab(tabId) })
   }
 
@@ -352,13 +381,26 @@ export class BrowserPageInspector {
   inspect(input: BrowserPageInspectInput & { readonly mode?: 'semantic' }): Promise<BrowserPageSnapshot>
   async inspect(input: BrowserPageInspectInput): Promise<BrowserPageSnapshot | BrowserRegionImage> {
     this.assertBinding(input)
-    if (input.mode === 'region_image') return this.captureRegion(input)
+    if (input.signal?.aborted) throw failure('CANCELLED')
+    const deadlineAt = Date.now() + this.inspectionTimeoutMs
+    if (input.mode === 'region_image') {
+      return this.withInspectionBudget(this.captureRegion(input, deadlineAt), input.signal, deadlineAt)
+    }
     if (input.ref !== undefined) throw failure('INVALID_INPUT')
-    if (input.cursor) return this.nextPage(input)
-    return this.captureSemantic(input)
+    if (input.cursor) return this.withInspectionBudget(this.nextPage(input, deadlineAt), input.signal, deadlineAt)
+    return this.withInspectionBudget(this.captureSemantic(input, deadlineAt), input.signal, deadlineAt)
   }
 
   async resolveRef(input: BrowserRefResolutionInput): Promise<BrowserResolvedElementReference> {
+    if (input.signal?.aborted) throw failure('CANCELLED')
+    const deadlineAt = Date.now() + this.inspectionTimeoutMs
+    return this.withInspectionBudget(this.resolveRefWithinBudget(input, deadlineAt), input.signal, deadlineAt)
+  }
+
+  private async resolveRefWithinBudget(
+    input: BrowserRefResolutionInput,
+    deadlineAt: number,
+  ): Promise<BrowserResolvedElementReference> {
     const binding = this.liveBinding(input.lease)
     const state = this.refs.get(input.ref)
     if (!state || !this.sameIdentity(state, {
@@ -369,7 +411,7 @@ export class BrowserPageInspector {
       navigationEpoch: input.navigationEpoch,
       origin: input.origin,
     })) throw failure('PAGE_CHANGED')
-    const { page, visibleNodes, auth, semanticFingerprint } = await this.readLivePageContext(input)
+    const { page, visibleNodes, auth, semanticFingerprint } = await this.readLivePageContext(input, deadlineAt)
     const current = visibleNodes.find((node) => node.backendNodeId === state.backendNodeId)
     if (!current
       || current.ignored
@@ -378,6 +420,7 @@ export class BrowserPageInspector {
       || safeText(current.name) !== state.name
       || current.dom.tagName.toLowerCase() !== state.tagName
       || current.dom.inputType?.toLowerCase() !== state.inputType
+      || safeHref(current.dom.href, page.url) !== state.href
       || current.enabled !== state.enabled
       || current.checked !== state.checked
       || current.selected !== state.selected) {
@@ -398,8 +441,12 @@ export class BrowserPageInspector {
   }
 
   async currentPageContext(input: BrowserPageContextInput): Promise<BrowserLivePageContext> {
-    const { auth, semanticFingerprint } = await this.readLivePageContext(input)
-    return Object.freeze({ auth, semanticFingerprint })
+    if (input.signal?.aborted) throw failure('CANCELLED')
+    const deadlineAt = Date.now() + this.inspectionTimeoutMs
+    return this.withInspectionBudget((async () => {
+      const { auth, semanticFingerprint } = await this.readLivePageContext(input, deadlineAt)
+      return Object.freeze({ auth, semanticFingerprint })
+    })(), input.signal, deadlineAt)
   }
 
   endRun(runId: string): void {
@@ -413,7 +460,7 @@ export class BrowserPageInspector {
     this.cursors.clear()
   }
 
-  private async captureSemantic(input: BrowserPageInspectInput): Promise<BrowserPageSnapshot> {
+  private async captureSemantic(input: BrowserPageInspectInput, deadlineAt: number): Promise<BrowserPageSnapshot> {
     const binding = this.liveBinding(input.lease)
     const runId = input.lease.ownerRunId
     const locators = this.policyLocators(binding)
@@ -423,9 +470,12 @@ export class BrowserPageInspector {
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
       locators,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt,
     })
     this.liveBinding(input.lease)
     this.assertPage(input, page)
+    this.assertRawBudget(page)
     const matchingPatterns = Object.values(binding.permissionMatrix).flat()
     if (!matchingPatterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) {
       throw failure('DOMAIN_BLOCKED')
@@ -460,6 +510,9 @@ export class BrowserPageInspector {
         imageRestricted: restrictedRegions.has(node.backendNodeId),
         tagName: node.dom.tagName.toLowerCase(),
         ...(node.dom.inputType === undefined ? {} : { inputType: node.dom.inputType.toLowerCase() }),
+        ...(role === 'link' && safeHref(node.dom.href, page.url) !== undefined
+          ? { href: safeHref(node.dom.href, page.url)! }
+          : {}),
       }]
     })
     const snapshotId = this.opaque('snapshot')
@@ -480,7 +533,7 @@ export class BrowserPageInspector {
     })
   }
 
-  private async nextPage(input: BrowserPageInspectInput): Promise<BrowserPageSnapshot> {
+  private async nextPage(input: BrowserPageInspectInput, deadlineAt: number): Promise<BrowserPageSnapshot> {
     const binding = this.liveBinding(input.lease)
     const runId = input.lease.ownerRunId
     const state = this.cursors.get(input.cursor!)
@@ -499,9 +552,12 @@ export class BrowserPageInspector {
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
       locators: this.policyLocators(binding),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt,
     })
     this.liveBinding(input.lease)
     this.assertPage(input, page)
+    this.assertRawBudget(page)
     return this.pageFromCandidates(state)
   }
 
@@ -623,7 +679,7 @@ export class BrowserPageInspector {
     })
   }
 
-  private async captureRegion(input: BrowserPageInspectInput): Promise<BrowserRegionImage> {
+  private async captureRegion(input: BrowserPageInspectInput, deadlineAt: number): Promise<BrowserRegionImage> {
     if (!input.visionSupported || !input.ref || input.cursor) throw failure('UNSUPPORTED_CONTROL')
     const binding = this.liveBinding(input.lease)
     const runId = input.lease.ownerRunId
@@ -636,6 +692,7 @@ export class BrowserPageInspector {
       navigationEpoch: input.navigationEpoch,
       origin: input.origin,
       ref: input.ref,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
     })
     if (state.imageRestricted) throw failure('UNSUPPORTED_CONTROL')
     const page = await this.port.readAccessibilitySnapshot({
@@ -644,9 +701,12 @@ export class BrowserPageInspector {
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
       locators: this.policyLocators(binding),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt,
     })
     this.liveBinding(input.lease)
     this.assertPage(input, page)
+    this.assertRawBudget(page)
     const patterns = Object.values(binding.permissionMatrix).flat()
     if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) throw failure('DOMAIN_BLOCKED')
     const mainFrameNodes = page.nodes.filter((node) => node.frameId === undefined || node.frameId === page.frameId)
@@ -665,6 +725,8 @@ export class BrowserPageInspector {
       expectedOrigin: state.origin,
       expectedNavigationEpoch: state.navigationEpoch,
       backendNodeId: state.backendNodeId,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt,
     })
     this.liveBinding(input.lease)
     const values = [box.x, box.y, box.width, box.height, box.viewportWidth, box.viewportHeight]
@@ -693,6 +755,8 @@ export class BrowserPageInspector {
       expectedName: state.name,
       expectedTagName: state.tagName,
       ...(state.inputType === undefined ? {} : { expectedInputType: state.inputType }),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt,
     })
     this.liveBinding(input.lease)
     return Object.freeze({
@@ -724,6 +788,64 @@ export class BrowserPageInspector {
       || input.origin !== exactOrigin) throw failure('INVALID_INPUT')
   }
 
+  private withInspectionBudget<T>(
+    operation: Promise<T>,
+    signal: AbortSignal | undefined,
+    deadlineAt: number,
+  ): Promise<T> {
+    if (signal?.aborted) return Promise.reject(failure('CANCELLED'))
+    const remaining = deadlineAt - Date.now()
+    if (remaining <= 0) return Promise.reject(failure('ACTION_LIMIT_EXCEEDED'))
+    return new Promise<T>((resolve, reject) => {
+      let settled = false
+      const finish = (result: { value: T } | { error: unknown }) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if ('error' in result) reject(result.error)
+        else resolve(result.value)
+      }
+      const onAbort = () => { finish({ error: failure('CANCELLED') }) }
+      const timer = setTimeout(() => {
+        finish({ error: failure('ACTION_LIMIT_EXCEEDED') })
+      }, remaining)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
+      void operation.then(
+        (value) => { finish({ value }) },
+        (error) => { finish({ error }) },
+      )
+    })
+  }
+
+  private assertRawBudget(page: BrowserPageReadResult): void {
+    const totalLocatorMatches = page.locatorMatches.reduce(
+      (total, entry) => total + entry.backendNodeIds.length,
+      0,
+    )
+    let serializedBytes = Number.POSITIVE_INFINITY
+    const locatorFanOutExceeded = page.locatorMatches.some(({ backendNodeIds }) => (
+        backendNodeIds.length > MAX_BROWSER_INSPECTION_LOCATOR_MATCHES
+    ))
+    if (page.nodes.length <= MAX_BROWSER_INSPECTION_RAW_NODES
+      && !locatorFanOutExceeded
+      && totalLocatorMatches <= maxBrowserInspectionTotalLocatorMatches) {
+      try {
+        serializedBytes = Buffer.byteLength(JSON.stringify({
+          nodes: page.nodes,
+          locatorMatches: page.locatorMatches,
+        }), 'utf8')
+      } catch { /* Non-serializable raw data fails the same closed budget boundary. */ }
+    }
+    if (page.nodes.length > MAX_BROWSER_INSPECTION_RAW_NODES
+      || locatorFanOutExceeded
+      || totalLocatorMatches > maxBrowserInspectionTotalLocatorMatches
+      || serializedBytes > MAX_BROWSER_INSPECTION_RAW_BYTES) {
+      throw failure('ACTION_LIMIT_EXCEEDED')
+    }
+  }
+
   private liveBinding(lease: BrowserContinuationLease): BrowserContinuationBinding {
     try {
       if (!lease.isCurrent(lease.binding)) throw failure('PAGE_CHANGED')
@@ -742,15 +864,17 @@ export class BrowserPageInspector {
 
   private policyLocators(binding: BrowserContinuationBinding): readonly string[] {
     const policy = binding.browserContinuation
-    return Object.freeze([
+    const locators = [
       ...(policy?.auth?.loggedIn ?? []),
       ...(policy?.auth?.loggedOut ?? []),
       ...(policy?.readableRegions ?? []),
       ...(policy?.manualActions ?? []).map(({ locator }) => locator),
-    ])
+    ]
+    if (locators.length > maxBrowserInspectionPolicyLocators) throw failure('ACTION_LIMIT_EXCEEDED')
+    return Object.freeze(locators)
   }
 
-  private async readLivePageContext(input: BrowserPageContextInput): Promise<{
+  private async readLivePageContext(input: BrowserPageContextInput, deadlineAt: number): Promise<{
     readonly page: BrowserPageReadResult
     readonly visibleNodes: readonly BrowserInspectionNode[]
     readonly auth: BrowserPageSnapshot['auth']
@@ -763,9 +887,12 @@ export class BrowserPageInspector {
       expectedOrigin: input.origin,
       expectedNavigationEpoch: input.navigationEpoch,
       locators: this.policyLocators(binding),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt,
     })
     this.liveBinding(input.lease)
     this.assertPage({ ...input, intent: 'live action validation' }, page)
+    this.assertRawBudget(page)
     const patterns = Object.values(binding.permissionMatrix).flat()
     if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) throw failure('DOMAIN_BLOCKED')
     const visibleNodes = page.nodes.filter((node) => (
@@ -824,6 +951,7 @@ export class BrowserPageInspector {
       .filter((value): value is string => value !== undefined)
       .slice(0, 16)
     const inputType = target.dom.inputType?.toLowerCase()
+    const href = safeHref(target.dom.href, page.url)
     const role = normalizedRole(target.role)
     const expectedNavigation = inputType === 'submit'
       || inputType === 'image'
@@ -836,6 +964,7 @@ export class BrowserPageInspector {
       formOwned,
       nearbyLabels: Object.freeze(nearbyLabels),
       ...(inputType === undefined ? {} : { inputType }),
+      ...(href === undefined ? {} : { href }),
       expectedNavigation,
       manualAction,
     })

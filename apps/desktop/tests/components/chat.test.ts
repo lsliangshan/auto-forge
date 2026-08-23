@@ -817,7 +817,7 @@ describe('chat interactions', () => {
   })
 
   it.each([
-    ['awaiting_user', '需要你在浏览器中操作', false],
+    ['awaiting_user', '需要你在浏览器中操作', true],
     ['completed', '浏览器自动操作已完成', true],
     ['failed', '浏览器自动操作失败', true],
     ['cancelled', '浏览器自动操作已停止', true],

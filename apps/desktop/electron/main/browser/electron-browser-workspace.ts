@@ -15,13 +15,26 @@ import {
   type BrowserContinuationProvenance,
   type BrowserContinuationResolvedTargetInput,
 } from './browser-continuation-types.js'
-import type {
-  BrowserInspectionDomSummary,
-  BrowserInspectionNode,
-  BrowserInspectionNodeBox,
-  BrowserPageCdpPort,
-  BrowserPageReadResult,
+import {
+  MAX_BROWSER_INSPECTION_LOCATOR_MATCHES,
+  MAX_BROWSER_INSPECTION_RAW_BYTES,
+  MAX_BROWSER_INSPECTION_RAW_NODES,
+  type BrowserInspectionDomSummary,
+  type BrowserInspectionNode,
+  type BrowserInspectionNodeBox,
+  type BrowserPageCdpPort,
+  type BrowserPageReadResult,
 } from './browser-page-inspector.js'
+
+interface InspectionCommandBudget {
+  readonly signal?: AbortSignal
+  readonly deadlineAt: number
+  calls: number
+}
+
+const maxBrowserInspectionCdpCalls = 2_048
+const maxBrowserInspectionDurationMs = 5_000
+const maxBrowserInspectionTotalLocatorMatches = 2_048
 
 interface Rectangle { x: number; y: number; width: number; height: number }
 interface NavigationEvent { preventDefault(): void }
@@ -640,43 +653,56 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     input: Parameters<BrowserPageCdpPort['readAccessibilitySnapshot']>[0],
   ): Promise<BrowserPageReadResult> {
     const state = this.continuationState(input)
+    const budget: InspectionCommandBudget = {
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      deadlineAt: Math.min(
+        input.deadlineAt ?? Date.now() + maxBrowserInspectionDurationMs,
+        Date.now() + maxBrowserInspectionDurationMs,
+      ),
+      calls: 0,
+    }
     const result = await this.restricted(state, [input.expectedOrigin], async () => {
       this.assertContinuationState(state, input)
-      const frameTree = await this.command(state, 'Page.getFrameTree') as {
+      const frameTree = await this.inspectionCommand(state, budget, 'Page.getFrameTree') as {
         frameTree?: { frame?: { id?: string } }
       }
       this.assertContinuationState(state, input)
       const frameId = frameTree.frameTree?.frame?.id
       if (!frameId) throw failure('PAGE_CHANGED')
-      const accessibility = await this.command(state, 'Accessibility.getFullAXTree') as {
+      const accessibility = await this.inspectionCommand(state, budget, 'Accessibility.getFullAXTree') as {
         nodes?: AccessibilityNodeResult[]
       }
       this.assertContinuationState(state, input)
-      const rawNodes = (accessibility.nodes ?? [])
+      const allRawNodes = accessibility.nodes ?? []
+      let rawBytes = Number.POSITIVE_INFINITY
+      if (allRawNodes.length <= MAX_BROWSER_INSPECTION_RAW_NODES) {
+        try { rawBytes = Buffer.byteLength(JSON.stringify(allRawNodes), 'utf8') } catch { /* fail below */ }
+      }
+      if (allRawNodes.length > MAX_BROWSER_INSPECTION_RAW_NODES
+        || rawBytes > MAX_BROWSER_INSPECTION_RAW_BYTES) throw failure('ACTION_LIMIT_EXCEEDED')
+      const rawNodes = allRawNodes
         .filter((node) => node.frameId === undefined || node.frameId === frameId)
         .filter((node) => typeof node.nodeId === 'string' && typeof node.backendDOMNodeId === 'number')
       const nodes: BrowserInspectionNode[] = []
       for (const rawNode of rawNodes) {
         const backendNodeId = rawNode.backendDOMNodeId!
-        let described: DescribedDomNode | undefined
-        try {
-          const result = await this.command(state, 'DOM.describeNode', {
-            backendNodeId, depth: 0, pierce: false,
-          }) as { node?: DescribedDomNode }
-          this.assertContinuationState(state, input)
-          described = result.node
-        } catch {
-          this.assertContinuationState(state, input)
-          this.assertOpen(state)
-          continue
-        }
-        if (!described) continue
+        const describedResult = await this.inspectionCommand(state, budget, 'DOM.describeNode', {
+          backendNodeId, depth: 0, pierce: false,
+        }) as { node?: DescribedDomNode }
+        this.assertContinuationState(state, input)
+        const described = describedResult.node
+        if (!described) throw failure('PAGE_CHANGED')
         nodes.push(this.inspectionNode(rawNode, described))
       }
       const locatorMatches = []
+      let locatorMatchCount = 0
       for (const locator of input.locators) {
-        const backendNodeIds = await this.resolveLocatorMatches(state, locator, rawNodes)
+        const backendNodeIds = await this.resolveLocatorMatches(state, locator, rawNodes, budget)
         this.assertContinuationState(state, input)
+        locatorMatchCount += backendNodeIds.length
+        if (locatorMatchCount > maxBrowserInspectionTotalLocatorMatches) {
+          throw failure('ACTION_LIMIT_EXCEEDED')
+        }
         locatorMatches.push({
           locator,
           backendNodeIds,
@@ -685,6 +711,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const viewport = await this.layoutViewport(
         state,
         () => { this.assertContinuationState(state, input) },
+        budget,
       )
       return {
         tabId: state.id,
@@ -1096,8 +1123,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     view.webContents.on('did-navigate-in-page', navigationChanged)
     view.webContents.on('did-start-loading', () => { this.setLoading(state, true) })
     view.webContents.on('did-stop-loading', () => { this.setLoading(state, false) })
-    view.webContents.on('before-input-event', () => { this.handleUserTakeover(state) })
-    view.webContents.on('before-mouse-event', () => { this.handleUserTakeover(state) })
+    view.webContents.on('before-input-event', () => {
+      void this.handleUserTakeover(state).catch(() => undefined)
+    })
+    view.webContents.on('before-mouse-event', () => {
+      void this.handleUserTakeover(state).catch(() => undefined)
+    })
     view.webContents.on('render-process-gone', () => {
       if (!view.webContents.isDestroyed()) view.webContents.close()
       this.handleDestroyed(state)
@@ -1158,15 +1189,15 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     }
   }
 
-  private handleUserTakeover(state: TargetTabState, force = false): void {
+  private handleUserTakeover(state: TargetTabState, force = false): Promise<void> {
     void this.clearContinuationHighlight(state.id).catch(() => undefined)
     const runId = state.ownerContinuationRunId
-    if (!runId || (!force && state.syntheticInputOperations > 0)) return
+    if (!runId || (!force && state.syntheticInputOperations > 0)) return Promise.resolve()
     state.ownerContinuationRunId = undefined
     this.emitPageInvalidated(state.id)
     void this.renderToolbar().catch(() => undefined)
     const takenOver = this.continuationRegistry?.markTakenOver(state.id, runId)
-    if (takenOver) void Promise.resolve(takenOver).catch(() => undefined)
+    return Promise.resolve(takenOver)
   }
 
   private addExecutionTab(executionId: string, state: TargetTabState): void {
@@ -1343,7 +1374,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
     if (command === 'activate' && id) {
       const tab = this.tabs.get(id)
-      if (tab && !tab.closed) await this.activate(tab)
+      if (tab && !tab.closed) {
+        if (active && active !== tab) await this.handleUserTakeover(active, true)
+        await this.activate(tab)
+      }
       return
     }
     if (command === 'close' && id) {
@@ -1354,15 +1388,15 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     if (!active || active.closed) return
     const history = active.view.webContents.navigationHistory
     if (command === 'back' && history.canGoBack()) {
-      this.handleUserTakeover(active, true)
+      await this.handleUserTakeover(active, true)
       history.goBack()
     }
     if (command === 'forward' && history.canGoForward()) {
-      this.handleUserTakeover(active, true)
+      await this.handleUserTakeover(active, true)
       history.goForward()
     }
     if (command === 'reload') {
-      this.handleUserTakeover(active, true)
+      await this.handleUserTakeover(active, true)
       active.view.webContents.reload()
     }
   }
@@ -1550,6 +1584,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       || /(?:display\s*:\s*none|visibility\s*:\s*hidden)/u.test(style)
     const readOnly = axReadOnly === true || attributes.has('readonly') || attributes.get('aria-readonly') === 'true'
     const contentEditable = attributes.get('contenteditable')?.toLowerCase() === 'true'
+    const href = attributes.get('href')
     return Object.freeze({
       tagName: node.nodeName?.toLowerCase() ?? '',
       ...(inputType === undefined ? {} : { inputType }),
@@ -1557,6 +1592,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       ...(hidden ? { hidden: true } : {}),
       ...(readOnly ? { readOnly: true } : {}),
       ...(contentEditable ? { contentEditable: true } : {}),
+      ...(href === undefined ? {} : { href }),
     })
   }
 
@@ -1576,38 +1612,51 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     state: TargetTabState,
     locator: string,
     accessibilityNodes: readonly AccessibilityNodeResult[],
+    budget: InspectionCommandBudget,
   ): Promise<readonly number[]> {
     const parsed = parseLocator(locator)
     if (parsed.kind === 'role') {
-      return Object.freeze(accessibilityNodes
+      const matches = accessibilityNodes
         .filter((node) => !node.ignored
           && this.axString(node.role)?.toLowerCase() === parsed.value
           && (parsed.name === undefined || this.axString(node.name) === parsed.name)
           && typeof node.backendDOMNodeId === 'number')
-        .map((node) => node.backendDOMNodeId!))
+        .map((node) => node.backendDOMNodeId!)
+      if (matches.length > MAX_BROWSER_INSPECTION_LOCATOR_MATCHES) {
+        throw failure('ACTION_LIMIT_EXCEEDED')
+      }
+      return Object.freeze(matches)
     }
-    const document = await this.command(state, 'DOM.getDocument', { depth: 0, pierce: true }) as {
+    const document = await this.inspectionCommand(state, budget, 'DOM.getDocument', {
+      depth: 0, pierce: true,
+    }) as {
       root?: { nodeId?: number }
     }
     const nodeId = document.root?.nodeId
     if (!nodeId) throw failure('PAGE_CHANGED')
     let queried: { nodeIds?: number[] }
     try {
-      queried = await this.command(state, 'DOM.querySelectorAll', {
+      queried = await this.inspectionCommand(state, budget, 'DOM.querySelectorAll', {
         nodeId, selector: parsed.value,
       }) as { nodeIds?: number[] }
-    } catch {
+    } catch (error) {
+      const safe = toSafeAppError(error)
+      if (safe.code === 'ACTION_LIMIT_EXCEEDED' || safe.code === 'CANCELLED') throw safe
       this.assertOpen(state)
       throw failure('PAGE_CHANGED')
     }
+    if ((queried.nodeIds?.length ?? 0) > MAX_BROWSER_INSPECTION_LOCATOR_MATCHES) {
+      throw failure('ACTION_LIMIT_EXCEEDED')
+    }
     const backendNodeIds: number[] = []
-    for (const matchedNodeId of (queried.nodeIds ?? []).slice(0, 100)) {
-      const described = await this.command(state, 'DOM.describeNode', {
+    for (const matchedNodeId of queried.nodeIds ?? []) {
+      const described = await this.inspectionCommand(state, budget, 'DOM.describeNode', {
         nodeId: matchedNodeId, depth: 0, pierce: false,
       }) as { node?: DescribedDomNode }
-      if (typeof described.node?.backendNodeId === 'number') backendNodeIds.push(described.node.backendNodeId)
+      if (typeof described.node?.backendNodeId !== 'number') throw failure('PAGE_CHANGED')
+      backendNodeIds.push(described.node.backendNodeId)
     }
-    return Object.freeze([...new Set(backendNodeIds)].slice(0, 2_000))
+    return Object.freeze([...new Set(backendNodeIds)])
   }
 
   private async nodeBox(
@@ -1641,8 +1690,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private async layoutViewport(
     state: TargetTabState,
     assertCurrent?: () => void,
+    budget?: InspectionCommandBudget,
   ): Promise<{ width: number; height: number }> {
-    const result = await this.command(state, 'Page.getLayoutMetrics') as {
+    const result = await (budget
+      ? this.inspectionCommand(state, budget, 'Page.getLayoutMetrics')
+      : this.command(state, 'Page.getLayoutMetrics')) as {
       cssLayoutViewport?: { clientWidth?: number; clientHeight?: number }
       layoutViewport?: { clientWidth?: number; clientHeight?: number }
     }
@@ -1664,6 +1716,40 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private command(state: TargetTabState, method: string, params?: Record<string, unknown>): Promise<unknown> {
     this.assertOpen(state)
     return state.view.webContents.debugger.sendCommand(method, params)
+  }
+
+  private inspectionCommand(
+    state: TargetTabState,
+    budget: InspectionCommandBudget,
+    method: string,
+    params?: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (budget.signal?.aborted) return Promise.reject(failure('CANCELLED'))
+    if (Date.now() >= budget.deadlineAt || ++budget.calls > maxBrowserInspectionCdpCalls) {
+      return Promise.reject(failure('ACTION_LIMIT_EXCEEDED'))
+    }
+    const operation = this.command(state, method, params)
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const finish = (result: { value: unknown } | { error: unknown }) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        budget.signal?.removeEventListener('abort', onAbort)
+        if ('error' in result) reject(result.error)
+        else resolve(result.value)
+      }
+      const onAbort = () => { finish({ error: failure('CANCELLED') }) }
+      const timer = setTimeout(() => {
+        finish({ error: failure('ACTION_LIMIT_EXCEEDED') })
+      }, Math.max(0, budget.deadlineAt - Date.now()))
+      budget.signal?.addEventListener('abort', onAbort, { once: true })
+      if (budget.signal?.aborted) onAbort()
+      void operation.then(
+        (value) => { finish({ value }) },
+        (error) => { finish({ error }) },
+      )
+    })
   }
 
   private async resolveLocator(state: TargetTabState, locator: string): Promise<number> {

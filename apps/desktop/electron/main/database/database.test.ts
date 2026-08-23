@@ -957,6 +957,65 @@ describe('openAppDatabase', () => {
     }
   })
 
+  it('terminalizes only nonterminal browser statuses owned by interrupted chat runs', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({ id: 'browser_status_recovery', title: 'Browser recovery' })
+    for (const [id, requestId, status] of [
+      ['run_browser_inspecting', 'request_browser_inspecting', 'running'],
+      ['run_browser_acting', 'request_browser_acting', 'streaming'],
+      ['run_browser_finished', 'request_browser_finished', 'completed'],
+    ] as const) {
+      database.chatRuns.insert({
+        id, conversationId: 'browser_status_recovery', requestId,
+        model: 'model', status, startedAt: 1,
+      })
+    }
+    const status = (blockId: string, requestId: string, state: 'inspecting' | 'acting' | 'awaiting_user' | 'completed') => ({
+      type: 'browser_status' as const,
+      blockId,
+      requestId,
+      bindingId: 'binding_browser_recovery',
+      siteLabel: '恢复测试站点',
+      origin: 'https://example.test',
+      state,
+      actionSummary: '恢复前状态',
+    })
+    database.messages.insert({
+      id: 'message_browser_status_recovery',
+      conversationId: 'browser_status_recovery',
+      role: 'assistant',
+      createdAt: 1,
+      blocks: [
+        status('block_inspecting', 'request_browser_inspecting', 'inspecting'),
+        status('block_acting', 'request_browser_acting', 'acting'),
+        status('block_handoff', 'request_browser_inspecting', 'awaiting_user'),
+        status('block_completed', 'request_browser_acting', 'completed'),
+        status('block_unrelated', 'request_browser_finished', 'acting'),
+        { type: 'malformed_unrelated', rawSecret: 'must remain isolated' },
+      ],
+    })
+
+    expect(database.recoverInterrupted()).toEqual({ executions: 0, chatRuns: 2 })
+    expect(database.messages.get('message_browser_status_recovery')?.blocks).toEqual([
+      {
+        ...status('block_inspecting', 'request_browser_inspecting', 'inspecting'),
+        state: 'failed',
+        actionSummary: '应用已重启，浏览器自动操作已中断',
+        errorCode: 'INTERNAL_ERROR',
+      },
+      {
+        ...status('block_acting', 'request_browser_acting', 'acting'),
+        state: 'failed',
+        actionSummary: '应用已重启，浏览器自动操作已中断',
+        errorCode: 'INTERNAL_ERROR',
+      },
+      status('block_handoff', 'request_browser_inspecting', 'awaiting_user'),
+      status('block_completed', 'request_browser_acting', 'completed'),
+      status('block_unrelated', 'request_browser_finished', 'acting'),
+      { type: 'malformed_unrelated', rawSecret: 'must remain isolated' },
+    ])
+  })
+
   it('invalidates persisted pending Agent approvals while tolerating unrelated malformed blocks', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'approval_recovery_conversation', title: 'Approval recovery' })

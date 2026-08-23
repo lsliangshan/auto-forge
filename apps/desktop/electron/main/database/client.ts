@@ -38,10 +38,14 @@ export function openAppDatabase(path: string) {
       WHERE id = @id
         AND status IN ('queued', 'awaiting_approval', 'running', 'streaming')
     `)
+    const failedRequestIds: string[] = []
     for (const run of interruptedRuns) {
       if (preservedRequestIds.has(run.requestId)) continue
-      chatRuns += failRun.run({ id: run.id, endedAt }).changes
+      const changes = failRun.run({ id: run.id, endedAt }).changes
+      chatRuns += changes
+      if (changes === 1) failedRequestIds.push(run.requestId)
     }
+    repositories.messages.failInterruptedBrowserStatuses(failedRequestIds)
     repositories.messages.invalidatePendingAgentApprovals()
     repositories.messages.failInterruptedMediaGenerations()
     return { executions, chatRuns }

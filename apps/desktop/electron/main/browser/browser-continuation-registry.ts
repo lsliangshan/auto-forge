@@ -34,6 +34,7 @@ export interface BrowserContinuationRegistryOptions {
     binding: BrowserContinuationBinding
     runId: string
   }): Promise<void> | void
+  isEligible?(binding: BrowserContinuationBinding): Promise<boolean>
   id?: () => string
   now?: () => number
 }
@@ -130,6 +131,15 @@ export class BrowserContinuationRegistry {
     )))
   }
 
+  async listEligible(userId: string, conversationId: string): Promise<readonly BrowserContinuationBinding[]> {
+    const eligible: BrowserContinuationBinding[] = []
+    for (const binding of this.list(userId, conversationId)) {
+      if (await this.bindingEligible(binding)) eligible.push(binding)
+      else await this.revokeBinding(binding.bindingId, 'WORKFLOW_CHANGED').catch(() => undefined)
+    }
+    return Object.freeze(eligible)
+  }
+
   get(bindingId: string): BrowserContinuationBinding | undefined {
     return this.bindings.get(bindingId)
   }
@@ -158,10 +168,19 @@ export class BrowserContinuationRegistry {
     if (binding.userId !== input.userId || binding.conversationId !== input.conversationId) {
       throw failure('NO_BOUND_PAGE')
     }
+    if (!await this.bindingEligible(binding)) {
+      await this.revokeBinding(bindingId, 'WORKFLOW_CHANGED').catch(() => undefined)
+      throw failure('WORKFLOW_CHANGED')
+    }
     if (this.leaseOwners.has(bindingId)) throw failure('PAGE_BUSY')
     await this.options.workspace.acquireContinuation(binding.tabId, input.runId)
-    if (this.bindings.get(bindingId) !== binding || this.stopped) {
+    if (this.bindings.get(bindingId) !== binding || this.stopped
+      || !await this.bindingEligible(binding)) {
       await this.options.workspace.releaseContinuation(binding.tabId, input.runId)
+      if (this.bindings.get(bindingId) === binding && !this.stopped) {
+        await this.revokeBinding(bindingId, 'WORKFLOW_CHANGED').catch(() => undefined)
+        throw failure('WORKFLOW_CHANGED')
+      }
       throw failure('PAGE_CLOSED')
     }
     this.leaseOwners.set(bindingId, input.runId)
@@ -173,6 +192,14 @@ export class BrowserContinuationRegistry {
         && candidate === binding
         && this.bindings.get(bindingId) === binding
         && this.leaseOwners.get(bindingId) === input.runId,
+      assertEligible: async () => {
+        if (released
+          || this.bindings.get(bindingId) !== binding
+          || this.leaseOwners.get(bindingId) !== input.runId) throw failure('PAGE_CLOSED')
+        if (await this.bindingEligible(binding)) return
+        await this.revokeBinding(bindingId, 'WORKFLOW_CHANGED').catch(() => undefined)
+        throw failure('WORKFLOW_CHANGED')
+      },
       release: async () => {
         if (released) return
         released = true
@@ -261,6 +288,16 @@ export class BrowserContinuationRegistry {
     this.bindings.delete(binding.bindingId)
     this.bindingsByTab.delete(binding.tabId)
     this.leaseOwners.delete(binding.bindingId)
+  }
+
+  private async bindingEligible(binding: BrowserContinuationBinding): Promise<boolean> {
+    if (!this.options.isEligible) return true
+    try {
+      return await this.options.isEligible(binding)
+        && this.bindings.get(binding.bindingId) === binding
+    } catch {
+      return false
+    }
   }
 
   private async revokeWhere(

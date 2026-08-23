@@ -79,13 +79,19 @@ function createHarness() {
     },
   }
   let id = 0
+  let eligible = true
+  const isEligible = vi.fn(async () => eligible)
   const registry = new BrowserContinuationRegistry({
     repository,
     workspace,
+    isEligible,
     id: () => `binding_${++id}`,
     now: () => 100 + id,
   })
-  return { registry, repository, workspace, stored, inserted, terminal, owners, workflowOwned, closed }
+  return {
+    registry, repository, workspace, stored, inserted, terminal, owners, workflowOwned, closed,
+    isEligible, setEligible: (value: boolean) => { eligible = value },
+  }
 }
 
 describe('BrowserContinuationRegistry', () => {
@@ -143,6 +149,50 @@ describe('BrowserContinuationRegistry', () => {
     await lease.release()
     expect(lease.isCurrent(binding)).toBe(false)
     expect(test.owners.has(binding.tabId)).toBe(false)
+  })
+
+  it('revokes ineligible bindings before catalog admission or lease acquisition', async () => {
+    const test = createHarness()
+    const binding = test.registry.bind(bindingInput())
+    test.setEligible(false)
+
+    await expect(test.registry.listEligible('user_1', 'conversation_1')).resolves.toEqual([])
+    expect(test.registry.get(binding.bindingId)).toBeUndefined()
+    expect(test.closed).toContain(binding.tabId)
+    expect(test.terminal).toContainEqual(expect.objectContaining({
+      id: binding.bindingId, status: 'revoked', reason: 'WORKFLOW_CHANGED',
+    }))
+
+    const second = test.registry.bind(bindingInput({ tabId: 'tab_2' }))
+    await expect(test.registry.acquire(second.bindingId, {
+      userId: second.userId, conversationId: second.conversationId, runId: 'run_2',
+    })).rejects.toMatchObject({ code: 'WORKFLOW_CHANGED' })
+    expect(test.owners.has(second.tabId)).toBe(false)
+  })
+
+  it('revalidates after workspace acquisition and through the live lease', async () => {
+    const race = createHarness()
+    const raced = race.registry.bind(bindingInput())
+    const acquire = race.workspace.acquireContinuation
+    race.workspace.acquireContinuation = async (tabId, runId) => {
+      await acquire(tabId, runId)
+      race.setEligible(false)
+    }
+    await expect(race.registry.acquire(raced.bindingId, {
+      userId: raced.userId, conversationId: raced.conversationId, runId: 'run_race',
+    })).rejects.toMatchObject({ code: 'WORKFLOW_CHANGED' })
+    expect(race.owners.has(raced.tabId)).toBe(false)
+    expect(race.registry.get(raced.bindingId)).toBeUndefined()
+
+    const live = createHarness()
+    const binding = live.registry.bind(bindingInput())
+    const lease = await live.registry.acquire(binding.bindingId, {
+      userId: binding.userId, conversationId: binding.conversationId, runId: 'run_live',
+    })
+    live.setEligible(false)
+    await expect(lease.assertEligible()).rejects.toMatchObject({ code: 'WORKFLOW_CHANGED' })
+    expect(lease.isCurrent(binding)).toBe(false)
+    expect(live.owners.has(binding.tabId)).toBe(false)
   })
 
   it('persists close and revoke transitions while removing live authority and releasing leases', async () => {

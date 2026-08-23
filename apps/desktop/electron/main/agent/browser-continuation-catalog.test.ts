@@ -44,7 +44,7 @@ function harness() {
   const catalog = new BrowserContinuationCatalog({
     registry: {
       // The catalog defends its own authority boundary even if an adapter returns an over-broad list.
-      list: () => bindings,
+      listEligible: async () => bindings,
     },
     describe: async (candidate) => descriptions.get(candidate.bindingId),
   })
@@ -87,6 +87,11 @@ describe('BrowserContinuationCatalog', () => {
     expect(Object.isFrozen(snapshot.tools[0]!.function)).toBe(true)
     expect(Object.isFrozen(snapshot.bindings.get('binding_1'))).toBe(true)
     expect('set' in snapshot.bindings).toBe(false)
+
+    const inspect = snapshot.tools.find((tool) => tool.function.name === 'browser_session_inspect')!
+    const act = snapshot.tools.find((tool) => tool.function.name === 'browser_session_act')!
+    expect(JSON.stringify(inspect.function.parameters)).not.toContain('region_image')
+    expect(JSON.stringify(act.function.parameters)).not.toContain('history')
   })
 
   it('omits a binding whose current safe page description is unavailable or invalid', async () => {

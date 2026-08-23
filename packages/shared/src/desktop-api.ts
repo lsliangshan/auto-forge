@@ -72,7 +72,7 @@ export const httpsUrlPatternSchema = z.string().refine(isHttpsUrlPattern, { mess
 export const browserLocatorSchema = z.string().refine(isBrowserLocator, { message: 'Expected a browser locator' })
 
 function nonEmptyUniqueArraySchema<T extends z.ZodType>(schema: T) {
-  return z.array(schema).min(1).refine((values) => new Set(values.map((value) => JSON.stringify(value))).size === values.length, {
+  return z.array(schema).min(1).max(32).refine((values) => new Set(values.map((value) => JSON.stringify(value))).size === values.length, {
     message: 'Values must be unique',
   })
 }

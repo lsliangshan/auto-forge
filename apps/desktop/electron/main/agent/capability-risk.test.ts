@@ -29,7 +29,7 @@ describe('classifyBrowserActionRisk', () => {
         : type === 'check'
           ? { type, ref: 'ref_1', checked: true, source: { kind: 'current_user' as const } }
           : type === 'navigate'
-            ? { type, url: 'https://example.com' }
+            ? { type, url: 'https://example.com', source: { kind: 'current_user' as const } }
             : type === 'scroll'
               ? { type, direction: 'down' as const }
               : type === 'wait' ? { type, milliseconds: 50 } : { type }

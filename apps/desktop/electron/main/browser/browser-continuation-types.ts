@@ -42,20 +42,22 @@ export interface BrowserContinuationLease {
   readonly binding: BrowserContinuationBinding
   readonly ownerRunId: string
   isCurrent(binding: BrowserContinuationBinding): boolean
+  assertEligible(): Promise<void>
   release(): Promise<void>
 }
 
 export type BrowserValueSource =
   | { readonly kind: 'current_user' }
-  | { readonly kind: 'history'; readonly messageId: string }
   | { readonly kind: 'page'; readonly snapshotId: string; readonly ref: string }
+
+export type BrowserNavigationSource = BrowserValueSource
 
 export type BrowserAction =
   | { readonly type: 'fill'; readonly ref: string; readonly value: string; readonly source: BrowserValueSource }
   | { readonly type: 'select'; readonly ref: string; readonly value: string; readonly source: BrowserValueSource }
   | { readonly type: 'click'; readonly ref: string }
   | { readonly type: 'check'; readonly ref: string; readonly checked: boolean; readonly source: BrowserValueSource }
-  | { readonly type: 'navigate'; readonly url: string }
+  | { readonly type: 'navigate'; readonly url: string; readonly source: BrowserNavigationSource }
   | { readonly type: 'scroll'; readonly ref?: string; readonly direction: 'up' | 'down' }
   | { readonly type: 'wait'; readonly milliseconds: number }
   | { readonly type: 'focus' }
@@ -81,6 +83,7 @@ export interface BrowserActionTargetContext {
   readonly inputType?: string
   readonly expectedNavigation?: boolean
   readonly manualAction?: boolean
+  readonly href?: string
 }
 
 export interface BrowserSemanticNode {

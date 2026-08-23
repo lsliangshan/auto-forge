@@ -8,6 +8,10 @@ import {
 } from './electron-browser-workspace.js'
 import { BrowserContinuationRegistry } from './browser-continuation-registry.js'
 import type { BrowserContinuationBindingInput } from './browser-continuation-types.js'
+import {
+  MAX_BROWSER_INSPECTION_LOCATOR_MATCHES,
+  MAX_BROWSER_INSPECTION_RAW_NODES,
+} from './browser-page-inspector.js'
 
 class FakeSession extends EventEmitter {
   readonly setProxy = vi.fn(async () => undefined)
@@ -473,7 +477,7 @@ describe('ElectronBrowserWorkspace', () => {
     expect(commands.some(({ method }) => method === 'Runtime.evaluate')).toBe(false)
   })
 
-  it('returns the complete safe AX tree so inspector pagination and late protected descendants remain visible', async () => {
+  it('fails closed before describing an oversized AX tree instead of returning a partial snapshot', async () => {
     const rawNodes = [
       {
         nodeId: 'ax_main', backendDOMNodeId: 10, frameId: 'frame_main', ignored: false,
@@ -483,7 +487,7 @@ describe('ElectronBrowserWorkspace', () => {
         nodeId: 'ax_image', parentId: 'ax_main', backendDOMNodeId: 11, frameId: 'frame_main', ignored: false,
         role: { value: 'img' }, name: { value: '结果图' },
       },
-      ...Array.from({ length: 2_000 }, (_, index) => ({
+      ...Array.from({ length: MAX_BROWSER_INSPECTION_RAW_NODES }, (_, index) => ({
         nodeId: `ax_${index + 100}`, parentId: 'ax_main', backendDOMNodeId: index + 100,
         frameId: 'frame_main', ignored: false, role: { value: 'row' }, name: { value: `结果 ${index}` },
       })),
@@ -508,22 +512,92 @@ describe('ElectronBrowserWorkspace', () => {
       }
       return {}
     }
-    const { workspace } = createHarness(respond)
+    const { workspace, views } = createHarness(respond)
     const tab = await workspace.acquire(executionInput())
     await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
     await workspace.releaseExecution('e1')
     await workspace.acquireContinuation(tab.id, 'agent_run_1')
 
-    const result = await workspace.readAccessibilitySnapshot({
+    await expect(workspace.readAccessibilitySnapshot({
       tabId: tab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
       expectedNavigationEpoch: tab.navigationEpoch, locators: [],
-    })
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
 
-    expect(result.nodes).toHaveLength(rawNodes.length)
-    expect(result.nodes).toContainEqual(expect.objectContaining({
-      backendNodeId: 2_100, parentAxNodeId: 'ax_image', name: '银行卡支付',
-    }))
-    expect(result.nodes.at(-1)).toMatchObject({ backendNodeId: 2_101, name: '末页公开信息' })
+    expect(views[1]!.webContents.debugger.commands.some(({ method }) => (
+      method === 'DOM.describeNode'
+    ))).toBe(false)
+  })
+
+  it('rejects locator fan-out, hung CDP calls, and cancellation with stable safe errors', async () => {
+    const fanout = createHarness((method) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [] }
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
+      if (method === 'DOM.querySelectorAll') return {
+        nodeIds: Array.from({ length: MAX_BROWSER_INSPECTION_LOCATOR_MATCHES + 1 }, (_, index) => index + 1),
+      }
+      return {}
+    })
+    const fanoutTab = await fanout.workspace.acquire(executionInput())
+    await fanoutTab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+    await fanout.workspace.releaseExecution('e1')
+    await fanout.workspace.acquireContinuation(fanoutTab.id, 'agent_run_1')
+    await expect(fanout.workspace.readAccessibilitySnapshot({
+      tabId: fanoutTab.id, runId: 'agent_run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: fanoutTab.navigationEpoch, locators: ['css=main'],
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+    expect(fanout.views[1]!.webContents.debugger.commands.filter(({ method }) => (
+      method === 'DOM.describeNode'
+    ))).toHaveLength(0)
+
+    const hung = createHarness((method) => method === 'Page.getFrameTree'
+      ? new Promise(() => undefined)
+      : {})
+    const hungTab = await hung.workspace.acquire(executionInput())
+    await hungTab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+    await hung.workspace.releaseExecution('e1')
+    await hung.workspace.acquireContinuation(hungTab.id, 'agent_run_hung')
+    await expect(hung.workspace.readAccessibilitySnapshot({
+      tabId: hungTab.id, runId: 'agent_run_hung', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: hungTab.navigationEpoch, locators: [], deadlineAt: Date.now() + 10,
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+
+    const controller = new AbortController()
+    const pending = hung.workspace.readAccessibilitySnapshot({
+      tabId: hungTab.id, runId: 'agent_run_hung', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: hungTab.navigationEpoch, locators: [], signal: controller.signal,
+    })
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' })
+  })
+
+  it('enforces a shared finite CDP-call budget across locator resolution', async () => {
+    const test = createHarness((method, params) => {
+      const input = params as { nodeId?: number } | undefined
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame_main' } } }
+      if (method === 'Accessibility.getFullAXTree') return { nodes: [] }
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
+      if (method === 'DOM.querySelectorAll') return {
+        nodeIds: Array.from({ length: MAX_BROWSER_INSPECTION_LOCATOR_MATCHES }, (_, index) => index + 1),
+      }
+      if (method === 'DOM.describeNode') return {
+        node: { backendNodeId: input?.nodeId, nodeName: 'DIV', attributes: [] },
+      }
+      return {}
+    })
+    const tab = await test.workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+    await test.workspace.releaseExecution('e1')
+    await test.workspace.acquireContinuation(tab.id, 'agent_run_budget')
+
+    await expect(test.workspace.readAccessibilitySnapshot({
+      tabId: tab.id, runId: 'agent_run_budget', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch,
+      locators: Array.from({ length: 9 }, (_, index) => `css=.region-${index}`),
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+    expect(test.views[1]!.webContents.debugger.commands.filter(({ method }) => (
+      method !== 'DOM.enable' && method !== 'Accessibility.enable'
+    )).length).toBeLessThanOrEqual(2_048)
   })
 
   it.each([
@@ -921,7 +995,7 @@ describe('ElectronBrowserWorkspace', () => {
       views[0]!.webContents.emit('will-navigate', navigation, `autoforge-browser://${command}`)
 
       expect(navigation.preventDefault).toHaveBeenCalledOnce()
-      expect(mutation).toHaveBeenCalledOnce()
+      await vi.waitFor(() => expect(mutation).toHaveBeenCalledOnce())
       expect(replacement).toBeDefined()
       const replacementLease = await replacement!
       expect(replacementLease.ownerRunId).toBe('run_after_toolbar')
@@ -1056,6 +1130,52 @@ describe('ElectronBrowserWorkspace', () => {
     })
     await lease.release()
     await replacement.release()
+  })
+
+  it('takes over an automated tab before trusted-toolbar activation can select another tab', async () => {
+    const dispatched = deferred<unknown>()
+    const respond = (method: string) => ({
+      'DOM.getDocument': { root: { nodeId: 1 } },
+      'Accessibility.queryAXTree': {
+        nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '继续' } }],
+      },
+      'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+    } as Record<string, unknown>)[method]
+      ?? (method === 'Input.dispatchMouseEvent' ? dispatched.promise : {})
+    const { workspace, views, windows } = createHarness(respond)
+    const input = executionInput()
+    const automated = await workspace.acquire(input)
+    await automated.open('https://www.baidu.com/start', ['https://www.baidu.com'])
+    await workspace.releaseExecution(input.executionId)
+    const selected = await workspace.acquire(executionInput({
+      executionId: 'execution_selected',
+      chatRunId: 'chat_run_selected',
+      workflowId: 'workflow.selected',
+    }))
+    await workspace.releaseExecution('execution_selected')
+    const registry = continuationRegistry(workspace)
+    workspace.setContinuationRegistry(registry)
+    const binding = registry.bind({ ...input, tabId: automated.id } as BrowserContinuationBindingInput)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: input.userId, conversationId: input.conversationId!, runId: 'run_tab_switch',
+    })
+    await workspace.focusContinuation(automated.id, 'run_tab_switch')
+
+    const clicking = automated.click('role=button[name="继续"]', 'https://www.baidu.com')
+    await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+      .toContainEqual(expect.objectContaining({ method: 'Input.dispatchMouseEvent' })))
+    views[0]!.webContents.emit(
+      'will-navigate', { preventDefault: vi.fn() }, `autoforge-browser://activate/${selected.id}`,
+    )
+
+    await vi.waitFor(() => expect(lease.isCurrent(binding)).toBe(false))
+    dispatched.resolve({})
+    await expect(clicking).rejects.toMatchObject({ code: 'CANCELLED' })
+    await vi.waitFor(() => {
+      expect(windows[0]!.children).toContain(views[2])
+      expect(windows[0]!.children).not.toContain(views[1])
+    })
+    await lease.release()
   })
 
   it('inherits a separate binding only for an allowed popup after the parent was bound', async () => {

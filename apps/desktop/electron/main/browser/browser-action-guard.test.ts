@@ -68,6 +68,53 @@ describe('BrowserActionGuard', () => {
   })
 
   it.each([
+    '/logout',
+    '/account/delete',
+    '/permit/withdraw',
+    '/change/confirm',
+    '/api?action=revoke',
+    '/pay?operation=payment',
+    '/bank/transfer',
+    '/checkout',
+  ])('hands protected same-origin navigation off: %s', (path) => {
+    expect(guard.decide(context({
+      action: {
+        type: 'navigate',
+        url: `https://service.example${path}`,
+        source: { kind: 'current_user' },
+      } as BrowserAction,
+      target: undefined,
+    }))).toEqual({ kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' })
+  })
+
+  it.each([
+    '/account?action=rotate',
+    '/account/rotate',
+    '/feature/toggle',
+    '/records/archive',
+  ])('hands an unknown state-changing navigation command off: %s', (path) => {
+    expect(guard.decide(context({
+      action: {
+        type: 'navigate',
+        url: `https://service.example${path}`,
+        source: { kind: 'current_user' },
+      } as BrowserAction,
+      target: undefined,
+    }))).toEqual({ kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' })
+  })
+
+  it('allows a safe exact navigation destination', () => {
+    expect(guard.decide(context({
+      action: {
+        type: 'navigate',
+        url: 'https://service.example/help?topic=permit',
+        source: { kind: 'current_user' },
+      } as BrowserAction,
+      target: undefined,
+    }))).toEqual({ kind: 'allowed' })
+  })
+
+  it.each([
     [{ type: 'click', ref: 'ref_save' }, node('button', '保存草稿', { ref: 'ref_save' })],
     [{ type: 'click', ref: 'ref_search' }, node('button', '搜索', { ref: 'ref_search' })],
     [{ type: 'click', ref: 'ref_next_page' }, node('button', '下一页', { ref: 'ref_next_page' })],
@@ -154,7 +201,9 @@ describe('BrowserActionGuard', () => {
     expect(requiredCapability({ type: 'click', ref: 'r' })).toBe('browser.click')
     expect(requiredCapability({ type: 'check', ref: 'r', checked: true, source: { kind: 'current_user' } }))
       .toBe('browser.click')
-    expect(requiredCapability({ type: 'navigate', url: 'https://service.example/next' })).toBe('browser.open')
+    expect(requiredCapability({
+      type: 'navigate', url: 'https://service.example/next', source: { kind: 'current_user' },
+    } as BrowserAction)).toBe('browser.open')
     expect(requiredCapability({ type: 'scroll', direction: 'down' })).toBeUndefined()
     expect(requiredCapability({ type: 'wait', milliseconds: 50 })).toBeUndefined()
     expect(requiredCapability({ type: 'focus' })).toBeUndefined()

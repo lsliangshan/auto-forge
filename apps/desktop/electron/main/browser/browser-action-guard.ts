@@ -41,6 +41,10 @@ const paymentText = /支付|付款|银行卡|信用卡|订单|payment|credit car
 const draftText = /保存(?:草稿)?|暂存|save(?: draft)?/iu
 const searchText = /搜索|查询|筛选|search|filter/iu
 const paginationText = /^(?:上一页|下一页|首页|末页|previous|next|first|last|\d{1,4})$/iu
+const protectedDestinationText = /(?:^|[/?#&=._;,:@~-])(?:logout|log-out|signout|sign-out|delet(?:e|ion)|destroy|remove|withdraw(?:al)?|revoke|revocation|cancel(?:lation)?|confirm(?:ation)?|approve|approval|submi(?:t|ssion)|payments?|pay|checkout|transfers?|remit|purchases?|publish|signature)(?=$|[/?#&=._;,:@~-])|退出(?:登录)?|注销(?:登录|账户)?|删除|撤回|提现|取款|撤销|吊销|取消|确认|批准|审批|提交|支付|付款|转账|汇款|结算|购买|发布|签名|签字/iu
+const unknownStateChangingDestinationText = /(?:^|[/?#&=._;,:@~-])(?:rotate|toggle|enable|disable|activate|deactivate|archive|restore|reset|clear|close|terminate|unsubscribe|subscribe|create|update|modify|mutate|execute|trigger|save|commit)(?=$|[/?#&=._;,:@~-])|启用|禁用|激活|停用|归档|恢复|重置|清空|关闭|创建|更新|修改|执行|触发|订阅|退订/iu
+const stateChangingParameter = /^(?:action|operation|op|command|cmd|do|event|method)$/iu
+const safeNavigationCommand = /^(?:view|show|read|list|search|filter|detail|details|help|next|previous|open|navigate)$/iu
 
 export function requiredCapability(
   action: BrowserAction,
@@ -108,6 +112,38 @@ function reversibleClick(context: BrowserActionGuardContext): boolean {
   return false
 }
 
+function decodedDestinationText(value: string): string {
+  let decoded = value.normalize('NFKC')
+  for (let depth = 0; depth < 3; depth += 1) {
+    try {
+      const next = decodeURIComponent(decoded)
+      if (next === decoded) break
+      decoded = next
+    } catch {
+      break
+    }
+  }
+  return decoded.toLowerCase()
+}
+
+function protectedOrUnknownDestination(value: string): boolean {
+  try {
+    const url = new URL(value)
+    const destination = decodedDestinationText(`${url.pathname}${url.search}${url.hash}`)
+    if (protectedDestinationText.test(destination)
+      || unknownStateChangingDestinationText.test(destination)) return true
+    for (const [name, rawValue] of url.searchParams) {
+      if (!stateChangingParameter.test(name)) continue
+      const command = decodedDestinationText(rawValue).trim()
+      if (!command || !safeNavigationCommand.test(command)) return true
+    }
+    const actionPath = destination.match(/\/(?:action|operation|command|do)\/([^/?#]+)/u)?.[1]
+    return actionPath !== undefined && !safeNavigationCommand.test(actionPath)
+  } catch {
+    return true
+  }
+}
+
 export class BrowserActionGuard {
   decide(context: BrowserActionGuardContext): BrowserActionDecision {
     if (!context.snapshotFresh) return { kind: 'blocked', code: 'PAGE_CHANGED' }
@@ -118,6 +154,9 @@ export class BrowserActionGuard {
       || (loginText.test(targetEvidence(context)) && !logoutText.test(targetEvidence(context)))
       || context.targetContext?.inputType?.toLowerCase() === 'password') {
       return { kind: 'handoff', code: 'AUTH_REQUIRED' }
+    }
+    if (context.action.type === 'navigate' && protectedOrUnknownDestination(context.action.url)) {
+      return { kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' }
     }
     if (exactManualAction(context)) return { kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' }
 

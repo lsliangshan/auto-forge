@@ -698,6 +698,7 @@ export interface AppRepositories {
     invalidatePendingAgentApprovals(): number
     hasWorkflowApproval(executionId: string): boolean
     failInterruptedMediaGenerations(): number
+    failInterruptedBrowserStatuses(requestIds: readonly string[]): number
   }
   conversationContexts: {
     get(conversationId: string): ConversationContextRecord | undefined
@@ -1718,6 +1719,40 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               changed = true
             }
             if (changed) database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id').run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+          }
+          return failed
+        })
+      },
+      failInterruptedBrowserStatuses(requestIds) {
+        return transaction(database, () => {
+          const interrupted = new Set(requestIds)
+          if (interrupted.size === 0) return 0
+          let failed = 0
+          for (const row of many<Query>(database, "SELECT id, blocks_json AS blocksJson FROM messages WHERE role = 'assistant'")) {
+            const blocks = storedBlocks(row.blocksJson as string)
+            if (!blocks) continue
+            let changed = false
+            for (const [index, block] of blocks.entries()) {
+              const parsed = chatBlockSchema.safeParse(block)
+              if (
+                !parsed.success
+                || parsed.data.type !== 'browser_status'
+                || !interrupted.has(parsed.data.requestId)
+                || (parsed.data.state !== 'inspecting' && parsed.data.state !== 'acting')
+              ) continue
+              blocks[index] = {
+                ...parsed.data,
+                state: 'failed',
+                actionSummary: '应用已重启，浏览器自动操作已中断',
+                errorCode: 'INTERNAL_ERROR',
+              }
+              failed += 1
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
           }
           return failed
         })

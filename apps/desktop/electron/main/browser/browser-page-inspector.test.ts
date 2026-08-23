@@ -6,6 +6,8 @@ import type {
 import { BrowserContinuationRegistry } from './browser-continuation-registry.js'
 import {
   BrowserPageInspector,
+  MAX_BROWSER_INSPECTION_LOCATOR_MATCHES,
+  MAX_BROWSER_INSPECTION_RAW_NODES,
   type BrowserInspectionNode,
   type BrowserPageCdpPort,
   type BrowserPageReadResult,
@@ -124,6 +126,7 @@ function input(
     binding: exactBinding,
     ownerRunId: runId,
     isCurrent: (candidate: BrowserContinuationBinding) => candidate === exactBinding,
+    assertEligible: async () => undefined,
     release: async () => undefined,
   })
   return {
@@ -151,6 +154,45 @@ function idSequence(): () => string {
 }
 
 describe('BrowserPageInspector', () => {
+  it('fails closed before emitting any partial snapshot for oversized raw trees or locator fan-out', async () => {
+    const oversized = new FakeCdpPort(Array.from(
+      { length: MAX_BROWSER_INSPECTION_RAW_NODES + 1 },
+      (_, index) => node(index + 1, index === 0 ? 'main' : 'statictext', `node ${index}`, {
+        ...(index === 0 ? { axNodeId: 'ax_main', parentAxNodeId: undefined } : {}),
+      }),
+    ))
+    const oversizedInspector = new BrowserPageInspector(oversized, { id: idSequence() })
+    await expect(oversizedInspector.inspect(input())).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+
+    const fanout = new FakeCdpPort([
+      node(10, 'main', '办事详情', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+    ], {
+      locatorMatches: [{
+        locator: 'role=main',
+        backendNodeIds: Array.from({ length: MAX_BROWSER_INSPECTION_LOCATOR_MATCHES + 1 }, (_, index) => index + 1),
+      }],
+    })
+    const fanoutInspector = new BrowserPageInspector(fanout, { id: idSequence() })
+    await expect(fanoutInspector.inspect(input())).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+  })
+
+  it('bounds hung inspection work and responds immediately to cancellation', async () => {
+    const hung = new FakeCdpPort([])
+    hung.readAccessibilitySnapshot.mockImplementation(async () => new Promise<BrowserPageReadResult>(() => undefined))
+    const deadlineInspector = new BrowserPageInspector(hung, {
+      id: idSequence(), inspectionTimeoutMs: 10,
+    })
+    await expect(deadlineInspector.inspect(input())).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+
+    const cancelled = new FakeCdpPort([])
+    cancelled.readAccessibilitySnapshot.mockImplementation(async () => new Promise<BrowserPageReadResult>(() => undefined))
+    const controller = new AbortController()
+    const cancellationInspector = new BrowserPageInspector(cancelled, { id: idSequence() })
+    const pending = cancellationInspector.inspect(input(binding(), { signal: controller.signal }))
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' })
+  })
+
   it('returns only bounded readable semantic data and drops realistic secret-bearing nodes', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '办事详情', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
@@ -510,11 +552,13 @@ describe('BrowserPageInspector', () => {
     expect(second.nodes).toHaveLength(121)
   })
 
-  it('preserves pagination and blocks an ancestor image when protection appears beyond the old AX cutoff', async () => {
+  it('preserves pagination and blocks an ancestor image when protection appears at the raw budget edge', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
       node(11, 'img', '结果图', { axNodeId: 'ax_result' }),
-      ...Array.from({ length: 2_000 }, (_, index) => node(100 + index, 'row', `结果 ${index}`)),
+      ...Array.from({ length: MAX_BROWSER_INSPECTION_RAW_NODES - 4 }, (_, index) => (
+        node(100 + index, 'row', `结果 ${index}`)
+      )),
       node(2_100, 'statictext', '末页公开信息'),
       node(2_101, 'textbox', '银行卡支付', { parentAxNodeId: 'ax_result' }),
     ])

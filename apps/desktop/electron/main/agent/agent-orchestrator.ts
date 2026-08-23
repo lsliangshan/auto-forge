@@ -101,6 +101,7 @@ type BrowserMutationType = Extract<BrowserAction['type'], 'navigate' | 'fill' | 
 interface BrowserAuthorizationEnvelope {
   readonly inspectIntent: string
   readonly trustedRequest: string
+  readonly navigationUrls: ReadonlySet<string>
   readonly mutationTypes: readonly BrowserMutationType[]
 }
 
@@ -139,24 +140,9 @@ const browserPageSnapshotSchema = z.object({
   serializedBytes: z.number().int().nonnegative().max(128 * 1_024),
 }).strict()
 
-const browserRegionImageSchema = z.object({
-  snapshotId: z.string().trim().min(1).max(128),
-  bindingId: z.string().trim().min(1).max(128),
-  origin: z.string().trim().min(1).max(2_048),
-  ref: z.string().trim().min(1).max(128),
-  capturedAt: z.string().max(64).datetime(),
-  mediaType: z.literal('image/png'),
-  width: z.number().positive().max(1_000_000),
-  height: z.number().positive().max(1_000_000),
-  data: z.string().max(8_000_000),
-}).strict()
-
 const browserInspectSuccessSchema = z.object({
   kind: z.literal('success'),
-  data: z.union([
-    z.object({ trust: z.literal('untrusted_page_data'), snapshot: browserPageSnapshotSchema }).strict(),
-    z.object({ trust: z.literal('untrusted_page_data'), regionImage: browserRegionImageSchema }).strict(),
-  ]),
+  data: z.object({ trust: z.literal('untrusted_page_data'), snapshot: browserPageSnapshotSchema }).strict(),
 }).strict()
 
 const browserActSuccessSchema = z.object({
@@ -487,17 +473,21 @@ function explicitBrowserBinding(
   return matches.length === 1 ? matches[0]!.bindingId : undefined
 }
 
-function explicitHttpsOrigins(content: string): ReadonlySet<string> {
-  const origins = new Set<string>()
+function explicitHttpsUrls(content: string): ReadonlySet<string> {
+  const urls = new Set<string>()
   const tokens = content.matchAll(/https:\/\/[^\s<>"'“”‘’（）()[\]{}，。；！？]+/giu)
   for (const match of tokens) {
     const token = match[0].replace(/[.,;!?，。；！？）)\]}]+$/gu, '')
     try {
       const url = new URL(token)
-      if (url.protocol === 'https:' && !url.username && !url.password) origins.add(url.origin)
+      if (url.protocol === 'https:' && !url.username && !url.password) urls.add(url.href)
     } catch { /* Malformed current-user URL tokens are not selection authority. */ }
   }
-  return origins
+  return urls
+}
+
+function explicitHttpsOrigins(content: string): ReadonlySet<string> {
+  return new Set([...explicitHttpsUrls(content)].map((value) => new URL(value).origin))
 }
 
 function actionCategoryAuthorized(
@@ -539,6 +529,7 @@ function browserAuthorization(content: string): BrowserAuthorizationEnvelope {
   return Object.freeze({
     inspectIntent: trustedRequest,
     trustedRequest,
+    navigationUrls: explicitHttpsUrls(content),
     mutationTypes: Object.freeze(mutationTypes),
   })
 }
@@ -582,8 +573,15 @@ function browserActionAuthorized(
   if (!envelope.mutationTypes.includes(action.type)) return false
   if (action.type === 'navigate') {
     try {
-      const origin = new URL(action.url).origin
-      return envelope.trustedRequest.includes(action.url) || envelope.trustedRequest.includes(origin)
+      const destination = new URL(action.url)
+      if (destination.protocol !== 'https:' || destination.username || destination.password) return false
+      if (action.source.kind === 'current_user') return envelope.navigationUrls.has(destination.href)
+      const source = action.source
+      const snapshot = snapshots.get(snapshotId)
+      const target = snapshot?.nodes.find((node) => node.ref === source.ref)
+      return source.snapshotId === snapshotId
+        && target?.role === 'link'
+        && trustedRequestNamesTarget(envelope.trustedRequest, target)
     } catch {
       return false
     }
@@ -872,16 +870,14 @@ export class AgentOrchestrator {
       || active.cancelled
       || active.controller.signal.aborted
       || !active.browserStarted
+      || active.browserTerminal
       || active.browserBindingId !== bindingId) return false
     const candidate = active.browserCatalog.bindings.get(bindingId)
     if (!candidate) return false
     active.cancelled = true
     active.controller.abort()
     active.browserTerminal = true
-    this.updateBrowserStatus(active, candidate, 'cancelled', '用户已接管浏览器页面', 'CANCELLED')
-    await this.cleanupBrowser(active, 'takeOver')
-    if (active.terminal) return true
-    this.finish(active, 'cancelled', appFailure('CANCELLED'))
+    await this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'takeOver')
     return true
   }
 
@@ -1287,26 +1283,22 @@ export class AgentOrchestrator {
       conversationId: active.conversationId,
       runId: active.runId,
       currentUser: active.currentUser,
-      referencedHistory: [],
       signal: active.controller.signal,
     })
     const inactive = await this.inactiveBrowserResult(active)
     if (inactive) return inactive
     let result = strictBrowserToolResult(call.name, rawResult)
     if (result?.kind === 'success' && call.name === 'browser_session_inspect') {
-      const inspectInput = browserSessionInspectInputSchema.parse(executorInput)
       const data = result.data as {
         snapshot?: BrowserPageSnapshot
-        regionImage?: { bindingId: string; origin: string }
       }
-      const inspected = data.snapshot ?? data.regionImage
+      const inspected = data.snapshot
       let inspectedOrigin: string | undefined
       try { inspectedOrigin = inspected && new URL(inspected.origin).origin } catch { /* invalid executor data */ }
       if (!inspected
         || inspected.bindingId !== candidate.bindingId
         || inspected.origin !== candidate.origin
-        || inspectedOrigin !== candidate.origin
-        || (inspectInput.mode === 'region_image') !== Boolean(data.regionImage)) result = undefined
+        || inspectedOrigin !== candidate.origin) result = undefined
       else if (data.snapshot) this.rememberBrowserEvidence(active, candidate, data.snapshot)
     }
     if (result?.kind === 'success' && call.name === 'browser_session_act'
@@ -1320,8 +1312,10 @@ export class AgentOrchestrator {
       this.updateBrowserStatus(
         active,
         candidate,
-        'completed',
-        call.name === 'browser_session_inspect' ? '已读取网页' : '已完成网页操作',
+        call.name === 'browser_session_inspect' ? 'inspecting' : 'acting',
+        call.name === 'browser_session_inspect'
+          ? '已读取网页，等待下一步'
+          : '已完成本步网页操作，等待下一步',
       )
     } else if (result.kind === 'handoff') {
       active.browserTerminal = true
@@ -1775,17 +1769,12 @@ export class AgentOrchestrator {
     active: ActiveAgentRun,
     status: 'completed' | 'failed' | 'cancelled',
     error?: AppError,
-    cleanup: 'endRun' | 'cancel' = 'endRun',
+    cleanup: 'endRun' | 'cancel' | 'takeOver' = 'endRun',
   ): Promise<AgentRunResult> {
     if (active.terminal) return active.terminal
     const candidate = active.browserBindingId === undefined
       ? undefined
       : active.browserCatalog.bindings.get(active.browserBindingId)
-    if (candidate && status === 'failed') {
-      this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', error?.code)
-    } else if (candidate && status === 'cancelled') {
-      this.updateBrowserStatus(active, candidate, 'cancelled', '网页操作已取消', error?.code)
-    }
     if (active.browserStarted && !active.browserCleaned && this.dependencies.browserContinuation) {
       active.browserTerminal = true
       try {
@@ -1794,6 +1783,26 @@ export class AgentOrchestrator {
         status = 'failed'
         error = appFailure('INTERNAL_ERROR')
         if (candidate) this.updateBrowserStatus(active, candidate, 'failed', '网页操作清理失败', error.code)
+      }
+    }
+    const currentBrowserState = active.browserStatusBlockId === undefined
+      ? undefined
+      : active.blocks.find((block): block is BrowserStatusBlock => (
+        block.type === 'browser_status' && block.blockId === active.browserStatusBlockId
+      ))?.state
+    if (candidate && !['awaiting_user', 'failed', 'cancelled'].includes(currentBrowserState ?? '')) {
+      if (status === 'completed') {
+        this.updateBrowserStatus(active, candidate, 'completed', '浏览器自动操作已完成')
+      } else if (status === 'failed') {
+        this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', error?.code)
+      } else {
+        this.updateBrowserStatus(
+          active,
+          candidate,
+          'cancelled',
+          cleanup === 'takeOver' ? '用户已接管浏览器页面' : '网页操作已取消',
+          error?.code,
+        )
       }
     }
     return this.finish(active, status, error)

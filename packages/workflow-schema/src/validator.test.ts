@@ -49,6 +49,23 @@ describe('validateManifest', () => {
     expect(validateManifest({ ...validManifest(), ...patch }).valid).toBe(false)
   })
 
+  it.each([
+    { browserContinuation: { auth: { loginUrls: Array.from({ length: 33 }, (_, index) => `https://sso.example.gov.cn/login/${index}`) } } },
+    { browserContinuation: { auth: { loggedIn: Array.from({ length: 33 }, (_, index) => `css=#logged-in-${index}`) } } },
+    { browserContinuation: { auth: { loggedOut: Array.from({ length: 33 }, (_, index) => `css=#logged-out-${index}`) } } },
+    { browserContinuation: { readableRegions: Array.from({ length: 33 }, (_, index) => `css=#region-${index}`) } },
+    {
+      browserContinuation: {
+        manualActions: Array.from({ length: 33 }, (_, index) => ({
+          locator: `css=#manual-${index}`,
+          reason: `manual ${index}`,
+        })),
+      },
+    },
+  ])('rejects continuation locator fan-out above the finite cap %#', (patch) => {
+    expect(validateManifest({ ...validManifest(), ...patch }).valid).toBe(false)
+  })
+
   it('requires activation examples and browser origin scopes', () => {
     const result = validateManifest({
       id: 'bad',

@@ -114,7 +114,7 @@ const statusLabel = computed(() => ({
 const statusTone = computed(() => props.block.state === 'completed'
   ? 'success'
   : ['failed', 'cancelled'].includes(props.block.state) ? 'danger' : 'warning')
-const terminal = computed(() => ['completed', 'failed', 'cancelled'].includes(props.block.state))
+const terminal = computed(() => ['awaiting_user', 'completed', 'failed', 'cancelled'].includes(props.block.state))
 const actionsDisabled = computed(() => terminal.value || actionBusy.value || actionSettled.value)
 const statusError = computed(() => actionError.value
   || (props.block.errorCode ? displayError({ code: props.block.errorCode }) : ''))
