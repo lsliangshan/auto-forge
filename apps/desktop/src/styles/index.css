@@ -88,7 +88,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:fo
 .af-status-dot.success { background: var(--af-success); }
 .af-status-dot.warning { background: var(--af-warning); }
 .af-status-dot.danger { background: var(--af-danger); }
-.af-truncate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-truncate { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .af-media-card, .af-media-generation { display: grid; width: min(100%, 640px); gap: 10px; overflow: hidden; border: 1px solid var(--af-border); border-radius: 10px; padding: 12px; background: var(--af-surface); }
 .af-media-image, .af-media-video { display: block; width: auto; max-width: min(100%, 560px); max-height: 420px; border-radius: 7px; object-fit: contain; background: var(--af-surface-muted); }
 .af-media-audio { display: block; width: min(100%, 520px); }
