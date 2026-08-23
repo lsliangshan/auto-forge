@@ -1271,6 +1271,25 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
         return values?.length === 4 ? Number(values[3]) : 1
       })()
     `) as number
+    const shieldVisual = await shield.webContents.executeJavaScript(`
+      (() => {
+        const banner = document.querySelector('.ai-operation-banner')
+        return {
+          text: banner?.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+          outlineWidth: getComputedStyle(document.body, '::before').borderTopWidth,
+        }
+      })()
+    `) as { text: string; outlineWidth: string }
+    const toolbarVisual = await toolbar.webContents.executeJavaScript(`
+      (() => {
+        const controls = document.querySelector('.automation-controls')
+        const takeover = document.querySelector('.automation-takeover')
+        return {
+          text: controls?.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+          takeoverBackground: takeover ? getComputedStyle(takeover).backgroundColor : '',
+        }
+      })()
+    `) as { text: string; takeoverBackground: string }
     const state = {
       targetPresent: target !== undefined,
       targetStateMatchesCachedView,
@@ -1287,6 +1306,8 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
       ...(target ? { targetBounds: target.view.getBounds() } : {}),
       documentAlpha,
       documentAlphaGreaterThanZero: documentAlpha > 0,
+      shieldVisual,
+      toolbarVisual,
     }
     if (!input.probeInput || !target) {
       return {

@@ -50,6 +50,8 @@ interface NativeInputShieldState {
   targetBounds: { x: number; y: number; width: number; height: number }
   documentAlpha: number
   documentAlphaGreaterThanZero: boolean
+  shieldVisual: { text: string; outlineWidth: string }
+  toolbarVisual: { text: string; takeoverBackground: string }
   shieldPointerEvents: number
   shieldPointerBlocked: boolean
   shieldKeyboardEvents: number
@@ -403,6 +405,14 @@ test.describe.serial('conversation-bound browser continuation', () => {
       toolbarBounds: { x: 0, y: 0, width: 1280, height: 52 },
       targetBounds: { x: 0, y: 52, width: 1280 },
       documentAlphaGreaterThanZero: true,
+      shieldVisual: {
+        text: 'AI 正在操作此网页操作完成后可继续使用',
+        outlineWidth: '2px',
+      },
+      toolbarVisual: {
+        text: 'AI 正在操作网页停止接管',
+        takeoverBackground: 'rgb(37, 99, 235)',
+      },
       shieldPointerEvents: 1,
       shieldPointerBlocked: true,
       shieldKeyboardEvents: 1,

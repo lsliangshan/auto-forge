@@ -988,7 +988,10 @@ describe('ElectronBrowserWorkspace', () => {
     const toolbarHtml = decodeURIComponent(toolbar!.webContents.loaded.at(-1)!.split(',')[1]!)
     const shieldHtml = decodeURIComponent(shield!.webContents.loaded[0]!.split(',')[1]!)
     expect(toolbarHtml).not.toContain('data-autoforge-input-shield')
-    expect(shieldHtml).toContain('background:rgb(0 0 0 / 0.004)')
+    expect(shieldHtml).toContain('rgb(0 0 0 / 0.004)')
+    expect(shieldHtml).toContain('class="ai-operation-banner"')
+    expect(shieldHtml).toContain('AI 正在操作此网页')
+    expect(shieldHtml).toContain('操作完成后可继续使用')
     await lease.release()
   })
 
@@ -1503,9 +1506,10 @@ describe('ElectronBrowserWorkspace', () => {
 
     await vi.waitFor(() => {
       const document = decodeURIComponent(views[0]!.webContents.loaded.at(-1)!.split(',')[1]!)
-      expect(document).toContain('<span class="automation" aria-live="polite">AI 正在操作</span>')
-      expect(document).toContain(`href="autoforge-browser://continuation/stop/${binding.bindingId}"`)
-      expect(document).toContain(`href="autoforge-browser://continuation/takeover/${binding.bindingId}"`)
+      expect(document).toContain('<span class="automation-state-dot" aria-hidden="true"></span>')
+      expect(document).toContain('AI 正在操作网页')
+      expect(document).toContain(`class="automation-stop" href="autoforge-browser://continuation/stop/${binding.bindingId}"`)
+      expect(document).toContain(`class="automation-takeover" href="autoforge-browser://continuation/takeover/${binding.bindingId}"`)
     })
     expect(views[0]!.options.webPreferences).toMatchObject({ partition: 'autoforge-browser-toolbar' })
     expect(views[1]!.options.webPreferences).not.toMatchObject({ partition: 'autoforge-browser-toolbar' })
