@@ -17,6 +17,7 @@ import {
 } from '../browser/browser-action-guard.js'
 import type {
   BrowserPageInspector,
+  BrowserPrivateFieldEvidence,
   BrowserResolvedElementReference,
 } from '../browser/browser-page-inspector.js'
 import type { BrowserContinuationRegistry } from '../browser/browser-continuation-registry.js'
@@ -114,7 +115,7 @@ interface BrowserActionAuditRepository {
 
 interface BrowserContinuationToolExecutorDependencies {
   readonly registry: Pick<BrowserContinuationRegistry, 'acquire'>
-  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'resolveRef' | 'currentPageContext' | 'endRun'>
+  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
   readonly audits: BrowserActionAuditRepository
   readonly guard?: BrowserActionGuard
@@ -135,7 +136,11 @@ interface ActiveRunState {
 }
 
 export type BrowserContinuationToolResult =
-  | { readonly kind: 'success'; readonly data: Readonly<Record<string, unknown>> }
+  | {
+      readonly kind: 'success'
+      readonly data: Readonly<Record<string, unknown>>
+      readonly privateFieldEvidence?: readonly BrowserPrivateFieldEvidence[]
+    }
   | { readonly kind: 'handoff'; readonly code: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL' }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
@@ -324,6 +329,7 @@ export class BrowserContinuationToolExecutor {
       await lease.assertEligible()
       this.assertActive(state, context)
       state.snapshots.set(result.snapshotId, result)
+      const privateFieldEvidence = this.dependencies.inspector.fieldEvidence(result.snapshotId)
       this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'completed')
       audited = true
       return {
@@ -332,6 +338,9 @@ export class BrowserContinuationToolExecutor {
           trust: 'untrusted_page_data',
           snapshot: result,
         }),
+        ...(privateFieldEvidence.length === 0
+          ? {}
+          : { privateFieldEvidence: Object.freeze([...privateFieldEvidence]) }),
       }
     } catch (error) {
       if (!audited) {

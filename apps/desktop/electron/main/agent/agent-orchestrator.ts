@@ -50,6 +50,10 @@ import {
   type BrowserContinuationToolName,
   type BrowserContinuationToolResult,
 } from './browser-continuation-tool-executor.js'
+import {
+  matchBrowserFieldSemantics,
+  type BrowserFieldSemanticMatchResult,
+} from './browser-field-semantic-matcher.js'
 import { WorkflowRouter, type WorkflowRoutingRequest } from './workflow-router.js'
 import {
   APPROVAL_EXPIRY_MS,
@@ -140,9 +144,17 @@ const browserPageSnapshotSchema = z.object({
   serializedBytes: z.number().int().nonnegative().max(128 * 1_024),
 }).strict()
 
-const browserInspectSuccessSchema = z.object({
+const browserPrivateFieldEvidenceSchema = z.object({
+  snapshotId: z.string().trim().min(1).max(128),
+  ref: z.string().trim().min(1).max(128),
+  label: z.string().trim().min(1).max(512),
+  value: z.string().trim().min(1).max(512),
+}).strict()
+
+const browserInspectHostSuccessSchema = z.object({
   kind: z.literal('success'),
   data: z.object({ trust: z.literal('untrusted_page_data'), snapshot: browserPageSnapshotSchema }).strict(),
+  privateFieldEvidence: z.array(browserPrivateFieldEvidenceSchema).max(500).optional(),
 }).strict()
 
 const browserActSuccessSchema = z.object({
@@ -539,21 +551,6 @@ function normalizedTrustedText(value: string): string {
   return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
-function longestSharedText(left: string, right: string): number {
-  let longest = 0
-  let previous = new Array<number>(right.length + 1).fill(0)
-  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
-    const current = new Array<number>(right.length + 1).fill(0)
-    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      if (left[leftIndex - 1] !== right[rightIndex - 1]) continue
-      current[rightIndex] = previous[rightIndex - 1]! + 1
-      longest = Math.max(longest, current[rightIndex]!)
-    }
-    previous = current
-  }
-  return longest
-}
-
 function trustedRequestNamesTarget(request: string, target: BrowserSemanticNode): boolean {
   const name = normalizedTrustedText(target.name)
   return name.length > 0 && normalizedTrustedText(request).includes(name)
@@ -606,25 +603,19 @@ function strictBrowserToolResult(
   value: unknown,
 ): BrowserContinuationToolResult | undefined {
   const successSchema = tool === 'browser_session_inspect'
-    ? browserInspectSuccessSchema
+    ? browserInspectHostSuccessSchema
     : tool === 'browser_session_act' ? browserActSuccessSchema : z.never()
   const parsed = z.union([successSchema, browserHandoffResultSchema, browserToolErrorResultSchema]).safeParse(value)
-  return parsed.success ? parsed.data as BrowserContinuationToolResult : undefined
+  if (!parsed.success) return undefined
+  if (tool === 'browser_session_inspect' && parsed.data.kind === 'success') {
+    return Object.freeze({ kind: 'success', data: parsed.data.data })
+  }
+  return parsed.data as BrowserContinuationToolResult
 }
 
-function relevantEvidence(request: string, evidence: BrowserFieldEvidence): boolean {
-  const trusted = normalizedTrustedText(request)
-  const label = normalizedTrustedText(evidence.label)
-  if (!trusted || label.length < 2) return false
-  if (trusted.includes(label)) return true
-  if (/(?:学历|学位|文化程度)/u.test(trusted)
-    && /^(?:学历|最高学历|文化程度|学位|最高学位)$/u.test(label)) return true
-  const latinTerms = evidence.label.toLowerCase().match(/[a-z0-9]{2,}/gu) ?? []
-  if (latinTerms.length > 0) {
-    const requestTerms = new Set(request.toLowerCase().match(/[a-z0-9]{2,}/gu) ?? [])
-    return latinTerms.every((term) => requestTerms.has(term))
-  }
-  return longestSharedText(label, trusted) >= 3
+function strictBrowserPrivateFieldEvidence(value: unknown): readonly z.infer<typeof browserPrivateFieldEvidenceSchema>[] {
+  const parsed = browserInspectHostSuccessSchema.safeParse(value)
+  return parsed.success ? Object.freeze([...(parsed.data.privateFieldEvidence ?? [])]) : Object.freeze([])
 }
 
 function safeAnswerText(value: string): string {
@@ -1066,7 +1057,7 @@ export class AgentOrchestrator {
         return this.continuePendingTool(active)
       }
       if (finishReason === 'stop') {
-        if (active.browserRead) this.appendText(active, this.browserAnswer(active))
+        if (active.browserRead) this.appendText(active, await this.browserAnswer(active))
         else for (const text of bufferedText) this.appendText(active, text)
         this.appendWorkflowProvenance(active)
         return this.terminalize(active, 'completed')
@@ -1303,6 +1294,9 @@ export class AgentOrchestrator {
     })
     const inactive = await this.inactiveBrowserResult(active)
     if (inactive) return inactive
+    const privateFieldEvidence = call.name === 'browser_session_inspect'
+      ? strictBrowserPrivateFieldEvidence(rawResult)
+      : Object.freeze([])
     let result = strictBrowserToolResult(call.name, rawResult)
     if (result?.kind === 'success' && call.name === 'browser_session_inspect') {
       const data = result.data as {
@@ -1315,7 +1309,9 @@ export class AgentOrchestrator {
         || inspected.bindingId !== candidate.bindingId
         || inspected.origin !== candidate.origin
         || inspectedOrigin !== candidate.origin) result = undefined
-      else if (data.snapshot) this.rememberBrowserEvidence(active, candidate, data.snapshot)
+      else if (data.snapshot) {
+        this.rememberBrowserEvidence(active, candidate, data.snapshot, privateFieldEvidence)
+      }
     }
     if (result?.kind === 'success' && call.name === 'browser_session_act'
       && result.data.completedActions !== browserSessionActInputSchema.parse(executorInput).actions.length) {
@@ -1324,6 +1320,8 @@ export class AgentOrchestrator {
     if (result?.kind === 'success' && call.name === 'browser_session_act') {
       const actions = browserSessionActInputSchema.parse(executorInput).actions
       if (actions.some((action) => action.type === 'navigate')) {
+        active.browserSnapshots.clear()
+        active.browserEvidence.length = 0
         const refreshed = await browser.catalog.refresh({
           userId: active.userId,
           conversationId: active.conversationId,
@@ -1550,15 +1548,29 @@ export class AgentOrchestrator {
     active: ActiveAgentRun,
     candidate: BrowserContinuationCandidate,
     snapshot: BrowserPageSnapshot,
+    privateFieldEvidence: readonly z.infer<typeof browserPrivateFieldEvidenceSchema>[],
   ): void {
+    const previousSnapshot = [...active.browserSnapshots.values()].at(-1)
+    if (previousSnapshot
+      && (previousSnapshot.origin !== snapshot.origin
+        || previousSnapshot.navigationEpoch !== snapshot.navigationEpoch)) {
+      active.browserSnapshots.clear()
+      active.browserEvidence.length = 0
+    }
     active.browserSnapshots.set(snapshot.snapshotId, snapshot)
-    for (const node of snapshot.nodes) {
-      if (node.value === undefined || !node.value.trim() || !node.name.trim()) continue
+    for (const evidence of privateFieldEvidence) {
+      const node = snapshot.nodes.find(({ ref }) => ref === evidence.ref)
+      if (evidence.snapshotId !== snapshot.snapshotId
+        || !node
+        || (node.role !== 'statictext' && node.role !== 'textbox')
+        || node.actions.length !== 0
+        || node.name !== evidence.label
+        || node.value !== undefined) continue
       active.browserEvidence.push({
         snapshotId: snapshot.snapshotId,
-        ref: node.ref,
-        label: node.name,
-        value: node.value,
+        ref: evidence.ref,
+        label: evidence.label,
+        value: evidence.value,
         pageLabel: candidate.pageLabel,
         origin: candidate.origin,
         capturedAt: snapshot.capturedAt,
@@ -1566,18 +1578,38 @@ export class AgentOrchestrator {
     }
   }
 
-  private browserAnswer(active: ActiveAgentRun): string {
-    const matches = active.browserEvidence.filter((evidence) => (
-      relevantEvidence(active.browserAuthorization.trustedRequest, evidence)
-    ))
+  private async browserAnswer(active: ActiveAgentRun): Promise<string> {
     const unique = new Map<string, BrowserFieldEvidence>()
-    for (const evidence of matches) {
+    for (const evidence of active.browserEvidence) {
       const key = [evidence.label, evidence.value, evidence.pageLabel, evidence.origin].join('\u0000')
       const previous = unique.get(key)
       if (!previous || evidence.capturedAt > previous.capturedAt) unique.set(key, evidence)
     }
-    if (unique.size === 1) {
-      const evidence = unique.values().next().value!
+    const candidateEvidence = [...unique.values()].map((evidence, index) => ({
+      id: `candidate_${index + 1}`,
+      label: evidence.label,
+      evidence,
+    }))
+    const semanticMatch: BrowserFieldSemanticMatchResult = candidateEvidence.length === 0
+      ? { matchingCandidateIds: [] as readonly string[] }
+      : await matchBrowserFieldSemantics({
+        trustedRequest: active.browserAuthorization.trustedRequest,
+        candidates: candidateEvidence.map(({ id, label }) => ({ id, label })),
+        providerSnapshot: active.providerSnapshot,
+        providerUsage: this.dependencies.providerUsage,
+        model: active.model,
+        userId: active.userId,
+        requestId: active.requestId,
+        chatRunId: active.runId,
+        signal: active.controller.signal,
+        id: this.id,
+        now: this.now,
+      })
+    if (semanticMatch.usage) this.addUsage(active, semanticMatch.usage)
+    if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+    if (semanticMatch.matchingCandidateIds.length === 1) {
+      const evidence = candidateEvidence.find(({ id }) => id === semanticMatch.matchingCandidateIds[0])?.evidence
+      if (!evidence) return '无法从已绑定网页中唯一确认请求的字段；请在可见页面核对后再继续。'
       return `${safeAnswerText(evidence.label)}：${safeAnswerText(evidence.value)}`
         + `（来源：${safeAnswerText(evidence.pageLabel)} / ${evidence.origin}；读取时间：${evidence.capturedAt}）。`
     }

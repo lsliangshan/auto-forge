@@ -195,7 +195,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(page.getByText('最高学历：本科')).toBeVisible()
     const requests = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests
       .filter((request) => request.conversationId === conversationId)
-    expect(requests).toHaveLength(12)
+    expect(requests).toHaveLength(13)
   })
 
   test('does not offer another conversation the bound page', async () => {

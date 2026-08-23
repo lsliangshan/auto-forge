@@ -148,6 +148,13 @@ export interface BrowserResolvedElementReference {
   readonly targetContext: BrowserActionTargetContext
 }
 
+export interface BrowserPrivateFieldEvidence {
+  readonly snapshotId: string
+  readonly ref: string
+  readonly label: string
+  readonly value: string
+}
+
 interface InspectorOptions {
   readonly id?: () => string
   readonly now?: () => number
@@ -167,6 +174,7 @@ interface SafeCandidate {
   readonly tagName: string
   readonly inputType?: string
   readonly href?: string
+  readonly fieldValue?: string
 }
 
 interface SnapshotIdentity {
@@ -261,22 +269,26 @@ const staticDateLabels: ReadonlySet<string> = new Set([
   'deadline date',
   'validity period',
 ])
-const requestScopedCertificateNumberLabels: ReadonlySet<string> = new Set([
+const staticCertificateNumberLabels: ReadonlySet<string> = new Set([
   '证件编号',
+  '证件号码',
   '证书编号',
   '居住证编号',
   '工作居住证编号',
 ])
-const requestScopedCertificateNumber = /^[A-Z0-9][A-Z0-9./_-]{5,30}[A-Z0-9]$/iu
-const explicitCertificateNumberRequest = /(?:证件|证书|居住证|工作居住证)(?:的)?(?:编号|号码)/u
-const requestScopedEducationLabels: ReadonlySet<string> = new Set([
+const safeCertificateNumberValue = /^[A-Z0-9][A-Z0-9./_-]{5,30}[A-Z0-9]$/iu
+const staticCertificateTypeLabels: ReadonlySet<string> = new Set([
+  '证件类型',
+  '证件种类',
+])
+const staticEducationLabels: ReadonlySet<string> = new Set([
   '学历',
   '最高学历',
   '文化程度',
   '学位',
   '最高学位',
 ])
-const requestScopedEducationValues: ReadonlySet<string> = new Set([
+const staticEducationValues: ReadonlySet<string> = new Set([
   '小学',
   '初中',
   '普通高中',
@@ -296,8 +308,6 @@ const requestScopedEducationValues: ReadonlySet<string> = new Set([
   '硕士',
   '博士',
 ])
-const explicitEducationRequest = /(?:学历|学位|文化程度)/u
-
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
 }
@@ -385,44 +395,51 @@ interface StructuredStaticField {
   readonly value: string
 }
 
-function structuredStaticField(
-  rawText: string,
-  intent: string,
-): StructuredStaticField | null | undefined {
-  if (unsafeStaticFieldRawText.test(rawText)) return null
-  const delimiter = /[:：]/u.exec(rawText)
-  if (!delimiter) return containsStaticDateEvidence(rawText) ? null : undefined
-  if (rawText.slice(delimiter.index + delimiter[0].length).includes('：')) return null
-  const label = normalizedText(rawText.slice(0, delimiter.index))
-  const value = normalizedText(rawText.slice(delimiter.index + delimiter[0].length))
+function validatedStructuredField(label: string, value: string): StructuredStaticField | null {
   if (!label || !value
     || [...label].length > maxStaticFieldLabelLength
     || [...value].length > maxStaticFieldValueLength) return null
   const safeLabel = safeText(label)
   if (!safeLabel) return null
-  if (requestScopedCertificateNumberLabels.has(safeLabel.toLowerCase())
-    && explicitCertificateNumberRequest.test(normalizedText(intent))
-    && requestScopedCertificateNumber.test(value)
+  const normalizedLabel = safeLabel.toLowerCase()
+  if (staticCertificateNumberLabels.has(normalizedLabel)
+    && safeCertificateNumberValue.test(value)
     && !chineseIdentity.test(value)
     && !instructionLikeText.test(value)) {
     return Object.freeze({ name: safeLabel, value })
   }
-  if (requestScopedEducationLabels.has(safeLabel.toLowerCase())
-    && explicitEducationRequest.test(normalizedText(intent))
-    && requestScopedEducationValues.has(value.toLowerCase())) {
+  if (staticCertificateNumberLabels.has(normalizedLabel)) return null
+  if (staticCertificateTypeLabels.has(normalizedLabel)) {
+    const safeValue = safeText(value)
+    if (!safeValue || instructionLikeText.test(safeValue)) return null
+    return Object.freeze({ name: safeLabel, value: safeValue })
+  }
+  if (staticEducationLabels.has(normalizedLabel)
+    && staticEducationValues.has(value.toLowerCase())) {
     return Object.freeze({ name: safeLabel, value })
   }
-  const safeOriginal = safeText(rawText)
+  if (staticEducationLabels.has(normalizedLabel)) return null
+  const safeOriginal = safeText(`${label}：${value}`)
   const safeValue = safeText(value)
   if (!safeOriginal || instructionLikeText.test(safeOriginal)
     || !safeValue
     || sensitiveStaticFieldLabel.test(safeLabel)
     || sensitiveText(`${safeLabel}: ${safeValue}`)
     || instructionLikeText.test(safeValue)) return null
-  if (!staticDateLabels.has(safeLabel.toLowerCase())) return null
-  if (!relevantValue(safeLabel, intent)) return null
+  if (!staticDateLabels.has(normalizedLabel)) return null
   if (!safeStaticDateValue(safeValue)) return null
   return Object.freeze({ name: safeLabel, value: safeValue })
+}
+
+function structuredStaticField(rawText: string): StructuredStaticField | null | undefined {
+  if (unsafeStaticFieldRawText.test(rawText)) return null
+  const delimiter = /[:：]/u.exec(rawText)
+  if (!delimiter) return containsStaticDateEvidence(rawText) ? null : undefined
+  if (rawText.slice(delimiter.index + delimiter[0].length).includes('：')) return null
+  return validatedStructuredField(
+    normalizedText(rawText.slice(0, delimiter.index)),
+    normalizedText(rawText.slice(delimiter.index + delimiter[0].length)),
+  )
 }
 
 function safeUrl(value: string, expectedOrigin: string): string {
@@ -604,6 +621,19 @@ export class BrowserPageInspector {
     })(), input.signal, deadlineAt)
   }
 
+  fieldEvidence(snapshotId: string): readonly BrowserPrivateFieldEvidence[] {
+    return Object.freeze([...this.refs.values()].flatMap((state) => (
+      state.snapshotId === snapshotId && state.fieldValue !== undefined
+        ? [Object.freeze({
+            snapshotId: state.snapshotId,
+            ref: state.ref,
+            label: state.name,
+            value: state.fieldValue,
+          })]
+        : []
+    )))
+  }
+
   endRun(runId: string): void {
     for (const [ref, state] of this.refs) if (state.runId === runId) this.refs.delete(ref)
     for (const [cursor, state] of this.cursors) if (state.runId === runId) this.cursors.delete(cursor)
@@ -644,21 +674,23 @@ export class BrowserPageInspector {
     const candidates = readable.flatMap((node): SafeCandidate[] => {
       const role = normalizedRole(node.role)
       if (!semanticRoles.has(role) || authNode(node)) return []
-      const staticField = rawStaticTextRoles.has(node.role)
-        ? structuredStaticField(node.name, input.intent)
-        : undefined
-      if (staticField === null) return []
-      const name = staticField?.name ?? safeText(node.name)
-      if (!name) return []
       const rawValue = node.value === undefined ? undefined : safeText(node.value)
-      const value = staticField?.value ?? (
+      const structuredField = rawStaticTextRoles.has(node.role)
+        ? structuredStaticField(node.name)
+        : node.dom.readOnly === true && rawValue !== undefined
+          ? validatedStructuredField(normalizedText(node.name), normalizedText(rawValue))
+          : undefined
+      if (structuredField === null) return []
+      const name = structuredField?.name ?? safeText(node.name)
+      if (!name) return []
+      const value = structuredField === undefined ? (
         valueRoles.has(role)
           && rawValue !== undefined
           && relevantValue(name, input.intent)
           && !imageRestrictedNode(node)
           ? rawValue
           : undefined
-      )
+      ) : undefined
       return [{
         backendNodeId: node.backendNodeId,
         role,
@@ -674,6 +706,7 @@ export class BrowserPageInspector {
         ...(role === 'link' && safeHref(node.dom.href, page.url) !== undefined
           ? { href: safeHref(node.dom.href, page.url)! }
           : {}),
+        ...(structuredField === undefined ? {} : { fieldValue: structuredField.value }),
       }]
     })
     const snapshotId = this.opaque('snapshot')

@@ -212,6 +212,29 @@ function currentUserText(request: ModelStreamRequest): string {
   return message.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n')
 }
 
+function semanticFieldMatches(request: ModelStreamRequest): string[] {
+  try {
+    const payload = JSON.parse(currentUserText(request)) as {
+      request?: unknown
+      candidates?: Array<{ id?: unknown; label?: unknown }>
+    }
+    if (typeof payload.request !== 'string' || !Array.isArray(payload.candidates)) return []
+    const wanted = payload.request.normalize('NFKC').toLowerCase()
+    return payload.candidates.flatMap(({ id, label }) => {
+      if (typeof id !== 'string' || typeof label !== 'string') return []
+      const candidate = label.normalize('NFKC').toLowerCase()
+      const matchesExpiry = /有效期|到期/u.test(wanted) && /有效期|到期/u.test(candidate)
+      const matchesEducation = /学历|文化程度/u.test(wanted) && /学历|文化程度/u.test(candidate)
+      const matchesDegree = /学位/u.test(wanted) && /学位/u.test(candidate)
+      const matchesCertificateNumber = /(?:证件|证书|居住证).*(?:编号|号码)/u.test(wanted)
+        && /(?:证件|证书|居住证).*(?:编号|号码)/u.test(candidate)
+      return matchesExpiry || matchesEducation || matchesDegree || matchesCertificateNumber ? [id] : []
+    })
+  } catch {
+    return []
+  }
+}
+
 function inspectedSnapshot(request: ModelStreamRequest): {
   snapshotId: string
   nodes: Array<{ ref: string; name: string; role: string }>
@@ -312,6 +335,15 @@ const deterministicProvider: CredentialBoundModelProvider = {
       conversationId,
       serialized: JSON.stringify({ messages: request.messages, tools: request.tools }),
     })
+    if (request.tools?.some((tool) => tool.function.name === 'report_browser_field_matches')) {
+      yield {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: `e2e_semantic_${randomUUID()}`,
+        name: 'report_browser_field_matches',
+        arguments: { matchingCandidateIds: semanticFieldMatches(request) },
+      }
+      yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+      return
+    }
     const previousTool = lastToolName(request)
     const workflowTool = request.tools?.find((tool) => tool.function.name.startsWith('workflow_'))
     if (userText.includes('E2E_WORKFLOW_OPEN') && !previousTool && workflowTool) {

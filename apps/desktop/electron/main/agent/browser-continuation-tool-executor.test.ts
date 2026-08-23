@@ -9,7 +9,10 @@ import {
   BrowserContinuationToolExecutor,
   type BrowserContinuationRunContext,
 } from './browser-continuation-tool-executor.js'
-import type { BrowserResolvedElementReference } from '../browser/browser-page-inspector.js'
+import type {
+  BrowserPrivateFieldEvidence,
+  BrowserResolvedElementReference,
+} from '../browser/browser-page-inspector.js'
 
 function binding(): BrowserContinuationBinding {
   return Object.freeze({
@@ -71,6 +74,7 @@ function harness(options: {
   const semanticFingerprint = () => `page_${++semanticRead}`
   const inspector = {
     inspect: vi.fn(async () => snapshots.shift() ?? snapshot()),
+    fieldEvidence: vi.fn<() => readonly BrowserPrivateFieldEvidence[]>(() => []),
     resolveRef: vi.fn(async (input: { ref: string; snapshotId: string }): Promise<BrowserResolvedElementReference> => {
       const candidate = snapshot().nodes.find((node) => node.ref === input.ref)
       if (!candidate || input.snapshotId !== 'snapshot_1') throw { code: 'PAGE_CHANGED' }
@@ -162,6 +166,34 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.audits).toEqual([expect.objectContaining({
       sequence: 1, action: 'inspect', targetSummary: 'page', risk: 'sensitive_read', outcome: 'completed',
     })])
+  })
+
+  it('returns static values only through host-private inspection evidence', async () => {
+    const privateSnapshot = snapshot({
+      nodes: Object.freeze([
+        Object.freeze({
+          ref: 'ref_certificate', role: 'statictext', name: '证件编号',
+          enabled: true, actions: [] as const,
+        }),
+      ]),
+    })
+    const test = harness({ snapshots: [privateSnapshot] })
+    test.inspector.fieldEvidence.mockReturnValueOnce(Object.freeze([Object.freeze({
+      snapshotId: 'snapshot_1', ref: 'ref_certificate', label: '证件编号', value: '202111127927',
+    })]))
+
+    const result = await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '我的证件号码是多少',
+    }, run())
+
+    expect(result).toEqual({
+      kind: 'success',
+      data: { trust: 'untrusted_page_data', snapshot: privateSnapshot },
+      privateFieldEvidence: [{
+        snapshotId: 'snapshot_1', ref: 'ref_certificate', label: '证件编号', value: '202111127927',
+      }],
+    })
+    expect(JSON.stringify(result.kind === 'success' ? result.data : {})).not.toContain('202111127927')
   })
 
   it('rechecks development eligibility after a hung inspection before admitting its snapshot', async () => {

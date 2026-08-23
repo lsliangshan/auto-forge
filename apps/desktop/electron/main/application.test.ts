@@ -3429,6 +3429,14 @@ describe('createApplicationRuntime', () => {
       validateCredential: vi.fn(async () => ({ valid: true })),
       stream: vi.fn(async function* (request: ModelStreamRequest) {
         captured.push(structuredClone(request))
+        if (request.tools?.some(({ function: tool }) => tool.name === 'report_browser_field_matches')) {
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'context_field_match',
+            name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+          return
+        }
         if (captured.length === 1) {
           yield {
             type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'context_inspect',
@@ -3500,16 +3508,19 @@ describe('createApplicationRuntime', () => {
     })
 
     await runtime.services.chat.send(chatInput(conversation.id, '读取证件有效期'))
-    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(3))
     await vi.waitFor(async () => expect(JSON.stringify(await runtime.services.chat.listMessages(conversation.id)))
       .toContain('2028-06-30'))
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).toContain(ephemeralPageData)
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(injection)
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(privateValue)
+    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain('2028-06-30')
+    expect(JSON.stringify(agentRequests(captured)[2]!.messages)).toContain('有效期至')
+    expect(JSON.stringify(agentRequests(captured)[2]!.messages)).not.toContain('2028-06-30')
 
     await runtime.services.chat.send(chatInput(conversation.id, '只总结上次安全结果'))
-    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(3))
-    const followUpContext = JSON.stringify(agentRequests(captured)[2]!.messages)
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(4))
+    const followUpContext = JSON.stringify(agentRequests(captured)[3]!.messages)
     expect(followUpContext).toContain('有效期至：2028-06-30')
     expect(followUpContext).toContain('[浏览器页面: permit.example.gov.cn; 来源: https://permit.example.gov.cn;')
     expect(followUpContext).not.toContain(injection)
