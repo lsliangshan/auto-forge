@@ -549,12 +549,12 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(destroyed.order).not.toContain('shield')
   })
 
-  test('stops after exactly thirty continuation actions', async () => {
+  test('continues beyond thirty continuation actions', async () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details')
     await expect(command(electronApp, 'directScenario', {
-      name: 'actionLimit', bindingId: binding.bindingId, userText: '点击保存进度草稿',
-    })).resolves.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED', completedActions: 30 })
+      name: 'actionsBeyondThirty', bindingId: binding.bindingId, userText: '点击保存进度草稿',
+    })).resolves.toMatchObject({ code: 'OK', completedActions: 31 })
   })
 
   test('conversation deletion closes its exact browser pages', async () => {

@@ -130,10 +130,6 @@ interface ActiveRunState {
   readonly bindingId: string
   readonly startedAt: number
   lease?: BrowserContinuationLease
-  actionCount: number
-  noProgressCount: number
-  inspectionNoProgressCount: number
-  lastInspectionSignature?: string
   nextAuditSequence?: number
   readonly snapshots: Map<string, BrowserPageSnapshot>
 }
@@ -145,18 +141,6 @@ export type BrowserContinuationToolResult =
 
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
-}
-
-function pageSignature(value: BrowserPageSnapshot): string {
-  return JSON.stringify({
-    origin: value.origin,
-    auth: value.auth,
-    nodes: value.nodes.map((node) => ({
-      role: node.role, name: node.name, value: node.value, enabled: node.enabled,
-      checked: node.checked, selected: node.selected, actions: node.actions,
-    })),
-    cursor: Boolean(value.cursor),
-  })
 }
 
 function trimmedText(value: string): string {
@@ -209,64 +193,6 @@ function textSupportsBoolean(requested: boolean, evidence: string): boolean {
     || new RegExp(`(?:^|${delimiter})同意(?:须知|条款|协议)?(?=$|${delimiter})`, 'iu').test(normalized)
   if (positive === negative) return false
   return requested ? positive : negative
-}
-
-function normalizedEvidenceText(value: string): string {
-  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
-}
-
-function longestSharedText(left: string, right: string): number {
-  let longest = 0
-  let previous = new Array<number>(right.length + 1).fill(0)
-  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
-    const current = new Array<number>(right.length + 1).fill(0)
-    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      if (left[leftIndex - 1] !== right[rightIndex - 1]) continue
-      current[rightIndex] = previous[rightIndex - 1]! + 1
-      longest = Math.max(longest, current[rightIndex]!)
-    }
-    previous = current
-  }
-  return longest
-}
-
-function evidenceRelevantToIntent(node: BrowserSemanticNode, intent: string): boolean {
-  const name = normalizedEvidenceText(node.name)
-  const request = normalizedEvidenceText(intent)
-  if (!name || !request) return false
-  if (request.includes(name) || name.includes(request)) return true
-  return longestSharedText(name, request) >= 3
-}
-
-function relevantEvidenceSet(snapshot: BrowserPageSnapshot, intent: string): Set<string> {
-  return new Set(snapshot.nodes
-    .filter((node) => evidenceRelevantToIntent(node, intent))
-    .map((node) => JSON.stringify({
-      role: node.role,
-      name: node.name,
-      value: node.value,
-      checked: node.checked,
-      selected: node.selected,
-      actions: node.actions,
-    })))
-}
-
-function revealsRelevantEvidence(
-  before: BrowserPageSnapshot,
-  after: BrowserPageSnapshot,
-  intent: string,
-): boolean {
-  const existing = relevantEvidenceSet(before, intent)
-  return [...relevantEvidenceSet(after, intent)].some((evidence) => !existing.has(evidence))
-}
-
-function navigationChanged(
-  before: BrowserContinuationPageState,
-  after: BrowserContinuationPageState,
-): boolean {
-  return before.origin !== after.origin
-    || before.url !== after.url
-    || before.navigationEpoch !== after.navigationEpoch
 }
 
 function targetSummary(target: BrowserSemanticNode | undefined): string {
@@ -352,9 +278,6 @@ export class BrowserContinuationToolExecutor {
       runId: context.runId,
       bindingId,
       startedAt: this.now(),
-      actionCount: 0,
-      noProgressCount: 0,
-      inspectionNoProgressCount: 0,
       snapshots: new Map(),
     }
     this.runs.set(context.runId, state)
@@ -400,19 +323,7 @@ export class BrowserContinuationToolExecutor {
       const result = await this.dependencies.inspector.inspect(common)
       await lease.assertEligible()
       this.assertActive(state, context)
-      const signature = pageSignature(result)
-      const changed = state.lastInspectionSignature !== undefined && signature !== state.lastInspectionSignature
-      state.inspectionNoProgressCount = signature === state.lastInspectionSignature
-        ? state.inspectionNoProgressCount + 1
-        : 1
-      state.lastInspectionSignature = signature
-      if (changed) state.noProgressCount = 0
       state.snapshots.set(result.snapshotId, result)
-      if (state.inspectionNoProgressCount >= 3) {
-        this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'failed', 'ACTION_LIMIT_EXCEEDED')
-        audited = true
-        throw failure('ACTION_LIMIT_EXCEEDED')
-      }
       this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'completed')
       audited = true
       return {
@@ -451,7 +362,6 @@ export class BrowserContinuationToolExecutor {
       throw failure('PAGE_CHANGED')
     }
     let completedActions = 0
-    let progressSnapshot = snapshot
     for (const rawAction of input.actions) {
       const action = rawAction as BrowserAction
       const targetRef = action.type === 'navigate' && action.source.kind === 'page'
@@ -526,7 +436,6 @@ export class BrowserContinuationToolExecutor {
           }
         }
         await lease.assertEligible()
-        state.actionCount += 1
         await this.dependencies.workspace.performContinuationAction({
           tabId: lease.binding.tabId,
           runId: context.runId,
@@ -546,33 +455,6 @@ export class BrowserContinuationToolExecutor {
           origin: after.origin,
           ...(context.signal === undefined ? {} : { signal: context.signal }),
         })
-        const navigated = navigationChanged(page, after)
-        let revealedRelevantEvidence = false
-        if (!navigated) {
-          const afterSnapshot = await this.dependencies.inspector.inspect({
-            lease,
-            tabId: lease.binding.tabId,
-            navigationEpoch: after.navigationEpoch,
-            origin: after.origin,
-            intent: context.currentUser.text,
-            ...(context.signal === undefined ? {} : { signal: context.signal }),
-          })
-          await lease.assertEligible()
-          this.assertActive(state, context)
-          if (action.type !== 'focus' && action.type !== 'wait') {
-            revealedRelevantEvidence = revealsRelevantEvidence(
-              progressSnapshot,
-              afterSnapshot,
-              context.currentUser.text,
-            )
-          }
-          progressSnapshot = afterSnapshot
-        }
-        const relevantProgress = action.type !== 'focus' && action.type !== 'wait'
-          && (navigated || revealedRelevantEvidence)
-        if (relevantProgress) state.noProgressCount = 0
-        else state.noProgressCount += 1
-        if (state.noProgressCount >= 3) throw failure('ACTION_LIMIT_EXCEEDED')
         if (liveAfter.auth === 'required') {
           try {
             const result = await this.performHandoff(
@@ -770,7 +652,6 @@ export class BrowserContinuationToolExecutor {
     context: BrowserContinuationRunContext,
   ): void {
     this.assertActive(state, context)
-    if (state.actionCount >= 30) throw failure('ACTION_LIMIT_EXCEEDED')
   }
 
   private auditAction(

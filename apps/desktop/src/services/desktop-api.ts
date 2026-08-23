@@ -72,7 +72,7 @@ const messages: Partial<Record<AppError['code'], string>> = {
   MANUAL_ACTION_REQUIRED: '此操作需要你在页面中手动确认',
   PAGE_CHANGED: '页面已变化，请重新检查后继续',
   UNSUPPORTED_CONTROL: '当前页面控件不受支持，请手动操作',
-  ACTION_LIMIT_EXCEEDED: '浏览器自动操作次数已达上限',
+  ACTION_LIMIT_EXCEEDED: '网页读取或单次操作超出安全处理范围',
   INTERNAL_ERROR: '操作失败，请稍后重试',
 }
 

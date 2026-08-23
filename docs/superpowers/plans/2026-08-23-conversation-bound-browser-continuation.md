@@ -20,7 +20,7 @@
 - The Agent may perform only reversible navigation/draft actions. Formal submit, confirmation, signature, payment, publication, delete, withdrawal, logout, files, credentials, OTP, and CAPTCHA require user handoff.
 - Raw page snapshots, region images, opaque element references, and model tool results are run-local and must not enter messages, summaries, diagnostics, execution logs, or audit rows.
 - Keep normal site cookies in the hashed user partition on logout; close all tabs and revoke all bindings first. Only the explicit “清除浏览器数据” action clears site data.
-- Keep the existing ten provider-decision limit; allow at most 30 browser actions per run, ten actions per batch, five active minutes, three no-progress cycles, and 128 KiB/500 nodes per snapshot.
+- Keep the existing ten provider-decision limit; browser actions have no cumulative per-run count limit, while each batch remains capped at ten actions, active browser-tool time remains five minutes, and each snapshot remains capped at 128 KiB/500 nodes.
 - Build changed `@autoforge/shared` and `@autoforge/workflow-schema` packages before desktop/root typecheck to avoid stale workspace `dist`.
 - Do not modify unrelated code or broaden the workflow Worker SDK beyond this design.
 
@@ -797,9 +797,9 @@ run, or takeover. Never dispatch the protected click.
 cd apps/desktop && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/browser/browser-action-guard.test.ts electron/main/agent/browser-continuation-tool-executor.test.ts electron/main/browser/electron-browser-workspace.test.ts electron/main/agent/capability-risk.test.ts
 ```
 
-Expected: PASS for all protected actions, action-scoped origins, 30-action/
-five-minute/three-no-progress limits, cancellation, audit redaction, and zero
-final clicks.
+Expected: PASS for all protected actions, action-scoped origins, unbounded
+cumulative browser actions, five-minute lifecycle limits, cancellation, audit
+redaction, and zero final clicks.
 
 - [ ] **Step 7: Commit guard and executor**
 
@@ -883,7 +883,7 @@ Extend `ActiveAgentRun` with a frozen browser catalog and per-run browser budget
 In `prepareTool`, dispatch by exact fixed browser tool name before looking up
 `active.workflows`; unknown names remain `INVALID_INPUT`. Keep workflow
 execution count at five and provider decision count at ten. Browser actions
-increment only the separate 30-action budget.
+remain separately counted for diagnostics but have no cumulative limit.
 
 Append browser tool calls/results only to `active.messages`. Add/update one
 system-owned `browser_status` block in `active.blocks`; never append raw snapshot

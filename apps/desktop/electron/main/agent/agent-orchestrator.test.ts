@@ -2930,7 +2930,7 @@ describe('AgentOrchestrator', () => {
     }))
   })
 
-  it('uses the separate thirty-action browser budget without consuming workflow starts', async () => {
+  it('continues browser actions beyond thirty without consuming workflow starts', async () => {
     const actionTurn = (index: number): ProviderStreamEvent[] => [{
       type: 'tool_call', choiceIndex: 0, index: 0, id: `action_call_${index}`,
       name: 'browser_session_act', arguments: {
@@ -2941,7 +2941,7 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([
       actionTurn(1), actionTurn(2), actionTurn(3), actionTurn(4),
       [
-        { type: 'text_delta', choiceIndex: 0, text: '已达到网页操作上限，未执行更多操作。' },
+        { type: 'text_delta', choiceIndex: 0, text: '网页操作已完成。' },
         { type: 'finish', choiceIndex: 0, reason: 'stop' },
       ],
     ])
@@ -2955,14 +2955,14 @@ describe('AgentOrchestrator', () => {
     }))
 
     expect(result.status).toBe('completed')
-    expect(browser.executor.execute).toHaveBeenCalledTimes(3)
+    expect(browser.executor.execute).toHaveBeenCalledTimes(4)
     expect(browser.executor.endRun).toHaveBeenCalledOnce()
     expect(dependencies.records.starts).toHaveLength(0)
     const finalRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[4]![0]
     expect(finalRequest.messages).toContainEqual(expect.objectContaining({
-      role: 'tool', tool_call_id: 'action_call_4', content: expect.stringContaining('ACTION_LIMIT_EXCEEDED'),
+      role: 'tool', tool_call_id: 'action_call_4', content: expect.stringContaining('completedActions'),
     }))
-    expect(finalRequest).not.toHaveProperty('tools')
+    expect(finalRequest.tools?.map((tool) => tool.function.name)).toContain('browser_session_act')
   })
 
   it.each([

@@ -336,7 +336,8 @@ An `act` call contains at most ten actions. Main validates and executes them
 sequentially, rechecking the tab and origin before and after every action. It
 stops at the first failure and never executes the remaining suffix. Batching
 keeps ordinary form filling within the existing ten-decision Agent loop without
-weakening per-action checks. A run may execute at most 30 browser actions.
+weakening per-action checks. Browser actions have no cumulative per-run count
+limit; user cancellation and the existing Agent lifecycle remain authoritative.
 
 No tool accepts CSS, JavaScript, coordinates, a URL outside a bounded navigation
 action, a raw CDP method, another conversation ID, cookies, storage keys, HTTP
@@ -371,6 +372,13 @@ OTP values, CAPTCHA images, unrelated frames, and arbitrary screenshot pixels.
 Password/OTP/CAPTCHA controls are represented only as the presence of a manual
 authentication requirement.
 
+An exact visible certificate serial such as `证件编号` may be projected only
+when the trusted current-user request explicitly asks for a certificate number.
+The label and value use closed grammars, Chinese national identity-number shapes
+remain blocked, and the projected value follows the same run-local provider-only
+path as other page evidence. Audit rows and raw tool-result persistence remain
+redacted.
+
 `region_image` is available only when semantic inspection is insufficient, the
 selected model accepts image input, and `ref` identifies one visible safe
 region in the current snapshot. It captures no more than 1,000,000 pixels, never
@@ -399,7 +407,7 @@ Before an action, `BrowserActionGuard` verifies in this order:
 5. fresh snapshot and unique visible supported element;
 6. declared `manualActions` and host-owned protected-action policy;
 7. login, CAPTCHA, file, signature, payment, and unsupported-control policy;
-8. action, time, read-size, and no-progress budgets.
+8. active-time and per-inspection read-size budgets.
 
 Host-owned protected semantics include formal submission, confirmation of a
 change, signature, payment, publication, deletion, withdrawal, and logout.
@@ -547,18 +555,18 @@ as authorization.
 
 ## Operation Budgets
 
-Each continuation run has all of these limits:
+Each continuation run has these per-operation and lifecycle limits:
 
-- 30 executed browser actions;
 - ten actions in one `browser_session_act` batch;
 - five minutes of active browser-tool time;
-- three consecutive no-progress inspections or repeated equivalent actions;
 - 128 KiB and 500 semantic nodes per model-visible snapshot;
 - the existing ten provider decision limit for the Agent loop.
 
-Waiting for the user is not part of a running continuation: login and protected
-actions terminate the run and require a new message. Reaching any budget ends
-browser automation, reports progress, and leaves the page visible.
+There is no cumulative browser-action count limit and repeated equivalent
+inspections do not terminate browser authority. Waiting for the user is not part
+of a running continuation: login and protected actions terminate the run and
+require a new message. Reaching a per-operation or lifecycle budget ends browser
+automation, reports progress, and leaves the page visible.
 
 ## Renderer and Browser Workspace UX
 
@@ -628,7 +636,8 @@ replay, reveal filled values, or store screenshots.
   `AUTH_STATE_UNKNOWN`;
 - audit schemas reject page text, entered values, query/fragment URLs, and
   oversized target summaries;
-- action, time, no-progress, node, and byte limits count exactly as specified.
+- browser actions remain unbounded across batches while time, node, and byte
+  limits count exactly as specified.
 
 ### Main integration tests
 
@@ -674,12 +683,13 @@ visible Electron page -> Agent -> Renderer chain.
 
 Visible acceptance covers:
 
-- reading an authenticated expiry-date field and returning its exact evidence;
+- reading an explicitly requested authenticated expiry-date or certificate-number
+  field and returning its exact evidence;
 - manual-login handoff and continuation from a new user message;
 - visible AI indicator, stop, takeover, and protected-action highlight;
 - reversible form edits followed by a user-only final submission;
 - cross-conversation denial, origin blocking, stale-page failure, concurrency,
-  popup binding, and action-budget termination;
+  popup binding, unbounded cumulative actions, and lifecycle-budget termination;
 - redacted task audit with no personal field values.
 
 After deterministic verification, perform a user-assisted smoke test against

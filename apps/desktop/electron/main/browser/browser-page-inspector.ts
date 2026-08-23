@@ -261,6 +261,14 @@ const staticDateLabels: ReadonlySet<string> = new Set([
   'deadline date',
   'validity period',
 ])
+const requestScopedCertificateNumberLabels: ReadonlySet<string> = new Set([
+  '证件编号',
+  '证书编号',
+  '居住证编号',
+  '工作居住证编号',
+])
+const requestScopedCertificateNumber = /^[A-Z0-9][A-Z0-9./_-]{5,30}[A-Z0-9]$/iu
+const explicitCertificateNumberRequest = /(?:证件|证书|居住证|工作居住证)(?:的)?(?:编号|号码)/u
 
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
@@ -356,11 +364,6 @@ function structuredStaticField(
   if (unsafeStaticFieldRawText.test(rawText)) return null
   const delimiter = /[:：]/u.exec(rawText)
   if (!delimiter) return containsStaticDateEvidence(rawText) ? null : undefined
-  const safeOriginal = safeText(rawText)
-  if (!safeOriginal) return null
-  if (instructionLikeText.test(safeOriginal) || sensitiveStaticFieldLabel.test(safeOriginal.split(/[:：]/u)[0] ?? '')) {
-    return null
-  }
   if (rawText.slice(delimiter.index + delimiter[0].length).includes('：')) return null
   const label = normalizedText(rawText.slice(0, delimiter.index))
   const value = normalizedText(rawText.slice(delimiter.index + delimiter[0].length))
@@ -368,8 +371,18 @@ function structuredStaticField(
     || [...label].length > maxStaticFieldLabelLength
     || [...value].length > maxStaticFieldValueLength) return null
   const safeLabel = safeText(label)
+  if (!safeLabel) return null
+  if (requestScopedCertificateNumberLabels.has(safeLabel.toLowerCase())
+    && explicitCertificateNumberRequest.test(normalizedText(intent))
+    && requestScopedCertificateNumber.test(value)
+    && !chineseIdentity.test(value)
+    && !instructionLikeText.test(value)) {
+    return Object.freeze({ name: safeLabel, value })
+  }
+  const safeOriginal = safeText(rawText)
   const safeValue = safeText(value)
-  if (!safeLabel || !safeValue
+  if (!safeOriginal || instructionLikeText.test(safeOriginal)
+    || !safeValue
     || sensitiveStaticFieldLabel.test(safeLabel)
     || sensitiveText(`${safeLabel}: ${safeValue}`)
     || instructionLikeText.test(safeValue)) return null

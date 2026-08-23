@@ -146,7 +146,7 @@ const safeErrorMessages: Record<AppErrorCode, string> = {
   MANUAL_ACTION_REQUIRED: 'This browser action requires your confirmation.',
   PAGE_CHANGED: 'The browser page changed. Inspect it again before continuing.',
   UNSUPPORTED_CONTROL: 'This browser control is not supported.',
-  ACTION_LIMIT_EXCEEDED: 'The browser action limit was reached.',
+  ACTION_LIMIT_EXCEEDED: 'The browser operation exceeded a safety boundary.',
 }
 
 export function toSafeAppError(error: unknown): AppError {

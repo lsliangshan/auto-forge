@@ -660,7 +660,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
       const after = await inspect()
       return { code: resultCode(after), takenOver: true }
     }
-    if (input.name === 'actionLimit') {
+    if (input.name === 'actionsBeyondThirty') {
       let completedActions = 0
       for (let batch = 0; batch < 3; batch += 1) {
         const inspected = await inspect()
@@ -679,12 +679,15 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
       const inspected = await inspect()
       if (inspected.kind !== 'success') return { code: resultCode(inspected), completedActions }
       const page = snapshotFrom(inspected)
-      const limited = await executor.execute('browser_session_act', {
+      const continued = await executor.execute('browser_session_act', {
         bindingId,
         snapshotId: page.snapshotId,
         actions: [{ type: 'click', ref: findRef(page, /^保存进度草稿$/iu, 'button') }],
       }, current)
-      return { code: resultCode(limited), completedActions }
+      if (continued.kind === 'success') {
+        completedActions += Number(continued.data.completedActions ?? 0)
+      }
+      return { code: resultCode(continued), completedActions }
     }
     const inspected = await inspect()
     if (inspected.kind !== 'success') {

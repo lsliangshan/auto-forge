@@ -3,7 +3,6 @@ import type { ModelStreamEvent } from '../chat/model-provider.js'
 import {
   APPROVAL_EXPIRY_MS,
   MAX_AGENT_ACTIVE_MS,
-  MAX_BROWSER_ACTIONS,
   WorkflowToolLoop,
 } from './workflow-tool-loop.js'
 
@@ -49,16 +48,16 @@ describe('WorkflowToolLoop', () => {
     expect(loop.beginDecision()).toEqual({ kind: 'failed', code: 'TOOL_CALL_LIMIT' })
   })
 
-  it('counts browser actions separately from workflow starts and provider decisions', () => {
+  it('counts browser actions without imposing a per-run action limit', () => {
     const loop = new WorkflowToolLoop({ now: () => 0 })
 
-    expect(loop.recordBrowserActions(MAX_BROWSER_ACTIONS)).toEqual({
+    expect(loop.recordBrowserActions(30)).toEqual({
       kind: 'recorded', browserActions: 30,
     })
-    expect(loop.recordBrowserActions(1)).toEqual({
-      kind: 'failed', code: 'ACTION_LIMIT_EXCEEDED',
+    expect(loop.recordBrowserActions(1_000)).toEqual({
+      kind: 'recorded', browserActions: 1_030,
     })
-    expect(loop.browserActions()).toBe(30)
+    expect(loop.browserActions()).toBe(1_030)
     expect(loop.workflowExecutions()).toBe(0)
     expect(loop.modelDecisions()).toBe(0)
     expect(loop.startExecution('workflow', false, {})).toEqual({
