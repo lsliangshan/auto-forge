@@ -318,6 +318,79 @@ describe('BrowserPageInspector', () => {
   })
 
   it.each([
+    ['StaticText', '有效期至', '有效期至：2032年02月29日', '2032年02月29日'],
+    ['statictext', '有效期至', '有效期至：2032年02月29日', '2032年02月29日'],
+    ['static-text', '有效期至', '有效期至：2032年02月29日', '2032年02月29日'],
+    ['StaticText', '工作居住证有效期', '工作居住证有效期：2032年02月29日', '2032年02月29日'],
+    ['statictext', '工作居住证有效期', '工作居住证有效期：2032年02月29日', '2032年02月29日'],
+    ['static-text', '工作居住证有效期', '工作居住证有效期：2032年02月29日', '2032年02月29日'],
+  ])('projects one Chinese calendar value for %s role and %s label', async (rawRole, label, field, value) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, rawRole, field),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.nodes.filter((candidate) => candidate.value !== undefined)).toEqual([{
+      ref: expect.any(String), role: 'statictext', name: label, value, enabled: true, actions: [],
+    }])
+  })
+
+  it.each([
+    ['non-leap February 29', '有效期至：2023年02月29日', '2023年02月29日'],
+    ['impossible month', '有效期至：2032年13月01日', '2032年13月01日'],
+    ['impossible day for month', '有效期至：2032年04月31日', '2032年04月31日'],
+    ['zero year', '有效期至：0000年01月01日', '0000年01月01日'],
+    ['zero month', '有效期至：2032年00月01日', '2032年00月01日'],
+    ['zero day', '有效期至：2032年01月00日', '2032年01月00日'],
+  ])('drops a calendar-invalid Chinese static date with $case', async (_case, field, rejectedValue) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'StaticText', field),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.nodes).toHaveLength(1)
+    expect(snapshot.nodes).not.toContainEqual(expect.objectContaining({ value: rejectedValue }))
+    expect(JSON.stringify(snapshot)).not.toContain(rejectedValue)
+  })
+
+  it.each([
+    ['three-digit year', '有效期至：032年02月29日', '032年02月29日'],
+    ['five-digit year', '有效期至：12032年02月29日', '12032年02月29日'],
+    ['one-digit month', '有效期至：2032年2月29日', '2032年2月29日'],
+    ['one-digit day', '有效期至：2032年02月9日', '2032年02月9日'],
+    ['fullwidth digits', '有效期至：２０３２年０２月２９日', '２０３２年０２月２９日'],
+    ['Arabic-Indic digits', '有效期至：٢٠٣٢年٠٢月٢٩日', '٢٠٣٢年٠٢月٢٩日'],
+    ['missing final day marker', '有效期至：2032年02月29', '2032年02月29'],
+    ['ASCII hyphen separators with a final day marker', '有效期至：2032-02-29日', '2032-02-29日'],
+    ['slash separators', '有效期至：2032/02/29日', '2032/02/29日'],
+    ['dot separators', '有效期至：2032.02.29日', '2032.02.29日'],
+    ['space after the year', '有效期至：2032 年02月29日', '2032 年02月29日'],
+    ['space after the month marker', '有效期至：2032年02月 29日', '2032年02月 29日'],
+    ['appended prose', '有效期至：2032年02月29日请及时续期', '2032年02月29日请及时续期'],
+    ['Chinese calendar date range', '有效期至：2032年02月29日至2033年02月28日', '2032年02月29日至2033年02月28日'],
+    ['Chinese numerals', '有效期至：二〇三二年二月二十九日', '二〇三二年二月二十九日'],
+    ['Chinese calendar date-time', '有效期至：2032年02月29日T12:34:56+08:00', '2032年02月29日T12:34:56+08:00'],
+  ])('drops a near-miss Chinese static date with $case', async (_case, field, rejectedValue) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'StaticText', field),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.nodes).toHaveLength(1)
+    expect(snapshot.nodes).not.toContainEqual(expect.objectContaining({ value: rejectedValue }))
+    expect(JSON.stringify(snapshot)).not.toContain(rejectedValue)
+  })
+
+  it.each([
     '有效期',
     '有效期至',
     '证件有效期',
@@ -464,6 +537,7 @@ describe('BrowserPageInspector', () => {
 
   it.each([
     ['canonical date fragment', '有效期至：2028-06-30'],
+    ['canonical Chinese date fragment', '有效期至：2032年02月29日'],
     ['ordinary layout fragment', '行内布局片段'],
   ])('drops an InlineTextBox %s instead of exporting name-only evidence', async (_case, field) => {
     const port = new FakeCdpPort([

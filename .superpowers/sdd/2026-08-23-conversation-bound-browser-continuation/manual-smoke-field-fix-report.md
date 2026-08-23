@@ -254,3 +254,57 @@ Tests       24 failed | 105 passed (129)
 - Round 4 is committed together as `fix(browser): fail closed on static date hints`.
 
 The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 4.
+
+## Fix Round 5: strict Chinese calendar date value
+
+### Files changed
+
+- `apps/desktop/electron/main/browser/browser-page-inspector.ts`
+- `apps/desktop/electron/main/browser/browser-page-inspector.test.ts`
+- `apps/desktop/electron/main/agent/agent-orchestrator.test.ts`
+- `.superpowers/sdd/2026-08-23-conversation-bound-browser-continuation/manual-smoke-field-fix-report.md`
+
+### RED evidence
+
+The Chinese calendar value and real Inspector-to-Orchestrator behavior tests were added before the production change and run with:
+
+```text
+node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts \
+  electron/main/browser/browser-page-inspector.test.ts \
+  electron/main/agent/agent-orchestrator.test.ts
+
+Test Files  2 failed (2)
+Tests       7 failed | 284 passed (291)
+```
+
+- All six combinations of the two observed labels (`有效期至` and `工作居住证有效期`) and three accepted raw static-text roles produced no structured value.
+- The real Inspector snapshot therefore contained no requested field evidence, and AgentOrchestrator emitted the safe uncertainty response instead of the synthetic Main-owned answer.
+- Calendar-invalid dates, strict-shape near misses, Chinese date-time/range variants, and the new `InlineTextBox` regression already stayed absent during RED; the failures were confined to the missing positive value type.
+
+### GREEN contract and security analysis
+
+- `safeStaticDateValue` now accepts one additional value grammar only: exactly four ASCII digits, literal `年`, two ASCII digits, literal `月`, two ASCII digits, and final literal `日`.
+- The captured year/month/day are converted to the already-supported ISO shape and passed through the existing calendar validator, preserving its year floor, month/day bounds, and Gregorian leap-year behavior.
+- Variable-width years/months/days, year zero, fullwidth and Arabic-Indic digits, Chinese numerals, missing `日`, hyphen/slash/dot substitutions with Chinese markers, internal whitespace, appended prose, Chinese date-time, and Chinese date ranges remain rejected.
+- Existing ISO date, ISO date-time, and ISO date-range positives remain unchanged. Both observed labels project exactly one structured value for `StaticText`, `statictext`, and `static-text`; `InlineTextBox` remains wholly absent.
+- The Inspector-to-Orchestrator integration returns the unique synthetic field as a Main-owned answer with page source and read time. Provider prose and rejected page content remain excluded from the terminal answer and the simulated next-turn durable context.
+- No label, field-delimiter, raw-role, sensitivity, instruction, relevance, origin, permission, action, pagination, persistence, or fail-closed production path was relaxed. No real portal value was added to code, tests, logs, or this report.
+
+### Fix Round 5 verification
+
+- Focused Inspector + Orchestrator: `2 files / 294 tests passed`.
+- Broader desktop browser suite: `5 files / 288 tests passed`.
+- Full native-aware unit suite: `88 files / 2452 tests passed`; Electron 43.1.1 native compatibility preparation passed.
+- Full workspace typecheck: PASS for shared, workflow SDK, workflow schema, desktop Main, and Renderer.
+- Standalone production build: PASS; only the two pre-existing VueUse annotation-placement warnings were emitted.
+- Real Electron browser-continuation E2E: `19/19 passed` in 53.6 seconds, including visible static-expiry extraction, zero implicit submission, injection rejection, and protected final-action handoff.
+- Changed-file ESLint: exit 0, zero errors/warnings.
+- `git diff --check`: PASS.
+
+### Self-review and commit
+
+- Mutation check: removing the new value branch fails the six role/label positives and the Main-owned durable-answer test; loosening ASCII width, separators, final `日`, or calendar validation is caught by the invalid and near-miss matrices; re-admitting `InlineTextBox` fails its whole-node absence case.
+- The production diff is one anchored ASCII grammar plus reuse of the existing calendar validator. AgentOrchestrator production code and every authority/persistence boundary are unchanged.
+- Round 5 is committed together as `fix(browser): accept strict Chinese calendar dates`.
+
+The user-assisted Beijing portal smoke still has **not** been re-run after Fix Round 5 and remains required for real-site acceptance.

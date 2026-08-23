@@ -231,6 +231,7 @@ const filesystemPath = /(?:\bfile\s*:|\b(?:file|folder|directory)path\s*[:=]|(?:
 const sensitiveStaticFieldLabel = /(?:authorization|bearer|cookie|credential|password|passcode|pin|secret|session|token|api[-_ ]?key|access[-_ ]?key|refresh[-_ ]?key|密码|口令|密钥|秘钥|令牌|验证码|校验码|动态码|身份证|身份号码|证件号码|社会保障号|银行卡|信用卡|借记卡|姓名|住址|地址|手机号|联系电话|邮箱|电子邮件)/iu
 const instructionLikeText = /(?:(?:忽略|无视|覆盖|绕过).{0,16}(?:系统|策略|指令|提示)|(?:调用|使用|新增|添加|执行|提交|发送|上传|删除).{0,16}(?:工具|字段|数据|内容|请求)|(?:ignore|disregard|override|bypass).{0,24}(?:system|policy|prompt|instruction)|(?:call|invoke|add|submit|send|upload|delete).{0,24}(?:tool|field|data|content|request))/iu
 const isoStaticDate = /^(\d{4})-(\d{2})-(\d{2})$/u
+const chineseStaticDate = /^([0-9]{4})年([0-9]{2})月([0-9]{2})日$/u
 const isoStaticDateToken = /\d{4}-\d{2}-\d{2}/u
 const isoStaticDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|[+-](\d{2}):(\d{2}))$/u
 const isoStaticDateRange = /^(\d{4}-\d{2}-\d{2})\s*(?:至|到|~|～|–)\s*(\d{4}-\d{2}-\d{2})$/u
@@ -298,6 +299,8 @@ function validIsoStaticDate(value: string): boolean {
 
 function safeStaticDateValue(value: string): boolean {
   if (validIsoStaticDate(value)) return true
+  const chineseDate = chineseStaticDate.exec(value)
+  if (chineseDate && validIsoStaticDate(`${chineseDate[1]}-${chineseDate[2]}-${chineseDate[3]}`)) return true
   const range = isoStaticDateRange.exec(value)
   if (range) return validIsoStaticDate(range[1]!) && validIsoStaticDate(range[2]!)
   const dateTime = isoStaticDateTime.exec(value)
