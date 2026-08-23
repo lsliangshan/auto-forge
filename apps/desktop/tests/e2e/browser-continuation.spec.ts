@@ -177,12 +177,22 @@ test.describe.serial('conversation-bound browser continuation', () => {
   test('edits and autosaves a draft but requires an explicit user click for final submit', async () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details')
-    const result = await command<{ code: string; completedActions: number }>(electronApp, 'directScenario', {
-      name: 'draft', bindingId: binding.bindingId,
-      userText: '把聘用单位改为：北京网聘信息技术有限公司，并保存草稿',
-    })
+    await sendChat(
+      page,
+      electronApp,
+      conversationId,
+      '填写聘用单位：北京网聘信息技术有限公司，并点击保存草稿 E2E_DRAFT',
+    )
 
-    expect(result).toMatchObject({ code: 'OK', completedActions: 2 })
+    const draftAttempt = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerAttempts
+      .find((attempt) => attempt.conversationId === conversationId && attempt.name === 'browser_session_act')
+    expect(draftAttempt).toMatchObject({ offered: true, afterInspectedPageData: true })
+    expect(draftAttempt?.arguments).toEqual(expect.objectContaining({
+      actions: [
+        expect.objectContaining({ type: 'fill', source: { kind: 'current_user' } }),
+        expect.objectContaining({ type: 'click' }),
+      ],
+    }))
     expect(await command<string>(electronApp, 'tabFieldValue', {
       tabId: binding.tabId, selector: '#employer',
     })).toBe('北京网聘信息技术有限公司')
@@ -208,13 +218,21 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
   })
 
-  test('revokes the exact bound page when its workflow version changes', async () => {
+  test('revokes the exact bound page across a real same-version reinstall', async () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details', '1.0.0')
-    await command(electronApp, 'workflowVersionChanged', { bindingId: binding.bindingId })
+    const reinstalled = await command<{
+      workflowId: string
+      workflowVersion: string
+      securityFingerprint: string
+    }>(electronApp, 'reinstallFixtureWorkflow', { bindingId: binding.bindingId })
 
     expect(await command<HarnessSnapshot>(electronApp, 'snapshot')).toMatchObject({
       openTabs: 0, activeBindings: 0,
+    })
+    expect(reinstalled).toMatchObject({
+      workflowId: 'e2e.browser.workflow', workflowVersion: '1.0.0',
+      securityFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
     })
     const durable = await command<{ bindings: string }>(electronApp, 'durableRows', { conversationId })
     expect(durable.bindings).toContain('WORKFLOW_CHANGED')
@@ -223,6 +241,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
   test('binds only an allowed popup to the same conversation', async () => {
     const conversationId = await createConversation(page, electronApp)
     const binding = await seed(electronApp, conversationId, '/details')
+    const parentFingerprint = (await command<HarnessSnapshot>(electronApp, 'snapshot'))
+      .bindingDetails.find(({ bindingId }) => bindingId === binding.bindingId)?.securityFingerprint
+    expect(parentFingerprint).toMatch(/^[a-f0-9]{64}$/u)
     await command(electronApp, 'userClick', { tabId: binding.tabId, selector: '#allowed-popup' })
     await expect.poll(() => command<HarnessSnapshot>(electronApp, 'snapshot')).toMatchObject({
       activeBindings: 2,
@@ -230,17 +251,17 @@ test.describe.serial('conversation-bound browser continuation', () => {
       bindingDetails: [
         expect.objectContaining({
           conversationId,
-          workflowId: 'e2e.browser.continuation',
+          workflowId: 'e2e.browser.workflow',
           workflowVersion: '1.0.0',
           source: 'installed',
-          securityFingerprint: 'e'.repeat(64),
+          securityFingerprint: parentFingerprint,
         }),
         expect.objectContaining({
           conversationId,
-          workflowId: 'e2e.browser.continuation',
+          workflowId: 'e2e.browser.workflow',
           workflowVersion: '1.0.0',
           source: 'installed',
-          securityFingerprint: 'e'.repeat(64),
+          securityFingerprint: parentFingerprint,
         }),
       ],
     })
@@ -377,7 +398,10 @@ test.describe.serial('conversation-bound browser continuation', () => {
     expect(attempts.slice(0, 3).every(({ offered }) => !offered)).toBe(true)
     expect(attempts.slice(3).every(({ offered }) => offered)).toBe(true)
     expect(attempts[3]!.arguments).toEqual(expect.objectContaining({
-      actions: [{ type: 'navigate', url: `${fixture.disallowedOrigin}/landing` }],
+      actions: [expect.objectContaining({
+        type: 'navigate', url: `${fixture.disallowedOrigin}/landing`,
+        source: expect.objectContaining({ kind: 'page' }),
+      })],
     }))
     expect(attempts[4]!.arguments).toEqual(expect.objectContaining({
       actions: [expect.objectContaining({ type: 'click' })],
@@ -395,6 +419,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
     const conversationId = await createConversation(page, electronApp)
     await submitChat(page, '运行工作居住证完整链路 E2E_WORKFLOW_OPEN')
     await expect(page.getByText('需要授权').last()).toBeVisible()
+    await expect(page.getByText('browser.fill').last()).toBeVisible()
+    await page.getByTestId('approve-once').last().click()
+    await expect(page.getByText('browser.click').last()).toBeVisible()
     await page.getByTestId('approve-once').last().click()
     await command(electronApp, 'waitForIdle', { conversationId })
     await expect(page.getByText(/调用完成.*E2E 工作居住证/).last()).toBeVisible()

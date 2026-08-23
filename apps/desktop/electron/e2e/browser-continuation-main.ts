@@ -52,6 +52,10 @@ import { registerDesktopIpc } from '../main/ipc/register-ipc.js'
 import { createMediaProtocolHandler } from '../main/media/media-protocol.js'
 import { NetworkProxyService } from '../main/network/network-proxy-service.js'
 import { createSecureWindow } from '../main/window.js'
+import {
+  browserPermissionMatrix,
+  workflowSecurityFingerprint,
+} from '../main/workflows/workflow-security-fingerprint.js'
 
 const certificateFingerprint = '0E:B3:8E:EE:8E:72:4A:4C:DF:82:A0:7E:70:A1:75:8E:3E:14:53:C8:DB:92:45:C2:C2:20:89:D4:47:EB:1E:AD'
 const offeredBrowserTools = [
@@ -201,7 +205,7 @@ function currentUserText(request: ModelStreamRequest): string {
 
 function inspectedSnapshot(request: ModelStreamRequest): {
   snapshotId: string
-  nodes: Array<{ ref: string; name: string }>
+  nodes: Array<{ ref: string; name: string; role: string }>
 } | undefined {
   const content = lastToolContent(request)
   if (!content?.includes('UNTRUSTED_BROWSER_PAGE_DATA')) return undefined
@@ -210,12 +214,14 @@ function inspectedSnapshot(request: ModelStreamRequest): {
   try {
     const parsed = JSON.parse(serialized) as {
       kind?: string
-      data?: { snapshot?: { snapshotId?: string; nodes?: Array<{ ref?: string; name?: string }> } }
+      data?: { snapshot?: { snapshotId?: string; nodes?: Array<{ ref?: string; name?: string; role?: string }> } }
     }
     const snapshot = parsed.data?.snapshot
     if (parsed.kind !== 'success' || !snapshot?.snapshotId || !Array.isArray(snapshot.nodes)) return undefined
     const nodes = snapshot.nodes
-      .filter((node): node is { ref: string; name: string } => typeof node.ref === 'string' && typeof node.name === 'string')
+      .filter((node): node is { ref: string; name: string; role: string } => (
+        typeof node.ref === 'string' && typeof node.name === 'string' && typeof node.role === 'string'
+      ))
     return { snapshotId: snapshot.snapshotId, nodes }
   } catch {
     return undefined
@@ -356,10 +362,33 @@ const deterministicProvider: CredentialBoundModelProvider = {
         return
       }
       if (userText.includes('E2E_INJECT_DISALLOWED_ORIGIN')) {
+        const disallowedRef = page.nodes.find((node) => /未授权来源/iu.test(node.name))?.ref
+        if (!disallowedRef) throw new Error('The real inspected snapshot did not contain the injected navigation link')
         yield attemptedToolCall(request, conversationId, 'browser_session_act', {
           bindingId,
           snapshotId: page.snapshotId,
-          actions: [{ type: 'navigate', url: `${disallowedOrigin}/landing` }],
+          actions: [{
+            type: 'navigate', url: `${disallowedOrigin}/landing`,
+            source: { kind: 'page', snapshotId: page.snapshotId, ref: disallowedRef },
+          }],
+        })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
+      if (userText.includes('E2E_DRAFT')) {
+        const employerRef = page.nodes.find((node) => /聘用单位/iu.test(node.name) && node.role === 'textbox')?.ref
+        const saveRef = page.nodes.find((node) => /^保存草稿$/iu.test(node.name) && node.role === 'button')?.ref
+        if (!employerRef || !saveRef) throw new Error('The real inspected snapshot did not contain the draft controls')
+        yield attemptedToolCall(request, conversationId, 'browser_session_act', {
+          bindingId,
+          snapshotId: page.snapshotId,
+          actions: [
+            {
+              type: 'fill', ref: employerRef, value: '北京网聘信息技术有限公司',
+              source: { kind: 'current_user' },
+            },
+            { type: 'click', ref: saveRef },
+          ],
         })
         yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
         return
@@ -398,6 +427,7 @@ let mainWindow: BrowserWindow | null = null
 let runtime: Runtime | undefined
 let disposeIpc: (() => void) | undefined
 let agentState: { hasActiveRuns(): boolean } | undefined
+let fixtureWorkflowProjectId: string | undefined
 const busyRuns = new Map<string, string>()
 
 interface InspectionPause {
@@ -467,7 +497,6 @@ function context(bindingId: string, conversationId: string, userText: string): B
     conversationId,
     runId: `direct_${randomUUID()}`,
     currentUser: { messageId: `message_${randomUUID()}`, text: userText },
-    referencedHistory: [],
   }
 }
 
@@ -553,7 +582,13 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
     if (input.name === 'disallowed') {
       const acted = await executor.execute('browser_session_act', {
         bindingId, snapshotId: page.snapshotId,
-        actions: [{ type: 'navigate', url: `${disallowedOrigin}/landing` }],
+        actions: [{
+          type: 'navigate', url: `${disallowedOrigin}/landing`,
+          source: {
+            kind: 'page', snapshotId: page.snapshotId,
+            ref: findRef(page, /未授权来源/iu, 'link'),
+          },
+        }],
       }, current)
       return { code: resultCode(acted) }
     }
@@ -568,22 +603,6 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
         actions: [{ type: 'click', ref: findRef(page, /保存草稿 V/iu) }],
       }, current)
       return { code: resultCode(acted) }
-    }
-    if (input.name === 'draft') {
-      const acted = await executor.execute('browser_session_act', {
-        bindingId, snapshotId: page.snapshotId,
-        actions: [
-          {
-            type: 'fill', ref: findRef(page, /聘用单位/iu, 'textbox'),
-            value: '北京网聘信息技术有限公司', source: { kind: 'current_user' },
-          },
-          { type: 'click', ref: findRef(page, /^保存草稿$/iu) },
-        ],
-      }, current)
-      return {
-        code: resultCode(acted),
-        completedActions: acted.kind === 'success' ? acted.data.completedActions : 0,
-      }
     }
     if (input.name === 'injection') {
       const acted = await executor.execute('browser_session_act', {
@@ -607,35 +626,18 @@ async function seedBinding(input: Record<string, unknown>): Promise<{ bindingId:
   const authenticate = input.authenticate !== false
   const chatRunId = `seed_run_${randomUUID()}`
   const executionId = `seed_execution_${randomUUID()}`
+  const workflow = await runtime!.services.workflows.get('e2e.browser.workflow', workflowVersion)
   const provenance: Omit<BrowserContinuationBindingInput, 'tabId'> = {
     userId,
     conversationId,
     chatRunId,
     executionId,
-    workflowId: 'e2e.browser.continuation',
+    workflowId: workflow.id,
     workflowVersion,
     source: 'installed',
-    securityFingerprint: 'e'.repeat(64),
-    permissionMatrix: {
-      'browser.open': [fixtureOrigin],
-      'browser.url': [fixtureOrigin],
-      'browser.fill': [fixtureOrigin],
-      'browser.click': [fixtureOrigin],
-    },
-    browserContinuation: {
-      auth: {
-        loginUrls: [`${fixtureOrigin}/login`],
-        loggedIn: ['role=button[name="退出"]'],
-        loggedOut: ['css=#manual-login'],
-      },
-      readableRegions: ['role=main'],
-      manualActions: [
-        { locator: 'css=#final-submit', reason: '正式提交必须由用户完成' },
-        { locator: 'css=#file-control', reason: '附件上传必须由用户完成' },
-        { locator: 'css=#signature-control', reason: '签名必须由用户完成' },
-        { locator: 'css=#payment-control', reason: '付款必须由用户完成' },
-      ],
-    },
+    securityFingerprint: workflowSecurityFingerprint(workflow),
+    permissionMatrix: browserPermissionMatrix(workflow),
+    browserContinuation: workflow.browserContinuation,
   }
   const database = openAppDatabase(databasePath)
   try {
@@ -723,7 +725,7 @@ function durableRows(conversationId: string): { bindings: string; audits: string
   }
 }
 
-async function installFixtureWorkflow(): Promise<void> {
+async function installFixtureWorkflow(): Promise<string> {
   if (!runtime) throw new Error('Application runtime is unavailable')
   const project = await runtime.services.developer.createProject('E2E Browser Continuation')
   const manifest = JSON.parse(
@@ -740,6 +742,7 @@ async function installFixtureWorkflow(): Promise<void> {
     permissions: [
       { capability: 'browser.open', scope: { origins: [fixtureOrigin] } },
       { capability: 'browser.url', scope: { origins: [fixtureOrigin] } },
+      { capability: 'browser.fill', scope: { origins: [fixtureOrigin] } },
       { capability: 'browser.click', scope: { origins: [fixtureOrigin] } },
     ],
     browserContinuation: {
@@ -765,6 +768,7 @@ async function installFixtureWorkflow(): Promise<void> {
   ].join('\n'))
   await runtime.services.developer.build(project.id)
   await runtime.services.workflows.installProject(project.id)
+  return project.id
 }
 
 async function dispatch(name: string, input: Record<string, unknown>): Promise<unknown> {
@@ -845,15 +849,17 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     return
   }
   if (name === 'deleteConversation') return runtime.services.chat.deleteConversation(String(input.conversationId))
-  if (name === 'workflowVersionChanged') {
+  if (name === 'reinstallFixtureWorkflow') {
     const binding = registry().get(String(input.bindingId))
     if (!binding) throw new Error('Binding is unavailable')
-    return registry().revokeWorkflow({
-      workflowId: binding.workflowId,
-      workflowVersion: binding.workflowVersion,
-      source: binding.source,
-      ...(binding.buildHash === undefined ? {} : { buildHash: binding.buildHash }),
-    }, 'WORKFLOW_CHANGED')
+    if (!fixtureWorkflowProjectId) throw new Error('Fixture workflow project is unavailable')
+    await runtime.services.workflows.remove(binding.workflowId, binding.workflowVersion)
+    const reinstalled = await runtime.services.workflows.installProject(fixtureWorkflowProjectId)
+    return {
+      workflowId: reinstalled.id,
+      workflowVersion: reinstalled.version,
+      securityFingerprint: workflowSecurityFingerprint(reinstalled),
+    }
   }
   if (name === 'logoutAndLogin') {
     await runtime.services.auth.logout()
@@ -917,7 +923,7 @@ async function initialize(): Promise<void> {
     defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/e2e-browser' } },
     proxy: { enabled: true, httpsProxy: fixtureProxy, bypassDomains: [] },
   })
-  await installFixtureWorkflow()
+  fixtureWorkflowProjectId = await installFixtureWorkflow()
   await workspace.updateProxy()
   await protocol.handle('autoforge-media', createMediaProtocolHandler(runtime.mediaAssets))
 
