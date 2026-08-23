@@ -761,7 +761,8 @@ describe('ElectronBrowserWorkspace', () => {
     expect(reused).toBe(first)
     expect(secondWorkflow).not.toBe(first)
     expect(secondUser).not.toBe(first)
-    const targetPreferences = views.slice(1).map((view) => view.options.webPreferences)
+    const targetPreferences = [views[1], views[3], views[4]]
+      .map((view) => view!.options.webPreferences)
     expect(targetPreferences[0]).toMatchObject({
       partition: browserPartition('user_1'), nodeIntegration: false, contextIsolation: true,
       sandbox: true, webSecurity: true, webviewTag: false, allowRunningInsecureContent: false,
@@ -837,6 +838,50 @@ describe('ElectronBrowserWorkspace', () => {
 
     expect(replacement.ownerRunId).toBe('run_3')
     await replacement.release()
+  })
+
+  it('preloads one detached input shield before a continuation-capable target acquisition returns', async () => {
+    const { workspace, views, windows } = createHarness()
+
+    await workspace.acquire(executionInput())
+
+    const [toolbar, target, shield] = views
+    expect(views).toHaveLength(3)
+    expect(shield!.webContents.loaded).toHaveLength(1)
+    expect(shield!.webContents.destroyed).toBe(false)
+    expect(windows[0]!.children).toContain(toolbar)
+    expect(windows[0]!.children).toContain(target)
+    expect(windows[0]!.children).not.toContain(shield)
+  })
+
+  it('does not create an input shield for an ordinary non-continuation target', async () => {
+    const { workspace, views, windows } = createHarness()
+
+    await acquire(workspace, 'exec_ordinary')
+
+    expect(views).toHaveLength(2)
+    expect(windows[0]!.children).toEqual([views[0], views[1]])
+  })
+
+  it('closes an unpublished continuation target when its input shield fails to load', async () => {
+    const { workspace, views, windows } = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          throw new Error('shield document failed to load')
+        }
+      },
+    )
+
+    await expect(workspace.acquire(executionInput())).rejects.toThrow('shield document failed to load')
+
+    const [, target, shield] = views
+    expect(views).toHaveLength(3)
+    expect(target!.webContents.destroyed).toBe(true)
+    expect(shield!.webContents.destroyed).toBe(true)
+    expect(windows[0]!.children).not.toContain(target)
+    expect(windows[0]!.children).not.toContain(shield)
   })
 
   it.each(['read', 'screenshot'] as const)(
@@ -1054,60 +1099,49 @@ describe('ElectronBrowserWorkspace', () => {
         }
       },
     )
-    const { workspace, views } = harness
-    const registry = continuationRegistry(workspace)
-    workspace.setContinuationRegistry(registry)
+    const { workspace, views, windows } = harness
     const firstInput = executionInput()
-    const first = await workspace.acquire(firstInput)
-    const firstBinding = registry.bind({
-      ...firstInput, tabId: first.id,
-    } as BrowserContinuationBindingInput)
-    await workspace.releaseExecution(firstInput.executionId)
+    const first = workspace.acquire(firstInput)
+    await vi.waitFor(() => expect(views).toHaveLength(3))
     const secondInput = executionInput({
       executionId: 'e2', chatRunId: 'chat_run_2', workflowId: 'workflow.two',
     })
-    const second = await workspace.acquire(secondInput)
-    const secondBinding = registry.bind({
-      ...secondInput, tabId: second.id,
-    } as BrowserContinuationBindingInput)
-    await workspace.releaseExecution(secondInput.executionId)
-
-    const firstLease = registry.acquire(firstBinding.bindingId, {
-      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_first',
-    })
-    const secondLease = registry.acquire(secondBinding.bindingId, {
-      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_second',
-    })
+    const second = workspace.acquire(secondInput)
     await vi.waitFor(() => expect(views).toHaveLength(4))
-    const shield = views[3]!
+    const shield = views[2]!
     expect(shield.webContents.loaded).toHaveLength(1)
 
     shieldLoad.resolve()
-    const leases = await Promise.all([firstLease, secondLease])
+    await Promise.all([first, second])
 
     expect(views).toHaveLength(4)
-    await leases[0].release()
-    await leases[1].release()
+    expect(windows[0]!.children).not.toContain(shield)
+    await workspace.releaseExecution(firstInput.executionId)
+    await workspace.releaseExecution(secondInput.executionId)
   })
 
   it('allows exactly one same-binding continuation to claim a tab while the shield loads', async () => {
     const shieldLoad = deferred<void>()
+    let shieldLoads = 0
     const harness = createHarness(
       () => ({}), false,
       async (url) => {
         if (url.startsWith('data:text/html')
-          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')
+          && ++shieldLoads === 2) {
           await shieldLoad.promise
         }
       },
     )
     const { views, windows } = harness
     const { binding, registry } = await bindIdleContinuation(harness)
+    expect(views).toHaveLength(3)
+    views[2]!.webContents.close()
 
     const first = registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_first',
     })
-    await vi.waitFor(() => expect(views).toHaveLength(3))
+    await vi.waitFor(() => expect(views).toHaveLength(4))
     const second = registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_second',
     })
@@ -1121,27 +1155,31 @@ describe('ElectronBrowserWorkspace', () => {
     expect(rejected[0]).toMatchObject({ reason: { code: 'PAGE_BUSY' } })
     const lease = fulfilled[0]!.value
     expect(lease.isCurrent(binding)).toBe(true)
-    expect(windows[0]!.children).toEqual([views[1], views[2], views[0]])
+    expect(windows[0]!.children).toEqual([views[1], views[3], views[0]])
     await lease.release()
   })
 
   it('returns PAGE_BUSY when workflow ownership is claimed while the shield loads', async () => {
     const shieldLoad = deferred<void>()
+    let shieldLoads = 0
     const harness = createHarness(
       () => ({}), false,
       async (url) => {
         if (url.startsWith('data:text/html')
-          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')
+          && ++shieldLoads === 2) {
           await shieldLoad.promise
         }
       },
     )
     const { workspace, views, windows } = harness
     const { tab, binding, registry } = await bindIdleContinuation(harness)
+    expect(views).toHaveLength(3)
+    views[2]!.webContents.close()
     const continuation = registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_continuation',
     })
-    await vi.waitFor(() => expect(views).toHaveLength(3))
+    await vi.waitFor(() => expect(views).toHaveLength(4))
 
     const workflow = await workspace.acquire(executionInput({
       executionId: 'e2', chatRunId: 'chat_run_2',
@@ -1154,28 +1192,33 @@ describe('ElectronBrowserWorkspace', () => {
     expect(windows[0]!.children).toContain(views[0])
     expect(windows[0]!.children).toContain(views[1])
     expect(windows[0]!.children).not.toContain(views[2])
+    expect(windows[0]!.children).not.toContain(views[3])
     await workspace.releaseExecution('e2')
   })
 
   it('closes an input shield whose window is replaced while its document loads', async () => {
     const shieldLoad = deferred<void>()
+    let shieldLoads = 0
     const harness = createHarness(
       () => ({}), false,
       async (url) => {
         if (url.startsWith('data:text/html')
-          && decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')
+          && ++shieldLoads === 2) {
           await shieldLoad.promise
         }
       },
     )
     const { workspace, views } = harness
     const { binding, registry } = await bindIdleContinuation(harness)
+    expect(views).toHaveLength(3)
+    views[2]!.webContents.close()
 
     const acquiring = registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_stale',
     })
-    await vi.waitFor(() => expect(views).toHaveLength(3))
-    const staleShield = views[2]!
+    await vi.waitFor(() => expect(views).toHaveLength(4))
+    const staleShield = views[3]!
     const resetting = workspace.reset()
     shieldLoad.resolve()
 
@@ -1409,7 +1452,7 @@ describe('ElectronBrowserWorkspace', () => {
     dispatched.resolve({})
     await expect(clicking).rejects.toMatchObject({ code: 'CANCELLED' })
     await vi.waitFor(() => {
-      expect(windows[0]!.children).toContain(views[2])
+      expect(windows[0]!.children).toContain(views[3])
       expect(windows[0]!.children).not.toContain(views[1])
     })
     await lease.release()
@@ -1452,7 +1495,7 @@ describe('ElectronBrowserWorkspace', () => {
     })
 
     expect(registry.list('user_1', 'conversation_1')).toHaveLength(1)
-    expect(views).toHaveLength(2)
+    expect(views).toHaveLength(3)
   })
 
   it('closes an unbound provisional popup when its load rejects', async () => {
@@ -1472,8 +1515,8 @@ describe('ElectronBrowserWorkspace', () => {
 
     views[1]!.webContents.windowOpenHandler?.({ url: popupUrl })
 
-    await vi.waitFor(() => expect(views).toHaveLength(3))
-    await vi.waitFor(() => expect(views[2]!.webContents.destroyed).toBe(true))
+    await vi.waitFor(() => expect(views).toHaveLength(4))
+    await vi.waitFor(() => expect(views[3]!.webContents.destroyed).toBe(true))
     expect(bindPopup).not.toHaveBeenCalled()
     expect(registry.list(input.userId, input.conversationId!)).toHaveLength(1)
   })
@@ -1495,8 +1538,8 @@ describe('ElectronBrowserWorkspace', () => {
 
     views[1]!.webContents.windowOpenHandler?.({ url: popupUrl })
 
-    await vi.waitFor(() => expect(views).toHaveLength(3))
-    await vi.waitFor(() => expect(views[2]!.webContents.destroyed).toBe(true))
+    await vi.waitFor(() => expect(views).toHaveLength(4))
+    await vi.waitFor(() => expect(views[3]!.webContents.destroyed).toBe(true))
     expect(bindPopup).not.toHaveBeenCalled()
     expect(registry.list(input.userId, input.conversationId!)).toHaveLength(1)
   })

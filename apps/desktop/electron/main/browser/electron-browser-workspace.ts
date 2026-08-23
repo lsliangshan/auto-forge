@@ -1098,6 +1098,14 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     })
     await view.webContents.loadURL('about:blank')
     const continuation = continuationFromAcquire(input)
+    if (continuation) {
+      try {
+        await this.ensureInputShield()
+      } catch (error) {
+        if (!view.webContents.isDestroyed()) view.webContents.close()
+        throw error
+      }
+    }
     const state: TargetTabState = {
       id: randomUUID(),
       userId: input.userId,
