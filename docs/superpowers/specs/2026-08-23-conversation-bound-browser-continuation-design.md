@@ -442,9 +442,34 @@ one-run-per-conversation admission remains unchanged.
 The trusted browser toolbar and chat status card both expose “停止” and “接管”.
 Stop cancels the Agent run. Takeover cancels pending browser actions, releases
 the lease, keeps the page visible, and lets the Agent finalize with a safe
-user-takeover result. A clear user keyboard or pointer event outside the short
-executor-owned input window is treated as takeover; automation and manual input
-are never intentionally interleaved.
+user-takeover result.
+
+While a continuation lease owns the active target tab, a dedicated trusted
+`WebContentsView` named the input shield sits between the target view and the
+52-pixel trusted toolbar. Its bounds cover only the target content area. Its
+native Electron background and its full-viewport document use the minimum
+nonzero alpha that participates in native hit testing while remaining visually
+imperceptible. The view absorbs physical pointer and keyboard input; it does
+not forward that input, mutate the target page, or convert it into implicit
+takeover or cancellation. Explicit “停止” and “接管” controls remain available
+above the shield.
+
+The shield is created with the browser workspace and loaded once. Lease
+acquisition synchronously sizes and inserts it above the target before
+acquisition returns. Terminal completion, failure, cancellation, handoff, and
+explicit takeover synchronously remove it before releasing control to the
+user. The stacking order during automation is target, input shield, then
+trusted toolbar. Outside automation the shield is detached, so the user can
+interact with the target normally.
+
+CDP automation continues to target the underlying target `webContents`
+directly, so it is not routed through the shield. Target `before-mouse-event`
+handling remains defense in depth only: a leaked non-synthetic event is
+prevented without ending the run, and no security guarantee relies on timing or
+event-source classification. This explicit-shield design supersedes implicit
+keyboard/pointer takeover during an active continuation; takeover is an
+explicit trusted control, so automation and manual input are never
+intentionally interleaved.
 
 ## Data Flow
 
@@ -544,6 +569,13 @@ During continuation, the chat status card and trusted browser toolbar show:
 - a visible automation indicator;
 - “停止” and “接管” controls.
 
+The target page remains visibly unchanged beneath a transparent input shield,
+but target-page pointer and keyboard interaction is disabled for the full
+continuation lease. The shield is not a model-controlled page overlay and is
+not injected into the remote site's DOM. It disappears synchronously when the
+Agent run ends or the user explicitly stops or takes over, after which ordinary
+target-page interaction resumes immediately.
+
 The model cannot generate or modify this status. Final-action and login handoff
 focuses the exact tab and explains what the user must do. Protected controls may
 be highlighted, but AutoForge never overlays or simulates the user's final
@@ -617,6 +649,16 @@ replay, reveal filled values, or store screenshots.
 - raw snapshots and tool results are absent from messages, summaries, logs, and
   audit rows after completion;
 - chat cancellation and takeover stop pending CDP work and release the lease;
+- lease acquisition synchronously installs a dedicated target-sized input
+  shield with stacking `target < shield < toolbar`, while CDP still reaches the
+  target directly;
+- physical input delivered to the shield does not mutate the target, revoke the
+  binding, invalidate the page, cancel pending work, or release the lease;
+- completion, failure, cancellation, handoff, and explicit takeover all remove
+  the shield before target interaction resumes, including cleanup failures and
+  replacement-run races;
+- the shield's native and document paint remain visually imperceptible, while
+  loading and blocked-origin trusted surfaces retain their existing appearance;
 - conversation deletion closes bound tabs before database deletion;
 - logout closes tabs and revokes bindings while preserving the user's partition;
 - clear-browser-data removes that partition's site state;
