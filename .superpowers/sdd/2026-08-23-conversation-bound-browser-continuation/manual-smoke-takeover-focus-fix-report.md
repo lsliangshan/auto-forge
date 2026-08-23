@@ -186,3 +186,90 @@ git diff --check
 - CDP target dispatch remains functional while ownership is held; a simultaneous real pointer cannot reach that target because the trusted topmost shield owns the hit area.
 - The public trusted-toolbar takeover path is exercised rather than low-level release. Existing Stop, loading, blocked-origin, and target keyboard paths remain green.
 - No configuration, IPC contract, or visible product UI was added. The E2E probe is intentionally the only added harness surface, required to exercise the real Electron view boundary.
+
+## Fix Round 2 — persistent composited toolbar hit surface
+
+### Root cause and files changed
+
+The user's physical-click smoke after restarting Main at `1403e0f` reproduced the bug: a click in visible target content reached the target `before-mouse-event` and cancelled the lease. Although the full-height trusted `WebContentsView` was topmost, its transparent area below the 52px bar had no full-viewport DOM element or nonzero composited paint, so the native click passed through it.
+
+- `apps/desktop/electron/main/browser/electron-browser-workspace.ts`
+- `apps/desktop/electron/e2e/browser-continuation-main.ts`
+- `apps/desktop/tests/e2e/browser-continuation.spec.ts`
+- This report.
+
+### Implementation
+
+- The toolbar document always contains an `aria-hidden` `data-autoforge-input-shield` element, including before any continuation lease is acquired.
+- `html` and `body` now explicitly fill the viewport. The surface is fixed to the content below the 52px toolbar, has `pointer-events:auto`, and uses `rgb(0 0 0 / 0.004)`: the smallest nonzero alpha that Chromium reports for a one-step 8-bit composited paint while remaining visually imperceptible.
+- The toolbar, loading surface, and blocked surface are above it with their existing appearance and controls. No ownership, CDP, keyboard, Stop, or Takeover logic changed.
+
+### TDD evidence
+
+#### RED
+
+Before the production document/CSS edit, I added the real Electron harness query and behavior test, then ran:
+
+```text
+pnpm --filter @autoforge/desktop exec tsup electron/e2e/browser-continuation-main.ts --format esm --platform node --external electron --external better-sqlite3 --out-dir .e2e/main --clean && \
+pnpm --filter @autoforge/desktop exec playwright test tests/e2e/browser-continuation.spec.ts --grep "pre-rendered composited hit surface"
+
+1 failed
+Received value: undefined
+at expect(before.surface).toMatchObject({ pointerEvents: 'auto' })
+```
+
+This is the required pre-ownership failure: the trusted toolbar document had no hit surface. It would also fail if the element were removed. Removing its viewport coverage fails the post-acquisition dimensions/`elementFromPoint` assertion; making its paint fully transparent fails the positive-alpha assertion.
+
+#### GREEN
+
+The same focused real-Electron command after the minimal production edit:
+
+```text
+1 passed (4.8s)
+```
+
+The probe proves the surface exists while the native view is still only 52px high. After `acquireContinuation()` returns, the already-rendered surface fills the synchronously expanded trusted view; a point at `(24, 96)` resolves to it, with `pointer-events:auto`, target-sized bounds, and `0 < alpha <= 0.004`. The existing direct-CDP assertion remains green in that same owned interval.
+
+Chromium serializes the supplied one-step alpha as `0.004`, so the test uses that exact upper bound rather than the unrounded mathematical `1 / 255`.
+
+### Full verification
+
+```text
+pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/browser/electron-browser-workspace.test.ts
+# PASS: 1 file / 66 tests
+
+pnpm --filter @autoforge/desktop exec node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts \
+  electron/main/browser/electron-browser-workspace.test.ts \
+  electron/main/browser/browser-continuation-registry.test.ts \
+  electron/main/browser/browser-page-inspector.test.ts \
+  electron/main/agent/browser-continuation-catalog.test.ts \
+  electron/main/agent/browser-continuation-tool-executor.test.ts
+# PASS: 5 files / 285 tests
+
+pnpm test
+# PASS: 88 files / 2455 tests
+
+pnpm typecheck
+# PASS: all workspace packages plus desktop Node and Renderer checks
+
+pnpm test:e2e:browser-continuation
+# PASS: 21 passed (1.0m), including the new persistent-hit-surface check
+
+pnpm exec eslint apps/desktop/electron/main/browser/electron-browser-workspace.ts \
+  apps/desktop/electron/e2e/browser-continuation-main.ts \
+  apps/desktop/tests/e2e/browser-continuation.spec.ts
+# PASS: exit 0, no output
+
+pnpm build
+# PASS: exit 0; only existing third-party VueUse annotation-placement warnings
+
+git diff --check
+# PASS: exit 0, no output
+```
+
+### Self-review and evidence limit
+
+- The input surface is persistent before ownership, so synchronous native view expansion does not depend on asynchronous `renderToolbar()` completion.
+- It is bounded below the existing trusted toolbar and deliberately below the loading/blocked trusted surfaces; their visual and hit-testing behavior remains unchanged.
+- The E2E harness can inspect the real `BaseWindow`/`WebContentsView` DOM, bounds, and direct-CDP-to-target path, but it has no OS-level pointer injector for this separate native `BaseWindow` and no composite-window bitmap capture API. Therefore it cannot independently prove the macOS compositor's physical-click result or a pixel-difference tolerance against the underlying target. The persistent element, full viewport sizing, `elementFromPoint` result, and nonzero composited paint are the strongest available automated preconditions; the user's repeated physical-click smoke after this commit is the remaining closure evidence.

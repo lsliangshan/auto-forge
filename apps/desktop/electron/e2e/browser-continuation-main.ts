@@ -425,6 +425,14 @@ type TargetState = {
   }; getBounds(): { x: number; y: number; width: number; height: number } }
 }
 
+interface TrustedToolbarHitSurface {
+  pointerEvents: string
+  backgroundAlpha: number
+  width: number
+  height: number
+  containsPoint: boolean
+}
+
 let mainWindow: BrowserWindow | null = null
 let runtime: Runtime | undefined
 let disposeIpc: (() => void) | undefined
@@ -836,6 +844,30 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     if (!target || target.closed) return { url: '', blockedErrorCode: 'PAGE_CLOSED' }
     return { url: target.view.webContents.getURL(), blockedErrorCode: target.blockedErrorCode }
   }
+  if (name === 'shieldSurfaceState') {
+    const internals = workspace as unknown as { toolbar?: WebContentsView }
+    const toolbar = internals.toolbar
+    if (!toolbar) throw new Error('Trusted toolbar shield is unavailable')
+    return {
+      toolbarBounds: toolbar.getBounds(),
+      surface: await toolbar.webContents.executeJavaScript(`
+        (() => {
+          const surface = document.querySelector('[data-autoforge-input-shield]')
+          if (!(surface instanceof HTMLElement)) return undefined
+          const style = getComputedStyle(surface)
+          const alpha = Number((style.backgroundColor.match(/rgba?\\([^,]+,[^,]+,[^,]+(?:,\\s*([^)]+))?\\)/)?.[1]) ?? 1)
+          const bounds = surface.getBoundingClientRect()
+          return {
+            pointerEvents: style.pointerEvents,
+            backgroundAlpha: alpha,
+            width: bounds.width,
+            height: bounds.height,
+            containsPoint: surface.contains(document.elementFromPoint(24, 96)),
+          }
+        })()
+      `) as TrustedToolbarHitSurface | undefined,
+    }
+  }
   if (name === 'shieldProbe') {
     const binding = registry().get(String(input.bindingId))
     const target = binding ? targets().get(binding.tabId) : undefined
@@ -872,6 +904,22 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
         toolbarBackground: String(await toolbar.webContents.executeJavaScript(
           'getComputedStyle(document.body).backgroundColor',
         )),
+        hitSurface: await toolbar.webContents.executeJavaScript(`
+          (() => {
+            const surface = document.querySelector('[data-autoforge-input-shield]')
+            if (!(surface instanceof HTMLElement)) return undefined
+            const style = getComputedStyle(surface)
+            const alpha = Number((style.backgroundColor.match(/rgba?\\([^,]+,[^,]+,[^,]+(?:,\\s*([^)]+))?\\)/)?.[1]) ?? 1)
+            const bounds = surface.getBoundingClientRect()
+            return {
+              pointerEvents: style.pointerEvents,
+              backgroundAlpha: alpha,
+              width: bounds.width,
+              height: bounds.height,
+              containsPoint: surface.contains(document.elementFromPoint(24, 96)),
+            }
+          })()
+        `) as TrustedToolbarHitSurface | undefined,
         shieldMouseEvents,
         targetMouseEvents: targetMouseEventsAfterShield,
         targetCdpMouseEvents: targetMouseEvents - targetMouseEventsAfterShield,

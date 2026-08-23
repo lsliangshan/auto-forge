@@ -40,9 +40,23 @@ interface InputShieldProbe {
   targetBounds: { x: number; y: number; width: number; height: number }
   toolbarTopmost: boolean
   toolbarBackground: string
+  hitSurface?: TrustedToolbarHitSurface
   shieldMouseEvents: number
   targetMouseEvents: number
   targetCdpMouseEvents: number
+}
+
+interface TrustedToolbarHitSurface {
+  pointerEvents: string
+  backgroundAlpha: number
+  width: number
+  height: number
+  containsPoint: boolean
+}
+
+interface TrustedToolbarSurfaceState {
+  toolbarBounds: { x: number; y: number; width: number; height: number }
+  surface?: TrustedToolbarHitSurface
 }
 
 async function command<T>(
@@ -334,6 +348,32 @@ test.describe.serial('conversation-bound browser continuation', () => {
       targetCdpMouseEvents: 1,
     })
     expect(shield.toolbarBounds.height).toBe(shield.targetBounds.y + shield.targetBounds.height)
+
+    await command(electronApp, 'releaseBusy', { bindingId: binding.bindingId })
+  })
+
+  test('keeps a pre-rendered composited hit surface ready for synchronous ownership expansion', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    const binding = await seed(electronApp, conversationId, '/details')
+
+    const before = await command<TrustedToolbarSurfaceState>(electronApp, 'shieldSurfaceState')
+    expect(before.toolbarBounds).toMatchObject({ x: 0, y: 0, width: 1280, height: 52 })
+    expect(before.surface).toMatchObject({ pointerEvents: 'auto' })
+    expect(before.surface?.backgroundAlpha).toBeGreaterThan(0)
+    expect(before.surface?.backgroundAlpha).toBeLessThanOrEqual(0.004)
+
+    await command(electronApp, 'holdBusy', { bindingId: binding.bindingId })
+    const owned = await command<InputShieldProbe>(electronApp, 'shieldProbe', { bindingId: binding.bindingId })
+
+    expect(owned.hitSurface).toMatchObject({
+      pointerEvents: 'auto',
+      containsPoint: true,
+      width: owned.targetBounds.width,
+      height: owned.targetBounds.height,
+    })
+    expect(owned.hitSurface?.backgroundAlpha).toBeGreaterThan(0)
+    expect(owned.hitSurface?.backgroundAlpha).toBeLessThanOrEqual(0.004)
+    expect(owned.targetCdpMouseEvents).toBe(1)
 
     await command(electronApp, 'releaseBusy', { bindingId: binding.bindingId })
   })
