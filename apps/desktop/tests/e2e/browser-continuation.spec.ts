@@ -116,13 +116,13 @@ test.describe.serial('conversation-bound browser continuation', () => {
     if (userData) await rm(userData, { recursive: true, force: true })
   })
 
-  test('reads the authenticated expiry in the same conversation and never submits', async () => {
+  test('reads a static authenticated expiry in the same conversation and never submits', async () => {
     const conversationId = await createConversation(page, electronApp)
     await seed(electronApp, conversationId, '/login')
     await command(electronApp, 'userClick', { selector: '#manual-login' })
     await sendChat(page, electronApp, conversationId, '我的工作居住证“有效期至”是什么')
 
-    await expect(page.getByText('有效期至：2028-06-30')).toBeVisible()
+    await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
     const evidence = page.getByText(/来源：permit\.autoforge\.test \/ https:\/\/permit\.autoforge\.test；读取时间：/)
     await expect(evidence).toBeVisible()
     const readTime = (await evidence.textContent())
@@ -168,9 +168,9 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect.poll(async () => (await fixture.snapshot()).authenticated).toBe(true)
     await page.waitForTimeout(500)
     expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests).toHaveLength(beforeLoginClick)
-    await expect(page.getByText('有效期至：2028-06-30')).toHaveCount(0)
+    await expect(page.getByText('工作居住证有效期：2028-06-30')).toHaveCount(0)
     await sendChat(page, electronApp, conversationId, '我已登录，请继续读取证件“有效期至”')
-    await expect(page.getByText('有效期至：2028-06-30')).toBeVisible()
+    await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
   })
 

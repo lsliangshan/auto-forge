@@ -98,7 +98,7 @@ function pageDocument(input: {
 <a id="manual-login" role="button" href="/authenticate">人工登录并继续</a></main></body></html>`
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>工作居住证详情</title></head>
 <body><main id="permit-details"><h1>工作居住证详情</h1><button id="logout-marker">退出</button>
-<section aria-label="证件有效期"><label>有效期至<input id="expiry-date" type="text" readonly value="2028-06-30"></label></section>
+<section aria-label="证件有效期"><div id="expiry-date">工作居住证有效期：2028-06-30</div></section>
 <section aria-label="聘用信息"><label>聘用单位<input id="employer" value="${input.employer}"></label></section>
 <section aria-label="草稿保存"><button id="save-draft" type="button" onclick="navigator.sendBeacon('/draft', document.querySelector('#employer').value)">保存草稿</button></section>
 <section aria-label="动态草稿"><button id="dynamic-save" type="button">保存草稿 V1</button></section>
