@@ -165,7 +165,7 @@ git commit -m "fix(browser): add native continuation input shield"
 
 **Interfaces:**
 - Consumes: Task 1's dedicated shield view, exact native view stacking, `holdBusy`/`releaseBusy`, direct CDP click probe, and public Stop/Takeover routes.
-- Produces: E2E-only `nativeInputShieldState` command returning safe structural fields: native background, bounds, attachment order, toolbar bounds, target bounds, shield event count, target event count, and direct-CDP target event count. It returns no page text, values, cookies, URLs with query data, or DOM excerpts.
+- Produces: E2E-only `nativeInputShieldState` command returning safe structural fields: bounds, attachment order, toolbar bounds, target bounds, document alpha, shield event count, target event count, and direct-CDP target event count. It returns no page text, values, cookies, URLs with query data, or DOM excerpts. Electron 43 exposes `View.setBackgroundColor()` but no native background getter, so the exact native color call is covered by the real production port plus the focused fake-port assertion; the user physical-click smoke verifies its native effect.
 
 - [ ] **Step 1: Write the failing real-Electron tests**
 
@@ -177,12 +177,10 @@ expect(owned).toMatchObject({
   order: ['target', 'shield', 'toolbar'],
   shieldBounds: { x: 0, y: 52 },
   toolbarBounds: { x: 0, y: 0, height: 52 },
-  nativeAlphaGreaterThanZero: true,
   documentAlphaGreaterThanZero: true,
   targetEventsAfterShieldInput: 0,
   directCdpTargetEvents: 1,
 })
-expect(owned.nativeAlpha).toBeLessThanOrEqual(0.004)
 expect(owned.documentAlpha).toBeLessThanOrEqual(0.004)
 ```
 
@@ -204,7 +202,7 @@ Expected: FAIL because `nativeInputShieldState` is absent and Round 2 still repo
 
 - [ ] **Step 3: Add the minimal safe E2E inspection command**
 
-Identify views by workspace identity and native child membership, not array position alone. Send test input directly to the shield only to prove its own event handler and send CDP directly to the target only to prove CDP bypass; label both as selected-WebContents injection, not OS-native input. Parse native and computed alpha independently. Do not claim that `sendInputEvent` proves macOS hit testing.
+Identify views by workspace identity and native child membership, not array position alone. Send test input directly to the shield only to prove its own event handler and send CDP directly to the target only to prove CDP bypass; label both as selected-WebContents injection, not OS-native input. Parse the document alpha and retain Task 1's exact fake-port assertion that production called `setBackgroundColor('rgba(0, 0, 0, 0.004)')`; do not invent a native getter or claim that `sendInputEvent` proves macOS hit testing.
 
 If the existing harness cannot capture the composited `BaseWindow`, report that exact limitation. Do not add AppleScript, accessibility privileges, platform-specific automation, or a false bitmap proxy. The user's physical-click smoke remains the acceptance boundary.
 
