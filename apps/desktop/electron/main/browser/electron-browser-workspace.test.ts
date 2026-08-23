@@ -195,12 +195,14 @@ function executionInput(
 
 function continuationRegistry(workspace: ElectronBrowserWorkspace) {
   const rows = new Map<string, unknown>()
+  const terminalEvents: unknown[] = []
   let id = 0
-  return new BrowserContinuationRegistry({
+  const registry = new BrowserContinuationRegistry({
     workspace,
     repository: {
       insert: vi.fn((value) => { rows.set(value.id, value); return value }),
       terminate: vi.fn((bindingId, value) => {
+        terminalEvents.push({ bindingId, value })
         const current = rows.get(bindingId)
         if (!current || typeof current !== 'object') return undefined
         const updated = { ...current, ...value }
@@ -211,6 +213,7 @@ function continuationRegistry(workspace: ElectronBrowserWorkspace) {
     id: () => `binding_${++id}`,
     now: () => id,
   })
+  return Object.assign(registry, { terminalEvents })
 }
 
 async function bindIdleContinuation(harness: ReturnType<typeof createHarness>) {
@@ -986,6 +989,205 @@ describe('ElectronBrowserWorkspace', () => {
     const shieldHtml = decodeURIComponent(shield!.webContents.loaded[0]!.split(',')[1]!)
     expect(toolbarHtml).not.toContain('data-autoforge-input-shield')
     expect(shieldHtml).toContain('background:rgb(0 0 0 / 0.004)')
+    await lease.release()
+  })
+
+  it('keeps the owned shield attached and below the full-height toolbar while loading repaint is pending', async () => {
+    const toolbarLoad = deferred<void>()
+    let pauseToolbar = false
+    let toolbarPaused = false
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (pauseToolbar && url.startsWith('data:text/html')
+          && !decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          toolbarPaused = true
+          await toolbarLoad.promise
+        }
+      },
+    )
+    const { views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_loading',
+    })
+    const [toolbar, target, shield] = views
+    const removeChildView = vi.spyOn(windows[0]!.contentView, 'removeChildView')
+    pauseToolbar = true
+
+    target!.webContents.emit('did-start-loading')
+    await vi.waitFor(() => expect(toolbarPaused).toBe(true))
+
+    expect(removeChildView).not.toHaveBeenCalledWith(shield)
+    expect(windows[0]!.children).toEqual([target, shield, toolbar])
+    expect(target!.bounds.at(-1)).toEqual({ x: 0, y: 52, width: 1200, height: 748 })
+    expect(shield!.bounds.at(-1)).toEqual({ x: 0, y: 52, width: 1200, height: 748 })
+    expect(toolbar!.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
+
+    toolbarLoad.resolve()
+    target!.webContents.emit('did-stop-loading')
+    await lease.release()
+  })
+
+  it('keeps the owned shield attached and below the full-height toolbar while blocked repaint is pending', async () => {
+    const toolbarLoad = deferred<void>()
+    let pauseToolbar = false
+    let toolbarPaused = false
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (pauseToolbar && url.startsWith('data:text/html')
+          && !decodeURIComponent(url).includes('<body aria-hidden="true">')) {
+          toolbarPaused = true
+          await toolbarLoad.promise
+        }
+      },
+    )
+    const { views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_blocked',
+    })
+    const [toolbar, target, shield] = views
+    const removeChildView = vi.spyOn(windows[0]!.contentView, 'removeChildView')
+    pauseToolbar = true
+
+    target!.webContents.windowOpenHandler?.({ url: 'https://attacker.example/' })
+    await vi.waitFor(() => expect(toolbarPaused).toBe(true))
+
+    expect(removeChildView).not.toHaveBeenCalledWith(shield)
+    expect(windows[0]!.children).toEqual([target, shield, toolbar])
+    expect(target!.bounds.at(-1)).toEqual({ x: 0, y: 52, width: 1200, height: 748 })
+    expect(shield!.bounds.at(-1)).toEqual({ x: 0, y: 52, width: 1200, height: 748 })
+    expect(toolbar!.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
+
+    toolbarLoad.resolve()
+    await lease.release()
+  })
+
+  it.each(['render-process-gone', 'destroyed'] as const)(
+    'fails closed for every continuation owner when the exact shield emits %s',
+    async (event) => {
+      const gate = deferred<unknown>()
+      const harness = createHarness((method) => ({
+        'DOM.getDocument': { root: { nodeId: 1 } },
+        'Accessibility.queryAXTree': {
+          nodes: [{ backendDOMNodeId: 80, ignored: false, role: { value: 'button' }, name: { value: '继续' } }],
+        },
+        'DOM.getBoxModel': { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } },
+      } as Record<string, unknown>)[method]
+        ?? (method === 'Input.dispatchMouseEvent' ? gate.promise : {}))
+      const { workspace, views, windows } = harness
+      const firstInput = executionInput()
+      const firstTab = await workspace.acquire(firstInput)
+      await workspace.releaseExecution(firstInput.executionId)
+      const secondInput = executionInput({
+        executionId: 'e2', chatRunId: 'chat_run_2', workflowId: 'workflow.two',
+      })
+      const secondTab = await workspace.acquire(secondInput)
+      await secondTab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
+      const registry = continuationRegistry(workspace)
+      workspace.setContinuationRegistry(registry)
+      const firstBinding = registry.bind({
+        ...firstInput, tabId: firstTab.id,
+      } as BrowserContinuationBindingInput)
+      const secondBinding = registry.bind({
+        ...secondInput, tabId: secondTab.id,
+      } as BrowserContinuationBindingInput)
+      workspace.markContinuationBound(firstTab.id)
+      workspace.markContinuationBound(secondTab.id)
+      await workspace.releaseExecution(secondInput.executionId)
+      const firstLease = await registry.acquire(firstBinding.bindingId, {
+        userId: firstInput.userId, conversationId: firstInput.conversationId!, runId: 'run_first',
+      })
+      const secondLease = await registry.acquire(secondBinding.bindingId, {
+        userId: secondInput.userId, conversationId: secondInput.conversationId!, runId: 'run_second',
+      })
+      const pending = secondTab.click('role=button[name="继续"]', 'https://www.baidu.com')
+      await vi.waitFor(() => expect(views[3]!.webContents.debugger.commands)
+        .toContainEqual(expect.objectContaining({ method: 'Input.dispatchMouseEvent' })))
+      const [toolbar, , shield, activeTarget] = views
+      expect(windows[0]!.children).toEqual([activeTarget, shield, toolbar])
+
+      if (event === 'render-process-gone') {
+        shield!.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+      } else {
+        shield!.webContents.close()
+      }
+      shield!.webContents.emit('destroyed')
+      const childrenAfterLoss = [...windows[0]!.children]
+      const leaseStateAfterLoss = [
+        firstLease.isCurrent(firstBinding), secondLease.isCurrent(secondBinding),
+      ]
+      const liveBindingsAfterLoss = [
+        registry.get(firstBinding.bindingId), registry.get(secondBinding.bindingId),
+      ]
+      const terminalEventsAfterLoss = [...registry.terminalEvents]
+      gate.resolve({})
+
+      await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' })
+      expect(childrenAfterLoss).toEqual([activeTarget, toolbar])
+      expect(shield!.webContents.destroyed).toBe(true)
+      expect(leaseStateAfterLoss).toEqual([false, false])
+      expect(liveBindingsAfterLoss).toEqual([undefined, undefined])
+      expect(terminalEventsAfterLoss).toHaveLength(2)
+      expect(terminalEventsAfterLoss).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          bindingId: firstBinding.bindingId,
+          value: expect.objectContaining({ status: 'closed', terminalReason: 'PAGE_CLOSED' }),
+        }),
+        expect.objectContaining({
+          bindingId: secondBinding.bindingId,
+          value: expect.objectContaining({ status: 'closed', terminalReason: 'PAGE_CLOSED' }),
+        }),
+      ]))
+      await firstLease.release()
+      await secondLease.release()
+    },
+  )
+
+  it('does not add a false shield terminal event during intentional workspace teardown', async () => {
+    const harness = createHarness()
+    const { workspace } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_reset',
+    })
+
+    await workspace.reset()
+
+    expect(lease.isCurrent(binding)).toBe(false)
+    expect(registry.terminalEvents).toHaveLength(1)
+    expect(registry.terminalEvents[0]).toMatchObject({
+      bindingId: binding.bindingId,
+      value: { status: 'closed', terminalReason: 'PAGE_CLOSED' },
+    })
+    await lease.release()
+  })
+
+  it('rebuilds an idle destroyed shield and ignores stale shield lifecycle events', async () => {
+    const harness = createHarness()
+    const { views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const [toolbar, target, staleShield] = views
+
+    staleShield!.webContents.close()
+    expect(registry.get(binding.bindingId)).toBe(binding)
+    expect(registry.terminalEvents).toEqual([])
+
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_rebuilt',
+    })
+    const replacementShield = views[3]!
+    expect(views).toHaveLength(4)
+    expect(windows[0]!.children).toEqual([target, replacementShield, toolbar])
+
+    staleShield!.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
+    staleShield!.webContents.emit('destroyed')
+
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(registry.terminalEvents).toEqual([])
+    expect(windows[0]!.children).toEqual([target, replacementShield, toolbar])
     await lease.release()
   })
 

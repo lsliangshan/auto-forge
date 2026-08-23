@@ -1328,6 +1328,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     })
     shield.webContents.on('before-mouse-event', (event: NavigationEvent) => event.preventDefault())
     shield.webContents.on('before-input-event', (event: NavigationEvent) => event.preventDefault())
+    shield.webContents.on('render-process-gone', () => {
+      this.handleInputShieldLost(shield)
+      if (!shield.webContents.isDestroyed()) shield.webContents.close()
+    })
+    shield.webContents.on('destroyed', () => { this.handleInputShieldLost(shield) })
     this.inputShield = shield
     try {
       await shield.webContents.loadURL(documentUrl)
@@ -1339,6 +1344,30 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       if (this.inputShield === shield) this.inputShield = undefined
       throw error
     }
+  }
+
+  private handleInputShieldLost(shield: WebContentsViewPort): void {
+    if (this.inputShield !== shield) return
+    const window = this.window
+    if (this.inputShieldAttached && window && !window.isDestroyed()) {
+      window.contentView.removeChildView(shield)
+    }
+    this.inputShield = undefined
+    this.inputShieldCreation = undefined
+    this.inputShieldAttached = false
+    if (!this.closingViews && !this.shuttingDown && window && !window.isDestroyed()) {
+      const owners = [...this.tabs.values()].filter((state) => (
+        !state.closed && state.ownerContinuationRunId !== undefined
+      ))
+      for (const state of owners) state.ownerContinuationRunId = undefined
+      for (const state of owners) {
+        try { this.continuationRegistry?.markClosed(state.id, 'PAGE_CLOSED') } catch {
+          /* Audit persistence cannot revive a lost input shield. */
+        }
+      }
+    }
+    this.layout()
+    void this.renderToolbar().catch(() => undefined)
   }
 
   private configureSession(partition: string): Promise<SessionPort> {
@@ -1399,7 +1428,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const bounds = window.getContentBounds()
     const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
     const coveringTarget = active?.loading === true || active?.blockedOrigin !== undefined
-    const shieldingTarget = !coveringTarget && active?.ownerContinuationRunId !== undefined
+    const shieldingTarget = active?.ownerContinuationRunId !== undefined
     toolbar.setBounds({
       x: 0, y: 0, width: bounds.width,
       height: coveringTarget ? bounds.height : toolbarHeight,
