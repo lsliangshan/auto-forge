@@ -168,3 +168,37 @@ Tests       13 failed | 198 passed (211)
 - `git diff --check`: PASS.
 
 The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 2.
+
+## Fix Round 3: colon-confusable fail-closed detection
+
+### RED evidence
+
+The focused Inspector RED reproduced the name-only fallback bypass:
+
+```text
+Test Files  1 failed (1)
+Tests       8 failed | 94 passed (102)
+```
+
+- U+FE55 SMALL COLON (`﹕`) and U+FE13 PRESENTATION FORM FOR VERTICAL COLON (`︓`) were not recognized by the canonical parser, so the entire raw string survived as name-only `StaticText`.
+- The same bypass was reproduced for the visual colon confusables U+2236 (`∶`), U+A789 (`꞉`), U+02D0 (`ː`), and U+02F8 (`˸`), plus repeated compatibility delimiters.
+- A complete code-point NFKC scan found U+2A74 DOUBLE COLON EQUAL (`⩴`, normalized as `::=`) in addition to U+FE13/U+FE55 and the canonical ASCII/fullwidth colons; its regression also failed before the fix.
+- Canonical/confusable mixtures already failed value/label validation, and regression cases preserve that behavior explicitly.
+
+### GREEN contract and security analysis
+
+- Raw unsafe-character rejection still runs first. A separate noncanonical-colon detector then rejects any character whose individual NFKC form contains ASCII `:`, excluding the two intentionally canonical raw delimiters `:` and `：`.
+- The detector additionally rejects the four common visual colon confusables above even though Unicode NFKC does not map them to ASCII colon.
+- NFKC is used only as a rejection signal. The input is never normalized into the parser, and the accepted structured delimiter grammar remains exactly `[:：]`.
+- Any confusable-only, repeated, or mixed delimiter node is dropped entirely before name-only fallback. Positive canonical ASCII/fullwidth labels, typed date values, frozen-intent relevance, source/read-time answer ownership, and durable-context exclusion are unchanged.
+- No AgentOrchestrator production code, permission, action, persistence, pagination, or ref behavior changed.
+
+### Fix Round 3 verification
+
+- Exact impacted Inspector + Orchestrator matrix: `2 files / 238 tests passed`.
+- Changed-file ESLint: exit 0, zero errors/warnings.
+- Full typecheck: PASS.
+- Real Electron browser-continuation E2E, including its production build: `19/19 passed` in 53.5 seconds. Static expiry still returned without submission; injection and protected final-action cases remained blocked.
+- `git diff --check`: PASS.
+
+The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 3.

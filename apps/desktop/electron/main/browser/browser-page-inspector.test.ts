@@ -370,6 +370,30 @@ describe('BrowserPageInspector', () => {
     expect(JSON.stringify(snapshot)).not.toContain('2028-06-30')
   })
 
+  it.each([
+    ['U+FE55 SMALL COLON', '工作居住证有效期﹕张三'],
+    ['U+FE13 PRESENTATION FORM FOR VERTICAL COLON', '工作居住证有效期︓2028-06-30'],
+    ['U+2236 RATIO', '工作居住证有效期∶2028-06-30'],
+    ['U+A789 MODIFIER LETTER COLON', '工作居住证有效期꞉2028-06-30'],
+    ['U+02D0 MODIFIER LETTER TRIANGULAR COLON', '工作居住证有效期ː2028-06-30'],
+    ['U+02F8 MODIFIER LETTER RAISED COLON', '工作居住证有效期˸2028-06-30'],
+    ['U+2A74 DOUBLE COLON EQUAL', '工作居住证有效期⩴2028-06-30'],
+    ['repeated compatibility colons', '工作居住证有效期﹕︓2028-06-30'],
+    ['compatibility then canonical colon', '工作居住证有效期﹕：2028-06-30'],
+    ['canonical then compatibility colon', '工作居住证有效期：2028-06-30﹕备用'],
+  ])('drops StaticText containing a noncanonical colon delimiter: %s', async (_case, field) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'StaticText', field),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input(binding(), { intent: '读取工作居住证有效期' }))
+
+    expect(snapshot.nodes).toHaveLength(1)
+    expect(JSON.stringify(snapshot)).not.toContain(field)
+  })
+
   it('does not project an InlineTextBox date as static field evidence', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),

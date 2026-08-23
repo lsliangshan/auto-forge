@@ -234,6 +234,7 @@ const isoStaticDate = /^(\d{4})-(\d{2})-(\d{2})$/u
 const isoStaticDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|[+-](\d{2}):(\d{2}))$/u
 const isoStaticDateRange = /^(\d{4}-\d{2}-\d{2})\s*(?:至|到|~|～|–)\s*(\d{4}-\d{2}-\d{2})$/u
 const unsafeStaticFieldRawText = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const visualStaticFieldColonConfusable = /[∶꞉ː˸]/u
 const staticDateLabels: ReadonlySet<string> = new Set([
   '有效期',
   '有效期至',
@@ -274,6 +275,14 @@ function normalizedText(value: string): string {
     const codePoint = character.codePointAt(0)!
     return codePoint <= 31 || codePoint === 127 ? ' ' : character
   }).join('').replaceAll(/\s+/g, ' ').trim()
+}
+
+function containsNonCanonicalStaticFieldColon(value: string): boolean {
+  return visualStaticFieldColonConfusable.test(value) || [...value].some((character) => (
+    character !== ':'
+      && character !== '：'
+      && character.normalize('NFKC').includes(':')
+  ))
 }
 
 function validIsoStaticDate(value: string): boolean {
@@ -343,6 +352,7 @@ function structuredStaticField(
   intent: string,
 ): StructuredStaticField | null | undefined {
   if (unsafeStaticFieldRawText.test(rawText)) return null
+  if (containsNonCanonicalStaticFieldColon(rawText)) return null
   const delimiter = /[:：]/u.exec(rawText)
   if (!delimiter) return undefined
   const safeOriginal = safeText(rawText)
