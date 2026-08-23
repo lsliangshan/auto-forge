@@ -35,6 +35,16 @@ interface HarnessSnapshot {
   highlightEvents: Array<{ conversationId: string; tabId: string; ref: string }>
 }
 
+interface InputShieldProbe {
+  toolbarBounds: { x: number; y: number; width: number; height: number }
+  targetBounds: { x: number; y: number; width: number; height: number }
+  toolbarTopmost: boolean
+  toolbarBackground: string
+  shieldMouseEvents: number
+  targetMouseEvents: number
+  targetCdpMouseEvents: number
+}
+
 async function command<T>(
   app: ElectronApplication,
   name: string,
@@ -305,6 +315,27 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(command(electronApp, 'directScenario', {
       name: 'takeover', bindingId: binding.bindingId, userText: '读取有效期',
     })).resolves.toMatchObject({ code: 'CANCELLED', takenOver: true })
+  })
+
+  test('uses the transparent trusted toolbar shield while CDP still targets the owned page', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    const binding = await seed(electronApp, conversationId, '/details')
+    await command(electronApp, 'holdBusy', { bindingId: binding.bindingId })
+
+    const shield = await command<InputShieldProbe>(electronApp, 'shieldProbe', { bindingId: binding.bindingId })
+
+    expect(shield).toMatchObject({
+      toolbarBounds: { x: 0, y: 0, width: 1280 },
+      targetBounds: { x: 0, y: 52, width: 1280 },
+      toolbarTopmost: true,
+      toolbarBackground: 'rgba(0, 0, 0, 0)',
+      shieldMouseEvents: 1,
+      targetMouseEvents: 0,
+      targetCdpMouseEvents: 1,
+    })
+    expect(shield.toolbarBounds.height).toBe(shield.targetBounds.y + shield.targetBounds.height)
+
+    await command(electronApp, 'releaseBusy', { bindingId: binding.bindingId })
   })
 
   test('stops after exactly thirty continuation actions', async () => {

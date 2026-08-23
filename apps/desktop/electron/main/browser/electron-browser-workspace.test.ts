@@ -87,6 +87,7 @@ class FakeWebContents extends EventEmitter {
 class FakeView {
   readonly webContents: FakeWebContents
   readonly bounds: Array<{ x: number; y: number; width: number; height: number }> = []
+  readonly backgroundColors: string[] = []
   constructor(
     readonly options: Record<string, unknown>,
     session: FakeSession,
@@ -100,6 +101,7 @@ class FakeView {
     )
   }
   setBounds(bounds: { x: number; y: number; width: number; height: number }) { this.bounds.push(bounds) }
+  setBackgroundColor(color: string) { this.backgroundColors.push(color) }
 }
 
 class FakeBaseWindow extends EventEmitter {
@@ -828,7 +830,7 @@ describe('ElectronBrowserWorkspace', () => {
   })
 
   it.each(['read', 'screenshot'] as const)(
-    'blocks physical target mouse input during a pending continuation %s without cancelling its result',
+    'keeps a pending continuation %s running while the trusted toolbar owns pointer space',
     async (operation) => {
       const gate = deferred<unknown>()
       const respond = (method: string, params?: unknown) => {
@@ -851,7 +853,7 @@ describe('ElectronBrowserWorkspace', () => {
         if (method === 'Page.captureScreenshot') return gate.promise
         return {}
       }
-      const { workspace, views } = createHarness(respond)
+      const { workspace, views, windows } = createHarness(respond)
       const input = executionInput()
       const tab = await workspace.acquire(input)
       await tab.open('https://www.baidu.com/results', ['https://www.baidu.com'])
@@ -880,12 +882,11 @@ describe('ElectronBrowserWorkspace', () => {
           method: operation === 'read' ? 'Accessibility.getFullAXTree' : 'Page.captureScreenshot',
         })))
 
-      const mouse = { preventDefault: vi.fn() }
-      views[1]!.webContents.emit('before-mouse-event', mouse, { type: 'mouseDown' })
-
-      expect(mouse.preventDefault).toHaveBeenCalledOnce()
       expect(invalidated).not.toHaveBeenCalled()
       expect(lease.isCurrent(binding)).toBe(true)
+      expect(views[0]!.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
+      expect(windows[0]!.children.at(-1)).toBe(views[0])
+      expect(views[0]!.backgroundColors).toContain('#00000000')
       gate.resolve(operation === 'read' ? { nodes: [] } : { data: 'stale-png-data' })
 
       if (operation === 'read') await expect(pending).resolves.toMatchObject({ tabId: tab.id })
@@ -894,8 +895,8 @@ describe('ElectronBrowserWorkspace', () => {
     },
   )
 
-  it('blocks physical target mouse input while an owned continuation tab is idle', async () => {
-    const { workspace, views } = createHarness()
+  it('keeps the transparent trusted toolbar above an idle owned continuation tab', async () => {
+    const { workspace, views, windows } = createHarness()
     const input = executionInput()
     const tab = await workspace.acquire(input)
     const registry = continuationRegistry(workspace)
@@ -906,26 +907,24 @@ describe('ElectronBrowserWorkspace', () => {
     const lease = await registry.acquire(binding.bindingId, {
       userId: input.userId, conversationId: input.conversationId!, runId: 'run_idle',
     })
-    const toolbar = views[0]!.webContents
-    await vi.waitFor(() => expect(decodeURIComponent(toolbar.loaded.at(-1)!.split(',')[1]!))
+    const toolbar = views[0]!
+    await vi.waitFor(() => expect(decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!))
       .toContain(`autoforge-browser://continuation/stop/${binding.bindingId}`))
-    const toolbarLoads = toolbar.loaded.length
+    const toolbarLoads = toolbar.webContents.loaded.length
     const invalidated = vi.fn()
     workspace.onPageInvalidated(invalidated)
-    const mouse = { preventDefault: vi.fn() }
-
-    views[1]!.webContents.emit('before-mouse-event', mouse, { type: 'mouseDown' })
-
-    expect(mouse.preventDefault).toHaveBeenCalledOnce()
     expect(invalidated).not.toHaveBeenCalled()
     expect(lease.isCurrent(binding)).toBe(true)
-    expect(toolbar.loaded).toHaveLength(toolbarLoads)
-    expect(decodeURIComponent(toolbar.loaded.at(-1)!.split(',')[1]!))
+    expect(toolbar.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
+    expect(windows[0]!.children.at(-1)).toBe(views[0])
+    expect(views[0]!.backgroundColors).toContain('#00000000')
+    expect(toolbar.webContents.loaded.length).toBeGreaterThanOrEqual(toolbarLoads)
+    expect(decodeURIComponent(toolbar.webContents.loaded.at(-1)!.split(',')[1]!))
       .toContain(`autoforge-browser://continuation/takeover/${binding.bindingId}`)
     await lease.release()
   })
 
-  it('does not mistake executor-dispatched pointer input for real user takeover', async () => {
+  it('cancels a pending executor-dispatched pointer action after target keyboard takeover', async () => {
     const dispatched = deferred<unknown>()
     const respond = (method: string) => ({
       'DOM.getDocument': { root: { nodeId: 1 } },
@@ -950,40 +949,48 @@ describe('ElectronBrowserWorkspace', () => {
     const clicking = tab.click('role=button[name="继续"]', 'https://www.baidu.com')
     await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
       .toContainEqual(expect.objectContaining({ method: 'Input.dispatchMouseEvent' })))
-    const mouse = { preventDefault: vi.fn() }
-    views[1]!.webContents.emit('before-mouse-event', mouse, { type: 'mouseDown' })
+    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
 
-    expect(mouse.preventDefault).not.toHaveBeenCalled()
-    expect(lease.isCurrent(binding)).toBe(true)
-    await expect(registry.acquire(binding.bindingId, {
-      userId: input.userId, conversationId: input.conversationId!, runId: 'run_not_takeover',
-    })).rejects.toMatchObject({ code: 'PAGE_BUSY' })
+    expect(lease.isCurrent(binding)).toBe(false)
     dispatched.resolve({})
-    await clicking
+    await expect(clicking).rejects.toMatchObject({ code: 'CANCELLED' })
     await lease.release()
   })
 
-  it('allows target mouse input after explicit continuation ownership release', async () => {
+  it('removes the shield through the public trusted-toolbar takeover command', async () => {
     const { workspace, views } = createHarness()
     const input = executionInput()
     const tab = await workspace.acquire(input)
     const registry = continuationRegistry(workspace)
     workspace.setContinuationRegistry(registry)
     const binding = registry.bind({ ...input, tabId: tab.id } as BrowserContinuationBindingInput)
+    workspace.markContinuationBound(tab.id)
     await workspace.releaseExecution(input.executionId)
+    const handlers = {
+      stop: vi.fn(async () => undefined),
+      takeOver: vi.fn(async () => { await lease.release() }),
+    }
+    workspace.setContinuationCommandHandlers(handlers)
     const lease = await registry.acquire(binding.bindingId, {
       userId: input.userId, conversationId: input.conversationId!, runId: 'run_explicit_takeover',
     })
-    await workspace.releaseContinuation(tab.id, 'run_explicit_takeover')
-    const mouse = { preventDefault: vi.fn() }
+    const toolbar = views[0]!
+    expect(toolbar.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 800 })
+    const navigation = { preventDefault: vi.fn() }
 
-    views[1]!.webContents.emit('before-mouse-event', mouse, { type: 'mouseDown' })
+    toolbar.webContents.emit(
+      'will-navigate', navigation, `autoforge-browser://continuation/takeover/${binding.bindingId}`,
+    )
 
-    expect(mouse.preventDefault).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(handlers.takeOver).toHaveBeenCalledWith(binding.bindingId))
+    expect(navigation.preventDefault).toHaveBeenCalledOnce()
+    expect(toolbar.bounds.at(-1)).toEqual({ x: 0, y: 0, width: 1200, height: 52 })
     await lease.release()
   })
 
-  it('repaints the trusted toolbar without automation controls after real target-content takeover', async () => {
+  it.each(['target', 'shield'] as const)(
+    'repaints the trusted toolbar without automation controls after %s keyboard takeover',
+    async (inputTarget) => {
     const { workspace, views } = createHarness()
     const input = executionInput()
     const tab = await workspace.acquire(input)
@@ -1000,7 +1007,8 @@ describe('ElectronBrowserWorkspace', () => {
       .toContain('autoforge-browser://continuation/stop/binding_1'))
     const loadCount = toolbar.loaded.length
 
-    views[1]!.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
+    const view = inputTarget === 'target' ? views[1]! : views[0]!
+    view.webContents.emit('before-input-event', {}, { type: 'keyDown', key: 'A' })
 
     expect(lease.isCurrent(binding)).toBe(false)
     await vi.waitFor(() => expect(toolbar.loaded.length).toBeGreaterThan(loadCount))
@@ -1009,7 +1017,8 @@ describe('ElectronBrowserWorkspace', () => {
     expect(document).not.toContain('autoforge-browser://continuation/stop/')
     expect(document).not.toContain('autoforge-browser://continuation/takeover/')
     await lease.release()
-  })
+    },
+  )
 
   it('swallows a rejected takeover repaint without restoring continuation authority', async () => {
     let rejectToolbar = false

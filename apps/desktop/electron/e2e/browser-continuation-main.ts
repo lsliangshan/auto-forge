@@ -419,8 +419,10 @@ type TargetState = {
   view: { webContents: {
     getURL(): string
     isDestroyed(): boolean
+    once(event: string, listener: () => void): void
+    removeListener(event: string, listener: () => void): void
     executeJavaScript<T>(script: string, userGesture?: boolean): Promise<T>
-  } }
+  }; getBounds(): { x: number; y: number; width: number; height: number } }
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -833,6 +835,51 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     const target = targets().get(String(input.tabId))
     if (!target || target.closed) return { url: '', blockedErrorCode: 'PAGE_CLOSED' }
     return { url: target.view.webContents.getURL(), blockedErrorCode: target.blockedErrorCode }
+  }
+  if (name === 'shieldProbe') {
+    const binding = registry().get(String(input.bindingId))
+    const target = binding ? targets().get(binding.tabId) : undefined
+    const internals = workspace as unknown as {
+      window?: BaseWindow
+      toolbar?: WebContentsView
+      click(state: TargetState, locator: string, allowedOrigin: string): Promise<void>
+    }
+    const toolbar = internals.toolbar
+    const window = internals.window
+    if (!target || !toolbar || !window) throw new Error('Trusted toolbar shield is unavailable')
+    let shieldMouseEvents = 0
+    let targetMouseEvents = 0
+    let resolveShieldMouse!: () => void
+    let resolveTargetCdpMouse!: () => void
+    const shieldMouse = new Promise<void>((resolve) => { resolveShieldMouse = resolve })
+    const targetCdpMouse = new Promise<void>((resolve) => { resolveTargetCdpMouse = resolve })
+    const onShieldMouse = () => { shieldMouseEvents += 1; resolveShieldMouse() }
+    const onTargetMouse = () => { targetMouseEvents += 1; resolveTargetCdpMouse() }
+    toolbar.webContents.once('before-mouse-event', onShieldMouse)
+    target.view.webContents.once('before-mouse-event', onTargetMouse)
+    try {
+      window.focus()
+      toolbar.webContents.sendInputEvent({ type: 'mouseDown', x: 24, y: 96, button: 'left', clickCount: 1 })
+      await shieldMouse
+      const targetMouseEventsAfterShield = targetMouseEvents
+      const clicking = internals.click(target, 'css=#progress-save', fixtureOrigin)
+      await targetCdpMouse
+      await clicking
+      return {
+        toolbarBounds: toolbar.getBounds(),
+        targetBounds: target.view.getBounds(),
+        toolbarTopmost: window.contentView.children.at(-1) === toolbar,
+        toolbarBackground: String(await toolbar.webContents.executeJavaScript(
+          'getComputedStyle(document.body).backgroundColor',
+        )),
+        shieldMouseEvents,
+        targetMouseEvents: targetMouseEventsAfterShield,
+        targetCdpMouseEvents: targetMouseEvents - targetMouseEventsAfterShield,
+      }
+    } finally {
+      toolbar.webContents.removeListener('before-mouse-event', onShieldMouse)
+      target.view.webContents.removeListener('before-mouse-event', onTargetMouse)
+    }
   }
   if (name === 'closeTab') return workspace.closeContinuation(String(input.tabId))
   if (name === 'holdBusy') {
