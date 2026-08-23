@@ -231,10 +231,11 @@ const filesystemPath = /(?:\bfile\s*:|\b(?:file|folder|directory)path\s*[:=]|(?:
 const sensitiveStaticFieldLabel = /(?:authorization|bearer|cookie|credential|password|passcode|pin|secret|session|token|api[-_ ]?key|access[-_ ]?key|refresh[-_ ]?key|密码|口令|密钥|秘钥|令牌|验证码|校验码|动态码|身份证|身份号码|证件号码|社会保障号|银行卡|信用卡|借记卡|姓名|住址|地址|手机号|联系电话|邮箱|电子邮件)/iu
 const instructionLikeText = /(?:(?:忽略|无视|覆盖|绕过).{0,16}(?:系统|策略|指令|提示)|(?:调用|使用|新增|添加|执行|提交|发送|上传|删除).{0,16}(?:工具|字段|数据|内容|请求)|(?:ignore|disregard|override|bypass).{0,24}(?:system|policy|prompt|instruction)|(?:call|invoke|add|submit|send|upload|delete).{0,24}(?:tool|field|data|content|request))/iu
 const isoStaticDate = /^(\d{4})-(\d{2})-(\d{2})$/u
+const isoStaticDateToken = /\d{4}-\d{2}-\d{2}/u
 const isoStaticDateTime = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(?:Z|[+-](\d{2}):(\d{2}))$/u
 const isoStaticDateRange = /^(\d{4}-\d{2}-\d{2})\s*(?:至|到|~|～|–)\s*(\d{4}-\d{2}-\d{2})$/u
 const unsafeStaticFieldRawText = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
-const visualStaticFieldColonConfusable = /[∶꞉ː˸]/u
+const rawStaticTextRoles: ReadonlySet<string> = new Set(['StaticText', 'statictext', 'static-text'])
 const staticDateLabels: ReadonlySet<string> = new Set([
   '有效期',
   '有效期至',
@@ -266,7 +267,7 @@ function failure(code: AppErrorCode): AppError {
 
 function normalizedRole(value: string): string {
   const role = value.replaceAll(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
-  if (role === 'static-text' || role === 'inline-text-box') return 'statictext'
+  if (role === 'static-text') return 'statictext'
   return role
 }
 
@@ -277,12 +278,10 @@ function normalizedText(value: string): string {
   }).join('').replaceAll(/\s+/g, ' ').trim()
 }
 
-function containsNonCanonicalStaticFieldColon(value: string): boolean {
-  return visualStaticFieldColonConfusable.test(value) || [...value].some((character) => (
-    character !== ':'
-      && character !== '：'
-      && character.normalize('NFKC').includes(':')
-  ))
+function containsStaticDateEvidence(value: string): boolean {
+  const normalized = normalizedText(value).toLowerCase()
+  return isoStaticDateToken.test(normalized)
+    || [...staticDateLabels].some((label) => normalized.includes(label))
 }
 
 function validIsoStaticDate(value: string): boolean {
@@ -352,9 +351,8 @@ function structuredStaticField(
   intent: string,
 ): StructuredStaticField | null | undefined {
   if (unsafeStaticFieldRawText.test(rawText)) return null
-  if (containsNonCanonicalStaticFieldColon(rawText)) return null
   const delimiter = /[:：]/u.exec(rawText)
-  if (!delimiter) return undefined
+  if (!delimiter) return containsStaticDateEvidence(rawText) ? null : undefined
   const safeOriginal = safeText(rawText)
   if (!safeOriginal) return null
   if (instructionLikeText.test(safeOriginal) || sensitiveStaticFieldLabel.test(safeOriginal.split(/[:：]/u)[0] ?? '')) {
@@ -597,7 +595,9 @@ export class BrowserPageInspector {
     const candidates = readable.flatMap((node): SafeCandidate[] => {
       const role = normalizedRole(node.role)
       if (!semanticRoles.has(role) || authNode(node)) return []
-      const staticField = node.role === 'StaticText' ? structuredStaticField(node.name, input.intent) : undefined
+      const staticField = rawStaticTextRoles.has(node.role)
+        ? structuredStaticField(node.name, input.intent)
+        : undefined
       if (staticField === null) return []
       const name = staticField?.name ?? safeText(node.name)
       if (!name) return []

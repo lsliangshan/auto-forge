@@ -202,3 +202,55 @@ Tests       8 failed | 94 passed (102)
 - `git diff --check`: PASS.
 
 The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 3.
+
+## Fix Round 4: semantic date-hint fail-closed boundary
+
+### Files changed
+
+- `apps/desktop/electron/main/browser/browser-page-inspector.ts`
+- `apps/desktop/electron/main/browser/browser-page-inspector.test.ts`
+- `.superpowers/sdd/2026-08-23-conversation-bound-browser-continuation/manual-smoke-field-fix-report.md`
+
+### RED evidence
+
+The Round 4 Inspector regressions were added before the production change and run with:
+
+```text
+node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts \
+  electron/main/browser/browser-page-inspector.test.ts
+
+Test Files  1 failed (1)
+Tests       24 failed | 105 passed (129)
+```
+
+- The two lower/canonical-hyphen static-text role spellings kept canonical fields as combined name-only nodes instead of typed evidence.
+- U+FE30 and the reviewer-listed U+0589, U+0703, U+0704, U+16EC, U+1803, U+1809, U+205A, U+05C3, U+A4FD, U+11DD9, and U+29F4 separator cases crossed the name-only fallback.
+- Recognized labels with arbitrary values, ISO-date tokens with arbitrary or absent delimiters, and repeated arbitrary separators likewise survived as name-only page text.
+- All three accepted raw static-text spellings reproduced the malformed-date fallback, while both canonical and ordinary `InlineTextBox` fragments were exported name-only.
+
+### GREEN contract and security analysis
+
+- The production confusable-character enumeration and NFKC rejection scan were removed. Structured parsing still consumes raw input and still accepts exactly ASCII `:` and fullwidth Chinese `：`; no other separator is normalized into acceptance.
+- Canonical parsing is attempted for exactly the raw `StaticText`, `statictext`, and `static-text` spellings. If parsing fails and the raw text contains a member of the existing closed date-label set or an ISO-shaped date token, the entire node is dropped, independent of the intervening separator.
+- `InlineTextBox` is no longer normalized into semantic static text, so neither its structured-looking nor ordinary layout fragments can become structured or name-only evidence.
+- Ordinary non-date static text remains a name-only semantic node for all three accepted raw spellings, with no value added.
+- Existing closed labels, date/date-time/range parsing, calendar validation, sensitive-text/instruction rejection, frozen-intent relevance, semantic budgets, refs/cursors, durable-context exclusion, and protected-action boundaries remain unchanged.
+
+### Fix Round 4 verification
+
+- Focused Inspector GREEN: `1 file / 129 tests passed`.
+- Exact impacted Inspector + Orchestrator matrix: `2 files / 265 tests passed`.
+- Full native-aware unit suite: `88 files / 2423 tests passed`; Electron 43.1.1 native compatibility preparation passed.
+- Full workspace typecheck: PASS for shared, workflow SDK, workflow schema, desktop Main, and Renderer.
+- Standalone production build: PASS; only the two pre-existing VueUse annotation-placement warnings were emitted.
+- Real Electron browser-continuation E2E: `19/19 passed` in 53.7 seconds, including the visible static-field answer, zero implicit submission, injection rejection, and protected final-action handoff.
+- Changed-file ESLint: exit 0, zero errors/warnings.
+- `git diff --check`: PASS.
+
+### Self-review and commit
+
+- Mutation check: restoring name-only fallback for hinted malformed static text fails the new separator/date-hint matrices; restoring exact-`StaticText` parsing fails the role-variant positives; restoring `InlineTextBox` normalization fails both whole-node absence cases.
+- The diff adds no origin, permission, action, persistence, pagination, private-data channel, or AgentOrchestrator production change.
+- Round 4 is committed together as `fix(browser): fail closed on static date hints`.
+
+The user-assisted Beijing portal smoke still has **not** been re-run and remains required after Fix Round 4.

@@ -300,6 +300,24 @@ describe('BrowserPageInspector', () => {
   })
 
   it.each([
+    'StaticText',
+    'statictext',
+    'static-text',
+  ])('projects a canonical static date from the raw %s role', async (rawRole) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, rawRole, '工作居住证有效期：2028-06-30'),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.nodes).toContainEqual(expect.objectContaining({
+      role: 'statictext', name: '工作居住证有效期', value: '2028-06-30', actions: [],
+    }))
+  })
+
+  it.each([
     '有效期',
     '有效期至',
     '证件有效期',
@@ -373,15 +391,27 @@ describe('BrowserPageInspector', () => {
   it.each([
     ['U+FE55 SMALL COLON', '工作居住证有效期﹕张三'],
     ['U+FE13 PRESENTATION FORM FOR VERTICAL COLON', '工作居住证有效期︓2028-06-30'],
+    ['U+FE30 PRESENTATION FORM FOR VERTICAL TWO DOT LEADER', '工作居住证有效期\u{FE30}2028-06-30'],
     ['U+2236 RATIO', '工作居住证有效期∶2028-06-30'],
     ['U+A789 MODIFIER LETTER COLON', '工作居住证有效期꞉2028-06-30'],
     ['U+02D0 MODIFIER LETTER TRIANGULAR COLON', '工作居住证有效期ː2028-06-30'],
     ['U+02F8 MODIFIER LETTER RAISED COLON', '工作居住证有效期˸2028-06-30'],
     ['U+2A74 DOUBLE COLON EQUAL', '工作居住证有效期⩴2028-06-30'],
+    ['U+0589 ARMENIAN FULL STOP', '工作居住证有效期\u{0589}2028-06-30'],
+    ['U+0703 SYRIAC SUPRALINEAR COLON', '工作居住证有效期\u{0703}2028-06-30'],
+    ['U+0704 SYRIAC SUBLINEAR COLON', '工作居住证有效期\u{0704}2028-06-30'],
+    ['U+16EC RUNIC MULTIPLE PUNCTUATION', '工作居住证有效期\u{16EC}2028-06-30'],
+    ['U+1803 MONGOLIAN FULL STOP', '工作居住证有效期\u{1803}2028-06-30'],
+    ['U+1809 MONGOLIAN MANCHU FULL STOP', '工作居住证有效期\u{1809}2028-06-30'],
+    ['U+205A TWO DOT PUNCTUATION', '工作居住证有效期\u{205A}2028-06-30'],
+    ['U+05C3 HEBREW PUNCTUATION SOF PASUQ', '工作居住证有效期\u{05C3}2028-06-30'],
+    ['U+A4FD LISU PUNCTUATION FULL STOP', '工作居住证有效期\u{A4FD}2028-06-30'],
+    ['U+11DD9 TOLONG SIKI SIGN COLON', '工作居住证有效期\u{11DD9}2028-06-30'],
+    ['U+29F4 RULE-DELAYED', '工作居住证有效期\u{29F4}2028-06-30'],
     ['repeated compatibility colons', '工作居住证有效期﹕︓2028-06-30'],
     ['compatibility then canonical colon', '工作居住证有效期﹕：2028-06-30'],
     ['canonical then compatibility colon', '工作居住证有效期：2028-06-30﹕备用'],
-  ])('drops StaticText containing a noncanonical colon delimiter: %s', async (_case, field) => {
+  ])('drops StaticText containing a noncanonical field separator: %s', async (_case, field) => {
     const port = new FakeCdpPort([
       node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
       node(11, 'StaticText', field),
@@ -394,18 +424,58 @@ describe('BrowserPageInspector', () => {
     expect(JSON.stringify(snapshot)).not.toContain(field)
   })
 
-  it('does not project an InlineTextBox date as static field evidence', async () => {
+  it.each([
+    ['recognized label and arbitrary value', '工作居住证有效期→待核验'],
+    ['ISO date token with an arbitrary delimiter', '记录→2028-06-30'],
+    ['ISO date token without a delimiter', '记录日期 2028-06-30'],
+    ['mixed arbitrary and canonical separators', '工作居住证有效期→：2028-06-30'],
+    ['repeated arbitrary separators', '工作居住证有效期→→2028-06-30'],
+    ['date token before repeated separators', '记录 2028-06-30→→备用'],
+  ])('drops date-like StaticText with %s', async (_case, field) => {
     const port = new FakeCdpPort([
       node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
-      node(11, 'InlineTextBox', '有效期至：2028-06-30'),
+      node(11, 'StaticText', field),
     ])
     const inspector = new BrowserPageInspector(port, { id: idSequence() })
 
     const snapshot = await inspector.inspect(input())
 
-    expect(snapshot.nodes).not.toContainEqual(expect.objectContaining({
-      role: 'statictext', value: expect.any(String),
-    }))
+    expect(snapshot.nodes).toHaveLength(1)
+    expect(JSON.stringify(snapshot)).not.toContain(field)
+  })
+
+  it.each([
+    'StaticText',
+    'statictext',
+    'static-text',
+  ])('fails closed for noncanonical date-like text from the raw %s role', async (rawRole) => {
+    const field = '工作居住证有效期→2028-06-30'
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, rawRole, field),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.nodes).toHaveLength(1)
+    expect(JSON.stringify(snapshot)).not.toContain(field)
+  })
+
+  it.each([
+    ['canonical date fragment', '有效期至：2028-06-30'],
+    ['ordinary layout fragment', '行内布局片段'],
+  ])('drops an InlineTextBox %s instead of exporting name-only evidence', async (_case, field) => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'InlineTextBox', field),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input())
+
+    expect(snapshot.nodes).toHaveLength(1)
+    expect(JSON.stringify(snapshot)).not.toContain(field)
   })
 
   it.each([
@@ -499,18 +569,22 @@ describe('BrowserPageInspector', () => {
     expect(snapshot.nodes).toHaveLength(1)
   })
 
-  it('keeps ordinary non-colon StaticText in the untrusted semantic snapshot', async () => {
+  it.each([
+    'StaticText',
+    'statictext',
+    'static-text',
+  ])('keeps ordinary non-date %s in the untrusted semantic snapshot', async (rawRole) => {
     const port = new FakeCdpPort([
       node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
-      node(11, 'StaticText', '北京市政务服务'),
+      node(11, rawRole, '北京市政务服务'),
     ])
     const inspector = new BrowserPageInspector(port, { id: idSequence() })
 
     const snapshot = await inspector.inspect(input())
 
-    expect(snapshot.nodes).toContainEqual(expect.objectContaining({
-      role: 'statictext', name: '北京市政务服务', actions: [],
-    }))
+    expect(snapshot.nodes.find(({ name }) => name === '北京市政务服务')).toEqual({
+      ref: expect.any(String), role: 'statictext', name: '北京市政务服务', enabled: true, actions: [],
+    })
   })
 
   it('preserves the existing relevant textbox value projection unchanged', async () => {
