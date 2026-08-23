@@ -40,9 +40,11 @@ import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
 import { BrowserPageInspector } from './browser/browser-page-inspector.js'
+import { EncryptedBrowserSessionStorageStore } from './browser/browser-session-storage-store.js'
 import type { ApplicationBrowserWorkspacePort } from './browser/electron-browser-workspace.js'
 import { DeepSeekProvider } from './chat/deepseek-provider.js'
 import { createConversationContextManager } from './chat/conversation-context.js'
+import { ConversationTitleService } from './chat/conversation-title-service.js'
 import type { ModelProvider, ModelProviderSnapshot } from './chat/model-provider.js'
 import { ProviderDiagnosticLog } from './chat/provider-diagnostic-log.js'
 import {
@@ -580,6 +582,9 @@ function executionSummary(execution: Execution): ExecutionSummary {
 export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const database = openAppDatabase(options.paths.database)
   const secretStore = new SecretStore(database.encryptedSecrets, options.safeStorage)
+  options.browserWorkspace.setSessionStorageStore?.(
+    new EncryptedBrowserSessionStorageStore(secretStore),
+  )
   const cloudBasePorts = options.authService
     ? undefined
     : createCloudBaseClientPorts(readCloudBaseAuthConfig(options.cloudbaseEnv ?? process.env))
@@ -804,6 +809,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     conversationId: string
     promise: Promise<void>
   }>()
+  const activeConversationTitleWork = new Map<string, {
+    conversationId: string
+    controller: AbortController
+    promise: Promise<void>
+  }>()
+  const conversationTitleContexts = new Map<string, {
+    conversationId: string
+    userId: string
+    providerSnapshot: ModelProviderSnapshot
+    providerCredentialEpoch: number
+    model?: string
+  }>()
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
   const recordFailure = failureRecorder.record
@@ -854,6 +871,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ?? ((path) => rm(path, { recursive: true, force: true })),
     },
   })
+  const conversationTitles = new ConversationTitleService({
+    repositories: database,
+    emit: (event) => emitChat(event),
+    id: randomUUID,
+    now: Date.now,
+  })
   const emitChat = (event: ChatEvent) => {
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
       activeRequests.delete(event.requestId)
@@ -874,6 +897,40 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
     if (belongsToCurrentUser) {
       try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
+    }
+    if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
+      const context = conversationTitleContexts.get(event.requestId)
+      conversationTitleContexts.delete(event.requestId)
+      if (event.status !== 'completed') return
+      const run = database.chatRuns.getByRequestId(event.requestId)
+      if (
+        context
+        && belongsToCurrentUser
+        && context.conversationId === event.conversationId
+        && context.userId === ownerId
+        && run?.userId === context.userId
+        && run.provider === context.providerSnapshot.providerId
+        && (providerCredentialEpoch.get(run.provider) ?? 0) === context.providerCredentialEpoch
+      ) {
+        const controller = new AbortController()
+        const promise = conversationTitles.generate({
+          conversationId: event.conversationId,
+          userId: context.userId,
+          requestId: event.requestId,
+          providerSnapshot: context.providerSnapshot,
+          ...(context.model === undefined ? {} : { model: context.model }),
+          signal: controller.signal,
+        }).then(() => undefined).finally(() => {
+          activeConversationTitleWork.delete(event.requestId)
+        })
+        activeConversationTitleWork.set(event.requestId, {
+          conversationId: event.conversationId,
+          controller,
+          promise,
+        })
+      } else {
+        database.conversations.failPendingTitleGeneration(event.conversationId)
+      }
     }
   }
   const conversationContext = createConversationContextManager(database)
@@ -1100,7 +1157,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       createConversation: async () => {
         const session = await auth.requireSession()
-        const conversation = database.conversations.insert({ id: randomUUID(), title: '新会话', userId: session.user.id })
+        const conversation = database.conversations.insert({
+          id: randomUUID(), title: '新会话', titleState: 'pending', userId: session.user.id,
+        })
         return {
           id: conversation.id,
           title: conversation.title,
@@ -1111,7 +1170,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       renameConversation: async (conversationId, title) => {
         const session = await auth.requireSession()
         requireOwnedConversation(conversationId, session.user.id)
-        const conversation = database.conversations.update(conversationId, { title })
+        const conversation = database.conversations.renameByUser(conversationId, title)
         if (!conversation) throw failure('NOT_FOUND')
         return {
           id: conversation.id,
@@ -1125,6 +1184,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         requireOwnedConversation(conversationId, session.user.id)
         return maintenance.runExclusive(
           () => [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
+            || [...activeConversationTitleWork.values()].some(
+              (work) => work.conversationId !== conversationId,
+            )
             || mediaGeneration.hasActiveRuns()
             || database.mediaGenerationJobs.listActive().length > 0
             || activeExecutions.size > 0
@@ -1135,6 +1197,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               .filter(([, work]) => work.conversationId === conversationId)
             await Promise.all(requests.map(([requestId]) => agent.cancel(requestId)))
             await Promise.all(requests.map(([, work]) => work.promise))
+            const titleRequests = [...activeConversationTitleWork.values()]
+              .filter((work) => work.conversationId === conversationId)
+            for (const work of titleRequests) work.controller.abort()
+            await Promise.all(titleRequests.map((work) => work.promise))
             await browserContinuations.revokeConversation(conversationId, 'CANCELLED')
             await mediaLifecycle.deleteConversation(conversationId)
           },
@@ -1186,6 +1252,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             throw failure('INVALID_INPUT')
           }
           const requestId = randomUUID()
+          const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
+          conversationTitleContexts.set(requestId, {
+            conversationId: input.conversationId,
+            userId: session.user.id,
+            providerSnapshot,
+            providerCredentialEpoch: credentialEpoch,
+            ...(titleModel === undefined ? {} : { model: titleModel }),
+          })
           const userBlocks: ChatBlock[] = [
             ...(input.content ? [{ type: 'text' as const, text: input.content }] : []),
             ...resolved.userBlocks,
@@ -1247,6 +1321,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 route: { ...route, outputType: 'video' },
               })
             } catch (error) {
+              conversationTitleContexts.delete(requestId)
               if (error instanceof ProviderUsageConsistencyError) {
                 recordFailure(error, 'video-submit')
               }
@@ -1623,6 +1698,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await maintenance.runExclusive(
           () => activeRequests.size > 0
             || activeChatWork.size > 0
+            || activeConversationTitleWork.size > 0
             || activeExecutions.size > 0
             || agent.hasActiveRuns()
             || mediaGeneration.hasActiveRuns()
@@ -1717,6 +1793,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           for (const result of results) if (result.status === 'rejected') {
             recordFailure(result.reason, 'chat-drain')
           }
+          const titleWork = [...activeConversationTitleWork.values()]
+          for (const work of titleWork) work.controller.abort()
+          const titleResults = await Promise.allSettled(titleWork.map((work) => work.promise))
+          for (const result of titleResults) if (result.status === 'rejected') {
+            recordFailure(result.reason, 'chat-drain')
+          }
+          conversationTitleContexts.clear()
         })
         await capture('execution-shutdown', () => executions.shutdown())
         await capture('continuation-shutdown', async () => {

@@ -677,6 +677,17 @@ export const useChatStore = defineStore('chat', {
       catch (error) { this.error = displayError(error, '取消生成失败') }
     },
     applyChatEvent(event: ChatEvent) {
+      if (event.type === 'conversation_title_updated') {
+        const index = this.conversations.findIndex(({ id }) => id === event.conversationId)
+        if (index >= 0) {
+          this.conversations[index] = {
+            ...this.conversations[index]!,
+            title: event.title,
+            updatedAt: event.updatedAt,
+          }
+        }
+        return
+      }
       if (event.type === 'status') {
         if (event.status === 'running') {
           if (!this._terminalRequests[event.requestId]) this.activeRequestByConversation[event.conversationId] = event.requestId

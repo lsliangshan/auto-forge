@@ -34,6 +34,10 @@ import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
 import type { BrowserContinuationBindingInput } from './browser/browser-continuation-types.js'
 import type { BrowserPageCdpPort } from './browser/browser-page-inspector.js'
+import {
+  browserSessionStorageSecretKey,
+  type BrowserSessionStorageStore,
+} from './browser/browser-session-storage-store.js'
 import type {
   BrowserWorkspacePort,
   BrowserWorkspaceTab,
@@ -105,6 +109,7 @@ interface ApplicationBrowserWorkspaceTestPort extends BrowserWorkspacePort,
     lastActiveAt: number
   } | undefined>
   clearUserData(userId: string): Promise<void>
+  setSessionStorageStore(store: BrowserSessionStorageStore): void
   setContinuationCommandHandlers(handlers: {
     stop(bindingId: string): Promise<void>
     takeOver(bindingId: string): Promise<void>
@@ -125,6 +130,7 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspaceTestPort {
     close: vi.fn(async () => undefined),
   }
   return {
+    setSessionStorageStore: vi.fn(),
     acquire: vi.fn(async () => tab),
     releaseExecution: vi.fn(async () => undefined),
     setContinuationRegistry: vi.fn(() => undefined),
@@ -656,6 +662,14 @@ async function applicationHarness(input: {
 
 function modelInfo(id: string, name: string): ModelInfo {
   return { id, name, inputModalities: ['text'], outputModalities: ['text'], supportsTools: false, generation: {} }
+}
+
+function isConversationTitleRequest(request: ModelStreamRequest): boolean {
+  return JSON.stringify(request.messages).includes('生成简短的中文会话标题')
+}
+
+function agentRequests(requests: ModelStreamRequest[]): ModelStreamRequest[] {
+  return requests.filter((request) => !isConversationTitleRequest(request))
 }
 
 function imageModelInfo(id: string): ModelInfo {
@@ -1379,6 +1393,120 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('generates one conversation title after the first completed AI reply', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-title-'))
+    directories.push(root)
+    const requests: ModelStreamRequest[] = []
+    const chatEvents: ChatEvent[] = []
+    const provider = snapshotProvider('openrouter', {
+      listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
+      validateCredential: async () => ({ valid: true }),
+      stream: async function* (request) {
+        requests.push(request)
+        if (JSON.stringify(request.messages).includes('生成简短的中文会话标题')) {
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: '北京工作居住证办理' }
+        } else {
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: '我可以帮你查询办理条件。' }
+        }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+      emitChat: (event) => { chatEvents.push(event) },
+    }))
+    await authenticate(runtime, 'Alice')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const current = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...current.defaultModels, openrouter: { text: 'openrouter/text' } },
+    })
+
+    const conversation = await runtime.services.chat.createConversation()
+    const first = await runtime.services.chat.send(chatInput(conversation.id, '我想办理北京工作居住证'))
+    await vi.waitFor(() => expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'conversation_title_updated',
+      conversationId: conversation.id,
+      title: '北京工作居住证办理',
+    })))
+    expect(chatEvents).toContainEqual(expect.objectContaining({
+      type: 'status', requestId: first.requestId, status: 'completed',
+    }))
+    expect(await runtime.services.chat.listConversations()).toEqual([
+      expect.objectContaining({ id: conversation.id, title: '北京工作居住证办理' }),
+    ])
+    expect(requests).toHaveLength(2)
+    expect(provider.acquireSnapshot).toHaveBeenCalledOnce()
+
+    await runtime.services.chat.send(chatInput(conversation.id, '还需要哪些材料？'))
+    await vi.waitFor(() => expect(requests).toHaveLength(3))
+    expect(chatEvents.filter((event) => event.type === 'conversation_title_updated')).toHaveLength(1)
+
+    const manuallyNamed = await runtime.services.chat.createConversation()
+    await runtime.services.chat.renameConversation(manuallyNamed.id, '我的自定义名称')
+    await runtime.services.chat.send(chatInput(manuallyNamed.id, '测试手动名称'))
+    await vi.waitFor(() => expect(requests).toHaveLength(4))
+    expect(await runtime.services.chat.listConversations()).toContainEqual(
+      expect.objectContaining({ id: manuallyNamed.id, title: '我的自定义名称' }),
+    )
+    await runtime.close()
+  })
+
+  it('aborts and drains a pending conversation-title request before closing the database', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-title-close-'))
+    directories.push(root)
+    const titleStarted = deferred<void>()
+    const releaseTitle = deferred<void>()
+    let titleSignal: AbortSignal | undefined
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: snapshotProviders({ openrouter: {
+        listModels: async () => [modelInfo('openrouter/text', 'OpenRouter text')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* (request) {
+          if (isConversationTitleRequest(request)) {
+            titleSignal = request.signal
+            titleStarted.resolve()
+            if (!request.signal) await new Promise<void>(() => undefined)
+            else if (!request.signal.aborted) {
+              await new Promise<void>((resolve) => {
+                request.signal!.addEventListener('abort', () => resolve(), { once: true })
+              })
+            }
+            await releaseTitle.promise
+            return
+          }
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: '正常回复' }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      } }),
+      emitChat: vi.fn(),
+    }))
+    await authenticate(runtime, 'Alice')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const current = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { ...current.defaultModels, openrouter: { text: 'openrouter/text' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, '测试关闭'))
+    await titleStarted.promise
+
+    let closed = false
+    const closing = runtime.close().then(() => { closed = true })
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+
+    expect(closed).toBe(false)
+    expect(titleSignal?.aborted).toBe(true)
+    releaseTitle.resolve()
+    await closing
+
+    const inspection = openAppDatabase(join(root, 'autoforge.sqlite'))
+    expect(inspection.conversations.get(conversation.id)).toMatchObject({ titleState: 'failed' })
+    inspection.close()
+  })
+
   it('does not forward a previous user conversation events after the active user changes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-event-isolation-'))
     directories.push(root)
@@ -1511,7 +1639,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-provider-snapshot-'))
     directories.push(root)
     const proxy = createNetworkProxy()
-    const requests: Array<{ url: string; authorization: string }> = []
+    const requests: Array<{ url: string; authorization: string; conversationTitle: boolean }> = []
     let switched = false
     let chatCalls = 0
     proxy.fetch.mockImplementation(async (input, init) => {
@@ -1519,6 +1647,7 @@ describe('createApplicationRuntime', () => {
       requests.push({
         url,
         authorization: new Headers(init?.headers).get('authorization') ?? '',
+        conversationTitle: String(init?.body).includes('生成简短的中文会话标题'),
       })
       if (!switched) {
         switched = true
@@ -1565,8 +1694,13 @@ describe('createApplicationRuntime', () => {
     await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
       type: 'status', requestId: second.requestId, status: 'completed',
     })))
+    await vi.waitFor(() => expect(emitChat).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'conversation_title_updated', conversationId: secondConversation.id,
+    })))
 
-    const chatRequests = requests.filter(({ url }) => url.endsWith('/chat/completions'))
+    const chatRequests = requests.filter(({ url, conversationTitle }) => (
+      url.endsWith('/chat/completions') && !conversationTitle
+    ))
     expect(chatRequests.map(({ authorization }) => authorization)).toEqual([
       'Bearer sk-openrouter-a',
       'Bearer sk-openrouter-b',
@@ -1578,14 +1712,14 @@ describe('createApplicationRuntime', () => {
     expect(catalogAuthorizations).toContain('Bearer sk-openrouter-b')
     const usage = await runtime.services.settings.getTokenUsage()
     expect(usage.allTime).toMatchObject({
-      openRouterCostUsd: '0.03',
-      openRouterKnownCostCount: 2,
+      openRouterCostUsd: '0.05',
+      openRouterKnownCostCount: 3,
       openRouterUnknownCostCount: 0,
     })
     expect(usage.allTime.models).toContainEqual(expect.objectContaining({
       provider: 'openrouter',
       model: 'openai/gpt-4.1-mini',
-      openRouterCostUsd: '0.03',
+      openRouterCostUsd: '0.05',
     }))
     await runtime.close()
 
@@ -1596,6 +1730,7 @@ describe('createApplicationRuntime', () => {
         FROM provider_usage_events ORDER BY started_at, operation_key
       `).all()).toEqual([
         { userId: session.user.id, apiKeyFingerprint: fingerprintApiKey('sk-openrouter-a'), costUsd: '0.01' },
+        { userId: session.user.id, apiKeyFingerprint: fingerprintApiKey('sk-openrouter-b'), costUsd: '0.02' },
         { userId: session.user.id, apiKeyFingerprint: fingerprintApiKey('sk-openrouter-b'), costUsd: '0.02' },
       ])
     } finally {
@@ -1998,7 +2133,7 @@ describe('createApplicationRuntime', () => {
 
       await app.settings.update({ developerMode: false })
 
-      await vi.waitFor(() => expect(app.providerRequests.at(-1)?.messages).toEqual(expect.arrayContaining([
+      await vi.waitFor(() => expect(agentRequests(app.providerRequests).at(-1)?.messages).toEqual(expect.arrayContaining([
         expect.objectContaining({ role: 'tool', content: expect.stringContaining('WORKFLOW_CHANGED') }),
       ])))
       expect(app.executions.started).toHaveLength(0)
@@ -3203,7 +3338,9 @@ describe('createApplicationRuntime', () => {
     const captured: ModelStreamRequest[] = []
     const stream = vi.fn(async function* (request: ModelStreamRequest) {
       captured.push(request)
-      if (captured.length === 1) {
+      if (isConversationTitleRequest(request)) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '第一轮问题' }
+      } else if (agentRequests(captured).length === 1) {
         yield { type: 'text_delta' as const, choiceIndex: 0, text: '第一轮回答' }
       }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
@@ -3249,15 +3386,15 @@ describe('createApplicationRuntime', () => {
     const conversation = await runtime.services.chat.createConversation()
     await expect(runtime.services.chat.send(chatInput(conversation.id, '第一轮问题')))
       .resolves.toEqual({ requestId: expect.any(String) })
-    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(1))
     await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ role: 'assistant', blocks: [{ type: 'text', text: '第一轮回答' }] }),
       ])))
 
     await runtime.services.chat.send(chatInput(conversation.id, '第二轮追问'))
-    await vi.waitFor(() => expect(captured).toHaveLength(2))
-    expect(captured[1]?.messages).toEqual([
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
+    expect(agentRequests(captured)[1]?.messages).toEqual([
       expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
       { role: 'user', content: '第一轮问题' },
       { role: 'assistant', content: '第一轮回答' },
@@ -3266,8 +3403,8 @@ describe('createApplicationRuntime', () => {
 
     const isolated = await runtime.services.chat.createConversation()
     await runtime.services.chat.send(chatInput(isolated.id, '独立问题'))
-    await vi.waitFor(() => expect(captured).toHaveLength(3))
-    expect(captured[2]?.messages).toEqual([
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(3))
+    expect(agentRequests(captured)[2]?.messages).toEqual([
       expect.objectContaining({ role: 'system', content: expect.stringContaining('当前所选模型') }),
       { role: 'user', content: '独立问题' },
     ])
@@ -3363,16 +3500,16 @@ describe('createApplicationRuntime', () => {
     })
 
     await runtime.services.chat.send(chatInput(conversation.id, '读取证件有效期'))
-    await vi.waitFor(() => expect(captured).toHaveLength(2))
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
     await vi.waitFor(async () => expect(JSON.stringify(await runtime.services.chat.listMessages(conversation.id)))
       .toContain('2028-06-30'))
-    expect(JSON.stringify(captured[1]!.messages)).toContain(ephemeralPageData)
-    expect(JSON.stringify(captured[1]!.messages)).not.toContain(injection)
-    expect(JSON.stringify(captured[1]!.messages)).not.toContain(privateValue)
+    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).toContain(ephemeralPageData)
+    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(injection)
+    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(privateValue)
 
     await runtime.services.chat.send(chatInput(conversation.id, '只总结上次安全结果'))
-    await vi.waitFor(() => expect(captured).toHaveLength(3))
-    const followUpContext = JSON.stringify(captured[2]!.messages)
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(3))
+    const followUpContext = JSON.stringify(agentRequests(captured)[2]!.messages)
     expect(followUpContext).toContain('有效期至：2028-06-30')
     expect(followUpContext).toContain('[浏览器页面: permit.example.gov.cn; 来源: https://permit.example.gov.cn;')
     expect(followUpContext).not.toContain(injection)
@@ -3644,7 +3781,11 @@ describe('createApplicationRuntime', () => {
     const captured: ModelStreamRequest[] = []
     const stream = vi.fn(async function* (request: ModelStreamRequest) {
       captured.push(request)
-      if (captured.length === 1) yield { type: 'text_delta' as const, choiceIndex: 0, text: '我看到了图片' }
+      if (isConversationTitleRequest(request)) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '图片内容理解' }
+      } else if (agentRequests(captured).length === 1) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '我看到了图片' }
+      }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const runtime = createApplicationRuntime({
@@ -3689,16 +3830,16 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send({
       ...chatInput(conversation.id, '第一轮图片问题'), assetIds: [asset!.id], outputType: 'text',
     })
-    await vi.waitFor(() => expect(captured).toHaveLength(1))
-    expect(JSON.stringify(captured[0]?.messages)).toContain(png.toString('base64'))
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(1))
+    expect(JSON.stringify(agentRequests(captured)[0]?.messages)).toContain(png.toString('base64'))
     await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ role: 'assistant', blocks: [{ type: 'text', text: '我看到了图片' }] }),
       ])))
 
     await runtime.services.chat.send(chatInput(conversation.id, '第二轮只问文字'))
-    await vi.waitFor(() => expect(captured).toHaveLength(2))
-    const followUp = JSON.stringify(captured[1]?.messages)
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
+    const followUp = JSON.stringify(agentRequests(captured)[1]?.messages)
     expect(followUp).toContain('名称: image.png')
     expect(followUp).not.toContain(png.toString('base64'))
     expect(followUp).not.toContain(source)
@@ -3736,7 +3877,10 @@ describe('createApplicationRuntime', () => {
         url: 'https://93.184.216.34/generated.png',
       }],
     }))
-    const stream = vi.fn(async function* () {
+    const stream = vi.fn(async function* (request: ModelStreamRequest) {
+      if (isConversationTitleRequest(request)) {
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '生成图片' }
+      }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
     })
     const runtime = createApplicationRuntime({
@@ -3804,9 +3948,10 @@ describe('createApplicationRuntime', () => {
             purpose: 'output',
           })],
         }),
-      ])))
+    ])))
     expect(networkProxy.withTransportLease).toHaveBeenCalledOnce()
-    expect(stream).not.toHaveBeenCalled()
+    expect(stream).toHaveBeenCalledOnce()
+    expect(isConversationTitleRequest(stream.mock.calls[0]![0])).toBe(true)
     expect(directFetch).not.toHaveBeenCalled()
     await runtime.close()
   })
@@ -6249,6 +6394,40 @@ describe('createApplicationRuntime', () => {
     expect(workspace.clearUserData).toHaveBeenCalledWith(alice.user.id)
     expect(registry.list(alice.user.id, aliceConversation.id)).toEqual([])
     expect(registry.list(bob.user.id, bobConversation.id)).toHaveLength(1)
+    await runtime.close()
+  })
+
+  it('installs an encrypted browser session-storage store before pages can be opened', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-session-store-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const runtime = createApplicationRuntime(options(root, {
+      browserWorkspace: workspace,
+      safeStorage: {
+        isAvailable: async () => true,
+        encrypt: async (value) => Buffer.from(value).reverse(),
+        decrypt: async (value) => ({
+          value: Buffer.from(value).reverse().toString(),
+          shouldReEncrypt: false,
+        }),
+      },
+    }))
+
+    expect(workspace.setSessionStorageStore).toHaveBeenCalledOnce()
+    const store = vi.mocked(workspace.setSessionStorageStore).mock.calls[0]?.[0]
+    expect(store).toBeDefined()
+    await store!.apply('user_alice', {
+      type: 'set', origin: 'https://fw.example', key: 'PTOKEN', value: 'runtime-private-token',
+    })
+    await store!.drain()
+
+    expect(await store!.get('user_alice', ['https://fw.example'])).toEqual({
+      'https://fw.example': { PTOKEN: 'runtime-private-token' },
+    })
+    const inspection = openAppDatabase(join(root, 'autoforge.sqlite'))
+    expect(inspection.encryptedSecrets.raw(browserSessionStorageSecretKey('user_alice')))
+      .not.toContain('runtime-private-token')
+    inspection.close()
     await runtime.close()
   })
 

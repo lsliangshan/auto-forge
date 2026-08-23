@@ -1920,7 +1920,9 @@ describe('AgentOrchestrator', () => {
     dependencies.emit = (event) => {
       const detail = event.type === 'block'
         ? event.block.type
-        : event.type === 'status' ? event.status : event.block.type
+        : event.type === 'status'
+          ? event.status
+          : event.type === 'block_update' ? event.block.type : event.title
       order.push(`emit:${event.type}:${detail}`)
     }
 

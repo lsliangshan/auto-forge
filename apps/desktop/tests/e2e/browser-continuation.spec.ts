@@ -10,6 +10,7 @@ const repositoryRoot = resolve(desktopRoot, '../..')
 const requireFromDesktop = createRequire(join(desktopRoot, 'package.json'))
 const electronExecutable = requireFromDesktop('electron') as string
 const e2eMain = join(desktopRoot, '.e2e/main/browser-continuation-main.js')
+const sessionStorageE2eMain = join(desktopRoot, '.e2e/main/browser-session-storage-main.js')
 
 interface HarnessSnapshot {
   openTabs: number
@@ -776,5 +777,87 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })
     await expect.poll(async () => (await fixture.snapshot()).draftSaves).toBe(takeoverDraftSaves + 1)
     expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
+  })
+})
+
+test.describe.serial('persistent workflow browser session storage', () => {
+  let fixture: BrowserContinuationFixture
+  let userData: string
+
+  async function launch(): Promise<ElectronApplication> {
+    const launched = await _electron.launch({
+      executablePath: electronExecutable,
+      args: [sessionStorageE2eMain],
+      env: {
+        ...process.env,
+        AUTOFORGE_E2E_USER_DATA: userData,
+        AUTOFORGE_E2E_FIXTURE_ORIGIN: fixture.origin,
+        AUTOFORGE_E2E_DISALLOWED_ORIGIN: fixture.disallowedOrigin,
+        AUTOFORGE_E2E_FIXTURE_PROXY: fixture.proxyUrl,
+      },
+    })
+    await expect.poll(() => command<boolean>(launched, 'ready')).toBe(true)
+    return launched
+  }
+
+  async function terminate(application: ElectronApplication): Promise<void> {
+    const child = application.process()
+    if (child.exitCode !== null || child.signalCode !== null) return
+    const exited = new Promise<void>((resolveExit) => { child.once('exit', () => resolveExit()) })
+    child.kill('SIGKILL')
+    await exited
+  }
+
+  test.beforeAll(async () => {
+    fixture = await startBrowserContinuationFixture()
+    userData = await mkdtemp(join(tmpdir(), 'autoforge-browser-session-storage-e2e-'))
+  })
+
+  test.afterAll(async () => {
+    await fixture?.close()
+    if (userData) await rm(userData, { recursive: true, force: true })
+  })
+
+  test('restores a sessionStorage-only login before site scripts run after restart', async () => {
+    let first: ElectronApplication | undefined
+    let restarted: ElectronApplication | undefined
+    try {
+      first = await launch()
+      expect(await command<string>(first, 'open')).toBe('logged-out')
+      expect(await command<string>(first, 'login')).toBe('logged-in')
+      expect(await command(first, 'persistenceState')).toEqual({
+        keys: ['fixture_login'],
+        hasLogin: true,
+      })
+      await command(first, 'flushPersistence')
+      await terminate(first)
+      first = undefined
+
+      restarted = await launch()
+      expect(await command(restarted, 'persistenceState')).toEqual({
+        keys: ['fixture_login'],
+        hasLogin: true,
+      })
+      const restoredPageState = await command<string>(restarted, 'open')
+      expect(await command(restarted, 'bootstrapReads')).toEqual([{
+        origins: [fixture.origin],
+        hasLogin: true,
+      }])
+      expect(await command(restarted, 'pageSessionState')).toEqual({
+        keys: ['fixture_login'],
+        hasLogin: true,
+      })
+      expect(restoredPageState).toBe('logged-in')
+      await command(restarted, 'clearBrowserData')
+      expect(await command<string>(restarted, 'open')).toBe('logged-out')
+      await command(restarted, 'flushPersistence')
+      await terminate(restarted)
+      restarted = undefined
+    } finally {
+      if (first) await command(first, 'flushPersistence').catch(() => undefined)
+      if (restarted) await command(restarted, 'flushPersistence').catch(() => undefined)
+      if (first) await terminate(first).catch(() => undefined)
+      if (restarted) await terminate(restarted).catch(() => undefined)
+    }
   })
 })

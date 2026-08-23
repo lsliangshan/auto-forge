@@ -25,6 +25,11 @@ import {
   type BrowserPageCdpPort,
   type BrowserPageReadResult,
 } from './browser-page-inspector.js'
+import type {
+  BrowserSessionStorageMutation,
+  BrowserSessionStorageRecords,
+  BrowserSessionStorageStore,
+} from './browser-session-storage-store.js'
 
 interface InspectionCommandBudget {
   readonly signal?: AbortSignal
@@ -45,7 +50,16 @@ interface DebuggerPort {
   attach(protocolVersion?: string): void
   detach(): void
   sendCommand(method: string, commandParams?: Record<string, unknown>): Promise<unknown>
+  on(event: 'message', listener: DebuggerMessageListener): this
+  removeListener(event: 'message', listener: DebuggerMessageListener): this
 }
+
+type DebuggerMessageListener = (
+  event: unknown,
+  method: string,
+  params: Record<string, unknown>,
+  sessionId?: string,
+) => void
 
 interface NavigationHistoryPort {
   canGoBack(): boolean
@@ -168,6 +182,7 @@ export interface BrowserWorkspacePort {
 }
 
 export interface ApplicationBrowserWorkspacePort extends BrowserWorkspacePort, BrowserPageCdpPort {
+  setSessionStorageStore?(store: BrowserSessionStorageStore): void
   acquireContinuation(tabId: string, runId: string): Promise<void>
   releaseContinuation(tabId: string, runId: string): Promise<void>
   closeContinuation(tabId: string): Promise<void>
@@ -213,6 +228,8 @@ interface TargetTabState {
   allowedOrigins?: readonly string[]
   navigationViolation?: AppError
   blockedOrigin?: string
+  sessionStorageBootstrapId?: string
+  sessionStorageListener?: DebuggerMessageListener
   blockedErrorCode?: AppErrorCode
   activeOperations: number
   syntheticInputOperations: number
@@ -446,8 +463,13 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private continuationCommandHandlers: BrowserContinuationCommandHandlers | undefined
   private readonly pageInvalidationListeners = new Set<(tabId: string) => void>()
   private readonly highlightedContinuationTabs = new Set<string>()
+  private sessionStorageStore: BrowserSessionStorageStore | undefined
 
   constructor(private readonly options: ElectronBrowserWorkspaceOptions) {}
+
+  setSessionStorageStore(store: BrowserSessionStorageStore): void {
+    this.sessionStorageStore = store
+  }
 
   async acquire(input: BrowserWorkspaceAcquireInput): Promise<BrowserWorkspaceTab> {
     if (this.resetOperation) {
@@ -849,10 +871,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       || state.ownerContinuationRunId
       || state.activeOperations > 0)) throw failure('CONFLICT')
     for (const state of states) await this.closeTab(state)
+    await this.sessionStorageStore?.drain()
     const session = await this.configureSession(browserPartition(userId))
     await Promise.all([
       session.clearStorageData(),
       session.clearCache(),
+      this.sessionStorageStore?.clear(userId),
     ])
   }
 
@@ -884,6 +908,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     if (this.resetOperation) await this.resetOperation
     await Promise.allSettled([...this.acquisitions])
     await this.closeWindow()
+    await this.sessionStorageStore?.drain()
   }
 
   reset(): Promise<void> {
@@ -907,6 +932,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     this.assertOpen(state)
     const requestedOrigin = originOf(url)
     if (!allowedOrigins.includes(requestedOrigin)) throw failure('CAPABILITY_SCOPE_DENIED')
+    await this.prepareSessionStorageBootstrap(state, allowedOrigins)
     await this.restricted(state, allowedOrigins, async () => {
       const navigation = this.waitForNavigation(state.view.webContents)
       try {
@@ -922,6 +948,40 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       await this.waitForNavigation(state.view.webContents, postLoadNavigationDetectionMs).promise
     })
     await this.renderToolbar().catch(() => undefined)
+  }
+
+  private async prepareSessionStorageBootstrap(
+    state: TargetTabState,
+    allowedOrigins: readonly string[],
+  ): Promise<void> {
+    const store = this.sessionStorageStore
+    if (!store) return
+    const authorizedOrigins = [...new Set(allowedOrigins.map((origin) => originOf(origin)))]
+    let stored: BrowserSessionStorageRecords
+    try {
+      stored = await store.get(state.userId, authorizedOrigins)
+    } catch {
+      return
+    }
+    const authorized = new Set(authorizedOrigins)
+    const selected: Record<string, Readonly<Record<string, string>>> = {}
+    for (const [origin, items] of Object.entries(stored)) {
+      if (authorized.has(origin)) selected[origin] = items
+    }
+    const encoded = JSON.stringify(JSON.stringify(selected))
+    const source = `(() => { const records = JSON.parse(${encoded}); const items = records[location.origin]; if (!items) return; for (const [key, value] of Object.entries(items)) sessionStorage.setItem(key, value); })()`
+    await this.command(state, 'Page.enable')
+    const installed = await this.command(state, 'Page.addScriptToEvaluateOnNewDocument', { source }) as {
+      identifier?: unknown
+    }
+    if (typeof installed.identifier !== 'string' || installed.identifier.length === 0) return
+    const previous = state.sessionStorageBootstrapId
+    state.sessionStorageBootstrapId = installed.identifier
+    if (previous) {
+      await this.command(state, 'Page.removeScriptToEvaluateOnNewDocument', {
+        identifier: previous,
+      }).catch(() => undefined)
+    }
   }
 
   async fill(state: TargetTabState, locator: string, value: string, allowedOrigin: string): Promise<void> {
@@ -1172,7 +1232,42 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       return { action: 'deny' }
     })
     await this.attachDebugger(state)
+    await this.observeSessionStorage(state)
     return state
+  }
+
+  private async observeSessionStorage(state: TargetTabState): Promise<void> {
+    if (state.sessionStorageListener) return
+    await this.command(state, 'DOMStorage.enable')
+    const listener: DebuggerMessageListener = (_event, method, params) => {
+      const store = this.sessionStorageStore
+      const storageId = params.storageId as {
+        securityOrigin?: unknown
+        storageKey?: unknown
+        isLocalStorage?: unknown
+      } | undefined
+      if (!store || !storageId || storageId.isLocalStorage !== false) return
+      const candidate = typeof storageId.securityOrigin === 'string'
+        ? storageId.securityOrigin
+        : storageId.storageKey
+      if (typeof candidate !== 'string') return
+      let origin: string
+      try { origin = originOf(candidate) } catch { return }
+      let mutation: BrowserSessionStorageMutation | undefined
+      if ((method === 'DOMStorage.domStorageItemAdded'
+          || method === 'DOMStorage.domStorageItemUpdated')
+        && typeof params.key === 'string'
+        && typeof params.newValue === 'string') {
+        mutation = { type: 'set', origin, key: params.key, value: params.newValue }
+      } else if (method === 'DOMStorage.domStorageItemRemoved' && typeof params.key === 'string') {
+        mutation = { type: 'remove', origin, key: params.key }
+      } else if (method === 'DOMStorage.domStorageItemsCleared') {
+        mutation = { type: 'clear', origin }
+      }
+      if (mutation) void store.apply(state.userId, mutation).catch(() => undefined)
+    }
+    state.sessionStorageListener = listener
+    state.view.webContents.debugger.on('message', listener)
   }
 
   private handleWindowOpen(parent: TargetTabState, url: string): void {
@@ -2020,6 +2115,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     this.tabs.delete(state.id)
     if (state.ownerExecutionId) this.removeExecutionTab(state.ownerExecutionId, state)
     try { this.continuationRegistry?.markClosed(state.id, 'PAGE_CLOSED') } catch { /* Audit persistence cannot revive a closed renderer. */ }
+    if (state.sessionStorageListener) {
+      state.view.webContents.debugger.removeListener('message', state.sessionStorageListener)
+      state.sessionStorageListener = undefined
+    }
     try {
       if (state.view.webContents.debugger.isAttached()) state.view.webContents.debugger.detach()
     } catch { /* already detached by renderer teardown */ }

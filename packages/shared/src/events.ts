@@ -223,6 +223,12 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     blockId: identifierSchema,
     block: z.union([mediaBlockSchema, mediaGenerationBlockSchema]),
   }).strict(),
+  z.object({
+    type: z.literal('conversation_title_updated'),
+    conversationId: identifierSchema,
+    title: z.string().trim().min(1).max(20),
+    updatedAt: timestampSchema,
+  }).strict(),
 ]).superRefine((event, context) => {
   if (event.type === 'block_update' && event.blockId !== event.block.blockId) {
     context.addIssue({

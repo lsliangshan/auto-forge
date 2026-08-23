@@ -13,6 +13,7 @@ import {
   MAX_BROWSER_INSPECTION_RAW_BYTES,
   MAX_BROWSER_INSPECTION_RAW_NODES,
 } from './browser-page-inspector.js'
+import type { BrowserSessionStorageStore } from './browser-session-storage-store.js'
 
 class FakeSession extends EventEmitter {
   readonly setProxy = vi.fn(async () => undefined)
@@ -23,14 +24,14 @@ class FakeSession extends EventEmitter {
   readonly setPermissionCheckHandler = vi.fn()
 }
 
-class FakeDebugger {
+class FakeDebugger extends EventEmitter {
   attached = false
   readonly commands: Array<{ method: string; params?: unknown }> = []
   constructor(
     private readonly respond: (method: string, params?: unknown) => unknown,
     private readonly documentReady: () => boolean,
     private readonly requireDocumentBeforeCommands: boolean,
-  ) {}
+  ) { super() }
   isAttached() { return this.attached }
   attach() { this.attached = true }
   detach() { this.attached = false }
@@ -647,7 +648,9 @@ describe('ElectronBrowserWorkspace', () => {
       locators: Array.from({ length: 9 }, (_, index) => `css=.region-${index}`),
     })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
     expect(test.views[1]!.webContents.debugger.commands.filter(({ method }) => (
-      method !== 'DOM.enable' && method !== 'Accessibility.enable'
+      method !== 'DOM.enable'
+      && method !== 'Accessibility.enable'
+      && method !== 'DOMStorage.enable'
     )).length).toBeLessThanOrEqual(2_048)
   })
 
@@ -740,6 +743,135 @@ describe('ElectronBrowserWorkspace', () => {
     expect(browserPartition('user_1')).toBe(browserPartition('user_1'))
     expect(browserPartition('user_2')).not.toBe(browserPartition('user_1'))
     expect(browserPartition('user_1')).not.toContain('user_1')
+  })
+
+  it('installs an allowed-origin session-storage bootstrap before target navigation', async () => {
+    const order: string[] = []
+    const store: BrowserSessionStorageStore = {
+      get: vi.fn(async () => ({
+        'https://fw.example': { PTOKEN: 'restored-private-token' },
+        'https://evil.example': { PTOKEN: 'must-not-be-injected' },
+      })),
+      apply: vi.fn(async () => undefined),
+      clear: vi.fn(async () => undefined),
+      drain: vi.fn(async () => undefined),
+    }
+    const harness = createHarness((method) => {
+      if (method === 'Page.addScriptToEvaluateOnNewDocument') {
+        order.push('bootstrap')
+        return { identifier: 'session-bootstrap-1' }
+      }
+      return {}
+    }, false, async (url) => {
+      if (url.startsWith('https://')) order.push('navigate')
+    })
+    harness.workspace.setSessionStorageStore(store)
+    const tab = await harness.workspace.acquire(executionInput())
+
+    await tab.open('https://fw.example/start', [
+      'https://fw.example',
+      'https://portal.example',
+    ])
+
+    expect(order).toEqual(['bootstrap', 'navigate'])
+    expect(store.get).toHaveBeenCalledWith('user_1', [
+      'https://fw.example',
+      'https://portal.example',
+    ])
+    const bootstrap = harness.views[1]!.webContents.debugger.commands.find(
+      ({ method }) => method === 'Page.addScriptToEvaluateOnNewDocument',
+    )?.params as { source?: string } | undefined
+    expect(bootstrap?.source).toContain('restored-private-token')
+    expect(bootstrap?.source).not.toContain('must-not-be-injected')
+  })
+
+  it('persists only HTTPS session-storage CDP mutations and stops observing closed tabs', async () => {
+    const store: BrowserSessionStorageStore = {
+      get: vi.fn(async () => ({})),
+      apply: vi.fn(async () => undefined),
+      clear: vi.fn(async () => undefined),
+      drain: vi.fn(async () => undefined),
+    }
+    const harness = createHarness((method) => (
+      method === 'Page.addScriptToEvaluateOnNewDocument'
+        ? { identifier: 'session-bootstrap-1' }
+        : {}
+    ))
+    harness.workspace.setSessionStorageStore(store)
+    const tab = await harness.workspace.acquire(executionInput())
+    const targetDebugger = harness.views[1]!.webContents.debugger
+    const emitMutation = (method: string, params: Record<string, unknown>) => {
+      targetDebugger.emit('message', {}, method, params)
+    }
+
+    emitMutation('DOMStorage.domStorageItemAdded', {
+      storageId: { securityOrigin: 'https://fw.example', isLocalStorage: false },
+      key: 'PTOKEN', newValue: 'persisted-private-token',
+    })
+    emitMutation('DOMStorage.domStorageItemUpdated', {
+      storageId: { securityOrigin: 'https://fw.example', isLocalStorage: false },
+      key: 'PTOKEN', newValue: 'rotated-private-token', oldValue: 'persisted-private-token',
+    })
+    emitMutation('DOMStorage.domStorageItemRemoved', {
+      storageId: { securityOrigin: 'https://fw.example', isLocalStorage: false },
+      key: 'checkState',
+    })
+    emitMutation('DOMStorage.domStorageItemsCleared', {
+      storageId: { securityOrigin: 'https://portal.example', isLocalStorage: false },
+    })
+    emitMutation('DOMStorage.domStorageItemAdded', {
+      storageId: { securityOrigin: 'https://fw.example', isLocalStorage: true },
+      key: 'local', newValue: 'ignored-local-storage',
+    })
+    emitMutation('DOMStorage.domStorageItemAdded', {
+      storageId: { securityOrigin: 'http://unsafe.example', isLocalStorage: false },
+      key: 'unsafe', newValue: 'ignored-insecure-storage',
+    })
+
+    await vi.waitFor(() => expect(store.apply).toHaveBeenCalledTimes(4))
+    expect(store.apply).toHaveBeenNthCalledWith(1, 'user_1', {
+      type: 'set', origin: 'https://fw.example', key: 'PTOKEN', value: 'persisted-private-token',
+    })
+    expect(store.apply).toHaveBeenNthCalledWith(2, 'user_1', {
+      type: 'set', origin: 'https://fw.example', key: 'PTOKEN', value: 'rotated-private-token',
+    })
+    expect(store.apply).toHaveBeenNthCalledWith(3, 'user_1', {
+      type: 'remove', origin: 'https://fw.example', key: 'checkState',
+    })
+    expect(store.apply).toHaveBeenNthCalledWith(4, 'user_1', {
+      type: 'clear', origin: 'https://portal.example',
+    })
+
+    await tab.close()
+    emitMutation('DOMStorage.domStorageItemAdded', {
+      storageId: { securityOrigin: 'https://fw.example', isLocalStorage: false },
+      key: 'late', newValue: 'must-not-persist',
+    })
+    await Promise.resolve()
+    expect(store.apply).toHaveBeenCalledTimes(4)
+  })
+
+  it('drains encrypted session-storage writes before workspace shutdown completes', async () => {
+    let releaseDrain!: () => void
+    const draining = new Promise<void>((resolve) => { releaseDrain = resolve })
+    const store: BrowserSessionStorageStore = {
+      get: vi.fn(async () => ({})),
+      apply: vi.fn(async () => undefined),
+      clear: vi.fn(async () => undefined),
+      drain: vi.fn(() => draining),
+    }
+    const harness = createHarness()
+    harness.workspace.setSessionStorageStore(store)
+    await harness.workspace.acquire(executionInput())
+
+    let completed = false
+    const shutdown = harness.workspace.shutdown().then(() => { completed = true })
+    await vi.waitFor(() => expect(store.drain).toHaveBeenCalledOnce())
+    expect(completed).toBe(false)
+
+    releaseDrain()
+    await shutdown
+    expect(completed).toBe(true)
   })
 
   it('creates one BaseWindow and secure switchable target tabs sharing only the same user session', async () => {
@@ -1965,6 +2097,13 @@ describe('ElectronBrowserWorkspace', () => {
 
   it('closes and clears only one hashed user partition for an explicit browser-data reset', async () => {
     const { workspace, sessions, views, fromPartition } = createHarness()
+    const sessionStorageStore: BrowserSessionStorageStore = {
+      get: vi.fn(async () => ({})),
+      apply: vi.fn(async () => undefined),
+      clear: vi.fn(async () => undefined),
+      drain: vi.fn(async () => undefined),
+    }
+    workspace.setSessionStorageStore(sessionStorageStore)
     await acquire(workspace, 'exec_1', 'user_1')
     await workspace.releaseExecution('exec_1')
     await acquire(workspace, 'exec_2', 'user_2')
@@ -1983,6 +2122,9 @@ describe('ElectronBrowserWorkspace', () => {
     expect(sessions.get('autoforge-browser-toolbar')?.clearStorageData).not.toHaveBeenCalled()
     expect(fromPartition).toHaveBeenCalledWith(userOnePartition)
     expect([...sessions.keys()]).not.toContain('default')
+    expect(sessionStorageStore.drain).toHaveBeenCalledOnce()
+    expect(sessionStorageStore.clear).toHaveBeenCalledOnce()
+    expect(sessionStorageStore.clear).toHaveBeenCalledWith('user_1')
   })
 
   it('refuses to clear a user partition while that user still owns execution or continuation work', async () => {

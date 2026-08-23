@@ -846,6 +846,28 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('carries an AI-generated conversation title as a strict chat event', () => {
+    expect(chatEventSchema.parse({
+      type: 'conversation_title_updated',
+      conversationId: 'conversation_1',
+      title: '北京工作居住证办理',
+      updatedAt: '2026-08-23T12:00:00.000Z',
+    })).toEqual({
+      type: 'conversation_title_updated',
+      conversationId: 'conversation_1',
+      title: '北京工作居住证办理',
+      updatedAt: '2026-08-23T12:00:00.000Z',
+    })
+
+    expect(() => chatEventSchema.parse({
+      type: 'conversation_title_updated',
+      conversationId: 'conversation_1',
+      title: '北京工作居住证办理',
+      updatedAt: 'not-a-timestamp',
+      ignored: true,
+    })).toThrow()
+  })
+
   it('allows attachment-only understanding but rejects empty or encoded sends', () => {
     expect(chatSendInputSchema.parse({
       conversationId: 'conversation_1',

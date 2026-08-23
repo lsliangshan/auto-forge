@@ -48,6 +48,7 @@ export function openAppDatabase(path: string) {
     repositories.messages.failInterruptedBrowserStatuses(failedRequestIds)
     repositories.messages.invalidatePendingAgentApprovals()
     repositories.messages.failInterruptedMediaGenerations()
+    repositories.conversations.failInterruptedTitleGenerations()
     return { executions, chatRuns }
   })()
 

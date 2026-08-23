@@ -9,6 +9,9 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 export const conversations = sqliteTable('conversations', {
   id: text('id').primaryKey(),
   title: text('title').notNull(),
+  titleState: text('title_state', {
+    enum: ['pending', 'generating', 'ai_named', 'user_named', 'failed'],
+  }).notNull().default('user_named'),
   userId: text('user_id').references(() => localUsers.id),
   generationPreferencesJson: text('generation_preferences_json'),
   createdAt: integer('created_at').notNull(),

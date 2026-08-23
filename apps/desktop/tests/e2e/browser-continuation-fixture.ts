@@ -119,6 +119,14 @@ ${input.dynamic ? `<script>setTimeout(() => { const old = document.querySelector
 </main></body></html>`
 }
 
+function sessionStorageDocument(): string {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>会话存储登录</title>
+<script>document.documentElement.dataset.authenticated = sessionStorage.getItem('fixture_login') === 'authenticated' ? 'true' : 'false'</script></head>
+<body><main><p id="session-state"></p><button id="session-login" type="button" onclick="sessionStorage.setItem('fixture_login', 'authenticated'); location.reload()">登录</button>
+<script>document.querySelector('#session-state').textContent = document.documentElement.dataset.authenticated === 'true' ? 'logged-in' : 'logged-out'</script>
+</main></body></html>`
+}
+
 async function listen(server: Server): Promise<number> {
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -174,6 +182,10 @@ export async function startBrowserContinuationFixture(): Promise<BrowserContinua
       state.finalSubmissions += 1
       response.writeHead(204)
       return response.end()
+    }
+    if (url.pathname === '/session-storage') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      return response.end(sessionStorageDocument())
     }
     if (url.pathname === '/authenticate') {
       state.authenticated = true

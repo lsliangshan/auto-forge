@@ -248,7 +248,7 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(10)
+    expect(database.schemaVersion()).toBe(11)
     const inspection = new Database(path, { readonly: true })
     expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
       .map(({ table, on_delete }) => ({ table, on_delete })))
@@ -377,8 +377,11 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(10)
-    expect(database.conversations.get('conversation_v1')).toMatchObject({ title: 'Persisted v1' })
+    expect(database.schemaVersion()).toBe(11)
+    expect(database.conversations.get('conversation_v1')).toMatchObject({
+      title: 'Persisted v1',
+      titleState: 'user_named',
+    })
     expect(database.messages.get('message_v1')).toMatchObject({
       blocks: [{ type: 'text', text: 'before upgrade' }],
       ordinal: 1,
@@ -388,7 +391,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(10)
+    expect(database.schemaVersion()).toBe(11)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -399,7 +402,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(10)
+    expect(database.schemaVersion()).toBe(11)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -419,7 +422,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(10)
+    expect(database.schemaVersion()).toBe(11)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -473,6 +476,44 @@ describe('openAppDatabase', () => {
       id: 'conversation_owned',
       userId: 'user_owner',
     })
+  })
+
+  it('allows one AI title attempt without overwriting a user rename', () => {
+    const database = openTestDatabase()
+    const conversations = database.conversations as typeof database.conversations & {
+      insert(value: { id: string; title: string; titleState: 'pending' }): unknown
+      claimTitleGeneration(id: string): boolean
+      completeTitleGeneration(id: string, title: string): unknown
+      failTitleGeneration(id: string): void
+      renameByUser(id: string, title: string): unknown
+    }
+
+    conversations.insert({ id: 'conversation_ai', title: '新会话', titleState: 'pending' })
+    expect(conversations.claimTitleGeneration('conversation_ai')).toBe(true)
+    expect(database.conversations.get('conversation_ai')).toMatchObject({ titleState: 'generating' })
+    expect(conversations.completeTitleGeneration('conversation_ai', '北京工作居住证')).toMatchObject({
+      title: '北京工作居住证',
+      titleState: 'ai_named',
+    })
+    expect(conversations.claimTitleGeneration('conversation_ai')).toBe(false)
+
+    conversations.insert({ id: 'conversation_manual', title: '新会话', titleState: 'pending' })
+    expect(conversations.claimTitleGeneration('conversation_manual')).toBe(true)
+    expect(conversations.renameByUser('conversation_manual', '我的证件事项')).toMatchObject({
+      title: '我的证件事项',
+      titleState: 'user_named',
+    })
+    expect(conversations.completeTitleGeneration('conversation_manual', '不应覆盖')).toBeUndefined()
+    expect(database.conversations.get('conversation_manual')).toMatchObject({
+      title: '我的证件事项',
+      titleState: 'user_named',
+    })
+
+    conversations.insert({ id: 'conversation_failed', title: '新会话', titleState: 'pending' })
+    expect(conversations.claimTitleGeneration('conversation_failed')).toBe(true)
+    conversations.failTitleGeneration('conversation_failed')
+    expect(database.conversations.get('conversation_failed')).toMatchObject({ titleState: 'failed' })
+    expect(conversations.claimTitleGeneration('conversation_failed')).toBe(false)
   })
 
   it('rejects a case-insensitive duplicate without replacing the current session', () => {
@@ -972,6 +1013,20 @@ describe('openAppDatabase', () => {
     }
   })
 
+  it('marks an interrupted conversation-title generation failed during recovery', () => {
+    const database = openTestDatabase()
+    database.conversations.insert({
+      id: 'conversation_title_recovery', title: '新会话', titleState: 'pending',
+    })
+    expect(database.conversations.claimTitleGeneration('conversation_title_recovery')).toBe(true)
+
+    database.recoverInterrupted()
+
+    expect(database.conversations.get('conversation_title_recovery')).toMatchObject({
+      title: '新会话', titleState: 'failed',
+    })
+  })
+
   it('terminalizes only nonterminal browser statuses owned by interrupted chat runs', () => {
     const database = openTestDatabase()
     database.conversations.insert({ id: 'browser_status_recovery', title: 'Browser recovery' })
@@ -1331,7 +1386,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(10)
+    expect(database.schemaVersion()).toBe(11)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)

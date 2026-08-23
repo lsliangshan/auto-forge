@@ -22,6 +22,7 @@ import { redact } from '../security/redaction.js'
 export interface Conversation {
   id: string
   title: string
+  titleState: 'pending' | 'generating' | 'ai_named' | 'user_named' | 'failed'
   userId?: string
   generationPreferences?: ConversationGenerationPreferences
   createdAt: number
@@ -677,11 +678,16 @@ export interface EncryptedSecretsRepository {
 
 export interface AppRepositories {
   conversations: {
-    insert(value: Pick<Conversation, 'id' | 'title'> & Partial<Pick<Conversation, 'userId' | 'createdAt' | 'updatedAt'>>): Conversation
+    insert(value: Pick<Conversation, 'id' | 'title'> & Partial<Pick<Conversation, 'titleState' | 'userId' | 'createdAt' | 'updatedAt'>>): Conversation
     get(id: string): Conversation | undefined
     list(): Conversation[]
     claimLegacyAndListForUser(userId: string): Conversation[]
-    update(id: string, value: Partial<Pick<Conversation, 'title' | 'updatedAt'>>): Conversation | undefined
+    renameByUser(id: string, title: string): Conversation | undefined
+    claimTitleGeneration(id: string): boolean
+    completeTitleGeneration(id: string, title: string): Conversation | undefined
+    failTitleGeneration(id: string): void
+    failPendingTitleGeneration(id: string): void
+    failInterruptedTitleGenerations(): number
     updateGenerationPreferences(id: string, preferences: ConversationGenerationPreferences): Conversation | undefined
     delete(id: string): void
   }
@@ -777,7 +783,7 @@ export interface AppRepositories {
   encryptedSecrets: EncryptedSecretsRepository
 }
 
-const conversationColumns = 'id, title, user_id AS userId, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
+const conversationColumns = 'id, title, title_state AS titleState, user_id AS userId, generation_preferences_json AS generationPreferencesJson, created_at AS createdAt, updated_at AS updatedAt'
 const messageColumns = 'id, conversation_id AS conversationId, role, blocks_json AS blocksJson, ordinal, execution_id AS executionId, created_at AS createdAt'
 const conversationContextColumns = 'conversation_id AS conversationId, summary_text AS summaryText, through_ordinal AS throughOrdinal, estimated_tokens AS estimatedTokens, updated_at AS updatedAt'
 const mediaAssetColumns = 'id, conversation_id AS conversationId, message_id AS messageId, source, kind, mime_type AS mimeType, original_name AS originalName, relative_path AS relativePath, byte_size AS byteSize, width, height, duration_ms AS durationMs, sha256, provider, model, status, created_at AS createdAt, updated_at AS updatedAt'
@@ -1013,6 +1019,7 @@ function conversationFromRow(row: Query): Conversation {
   return {
     id: row.id as string,
     title: row.title as string,
+    titleState: row.titleState as Conversation['titleState'],
     ...(userId === undefined ? {} : { userId }),
     ...(preferences === undefined ? {} : { generationPreferences: conversationGenerationPreferencesSchema.parse(preferences) }),
     createdAt: row.createdAt as number,
@@ -1536,8 +1543,9 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       insert(value) {
         const createdAt = value.createdAt ?? now()
         const updatedAt = value.updatedAt ?? createdAt
-        transaction(database, () => database.prepare('INSERT INTO conversations (id, title, user_id, created_at, updated_at) VALUES (@id, @title, @userId, @createdAt, @updatedAt)').run({ ...value, userId: value.userId ?? null, createdAt, updatedAt }))
-        return { id: value.id, title: value.title, ...(value.userId === undefined ? {} : { userId: value.userId }), createdAt, updatedAt }
+        const titleState = value.titleState ?? 'user_named'
+        transaction(database, () => database.prepare('INSERT INTO conversations (id, title, title_state, user_id, created_at, updated_at) VALUES (@id, @title, @titleState, @userId, @createdAt, @updatedAt)').run({ ...value, titleState, userId: value.userId ?? null, createdAt, updatedAt }))
+        return { id: value.id, title: value.title, titleState, ...(value.userId === undefined ? {} : { userId: value.userId }), createdAt, updatedAt }
       },
       get: (id) => { const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id }); return row && conversationFromRow(row) },
       list: () => many<Query>(database, `SELECT ${conversationColumns} FROM conversations ORDER BY updated_at DESC, id`).map(conversationFromRow),
@@ -1545,12 +1553,36 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         database.prepare('UPDATE conversations SET user_id = @userId WHERE user_id IS NULL').run({ userId })
         return many<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE user_id = @userId ORDER BY updated_at DESC, id`, { userId }).map(conversationFromRow)
       }),
-      update(id, value) {
-        const updatedAt = value.updatedAt ?? now()
-        transaction(database, () => database.prepare('UPDATE conversations SET title = COALESCE(@title, title), updated_at = @updatedAt WHERE id = @id').run({ id, title: value.title ?? null, updatedAt }))
+      renameByUser(id, title) {
+        const updatedAt = now()
+        transaction(database, () => database.prepare("UPDATE conversations SET title = @title, title_state = 'user_named', updated_at = @updatedAt WHERE id = @id").run({ id, title, updatedAt }))
         const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id })
         return row && conversationFromRow(row)
       },
+      claimTitleGeneration: (id) => transaction(database, () => (
+        database.prepare("UPDATE conversations SET title_state = 'generating' WHERE id = @id AND title_state = 'pending'")
+          .run({ id }).changes === 1
+      )),
+      completeTitleGeneration(id, title) {
+        return transaction(database, () => {
+          const updatedAt = now()
+          const result = database.prepare("UPDATE conversations SET title = @title, title_state = 'ai_named', updated_at = @updatedAt WHERE id = @id AND title_state = 'generating'")
+            .run({ id, title, updatedAt })
+          if (result.changes !== 1) return undefined
+          const row = one<Query>(database, `SELECT ${conversationColumns} FROM conversations WHERE id = @id`, { id })
+          return row && conversationFromRow(row)
+        })
+      },
+      failTitleGeneration: (id) => {
+        transaction(database, () => database.prepare("UPDATE conversations SET title_state = 'failed' WHERE id = @id AND title_state = 'generating'").run({ id }))
+      },
+      failPendingTitleGeneration: (id) => {
+        transaction(database, () => database.prepare("UPDATE conversations SET title_state = 'failed' WHERE id = @id AND title_state = 'pending'").run({ id }))
+      },
+      failInterruptedTitleGenerations: () => transaction(database, () => (
+        database.prepare("UPDATE conversations SET title_state = 'failed' WHERE title_state = 'generating'")
+          .run().changes
+      )),
       updateGenerationPreferences(id, preferences) {
         const validated = conversationGenerationPreferencesSchema.parse(preferences)
         transaction(database, () => database.prepare('UPDATE conversations SET generation_preferences_json = @generationPreferencesJson, updated_at = @updatedAt WHERE id = @id').run({

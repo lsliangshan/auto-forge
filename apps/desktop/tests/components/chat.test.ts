@@ -1392,6 +1392,29 @@ describe('chat interactions', () => {
     ])
   })
 
+  it('updates the matching sidebar conversation from an AI title event', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [{
+      id: 'conv_1', title: '新会话',
+      createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
+    }]
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'conversation_title_updated',
+      conversationId: 'conv_1',
+      title: '北京工作居住证办理',
+      updatedAt: '2026-08-23T00:01:00.000Z',
+    })
+
+    expect(store.conversations).toEqual([{
+      id: 'conv_1', title: '北京工作居住证办理',
+      createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:01:00.000Z',
+    }])
+  })
+
   it('does not let a loading snapshot overwrite a newer streamed delta', async () => {
     const { api, emitChat } = createEventApi()
     let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void

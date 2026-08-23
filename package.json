@@ -14,7 +14,7 @@
     "dev": "pnpm -r --filter \"./packages/**\" build && pnpm --filter @autoforge/desktop dev",
     "test:e2e": "pnpm build && playwright test",
     "pretest:e2e:browser-continuation": "pnpm --filter @autoforge/desktop prepare:native-electron",
-    "test:e2e:browser-continuation": "pnpm build && pnpm --filter @autoforge/desktop exec tsup electron/e2e/browser-continuation-main.ts --format esm --platform node --external electron --external better-sqlite3 --out-dir .e2e/main --clean && playwright test apps/desktop/tests/e2e/browser-continuation.spec.ts",
+    "test:e2e:browser-continuation": "pnpm build && pnpm --filter @autoforge/desktop exec tsup electron/e2e/browser-continuation-main.ts electron/e2e/browser-session-storage-main.ts --format esm --platform node --external electron --external better-sqlite3 --out-dir .e2e/main --clean && playwright test apps/desktop/tests/e2e/browser-continuation.spec.ts",
     "dist:dir": "pnpm build && pnpm --filter @autoforge/desktop dist:dir"
   },
   "devDependencies": {
