@@ -11,6 +11,8 @@ Configure these values as server-side environment variables for the CloudBase fu
 
 Both credentials are environment-only. Do not commit them, bundle them into Electron, pass them in an event, or print them in function logs.
 
+The PostgreSQL response boundary has a fixed 8 MiB byte ceiling. The function checks `Content-Length` when present and independently enforces the same limit while streaming the response body before JSON parsing.
+
 ## Dry-run and static verification
 
 From the repository root:

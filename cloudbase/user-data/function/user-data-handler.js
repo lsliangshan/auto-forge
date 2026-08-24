@@ -1,4 +1,4 @@
-/* global AbortController, Buffer, URL, clearTimeout, fetch, module, setTimeout */
+/* global AbortController, Buffer, TextDecoder, URL, clearTimeout, fetch, module, setTimeout */
 
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
@@ -61,12 +61,8 @@ const executionStatuses = new Set([
   'queued', 'awaiting_approval', 'running', 'completed', 'failed', 'cancelled', 'interrupted',
 ])
 const maximumRequestBytes = 1_048_576
+const maximumResponseBytes = 8 * 1024 * 1024
 const maximumBatchItems = 100
-const forbiddenResponseKeys = new Set([
-  'apiKey', 'api_key', 'accessToken', 'access_token', 'refreshToken', 'refresh_token',
-  'authorization', 'cookie', 'details', 'password', 'path', 'query', 'secret',
-  'serviceKey', 'service_key', 'sql', 'token', 'uid', 'userId', 'ownerUserId', 'owner_user_id',
-])
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -137,16 +133,44 @@ function withinRequestLimit(value) {
   }
 }
 
-function containsForbiddenResponseKey(value) {
-  if (Array.isArray(value)) return value.some(containsForbiddenResponseKey)
-  if (!isRecord(value)) return false
-  return Object.entries(value).some(([key, child]) => (
-    forbiddenResponseKeys.has(key) || containsForbiddenResponseKey(child)
-  ))
-}
-
 function cloneValidatedJson(value) {
   return JSON.parse(JSON.stringify(value))
+}
+
+function sensitiveOpaqueKey(key) {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '')
+  return normalized === 'authorization'
+    || normalized === 'cookie'
+    || normalized === 'uid'
+    || normalized.endsWith('uid')
+    || normalized.includes('userid')
+    || normalized === 'path'
+    || normalized.endsWith('path')
+    || normalized.includes('owner')
+    || normalized.includes('credential')
+    || normalized.includes('token')
+    || normalized.includes('password')
+    || normalized.includes('secret')
+    || normalized.includes('servicekey')
+    || normalized.includes('apikey')
+    || normalized.includes('prompt')
+    || normalized.includes('responsebody')
+    || normalized.includes('base64')
+}
+
+function sanitizeOpaqueJson(value) {
+  if (Array.isArray(value)) return value.map(sanitizeOpaqueJson)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+    key,
+    sensitiveOpaqueKey(key) ? '[REDACTED]' : sanitizeOpaqueJson(child),
+  ]))
+}
+
+function sanitizeChatBlock(block) {
+  const cloned = cloneValidatedJson(block)
+  if (cloned.type === 'workflow_proposal') cloned.args = sanitizeOpaqueJson(cloned.args)
+  return cloned
 }
 
 function validateConsent(value, requiredPurpose) {
@@ -180,19 +204,78 @@ function httpsOrigin(value) {
   }
 }
 
-function httpsUrlPattern(value) {
-  if (!nonEmptyString(value)
-    || value.includes('?')
-    || value.includes('#')
-    || value.includes('\\')) return false
-  const candidate = value.includes('://') ? value : `https://${value}`
-  if (!candidate.startsWith('https://')) return false
+// Standalone semantic copy of packages/shared/src/https-url-pattern.ts.
+// Keep parity regression cases in tests/cloudbase/user-data-handler.test.ts.
+const schemePattern = /^([A-Za-z][A-Za-z\d+.-]*):\/\//
+const hostnameLabelPattern = /^[A-Za-z\d*](?:[A-Za-z\d*-]*[A-Za-z\d*])?$/
+
+function normalizedGlob(value) {
+  return value.replace(/\*+/g, '*')
+}
+
+function parseWildcardHttpsPattern(value, schemeLength) {
+  const remainder = value.slice(schemeLength)
+  const slashIndex = remainder.indexOf('/')
+  const authority = slashIndex < 0 ? remainder : remainder.slice(0, slashIndex)
+  const path = slashIndex < 0 ? undefined : remainder.slice(slashIndex)
+  if (!authority || authority.includes('@') || authority.includes('[') || authority.includes(']')) {
+    return undefined
+  }
+  const colonIndex = authority.lastIndexOf(':')
+  if (colonIndex !== authority.indexOf(':')) return undefined
+  const host = (colonIndex < 0 ? authority : authority.slice(0, colonIndex)).toLowerCase()
+  const portText = colonIndex < 0 ? '' : authority.slice(colonIndex + 1)
+  if (colonIndex >= 0 && !portText) return undefined
+  if (!host || host.startsWith('.') || host.endsWith('.') || host.includes('..')) return undefined
+  if (!host.split('.').every((label) => hostnameLabelPattern.test(label))) return undefined
+  if (!/[A-Za-z\d]/.test(host) || /^[\d.*]+$/.test(host)) return undefined
+  if (portText && !/^\d+$/.test(portText)) return undefined
+  const port = portText ? Number(portText) : 443
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return undefined
+  if (path?.includes('\\')) return undefined
+  return {
+    host: normalizedGlob(host),
+    hostHasWildcard: true,
+    port: port === 443 ? '' : String(port),
+    ...(path && path !== '/*' ? { path: normalizedGlob(path) } : {}),
+  }
+}
+
+function parseExactHttpsPattern(value, schemeLength) {
+  const remainder = value.slice(schemeLength)
+  const slashIndex = remainder.indexOf('/')
+  const authority = slashIndex < 0 ? remainder : remainder.slice(0, slashIndex)
+  const hasPath = slashIndex >= 0
+  if (!authority || authority.endsWith(':')) return undefined
   try {
-    const url = new URL(candidate.replaceAll('*', 'wildcard'))
-    return url.protocol === 'https:' && url.username === '' && url.password === '' && Boolean(url.hostname)
+    const url = new URL(schemeLength ? value : `https://${value}`)
+    if (url.protocol !== 'https:'
+      || url.username
+      || url.password
+      || !url.hostname
+      || url.hostname.includes('..')) return undefined
+    return {
+      host: url.hostname.toLowerCase(),
+      hostHasWildcard: false,
+      port: url.port,
+      ...(hasPath ? { path: url.pathname } : {}),
+    }
   } catch {
+    return undefined
+  }
+}
+
+function httpsUrlPattern(value) {
+  if (!value || value !== value.trim() || value.includes('?') || value.includes('#') || value.includes('\\')) {
     return false
   }
+  const scheme = value.match(schemePattern)
+  if (scheme && scheme[1]?.toLowerCase() !== 'https') return false
+  const schemeLength = scheme?.[0].length ?? 0
+  if (!scheme && value.includes('://')) return false
+  return value.includes('*')
+    ? parseWildcardHttpsPattern(value, schemeLength) !== undefined
+    : parseExactHttpsPattern(value, schemeLength) !== undefined
 }
 
 function validateScope(capability, scope) {
@@ -327,7 +410,7 @@ function validateChatBlock(block) {
         && identifier(block.executionId) && typeof block.summary === 'string'
     case 'error':
       return hasStrictShape(block, ['type', 'code', 'message'])
-        && appErrorCodes.has(block.code) && nonEmptyString(block.message)
+        && nonEmptyString(block.code) && nonEmptyString(block.message)
     case 'browser_status':
       return hasStrictShape(
         block,
@@ -399,6 +482,12 @@ function validateLegacyConfirm(value) {
     return validateConsent(value.unownedImportConsent, 'legacy_unowned_import')
   }
   return value.unownedImportConsent === undefined
+}
+
+function validateStoredLegacyReceipt(value) {
+  return hasStrictShape(value, ['batchId', 'includeUnowned'])
+    && identifier(value.batchId)
+    && typeof value.includeUnowned === 'boolean'
 }
 
 function validateUsage(value) {
@@ -526,6 +615,9 @@ function parseSyncPushResponse(value) {
 }
 
 function parsePulledMutation(value) {
+  const payloadIsValid = value?.kind === 'legacy.import'
+    ? validateStoredLegacyReceipt(value.payload)
+    : validateMutationPayload(value?.kind, value?.payload)
   if (!hasStrictShape(
     value,
     ['id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'payload', 'receivedAt'],
@@ -534,7 +626,7 @@ function parsePulledMutation(value) {
     || !identifier(value.entityId)
     || !nonnegativeInteger(value.baseRevision)
     || (value.resultRevision !== null && !nonnegativeInteger(value.resultRevision))
-    || !validateMutationPayload(value.kind, value.payload)
+    || !payloadIsValid
     || !mutationEntityMatches(value.kind, value.entityId, value.payload)
     || !timestamp(value.receivedAt)) return undefined
   return {
@@ -543,7 +635,12 @@ function parsePulledMutation(value) {
     entityId: value.entityId,
     baseRevision: value.baseRevision,
     resultRevision: value.resultRevision,
-    payload: cloneValidatedJson(value.payload),
+    payload: value.kind === 'message.append'
+      ? {
+          ...cloneValidatedJson(value.payload),
+          blocks: value.payload.blocks.map(sanitizeChatBlock),
+        }
+      : cloneValidatedJson(value.payload),
     receivedAt: value.receivedAt,
   }
 }
@@ -599,7 +696,7 @@ function parseMessage(value) {
     id: value.id,
     conversationId: value.conversationId,
     role: value.role,
-    blocks: value.blocks.map(cloneValidatedJson),
+    blocks: value.blocks.map(sanitizeChatBlock),
     ...(value.executionId === undefined ? {} : { executionId: value.executionId }),
     createdAt: value.createdAt,
   }
@@ -692,7 +789,6 @@ function parsePreferences(value, includeUpdatedAt) {
 }
 
 function parseRpcResponse(name, value) {
-  if (containsForbiddenResponseKey(value)) return undefined
   switch (name) {
     case 'autoforge_sync_push': return parseSyncPushResponse(value)
     case 'autoforge_sync_pull': return parseSyncPullResponse(value)
@@ -704,6 +800,70 @@ function parseRpcResponse(name, value) {
     case 'autoforge_get_user_data_preferences': return parsePreferences(value, true)
     case 'autoforge_update_user_data_preferences': return parsePreferences(value, false)
     default: return undefined
+  }
+}
+
+async function readBoundedJsonResponse(response, signal) {
+  if (!response?.headers || typeof response.headers.get !== 'function') {
+    throw { code: 'SERVICE_UNAVAILABLE' }
+  }
+  const contentLength = response.headers.get('content-length')
+  if (contentLength !== null) {
+    if (!/^\d+$/.test(contentLength)) throw { code: 'SERVICE_UNAVAILABLE' }
+    const declaredBytes = Number(contentLength)
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > maximumResponseBytes) {
+      throw { code: 'SERVICE_UNAVAILABLE' }
+    }
+  }
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw { code: 'SERVICE_UNAVAILABLE' }
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  let byteCount = 0
+  let text = ''
+  let complete = false
+  let abortListener
+  const aborted = new Promise((_, reject) => {
+    abortListener = () => reject({ code: 'SERVICE_UNAVAILABLE' })
+    if (signal.aborted) abortListener()
+    else signal.addEventListener('abort', abortListener, { once: true })
+  })
+
+  try {
+    while (true) {
+      const chunk = await Promise.race([reader.read(), aborted])
+      if (!isRecord(chunk) || typeof chunk.done !== 'boolean') {
+        throw { code: 'SERVICE_UNAVAILABLE' }
+      }
+      if (chunk.done) {
+        complete = true
+        text += decoder.decode()
+        break
+      }
+      if (!(chunk.value instanceof Uint8Array)) throw { code: 'SERVICE_UNAVAILABLE' }
+      byteCount += chunk.value.byteLength
+      if (byteCount > maximumResponseBytes) throw { code: 'SERVICE_UNAVAILABLE' }
+      text += decoder.decode(chunk.value, { stream: true })
+    }
+    return JSON.parse(text)
+  } finally {
+    signal.removeEventListener('abort', abortListener)
+    if (!complete && typeof reader.cancel === 'function') {
+      try {
+        Promise.resolve(reader.cancel()).catch(() => undefined)
+      } catch {
+        // Cancellation is best effort; the caller still returns only a stable error.
+      }
+    }
+    if (typeof reader.releaseLock === 'function') {
+      try {
+        reader.releaseLock()
+      } catch {
+        // Releasing an already-closed reader must not change the safe error envelope.
+      }
+    }
   }
 }
 
@@ -935,7 +1095,7 @@ function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch, timeo
       }
       let body
       try {
-        body = await Promise.race([response.json(), timeout])
+        body = await Promise.race([readBoundedJsonResponse(response, controller.signal), timeout])
       } catch {
         throw { code: 'SERVICE_UNAVAILABLE' }
       }

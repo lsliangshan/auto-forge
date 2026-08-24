@@ -43,6 +43,62 @@ function messageMutation(blocks: unknown[]) {
   }
 }
 
+function approvalMutation(origin: string) {
+  return messageMutation([{
+    type: 'approval',
+    blockId: 'block_1',
+    state: 'pending',
+    executionId: 'execution_1',
+    workflowId: 'workflow_1',
+    workflowName: 'Workflow',
+    workflowVersion: '1.0.0',
+    source: 'installed',
+    actionSummary: 'Open the approved site',
+    permissionIndex: 0,
+    capability: 'browser.open',
+    scope: { origins: [origin] },
+    scopeHash: 'a'.repeat(64),
+  }])
+}
+
+function mockRpcResponse(
+  value: unknown,
+  options: {
+    ok?: boolean
+    status?: number
+    rawBody?: string
+    contentLength?: string | null
+  } = {},
+) {
+  const bodyText = options.rawBody ?? JSON.stringify(value)
+  const bytes = new TextEncoder().encode(bodyText)
+  let consumed = false
+  return {
+    ok: options.ok ?? true,
+    status: options.status ?? 200,
+    headers: {
+      get: vi.fn((name: string) => name.toLowerCase() === 'content-length'
+        ? (options.contentLength === undefined ? String(bytes.byteLength) : options.contentLength)
+        : null),
+    },
+    body: {
+      getReader: () => ({
+        read: vi.fn(async () => {
+          if (consumed) return { done: true, value: undefined }
+          consumed = true
+          return { done: false, value: bytes }
+        }),
+        cancel: vi.fn().mockResolvedValue(undefined),
+        releaseLock: vi.fn(),
+      }),
+    },
+    json: vi.fn(async () => {
+      if (options.rawBody !== undefined) return JSON.parse(options.rawBody)
+      return value
+    }),
+  }
+}
+
 describe('CloudBase user data function', () => {
   it('uses a CommonJS entry compatible with the CloudBase index.main loader', async () => {
     const packageJson = JSON.parse(await readFile(
@@ -312,7 +368,6 @@ describe('CloudBase user data function', () => {
         origin: 'http://example.com',
         state: 'inspecting',
       }]),
-      messageMutation([{ type: 'error', code: 'NOT_AN_APP_ERROR', message: 'failed' }]),
       messageMutation([{
         type: 'workflow_status',
         blockId: 'block_1',
@@ -369,6 +424,50 @@ describe('CloudBase user data function', () => {
       }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
     }
     expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('matches Task 1 generic error-code and HTTPS URL-pattern edge semantics', async () => {
+    const genericErrorRpc = vi.fn().mockResolvedValue({
+      results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }],
+      cursor: opaqueCursor,
+    })
+    const genericErrorHandler = createUserDataHandler({ rpc: genericErrorRpc })
+    await expect(genericErrorHandler({
+      action: 'syncPush',
+      protocolVersion: 1,
+      deviceId: 'dev_1',
+      mutations: [messageMutation([{
+        type: 'error', code: 'VENDOR_SPECIFIC_FAILURE', message: 'Provider failed',
+      }])],
+    }, authenticatedContext)).resolves.toEqual({
+      ok: true,
+      data: {
+        results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }],
+        cursor: opaqueCursor,
+      },
+    })
+    expect(genericErrorRpc).toHaveBeenCalledOnce()
+
+    const malformedRpc = vi.fn()
+    const malformedHandler = createUserDataHandler({ rpc: malformedRpc })
+    await expect(malformedHandler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1',
+      mutations: [approvalMutation('https://foo..bar/*')],
+    }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    expect(malformedRpc).not.toHaveBeenCalled()
+
+    const uppercaseRpc = vi.fn().mockResolvedValue({
+      results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }],
+    })
+    const uppercaseHandler = createUserDataHandler({ rpc: uppercaseRpc })
+    await expect(uppercaseHandler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1',
+      mutations: [approvalMutation('HTTPS://*.Example.com/*')],
+    }, authenticatedContext)).resolves.toEqual({
+      ok: true,
+      data: { results: [{ id: 'message_mutation_1', status: 'applied', revision: 1 }] },
+    })
+    expect(uppercaseRpc).toHaveBeenCalledOnce()
   })
 
   it('does not invent text limits absent from the Task 1 wire contract', async () => {
@@ -604,11 +703,7 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
 
   it('parses a realistic explicit safe output for every allowlisted RPC', async () => {
     for (const [name, output] of Object.entries(validOutputs)) {
-      const fetchImpl = vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: vi.fn().mockResolvedValue(output),
-      })
+      const fetchImpl = vi.fn().mockResolvedValue(mockRpcResponse(output))
       const rpc = createPostgresRpcClient({
         baseUrl: 'https://autoforge.example/v1/rdb/rest/',
         serviceKey: 'server-secret',
@@ -638,25 +733,18 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
         const rpc = createPostgresRpcClient({
           baseUrl: 'https://autoforge.example/v1/rdb/rest',
           serviceKey: 'server-secret',
-          fetchImpl: vi.fn().mockResolvedValue({
-            ok: true,
-            status: 200,
-            json: vi.fn().mockResolvedValue(body),
-          }),
+          fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse(body)),
         })
         await expect(rpc(name, {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
       }
     }
   })
 
-  it('rejects forbidden keys nested inside otherwise unknown contract fields', async () => {
+  it('preserves ordinary opaque args while recursively redacting sensitive named variants', async () => {
     const rpc = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest',
       serviceKey: 'server-secret',
-      fetchImpl: vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: vi.fn().mockResolvedValue({
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
           items: [{
             id: 'message_1',
             conversationId: 'conv_1',
@@ -665,25 +753,88 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
               type: 'workflow_proposal',
               workflowId: 'workflow_1',
               workflowName: 'Workflow',
-              args: { token: 'must-not-cross-the-boundary' },
+              args: {
+                query: 'status:open',
+                ServiceKey: 'service-key-must-not-cross',
+                rootPath: '/Users/private/project',
+                nested: {
+                  Authorization: 'authorization-must-not-cross',
+                  callerUserId: 'user-id-must-not-cross',
+                  access_token: 'token-must-not-cross',
+                  passwordValue: 'password-must-not-cross',
+                  promptText: 'prompt-must-not-cross',
+                  response_body: 'response-must-not-cross',
+                  imageBase64: 'base64-must-not-cross',
+                  credentialOwner: 'owner-must-not-cross',
+                },
+              },
             }],
             createdAt: occurredAt,
           }],
-        }),
-      }),
+        })),
     })
 
-    await expect(rpc('autoforge_list_messages', {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+    const result = await rpc('autoforge_list_messages', {})
+    expect(result).toEqual({
+      items: [{
+        id: 'message_1',
+        conversationId: 'conv_1',
+        role: 'assistant',
+        blocks: [{
+          type: 'workflow_proposal',
+          workflowId: 'workflow_1',
+          workflowName: 'Workflow',
+          args: {
+            query: 'status:open',
+            ServiceKey: '[REDACTED]',
+            rootPath: '[REDACTED]',
+            nested: {
+              Authorization: '[REDACTED]',
+              callerUserId: '[REDACTED]',
+              access_token: '[REDACTED]',
+              passwordValue: '[REDACTED]',
+              promptText: '[REDACTED]',
+              response_body: '[REDACTED]',
+              imageBase64: '[REDACTED]',
+              credentialOwner: '[REDACTED]',
+            },
+          },
+        }],
+        createdAt: occurredAt,
+      }],
+    })
+    expect(JSON.stringify(result)).not.toMatch(
+      /service-key-must-not-cross|Users\/private|authorization-must-not-cross|user-id-must-not-cross|token-must-not-cross|password-must-not-cross|prompt-must-not-cross|response-must-not-cross|base64-must-not-cross|owner-must-not-cross/,
+    )
+  })
+
+  it('parses the distinct stored legacy-import receipt emitted by sync pull', async () => {
+    const output = {
+      mutations: [{
+        id: 'batch_1',
+        kind: 'legacy.import',
+        entityId: 'batch_1',
+        baseRevision: 0,
+        resultRevision: 0,
+        payload: { batchId: 'batch_1', includeUnowned: false },
+        receivedAt: occurredAt,
+      }],
+      cursor: opaqueCursor,
+    }
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse(output)),
+    })
+
+    await expect(rpc('autoforge_sync_pull', {})).resolves.toEqual(output)
   })
 
   it('rejects pulled mutations whose entity identity disagrees with the strict payload', async () => {
     const rpc = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest',
       serviceKey: 'server-secret',
-      fetchImpl: vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: vi.fn().mockResolvedValue({
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
           mutations: [{
             id: 'mutation_1',
             kind: 'privacy.consent',
@@ -694,8 +845,7 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
             receivedAt: occurredAt,
           }],
           cursor: opaqueCursor,
-        }),
-      }),
+        })),
     })
 
     await expect(rpc('autoforge_sync_pull', {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
@@ -705,16 +855,84 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
     const rpc = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest',
       serviceKey: 'server-secret',
-      fetchImpl: vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: vi.fn().mockRejectedValue(new SyntaxError('private upstream response body')),
-      }),
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse(undefined, { rawBody: '{' })),
     })
 
     await expect(rpc('autoforge_get_user_data_preferences', {})).rejects.toEqual({
       code: 'SERVICE_UNAVAILABLE',
     })
+  })
+
+  it('rejects oversized or invalid Content-Length before reading the response stream', async () => {
+    for (const contentLength of ['8388609', 'not-a-number']) {
+      const getReader = vi.fn()
+      let requestSignal: AbortSignal | undefined
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest',
+        serviceKey: 'server-secret',
+        fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
+          requestSignal = init.signal
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: { get: vi.fn().mockReturnValue(contentLength) },
+            body: { getReader },
+            json: vi.fn().mockResolvedValue(
+              validOutputs.autoforge_get_user_data_preferences,
+            ),
+          })
+        }),
+      })
+
+      await expect(rpc('autoforge_get_user_data_preferences', {})).rejects.toEqual({
+        code: 'SERVICE_UNAVAILABLE',
+      })
+      expect(getReader).not.toHaveBeenCalled()
+      expect(requestSignal?.aborted).toBe(true)
+    }
+  })
+
+  it('cancels a response stream that crosses the 8 MiB byte ceiling', async () => {
+    vi.useFakeTimers()
+    const chunks = [
+      new Uint8Array(4 * 1024 * 1024),
+      new Uint8Array(4 * 1024 * 1024),
+      new Uint8Array([0]),
+    ]
+    let index = 0
+    const cancel = vi.fn().mockResolvedValue(undefined)
+    const releaseLock = vi.fn()
+    const read = vi.fn().mockImplementation(async () => (
+      index < chunks.length ? { done: false, value: chunks[index++] } : { done: true }
+    ))
+    let requestSignal: AbortSignal | undefined
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
+        requestSignal = init.signal
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: { get: vi.fn().mockReturnValue(null) },
+          body: { getReader: () => ({ read, cancel, releaseLock }) },
+          json: vi.fn().mockResolvedValue(validOutputs.autoforge_get_user_data_preferences),
+        })
+      }),
+    })
+
+    try {
+      await expect(rpc('autoforge_get_user_data_preferences', {})).rejects.toEqual({
+        code: 'SERVICE_UNAVAILABLE',
+      })
+      expect(cancel).toHaveBeenCalledOnce()
+      expect(releaseLock).toHaveBeenCalledOnce()
+      expect(requestSignal?.aborted).toBe(true)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
   })
 
   it('aborts a timed-out fetch and clears its timer', async () => {
@@ -767,6 +985,14 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
         return Promise.resolve({
           ok: true,
           status: 200,
+          headers: { get: vi.fn().mockReturnValue(null) },
+          body: {
+            getReader: () => ({
+              read: () => new Promise((_resolve, reject) => { rejectBody = reject }),
+              cancel: vi.fn().mockResolvedValue(undefined),
+              releaseLock: vi.fn(),
+            }),
+          },
           json: () => new Promise((_resolve, reject) => { rejectBody = reject }),
         })
       }),
@@ -784,11 +1010,9 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
         baseUrl: 'https://autoforge.example/v1/rdb/rest',
         serviceKey: 'server-secret',
         timeoutMs: 50,
-        fetchImpl: vi.fn().mockResolvedValue({
-          ok: true,
-          status: 200,
-          json: vi.fn().mockResolvedValue(validOutputs.autoforge_get_user_data_preferences),
-        }),
+        fetchImpl: vi.fn().mockResolvedValue(
+          mockRpcResponse(validOutputs.autoforge_get_user_data_preferences),
+        ),
       })
       await expect(successfulRpc('autoforge_get_user_data_preferences', {})).resolves.toEqual(
         validOutputs.autoforge_get_user_data_preferences,
@@ -806,13 +1030,9 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
     const rejected = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest',
       serviceKey: 'server-secret',
-      fetchImpl: vi.fn().mockResolvedValue({
-        ok: false,
-        status: 400,
-        json: vi.fn().mockResolvedValue({
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
           code: 'SQL_FAILURE', message: 'private SQL', serviceKey: 'server-secret', payload: 'private',
-        }),
-      }),
+        }, { ok: false, status: 400 })),
     })
     const unavailable = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest',
