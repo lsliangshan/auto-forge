@@ -151,6 +151,7 @@ interface ActiveRunState {
   waitersCancelled: boolean
   lease?: BrowserContinuationLease
   nextAuditSequence?: number
+  latestSnapshot?: BrowserPageSnapshot
   readonly snapshots: Map<string, BrowserPageSnapshot>
 }
 
@@ -257,6 +258,35 @@ function isSnapshotIndependentAction(action: BrowserAction): boolean {
     || (action.type === 'scroll' && action.ref === undefined)
 }
 
+function sameSnapshot(left: BrowserPageSnapshot, right: BrowserPageSnapshot): boolean {
+  return left.snapshotId === right.snapshotId
+    && left.bindingId === right.bindingId
+    && left.origin === right.origin
+    && left.url === right.url
+    && left.title === right.title
+    && left.capturedAt === right.capturedAt
+    && left.navigationEpoch === right.navigationEpoch
+    && left.auth === right.auth
+    && left.cursor === right.cursor
+    && left.serializedBytes === right.serializedBytes
+    && left.nodes.length === right.nodes.length
+    && left.nodes.every((node, index) => {
+      const candidate = right.nodes[index]
+      return candidate !== undefined
+        && node.ref === candidate.ref
+        && node.parentRef === candidate.parentRef
+        && node.role === candidate.role
+        && node.name === candidate.name
+        && node.value === candidate.value
+        && node.enabled === candidate.enabled
+        && node.checked === candidate.checked
+        && node.selected === candidate.selected
+        && node.answerable === candidate.answerable
+        && node.actions.length === candidate.actions.length
+        && node.actions.every((action, actionIndex) => action === candidate.actions[actionIndex])
+    })
+}
+
 export class BrowserContinuationToolExecutor {
   private readonly guard: BrowserActionGuard
   private readonly id: () => string
@@ -340,14 +370,14 @@ export class BrowserContinuationToolExecutor {
       if (!lease) throw failure('CANCELLED')
       await lease.assertEligible()
       this.assertActive(state, context)
-      const snapshot = state.snapshots.get(input.snapshotId)
+      const snapshot = state.latestSnapshot
       const finalPage = input.pages.at(-1)
-      if (!snapshot || !finalPage
+      if (!snapshot || input.snapshotId !== snapshot.snapshotId || !finalPage
         || input.pages.some((page) => page.snapshotId !== input.snapshotId
           || page.bindingId !== input.bindingId
           || page.origin !== snapshot.origin
           || page.navigationEpoch !== snapshot.navigationEpoch)
-        || finalPage !== snapshot) {
+        || !sameSnapshot(finalPage, snapshot)) {
         throw failure('PAGE_CHANGED')
       }
       const page = await this.dependencies.workspace.getContinuationState(
@@ -368,9 +398,13 @@ export class BrowserContinuationToolExecutor {
         ...(context.signal === undefined ? {} : { signal: context.signal }),
       }
       const data = await this.dependencies.inspector.captureVisualEvidence(captureInput)
-      if (!this.isRunActive(context.runId) || context.signal?.aborted) {
+      if (this.runs.get(context.runId) !== state || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension || state.bindingId !== input.bindingId
+        || state.lease !== lease) {
         return { kind: 'tool_error', code: 'CANCELLED' }
       }
+      await lease.assertEligible()
+      this.assertActive(state, context)
       return { kind: 'success', data }
     } catch (error) {
       return { kind: 'tool_error', code: toSafeAppError(error).code }
@@ -596,6 +630,7 @@ export class BrowserContinuationToolExecutor {
       await lease.assertEligible()
       this.assertActive(state, context)
       state.snapshots.set(result.snapshotId, result)
+      state.latestSnapshot = result
       const privateFieldEvidence = this.dependencies.inspector.fieldEvidence(result.snapshotId)
       this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'completed')
       audited = true
@@ -1156,6 +1191,7 @@ export class BrowserContinuationToolExecutor {
   ): Promise<void> {
     const lease = state.lease
     state.snapshots.clear()
+    state.latestSnapshot = undefined
     this.dependencies.inspector.endRun(state.runId)
     if (!preserveHighlight && lease) {
       await this.dependencies.workspace.clearContinuationHighlight(lease.binding.tabId).catch(() => undefined)

@@ -253,19 +253,46 @@ describe('BrowserContinuationToolExecutor', () => {
   it('captures visual evidence only from the current run snapshot chain', async () => {
     const page = snapshot()
     const evidence = visualBundle(page)
+    const submitted = structuredClone(page)
     const test = harness({ snapshots: [page], visualEvidenceBundle: evidence })
     await test.executor.execute('browser_session_inspect', {
       bindingId: 'binding_1', intent: '查看表单',
     }, run())
 
     await expect(test.executor.captureVisualEvidence({
-      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [submitted],
     }, run())).resolves.toEqual({ kind: 'success', data: evidence })
     expect(test.inspector.captureVisualEvidence).toHaveBeenCalledWith(expect.objectContaining({
       lease: expect.objectContaining({ ownerRunId: 'agent_run_1' }),
       tabId: 'tab_1', navigationEpoch: 1,
       origin: 'https://service.example',
-      pages: [expect.objectContaining({ snapshotId: 'snapshot_1' })],
+      pages: [submitted],
+    }))
+  })
+
+  it('captures a cloned complete semantic page chain in its original order', async () => {
+    const first = snapshot({
+      cursor: 'cursor_1',
+      nodes: Object.freeze([snapshot().nodes[0]!]),
+    })
+    const latest = snapshot({
+      nodes: Object.freeze([snapshot().nodes[1]!]),
+    })
+    const evidence = visualBundle(latest)
+    const test = harness({ snapshots: [first, latest], visualEvidenceBundle: evidence })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '继续查看表单', cursor: 'cursor_1',
+    }, run())
+    const submitted = Object.freeze([structuredClone(first), structuredClone(latest)])
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: submitted,
+    }, run())).resolves.toEqual({ kind: 'success', data: evidence })
+    expect(test.inspector.captureVisualEvidence).toHaveBeenLastCalledWith(expect.objectContaining({
+      pages: submitted,
     }))
   })
 
@@ -333,6 +360,23 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
   })
 
+  it('rejects visual evidence capture for an older independently inspected snapshot', async () => {
+    const first = snapshot({ snapshotId: 'snapshot_a' })
+    const latest = snapshot({ snapshotId: 'snapshot_b' })
+    const test = harness({ snapshots: [first, latest] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看第一张表单',
+    }, run())
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看第二张表单',
+    }, run())
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_a', pages: [first],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
   it('rejects visual evidence capture after workspace state changes', async () => {
     const page = snapshot()
     const test = harness({ snapshots: [page] })
@@ -386,6 +430,48 @@ describe('BrowserContinuationToolExecutor', () => {
     await expect(test.executor.captureVisualEvidence({
       bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
     }, run())).resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
+  })
+
+  it('does not return visual evidence after the run ends during capture', async () => {
+    let finishCapture!: (value: BrowserVisualEvidenceBundle) => void
+    const pendingCapture = new Promise<BrowserVisualEvidenceBundle>((resolve) => { finishCapture = resolve })
+    const page = snapshot()
+    const evidence = visualBundle(page)
+    const test = harness({ snapshots: [page] })
+    test.inspector.captureVisualEvidence.mockImplementationOnce(async () => pendingCapture)
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    const captured = test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())
+    await vi.waitFor(() => expect(test.inspector.captureVisualEvidence).toHaveBeenCalledOnce())
+    await test.executor.endRun('agent_run_1')
+    finishCapture(evidence)
+
+    await expect(captured).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+  })
+
+  it('does not return visual evidence after its lease is released during capture', async () => {
+    let finishCapture!: (value: BrowserVisualEvidenceBundle) => void
+    const pendingCapture = new Promise<BrowserVisualEvidenceBundle>((resolve) => { finishCapture = resolve })
+    const page = snapshot()
+    const evidence = visualBundle(page)
+    const test = harness({ snapshots: [page] })
+    test.inspector.captureVisualEvidence.mockImplementationOnce(async () => pendingCapture)
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    const captured = test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())
+    await vi.waitFor(() => expect(test.inspector.captureVisualEvidence).toHaveBeenCalledOnce())
+    await test.lease.release()
+    finishCapture(evidence)
+
+    await expect(captured).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
   })
 
   it('rechecks development eligibility after a hung inspection before admitting its snapshot', async () => {
