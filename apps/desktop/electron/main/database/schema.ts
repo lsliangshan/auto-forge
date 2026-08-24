@@ -150,7 +150,7 @@ export const executions = sqliteTable('executions', {
   id: text('id').primaryKey(),
   workflowId: text('workflow_id').notNull(),
   workflowVersion: text('workflow_version').notNull(),
-  chatRunId: text('chat_run_id').references(() => chatRuns.id, { onDelete: 'set null' }),
+  chatRunId: text('chat_run_id'),
   status: text('status').notNull(),
   inputJson: text('input_json').notNull(),
   resultJson: text('result_json'),
