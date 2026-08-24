@@ -120,6 +120,15 @@ The resolver cannot return answer prose or introduce OCR text as an answer. It
 validates IDs, uniqueness, answerability, shape, model output form, and input
 bounds using the same fail-closed principles as the semantic resolver.
 
+### BrowserContinuationToolExecutor
+
+The executor exposes one internal, read-only visual-evidence operation to the
+orchestrator. It accepts the exact binding ID and snapshot ID plus the existing
+run context, verifies the active run, lease, current page identity, and stored
+snapshot, and then delegates capture to `BrowserPageInspector`. It returns either
+the bounded visual bundle or the existing safe tool-error shape. This operation
+is not added to the model tool catalog and cannot perform browser mutations.
+
 ### Existing Semantic Resolver
 
 `BrowserPageEvidenceResolver` remains unchanged in responsibility and remains
@@ -176,6 +185,7 @@ tools, permissions, destinations, output schemas, or safety policy.
 5. The semantic resolver selects exact answer/support node IDs. A valid result is
    rendered immediately.
 6. If semantic selection is empty and visual fallback is eligible, the inspector
+   is reached through the current run's `BrowserContinuationToolExecutor`; it
    captures sanitized page tiles and node rectangles for the same snapshot.
 7. The visual resolver uses the screenshots and graph together to select answer
    and supporting IDs.
@@ -318,6 +328,8 @@ are required.
 - `apps/desktop/electron/main/agent/agent-orchestrator.test.ts`
 - `apps/desktop/electron/main/agent/browser-visual-evidence-resolver.ts` (new)
 - `apps/desktop/electron/main/agent/browser-visual-evidence-resolver.test.ts` (new)
+- `apps/desktop/electron/main/agent/browser-continuation-tool-executor.ts`
+- `apps/desktop/electron/main/agent/browser-continuation-tool-executor.test.ts`
 - `apps/desktop/electron/main/browser/browser-continuation-types.ts`
 - `apps/desktop/electron/main/browser/browser-page-inspector.ts`
 - `apps/desktop/electron/main/browser/browser-page-inspector.test.ts`
