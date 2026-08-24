@@ -239,6 +239,7 @@ export async function resolveBrowserVisualEvidence(
     return emptyResolution(usage)
   }
 
+  if (input.signal?.aborted) throw toSafeAppError({ code: 'CANCELLED' })
   if (finishReason !== 'tool_calls' || emittedText || toolCalls.length !== 1) {
     return emptyResolution(usage)
   }

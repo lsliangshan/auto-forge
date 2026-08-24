@@ -292,4 +292,16 @@ describe('resolveBrowserVisualEvidence', () => {
     await expect(test.run(bundle, '我上传了哪些附件', controller.signal))
       .rejects.toMatchObject({ code: 'CANCELLED' })
   })
+
+  it('rejects cancellation observed after a valid stream completes cleanly', async () => {
+    const controller = new AbortController()
+    const test = harness([])
+    test.stream.mockImplementationOnce(async function* () {
+      for (const event of successfulEvents) yield event
+      controller.abort()
+    })
+
+    await expect(test.run(bundle, '我上传了哪些附件', controller.signal))
+      .rejects.toMatchObject({ code: 'CANCELLED' })
+  })
 })
