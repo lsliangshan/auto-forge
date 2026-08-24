@@ -23,6 +23,11 @@ const adminSession: AuthSession = {
   },
 }
 
+const bobSession: AuthSession = {
+  user: { id: 'user_2', account: 'Bob' },
+  authenticatedAt: '2026-08-07T00:02:00.000Z',
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -106,6 +111,46 @@ afterEach(() => {
 })
 
 describe('authentication store', () => {
+  it.each(['restore', 'password', 'otp'] as const)(
+    'resets old-user chat before a direct UID replacement through %s',
+    async (flow) => {
+      const api = createApi()
+      vi.mocked(api.auth.getSession).mockResolvedValue(bobSession)
+      vi.mocked(api.auth.loginWithPassword).mockResolvedValue(bobSession)
+      vi.mocked(api.auth.verifyOtp).mockResolvedValue(bobSession)
+      Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+      const auth = useAuthStore()
+      const chat = useChatStore()
+      auth.session = authSession
+      chat.conversations = [{
+        id: 'alice_conversation', title: 'Alice', titleState: 'user_named', revision: 1,
+        syncState: 'synced', createdAt: '2026-08-07T00:00:00.000Z',
+        lastActivityAt: '2026-08-07T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-07T00:00:00.000Z',
+      }]
+      chat.selectedConversationId = 'alice_conversation'
+      const reset = vi.spyOn(chat, 'resetLocalData')
+      reset.mockImplementationOnce(() => {
+        expect(auth.session?.user.id).toBe(authSession.user.id)
+        chat.$patch({ conversations: [], selectedConversationId: '' })
+      })
+
+      if (flow === 'restore') {
+        await auth.restore()
+      } else if (flow === 'password') {
+        await auth.loginWithPassword({ account: 'Bob', password: 'password' })
+      } else {
+        auth.challenge = { challengeId: 'challenge_bob', expiresIn: 300 }
+        await auth.verifyOtp('123456')
+      }
+
+      expect(reset).toHaveBeenCalledOnce()
+      expect(auth.session).toEqual(bobSession)
+      expect(chat.conversations).toEqual([])
+      expect(chat.selectedConversationId).toBe('')
+    },
+  )
+
   it('deduplicates concurrent session restoration', async () => {
     const api = createApi()
     let resolveSession!: (value: AuthSession) => void

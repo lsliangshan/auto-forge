@@ -53,6 +53,15 @@ function finishRestoring(store: { restoring: boolean }): void {
   store.restoring = count > 0
 }
 
+function replaceSession(store: { session: AuthSession | null }, session: AuthSession | null): void {
+  const previousUserId = store.session?.user.id
+  const nextUserId = session?.user.id
+  if (previousUserId !== undefined && previousUserId !== nextUserId) {
+    useChatStore().resetLocalData()
+  }
+  store.session = session
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     session: null as AuthSession | null,
@@ -79,11 +88,11 @@ export const useAuthStore = defineStore('auth', {
         try {
           const session = await getDesktopApi().auth.getSession()
           if (generation !== sessionGeneration(this)) return
-          this.session = session
+          replaceSession(this, session)
           this.initialized = true
         } catch (error) {
           if (generation !== sessionGeneration(this)) return
-          this.session = null
+          replaceSession(this, null)
           this.initialized = true
           this.error = displayError(error, '登录状态恢复失败')
         } finally {
@@ -151,19 +160,19 @@ export const useAuthStore = defineStore('auth', {
             await getDesktopApi().auth.logout()
           } catch {
             if (cleanupOwner === sessionGeneration(this)) {
-              this.session = session
+              replaceSession(this, session)
               this.initialized = true
               this.error = '退出登录失败'
             }
             return undefined
           }
           nextSessionGeneration(this)
-          this.session = null
+          replaceSession(this, null)
           this.initialized = true
           this.error = ''
           return undefined
         }
-        this.session = session
+        replaceSession(this, session)
         this.initialized = true
         return session
       } catch (error) {
@@ -202,7 +211,7 @@ export const useAuthStore = defineStore('auth', {
       try {
         const session = await getDesktopApi().auth.loginWithPassword(credentials)
         if (sessionOwner !== sessionGeneration(this)) return undefined
-        this.session = session
+        replaceSession(this, session)
         this.initialized = true
         return session
       } catch (error) {
@@ -241,7 +250,7 @@ export const useAuthStore = defineStore('auth', {
       const sessionOwner = sessionGeneration(this)
       try {
         const session = await getDesktopApi().auth.refreshAuthorization()
-        if (sessionOwner === sessionGeneration(this)) this.session = session
+        if (sessionOwner === sessionGeneration(this)) replaceSession(this, session)
       } catch (error) {
         if (sessionOwner !== sessionGeneration(this) || !this.session) return
         this.session = {

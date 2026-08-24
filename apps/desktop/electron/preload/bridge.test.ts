@@ -273,4 +273,27 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.removeListener).toHaveBeenCalledTimes(1)
     expect(app.ipcRenderer.removeListener).toHaveBeenCalledWith(ipcChannels.chatEvent, wrapped)
   })
+
+  it('forwards only strict owner-free conversation projection events', () => {
+    const app = harness()
+    const listener = vi.fn()
+    app.api.chat.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.chatEvent)!][0]!
+    const event = {
+      type: 'conversation_updated',
+      conversationId: 'conversation_1',
+      conversation: {
+        id: 'conversation_1', title: 'Updated', titleState: 'user_named', revision: 2,
+        syncState: 'syncing', createdAt: '2026-08-25T00:00:00.000Z',
+        lastActivityAt: '2026-08-25T00:01:00.000Z',
+        metadataUpdatedAt: '2026-08-25T00:01:00.000Z',
+      },
+    }
+
+    wrapped({}, event)
+    wrapped({}, { ...event, ownerUserId: 'private-owner' })
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
+  })
 })

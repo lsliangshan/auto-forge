@@ -1986,6 +1986,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       reconcileInterrupted(endedAt) {
         return transaction(database, () => {
           const preservedRequestIds: string[] = []
+          const failedRequestIds = new Set<string>()
           const rows = many<Query>(
             database,
             `SELECT ${mediaGenerationJobColumns}
@@ -2008,7 +2009,9 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             try {
               job = mediaGenerationJobFromRow(row)
             } catch {
-              failJob.run({ id: row.id as string, endedAt })
+              const id = row.id as string
+              failJob.run({ id, endedAt })
+              failedRequestIds.add(id)
               continue
             }
             if (resumableVideoAssociation(database, job)) {
@@ -2016,6 +2019,33 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               continue
             }
             failJob.run({ id: job.id, endedAt })
+            failedRequestIds.add(job.id)
+          }
+          for (const requestId of failedRequestIds) {
+            database.prepare(`
+              UPDATE chat_runs
+              SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
+              WHERE request_id = @requestId AND status = 'running'
+            `).run({ requestId, endedAt })
+          }
+          for (const row of many<Query>(database, 'SELECT id, blocks_json AS blocksJson FROM messages')) {
+            let blocks: ChatBlock[]
+            try {
+              blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+            } catch {
+              continue
+            }
+            let changed = false
+            for (const block of blocks) {
+              if (block.type !== 'media_generation' || !failedRequestIds.has(block.jobId)) continue
+              block.status = 'failed'
+              block.errorCode = 'MEDIA_GENERATION_FAILED'
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
           }
           return preservedRequestIds
         })

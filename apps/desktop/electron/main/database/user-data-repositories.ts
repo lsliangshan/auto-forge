@@ -1370,7 +1370,17 @@ export function createUserDataRepositories(
     startSubmissionIntent(value) {
       requireOwnedConversation(database, ownerUserId, value.job.conversationId)
       assertOwner(value.run.userId, ownerUserId)
-      return repositories.mediaGenerationJobs.startSubmissionIntent(value)
+      const mutation = messageMutation(value.userMessage)
+      let started: ReturnType<AppRepositories['mediaGenerationJobs']['startSubmissionIntent']> | undefined
+      recordMutation(mutation, () => {
+        started = repositories.mediaGenerationJobs.startSubmissionIntent({
+          ...value,
+          run: { ...value.run, userId: ownerUserId },
+        })
+        bumpConversationActivity(value.job.conversationId, value.userMessage.createdAt)
+      })
+      if (!started) throw new UserDataConsistencyError()
+      return started
     },
     bindSubmitted(id, input) {
       if (!requireOwnedMediaJob(id)) return undefined
@@ -1379,7 +1389,10 @@ export function createUserDataRepositories(
     insertTurn(value) {
       requireOwnedConversation(database, ownerUserId, value.run.conversationId)
       assertOwner(value.run.userId, ownerUserId)
-      return repositories.mediaGenerationJobs.insertTurn(value)
+      return repositories.mediaGenerationJobs.insertTurn({
+        ...value,
+        run: { ...value.run, userId: ownerUserId },
+      })
     },
     get: requireOwnedMediaJob,
     reconcileInterrupted(endedAt) {
@@ -1409,11 +1422,31 @@ export function createUserDataRepositories(
     complete(id, expectedStatuses, input) {
       if (!requireOwnedMediaJob(id)) return undefined
       if (!mediaAssets.get(input.assetId)) throw new UserDataConsistencyError()
-      return repositories.mediaGenerationJobs.complete(id, expectedStatuses, input)
+      let completed: ReturnType<AppRepositories['mediaGenerationJobs']['complete']>
+      transaction(database, () => {
+        completed = repositories.mediaGenerationJobs.complete(id, expectedStatuses, input)
+        if (!completed) return
+        assertOutboxCapacity(database)
+        const mutation = syncMutationSchema.parse(messageMutation(completed.message))
+        insertOutbox(database, mutation)
+        bumpConversationActivity(completed.job.conversationId, input.endedAt)
+        recomputeAffectedConversations(database, ownerUserId, [mutation])
+      })
+      return completed
     },
     fail(id, expectedStatuses, errorCode, endedAt) {
       if (!requireOwnedMediaJob(id)) return undefined
-      return repositories.mediaGenerationJobs.fail(id, expectedStatuses, errorCode, endedAt)
+      let failed: ReturnType<AppRepositories['mediaGenerationJobs']['fail']>
+      transaction(database, () => {
+        failed = repositories.mediaGenerationJobs.fail(id, expectedStatuses, errorCode, endedAt)
+        if (!failed) return
+        assertOutboxCapacity(database)
+        const mutation = syncMutationSchema.parse(messageMutation(failed.message))
+        insertOutbox(database, mutation)
+        bumpConversationActivity(failed.job.conversationId, endedAt)
+        recomputeAffectedConversations(database, ownerUserId, [mutation])
+      })
+      return failed
     },
   }
   const chatRuns = {
@@ -1563,6 +1596,15 @@ export function createUserDataRepositories(
       insertOutbox(database, mutation)
       recomputeAffectedConversations(database, ownerUserId, [mutation])
     })
+  }
+  function bumpConversationActivity(conversationId: string, occurredAt: number): void {
+    database.prepare(`
+      UPDATE conversations
+      SET last_activity_at = MAX(last_activity_at + 1, @occurredAt),
+          updated_at = MAX(updated_at, last_activity_at + 1, @occurredAt),
+          sync_state = 'pending'
+      WHERE id = @conversationId AND user_id = @ownerUserId
+    `).run({ conversationId, ownerUserId, occurredAt })
   }
   return {
     conversations,

@@ -187,6 +187,38 @@ function mergeConversationPages(
   return sortConversations([...byId.values()])
 }
 
+function advanceActivity(current: string, candidate: string, latest: string): string {
+  const currentAt = Date.parse(current)
+  const candidateAt = Date.parse(candidate)
+  const latestAt = Date.parse(latest)
+  return new Date(Math.max(candidateAt, currentAt + 1, latestAt + 1)).toISOString()
+}
+
+function updateConversationActivity(
+  conversations: ConversationSummary[],
+  conversationId: string,
+  candidateAt: string,
+  patch: Partial<ConversationSummary> = {},
+): ConversationSummary[] {
+  const current = conversations.find(({ id }) => id === conversationId)
+  if (!current) return conversations
+  const latest = conversations.reduce(
+    (activity, conversation) => conversation.lastActivityAt > activity
+      ? conversation.lastActivityAt
+      : activity,
+    current.lastActivityAt,
+  )
+  return mergeConversationPages(
+    conversations.filter(({ id }) => id !== conversationId),
+    [{
+      ...current,
+      ...patch,
+      syncState: 'pending',
+      lastActivityAt: advanceActivity(current.lastActivityAt, candidateAt, latest),
+    }],
+  )
+}
+
 function mergeHistoryPages(older: UiChatMessage[], current: UiChatMessage[]): UiChatMessage[] {
   const order: string[] = []
   const byId = new Map<string, UiChatMessage>()
@@ -231,8 +263,9 @@ export const useChatStore = defineStore('chat', {
     _selectionVersion: 0,
     _messageVersions: {} as Record<string, number>,
     _messageLoadVersions: {} as Record<string, number>,
-    _conversationPageRequests: {} as Record<string, true>,
-    _messagePageRequests: {} as Record<string, true>,
+    _conversationPageRequests: {} as Record<string, number>,
+    _messagePageRequests: {} as Record<string, number>,
+    _pageRequestSequence: 0,
     _preferenceVersions: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
@@ -279,6 +312,7 @@ export const useChatStore = defineStore('chat', {
       this._terminalRequests = {}
       this._messageVersions = {}
       this._messageLoadVersions = {}
+      this._pageRequestSequence += 1
       this._conversationPageRequests = {}
       this._messagePageRequests = {}
       this._preferenceVersions = {}
@@ -307,7 +341,8 @@ export const useChatStore = defineStore('chat', {
       const requestKey = 'initial'
       if (this._conversationPageRequests[requestKey]) return
       const version = ++this._loadVersion
-      this._conversationPageRequests[requestKey] = true
+      const requestToken = ++this._pageRequestSequence
+      this._conversationPageRequests[requestKey] = requestToken
       this.loading = true
       this.error = ''
       try {
@@ -333,14 +368,17 @@ export const useChatStore = defineStore('chat', {
       } catch (error) {
         if (version === this._loadVersion) this.error = displayError(error, '会话加载失败')
       } finally {
-        delete this._conversationPageRequests[requestKey]
+        if (this._conversationPageRequests[requestKey] === requestToken) {
+          delete this._conversationPageRequests[requestKey]
+        }
         if (version === this._loadVersion) this.loading = false
       }
     },
     async loadMoreConversations() {
       const cursor = this.nextConversationCursor
       if (!cursor || this._conversationPageRequests[cursor]) return
-      this._conversationPageRequests[cursor] = true
+      const requestToken = ++this._pageRequestSequence
+      this._conversationPageRequests[cursor] = requestToken
       try {
         const page = await getDesktopApi().chat.listConversations({ limit: 50, cursor })
         if (this.nextConversationCursor !== cursor) return
@@ -349,7 +387,9 @@ export const useChatStore = defineStore('chat', {
       } catch (error) {
         this.error = displayError(error, '会话加载失败')
       } finally {
-        delete this._conversationPageRequests[cursor]
+        if (this._conversationPageRequests[cursor] === requestToken) {
+          delete this._conversationPageRequests[cursor]
+        }
       }
     },
     async createConversation() {
@@ -437,7 +477,8 @@ export const useChatStore = defineStore('chat', {
       const mutationVersion = this._messageVersions[conversationId] ?? 0
       const loadVersion = (this._messageLoadVersions[conversationId] ?? 0) + 1
       this._messageLoadVersions[conversationId] = loadVersion
-      this._messagePageRequests[requestKey] = true
+      const requestToken = ++this._pageRequestSequence
+      this._messagePageRequests[requestKey] = requestToken
       try {
         const page = await getDesktopApi().chat.listMessages({ conversationId, limit: 100 })
         if (this.selectedConversationId !== conversationId
@@ -458,14 +499,17 @@ export const useChatStore = defineStore('chat', {
           this.error = displayError(error, '消息记录加载失败')
         }
       } finally {
-        delete this._messagePageRequests[requestKey]
+        if (this._messagePageRequests[requestKey] === requestToken) {
+          delete this._messagePageRequests[requestKey]
+        }
       }
     },
     async loadOlderMessages(conversationId: string) {
       const cursor = this.previousMessageCursorByConversation[conversationId]
       const requestKey = `${conversationId}:${cursor ?? 'complete'}`
       if (!cursor || this._messagePageRequests[requestKey]) return
-      this._messagePageRequests[requestKey] = true
+      const requestToken = ++this._pageRequestSequence
+      this._messagePageRequests[requestKey] = requestToken
       try {
         const page = await getDesktopApi().chat.listMessages({
           conversationId,
@@ -483,7 +527,9 @@ export const useChatStore = defineStore('chat', {
           this.error = displayError(error, '消息记录加载失败')
         }
       } finally {
-        delete this._messagePageRequests[requestKey]
+        if (this._messagePageRequests[requestKey] === requestToken) {
+          delete this._messagePageRequests[requestKey]
+        }
       }
     },
     async retrySync(conversationId: string) {
@@ -689,6 +735,14 @@ export const useChatStore = defineStore('chat', {
         || this.isRunning) return false
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
+      const previousConversation = this.conversations.find(({ id }) => id === conversationId)
+      this.conversations = updateConversationActivity(
+        this.conversations,
+        conversationId,
+        new Date().toISOString(),
+      )
+      const optimisticActivity = this.conversations.find(({ id }) => id === conversationId)
+        ?.lastActivityAt
       this.pendingRequestByConversation[conversationId] = true
       this.awaitingResponseByConversation[conversationId] = true
       const drafts = this.draftsByConversation[conversationId] ?? []
@@ -761,6 +815,13 @@ export const useChatStore = defineStore('chat', {
         delete this._cancelRequestedByConversation[conversationId]
         this.messagesByConversation[conversationId] = (this.messagesByConversation[conversationId] ?? [])
           .filter(({ id }) => id !== localId)
+        const currentConversation = this.conversations.find(({ id }) => id === conversationId)
+        if (previousConversation && currentConversation?.lastActivityAt === optimisticActivity) {
+          this.conversations = mergeConversationPages(
+            this.conversations.filter(({ id }) => id !== conversationId),
+            [previousConversation],
+          )
+        }
         this._messageVersions[conversationId] = (this._messageVersions[conversationId] ?? 0) + 1
         this.reportConversationError(conversationId, epoch, displayError(error, '消息发送失败'))
         return false
@@ -779,17 +840,27 @@ export const useChatStore = defineStore('chat', {
       catch (error) { this.error = displayError(error, '取消生成失败') }
     },
     applyChatEvent(event: ChatEvent) {
+      if (event.type === 'conversation_updated') {
+        this.conversations = mergeConversationPages(
+          this.conversations.filter(({ id }) => id !== event.conversationId),
+          [event.conversation],
+        )
+        return
+      }
       if (event.type === 'conversation_title_updated') {
         const index = this.conversations.findIndex(({ id }) => id === event.conversationId)
         if (index >= 0) {
           const updated = {
             ...this.conversations[index]!,
             title: event.title,
+            titleState: 'ai_named' as const,
             metadataUpdatedAt: event.updatedAt,
           }
-          this.conversations = mergeConversationPages(
-            this.conversations.filter(({ id }) => id !== event.conversationId),
-            [updated],
+          this.conversations = updateConversationActivity(
+            this.conversations,
+            event.conversationId,
+            event.updatedAt,
+            updated,
           )
         }
         return
@@ -798,6 +869,11 @@ export const useChatStore = defineStore('chat', {
         if (event.status === 'running') {
           if (!this._terminalRequests[event.requestId]) this.activeRequestByConversation[event.conversationId] = event.requestId
         } else {
+          this.conversations = updateConversationActivity(
+            this.conversations,
+            event.conversationId,
+            new Date().toISOString(),
+          )
           delete this.awaitingResponseByConversation[event.conversationId]
           const matchedActive = this.activeRequestByConversation[event.conversationId] === event.requestId
           if (matchedActive) delete this.activeRequestByConversation[event.conversationId]

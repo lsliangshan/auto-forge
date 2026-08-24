@@ -25,13 +25,13 @@ function openAppDatabase(path: string) {
       SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ?
       WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')
     `).run(endedAt).changes
-    const preservedRequestIds = new Set(repositories.mediaGenerationJobs.reconcileInterrupted(endedAt))
-    let chatRuns = 0
     const interruptedRuns = sqlite.prepare(`
       SELECT id, request_id AS requestId
       FROM chat_runs
       WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
     `).all() as Array<{ id: string; requestId: string }>
+    const preservedRequestIds = new Set(repositories.mediaGenerationJobs.reconcileInterrupted(endedAt))
+    let chatRuns = 0
     const failRun = sqlite.prepare(`
       UPDATE chat_runs
       SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
@@ -42,8 +42,15 @@ function openAppDatabase(path: string) {
     for (const run of interruptedRuns) {
       if (preservedRequestIds.has(run.requestId)) continue
       const changes = failRun.run({ id: run.id, endedAt }).changes
-      chatRuns += changes
-      if (changes === 1) failedRequestIds.push(run.requestId)
+      const reconciled = changes === 1 || sqlite.prepare(`
+        SELECT 1 FROM chat_runs
+        WHERE id = @id AND status = 'failed'
+          AND error_code = 'INTERNAL_ERROR' AND ended_at = @endedAt
+      `).get({ id: run.id, endedAt }) !== undefined
+      if (reconciled) {
+        chatRuns += 1
+        failedRequestIds.push(run.requestId)
+      }
     }
     repositories.messages.failInterruptedBrowserStatuses(failedRequestIds)
     repositories.messages.invalidatePendingAgentApprovals()

@@ -30,6 +30,7 @@ interface SyncEngineDependencies {
   setTimeout: (callback: () => void, delay: number) => TimerHandle
   clearTimeout: (handle: TimerHandle) => void
   jitter: (delay: number, attempt: number) => number
+  onConversationChanged: (conversationIds: readonly string[]) => void
 }
 
 interface ActiveBinding {
@@ -43,6 +44,24 @@ const defaultDependencies: SyncEngineDependencies = {
   setTimeout: (callback, delay) => setTimeout(callback, delay),
   clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
   jitter: (delay) => Math.round(delay * (0.75 + Math.random() * 0.5)),
+  onConversationChanged: () => undefined,
+}
+
+function affectedConversationIds(
+  mutations: readonly { kind: string; entityId: string; payload: unknown }[],
+): string[] {
+  const ids = new Set<string>()
+  for (const mutation of mutations) {
+    if (mutation.kind.startsWith('conversation.')) ids.add(mutation.entityId)
+    if (mutation.kind === 'message.append'
+      && typeof mutation.payload === 'object'
+      && mutation.payload !== null
+      && 'conversationId' in mutation.payload
+      && typeof mutation.payload.conversationId === 'string') {
+      ids.add(mutation.payload.conversationId)
+    }
+  }
+  return [...ids]
 }
 
 function validIdentifier(value: string): boolean {
@@ -137,6 +156,7 @@ export class UserDataSyncEngine {
       this.#flushRequested = false
       this.#pullRequested = false
       binding.store.outbox.retryFailed(entityId)
+      if (entityId !== undefined) this.#notify(binding, [entityId])
       this.#status = { state: 'idle' }
       this.#flushRequested = true
       await this.#ensureDrain(binding)
@@ -233,6 +253,7 @@ export class UserDataSyncEngine {
       }
       if (batchLength === 0) {
         binding.store.outbox.markFailed(ready[0]!.id, 'OUTBOX_LIMIT_EXCEEDED')
+        this.#notify(binding, affectedConversationIds([ready[0]!]))
         quarantineCode ??= 'OUTBOX_LIMIT_EXCEEDED'
         continue
       }
@@ -241,6 +262,8 @@ export class UserDataSyncEngine {
       const ids = batch.map(({ id }) => id)
       binding.store.outbox.markSyncing(ids)
       this.#trackSyncing(binding, ids)
+      const conversationIds = affectedConversationIds(batch)
+      this.#notify(binding, conversationIds)
 
       let response: UserDataFunctionResponse
       try {
@@ -258,10 +281,12 @@ export class UserDataSyncEngine {
         } else if (code === 'AUTH_REQUIRED') {
           for (const id of ids) binding.store.outbox.markPending(id)
           this.#untrackSyncing(binding, ids)
+          this.#notify(binding, conversationIds)
           this.#pauseForAuth()
         } else {
           for (const id of ids) binding.store.outbox.markFailed(id, code)
           this.#untrackSyncing(binding, ids)
+          this.#notify(binding, conversationIds)
           this.#quarantine(code)
         }
         return
@@ -275,10 +300,12 @@ export class UserDataSyncEngine {
         } else if (code === 'AUTH_REQUIRED') {
           for (const id of ids) binding.store.outbox.markPending(id)
           this.#untrackSyncing(binding, ids)
+          this.#notify(binding, conversationIds)
           this.#pauseForAuth()
         } else {
           for (const id of ids) binding.store.outbox.markFailed(id, code)
           this.#untrackSyncing(binding, ids)
+          this.#notify(binding, conversationIds)
           this.#quarantine(code)
         }
         return
@@ -288,6 +315,7 @@ export class UserDataSyncEngine {
       if (!data || !this.#validResults(ids, data.results)) {
         for (const id of ids) binding.store.outbox.markFailed(id, 'SYNC_FAILED')
         this.#untrackSyncing(binding, ids)
+        this.#notify(binding, conversationIds)
         this.#quarantine('SYNC_FAILED')
         return
       }
@@ -295,6 +323,7 @@ export class UserDataSyncEngine {
       try {
         binding.store.outbox.acknowledgePushResults(mutations, data.results)
         this.#pruneSyncing(binding)
+        this.#notify(binding, conversationIds)
       } catch {
         for (const id of ids) {
           if (binding.store.outbox.find(id)?.state === 'syncing') {
@@ -302,6 +331,7 @@ export class UserDataSyncEngine {
           }
         }
         this.#untrackSyncing(binding, ids)
+        this.#notify(binding, conversationIds)
         this.#quarantine('SYNC_FAILED')
         return
       }
@@ -321,6 +351,7 @@ export class UserDataSyncEngine {
         }
       }
       if (terminalResultCode) {
+        this.#notify(binding, conversationIds)
         this.#quarantine(terminalResultCode)
         return
       }
@@ -393,6 +424,7 @@ export class UserDataSyncEngine {
           cursor: data.cursor,
         }, this.#dependencies.now())
         this.#pruneSyncing(binding)
+        this.#notify(binding, affectedConversationIds(data.mutations))
       } catch {
         this.#quarantine('INTERNAL_ERROR')
         return 'stopped'
@@ -417,13 +449,14 @@ export class UserDataSyncEngine {
 
   #retryBatch(
     binding: ActiveBinding,
-    batch: readonly { id: string }[],
+    batch: readonly { id: string; kind: string; entityId: string; payload: unknown }[],
     attempt: number,
   ): void {
     const delay = this.#jitteredDelay(attempt)
     const nextRetryAt = this.#dependencies.now() + delay
     for (const { id } of batch) binding.store.outbox.markPending(id, nextRetryAt)
     this.#untrackSyncing(binding, batch.map(({ id }) => id))
+    this.#notify(binding, affectedConversationIds(batch))
     this.#scheduleRetry(binding, attempt, delay)
   }
 
@@ -490,6 +523,13 @@ export class UserDataSyncEngine {
       if (binding.store.outbox.find(id)?.state !== 'syncing') tracked.delete(id)
     }
     if (tracked.size === 0) this.#syncingIds.delete(binding.generation)
+  }
+
+  #notify(binding: ActiveBinding, conversationIds: readonly string[]): void {
+    if (!this.#isCurrent(binding) || conversationIds.length === 0) return
+    try {
+      this.#dependencies.onConversationChanged([...new Set(conversationIds)])
+    } catch { /* Projection notifications are observational. */ }
   }
 
   #clearTimer(): void {

@@ -117,6 +117,69 @@ function projectedConversation(
   return store.conversations.listPage({ limit: 50 }).items.find((conversation) => conversation.id === id)
 }
 
+function startVideoIntent(
+  store: ReturnType<UserDataStoreManager['open']>,
+  suffix: string,
+  createdAt = 1_000,
+) {
+  const conversationId = `video_conversation_${suffix}`
+  const requestId = `video_request_${suffix}`
+  const assistantMessageId = `video_assistant_${suffix}`
+  store.conversations.insert({
+    id: conversationId,
+    title: `Video ${suffix}`,
+    userId: 'cloud-alice',
+    createdAt,
+    updatedAt: createdAt,
+  })
+  store.mediaGenerationJobs.startSubmissionIntent({
+    userMessage: {
+      id: `video_user_${suffix}`,
+      conversationId,
+      role: 'user',
+      blocks: [{ type: 'text', text: `Generate ${suffix}` }],
+      createdAt,
+    },
+    userAssetIds: [],
+    assistantMessage: {
+      id: assistantMessageId,
+      conversationId,
+      role: 'assistant',
+      blocks: [{
+        type: 'media_generation',
+        blockId: `video_block_${suffix}`,
+        jobId: requestId,
+        kind: 'video',
+        status: 'pending',
+      }],
+      createdAt,
+    },
+    run: {
+      id: `video_run_${suffix}`,
+      conversationId,
+      requestId,
+      userId: 'cloud-alice',
+      provider: 'openrouter',
+      model: 'video-model',
+      status: 'running',
+      startedAt: createdAt,
+    },
+    job: {
+      id: requestId,
+      conversationId,
+      assistantMessageId,
+      provider: 'openrouter',
+      model: 'video-model',
+      kind: 'video',
+      status: 'pending',
+      parameters: { version: 1, options: {}, submission: { phase: 'intent' } },
+      createdAt,
+      updatedAt: createdAt,
+    },
+  })
+  return { conversationId, requestId, assistantMessageId }
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })
@@ -244,6 +307,139 @@ describe('UserDataStoreManager', () => {
     ])
     expect(projectedConversation(store, 'conversation_title'))
       .toMatchObject({ title: 'AI title', titleState: 'ai_named', syncState: 'pending' })
+    manager.close()
+  })
+
+  it('atomically records only the immutable user message when a video intent starts', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const video = startVideoIntent(store, 'start')
+
+    expect(store.messages.listForConversation(video.conversationId)).toHaveLength(2)
+    expect(store.outbox.list(10)).toEqual([
+      expect.objectContaining({
+        kind: 'message.append',
+        entityId: 'video_user_start',
+        payload: expect.objectContaining({ role: 'user' }),
+      }),
+    ])
+    expect(store.outbox.list(10).some(({ entityId }) => entityId === video.assistantMessageId))
+      .toBe(false)
+    expect(projectedConversation(store, video.conversationId)).toMatchObject({
+      syncState: 'pending',
+      lastActivityAt: '1970-01-01T00:00:01.001Z',
+    })
+    manager.close()
+  })
+
+  it('atomically records one immutable failed video message and survives restart', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const video = startVideoIntent(store, 'failed')
+
+    expect(store.mediaGenerationJobs.fail(
+      video.requestId,
+      ['pending'],
+      'MEDIA_GENERATION_FAILED',
+      2_000,
+    )).toMatchObject({ job: { status: 'failed' } })
+    expect(store.mediaGenerationJobs.fail(
+      video.requestId,
+      ['pending'],
+      'MEDIA_GENERATION_FAILED',
+      2_000,
+    )).toBeUndefined()
+    expect(store.outbox.list(10).map(({ entityId }) => entityId)).toEqual([
+      'video_user_failed', video.assistantMessageId,
+    ])
+    expect(store.outbox.list(10)[1]).toMatchObject({
+      kind: 'message.append',
+      payload: {
+        role: 'assistant',
+        blocks: [expect.objectContaining({
+          type: 'media_generation', status: 'failed', errorCode: 'MEDIA_GENERATION_FAILED',
+        })],
+      },
+    })
+    expect(projectedConversation(store, video.conversationId)).toMatchObject({
+      syncState: 'pending',
+      lastActivityAt: '1970-01-01T00:00:02.000Z',
+    })
+    store.outbox.markSyncing(store.outbox.list(10).map(({ id }) => id))
+    manager.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(reopened.outbox.list(10).map(({ entityId }) => entityId)).toEqual([
+      'video_user_failed', video.assistantMessageId,
+    ])
+    expect(reopened.outbox.list(10).every(({ state }) => state === 'pending')).toBe(true)
+    manager.close()
+  })
+
+  it('atomically records one immutable completed video message', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const video = startVideoIntent(store, 'completed')
+    store.mediaGenerationJobs.bindSubmitted(video.requestId, {
+      providerJobId: 'provider_video_completed',
+      status: 'in_progress',
+      parameters: { version: 1, options: {} },
+      nextPollAt: 1_500,
+      updatedAt: 1_100,
+    })
+    store.mediaGenerationJobs.transition(video.requestId, ['in_progress'], {
+      status: 'downloading', nextPollAt: null, updatedAt: 1_500,
+    })
+    store.mediaAssets.insert({
+      id: 'video_asset_completed',
+      conversationId: video.conversationId,
+      source: 'generated',
+      kind: 'video',
+      mimeType: 'video/mp4',
+      originalName: 'completed.mp4',
+      relativePath: `${video.conversationId}/completed.mp4`,
+      byteSize: 24,
+      sha256: 'a'.repeat(64),
+      provider: 'openrouter',
+      model: 'video-model',
+      status: 'ready',
+      createdAt: 1_500,
+      updatedAt: 1_500,
+    })
+
+    const terminal = store.mediaGenerationJobs.complete(video.requestId, ['downloading'], {
+      assetId: 'video_asset_completed',
+      block: {
+        type: 'media',
+        blockId: 'video_block_completed',
+        assetId: 'video_asset_completed',
+        kind: 'video',
+        purpose: 'output',
+        name: 'completed.mp4',
+        mimeType: 'video/mp4',
+        byteSize: 24,
+      },
+      endedAt: 2_000,
+    })
+
+    expect(terminal).toMatchObject({ job: { status: 'completed' } })
+    expect(store.mediaGenerationJobs.complete(video.requestId, ['downloading'], {
+      assetId: 'video_asset_completed',
+      block: terminal!.block,
+      endedAt: 2_000,
+    })).toBeUndefined()
+    expect(store.outbox.list(10).map(({ entityId }) => entityId)).toEqual([
+      'video_user_completed', video.assistantMessageId,
+    ])
+    expect(store.outbox.list(10)[1]).toMatchObject({
+      kind: 'message.append',
+      payload: { role: 'assistant', blocks: [expect.objectContaining({ type: 'media' })] },
+    })
+    expect(projectedConversation(store, video.conversationId)).toMatchObject({
+      syncState: 'pending',
+      lastActivityAt: '1970-01-01T00:00:02.000Z',
+    })
     manager.close()
   })
 

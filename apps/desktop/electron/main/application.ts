@@ -428,6 +428,54 @@ export class MaintenanceGate {
   }
 }
 
+class UserDataAdmissionGate {
+  private closed = false
+  private stopped = false
+  private active = 0
+  private readonly drainWaiters = new Set<() => void>()
+
+  private resolveDrainWaiters(): void {
+    if (this.active !== 0) return
+    for (const resolve of this.drainWaiters) resolve()
+    this.drainWaiters.clear()
+  }
+
+  acceptsNewWork(): boolean {
+    return !this.closed && !this.stopped
+  }
+
+  async run<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.closed || this.stopped) throw failure('CONFLICT')
+    this.active += 1
+    try {
+      return await operation()
+    } finally {
+      this.active -= 1
+      this.resolveDrainWaiters()
+    }
+  }
+
+  async transition<T>(operation: (waitForActive: () => Promise<void>) => Promise<T>): Promise<T> {
+    if (this.closed || this.stopped) throw failure('CONFLICT')
+    this.closed = true
+    try {
+      return await operation(async () => {
+        if (this.active === 0) return
+        await new Promise<void>((resolve) => { this.drainWaiters.add(resolve) })
+      })
+    } finally {
+      this.closed = false
+    }
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stopped = true
+    this.closed = true
+    if (this.active === 0) return
+    await new Promise<void>((resolve) => { this.drainWaiters.add(resolve) })
+  }
+}
+
 function iso(timestamp: number | undefined): string | undefined {
   return timestamp === undefined ? undefined : new Date(timestamp).toISOString()
 }
@@ -618,7 +666,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     ?? (cloudBasePorts
       ? new CloudBaseUserDataPort(cloudBasePorts.functions)
       : { call: async () => { throw failure('SERVICE_UNAVAILABLE') } })
-  const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores)
+  let notifyConversationChanges: (conversationIds: readonly string[]) => void = () => undefined
+  const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores, {
+    onConversationChanged: (conversationIds) => { notifyConversationChanges(conversationIds) },
+  })
   const storedDeviceId = database.appSettings.get('user-data.device-id.v1')?.value
   const deviceId = typeof storedDeviceId === 'string'
     && storedDeviceId.length > 0
@@ -633,22 +684,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let userDataLifecycleTail = Promise.resolve()
   let activateUserReconciliation: (recoverInterrupted: boolean) => void = () => undefined
   let pauseUserReconciliation = async (): Promise<void> => undefined
+  let activateVideoJobs: (recoverInterrupted: boolean) => Promise<void> = async () => undefined
+  let pauseVideoJobs = async (): Promise<void> => undefined
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
         activateUserReconciliation(runtimeRecovered)
+        await activateVideoJobs(runtimeRecovered)
         return
       }
       await userDataSync.start(session.user.id, deviceId)
       boundUserId = session.user.id
       await userDataSync.pull()
       activateUserReconciliation(runtimeRecovered)
+      await activateVideoJobs(runtimeRecovered)
     })
     userDataLifecycleTail = operation.catch(() => undefined)
     return operation
   }
   const pauseUserData = (): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
+      await pauseVideoJobs()
       await pauseUserReconciliation()
       await userDataSync.pause()
       userDataStores.close()
@@ -680,6 +736,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     upload: qiniuUploader,
   })
   const maintenance = new MaintenanceGate()
+  const userDataAdmission = new UserDataAdmissionGate()
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -1106,6 +1163,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         && run?.userId === context.userId
         && run.provider === context.providerSnapshot.providerId
         && (providerCredentialEpoch.get(run.provider) ?? 0) === context.providerCredentialEpoch
+        && userDataAdmission.acceptsNewWork()
       ) {
         const controller = new AbortController()
         const promise = conversationTitles.generate({
@@ -1126,6 +1184,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       } else {
         chatDatabase.conversations.failPendingTitleGeneration(event.conversationId)
       }
+    }
+  }
+  notifyConversationChanges = (conversationIds) => {
+    for (const conversationId of conversationIds) {
+      const conversation = currentUserData().conversations.getSummary(conversationId)
+      if (conversation) emitChat({
+        type: 'conversation_updated',
+        conversationId,
+        conversation,
+      })
     }
   }
   const conversationContext = createConversationContextManager(chatDatabase)
@@ -1165,14 +1233,26 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerUsage: chatDatabase.providerUsage,
     emit: emitChat,
   })
-  const videoJobs = new VideoJobRunner({
+  const createVideoJobs = () => new VideoJobRunner({
     database: chatDatabase,
     providerUsage: chatDatabase.providerUsage,
     providers: providerRegistry,
     media,
     emit: emitChat,
     onBackgroundFailure: (error) => { recordFailure(error, 'video-background') },
+    onMutationCommitted: () => { queueUserDataFlush() },
   })
+  let videoJobs = createVideoJobs()
+  activateVideoJobs = async (recoverInterrupted) => {
+    if (recoverInterrupted) await videoJobs.recover()
+  }
+  pauseVideoJobs = async () => {
+    try {
+      await videoJobs.stop()
+    } finally {
+      videoJobs = createVideoJobs()
+    }
+  }
 
   const requireValidCredential = async (snapshot: ModelProviderSnapshot): Promise<void> => {
     const result = await snapshot.provider.validateCredential()
@@ -1296,7 +1376,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
   }
-  const beforeAuthIdentityChange = async (): Promise<void> => {
+  const beforeAuthIdentityChange = async (waitForActive: () => Promise<void>): Promise<void> => {
     const current = await auth.getSession()
     if (current) {
       await resetBrowserIdentity(current.user.id)
@@ -1310,40 +1390,61 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       const titleWork = [...activeConversationTitleWork.values()]
       for (const work of titleWork) work.controller.abort()
       await Promise.all(titleWork.map(({ promise }) => promise))
+      await waitForActive()
       await pauseUserData()
+      return
     }
+    await waitForActive()
   }
+  const transitionIdentity = <T>(operation: () => Promise<T>): Promise<T> => (
+    userDataAdmission.transition(async (waitForActive) => {
+      try {
+        await beforeAuthIdentityChange(waitForActive)
+        return await operation()
+      } catch (error) {
+        const restored = await auth.getSession().catch(() => null)
+        if (restored) await bindUserData(restored)
+        else await pauseUserData()
+        throw error
+      }
+    })
+  )
 
   let settingsUpdateTail = Promise.resolve()
-  const services: DesktopIpcServices = {
+  const ungatedServices: DesktopIpcServices = {
     auth: {
-      getSession: async () => {
-        const session = await auth.getSession()
-        if (session) await bindUserData(session)
-        else await pauseUserData()
-        return session
-      },
-      refreshAuthorization: async () => {
+      getSession: () => userDataAdmission.transition(async (waitForActive) => {
+        try {
+          await waitForActive()
+          const session = await auth.getSession()
+          if (session) await bindUserData(session)
+          else await pauseUserData()
+          return session
+        } catch (error) {
+          const restored = await auth.getSession().catch(() => null)
+          if (restored) await bindUserData(restored)
+          throw error
+        }
+      }),
+      refreshAuthorization: () => userDataAdmission.run(async () => {
         const session = await auth.refreshAuthorization()
         await bindUserData(session)
         return session
-      },
+      }),
       sendOtp: (input) => auth.sendOtp(input),
-      verifyOtp: async (input) => {
-        await beforeAuthIdentityChange()
+      verifyOtp: (input) => transitionIdentity(async () => {
         const session = await auth.verifyOtp(input)
         await bindUserData(session)
         return session
-      },
+      }),
       cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
-      loginWithPassword: async (input) => {
-        await beforeAuthIdentityChange()
+      loginWithPassword: (input) => transitionIdentity(async () => {
         const session = await auth.loginWithPassword(input)
         await bindUserData(session)
         return session
-      },
-      logout: async () => { await beforeAuthIdentityChange(); await auth.logout() },
-      requireSession: requireAuthenticatedSession,
+      }),
+      logout: () => transitionIdentity(() => auth.logout()),
+      requireSession: () => userDataAdmission.run(requireAuthenticatedSession),
     },
     userAdmin: {
       list: (input) => userAdmin.list(input),
@@ -1981,17 +2082,44 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
   }
 
+  const gateUserDataService = <Service extends object>(service: Service): Service => new Proxy(
+    service,
+    {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver)
+        if (typeof value !== 'function') return value
+        return (...args: unknown[]) => userDataAdmission.run(
+          () => Reflect.apply(value, target, args),
+        )
+      },
+    },
+  )
+  const services: DesktopIpcServices = {
+    ...ungatedServices,
+    chat: gateUserDataService(ungatedServices.chat),
+    media: gateUserDataService(ungatedServices.media),
+    executions: gateUserDataService(ungatedServices.executions),
+    settings: {
+      ...ungatedServices.settings,
+      getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),
+      clearLocalData: (scope) => userDataAdmission.run(
+        () => ungatedServices.settings.clearLocalData(scope),
+      ),
+      clearBrowserData: () => userDataAdmission.run(ungatedServices.settings.clearBrowserData),
+    },
+  }
+
   let closePromise: Promise<void> | undefined
   return {
     services,
     mediaAssets: {
-      resolveReadyAsset: async (assetId: string) => {
+      resolveReadyAsset: (assetId: string) => userDataAdmission.run(async () => {
         const session = await auth.requireSession()
         const record = chatDatabase.mediaAssets.get(assetId)
         if (!record) throw failure('NOT_FOUND')
         requireOwnedConversation(record.conversationId, session.user.id)
         return media.resolveReadyAsset(assetId)
-      },
+      }),
     },
     recover: async () => {
       if (closePromise) throw failure('CONFLICT')
@@ -2022,6 +2150,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ): Promise<void> => {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
         }
+        await capture('admission-drain', () => userDataAdmission.stopAndDrain())
         await capture('admission-drain', () => maintenance.stopAndDrain())
         const reconciliationStopped = Promise.resolve()
           .then(() => pauseUserReconciliation())

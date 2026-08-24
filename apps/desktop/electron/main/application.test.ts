@@ -20,6 +20,7 @@ import {
   type ExecutionEvent,
   type ModelInfo,
   type ProxySettings,
+  type SyncMutation,
   type WorkflowDetail,
 } from '@autoforge/shared'
 import {
@@ -6710,6 +6711,165 @@ describe('createApplicationRuntime', () => {
     expect([...deviceIds][0]).toEqual(expect.any(String))
     expect(JSON.stringify(syncCalls)).not.toContain(alice.user.id)
 
+    await runtime.close()
+  })
+
+  it('closes user-data admission before a deferred send session can race a direct UID switch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-uid-switch-gate-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const stream = vi.fn(async function* () {
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: 'reply' }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      modelProviders: snapshotProviders({ deepseek: {
+        listModels: async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')],
+        validateCredential: async () => ({ valid: true }),
+        stream,
+      } }),
+    }))
+    const alice = await authenticate(runtime, 'GateAlice')
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'GateBobby')
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'GateAlice', password: 'password' })
+
+    const sessionStarted = deferred<void>()
+    const releaseSession = deferred<void>()
+    const requireSession = authService.requireSession.bind(authService)
+    vi.spyOn(authService, 'requireSession').mockImplementationOnce(async () => {
+      sessionStarted.resolve()
+      await releaseSession.promise
+      return requireSession()
+    })
+    const sending = runtime.services.chat.send(chatInput(conversation.id, 'old owner request'))
+    await sessionStarted.promise
+    const underlyingLogin = vi.spyOn(authService, 'loginWithPassword')
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'GateBobby', password: 'password',
+    })
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+
+    expect(underlyingLogin).not.toHaveBeenCalled()
+    await expect(runtime.services.chat.createConversation())
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+
+    releaseSession.resolve()
+    await sending
+    await switching
+
+    expect(withUserData(root, alice.user.id, (store) => (
+      store.messages.listForConversation(conversation.id)
+    ))).toHaveLength(2)
+    expect(stream).toHaveBeenCalledOnce()
+    expect(await runtime.services.chat.listConversations({ limit: 50 })).toEqual({ items: [] })
+    await runtime.close()
+  })
+
+  it('restores user-data admission and the old cache after a direct UID switch fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-uid-switch-failure-gate-'))
+    directories.push(root)
+    const authService = createTestAuthService()
+    const runtime = createApplicationRuntime(options(root, { authService }))
+    const alice = await authenticate(runtime, 'GateFailureAlice')
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'GateFailureBobby')
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({
+      account: 'GateFailureAlice', password: 'password',
+    })
+    const loginStarted = deferred<void>()
+    const rejectLogin = deferred<never>()
+    vi.spyOn(authService, 'loginWithPassword').mockImplementationOnce(async () => {
+      loginStarted.resolve()
+      return rejectLogin.promise
+    })
+
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'GateFailureBobby', password: 'password',
+    })
+    await loginStarted.promise
+    await expect(runtime.services.chat.createConversation())
+      .rejects.toMatchObject({ code: 'CONFLICT' })
+    rejectLogin.reject(toSafeAppError({ code: 'AUTH_INVALID_CREDENTIALS' }))
+    await expect(switching).rejects.toMatchObject({ code: 'AUTH_INVALID_CREDENTIALS' })
+
+    const conversation = await runtime.services.chat.createConversation()
+    expect(withUserData(root, alice.user.id, (store) => store.conversations.get(conversation.id)))
+      .toBeDefined()
+    await runtime.close()
+  })
+
+  it('emits strict conversation projections from real background failure and retry transitions', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-sync-event-'))
+    directories.push(root)
+    const events: ChatEvent[] = []
+    let rejectPush = true
+    let applied: SyncMutation | undefined
+    let deliverReceipt = false
+    const runtime = createApplicationRuntime(options(root, {
+      emitChat: (event) => { events.push(event) },
+      userDataSyncPort: {
+        call: vi.fn(async (input) => {
+          if (input.action === 'syncPush') {
+            const mutation = input.mutations[0]!
+            if (rejectPush) {
+              return {
+                ok: true as const,
+                data: {
+                  results: [{
+                    id: mutation.id,
+                    status: 'conflict' as const,
+                    errorCode: 'SYNC_CONFLICT' as const,
+                  }],
+                  cursor: 'cursor_sync_event_conflict',
+                },
+              }
+            }
+            applied = mutation
+            deliverReceipt = true
+            return {
+              ok: true as const,
+              data: {
+                results: [{ id: mutation.id, status: 'applied' as const, revision: 1 }],
+                cursor: 'cursor_sync_event_applied',
+              },
+            }
+          }
+          if (!deliverReceipt || !applied) {
+            return { ok: true as const, data: { mutations: [], cursor: 'cursor_sync_event_empty' } }
+          }
+          deliverReceipt = false
+          const { occurredAt, ...receipt } = applied
+          return {
+            ok: true as const,
+            data: {
+              mutations: [{ ...receipt, resultRevision: 1, receivedAt: occurredAt }],
+              cursor: 'cursor_sync_event_receipt',
+            },
+          }
+        }),
+      },
+    }))
+    await authenticate(runtime, 'SyncEventAlice')
+    const conversation = await runtime.services.chat.createConversation()
+
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: 'conversation_updated',
+      conversationId: conversation.id,
+      conversation: expect.objectContaining({ id: conversation.id, syncState: 'failed' }),
+    })))
+    rejectPush = false
+    await runtime.services.chat.retrySync(conversation.id)
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: 'conversation_updated',
+      conversationId: conversation.id,
+      conversation: expect.objectContaining({ id: conversation.id, syncState: 'synced' }),
+    })))
+    expect(JSON.stringify(events)).not.toMatch(/owner|userId|uid|path|secret/i)
     await runtime.close()
   })
 

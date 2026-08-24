@@ -71,6 +71,7 @@ export interface VideoJobRunnerDependencies {
   >
   emit: (event: ChatEvent) => void
   onBackgroundFailure: (error: unknown) => void
+  onMutationCommitted: (conversationId: string) => void
   id?: () => string
   now?: () => number
   timers?: {
@@ -339,6 +340,7 @@ export class VideoJobRunner {
         },
       } satisfies VideoGenerationSubmissionIntentInput
       intent = this.dependencies.database.mediaGenerationJobs.startSubmissionIntent(preparedTurn)
+      this.dependencies.onMutationCommitted(intent.conversationId)
 
       controller = new AbortController()
       this.controllers.set(input.requestId, controller)
@@ -993,6 +995,7 @@ export class VideoJobRunner {
         },
       )
       if (!completed) return
+      this.dependencies.onMutationCommitted(completed.job.conversationId)
     } catch (error) {
       await this.dependencies.media.removeDraft(assetId, job.conversationId).catch(() => undefined)
       throw error
@@ -1037,6 +1040,7 @@ export class VideoJobRunner {
       this.now(),
     )
     if (!failed) return
+    this.dependencies.onMutationCommitted(failed.job.conversationId)
     this.providerSnapshots.delete(job.id)
     this.emitTransition(failed)
     this.safeEmit({

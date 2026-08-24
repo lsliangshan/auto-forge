@@ -255,6 +255,31 @@ describe('chat history pagination', () => {
       .toEqual(['message_oldest', 'message_newest'])
     expect(store.previousMessageCursorByConversation.conversation_1).toBeUndefined()
   })
+
+  it('does not let a stale page completion release the replacement request after reset', async () => {
+    const { api } = createEventApi()
+    const oldPage = deferred<{ items: [] }>()
+    const newPage = deferred<{ items: [] }>()
+    vi.mocked(api.chat.listConversations)
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(newPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+
+    const oldRequest = store.loadConversations()
+    store.resetLocalData()
+    const newRequest = store.loadConversations()
+    oldPage.resolve({ items: [] })
+    await oldRequest
+
+    await store.loadConversations()
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(2)
+
+    newPage.resolve({ items: [] })
+    await newRequest
+    await store.loadConversations()
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(3)
+  })
 })
 
 function mountScrollableChat() {
@@ -265,14 +290,22 @@ function mountScrollableChat() {
     {
       id: 'conversation_1',
       title: '会话一',
+      titleState: 'user_named',
+      revision: 1,
+      syncState: 'synced',
       createdAt: '2026-07-25T00:00:00.000Z',
-      updatedAt: '2026-07-25T00:00:00.000Z',
+      lastActivityAt: '2026-07-25T00:00:00.000Z',
+      metadataUpdatedAt: '2026-07-25T00:00:00.000Z',
     },
     {
       id: 'conversation_2',
       title: '会话二',
+      titleState: 'user_named',
+      revision: 1,
+      syncState: 'synced',
       createdAt: '2026-07-25T00:00:00.000Z',
-      updatedAt: '2026-07-25T00:00:00.000Z',
+      lastActivityAt: '2026-07-25T00:00:00.000Z',
+      metadataUpdatedAt: '2026-07-25T00:00:00.000Z',
     },
   ]
   chat.selectedConversationId = 'conversation_1'
@@ -320,8 +353,12 @@ describe('chat interactions', () => {
     chat.conversations = [{
       id: 'conversation_1',
       title: '会话',
+      titleState: 'user_named',
+      revision: 1,
+      syncState: 'synced',
       createdAt: '2026-07-25T00:00:00.000Z',
-      updatedAt: '2026-07-25T00:00:00.000Z',
+      lastActivityAt: '2026-07-25T00:00:00.000Z',
+      metadataUpdatedAt: '2026-07-25T00:00:00.000Z',
     }]
     chat.selectedConversationId = 'conversation_1'
     chat.preferencesByConversation.conversation_1 = generationPreferences({ outputType: 'image' })
@@ -367,8 +404,12 @@ describe('chat interactions', () => {
     chat.conversations = [{
       id: 'conversation_1',
       title: '会话',
+      titleState: 'user_named',
+      revision: 1,
+      syncState: 'synced',
       createdAt: '2026-07-25T00:00:00.000Z',
-      updatedAt: '2026-07-25T00:00:00.000Z',
+      lastActivityAt: '2026-07-25T00:00:00.000Z',
+      metadataUpdatedAt: '2026-07-25T00:00:00.000Z',
     }]
     chat.selectedConversationId = 'conversation_1'
     chat.preferencesByConversation.conversation_1 = generationPreferences({
@@ -1492,10 +1533,20 @@ describe('chat interactions', () => {
     const { api, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
-    store.conversations = [{
-      id: 'conv_1', title: '新会话',
-      createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
-    }]
+    store.conversations = [
+      {
+        id: 'conv_2', title: '较新会话', titleState: 'user_named', revision: 1, syncState: 'synced',
+        createdAt: '2026-08-23T00:00:00.000Z',
+        lastActivityAt: '2026-08-23T00:00:30.000Z',
+        metadataUpdatedAt: '2026-08-23T00:00:30.000Z',
+      },
+      {
+        id: 'conv_1', title: '新会话', titleState: 'generating', revision: 1, syncState: 'synced',
+        createdAt: '2026-08-23T00:00:00.000Z',
+        lastActivityAt: '2026-08-23T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-23T00:00:00.000Z',
+      },
+    ]
     store.ensureSubscriptions()
 
     emitChat({
@@ -1505,11 +1556,47 @@ describe('chat interactions', () => {
       updatedAt: '2026-08-23T00:01:00.000Z',
     })
 
-    expect(store.conversations).toEqual([{
-      id: 'conv_1', title: '北京工作居住证办理',
-      createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
+    expect(store.conversations[0]).toMatchObject({
+      id: 'conv_1', title: '北京工作居住证办理', titleState: 'ai_named',
+      syncState: 'pending', lastActivityAt: '2026-08-23T00:01:00.000Z',
       metadataUpdatedAt: '2026-08-23T00:01:00.000Z',
+    })
+  })
+
+  it('merges a real conversation projection event without refetching or losing local state', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [{
+      id: 'conv_1', title: 'Local', titleState: 'pending', revision: 0, syncState: 'pending',
+      createdAt: '2026-08-25T00:00:00.000Z',
+      lastActivityAt: '2026-08-25T00:00:00.000Z',
+      metadataUpdatedAt: '2026-08-25T00:00:00.000Z',
+    }]
+    store.selectedConversationId = 'conv_1'
+    store.messagesByConversation.conv_1 = [{ id: 'local_1', role: 'user', blocks: [] }]
+    store.ensureSubscriptions()
+
+    emitChat({
+      type: 'conversation_updated',
+      conversationId: 'conv_1',
+      conversation: {
+        id: 'conv_1', title: 'Remote', titleState: 'user_named', revision: 2,
+        syncState: 'failed', createdAt: '2026-08-25T00:00:00.000Z',
+        lastActivityAt: '2026-08-25T00:02:00.000Z',
+        metadataUpdatedAt: '2026-08-25T00:01:00.000Z',
+      },
+    })
+
+    expect(store.conversations).toEqual([{
+      id: 'conv_1', title: 'Remote', titleState: 'user_named', revision: 2,
+      syncState: 'failed', createdAt: '2026-08-25T00:00:00.000Z',
+      lastActivityAt: '2026-08-25T00:02:00.000Z',
+      metadataUpdatedAt: '2026-08-25T00:01:00.000Z',
     }])
+    expect(store.selectedConversationId).toBe('conv_1')
+    expect(store.messagesByConversation.conv_1).toEqual([{ id: 'local_1', role: 'user', blocks: [] }])
+    expect(api.chat.listConversations).not.toHaveBeenCalled()
   })
 
   it('does not let a loading snapshot overwrite a newer streamed delta', async () => {
@@ -1772,6 +1859,49 @@ describe('chat interactions', () => {
       status: 'cancelled',
     })
     expect(store.isRunning).toBe(false)
+  })
+
+  it('moves optimistic sends and terminal replies to the top with pending sync state', async () => {
+    const { api, emitChat } = createEventApi()
+    const pendingSend = deferred<{ requestId: string }>()
+    vi.mocked(api.chat.send).mockReturnValue(pendingSend.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      {
+        id: 'conv_newer', title: 'Newer', titleState: 'user_named', revision: 1,
+        syncState: 'synced', createdAt: '2026-08-25T00:00:00.000Z',
+        lastActivityAt: '2026-08-25T00:01:00.000Z',
+        metadataUpdatedAt: '2026-08-25T00:01:00.000Z',
+      },
+      {
+        id: 'conv_target', title: 'Target', titleState: 'user_named', revision: 1,
+        syncState: 'synced', createdAt: '2026-08-25T00:00:00.000Z',
+        lastActivityAt: '2026-08-25T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-25T00:00:00.000Z',
+      },
+    ]
+    store.selectedConversationId = 'conv_target'
+    store.ensureSubscriptions()
+
+    const sending = store.send({
+      content: 'Move now', assetIds: [], outputType: 'text',
+      generation: generationPreferences().generation,
+    })
+
+    expect(store.conversations[0]).toMatchObject({ id: 'conv_target', syncState: 'pending' })
+    expect(store.conversations[0]!.lastActivityAt)
+      .not.toBe('2026-08-25T00:00:00.000Z')
+    pendingSend.resolve({ requestId: 'request_target' })
+    await sending
+    const optimisticActivity = store.conversations[0]!.lastActivityAt
+
+    emitChat({
+      type: 'status', conversationId: 'conv_target', requestId: 'request_target', status: 'completed',
+    })
+
+    expect(store.conversations[0]).toMatchObject({ id: 'conv_target', syncState: 'pending' })
+    expect(store.conversations[0]!.lastActivityAt >= optimisticActivity).toBe(true)
   })
 
   it('awaits the first assistant block from the moment a valid send starts', async () => {

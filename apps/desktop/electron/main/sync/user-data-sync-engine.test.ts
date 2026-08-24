@@ -155,6 +155,7 @@ function createEngine(
   manager: UserDataStoreManager,
   call: (input: CloudBaseUserDataCall) => Promise<UserDataFunctionResponse>,
   clock = new FakeClock(),
+  onConversationChanged: (conversationIds: readonly string[]) => void = () => undefined,
 ) {
   return {
     clock,
@@ -163,6 +164,7 @@ function createEngine(
       setTimeout: clock.setTimeout,
       clearTimeout: clock.clearTimeout,
       jitter: (delay) => delay,
+      onConversationChanged,
     }),
   }
 }
@@ -172,6 +174,53 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
+  it('notifies exact conversation projections through failure, retry, and success', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const mutation = createMutation(42)
+    store.outbox.recordWithConversation(mutation)
+    let rejectPush = true
+    const projections: Array<{ ids: readonly string[]; state: string }> = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        if (rejectPush) {
+          return success({
+            results: input.mutations.map(({ id }) => ({
+              id, status: 'conflict' as const, errorCode: 'SYNC_CONFLICT' as const,
+            })),
+            cursor: 'cursor_conflict_projection',
+          })
+        }
+        return success({
+          results: input.mutations.map(({ id }) => ({
+            id, status: 'applied' as const, revision: 1,
+          })),
+          cursor: 'cursor_applied_projection',
+        })
+      }
+      return success({ mutations: [pulled(mutation)], cursor: 'cursor_pull_projection' })
+    }, new FakeClock(), (ids) => {
+      projections.push({
+        ids: [...ids],
+        state: store.conversations.getSummary(mutation.entityId)?.syncState ?? 'missing',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+    expect(projections).toEqual(expect.arrayContaining([
+      { ids: [mutation.entityId], state: 'syncing' },
+      { ids: [mutation.entityId], state: 'failed' },
+    ]))
+
+    rejectPush = false
+    await engine.retry(mutation.entityId)
+    expect(projections).toEqual(expect.arrayContaining([
+      { ids: [mutation.entityId], state: 'pending' },
+      { ids: [mutation.entityId], state: 'synced' },
+    ]))
+  })
+
   it('pushes local rows, pulls receipts, and advances the checkpoint atomically', async () => {
     const manager = createManager()
     const store = manager.open('alice')

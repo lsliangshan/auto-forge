@@ -1,7 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import type {
@@ -10,7 +9,7 @@ import type {
   GenerationOptions,
   MediaAsset,
 } from '@autoforge/shared'
-import { openAppDatabase } from '../database/client.js'
+import { UserDataStoreManager, type UserDataStore } from '../database/user-data-client.js'
 import { ProviderUsageConsistencyError } from '../database/repositories.js'
 import type {
   GeneratedStreamInput,
@@ -24,9 +23,11 @@ import {
 } from './video-job-runner.js'
 
 const temporaryDirectories: string[] = []
+const userDataManagers: UserDataStoreManager[] = []
 
 afterEach(() => {
   vi.useRealTimers()
+  for (const manager of userDataManagers.splice(0)) manager.close()
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })
   }
@@ -65,42 +66,65 @@ const submitInput = {
 
 const submittedOutputAssetId = 'video_8072e20a4619b4b2251a7c9e4522ab22a9728450834087c29e18d2651db6f0c0'
 
-function createDatabase(databasePath?: string) {
+type TestDatabase = UserDataStore & {
+  readonly cachePath: string
+  close(): void
+}
+
+function userCacheRoot(databasePath: string): string {
+  return `${databasePath}.user-cache`
+}
+
+function openUserDataDatabase(databasePath: string, seedConversation: boolean): TestDatabase {
+  const root = userCacheRoot(databasePath)
+  const manager = new UserDataStoreManager(root)
+  userDataManagers.push(manager)
+  const database = manager.open('user_1') as TestDatabase
+  const cacheFile = readdirSync(root).find((name) => name.endsWith('.sqlite'))
+  if (!cacheFile) throw new Error('User cache was not created')
+  Object.defineProperties(database, {
+    cachePath: { value: join(root, cacheFile) },
+    close: { value: () => manager.close() },
+  })
+  if (seedConversation) {
+    database.conversations.insert({
+      id: submitInput.conversationId,
+      title: 'Video',
+      userId: 'user_1',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+  }
+  return database
+}
+
+function createDatabase(databasePath?: string): TestDatabase {
   const path = databasePath ?? (() => {
     const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-runner-'))
     temporaryDirectories.push(directory)
     return join(directory, 'autoforge.sqlite')
   })()
-  const database = openAppDatabase(path)
-  database.localAuth.createUserAndSession({
-    id: 'user_1',
-    account: 'User One',
-    accountNormalized: 'user one',
-    passwordDigest: 'digest-user-1',
-    createdAt: 1,
-    updatedAt: 1,
-  }, 1)
-  database.conversations.insert({ id: submitInput.conversationId, title: 'Video' })
-  return database
+  return openUserDataDatabase(path, true)
 }
 
-function createLegacyV4VideoDatabase(status: 'pending' | 'in_progress' | 'downloading' = 'pending') {
+function reopenDatabase(databasePath: string): TestDatabase {
+  return openUserDataDatabase(databasePath, false)
+}
+
+function createUserDataDatabase(): TestDatabase {
+  const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-user-cache-'))
+  temporaryDirectories.push(directory)
+  return createDatabase(join(directory, 'autoforge.sqlite'))
+}
+
+function createLegacyV4VideoDatabase(
+  status: 'pending' | 'in_progress' | 'downloading' = 'pending',
+): TestDatabase {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-v4-'))
   temporaryDirectories.push(directory)
   const path = join(directory, 'autoforge.sqlite')
-  const sqlite = new Database(path)
-  for (const [index, fileName] of [
-    '0001_init.sql',
-    '0002_multimodal_media.sql',
-    '0003_conversation_context.sql',
-    '0004_local_auth.sql',
-  ].entries()) {
-    sqlite.exec(readFileSync(fileURLToPath(new URL(`../../../resources/migrations/${fileName}`, import.meta.url)), 'utf8'))
-    sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
-      .run(index + 1, index + 1)
-  }
-  sqlite.prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
-    .run(submitInput.conversationId, 'Legacy video', 1, 1)
+  const database = createDatabase(path)
+  const sqlite = new Database(database.cachePath)
   sqlite.prepare('INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run('assistant_video_legacy', submitInput.conversationId, 'assistant', JSON.stringify([{
       type: 'media_generation',
@@ -109,8 +133,11 @@ function createLegacyV4VideoDatabase(status: 'pending' | 'in_progress' | 'downlo
       kind: 'video',
       status,
     }]), 1, 1)
-  sqlite.prepare('INSERT INTO chat_runs (id, conversation_id, request_id, model, status, started_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run('run_video_legacy', submitInput.conversationId, submitInput.requestId, route.model, 'running', 1)
+  sqlite.prepare(`
+    INSERT INTO chat_runs (
+      id, conversation_id, request_id, model, status, started_at, user_id, provider
+    ) VALUES (?, ?, ?, ?, ?, ?, 'user_1', 'deepseek')
+  `).run('run_video_legacy', submitInput.conversationId, submitInput.requestId, route.model, 'running', 1)
   sqlite.prepare(`
     INSERT INTO media_generation_jobs (
       id, conversation_id, assistant_message_id, provider, model, kind,
@@ -121,7 +148,7 @@ function createLegacyV4VideoDatabase(status: 'pending' | 'in_progress' | 'downlo
     submitInput.requestId,
     submitInput.conversationId,
     'assistant_video_legacy',
-    'openrouter',
+    'deepseek',
     route.model,
     'provider_job_legacy',
     status,
@@ -129,7 +156,7 @@ function createLegacyV4VideoDatabase(status: 'pending' | 'in_progress' | 'downlo
     status === 'downloading' ? null : 1,
   )
   sqlite.close()
-  return openAppDatabase(path)
+  return database
 }
 
 function videoAsset(id: string): MediaAsset {
@@ -144,7 +171,7 @@ function videoAsset(id: string): MediaAsset {
 
 function createHarness(
   overrides: Omit<Partial<VideoJobRunnerDependencies>, 'database'> & {
-    database?: ReturnType<typeof createDatabase>
+    database?: TestDatabase
   } = {},
 ) {
   const database = overrides.database ?? createDatabase()
@@ -229,6 +256,7 @@ function createHarness(
     media,
     emit: (event) => events.push(event),
     onBackgroundFailure: vi.fn(),
+    onMutationCommitted: vi.fn(),
     id: (() => {
       const ids = ['user_message_1', 'run_video_1', 'assistant_video_1', 'block_video_1']
       return () => ids.shift() ?? 'unexpected_id'
@@ -244,6 +272,48 @@ async function flush(): Promise<void> {
 }
 
 describe('VideoJobRunner', () => {
+  it('requests sync after the committed start and completed terminal mutations', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness({ database: createUserDataDatabase() })
+    vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
+      status: 'completed',
+      generationId: 'generation_flush_completed',
+      costUsd: '0.21',
+    })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await runner.submit(submitInput)
+    expect(harness.dependencies.onMutationCommitted).toHaveBeenCalledTimes(1)
+    expect(harness.dependencies.onMutationCommitted).toHaveBeenLastCalledWith(submitInput.conversationId)
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await flush()
+
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')?.status).toBe('completed')
+    expect(harness.dependencies.onMutationCommitted).toHaveBeenCalledTimes(2)
+    expect(harness.dependencies.onMutationCommitted).toHaveBeenLastCalledWith(submitInput.conversationId)
+  })
+
+  it('requests sync after the committed start and failed terminal mutations', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const harness = createHarness({ database: createUserDataDatabase() })
+    vi.mocked(harness.provider.submitVideo!).mockRejectedValue({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
+    const runner = new VideoJobRunner(harness.dependencies)
+
+    await expect(runner.submit(submitInput)).resolves.toMatchObject({
+      status: 'failed',
+    })
+
+    expect(harness.database.mediaGenerationJobs.get('request_video_1')?.status).toBe('failed')
+    expect(harness.dependencies.onMutationCommitted).toHaveBeenCalledTimes(2)
+    expect(harness.dependencies.onMutationCommitted)
+      .toHaveBeenNthCalledWith(1, submitInput.conversationId)
+    expect(harness.dependencies.onMutationCommitted)
+      .toHaveBeenNthCalledWith(2, submitInput.conversationId)
+  })
+
   it('rethrows submit-time provider usage consistency errors without failing the durable intent', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
@@ -659,16 +729,7 @@ describe('VideoJobRunner', () => {
     await submitting.stop()
     database.close()
 
-    const reopened = openAppDatabase(path)
-    reopened.localAuth.createUserAndSession({
-      id: 'user_2',
-      account: 'User Two',
-      accountNormalized: 'user two',
-      passwordDigest: 'digest-user-2',
-      createdAt: 1_500,
-      updatedAt: 1_500,
-    }, 1_500)
-    expect(reopened.localAuth.getCurrentSession()?.user.id).toBe('user_2')
+    const reopened = reopenDatabase(path)
     reopened.providerUsage.recoverPending(1_500)
     const recoveredHarness = createHarness({ database: reopened })
     vi.mocked(recoveredHarness.provider.pollVideo!).mockResolvedValue({
@@ -693,20 +754,13 @@ describe('VideoJobRunner', () => {
       openRouterKnownCostCount: 1,
       openRouterUnknownCostCount: 0,
     })
-    expect(recoveredHarness.database.providerUsage.summarize({
-      userId: 'user_2',
-      yesterdayStartedAt: 0,
-      todayStartedAt: 0,
-      weekStartedAt: 0,
-      monthStartedAt: 0,
-      endedAt: 10_000,
-    }).allTime).toMatchObject({
-      openRouterCostUsd: '0',
-      openRouterKnownCostCount: 0,
-      openRouterUnknownCostCount: 0,
-    })
+    expect(() => recoveredHarness.database.providerUsage.summarize({
+      userId: 'user_2', yesterdayStartedAt: 0, todayStartedAt: 0,
+      weekStartedAt: 0, monthStartedAt: 0, endedAt: 10_000,
+    })).toThrow()
+    const cachePath = reopened.cachePath
     reopened.close()
-    const inspection = new Database(path, { readonly: true })
+    const inspection = new Database(cachePath, { readonly: true })
     expect(inspection.prepare(`
       SELECT user_id AS userId, api_key_fingerprint AS apiKeyFingerprint, status
       FROM provider_usage_events
@@ -765,7 +819,7 @@ describe('VideoJobRunner', () => {
       },
       expectedStatus: 'failed',
     },
-  ])('recovers a real v4 legacy OpenRouter video when $name without creating billing', async ({ configure, expectedStatus }) => {
+  ])('recovers an owner-scoped v4 video when $name without creating billing', async ({ configure, expectedStatus }) => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
     const database = createLegacyV4VideoDatabase()
@@ -790,16 +844,15 @@ describe('VideoJobRunner', () => {
     expect(markUnknown).not.toHaveBeenCalled()
   })
 
-  it('finishes an already-downloading v4 legacy OpenRouter video without billing it', async () => {
+  it('finishes an already-downloading owner-scoped v4 video without billing it', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
     const database = createLegacyV4VideoDatabase('downloading')
     const harness = createHarness({ database })
     harness.dependencies.providers = {
       acquire: vi.fn(async (): Promise<ModelProviderSnapshot> => ({
-        providerId: 'openrouter' as const,
+        providerId: 'deepseek' as const,
         provider: harness.provider as ModelProvider,
-        apiKeyFingerprint: 'legacy_current_fingerprint',
       })),
     }
     const runner = new VideoJobRunner(harness.dependencies)
@@ -864,33 +917,22 @@ describe('VideoJobRunner', () => {
     expect(harness.database.mediaGenerationJobs.get('request_owned_missing_usage')?.pollAttempts).toBe(0)
   })
 
-  it('rejects contradictory legacy ownership when an attributed usage event exists', async () => {
+  it('rejects a contradictory attributed event on an untracked recovered job', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
     const database = createLegacyV4VideoDatabase()
-    database.localAuth.createUserAndSession({
-      id: 'user_legacy_conflict',
-      account: 'Legacy Conflict',
-      accountNormalized: 'legacy conflict',
-      passwordDigest: 'digest-legacy-conflict',
-      createdAt: 1,
-      updatedAt: 1,
-    }, 1)
-    database.providerUsage.start({
-      id: 'usage_legacy_conflict',
-      operationKey: `video:${submitInput.requestId}`,
-      userId: 'user_legacy_conflict',
-      provider: 'openrouter',
-      apiKeyFingerprint: 'fingerprint_1',
-      requestId: submitInput.requestId,
-      chatRunId: 'run_video_legacy',
-      model: route.model,
-      modality: 'video',
-      startedAt: 1,
-    })
-    database.providerUsage.bindIdentity(`video:${submitInput.requestId}`, {
-      providerJobId: 'provider_job_legacy',
-    })
+    const fault = new Database(database.cachePath)
+    fault.prepare(`
+      INSERT INTO provider_usage_events (
+        id, operation_key, user_id, provider, api_key_fingerprint, request_id,
+        chat_run_id, provider_job_id, model, modality, status, started_at
+      ) VALUES (?, ?, 'user_1', 'deepseek', NULL, ?, ?, ?, ?, 'video', 'pending', ?)
+    `).run(
+      'usage_legacy_conflict', `video:${submitInput.requestId}`,
+      submitInput.requestId, 'run_video_legacy', 'provider_job_legacy',
+      route.model, 1,
+    )
+    fault.close()
     const harness = createHarness({ database })
     const runner = new VideoJobRunner(harness.dependencies)
 
@@ -997,14 +1039,13 @@ describe('VideoJobRunner', () => {
     expect(harness.database.mediaGenerationJobs.get(submitInput.requestId)?.pollAttempts).toBe(1)
   })
 
-  it('retries a credential-unavailable legacy job without attributing or spending attempts', async () => {
+  it('retries a credential-unavailable owner-scoped v4 job without spending attempts', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(1_000)
     const database = createLegacyV4VideoDatabase()
     const harness = createHarness({ database })
     const snapshot: ModelProviderSnapshot = {
-      providerId: 'openrouter', provider: harness.provider as ModelProvider,
-      apiKeyFingerprint: 'current_legacy_fingerprint',
+      providerId: 'deepseek', provider: harness.provider as ModelProvider,
     }
     let available = false
     harness.dependencies.providers = {
@@ -1189,7 +1230,7 @@ describe('VideoJobRunner', () => {
     const path = join(directory, 'autoforge.sqlite')
     const database = createDatabase(path)
     const harness = createHarness({ database })
-    const fault = new Database(path)
+    const fault = new Database(database.cachePath)
     fault.exec(`
       CREATE TRIGGER fail_video_intent_insert
       BEFORE INSERT ON media_generation_jobs
@@ -1254,7 +1295,7 @@ describe('VideoJobRunner', () => {
     const path = join(directory, 'autoforge.sqlite')
     const database = createDatabase(path)
     const harness = createHarness({ database })
-    const fault = new Database(path)
+    const fault = new Database(database.cachePath)
     fault.exec(`
       CREATE TRIGGER fail_video_provider_bind
       BEFORE UPDATE OF provider_job_id ON media_generation_jobs
@@ -1298,7 +1339,7 @@ describe('VideoJobRunner', () => {
     const path = join(directory, 'autoforge.sqlite')
     const database = createDatabase(path)
     const harness = createHarness({ database })
-    const fault = new Database(path)
+    const fault = new Database(database.cachePath)
     fault.exec(`
       CREATE TRIGGER fail_video_provider_bind_twice
       BEFORE UPDATE OF provider_job_id ON media_generation_jobs
@@ -1334,8 +1375,9 @@ describe('VideoJobRunner', () => {
     database.close()
 
     vi.setSystemTime(2_000)
-    const reopened = openAppDatabase(path)
-    reopened.recoverInterrupted()
+    const reopened = reopenDatabase(path)
+    const recoveredHarness = createHarness({ database: reopened })
+    await new VideoJobRunner(recoveredHarness.dependencies).recover()
     expect(reopened.mediaGenerationJobs.get('request_video_1')).toMatchObject({
       providerJobId: 'local:autoforge_video_submission_intent',
       status: 'failed',
@@ -1486,8 +1528,9 @@ describe('VideoJobRunner', () => {
     await Promise.resolve()
     database.close()
 
-    const reopened = openAppDatabase(path)
-    reopened.recoverInterrupted()
+    const reopened = reopenDatabase(path)
+    const recoveredHarness = createHarness({ database: reopened })
+    await new VideoJobRunner(recoveredHarness.dependencies).recover()
 
     expect(reopened.mediaGenerationJobs.get('request_video_1')).toMatchObject({
       providerJobId: 'local:autoforge_video_submission_intent',
@@ -1749,6 +1792,7 @@ describe('VideoJobRunner', () => {
       id: 'existing_run',
       conversationId: submitInput.conversationId,
       requestId: submitInput.requestId,
+      provider: 'openrouter',
       model: route.model,
       status: 'running',
       startedAt: 1,
@@ -1785,6 +1829,7 @@ describe('VideoJobRunner', () => {
       id: 'run_video_1',
       conversationId: submitInput.conversationId,
       requestId: 'existing_request',
+      provider: 'openrouter',
       model: route.model,
       status: 'running',
       startedAt: 1,
@@ -2586,6 +2631,7 @@ describe('video job persistence boundaries', () => {
       id: 'run_recovery',
       conversationId: submitInput.conversationId,
       requestId: 'request_recovery',
+      provider: 'openrouter',
       model: 'video-model',
       status: 'running',
       startedAt: 1,
@@ -2604,14 +2650,14 @@ describe('video job persistence boundaries', () => {
       updatedAt: 1,
     })
 
-    database.recoverInterrupted()
+    database.mediaGenerationJobs.reconcileInterrupted(Date.now())
 
     expect(database.chatRuns.get('run_recovery')?.status).toBe('running')
   })
 
   it('fails corrupted resumable associations while preserving exact active and paused pairs', () => {
     const database = createDatabase()
-    database.conversations.insert({ id: 'conversation_other', title: 'Other' })
+    database.conversations.insert({ id: 'conversation_other', title: 'Other', userId: 'user_1' })
     const addJob = (input: {
       id: string
       status?: 'pending' | 'paused'
@@ -2651,6 +2697,7 @@ describe('video job persistence boundaries', () => {
         id: `run_${input.id}`,
         conversationId: input.runConversationId ?? submitInput.conversationId,
         requestId: input.id,
+        provider: 'openrouter',
         model: input.runModel ?? route.model,
         status: 'running',
         startedAt: 1,
@@ -2679,7 +2726,7 @@ describe('video job persistence boundaries', () => {
     addJob({ id: 'wrong_block_status', blockStatus: 'in_progress' })
     addJob({ id: 'wrong_block_kind', blockKind: 'image' })
 
-    database.recoverInterrupted()
+    database.mediaGenerationJobs.reconcileInterrupted(Date.now())
 
     expect(database.chatRuns.get('run_valid_active')?.status).toBe('running')
     expect(database.chatRuns.get('run_valid_paused')?.status).toBe('running')
@@ -2721,8 +2768,10 @@ describe('video job persistence boundaries', () => {
     const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-corrupt-recovery-'))
     temporaryDirectories.push(directory)
     const path = join(directory, 'autoforge.sqlite')
-    const database = openAppDatabase(path)
-    database.conversations.insert({ id: 'conversation_corrupt_recovery', title: 'Corrupt' })
+    const database = createDatabase(path)
+    database.conversations.insert({
+      id: 'conversation_corrupt_recovery', title: 'Corrupt', userId: 'user_1',
+    })
     database.messages.insert({
       id: 'assistant_corrupt_recovery',
       conversationId: 'conversation_corrupt_recovery',
@@ -2740,6 +2789,7 @@ describe('video job persistence boundaries', () => {
       id: 'run_corrupt_recovery',
       conversationId: 'conversation_corrupt_recovery',
       requestId: 'request_corrupt_recovery',
+      provider: 'openrouter',
       model: route.model,
       status: 'running',
       startedAt: 1,
@@ -2757,12 +2807,12 @@ describe('video job persistence boundaries', () => {
       createdAt: 1,
       updatedAt: 1,
     })
-    const fault = new Database(path)
+    const fault = new Database(database.cachePath)
     fault.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
       .run('{not valid json', 'assistant_corrupt_recovery')
     fault.close()
 
-    expect(() => database.recoverInterrupted()).not.toThrow()
+    expect(() => database.mediaGenerationJobs.reconcileInterrupted(Date.now())).not.toThrow()
     expect(database.mediaGenerationJobs.get('request_corrupt_recovery')).toMatchObject({
       status: 'failed',
       errorCode: 'MEDIA_GENERATION_FAILED',
@@ -2794,6 +2844,7 @@ describe('video job persistence boundaries', () => {
       id: 'run_existing',
       conversationId: submitInput.conversationId,
       requestId: 'request_atomic',
+      provider: 'openrouter',
       model: 'video-model',
       status: 'running',
       startedAt: 1,
@@ -2864,8 +2915,10 @@ describe('video job persistence boundaries', () => {
     const directory = mkdtempSync(join(tmpdir(), 'autoforge-video-terminal-'))
     temporaryDirectories.push(directory)
     const path = join(directory, 'autoforge.sqlite')
-    const database = openAppDatabase(path)
-    database.conversations.insert({ id: 'conversation_terminal', title: 'Terminal' })
+    const database = createDatabase(path)
+    database.conversations.insert({
+      id: 'conversation_terminal', title: 'Terminal', userId: 'user_1',
+    })
     database.mediaGenerationJobs.insertTurn({
       userMessage: {
         id: 'user_terminal',
@@ -2892,6 +2945,7 @@ describe('video job persistence boundaries', () => {
         id: 'run_terminal',
         conversationId: 'conversation_terminal',
         requestId: 'request_terminal',
+        provider: 'openrouter',
         model: 'video-model',
         status: 'running',
         startedAt: 1,
@@ -2936,7 +2990,7 @@ describe('video job persistence boundaries', () => {
       createdAt: 3,
       updatedAt: 3,
     })
-    const fault = new Database(path)
+    const fault = new Database(database.cachePath)
     fault.exec(`
       CREATE TRIGGER fail_video_job_completion
       BEFORE UPDATE ON media_generation_jobs

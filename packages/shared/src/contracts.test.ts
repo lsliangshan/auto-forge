@@ -1297,6 +1297,32 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('carries an owner-free strict conversation sync projection event', () => {
+    const event = {
+      type: 'conversation_updated',
+      conversationId: 'conversation_1',
+      conversation: {
+        id: 'conversation_1',
+        title: 'Synced title',
+        titleState: 'user_named',
+        revision: 2,
+        syncState: 'synced',
+        createdAt: '2026-08-23T12:00:00.000Z',
+        lastActivityAt: '2026-08-23T12:01:00.000Z',
+        metadataUpdatedAt: '2026-08-23T12:01:00.000Z',
+      },
+    }
+    expect(chatEventSchema.parse(event)).toEqual(event)
+    expect(() => chatEventSchema.parse({
+      ...event,
+      conversation: { ...event.conversation, userId: 'private-owner' },
+    })).toThrow()
+    expect(() => chatEventSchema.parse({
+      ...event,
+      conversationId: 'different-conversation',
+    })).toThrow()
+  })
+
   it('allows attachment-only understanding but rejects empty or encoded sends', () => {
     expect(chatSendInputSchema.parse({
       conversationId: 'conversation_1',

@@ -245,6 +245,17 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
 
 export type ChatBlock = z.infer<typeof chatBlockSchema>
 
+const conversationEventSummarySchema = z.object({
+  id: identifierSchema,
+  title: nonEmptyStringSchema,
+  titleState: z.enum(['pending', 'generating', 'ai_named', 'user_named', 'failed']),
+  revision: z.number().int().nonnegative(),
+  syncState: z.enum(['synced', 'pending', 'syncing', 'failed']),
+  createdAt: timestampSchema,
+  lastActivityAt: timestampSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+
 export const chatEventSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('block'),
@@ -272,12 +283,24 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     title: z.string().trim().min(1).max(20),
     updatedAt: timestampSchema,
   }).strict(),
+  z.object({
+    type: z.literal('conversation_updated'),
+    conversationId: identifierSchema,
+    conversation: conversationEventSummarySchema,
+  }).strict(),
 ]).superRefine((event, context) => {
   if (event.type === 'block_update' && event.blockId !== event.block.blockId) {
     context.addIssue({
       code: 'custom',
       path: ['blockId'],
       message: 'Replacement block identity must match the updated block',
+    })
+  }
+  if (event.type === 'conversation_updated' && event.conversationId !== event.conversation.id) {
+    context.addIssue({
+      code: 'custom',
+      path: ['conversationId'],
+      message: 'Conversation identity must match the updated projection',
     })
   }
 })
