@@ -25,6 +25,8 @@ function createManager(): UserDataStoreManager {
 
 type CreateMutation = Extract<SyncMutation, { kind: 'conversation.create' }>
 type PulledCreateMutation = Extract<RemoteSyncMutation, { kind: 'conversation.create' }>
+type RenameMutation = Extract<SyncMutation, { kind: 'conversation.rename' }>
+type MessageMutation = Extract<SyncMutation, { kind: 'message.append' }>
 
 function createMutation(index: number, prefix = 'alice'): CreateMutation {
   const suffix = String(index).padStart(3, '0')
@@ -65,6 +67,43 @@ function pulled(mutation: CreateMutation, resultRevision = 1): PulledCreateMutat
     resultRevision,
     payload: mutation.payload,
     receivedAt: mutation.occurredAt,
+  }
+}
+
+function remoteReceipt(mutation: SyncMutation, resultRevision: number): RemoteSyncMutation {
+  const { occurredAt, ...receipt } = mutation
+  return { ...receipt, resultRevision, receivedAt: occurredAt } as RemoteSyncMutation
+}
+
+function renameMutation(id: string, entityId: string, baseRevision: number, title: string): RenameMutation {
+  return {
+    id,
+    kind: 'conversation.rename',
+    entityId,
+    baseRevision,
+    payload: {
+      title,
+      titleState: 'user_named',
+      metadataUpdatedAt: '2026-08-25T00:02:00.000Z',
+    },
+    occurredAt: '2026-08-25T00:02:00.000Z',
+  }
+}
+
+function messageMutation(id: string, conversationId: string, baseRevision: number): MessageMutation {
+  return {
+    id,
+    kind: 'message.append',
+    entityId: `${id}_message`,
+    baseRevision,
+    payload: {
+      id: `${id}_message`,
+      conversationId,
+      role: 'user',
+      blocks: [{ type: 'text', text: 'Message' }],
+      createdAt: '2026-08-25T00:03:00.000Z',
+    },
+    occurredAt: '2026-08-25T00:03:00.000Z',
   }
 }
 
@@ -191,6 +230,71 @@ describe('UserDataSyncEngine', () => {
     expect(store.outbox.countPending()).toBe(0)
   })
 
+  it('retains two applied renames until their ordered pull receipts arrive', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(40)
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_rename_setup', mutations: [pulled(create)],
+    }, 1)
+    const first = renameMutation('rename_batch_first', create.entityId, 1, 'First title')
+    const second = renameMutation('rename_batch_second', create.entityId, 2, 'Second title')
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(second)
+    const { engine } = createEngine(manager, async (input) => input.action === 'syncPush'
+      ? success({
+          results: [
+            { id: first.id, status: 'applied', revision: 2 },
+            { id: second.id, status: 'applied', revision: 3 },
+          ],
+          cursor: 'cursor_rename_push',
+        })
+      : success({
+          mutations: [remoteReceipt(first, 2), remoteReceipt(second, 3)],
+          cursor: 'cursor_rename_pull',
+        }))
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(store.outbox.countPending()).toBe(0)
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({
+        id: create.entityId, title: 'Second title', revision: 3, syncState: 'synced',
+      }),
+    )
+  })
+
+  it('retains an applied create before its same-batch message receipt', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(41)
+    const message = messageMutation('create_message_batch', create.entityId, 1)
+    store.outbox.recordWithConversation(create)
+    store.outbox.recordWithMessage(message)
+    const { engine } = createEngine(manager, async (input) => input.action === 'syncPush'
+      ? success({
+          results: [
+            { id: create.id, status: 'applied', revision: 1 },
+            { id: message.id, status: 'applied', revision: 2 },
+          ],
+          cursor: 'cursor_create_message_push',
+        })
+      : success({
+          mutations: [remoteReceipt(create, 1), remoteReceipt(message, 2)],
+          cursor: 'cursor_create_message_pull',
+        }))
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(store.outbox.countPending()).toBe(0)
+    expect(store.messages.get(message.payload.id)).toBeDefined()
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: create.entityId, revision: 2, syncState: 'synced' }),
+    )
+  })
+
   it('builds the largest FIFO push prefix within the exact one-mebibyte event limit', async () => {
     const manager = createManager()
     const store = manager.open('alice')
@@ -200,10 +304,17 @@ describe('UserDataSyncEngine', () => {
     store.outbox.recordWithConversation(second)
     const eventBytes: number[] = []
     const batchIds: string[][] = []
+    const pushed: SyncMutation[] = []
     const { engine } = createEngine(manager, async (input) => {
-      if (input.action === 'syncPull') return success({ mutations: [], cursor: null })
+      if (input.action === 'syncPull') {
+        return success({
+          mutations: pushed.map((mutation) => remoteReceipt(mutation, 1)),
+          cursor: 'cursor_byte_pull',
+        })
+      }
       eventBytes.push(Buffer.byteLength(JSON.stringify(input), 'utf8'))
       batchIds.push(input.mutations.map(({ id }) => id))
+      pushed.push(...input.mutations)
       return success({
         results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
         cursor: `cursor_byte_batch_${batchIds.length}`,
@@ -227,7 +338,9 @@ describe('UserDataSyncEngine', () => {
     store.outbox.recordWithConversation(later)
     const pushedIds: string[] = []
     const { engine } = createEngine(manager, async (input) => {
-      if (input.action === 'syncPull') return success({ mutations: [], cursor: null })
+      if (input.action === 'syncPull') {
+        return success({ mutations: [pulled(later)], cursor: 'cursor_after_oversize_pull' })
+      }
       expect(Buffer.byteLength(JSON.stringify(input), 'utf8')).toBeLessThanOrEqual(MAX_EVENT_BYTES)
       pushedIds.push(...input.mutations.map(({ id }) => id))
       return success({
@@ -382,6 +495,54 @@ describe('UserDataSyncEngine', () => {
     expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
   })
 
+  it('retries a failed conversation through pending to synced', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const mutation = createMutation(42)
+    store.outbox.recordWithConversation(mutation)
+    let resolveRetryPush!: (response: UserDataFunctionResponse) => void
+    const retryPush = new Promise<UserDataFunctionResponse>((resolve) => { resolveRetryPush = resolve })
+    let pushCount = 0
+    const call = vi.fn(async (input: CloudBaseUserDataCall) => {
+      if (input.action === 'syncPull') {
+        return success({ mutations: [pulled(mutation)], cursor: 'cursor_retry_pull' })
+      }
+      pushCount += 1
+      if (pushCount === 1) {
+        return success({
+          results: [{ id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' }],
+          cursor: 'cursor_retry_conflict',
+        })
+      }
+      return retryPush
+    })
+    const { engine } = createEngine(manager, call)
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'SYNC_CONFLICT' })
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, syncState: 'failed' }),
+    )
+
+    const retrying = engine.retry(mutation.entityId)
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(2))
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, syncState: 'pending' }),
+    )
+    resolveRetryPush(success({
+      results: [{ id: mutation.id, status: 'applied', revision: 1 }],
+      cursor: 'cursor_retry_push',
+    }))
+    await retrying
+
+    expect(store.outbox.find(mutation.id)).toBeUndefined()
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, revision: 1, syncState: 'synced' }),
+    )
+    expect(engine.status()).toEqual({ state: 'idle' })
+  })
+
   it('quarantines malformed remote output without advancing the checkpoint', async () => {
     const manager = createManager()
     const store = manager.open('alice')
@@ -402,17 +563,21 @@ describe('UserDataSyncEngine', () => {
     let resolveAlice!: (response: UserDataFunctionResponse) => void
     const aliceResponse = new Promise<UserDataFunctionResponse>((resolve) => { resolveAlice = resolve })
     const calls: CloudBaseUserDataCall[] = []
+    const bobPushed: SyncMutation[] = []
     const { engine } = createEngine(manager, async (input) => {
       calls.push(input)
       if (input.action === 'syncPush' && input.mutations.some(({ id }) => id === aliceMutation.id)) {
         return aliceResponse
       }
       if (input.action === 'syncPush') {
+        bobPushed.push(...input.mutations)
         return success({ results: input.mutations.map((item) => ({
           id: item.id, status: 'applied', revision: 1,
         })), cursor: 'cursor_bob_push' })
       }
-      return success({ mutations: [], cursor: null })
+      return success({
+        mutations: bobPushed.map((mutation) => remoteReceipt(mutation, 1)), cursor: null,
+      })
     })
 
     await engine.start('alice', 'device-a')
@@ -454,7 +619,7 @@ describe('UserDataSyncEngine', () => {
           cursor: 'cursor_queued_flush',
         })
       }
-      return success({ mutations: [], cursor: null })
+      return success({ mutations: [pulled(mutation)], cursor: null })
     })
 
     await engine.start('alice', 'device-a')
@@ -481,7 +646,7 @@ describe('UserDataSyncEngine', () => {
     const { engine } = createEngine(manager, async (input) => {
       actions.push(input.action)
       if (input.action === 'syncPush') return deferredPush
-      return success({ mutations: [], cursor: null })
+      return success({ mutations: [pulled(mutation)], cursor: null })
     })
 
     await engine.start('alice', 'device-a')
@@ -496,6 +661,61 @@ describe('UserDataSyncEngine', () => {
 
     expect(actions).toEqual(['syncPush', 'syncPull'])
     expect(store.outbox.find(mutation.id)).toBeUndefined()
+  })
+
+  it.each([
+    { code: 'AUTH_REQUIRED' as const, state: 'paused' as const },
+    { code: 'INVALID_INPUT' as const, state: 'quarantined' as const },
+  ])('drops a queued flush when pull ends in $code', async ({ code, state }) => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    let resolvePull!: (response: UserDataFunctionResponse) => void
+    const deferredPull = new Promise<UserDataFunctionResponse>((resolve) => { resolvePull = resolve })
+    const call = vi.fn().mockReturnValue(deferredPull)
+    const { engine } = createEngine(manager, call)
+
+    await engine.start('alice', 'device-a')
+    const pulling = engine.pull()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
+    store.outbox.recordWithConversation(createMutation(32))
+    const flushing = engine.flush()
+    resolvePull(failure(code))
+    await Promise.all([pulling, flushing])
+
+    expect(call).toHaveBeenCalledOnce()
+    expect(engine.status()).toMatchObject({ state, errorCode: code })
+  })
+
+  it.each([
+    { label: 'authentication', response: failure('AUTH_REQUIRED'), state: 'paused' as const, code: 'AUTH_REQUIRED' as const },
+    {
+      label: 'conflict',
+      response: success({
+        results: [{ id: createMutation(33).id, status: 'conflict', errorCode: 'SYNC_CONFLICT' }],
+        cursor: 'cursor_conflict_stop',
+      }),
+      state: 'quarantined' as const,
+      code: 'SYNC_CONFLICT' as const,
+    },
+  ])('drops a queued pull when push ends in $label', async ({ response, state, code }) => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const mutation = createMutation(33)
+    store.outbox.recordWithConversation(mutation)
+    let resolvePush!: (response: UserDataFunctionResponse) => void
+    const deferredPush = new Promise<UserDataFunctionResponse>((resolve) => { resolvePush = resolve })
+    const call = vi.fn().mockReturnValue(deferredPush)
+    const { engine } = createEngine(manager, call)
+
+    await engine.start('alice', 'device-a')
+    const flushing = engine.flush()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
+    const pulling = engine.pull()
+    resolvePush(response)
+    await Promise.all([flushing, pulling])
+
+    expect(call).toHaveBeenCalledOnce()
+    expect(engine.status()).toMatchObject({ state, errorCode: code })
   })
 
   it.each([

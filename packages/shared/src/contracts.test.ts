@@ -39,6 +39,7 @@ import {
   providerCredentialStatusSchema,
   proxySettingsSchema,
   pulledMutationSchema,
+  sanitizeOpaqueWorkflowArgs,
   toSafeAppError,
   tokenUsageSnapshotSchema,
   syncMutationResultSchema,
@@ -302,6 +303,54 @@ describe('cross-process contracts', () => {
       ...receipt,
       entityId: 'different_batch',
     }).success).toBe(false)
+  })
+
+  it('matches Task 3 token-aware workflow proposal arg sanitization', () => {
+    expect(sanitizeOpaqueWorkflowArgs({
+      query: 'status:open',
+      fluid: 'hydraulic',
+      liquid: 'water',
+      sql: 'select private',
+      ServiceKey: 'service-private',
+      rootPath: '/Users/private/project',
+      nested: {
+        Authorization: 'auth-private',
+        authorizationHeader: 'header-private',
+        cookieValue: 'cookie-private',
+        uidValue: 'uid-private',
+        filePathValue: 'file-private',
+        callerUserId: 'user-private',
+        access_token: 'token-private',
+        passwordValue: 'password-private',
+        promptText: 'prompt-private',
+        response_body: 'response-private',
+        imageBase64: 'base64-private',
+        credentialOwner: 'owner-private',
+      },
+    })).toEqual({
+      query: 'status:open',
+      fluid: 'hydraulic',
+      liquid: 'water',
+      sql: '[REDACTED]',
+      ServiceKey: '[REDACTED]',
+      rootPath: '[REDACTED]',
+      nested: {
+        Authorization: '[REDACTED]',
+        authorizationHeader: '[REDACTED]',
+        cookieValue: '[REDACTED]',
+        uidValue: '[REDACTED]',
+        filePathValue: '[REDACTED]',
+        callerUserId: '[REDACTED]',
+        access_token: '[REDACTED]',
+        passwordValue: '[REDACTED]',
+        promptText: '[REDACTED]',
+        response_body: '[REDACTED]',
+        imageBase64: '[REDACTED]',
+        credentialOwner: '[REDACTED]',
+      },
+    })
+    expect(sanitizeOpaqueWorkflowArgs(['plain', { query: 'kept', token: 'hidden' }]))
+      .toEqual(['plain', { query: 'kept', token: '[REDACTED]' }])
   })
 
   it('keeps cloud-sync and unowned legacy import consent distinct', () => {

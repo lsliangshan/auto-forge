@@ -293,7 +293,106 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
-  it('atomically acknowledges exact successful push results without waiting for pull', () => {
+  it('persists failed conversation projection and atomically requeues it for retry', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const mutation = createConversationMutation('retry_projection_mutation', 'retry_projection_conversation')
+    store.outbox.recordWithConversation(mutation)
+    store.outbox.markFailed(mutation.id, 'SYNC_CONFLICT')
+
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, syncState: 'failed' }),
+    )
+    manager.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(reopened.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, syncState: 'failed' }),
+    )
+    expect(reopened.outbox.retryFailed(mutation.entityId)).toEqual([mutation.id])
+    expect(reopened.outbox.find(mutation.id)).toMatchObject({ state: 'pending' })
+    expect(reopened.outbox.find(mutation.id)).not.toHaveProperty('lastErrorCode')
+    expect(reopened.outbox.find(mutation.id)).not.toHaveProperty('nextAttemptAt')
+    expect(reopened.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, syncState: 'pending' }),
+    )
+
+    reopened.outbox.markSyncing([mutation.id])
+    reopened.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_retry_projection',
+      mutations: [pulledMutation(mutation, 1)],
+    }, 2)
+    expect(reopened.outbox.find(mutation.id)).toBeUndefined()
+    expect(reopened.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, revision: 1, syncState: 'synced' }),
+    )
+    manager.close()
+  })
+
+  it('keeps transient conversation failures pending instead of failed', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const mutation = createConversationMutation('transient_projection', 'transient_conversation')
+    store.outbox.recordWithConversation(mutation)
+    store.outbox.markPending(mutation.id, 2_000)
+
+    expect(store.outbox.find(mutation.id)).toMatchObject({ state: 'pending', nextAttemptAt: 2_000 })
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: mutation.entityId, syncState: 'pending' }),
+    )
+    manager.close()
+  })
+
+  it('keeps a conversation failed while a later terminal row remains', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('failed_chain_create', 'failed_chain_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_failed_chain_create', mutations: [pulledMutation(create, 1)],
+    }, 1)
+    const first = renameConversationMutation('failed_chain_first', create.entityId, 1, 'First')
+    const second = renameConversationMutation('failed_chain_second', create.entityId, 2, 'Second')
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(second)
+    store.outbox.markSyncing([first.id, second.id])
+    store.outbox.markFailed(second.id, 'SYNC_CONFLICT')
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_failed_chain_first', mutations: [pulledMutation(first, 2)],
+    }, 2)
+
+    expect(store.outbox.find(first.id)).toBeUndefined()
+    expect(store.outbox.find(second.id)).toMatchObject({ state: 'failed' })
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: create.entityId, revision: 2, syncState: 'failed' }),
+    )
+    manager.close()
+  })
+
+  it('retries a failed message by its mutation entity ID', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('retry_message_create', 'retry_message_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_retry_message_create', mutations: [pulledMutation(create, 1)],
+    }, 1)
+    const message = appendMessageMutation(
+      'retry_message_mutation', create.entityId, 'retry_message_entity',
+    )
+    store.outbox.recordWithMessage(message)
+    store.outbox.markFailed(message.id, 'INVALID_INPUT')
+
+    expect(store.outbox.retryFailed(message.entityId)).toEqual([message.id])
+    expect(store.outbox.find(message.id)).toMatchObject({ state: 'pending' })
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({ id: create.entityId, syncState: 'pending' }),
+    )
+    manager.close()
+  })
+
+  it('acknowledges duplicate push results but retains applied evidence for pull', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')
     const first = createConversationMutation('push_ack_first', 'push_ack_conversation_first')
@@ -307,10 +406,10 @@ describe('UserDataStoreManager', () => {
       { id: second.id, status: 'duplicate', revision: 1 },
     ])
 
-    expect(store.outbox.find(first.id)).toBeUndefined()
+    expect(store.outbox.find(first.id)).toMatchObject({ state: 'syncing' })
     expect(store.outbox.find(second.id)).toBeUndefined()
     expect(store.conversations.listPage({ limit: 50 }).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: first.entityId, revision: 1, syncState: 'synced' }),
+      expect.objectContaining({ id: first.entityId, revision: 0, syncState: 'pending' }),
       expect.objectContaining({ id: second.entityId, revision: 1, syncState: 'synced' }),
     ]))
     manager.close()
@@ -331,6 +430,62 @@ describe('UserDataStoreManager', () => {
     ])).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
     expect(store.outbox.find(first.id)).toMatchObject({ state: 'syncing' })
     expect(store.outbox.find(second.id)).toMatchObject({ state: 'syncing' })
+    manager.close()
+  })
+
+  it('matches sanitized workflow args without changing local message content', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('sanitize_create', 'sanitize_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_sanitize_create',
+      mutations: [pulledMutation(create, 1)],
+    }, 1)
+    const append: Extract<SyncMutation, { kind: 'message.append' }> = {
+      ...appendMessageMutation('sanitize_append', create.entityId, 'sanitize_message'),
+      payload: {
+        ...appendMessageMutation('sanitize_append', create.entityId, 'sanitize_message').payload,
+        blocks: [
+          { type: 'text', text: 'ordinary prompt token filePath content' },
+          {
+            type: 'workflow_proposal',
+            workflowId: 'workflow_1',
+            workflowName: 'Workflow',
+            args: {
+              query: 'status:open', fluid: 'hydraulic',
+              prompt: 'private prompt', token: 'private token', filePath: '/private/file',
+            },
+          },
+        ],
+      },
+    }
+    store.outbox.recordWithMessage(append)
+    store.outbox.markSyncing([append.id])
+    const sanitizedReceipt = pulledMutation(append, 2)
+    sanitizedReceipt.payload = {
+      ...sanitizedReceipt.payload,
+      blocks: [
+        { type: 'text', text: 'ordinary prompt token filePath content' },
+        {
+          type: 'workflow_proposal',
+          workflowId: 'workflow_1',
+          workflowName: 'Workflow',
+          args: {
+            query: 'status:open', fluid: 'hydraulic',
+            prompt: '[REDACTED]', token: '[REDACTED]', filePath: '[REDACTED]',
+          },
+        },
+      ],
+    }
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_sanitize_message',
+      mutations: [sanitizedReceipt],
+    }, 2)).not.toThrow()
+    expect(store.outbox.find(append.id)).toBeUndefined()
+    expect(store.messages.get(append.payload.id)?.blocks).toEqual(append.payload.blocks)
     manager.close()
   })
 

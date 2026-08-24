@@ -9,6 +9,7 @@ import {
   conversationTitleStateSchema,
   opaqueCursorSchema,
   pulledMutationSchema,
+  sanitizeOpaqueWorkflowArgs,
   syncStateSchema,
   syncMutationResultSchema,
   syncMutationSchema,
@@ -124,6 +125,7 @@ export interface UserDataRepositories {
       sent: readonly SyncMutation[],
       results: readonly SyncMutationResult[],
     ): void
+    retryFailed(entityId?: string): string[]
     delete(id: string): void
   }
 }
@@ -372,11 +374,28 @@ function requireOwnedConversation(
 }
 
 function sameMutationIdentity(local: SyncMutation, remote: MutationReceipt): boolean {
+  const payloadsMatch = local.kind === 'message.append' && remote.kind === 'message.append'
+    ? isDeepStrictEqual(
+        canonicalMessagePayload(local.payload),
+        canonicalMessagePayload(remote.payload as typeof local.payload),
+      )
+    : isDeepStrictEqual(local.payload, remote.payload)
   return local.id === remote.id
     && local.kind === remote.kind
     && local.entityId === remote.entityId
     && local.baseRevision === remote.baseRevision
-    && isDeepStrictEqual(local.payload, remote.payload)
+    && payloadsMatch
+}
+
+function canonicalMessagePayload(
+  payload: Extract<SyncMutation, { kind: 'message.append' }>['payload'],
+): Extract<SyncMutation, { kind: 'message.append' }>['payload'] {
+  return {
+    ...payload,
+    blocks: payload.blocks.map((block) => block.type === 'workflow_proposal'
+      ? { ...block, args: sanitizeOpaqueWorkflowArgs(block.args) }
+      : block),
+  }
 }
 
 function requireValidRemoteResult(mutation: MutationReceipt): number {
@@ -459,6 +478,26 @@ function hasPendingConversationMutation(
   `).get({ mutationId, conversationId }) !== undefined
 }
 
+function hasTerminalConversationMutation(
+  database: SqliteDatabase,
+  mutationId: string,
+  conversationId: string,
+): boolean {
+  return database.prepare(`
+    SELECT 1
+    FROM outbox_mutations
+    WHERE id <> @mutationId
+      AND state = 'failed'
+      AND next_attempt_at IS NULL
+      AND (
+        (entity_id = @conversationId AND kind LIKE 'conversation.%')
+        OR (kind = 'message.append'
+          AND json_extract(payload_json, '$.conversationId') = @conversationId)
+      )
+    LIMIT 1
+  `).get({ mutationId, conversationId }) !== undefined
+}
+
 function acknowledgeLocalMutation(
   database: SqliteDatabase,
   ownerUserId: string,
@@ -495,9 +534,11 @@ function acknowledgeLocalMutation(
     `).run({
       conversationId,
       revision: resultRevision,
-      syncState: hasPendingConversationMutation(database, local.id, conversationId)
-        ? 'pending'
-        : 'synced',
+      syncState: hasTerminalConversationMutation(database, local.id, conversationId)
+        ? 'failed'
+        : hasPendingConversationMutation(database, local.id, conversationId)
+          ? 'pending'
+          : 'synced',
     })
   }
 }
@@ -541,7 +582,10 @@ function sameMessageAppend(
     && stored.role === mutation.payload.role
     && stored.executionId === mutation.payload.executionId
     && timestamp(stored.createdAt) === timestamp(mutation.payload.createdAt)
-    && isDeepStrictEqual(stored.blocks, mutation.payload.blocks)
+    && isDeepStrictEqual(
+      canonicalMessagePayload({ ...mutation.payload, blocks: stored.blocks }).blocks,
+      canonicalMessagePayload(mutation.payload).blocks,
+    )
 }
 
 function applyRemoteMutation(
@@ -839,6 +883,48 @@ function outboxFromRow(row: Query): OutboxMutationRecord {
   })
 }
 
+function findOutboxMutation(database: SqliteDatabase, id: string): OutboxMutationRecord | undefined {
+  const row = database.prepare(`
+    SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
+           payload_json AS payloadJson, state, attempts,
+           next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
+           occurred_at AS occurredAt, created_at AS createdAt
+    FROM outbox_mutations
+    WHERE id = @id
+  `).get({ id }) as Query | undefined
+  return row === undefined ? undefined : outboxFromRow(row)
+}
+
+function affectedConversationId(mutation: SyncMutation): string | undefined {
+  switch (mutation.kind) {
+    case 'conversation.create':
+    case 'conversation.rename':
+    case 'conversation.delete':
+    case 'conversation.restore':
+      return mutation.entityId
+    case 'message.append':
+      return mutation.payload.conversationId
+    default:
+      return undefined
+  }
+}
+
+function projectOutboxConversation(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  mutation: SyncMutation,
+  syncState: 'pending' | 'failed',
+): void {
+  const conversationId = affectedConversationId(mutation)
+  if (conversationId === undefined) return
+  if (remoteConversation(database, ownerUserId, conversationId) === undefined) return
+  database.prepare(`
+    UPDATE conversations
+    SET sync_state = @syncState
+    WHERE id = @conversationId
+  `).run({ conversationId, syncState })
+}
+
 function checkpointFromRow(row: Query | undefined): SyncCheckpoint | undefined {
   if (row === undefined) return undefined
   return parsePersisted(() => checkpointSchema.parse({
@@ -903,7 +989,9 @@ function acknowledgePushResults(
       }
       const local = validateOutboxReceipt(database, receipt, false)
       if (local?.state !== 'syncing') throw new UserDataConsistencyError()
-      if (result.status === 'applied' || result.status === 'duplicate') {
+      if (result.status === 'applied') {
+        requireValidRemoteResult(receipt)
+      } else if (result.status === 'duplicate') {
         requireValidRemoteResult(receipt)
         acknowledgeLocalMutation(database, ownerUserId, local, receipt)
       }
@@ -1283,15 +1371,7 @@ export function createUserDataRepositories(
         `).all({ now, limit }) as Query[]).map(outboxFromRow)
       },
       find(id) {
-        const row = database.prepare(`
-          SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
-                 payload_json AS payloadJson, state, attempts,
-                 next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
-                 occurred_at AS occurredAt, created_at AS createdAt
-          FROM outbox_mutations
-          WHERE id = @id
-        `).get({ id }) as Query | undefined
-        return row === undefined ? undefined : outboxFromRow(row)
+        return findOutboxMutation(database, id)
       },
       list(limit) {
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
@@ -1321,22 +1401,67 @@ export function createUserDataRepositories(
         })
       },
       markPending(id, nextAttemptAt) {
-        transaction(database, () => database.prepare(`
-          UPDATE outbox_mutations
-          SET state = 'pending', next_attempt_at = @nextAttemptAt, last_error_code = NULL
-          WHERE id = @id
-        `).run({ id, nextAttemptAt: nextAttemptAt ?? null }))
+        transaction(database, () => {
+          const local = findOutboxMutation(database, id)
+          database.prepare(`
+            UPDATE outbox_mutations
+            SET state = 'pending', next_attempt_at = @nextAttemptAt, last_error_code = NULL
+            WHERE id = @id
+          `).run({ id, nextAttemptAt: nextAttemptAt ?? null })
+          if (local) projectOutboxConversation(database, ownerUserId, local, 'pending')
+        })
       },
       markFailed(id, errorCode, nextAttemptAt) {
         const validatedErrorCode = parsePersisted(() => appErrorCodeSchema.parse(errorCode))
-        transaction(database, () => database.prepare(`
-          UPDATE outbox_mutations
-          SET state = 'failed', next_attempt_at = @nextAttemptAt, last_error_code = @errorCode
-          WHERE id = @id
-        `).run({ id, errorCode: validatedErrorCode, nextAttemptAt: nextAttemptAt ?? null }))
+        transaction(database, () => {
+          const local = findOutboxMutation(database, id)
+          database.prepare(`
+            UPDATE outbox_mutations
+            SET state = 'failed', next_attempt_at = @nextAttemptAt, last_error_code = @errorCode
+            WHERE id = @id
+          `).run({ id, errorCode: validatedErrorCode, nextAttemptAt: nextAttemptAt ?? null })
+          if (local) {
+            projectOutboxConversation(
+              database,
+              ownerUserId,
+              local,
+              nextAttemptAt === undefined ? 'failed' : 'pending',
+            )
+          }
+        })
       },
       acknowledgePushResults(sent, results) {
         acknowledgePushResults(database, ownerUserId, sent, results)
+      },
+      retryFailed(entityId) {
+        const validatedEntityId = entityId === undefined
+          ? undefined
+          : parsePersisted(() => z.string().trim().min(1).parse(entityId))
+        return transaction(database, () => {
+          const failed = (database.prepare(`
+            SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
+                   payload_json AS payloadJson, state, attempts,
+                   next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
+                   occurred_at AS occurredAt, created_at AS createdAt
+            FROM outbox_mutations
+            WHERE state = 'failed'
+            ORDER BY enqueue_sequence
+          `).all() as Query[]).map(outboxFromRow).filter((mutation) => (
+            validatedEntityId === undefined
+              || mutation.entityId === validatedEntityId
+              || affectedConversationId(mutation) === validatedEntityId
+          ))
+          const update = database.prepare(`
+            UPDATE outbox_mutations
+            SET state = 'pending', next_attempt_at = NULL, last_error_code = NULL
+            WHERE id = @id AND state = 'failed'
+          `)
+          for (const mutation of failed) {
+            update.run({ id: mutation.id })
+            projectOutboxConversation(database, ownerUserId, mutation, 'pending')
+          }
+          return failed.map(({ id }) => id)
+        })
       },
       delete(id) {
         transaction(database, () => database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id }))

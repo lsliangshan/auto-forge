@@ -61,7 +61,7 @@ describe('CloudBaseUserDataPort', () => {
     })
   })
 
-  it('rejects invalid action input before calling CloudBase', async () => {
+  it('maps an oversized mutation count to the Task 3 outbox limit', async () => {
     const callFunction = vi.fn()
     const port = new CloudBaseUserDataPort({ callFunction })
 
@@ -70,7 +70,7 @@ describe('CloudBaseUserDataPort', () => {
       protocolVersion: 1,
       deviceId: 'device-a',
       mutations: Array.from({ length: 101 }, () => mutation),
-    })).rejects.toMatchObject({ code: 'INVALID_INPUT', message: 'The request is invalid.' })
+    })).rejects.toMatchObject({ code: 'OUTBOX_LIMIT_EXCEEDED' })
     expect(callFunction).not.toHaveBeenCalled()
   })
 
@@ -101,7 +101,7 @@ describe('CloudBaseUserDataPort', () => {
         ...exact.mutations[0],
         payload: { ...exact.mutations[0].payload, title: `${exact.mutations[0].payload.title}x` },
       }],
-    })).rejects.toMatchObject({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(callFunction).toHaveBeenCalledOnce()
     expect(Buffer.byteLength(JSON.stringify(callFunction.mock.calls[0]?.[0].data), 'utf8'))
       .toBe(1_048_576)

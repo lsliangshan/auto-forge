@@ -108,11 +108,25 @@ export class CloudBaseUserDataPort {
   ) {}
 
   async call(input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> {
-    const parsedInput = cloudBaseUserDataCallSchema.safeParse(input)
-    if (!parsedInput.success) throw toSafeAppError({ code: 'INVALID_INPUT' })
-    if (Buffer.byteLength(JSON.stringify(parsedInput.data), 'utf8') > maximumRequestBytes) {
+    let serialized: string | undefined
+    try {
+      serialized = JSON.stringify(input)
+    } catch {
+      throw toSafeAppError({ code: 'INVALID_INPUT' })
+    }
+    if (typeof serialized !== 'string'
+      || Buffer.byteLength(serialized, 'utf8') > maximumRequestBytes) {
+      throw toSafeAppError({ code: 'INVALID_INPUT' })
+    }
+    if (typeof input === 'object'
+      && input !== null
+      && (input as { action?: unknown }).action === 'syncPush'
+      && Array.isArray((input as { mutations?: unknown }).mutations)
+      && ((input as { mutations: unknown[] }).mutations.length > 100)) {
       throw toSafeAppError({ code: 'OUTBOX_LIMIT_EXCEEDED' })
     }
+    const parsedInput = cloudBaseUserDataCallSchema.safeParse(input)
+    if (!parsedInput.success) throw toSafeAppError({ code: 'INVALID_INPUT' })
 
     let raw: unknown
     try {

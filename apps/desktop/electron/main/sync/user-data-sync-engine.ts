@@ -124,6 +124,25 @@ export class UserDataSyncEngine {
     return this.#ensureDrain(binding)
   }
 
+  retry(entityId?: string): Promise<void> {
+    if (entityId !== undefined && !validIdentifier(entityId)) {
+      return Promise.reject(toSafeAppError({ code: 'INVALID_INPUT' }))
+    }
+    return this.#queueLifecycle(async () => {
+      const binding = this.#binding
+      if (!binding) return
+      await this.#drainPromise
+      if (!this.#isCurrent(binding)) return
+      this.#clearTimer()
+      this.#flushRequested = false
+      this.#pullRequested = false
+      binding.store.outbox.retryFailed(entityId)
+      this.#status = { state: 'idle' }
+      this.#flushRequested = true
+      await this.#ensureDrain(binding)
+    })
+  }
+
   pause(): Promise<void> {
     return this.#queueLifecycle(async () => {
       await this.#handoff()
@@ -175,6 +194,7 @@ export class UserDataSyncEngine {
       if (this.#flushRequested) {
         this.#flushRequested = false
         await this.#flush(binding)
+        if (this.#stopRequestedWork()) return
         continue
       }
       if (this.#pullRequested) {
@@ -182,6 +202,7 @@ export class UserDataSyncEngine {
         this.#status = { state: 'running' }
         const outcome = await this.#pull(binding)
         if (outcome === 'success' && this.#isCurrent(binding)) this.#status = { state: 'idle' }
+        if (this.#stopRequestedWork()) return
         continue
       }
       return
@@ -285,18 +306,23 @@ export class UserDataSyncEngine {
         return
       }
 
+      let terminalResultCode: AppErrorCode | undefined
       for (const result of data.results) {
         if (result.status === 'conflict') {
           const code = result.errorCode === 'SYNC_CONFLICT' ? result.errorCode : 'SYNC_CONFLICT'
           binding.store.outbox.markFailed(result.id, code)
           this.#untrackSyncing(binding, [result.id])
-          quarantineCode ??= code
+          terminalResultCode ??= code
         } else if (result.status === 'rejected') {
           const code = result.errorCode ?? 'INVALID_INPUT'
           binding.store.outbox.markFailed(result.id, code)
           this.#untrackSyncing(binding, [result.id])
-          quarantineCode ??= code
+          terminalResultCode ??= code
         }
+      }
+      if (terminalResultCode) {
+        this.#quarantine(terminalResultCode)
+        return
       }
     }
 
@@ -430,6 +456,13 @@ export class UserDataSyncEngine {
   #quarantine(errorCode: AppErrorCode): void {
     this.#clearTimer()
     this.#status = { state: 'quarantined', errorCode }
+  }
+
+  #stopRequestedWork(): boolean {
+    if (this.#status.state !== 'paused' && this.#status.state !== 'quarantined') return false
+    this.#flushRequested = false
+    this.#pullRequested = false
+    return true
   }
 
   #trackSyncing(binding: ActiveBinding, ids: readonly string[]): void {
