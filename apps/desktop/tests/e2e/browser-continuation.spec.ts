@@ -771,13 +771,20 @@ test.describe.serial('conversation-bound browser continuation', () => {
   test('normal workflow origin drives the complete chain and visible browser controls', async () => {
     const conversationId = await createConversation(page, electronApp)
     await submitChat(page, '运行工作居住证完整链路 E2E_WORKFLOW_OPEN')
-    await expect(page.getByText('需要授权').last()).toBeVisible()
+    const approvalCard = page.getByTestId('approval-card').last()
+    await expect(approvalCard).toBeVisible()
+    await expect(approvalCard.getByTestId('approval-status-badge')).toHaveText('待确认')
     await expect(page.getByText('browser.fill').last()).toBeVisible()
     await page.getByTestId('approve-once').last().click()
     await expect(page.getByText('browser.click').last()).toBeVisible()
     await page.getByTestId('approve-once').last().click()
     await command(electronApp, 'waitForIdle', { conversationId })
-    await expect(page.getByText(/调用完成.*E2E 工作居住证/).last()).toBeVisible()
+    const completedWorkflow = page.getByTestId('workflow-status').last()
+    await expect(completedWorkflow.getByTestId('workflow-status-badge')).toHaveText('已完成')
+    await expect(completedWorkflow).toContainText('E2E 工作居住证')
+    const workflowProvenance = page.getByTestId('workflow-provenance').last()
+    await expect(workflowProvenance).toBeVisible()
+    await expect(workflowProvenance.getByTestId('workflow-provenance-badge')).toHaveText('已完成')
 
     const originated = await command<HarnessSnapshot>(electronApp, 'snapshot')
     expect(originated).toMatchObject({
@@ -812,7 +819,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await command(electronApp, 'pauseNextInspection')
     await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_STOP')
     const stopCard = page.getByTestId('browser-status').last()
-    await expect(stopCard.getByText('AI 正在读取网页')).toBeVisible()
+    await expect(stopCard.getByText('读取中')).toBeVisible()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
     })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
@@ -825,7 +832,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })).toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
-    await expect(stopCard.getByText('浏览器自动操作已停止')).toBeVisible()
+    await expect(stopCard.getByText('已取消')).toBeVisible()
     const stopDraftSaves = (await fixture.snapshot()).draftSaves
     await command(electronApp, 'userPageOperation', {
       tabId: continuationBinding.tabId, selector: '#save-draft',
@@ -835,7 +842,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await command(electronApp, 'pauseNextInspection')
     await submitChat(page, '读取证件有效期 E2E_PAUSE_FOR_TAKEOVER')
     const takeoverCard = page.getByTestId('browser-status').last()
-    await expect(takeoverCard.getByText('AI 正在读取网页')).toBeVisible()
+    await expect(takeoverCard.getByText('读取中')).toBeVisible()
     await expect.poll(() => command<NativeInputShieldState>(electronApp, 'nativeInputShieldState', {
       bindingId: continuationBinding.bindingId,
     })).toMatchObject({ attached: true, targetNativeChild: true, order: ['target', 'shield', 'toolbar'] })
@@ -848,7 +855,7 @@ test.describe.serial('conversation-bound browser continuation', () => {
     })).toMatchObject({ attached: false, targetNativeChild: true, order: ['target', 'toolbar'] })
     await command(electronApp, 'releaseInspection')
     await command(electronApp, 'waitForIdle', { conversationId })
-    await expect(takeoverCard.getByText('浏览器自动操作已停止')).toBeVisible()
+    await expect(takeoverCard.getByText('已取消')).toBeVisible()
     const takeoverDraftSaves = (await fixture.snapshot()).draftSaves
     await command(electronApp, 'userPageOperation', {
       tabId: continuationBinding.tabId, selector: '#save-draft',

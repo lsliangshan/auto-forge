@@ -343,6 +343,12 @@ describe('workbench', () => {
 
     await vi.waitFor(() => expect(success.text()).toContain('执行中'))
     await vi.waitFor(() => expect(failed.text()).toContain('执行详情加载失败'))
+    expect(success.classes()).toContain('af-operation-card')
+    expect(success.classes()).toContain('tone-active')
+    expect(success.find('.af-operation-icon').exists()).toBe(false)
+    expect(success.get('.af-operation-marker').exists()).toBe(true)
+    expect(success.get('[data-testid="execution-status-badge"]').text()).toBe('执行中')
+    expect(failed.classes()).toContain('tone-neutral')
     expect(success.text()).not.toContain('执行详情加载失败')
     expect(failed.text()).toContain('加载失败')
     expect(failed.text()).not.toContain('取消执行')

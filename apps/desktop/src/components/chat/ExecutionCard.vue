@@ -1,38 +1,62 @@
 <template>
-  <section class="execution-card">
-    <div class="execution-topline">
-      <div><span :class="['af-status-dot', statusTone]" /> <strong>工作流执行</strong></div>
-      <span class="status-label">{{ statusLabel }}</span>
-    </div>
-    <code>{{ executionId }}</code>
-    <p
-      v-if="detailError"
-      class="execution-error"
-      role="alert"
-    >
-      {{ detailError }}
-    </p>
-    <div class="execution-actions">
-      <el-button
-        size="small"
-        @click="store.select(executionId)"
+  <section :class="['execution-card', 'af-operation-card', `tone-${statusTone}`]">
+    <header class="af-operation-card-header">
+      <span
+        :class="['af-operation-marker', `tone-${statusTone}`]"
+        aria-hidden="true"
       >
-        在检查器中查看
-      </el-button>
-      <el-button
-        v-if="cancellable"
-        size="small"
-        type="danger"
-        plain
-        @click="store.cancel(executionId)"
+        <el-icon :class="{ 'is-loading': detailLoading }">
+          <component :is="statusIcon" />
+        </el-icon>
+      </span>
+      <div class="af-operation-title">
+        <span class="af-operation-eyebrow">执行记录</span>
+        <strong>工作流执行</strong>
+      </div>
+      <div class="af-operation-summary">
+        <span
+          class="af-operation-badge"
+          data-testid="execution-status-badge"
+        >{{ statusLabel }}</span>
+      </div>
+    </header>
+    <div class="af-operation-content">
+      <div class="af-operation-meta">
+        <code class="af-operation-chip">{{ executionId }}</code>
+      </div>
+      <p
+        v-if="detailError"
+        class="af-operation-alert execution-error"
+        role="alert"
       >
-        取消执行
-      </el-button>
+        <el-icon aria-hidden="true">
+          <Warning />
+        </el-icon><span>{{ detailError }}</span>
+      </p>
+      <footer class="af-operation-footer">
+        <button
+          type="button"
+          class="af-operation-link"
+          @click="store.select(executionId)"
+        >
+          查看执行详情 <el-icon><ArrowRight /></el-icon>
+        </button>
+        <el-button
+          v-if="cancellable"
+          size="small"
+          type="danger"
+          plain
+          @click="store.cancel(executionId)"
+        >
+          取消执行
+        </el-button>
+      </footer>
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
+import { ArrowRight, Check, Clock, CloseBold, Loading, Warning } from '@element-plus/icons-vue'
 import { computed, onMounted } from 'vue'
 import { useExecutionStore } from '../../stores/execution'
 
@@ -47,15 +71,24 @@ const statusLabel = computed(() => ({
   failed: '失败', cancelled: '已取消', interrupted: '已中断',
 })[detail.value?.status ?? ''] ?? (detailLoading.value ? '正在加载' : detailError.value ? '加载失败' : '未知'))
 const cancellable = computed(() => Boolean(detail.value && ['queued', 'awaiting_approval', 'running'].includes(detail.value.status)))
-const statusTone = computed(() => detail.value?.status === 'completed' ? 'success' : detail.value?.status === 'failed' ? 'danger' : 'warning')
+const statusTone = computed(() => {
+  if (detailLoading.value) return 'active'
+  if (!detail.value) return 'neutral'
+  return ({
+    queued: 'neutral', awaiting_approval: 'warning', running: 'active', completed: 'success',
+    failed: 'danger', cancelled: 'neutral', interrupted: 'warning',
+  })[detail.value.status]
+})
+const statusIcon = computed(() => {
+  if (detailLoading.value) return Loading
+  if (!detail.value) return detailError.value ? CloseBold : Clock
+  return ({
+    queued: Clock, awaiting_approval: Clock, running: Loading, completed: Check,
+    failed: CloseBold, cancelled: CloseBold, interrupted: Warning,
+  })[detail.value.status]
+})
 </script>
 
 <style scoped>
-.execution-card { max-width: 640px; border: 1px solid var(--af-border); border-left: 3px solid var(--af-cobalt); padding: 13px 14px; background: var(--af-surface-muted); }
-.execution-topline, .execution-topline > div, .execution-actions { display: flex; align-items: center; }
-.execution-topline { justify-content: space-between; }.execution-topline > div { gap: 8px; }
-.status-label { color: var(--af-text-muted); font-size: 12px; }
-code { display: block; margin-top: 8px; color: var(--af-text-muted); font-size: 11px; overflow-wrap: anywhere; }
-.execution-actions { justify-content: flex-end; gap: 8px; margin-top: 10px; }
-.execution-error { color: var(--af-danger); font-size: 12px; }
+.execution-error { color: var(--af-danger); }
 </style>

@@ -633,6 +633,36 @@ function attachCombinedBrowserContinuation(
 }
 
 describe('AgentOrchestrator', () => {
+  it('sends the AutoForge assistant identity as the leading system prompt', async () => {
+    const dependencies = harness([[
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'conversation_identity', content: '你是谁？', provider: 'openrouter',
+        model: 'openrouter/model', requestId: 'request_identity',
+      }),
+      allowTools: false,
+    })
+
+    expect(dependencies.history.prepare).toHaveBeenCalledWith(expect.objectContaining({
+      leadingMessages: [expect.objectContaining({
+        role: 'system',
+        content: expect.stringContaining('你是 AutoForge 的内置 AI 助手'),
+      })],
+    }))
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({
+      messages: [
+        expect.objectContaining({
+          role: 'system',
+          content: expect.stringContaining('你好，我是 AutoForge AI 助手'),
+        }),
+        { role: 'user', content: '你是谁？' },
+      ],
+    }))
+  })
+
   it('passes depleted run-scoped tool budgets through the executor before reserve or start', async () => {
     const dependencies = harness([
       toolTurn,

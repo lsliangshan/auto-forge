@@ -49,10 +49,14 @@
     </section>
     <section
       v-else-if="block.type === 'error'"
-      class="af-error"
+      class="af-error message-error message-error-inline"
       role="alert"
     >
-      <strong>处理失败</strong><p>{{ block.message }}</p>
+      <span
+        class="message-error-icon"
+        aria-hidden="true"
+      ><el-icon><WarningFilled /></el-icon></span>
+      <div><strong>未完成</strong><p>{{ messageErrorText }}</p></div>
     </section>
     <MediaBlock
       v-else-if="block.type === 'media'"
@@ -66,9 +70,11 @@
 </template>
 
 <script setup lang="ts">
-import { Loading } from '@element-plus/icons-vue'
+import { Loading, WarningFilled } from '@element-plus/icons-vue'
 import 'highlight.js/styles/github-dark.css'
+import { computed } from 'vue'
 import type { UiChatBlock } from '../../stores/chat'
+import { displayError } from '../../services/desktop-api'
 import ApprovalCard from './ApprovalCard.vue'
 import BrowserStatusCard from './BrowserStatusCard.vue'
 import ExecutionCard from './ExecutionCard.vue'
@@ -78,7 +84,10 @@ import MediaGenerationBlock from './MediaGenerationBlock.vue'
 import WorkflowProvenance from './WorkflowProvenance.vue'
 import WorkflowStatusCard from './WorkflowStatusCard.vue'
 
-defineProps<{ block: UiChatBlock }>()
+const props = defineProps<{ block: UiChatBlock }>()
+const messageErrorText = computed(() => props.block.type === 'error'
+  ? displayError({ code: props.block.code }, props.block.message)
+  : '')
 </script>
 
 <style scoped>
@@ -108,4 +117,8 @@ defineProps<{ block: UiChatBlock }>()
 .reasoning { display: flex; align-items: center; gap: 7px; color: var(--af-text-muted); font-size: 12px; }
 .proposal, .result { display: grid; gap: 5px; max-width: 640px; border: 1px solid var(--af-border); padding: 12px 14px; background: var(--af-surface-muted); }
 .proposal strong { color: var(--af-cobalt); }.result p, .af-error p { margin: 4px 0 0; }
+.message-error { max-width: 680px; }
+.message-error-inline { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 9px; border: 0; border-top: 1px solid var(--af-danger-border); border-radius: 0; padding: 10px 2px 0; background: transparent; }
+.message-error-icon { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: var(--af-danger); background: var(--af-danger-soft); font-size: 12px; }
+.message-error strong { color: var(--af-danger); font-size: 11px; }.message-error p { margin: 2px 0 0; color: var(--af-text-muted); font-size: 12px; line-height: 1.5; }
 </style>

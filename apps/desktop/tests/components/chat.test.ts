@@ -270,7 +270,115 @@ function mountScrollableChat() {
 
 describe('chat interactions', () => {
   beforeEach(() => setActivePinia(createPinia()))
-  afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+  afterEach(() => {
+    vi.useRealTimers()
+    Reflect.deleteProperty(window, 'autoForge')
+  })
+
+  it('renders each message creation time outside the message surface', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 7, 24, 16, 0))
+    const { chat, wrapper } = mountScrollableChat()
+    chat.messagesByConversation.conversation_1 = [
+      {
+        id: 'user_1',
+        role: 'user',
+        blocks: [{ id: 'user_1:text:0', type: 'text', text: '今天的消息' }],
+        createdAt: new Date(2026, 7, 24, 14, 32).toISOString(),
+      },
+      {
+        id: 'assistant_1',
+        role: 'assistant',
+        blocks: [{ id: 'assistant_1:text:0', type: 'text', text: '昨天的回复' }],
+        createdAt: new Date(2026, 7, 23, 9, 5).toISOString(),
+      },
+    ]
+    await wrapper.vm.$nextTick()
+
+    const messages = wrapper.findAll('article.message')
+    expect(messages).toHaveLength(2)
+    const userSurface = messages[0]!.get('.message-surface')
+    expect(userSurface.classes()).toContain('message-bubble')
+    expect(userSurface.find('.message-header').exists()).toBe(false)
+    expect(messages[0]!.get('.message-meta').text()).toContain('你')
+    expect(messages[0]!.get('time').text()).toBe('14:32')
+    expect(messages[0]!.get('time').attributes('title')).toBe('2026年8月24日 14:32')
+    const assistantSurface = messages[1]!.get('.message-surface')
+    expect(assistantSurface.classes()).toContain('message-response')
+    expect(assistantSurface.find('.message-header').exists()).toBe(false)
+    expect(messages[1]!.get('.message-meta').text()).toContain('AutoForge')
+    expect(messages[1]!.get('time').text()).toBe('8月23日 09:05')
+  })
+
+  it('uses the app logo for assistant identity', async () => {
+    const { chat, wrapper } = mountScrollableChat()
+    chat.messagesByConversation.conversation_1 = [{
+      id: 'assistant_1',
+      role: 'assistant',
+      blocks: [{ id: 'assistant_1:text:0', type: 'text', text: '助手回复' }],
+      createdAt: '2026-08-24T06:32:00.000Z',
+    }]
+    chat.awaitingResponseByConversation.conversation_1 = true
+    await wrapper.vm.$nextTick()
+
+    const avatars = wrapper.findAll('[data-testid="assistant-avatar"]')
+    expect(avatars).toHaveLength(2)
+    for (const avatar of avatars) {
+      expect(avatar.element.tagName).toBe('IMG')
+      expect(avatar.attributes('src')).toContain('autoforge-logo.png')
+      expect(avatar.attributes('alt')).toBe('')
+    }
+  })
+
+  it('keeps the persisted message creation time in renderer state', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.chat.listMessages).mockResolvedValue([{
+      id: 'assistant_1',
+      conversationId: 'conversation_1',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: '已持久化回复' }],
+      createdAt: '2026-08-24T06:32:00.000Z',
+    }])
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+
+    await chat.selectConversation('conversation_1')
+
+    expect(chat.messagesByConversation.conversation_1?.[0]?.createdAt)
+      .toBe('2026-08-24T06:32:00.000Z')
+  })
+
+  it('timestamps optimistic user messages and first streamed assistant blocks', async () => {
+    vi.useFakeTimers()
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.selectedConversationId = 'conversation_1'
+    chat.ensureSubscriptions()
+    vi.setSystemTime(new Date('2026-08-24T06:32:00.000Z'))
+
+    await chat.send({
+      content: '本地消息',
+      assetIds: [],
+      outputType: 'text',
+      model: 'text/default',
+      generation: generationPreferences().generation,
+    })
+
+    expect(chat.messagesByConversation.conversation_1?.[0]?.createdAt)
+      .toBe('2026-08-24T06:32:00.000Z')
+
+    vi.setSystemTime(new Date('2026-08-24T06:32:05.000Z'))
+    emitChat({
+      type: 'block',
+      conversationId: 'conversation_1',
+      messageId: 'assistant_1',
+      block: { type: 'text', text: '流式回复' },
+    })
+
+    expect(chat.messagesByConversation.conversation_1?.[1]?.createdAt)
+      .toBe('2026-08-24T06:32:05.000Z')
+  })
 
   it('passes the exact selected output default to the composer while auto continues to prefer text', async () => {
     const { api } = createEventApi()
@@ -531,22 +639,129 @@ describe('chat interactions', () => {
   })
 
   it.each([
-    ['queued', '准备调用'],
-    ['awaiting_approval', '等待授权'],
-    ['running', '正在调用'],
-    ['completed', '调用完成'],
-    ['failed', '调用失败'],
-    ['cancelled', '已取消调用'],
-    ['interrupted', '调用已中断'],
-  ] as const)('renders the authoritative %s workflow state', (status, label) => {
+    ['queued', '准备中', 'neutral'],
+    ['awaiting_approval', '等待授权', 'warning'],
+    ['running', '进行中', 'active'],
+    ['completed', '已完成', 'success'],
+    ['failed', '未完成', 'danger'],
+    ['cancelled', '已取消', 'neutral'],
+    ['interrupted', '已中断', 'warning'],
+  ] as const)('renders the authoritative %s workflow state', async (status, label, tone) => {
     const wrapper = mount(MessageBlock, {
       props: { block: workflowStatusBlock(status) },
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="workflow-status"]').text()).toContain(`${label} 北京工作居住证`)
-    expect(wrapper.text()).toContain('北京')
-    expect(wrapper.text()).toContain('1 / 5')
+    const card = wrapper.get('[data-testid="workflow-status"]')
+    expect(card.classes()).toContain('af-operation-card')
+    expect(card.classes()).toContain(`tone-${tone}`)
+    expect(card.get('[data-testid="workflow-status-badge"]').text()).toBe(label)
+    expect(card.get('.af-operation-title strong').text()).toBe('北京工作居住证')
+    if (status === 'completed') await card.get('[data-testid="toggle-workflow-details"]').trigger('click')
+    expect(card.findAll('.af-operation-chip').map((chip) => chip.text()))
+      .toEqual(['北京', 'v1.0.0', '开发版本'])
+    expect(card.text()).toContain('第 1 次调用 · 上限 5 次')
+  })
+
+  it('collapses completed workflow details until the user expands them', async () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('completed') },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="workflow-status"]')
+    const toggle = card.get('[data-testid="toggle-workflow-details"]')
+    expect(card.classes()).toContain('is-collapsed')
+    expect(toggle.attributes('aria-expanded')).toBe('false')
+    expect(card.find('[data-testid="workflow-status-content"]').exists()).toBe(false)
+
+    await toggle.trigger('click')
+
+    expect(card.classes()).not.toContain('is-collapsed')
+    expect(toggle.attributes('aria-expanded')).toBe('true')
+    expect(card.get('[data-testid="workflow-status-content"]').isVisible()).toBe(true)
+  })
+
+  it('keeps a failed workflow expanded so the reason remains visible', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('failed', { errorSummary: '执行任务时连接中断' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="workflow-status"]')
+    expect(card.classes()).not.toContain('is-collapsed')
+    expect(card.get('[data-testid="toggle-workflow-details"]').attributes('aria-expanded')).toBe('true')
+    expect(card.get('[data-testid="workflow-status-message"]').text()).toBe('执行任务时连接中断')
+  })
+
+  it('collapses workflow details when a live run reaches completed state', async () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('running') },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('[data-testid="workflow-status-content"]').exists()).toBe(true)
+
+    await wrapper.setProps({ block: workflowStatusBlock('completed') })
+
+    expect(wrapper.get('[data-testid="workflow-status"]').classes()).toContain('is-collapsed')
+    expect(wrapper.find('[data-testid="workflow-status-content"]').exists()).toBe(false)
+  })
+
+  it('uses a neutral progress marker for a cancelled workflow', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('cancelled') },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="workflow-status"]')
+    expect(card.find('.workflow-progress-step.is-cancelled').exists()).toBe(true)
+    expect(card.find('.workflow-progress-step.is-interrupted').exists()).toBe(false)
+  })
+
+  it('links each workflow disclosure button to its own details region', () => {
+    const first = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('running', { blockId: 'workflow_status_1' }) },
+      global: { plugins: [ElementPlus] },
+    })
+    const second = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('running', { blockId: 'workflow_status_2' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const firstTarget = first.get('[data-testid="toggle-workflow-details"]').attributes('aria-controls')
+    const secondTarget = second.get('[data-testid="toggle-workflow-details"]').attributes('aria-controls')
+    expect(first.get('[data-testid="workflow-status-content"]').attributes('id')).toBe(firstTarget)
+    expect(second.get('[data-testid="workflow-status-content"]').attributes('id')).toBe(secondTarget)
+    expect(firstTarget).not.toBe(secondTarget)
+  })
+
+  it('presents a running workflow as a four-stage progress rail', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('running') },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const progress = wrapper.get('[data-testid="workflow-progress"]')
+    const steps = progress.findAll('.workflow-progress-step')
+    expect(steps.map((step) => step.text())).toEqual(['匹配工作流', '检查授权', '执行任务', '返回结果'])
+    expect(steps[0]!.classes()).toContain('is-complete')
+    expect(steps[1]!.classes()).toContain('is-complete')
+    expect(steps[2]!.classes()).toContain('is-current')
+    expect(steps[3]!.classes()).toContain('is-pending')
+  })
+
+  it('keeps workflow failure emphasis on the failed stage and compact alert only', () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: workflowStatusBlock('failed', { errorSummary: '执行任务时连接中断' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="workflow-status"]')
+    expect(card.find('.af-operation-icon').exists()).toBe(false)
+    expect(card.get('.af-operation-marker').classes()).toContain('tone-danger')
+    expect(card.findAll('.workflow-progress-step')[2]!.classes()).toContain('is-failed')
+    expect(card.get('[data-testid="workflow-status-message"]').classes()).toContain('af-operation-alert')
   })
 
   it('renders unrestricted workflow status and opens its execution with the existing execution store', async () => {
@@ -635,7 +850,8 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.text()).toContain('调用完成 北京工作居住证')
+    expect(wrapper.get('[data-testid="workflow-status-badge"]').text()).toBe('已完成')
+    expect(wrapper.text()).toContain('北京工作居住证')
     expect(wrapper.get('[data-testid="workflow-status-message"]').text())
       .toBe('执行完成，结果未提供给模型')
   })
@@ -650,6 +866,8 @@ describe('chat interactions', () => {
 
     const status = wrapper.get('[data-testid="browser-status"]')
     expect(status.attributes('aria-live')).toBe('polite')
+    expect(status.find('.af-operation-icon').exists()).toBe(false)
+    expect(status.get('.af-operation-marker').exists()).toBe(true)
     expect(status.text()).toContain('北京人才服务')
     expect(status.text()).toContain('fw.bjrcgz.gov.cn')
     expect(wrapper.get('[data-testid="browser-action-summary"]').text()).toBe('填写单位信息')
@@ -859,33 +1077,121 @@ describe('chat interactions', () => {
   it.each([
     ['inspecting', true],
     ['acting', false],
-  ] as const)('renders the dedicated loader for browser %s only', (state, loading) => {
+  ] as const)('renders motion on the browser %s icon only while inspecting', (state, loading) => {
     const wrapper = mount(MessageBlock, {
       props: { block: browserStatusBlock(state) },
       global: { plugins: [ElementPlus] },
     })
 
-    const loader = wrapper.find('[data-testid="browser-status-loader"]')
-    expect(loader.exists()).toBe(loading)
-    expect(wrapper.find('.af-status-dot').exists()).toBe(!loading)
-    if (loading) expect(loader.attributes('aria-hidden')).toBe('true')
+    const icon = wrapper.get('[data-testid="browser-status-icon"]')
+    expect(icon.classes()).toContain('af-operation-marker')
+    expect(icon.classes().includes('is-loading')).toBe(loading)
+    expect(icon.attributes('aria-hidden')).toBe('true')
   })
 
   it.each([
-    ['awaiting_user', '需要你在浏览器中操作', true],
-    ['completed', '浏览器自动操作已完成', true],
-    ['failed', '浏览器自动操作失败', true],
-    ['cancelled', '浏览器自动操作已停止', true],
-  ] as const)('renders accessible %s browser copy and terminal action state', (state, copy, disabled) => {
+    ['awaiting_user', '需要你在浏览器中操作', 'warning', true],
+    ['completed', '已完成', 'success', true],
+    ['failed', '未完成', 'danger', true],
+    ['cancelled', '已取消', 'neutral', true],
+  ] as const)('renders accessible %s browser copy and terminal action state', (state, copy, tone, disabled) => {
     const wrapper = mount(MessageBlock, {
       props: { block: browserStatusBlock(state, state === 'failed' ? { errorCode: 'PAGE_CHANGED' } : {}) },
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="browser-status"]').text()).toContain(copy)
-    expect((wrapper.get('[data-testid="stop-browser"]').element as HTMLButtonElement).disabled).toBe(disabled)
-    expect((wrapper.get('[data-testid="take-over-browser"]').element as HTMLButtonElement).disabled).toBe(disabled)
+    const card = wrapper.get('[data-testid="browser-status"]')
+    expect(card.classes()).toContain('af-operation-card')
+    expect(card.classes()).toContain(`tone-${tone}`)
+    expect(card.get('[data-testid="browser-status-badge"]').text()).toBe(copy)
+    expect(wrapper.find('[data-testid="stop-browser"]').exists()).toBe(!disabled)
+    expect(wrapper.find('[data-testid="take-over-browser"]').exists()).toBe(!disabled)
     if (state === 'failed') expect(wrapper.text()).toContain('页面已变化，请重新检查后继续')
+  })
+
+  it('collapses completed browser details while keeping them expandable', async () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('completed', { actionSummary: '已读取证件信息' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="browser-status"]')
+    const toggle = card.get('[data-testid="toggle-browser-details"]')
+    expect(card.classes()).toContain('is-collapsed')
+    expect(toggle.attributes('aria-expanded')).toBe('false')
+    expect(card.find('[data-testid="browser-status-content"]').exists()).toBe(false)
+
+    await toggle.trigger('click')
+
+    expect(card.classes()).not.toContain('is-collapsed')
+    expect(toggle.attributes('aria-expanded')).toBe('true')
+    expect(card.get('[data-testid="browser-status-content"]').isVisible()).toBe(true)
+  })
+
+  it('collapses browser details when a live operation completes', async () => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting') },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.find('[data-testid="browser-status-content"]').exists()).toBe(true)
+
+    await wrapper.setProps({ block: browserStatusBlock('completed') })
+
+    expect(wrapper.get('[data-testid="browser-status"]').classes()).toContain('is-collapsed')
+    expect(wrapper.find('[data-testid="browser-status-content"]').exists()).toBe(false)
+  })
+
+  it('renders cancellation as a neutral terminal state without an error alert', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: browserStatusBlock('cancelled', {
+          actionSummary: '网页操作已取消',
+          errorCode: 'CANCELLED',
+        }),
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="browser-status"]')
+    expect(card.classes()).toContain('tone-neutral')
+    expect(card.get('[data-testid="browser-status-badge"]').text()).toBe('已取消')
+    expect(card.get('[data-testid="browser-action-summary"]').text()).toBe('网页操作已取消')
+    expect(card.find('[role="alert"]').exists()).toBe(false)
+  })
+
+  it('shows one localized browser failure reason instead of a duplicate action summary', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: browserStatusBlock('failed', {
+          actionSummary: '网页操作已安全停止',
+          errorCode: 'TOOL_CALL_LIMIT',
+        }),
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="browser-status"]')
+    expect(card.get('[role="alert"]').text()).toBe('工作流工具调用次数已达上限')
+    expect(card.find('[data-testid="browser-action-summary"]').exists()).toBe(false)
+    expect(card.text()).not.toContain('网页操作已安全停止')
+  })
+
+  it('links each browser disclosure button to its own details region', () => {
+    const first = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting', { blockId: 'browser_status_1' }) },
+      global: { plugins: [ElementPlus] },
+    })
+    const second = mount(MessageBlock, {
+      props: { block: browserStatusBlock('acting', { blockId: 'browser_status_2' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const firstTarget = first.get('[data-testid="toggle-browser-details"]').attributes('aria-controls')
+    const secondTarget = second.get('[data-testid="toggle-browser-details"]').attributes('aria-controls')
+    expect(first.get('[data-testid="browser-status-content"]').attributes('id')).toBe(firstTarget)
+    expect(second.get('[data-testid="browser-status-content"]').attributes('id')).toBe(secondTarget)
+    expect(firstTarget).not.toBe(secondTarget)
   })
 
   it('replaces browser status by its Main-owned block id', () => {
@@ -908,7 +1214,7 @@ describe('chat interactions', () => {
     ])
   })
 
-  it('renders one system provenance entry as an expandable execution link', async () => {
+  it('renders one system provenance entry as a compact operation card', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(MessageBlock, {
@@ -925,13 +1231,23 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="workflow-provenance"] summary').text())
-      .toContain('已使用：北京工作居住证 · 北京')
+    const card = wrapper.get('[data-testid="workflow-provenance"]')
+    expect(card.classes()).toContain('af-operation-card')
+    expect(card.classes()).toContain('tone-success')
+    expect(card.classes()).toContain('is-collapsed')
+    expect(card.get('.af-operation-eyebrow').text()).toBe('已使用工作流 · 北京')
+    expect(card.get('.af-operation-title strong').text()).toBe('北京工作居住证')
+    expect(card.get('[data-testid="workflow-provenance-badge"]').text()).toBe('已完成')
+    expect(card.find('[data-testid="workflow-provenance-content"]').exists()).toBe(false)
+
+    await card.get('[data-testid="toggle-workflow-provenance"]').trigger('click')
+
+    expect(card.get('[data-testid="workflow-provenance-content"]').isVisible()).toBe(true)
     await wrapper.get('[data-testid="open-provenance-execution-execution_1"]').trigger('click')
     expect(useExecutionStore().selectedId).toBe('execution_1')
   })
 
-  it('expands multiple provenance entries and uses the all-cities label', () => {
+  it('summarizes multiple provenance entries and uses the most severe status tone', async () => {
     const wrapper = mount(MessageBlock, {
       props: { block: workflowProvenanceBlock([
         {
@@ -948,11 +1264,17 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="workflow-provenance"] summary').text())
-      .toContain('已使用：北京工作居住证 · 北京')
-    expect(wrapper.get('[data-testid="workflow-provenance"]').attributes('data-entry-count')).toBe('2')
-    expect(wrapper.text()).toContain('全国政策查询')
-    expect(wrapper.text()).toContain('不限城市')
+    const card = wrapper.get('[data-testid="workflow-provenance"]')
+    expect(card.attributes('data-entry-count')).toBe('2')
+    expect(card.classes()).toContain('tone-danger')
+    expect(card.get('.af-operation-eyebrow').text()).toBe('已使用 2 个工作流')
+    expect(card.get('.af-operation-title strong').text()).toContain('北京工作居住证')
+    expect(card.get('[data-testid="workflow-provenance-badge"]').text()).toBe('含未完成项')
+
+    await card.get('[data-testid="toggle-workflow-provenance"]').trigger('click')
+
+    expect(card.text()).toContain('全国政策查询')
+    expect(card.text()).toContain('不限城市')
   })
 
   it('does not treat model text as authoritative workflow provenance', () => {
@@ -962,6 +1284,44 @@ describe('chat interactions', () => {
     })
 
     expect(wrapper.find('[data-testid="workflow-provenance"]').exists()).toBe(false)
+  })
+
+  it('renders a message failure as a contained alert instead of a page-level error strip', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:error:MODEL_PROVIDER_FAILED',
+          type: 'error',
+          code: 'MODEL_PROVIDER_FAILED',
+          message: '大模型供应商请求失败，请稍后重试',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const alert = wrapper.get('[role="alert"]')
+    expect(alert.classes()).toContain('message-error')
+    expect(alert.classes()).toContain('message-error-inline')
+    expect(alert.text()).toContain('未完成')
+    expect(alert.text()).toContain('大模型供应商请求失败，请稍后重试')
+  })
+
+  it('localizes a message failure from its error code instead of exposing provider copy', () => {
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: {
+          id: 'message_1:error:TOOL_CALL_LIMIT',
+          type: 'error',
+          code: 'TOOL_CALL_LIMIT',
+          message: 'The workflow reached its tool call limit.',
+        },
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const alert = wrapper.get('[role="alert"]')
+    expect(alert.text()).toContain('工作流工具调用次数已达上限')
+    expect(alert.text()).not.toContain('The workflow reached its tool call limit.')
   })
 
   it('renders raster images only through the safe asset protocol without leaking paths or encoded bytes', () => {
@@ -1318,7 +1678,7 @@ describe('chat interactions', () => {
     expect(displayError({ code, message: 'unsafe provider details' })).toBe(message)
   })
 
-  it('shows the exact bound chat approval details safely and offers only once or deny', () => {
+  it('shows a focused approval summary and keeps technical details behind disclosure', async () => {
     const { api } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(ApprovalCard, {
@@ -1326,18 +1686,68 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.text()).toContain('北京工作居住证')
-    expect(wrapper.text()).toContain('workflow.beijing')
-    expect(wrapper.text()).toContain('1.0.0')
-    expect(wrapper.text()).toContain('开发版本')
-    expect(wrapper.text()).toContain(buildHash)
-    expect(wrapper.text()).toContain('北京')
-    expect(wrapper.text()).toContain('填写并点击提交')
-    expect(wrapper.text()).toContain('browser.click')
-    expect(wrapper.text()).toContain('https://example.com')
+    const card = wrapper.get('[data-testid="approval-card"]')
+    expect(card.classes()).toContain('af-operation-card')
+    expect(card.classes()).toContain('tone-warning')
+    expect(card.classes()).not.toContain('is-collapsed')
+    expect(card.get('.af-operation-eyebrow').text()).toBe('权限请求')
+    expect(card.get('.af-operation-title strong').text()).toBe('北京工作居住证')
+    expect(card.get('[data-testid="approval-status-badge"]').text()).toBe('待确认')
+    expect(card.text()).toContain('填写并点击提交')
+    expect(card.text()).toContain('browser.click')
+    expect(card.text()).toContain('https://example.com')
+    expect(card.get('.approval-technical-list').isVisible()).toBe(false)
+
+    await card.get('[data-testid="approval-technical-details"] summary').trigger('click')
+
+    expect(card.get('.approval-technical-list').isVisible()).toBe(true)
+    expect(card.text()).toContain('workflow.beijing')
+    expect(card.text()).toContain('1.0.0')
+    expect(card.text()).toContain('开发版本')
+    expect(card.text()).toContain(buildHash)
+    expect(card.text()).toContain('北京')
     expect(wrapper.find('[data-testid="approve-always"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="deny-approval"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="approve-once"]').exists()).toBe(true)
+  })
+
+  it('collapses an authoritative resolved approval into a status summary', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: approvalBlock({ state: 'approved' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="approval-card"]')
+    expect(card.classes()).toContain('tone-success')
+    expect(card.classes()).toContain('is-collapsed')
+    expect(card.get('[data-testid="approval-status-badge"]').text()).toBe('已允许本次')
+    expect(card.find('[data-testid="approval-card-content"]').exists()).toBe(false)
+    expect(card.find('[data-testid="deny-approval"]').exists()).toBe(false)
+    expect(card.find('[data-testid="approve-once"]').exists()).toBe(false)
+
+    await card.get('[data-testid="toggle-approval-details"]').trigger('click')
+
+    expect(card.get('[data-testid="approval-card-content"]').isVisible()).toBe(true)
+    expect(card.find('[data-testid="deny-approval"]').exists()).toBe(false)
+    expect(card.find('[data-testid="approve-once"]').exists()).toBe(false)
+  })
+
+  it('collapses a live approval when Main resolves the pending request', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(ApprovalCard, {
+      props: { approval: approvalBlock() },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="approval-card"]').classes()).not.toContain('is-collapsed')
+
+    await wrapper.setProps({ approval: approvalBlock({ state: 'approved' }) })
+
+    expect(wrapper.get('[data-testid="approval-card"]').classes()).toContain('is-collapsed')
+    expect(wrapper.find('[data-testid="approval-card-content"]').exists()).toBe(false)
   })
 
   it('submits only the strict once contract and disables duplicate approval', async () => {
@@ -1384,10 +1794,9 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe(label)
-    expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
-    expect(wrapper.get('[data-testid="deny-approval"]').attributes('disabled')).toBeDefined()
-    await wrapper.get('[data-testid="approve-once"]').trigger('click')
+    expect(wrapper.get('[data-testid="approval-status-badge"]').text()).toBe(label)
+    expect(wrapper.find('[data-testid="approve-once"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="deny-approval"]').exists()).toBe(false)
     expect(decide).not.toHaveBeenCalled()
   })
 
@@ -1428,8 +1837,8 @@ describe('chat interactions', () => {
       global: { plugins: [ElementPlus] },
     })
 
-    expect(wrapper.get('[data-testid="approval-state"]').text()).toBe('审批已失效')
-    expect(wrapper.get('[data-testid="approve-once"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="approval-status-badge"]').text()).toBe('审批已失效')
+    expect(wrapper.find('[data-testid="approve-once"]').exists()).toBe(false)
   })
 
   it('subscribes once and merges streamed text deltas without duplication', () => {

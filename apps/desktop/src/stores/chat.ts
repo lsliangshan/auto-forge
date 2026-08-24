@@ -13,7 +13,12 @@ import type {
 import { displayError, getDesktopApi } from '../services/desktop-api'
 
 export type UiChatBlock = ChatBlock & { id: string }
-export interface UiChatMessage { id: string; role: 'user' | 'assistant'; blocks: UiChatBlock[] }
+export interface UiChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  blocks: UiChatBlock[]
+  createdAt: string
+}
 export type ChatSendAcknowledgement = (accepted: boolean) => void
 
 interface ChatHub { listeners: Set<(event: ChatEvent) => void>; unsubscribe: () => void }
@@ -89,6 +94,7 @@ function persistedMessage(message: ChatMessage): UiChatMessage {
     id: message.id,
     role: message.role,
     blocks: message.blocks.map((block, index) => ({ ...block, id: blockIdentity(message.id, block, index) })),
+    createdAt: message.createdAt,
   }
 }
 
@@ -617,6 +623,7 @@ export const useChatStore = defineStore('chat', {
         id: localId,
         role: 'user',
         blocks,
+        createdAt: new Date().toISOString(),
       }
       const messages = this.messagesByConversation[conversationId] ?? []
       this.messagesByConversation[conversationId] = [...messages, message]
@@ -713,7 +720,12 @@ export const useChatStore = defineStore('chat', {
       const messages = this.messagesByConversation[event.conversationId] ?? []
       let message = messages.find(({ id }) => id === event.messageId)
       if (!message) {
-        message = { id: event.messageId, role: 'assistant', blocks: [] }
+        message = {
+          id: event.messageId,
+          role: 'assistant',
+          blocks: [],
+          createdAt: new Date().toISOString(),
+        }
         this.messagesByConversation[event.conversationId] = [...messages, message]
       }
       if (event.type === 'block_update') {
