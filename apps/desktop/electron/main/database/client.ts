@@ -1,10 +1,11 @@
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
+import { toSafeAppError } from '@autoforge/shared'
 import { runMigrations } from './migrations.js'
 import { createCloudBaseIdentityRepository } from './cloudbase-identity-repository.js'
 import { createLocalAuthRepository } from './local-auth-repository.js'
 import { createUserProfileRepository } from './user-profile-repository.js'
-import { createRepositories } from './repositories.js'
+import { createRepositories, type AppRepositories } from './repositories.js'
 import * as schema from './schema.js'
 
 export function openAppDatabase(path: string) {
@@ -18,11 +19,21 @@ export function openAppDatabase(path: string) {
   const userProfiles = createUserProfileRepository(sqlite)
   const cloudBaseIdentities = createCloudBaseIdentityRepository(sqlite)
   repositories.messages.upgradeLegacyApprovals()
-  const legacyConversations = {
+  const legacyReadOnly = (): never => {
+    throw toSafeAppError({ code: 'CONFLICT' })
+  }
+  const legacyConversations: AppRepositories['conversations'] = {
     ...repositories.conversations,
-    claimLegacyAndListForUser: (userId: string) => repositories.conversations
-      .list()
-      .filter((conversation) => conversation.userId === userId),
+    insert: legacyReadOnly,
+    claimLegacyAndListForUser: legacyReadOnly,
+    renameByUser: legacyReadOnly,
+    claimTitleGeneration: legacyReadOnly,
+    completeTitleGeneration: legacyReadOnly,
+    failTitleGeneration: legacyReadOnly,
+    failPendingTitleGeneration: legacyReadOnly,
+    failInterruptedTitleGenerations: legacyReadOnly,
+    updateGenerationPreferences: legacyReadOnly,
+    delete: legacyReadOnly,
   }
 
   const recoverInterrupted = () => sqlite.transaction(() => {
@@ -58,11 +69,14 @@ export function openAppDatabase(path: string) {
     return { executions, chatRuns }
   })()
 
-  const clearConversations = () => undefined
+  const clearConversations = legacyReadOnly
 
-  const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => sqlite.transaction(() => {
-    if (scope === 'executions' || scope === 'all') sqlite.prepare('DELETE FROM executions').run()
-  })()
+  const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => {
+    if (scope !== 'executions') legacyReadOnly()
+    return sqlite.transaction(() => {
+      sqlite.prepare('DELETE FROM executions').run()
+    })()
+  }
 
   return {
     db,

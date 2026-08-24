@@ -6,11 +6,35 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { sql } from 'drizzle-orm'
 import { authAccountSchema, chatBlockSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
-import { openAppDatabase } from './client.js'
+import { openAppDatabase as openProductionAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
-import { ProviderUsageConsistencyError } from './repositories.js'
+import { createRepositories, ProviderUsageConsistencyError } from './repositories.js'
 
 const temporaryDirectories: string[] = []
+
+function openAppDatabase(path: string) {
+  const production = openProductionAppDatabase(path)
+  const sqlite = new Database(path)
+  sqlite.pragma('foreign_keys = ON')
+  const repositories = createRepositories(sqlite)
+  const clearConversations = () => sqlite.transaction(() => {
+    sqlite.prepare('DELETE FROM conversations').run()
+  })()
+  const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => sqlite.transaction(() => {
+    if (scope === 'executions' || scope === 'all') sqlite.prepare('DELETE FROM executions').run()
+    if (scope === 'conversations' || scope === 'all') sqlite.prepare('DELETE FROM conversations').run()
+  })()
+  return {
+    ...production,
+    conversations: repositories.conversations,
+    clearConversations,
+    clearLocalData,
+    close() {
+      sqlite.close()
+      production.close()
+    },
+  }
+}
 
 function openTestDatabase() {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-'))
@@ -224,6 +248,44 @@ afterEach(() => {
 })
 
 describe('openAppDatabase', () => {
+  it('exposes global legacy conversations as read-only import data', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-legacy-read-only-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    openProductionAppDatabase(path).close()
+    const seed = new Database(path)
+    seed.prepare(`
+      INSERT INTO conversations (id, title, created_at, updated_at)
+      VALUES ('legacy_read_only', 'Legacy', 1, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO executions (
+        id, workflow_id, workflow_version, status, input_json, created_at
+      ) VALUES ('legacy_execution', 'workflow', '1.0.0', 'completed', '{}', 1)
+    `).run()
+    seed.close()
+    const database = openProductionAppDatabase(path)
+    const expected = { code: 'CONFLICT', message: 'The requested operation conflicts with existing state.' }
+
+    expect(database.conversations.list().map(({ id }) => id)).toEqual(['legacy_read_only'])
+    expect(() => database.conversations.insert({ id: 'forbidden_insert', title: 'Forbidden' }))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.conversations.renameByUser('legacy_read_only', 'Forbidden'))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.conversations.delete('legacy_read_only'))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.conversations.claimLegacyAndListForUser('cloud-alice'))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.clearConversations()).toThrow(expect.objectContaining(expected))
+    expect(() => database.clearLocalData('all')).toThrow(expect.objectContaining(expected))
+    expect(database.conversations.get('legacy_read_only')).toBeDefined()
+    expect(database.executions.get('legacy_execution')).toBeDefined()
+
+    database.clearLocalData('executions')
+    expect(database.executions.get('legacy_execution')).toBeUndefined()
+    database.close()
+  })
+
   it('packages migrations where the migration runner resolves them', () => {
     const configPath = fileURLToPath(new URL('../../../electron-builder.yml', import.meta.url))
     const config = readFileSync(configPath, 'utf8')
@@ -926,7 +988,7 @@ describe('openAppDatabase', () => {
   })
 
   it('retains provider usage after conversation deletion and local-data clearing', () => {
-    const database = openTestDatabase()
+    const { database, path } = openInspectableTestDatabase()
     insertLocalUser(database, 'user_retention', 'Retention')
     for (const suffix of ['delete', 'clear_conversations', 'clear_all']) {
       const conversationId = `conversation_usage_${suffix}`
@@ -949,13 +1011,17 @@ describe('openAppDatabase', () => {
       status: 'completed',
     })
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
-    database.clearConversations()
+    const production = openProductionAppDatabase(path)
+    expect(() => production.clearConversations()).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
     expect(database.conversations.get('conversation_usage_clear_conversations')).toBeDefined()
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
-    database.clearLocalData('all')
+    expect(() => production.clearLocalData('all')).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
     expect(database.conversations.get('conversation_usage_clear_all')).toBeDefined()
+    expect(database.executions.get('execution_clear_all')).toBeDefined()
+    production.clearLocalData('executions')
     expect(database.executions.get('execution_clear_all')).toBeUndefined()
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
+    production.close()
   })
 
   it('backfills insertion order and allocates independent conversation ordinals', () => {
@@ -2035,7 +2101,7 @@ describe('openAppDatabase', () => {
   })
 
   it('summarizes retained token usage and preserves it during global legacy clearing', () => {
-    const database = openTestDatabase()
+    const { database, path } = openInspectableTestDatabase()
     insertLocalUser(database, 'usage_user', 'usage@example.com')
     database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
     const insert = (
@@ -2094,9 +2160,12 @@ describe('openAppDatabase', () => {
     })
     expect(usage.allTime.models.some(({ model }) => model === 'ignored/model')).toBe(false)
 
-    database.clearLocalData('conversations')
+    const production = openProductionAppDatabase(path)
+    expect(() => production.clearLocalData('conversations'))
+      .toThrow(expect.objectContaining({ code: 'CONFLICT' }))
     expect(database.chatRuns.summarizeTokenUsage(query)).toEqual(usage)
     expect(database.conversations.get('conversation_usage')).toMatchObject({ id: 'conversation_usage' })
+    production.close()
   })
 
   it('groups token usage trends by local calendar boundaries and excludes the query end point', () => {

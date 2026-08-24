@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto'
 import { mkdirSync, rmSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 import userCacheMigration from '../../../resources/user-cache-migrations/0001_user_cache.sql?raw'
 import {
@@ -12,6 +12,7 @@ import {
 
 const USER_CACHE_DOMAIN = 'autoforge-user-cache-v1\0'
 const USER_CACHE_FILE_PATTERN = /^[0-9a-f]{32}\.sqlite$/
+const USER_CACHE_MIGRATIONS = [{ version: 1, source: userCacheMigration }] as const
 
 export type UserDataStore = UserDataRepositories
 
@@ -42,15 +43,20 @@ function cacheScope(userId: string): string {
 
 function migrate(database: Database.Database): void {
   database.pragma('foreign_keys = ON')
-  const hasMigrationTable = database.prepare(`
-    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'
-  `).get()
-  if (hasMigrationTable) return
-  database.transaction(() => {
-    database.exec(userCacheMigration)
-    database.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)')
-      .run(Date.now())
-  })()
+  for (const migration of USER_CACHE_MIGRATIONS) {
+    const hasMigrationTable = database.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'
+    `).get()
+    const applied = hasMigrationTable
+      ? database.prepare('SELECT 1 FROM schema_migrations WHERE version = ?').get(migration.version)
+      : undefined
+    if (applied) continue
+    database.transaction(() => {
+      database.exec(migration.source)
+      database.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
+        .run(migration.version, Date.now())
+    })()
+  }
 }
 
 export class UserDataStoreManager {

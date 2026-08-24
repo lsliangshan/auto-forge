@@ -17,7 +17,9 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import Database from 'better-sqlite3'
 import { openAppDatabase } from '../database/client.js'
+import { createRepositories } from '../database/repositories.js'
 import {
   MediaLifecycle,
   type MediaLifecycleDatabase,
@@ -33,12 +35,27 @@ function setup() {
   temporaryDirectories.push(dataDirectory)
   const mediaRoot = join(dataDirectory, 'media')
   mkdirSync(mediaRoot, { recursive: true })
-  const database = openAppDatabase(join(dataDirectory, 'autoforge.sqlite'))
-  return { database, mediaRoot }
+  const databasePath = join(dataDirectory, 'autoforge.sqlite')
+  const productionDatabase = openAppDatabase(databasePath)
+  const sqlite = new Database(databasePath)
+  sqlite.pragma('foreign_keys = ON')
+  const repositories = createRepositories(sqlite)
+  const database = {
+    ...productionDatabase,
+    conversations: repositories.conversations,
+    clearConversations: () => sqlite.transaction(() => {
+      sqlite.prepare('DELETE FROM conversations').run()
+    })(),
+    close() {
+      sqlite.close()
+      productionDatabase.close()
+    },
+  }
+  return { database, productionDatabase, databasePath, mediaRoot }
 }
 
 function insertConversation(
-  database: ReturnType<typeof openAppDatabase>,
+  database: { conversations: ReturnType<typeof createRepositories>['conversations'] },
   conversationId: string,
 ) {
   database.conversations.insert({
@@ -50,7 +67,7 @@ function insertConversation(
 }
 
 function insertAsset(
-  database: ReturnType<typeof openAppDatabase>,
+  database: { mediaAssets: ReturnType<typeof createRepositories>['mediaAssets'] },
   input: {
     id: string
     conversationId: string
@@ -85,7 +102,7 @@ function writeAsset(mediaRoot: string, conversationId: string, name: string, byt
 }
 
 function databasePort(
-  database: ReturnType<typeof openAppDatabase>,
+  database: MediaLifecycleDatabase,
   overrides: Partial<MediaLifecycleDatabase> = {},
 ): MediaLifecycleDatabase {
   return {
@@ -279,6 +296,28 @@ describe('MediaLifecycle', () => {
       expect(await readFile(join(mediaRoot, id, 'asset.png'), 'utf8')).toBe(id)
       expect(existsSync(join(mediaRoot, '.quarantine', `${id}.deleting`))).toBe(false)
     }
+  })
+
+  it('restores legacy media when the production global database refuses clearing', async () => {
+    const { database: mutableDatabase, productionDatabase: database, databasePath, mediaRoot } = setup()
+    const seed = new Database(databasePath)
+    seed.prepare(`
+      INSERT INTO conversations (id, title, created_at, updated_at)
+      VALUES ('legacy_media', 'Legacy media', 1, 1)
+    `).run()
+    seed.close()
+    writeAsset(mediaRoot, 'legacy_media', 'asset.png', 'legacy')
+    const lifecycle = new MediaLifecycle({ database: databasePort(database), mediaRoot })
+
+    await expect(lifecycle.clearConversations()).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: 'The requested operation conflicts with existing state.',
+    })
+
+    expect(database.conversations.get('legacy_media')).toBeDefined()
+    expect(await readFile(join(mediaRoot, 'legacy_media', 'asset.png'), 'utf8')).toBe('legacy')
+    expect(existsSync(join(mediaRoot, '.quarantine', 'legacy_media.deleting'))).toBe(false)
+    mutableDatabase.close()
   })
 
   it('reports a failed clear even when a live conversation has no media directory', async () => {
