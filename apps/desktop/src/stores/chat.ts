@@ -265,6 +265,7 @@ export const useChatStore = defineStore('chat', {
     _messageLoadVersions: {} as Record<string, number>,
     _conversationPageRequests: {} as Record<string, number>,
     _messagePageRequests: {} as Record<string, number>,
+    _preferenceLoadRequests: {} as Record<string, number>,
     _pageRequestSequence: 0,
     _dataGeneration: 0,
     _preferenceVersions: {} as Record<string, number>,
@@ -317,6 +318,7 @@ export const useChatStore = defineStore('chat', {
       this._pageRequestSequence += 1
       this._conversationPageRequests = {}
       this._messagePageRequests = {}
+      this._preferenceLoadRequests = {}
       this._preferenceVersions = {}
       closedMediaAdmissions.delete(this)
       this.loading = false
@@ -338,7 +340,7 @@ export const useChatStore = defineStore('chat', {
         }
       }
     },
-    async loadConversations() {
+    async loadConversations(hydrateSelected = true) {
       this.ensureSubscriptions()
       const requestKey = 'initial'
       if (this._conversationPageRequests[requestKey]) return
@@ -360,7 +362,7 @@ export const useChatStore = defineStore('chat', {
           this.selectedConversationId = this.conversations[0]?.id ?? ''
           this._selectionVersion += 1
         }
-        if (this.selectedConversationId) {
+        if (hydrateSelected && this.selectedConversationId) {
           await Promise.all([
             this.messagesByConversation[this.selectedConversationId] === undefined
               ? this.loadMessages(this.selectedConversationId)
@@ -570,18 +572,32 @@ export const useChatStore = defineStore('chat', {
       }
     },
     async loadGenerationPreferences(conversationId: string) {
+      if (this._preferenceLoadRequests[conversationId]) return
       const epoch = this._stateEpoch
       const version = (this._preferenceVersions[conversationId] ?? 0) + 1
       this._preferenceVersions[conversationId] = version
+      const requestToken = ++this._pageRequestSequence
+      const dataGeneration = this._dataGeneration
+      this._preferenceLoadRequests[conversationId] = requestToken
       try {
         const preferences = await getDesktopApi().chat.getGenerationPreferences(conversationId)
-        if (epoch !== this._stateEpoch || version !== this._preferenceVersions[conversationId]) return
+        if (dataGeneration !== this._dataGeneration
+          || this._preferenceLoadRequests[conversationId] !== requestToken
+          || epoch !== this._stateEpoch
+          || version !== this._preferenceVersions[conversationId]) return
         this.preferencesByConversation[conversationId] = preferences
       } catch (error) {
-        if (epoch === this._stateEpoch
+        if (dataGeneration === this._dataGeneration
+          && this._preferenceLoadRequests[conversationId] === requestToken
+          && epoch === this._stateEpoch
           && version === this._preferenceVersions[conversationId]
           && this.selectedConversationId === conversationId) {
           this.error = displayError(error, '生成设置加载失败')
+        }
+      } finally {
+        if (dataGeneration === this._dataGeneration
+          && this._preferenceLoadRequests[conversationId] === requestToken) {
+          delete this._preferenceLoadRequests[conversationId]
         }
       }
     },
@@ -868,6 +884,34 @@ export const useChatStore = defineStore('chat', {
       try { await getDesktopApi().chat.cancel(requestId) }
       catch (error) { this.error = displayError(error, '取消生成失败') }
     },
+    async refreshAfterConversationRemoval(
+      dataGeneration: number,
+      selectedBeforeRemoval: string,
+      selectedMessageLoadInvalidated: boolean,
+      selectedPreferenceLoadInvalidated: boolean,
+    ) {
+      try {
+        await this.loadConversations(false)
+        if (dataGeneration !== this._dataGeneration) return
+        const conversationId = this.selectedConversationId
+        if (!conversationId) return
+        const selectedConversationWasPreserved = conversationId === selectedBeforeRemoval
+        await Promise.all([
+          this.messagesByConversation[conversationId] === undefined
+            || (selectedConversationWasPreserved && selectedMessageLoadInvalidated)
+            ? this.loadMessages(conversationId)
+            : undefined,
+          this.preferencesByConversation[conversationId] === undefined
+            || (selectedConversationWasPreserved && selectedPreferenceLoadInvalidated)
+            ? this.loadGenerationPreferences(conversationId)
+            : undefined,
+        ])
+      } catch (error) {
+        if (dataGeneration === this._dataGeneration) {
+          this.error = displayError(error, '会话刷新失败')
+        }
+      }
+    },
     applyChatEvent(event: ChatEvent) {
       if (event.type === 'conversation_updated') {
         this.conversations = mergeConversationPages(
@@ -877,6 +921,12 @@ export const useChatStore = defineStore('chat', {
         return
       }
       if (event.type === 'conversation_removed') {
+        const selectedBeforeRemoval = this.selectedConversationId
+        const selectedMessageLoadInvalidated = selectedBeforeRemoval !== ''
+          && Object.keys(this._messagePageRequests)
+            .some((requestKey) => requestKey.startsWith(`${selectedBeforeRemoval}:`))
+        const selectedPreferenceLoadInvalidated = selectedBeforeRemoval !== ''
+          && this._preferenceLoadRequests[selectedBeforeRemoval] !== undefined
         const removedIndex = this.conversations.findIndex(({ id }) => id === event.conversationId)
         this.conversations = this.conversations.filter(({ id }) => id !== event.conversationId)
         delete this.messagesByConversation[event.conversationId]
@@ -896,12 +946,20 @@ export const useChatStore = defineStore('chat', {
         this._dataGeneration += 1
         this._conversationPageRequests = {}
         this._messagePageRequests = {}
+        this._preferenceLoadRequests = {}
         this.loading = false
         if (this.selectedConversationId === event.conversationId) {
           const nextIndex = removedIndex < 0 ? 0 : Math.min(removedIndex, this.conversations.length - 1)
           this.selectedConversationId = nextIndex < 0 ? '' : (this.conversations[nextIndex]?.id ?? '')
           this._selectionVersion += 1
         }
+        const dataGeneration = this._dataGeneration
+        void this.refreshAfterConversationRemoval(
+          dataGeneration,
+          selectedBeforeRemoval,
+          selectedMessageLoadInvalidated,
+          selectedPreferenceLoadInvalidated,
+        )
         return
       }
       if (event.type === 'conversation_title_updated') {

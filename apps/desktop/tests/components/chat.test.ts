@@ -1759,8 +1759,17 @@ describe('chat interactions', () => {
     expect(api.chat.listConversations).not.toHaveBeenCalled()
   })
 
-  it('removes a selected tombstoned conversation and selects the deterministic next visible row', () => {
+  it('refreshes after a selected tombstone and hydrates the deterministic next visible row', async () => {
     const { api, emitChat } = createEventApi()
+    const replacementPreferences = generationPreferences({ outputType: 'video' })
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_3', '2026-08-25T00:01:00.000Z'),
+    ] })
+    vi.mocked(api.chat.listMessages).mockResolvedValue({
+      items: [storedMessage('message_3', 'conv_3', 'replacement history')],
+    })
+    vi.mocked(api.chat.getGenerationPreferences).mockResolvedValue(replacementPreferences)
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     store.conversations = [
@@ -1774,17 +1783,23 @@ describe('chat interactions', () => {
     store.ensureSubscriptions()
 
     emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+    await flushPromises()
 
     expect(store.conversations.map(({ id }) => id)).toEqual(['conv_1', 'conv_3'])
     expect(store.selectedConversationId).toBe('conv_3')
     expect(store.messagesByConversation.conv_2).toBeUndefined()
     expect(store.previousMessageCursorByConversation.conv_2).toBeUndefined()
-    expect(api.chat.listConversations).not.toHaveBeenCalled()
-    expect(api.chat.listMessages).not.toHaveBeenCalled()
+    expect(api.chat.listConversations).toHaveBeenCalledWith({ limit: 50 })
+    expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_3', limit: 100 })
+    expect(store.messagesByConversation.conv_3?.map(({ id }) => id)).toEqual(['message_3'])
+    expect(store.preferencesByConversation.conv_3).toEqual(replacementPreferences)
   })
 
-  it('removes a nonselected tombstoned conversation without changing selection', () => {
+  it('refreshes a nonselected tombstone without reloading valid selected data', async () => {
     const { api, emitChat } = createEventApi()
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('conv_1', '2026-08-25T00:03:00.000Z')],
+    })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     store.conversations = [
@@ -1792,16 +1807,157 @@ describe('chat interactions', () => {
       conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
     ]
     store.selectedConversationId = 'conv_1'
+    store.messagesByConversation.conv_1 = [{ id: 'message_1', role: 'assistant', blocks: [] }]
+    store.preferencesByConversation.conv_1 = generationPreferences({ outputType: 'text' })
     store.messagesByConversation.conv_2 = [{ id: 'message_2', role: 'assistant', blocks: [] }]
     store.previousMessageCursorByConversation.conv_2 = 'older-cursor'
     store.ensureSubscriptions()
 
     emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+    await flushPromises()
 
     expect(store.conversations.map(({ id }) => id)).toEqual(['conv_1'])
     expect(store.selectedConversationId).toBe('conv_1')
     expect(store.messagesByConversation.conv_2).toBeUndefined()
     expect(store.previousMessageCursorByConversation.conv_2).toBeUndefined()
+    expect(store.messagesByConversation.conv_1?.map(({ id }) => id)).toEqual(['message_1'])
+    expect(api.chat.listConversations).toHaveBeenCalledWith({ limit: 50 })
+    expect(api.chat.listMessages).not.toHaveBeenCalled()
+    expect(api.chat.getGenerationPreferences).not.toHaveBeenCalled()
+  })
+
+  it('reschedules current message and preference hydration invalidated by a nonselected tombstone', async () => {
+    const { api, emitChat } = createEventApi()
+    const oldMessages = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const oldPreferences = deferred<ConversationGenerationPreferences>()
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('conv_1', '2026-08-25T00:03:00.000Z')],
+    })
+    vi.mocked(api.chat.listMessages)
+      .mockReturnValueOnce(oldMessages.promise)
+      .mockResolvedValueOnce({ items: [storedMessage('new-message', 'conv_1', 'new identity-safe row')] })
+    vi.mocked(api.chat.getGenerationPreferences)
+      .mockReturnValueOnce(oldPreferences.promise)
+      .mockResolvedValueOnce(generationPreferences({ outputType: 'video' }))
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
+    ]
+    store.selectedConversationId = 'conv_1'
+    store.ensureSubscriptions()
+
+    const originalHydration = store.selectConversation('conv_1')
+    await vi.waitFor(() => {
+      expect(api.chat.listMessages).toHaveBeenCalledTimes(1)
+      expect(api.chat.getGenerationPreferences).toHaveBeenCalledTimes(1)
+    })
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+    await vi.waitFor(() => {
+      expect({
+        conversations: vi.mocked(api.chat.listConversations).mock.calls.length,
+        messages: vi.mocked(api.chat.listMessages).mock.calls.length,
+        preferences: vi.mocked(api.chat.getGenerationPreferences).mock.calls.length,
+      }).toEqual({ conversations: 1, messages: 2, preferences: 2 })
+    })
+
+    oldMessages.resolve({ items: [storedMessage('old-message', 'conv_1', 'stale row')] })
+    oldPreferences.resolve(generationPreferences({ outputType: 'audio' }))
+    await originalHydration
+    await flushPromises()
+    expect(store.messagesByConversation.conv_1?.map(({ id }) => id)).toEqual(['new-message'])
+    expect(store.preferencesByConversation.conv_1?.outputType).toBe('video')
+  })
+
+  it('clears selection and conversation state when a removed selected row has no replacement', async () => {
+    const { api, emitChat } = createEventApi()
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [] })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [conversationSummary('conv_1', '2026-08-25T00:03:00.000Z')]
+    store.selectedConversationId = 'conv_1'
+    store.messagesByConversation.conv_1 = [{ id: 'message_1', role: 'assistant', blocks: [] }]
+    store.draftsByConversation.conv_1 = [mediaAsset('draft_1')]
+    store.preferencesByConversation.conv_1 = generationPreferences({ outputType: 'image' })
+    store.ensureSubscriptions()
+
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_1' })
+    await flushPromises()
+
+    expect(store.conversations).toEqual([])
+    expect(store.selectedConversationId).toBe('')
+    expect(store.messagesByConversation.conv_1).toBeUndefined()
+    expect(store.draftsByConversation.conv_1).toBeUndefined()
+    expect(store.preferencesByConversation.conv_1).toBeUndefined()
+    expect(api.chat.listMessages).not.toHaveBeenCalled()
+    expect(api.chat.getGenerationPreferences).not.toHaveBeenCalled()
+  })
+
+  it('lets only the newest consecutive removal refresh hydrate its replacement', async () => {
+    const { api, emitChat } = createEventApi()
+    const stalePage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    const currentPage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations)
+      .mockReturnValueOnce(stalePage.promise)
+      .mockReturnValueOnce(currentPage.promise)
+    vi.mocked(api.chat.listMessages).mockResolvedValue({
+      items: [storedMessage('message_3', 'conv_3', 'current replacement')],
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
+      conversationSummary('conv_3', '2026-08-25T00:01:00.000Z'),
+    ]
+    store.selectedConversationId = 'conv_1'
+    store.ensureSubscriptions()
+
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_1' })
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(2)
+    stalePage.resolve({ items: [conversationSummary('stale-row', '2026-08-25T00:04:00.000Z')] })
+    await flushPromises()
+    currentPage.resolve({ items: [conversationSummary('conv_3', '2026-08-25T00:01:00.000Z')] })
+    await flushPromises()
+
+    expect(store.conversations.map(({ id }) => id)).toEqual(['conv_3'])
+    expect(store.selectedConversationId).toBe('conv_3')
+    expect(store.messagesByConversation.conv_3?.map(({ id }) => id)).toEqual(['message_3'])
+    expect(api.chat.listMessages).toHaveBeenCalledTimes(1)
+    expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_3', limit: 100 })
+  })
+
+  it('does not let removal refresh work apply after an identity reset', async () => {
+    const { api, emitChat } = createEventApi()
+    const stalePage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations).mockReturnValue(stalePage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('old-selected', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('old-replacement', '2026-08-25T00:02:00.000Z'),
+    ]
+    store.selectedConversationId = 'old-selected'
+    store.ensureSubscriptions()
+
+    emitChat({ type: 'conversation_removed', conversationId: 'old-selected' })
+    expect(api.chat.listConversations).toHaveBeenCalledOnce()
+    store.resetLocalData()
+    store.conversations = [conversationSummary('new-selected', '2026-08-25T00:04:00.000Z')]
+    store.selectedConversationId = 'new-selected'
+    store.messagesByConversation['new-selected'] = [{ id: 'new-message', role: 'assistant', blocks: [] }]
+    store.preferencesByConversation['new-selected'] = generationPreferences({ outputType: 'text' })
+    stalePage.reject(new Error('old identity refresh failed'))
+    await flushPromises()
+
+    expect(store.conversations.map(({ id }) => id)).toEqual(['new-selected'])
+    expect(store.selectedConversationId).toBe('new-selected')
+    expect(store.messagesByConversation['new-selected']?.map(({ id }) => id)).toEqual(['new-message'])
+    expect(store.error).toBe('')
+    expect(api.chat.listMessages).not.toHaveBeenCalled()
+    expect(api.chat.getGenerationPreferences).not.toHaveBeenCalled()
   })
 
   it('does not let a loading snapshot overwrite a newer streamed delta', async () => {
