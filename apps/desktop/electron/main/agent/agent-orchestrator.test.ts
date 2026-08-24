@@ -415,6 +415,91 @@ async function inspectedStaticFields(fields: string[]): Promise<BrowserContinuat
   }
 }
 
+async function inspectedAttachmentTable(): Promise<BrowserContinuationToolResult> {
+  const binding = continuationBinding({
+    browserContinuation: { readableRegions: ['role=main'] },
+  })
+  const rows = [
+    ['学历证书', '已上传', '2021-09-08', '查看 删除'],
+    ['学位证书', '已上传', '2021-09-08', '查看 删除'],
+    ['职称证书和评审材料', '未上传', '-', '上传'],
+    ['应税收入材料', '已上传', '2024-12-11', '查看 删除'],
+    ['户口本首页及本人页', '已上传', '2023-06-05', '查看 删除'],
+    ['诚信声明', '已上传', '2024-12-11', '查看 删除'],
+    ['婚姻证明材料', '已上传', '2023-06-05', '查看 删除'],
+    ['在京合法稳定住所证明', '已上传', '2024-12-11', '查看 删除'],
+    ['其他材料', '已上传', '2024-12-11', '查看 删除'],
+  ] as const
+  let backendNodeId = 10
+  const inspectionNode = (
+    role: string,
+    name: string,
+    axNodeId: string,
+    parentAxNodeId: string | undefined,
+    tagName = 'div',
+  ): BrowserInspectionNode => ({
+    axNodeId, parentAxNodeId, backendNodeId: backendNodeId++, role, name,
+    enabled: true, ignored: false, frameId: 'frame_main', dom: { tagName },
+  })
+  const nodes: BrowserInspectionNode[] = [
+    inspectionNode('main', '附件管理', 'ax_main', undefined, 'main'),
+    inspectionNode('table', '附件列表', 'ax_table', 'ax_main', 'table'),
+    inspectionNode('row', '表头', 'ax_header', 'ax_table', 'tr'),
+    ...['附件名称', '当前状态', '上传日期', '操作'].map((name, index) => (
+      inspectionNode('columnheader', name, `ax_header_${index}`, 'ax_header', 'th')
+    )),
+    ...rows.flatMap((row, rowIndex) => {
+      const rowAxId = `ax_row_${rowIndex}`
+      return [
+        inspectionNode('row', row.join(' '), rowAxId, 'ax_table', 'tr'),
+        ...row.flatMap((value, columnIndex) => {
+          const cellAxId = `ax_cell_${rowIndex}_${columnIndex}`
+          return [
+            inspectionNode('cell', value, cellAxId, rowAxId, 'td'),
+            inspectionNode('StaticText', value, `ax_text_${rowIndex}_${columnIndex}`, cellAxId),
+          ]
+        }),
+      ]
+    }),
+  ]
+  const page: BrowserPageReadResult = {
+    tabId: 'tab_1', navigationEpoch: 1,
+    origin: 'https://permit.example.gov.cn', url: 'https://permit.example.gov.cn/attachments',
+    title: '附件管理', frameId: 'frame_main', viewportWidth: 1_200, viewportHeight: 800,
+    nodes, locatorMatches: [{ locator: 'role=main', backendNodeIds: [10] }],
+  }
+  const port: BrowserPageCdpPort = {
+    readAccessibilitySnapshot: async () => page,
+    readNode: async ({ backendNodeId: targetId }) => (
+      nodes.find((candidate) => candidate.backendNodeId === targetId)
+    ),
+    getNodeBox: async () => ({ x: 0, y: 0, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }),
+    captureNodeScreenshot: async () => '',
+    onPageInvalidated: () => () => undefined,
+  }
+  const lease: BrowserContinuationLease = Object.freeze({
+    binding,
+    ownerRunId: 'attachment_table_run',
+    isCurrent: (candidate: BrowserContinuationBinding) => candidate === binding,
+    assertEligible: async () => undefined,
+    release: async () => undefined,
+  })
+  let id = 0
+  const inspector = new BrowserPageInspector(port, {
+    id: () => `attachment_${++id}`,
+    now: () => Date.parse('2026-08-24T08:00:00.000Z'),
+  })
+  try {
+    const snapshot = await inspector.inspect({
+      lease, tabId: 'tab_1', navigationEpoch: 1, origin: page.origin,
+      intent: '我上传了哪些附件', mode: 'semantic',
+    })
+    return { kind: 'success', data: { trust: 'untrusted_page_data', snapshot } }
+  } finally {
+    inspector.dispose()
+  }
+}
+
 function attachCombinedBrowserContinuation(
   dependencies: AgentOrchestratorDependencies,
   nodes: BrowserSemanticNode[],
@@ -4298,6 +4383,65 @@ describe('AgentOrchestrator', () => {
     expect(browser.executor.execute).not.toHaveBeenCalled()
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
     expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(answer)
+  })
+
+  it('answers an attachment question from full-page row context', async () => {
+    const inspected = await inspectedAttachmentTable()
+    if (inspected.kind !== 'success') throw new Error('expected attachment snapshot')
+    const snapshot = (inspected.data as { snapshot: BrowserPageSnapshot }).snapshot
+    const uploadedAttachmentNames = [
+      '学历证书',
+      '学位证书',
+      '应税收入材料',
+      '户口本首页及本人页',
+      '诚信声明',
+      '婚姻证明材料',
+      '在京合法稳定住所证明',
+      '其他材料',
+    ]
+    const selectedNodeIds = uploadedAttachmentNames.map((name) => (
+      snapshot.nodes.find((node) => node.answerable === true && node.name === name)!.ref
+    ))
+    const supportingNodeIds = [
+      ...snapshot.nodes.filter(({ role }) => role === 'columnheader').map(({ ref }) => ref),
+      ...snapshot.nodes.filter((node) => node.answerable === true && node.name === '已上传').map(({ ref }) => ref),
+    ]
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'attachment_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取附件管理页面' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'attachment_evidence',
+        name: 'report_browser_page_evidence',
+        arguments: { shape: 'list', selectedNodeIds, supportingNodeIds },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    attachBrowserContinuation(dependencies, { execute: async () => inspected })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我上传了哪些附件',
+      provider: 'openrouter', model: 'model', requestId: 'attachment_evidence_request',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    for (const name of uploadedAttachmentNames) {
+      expect(terminal.split(name)).toHaveLength(2)
+    }
+    expect(terminal).not.toContain('职称证书和评审材料')
+    expect(terminal.indexOf('学历证书')).toBeLessThan(terminal.indexOf('学位证书'))
+    expect(terminal).toContain('https://permit.example.gov.cn')
+    expect(terminal).not.toMatch(/已上传|未上传|2021-09-08|2024-12-11|查看 删除/u)
+
+    const resolverRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    const serializedResolverRequest = JSON.stringify(resolverRequest.messages)
+    expect(serializedResolverRequest).toContain('parentRef')
+    expect(serializedResolverRequest).toContain('职称证书和评审材料')
+    expect(serializedResolverRequest).toContain('未上传')
   })
 
   it('fails closed when AI says a related browser label is not the requested attribute', async () => {

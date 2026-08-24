@@ -55,6 +55,10 @@ import {
   matchBrowserFieldSemantics,
   type BrowserFieldSemanticMatchResult,
 } from './browser-field-semantic-matcher.js'
+import {
+  resolveBrowserPageEvidence,
+  type BrowserPageEvidenceResolution,
+} from './browser-page-evidence-resolver.js'
 import { WorkflowRouter, type WorkflowRoutingRequest } from './workflow-router.js'
 import {
   APPROVAL_EXPIRY_MS,
@@ -122,6 +126,7 @@ interface BrowserFieldEvidence {
 
 const browserSemanticNodeSchema = z.object({
   ref: z.string().trim().min(1).max(128),
+  parentRef: z.string().trim().min(1).max(128).optional(),
   role: z.string().trim().min(1).max(80),
   name: z.string().max(512),
   value: z.string().max(512).optional(),
@@ -129,6 +134,7 @@ const browserSemanticNodeSchema = z.object({
   checked: z.boolean().optional(),
   selected: z.boolean().optional(),
   actions: z.array(z.enum(['fill', 'select', 'click', 'check', 'scroll'])).max(5),
+  answerable: z.boolean().optional(),
 }).strict()
 
 const browserPageSnapshotSchema = z.object({
@@ -434,6 +440,10 @@ interface ActiveAgentRun {
   browserRead: boolean
   browserAuthorization: BrowserAuthorizationEnvelope
   browserSnapshots: Map<string, BrowserPageSnapshot>
+  browserEvidencePages: BrowserPageSnapshot[]
+  browserPageEvidenceRevision: number
+  browserPageEvidenceMatchRevision?: number
+  browserPageEvidenceSelection?: BrowserPageEvidenceResolution
   browserSnapshotToolMessages: Map<string, Array<Extract<ModelMessage, { role: 'tool' }>>>
   browserEvidence: BrowserFieldEvidence[]
   browserEvidenceRevision: number
@@ -765,6 +775,8 @@ export class AgentOrchestrator {
         browserRead: false,
         browserAuthorization: browserAuthorization(input.content),
         browserSnapshots: new Map(),
+        browserEvidencePages: [],
+        browserPageEvidenceRevision: 0,
         browserSnapshotToolMessages: new Map(),
         browserEvidence: [],
         browserEvidenceRevision: 0,
@@ -1397,11 +1409,13 @@ export class AgentOrchestrator {
         this.rememberBrowserEvidence(active, candidate, data.snapshot, privateFieldEvidence)
         pageAuthenticationRequired = data.snapshot.auth === 'required'
         if (!pageAuthenticationRequired
-          && active.browserEvidence.length > 0
+          && (active.browserEvidence.length > 0
+            || data.snapshot.nodes.some(({ answerable }) => answerable === true))
           && data.snapshot.cursor === undefined
           && active.browserAuthorization.mutationTypes.length === 0
           && active.browserAuthorization.navigationUrls.size === 0) {
-          earlyBrowserAnswer = await this.matchedBrowserEvidenceAnswer(active)
+          earlyBrowserAnswer = await this.matchedBrowserPageAnswer(active)
+            ?? await this.matchedBrowserEvidenceAnswer(active)
         }
       }
     }
@@ -1425,6 +1439,7 @@ export class AgentOrchestrator {
       const actions = browserSessionActInputSchema.parse(executorInput).actions
       if (actions.some((action) => action.type === 'navigate')) {
         active.browserSnapshots.clear()
+        this.clearBrowserPageEvidence(active)
         const hadBrowserEvidence = active.browserEvidence.length > 0
         active.browserEvidence.length = 0
         if (hadBrowserEvidence) active.browserEvidenceRevision += 1
@@ -1502,6 +1517,7 @@ export class AgentOrchestrator {
       active.browserHandoffCode = undefined
       active.browserTerminal = false
       active.browserSnapshots.clear()
+      this.clearBrowserPageEvidence(active)
       this.supersedeBrowserSnapshots(active)
       if (active.browserEvidence.length > 0) active.browserEvidenceRevision += 1
       active.browserEvidence.length = 0
@@ -1765,8 +1781,28 @@ export class AgentOrchestrator {
       && (previousSnapshot.origin !== snapshot.origin
         || previousSnapshot.navigationEpoch !== snapshot.navigationEpoch)) {
       active.browserSnapshots.clear()
+      this.clearBrowserPageEvidence(active)
       evidenceChanged = active.browserEvidence.length > 0
       active.browserEvidence.length = 0
+    }
+    const previousEvidencePage = active.browserEvidencePages.at(-1)
+    if (previousEvidencePage
+      && (previousEvidencePage.snapshotId !== snapshot.snapshotId
+        || previousEvidencePage.origin !== snapshot.origin
+        || previousEvidencePage.navigationEpoch !== snapshot.navigationEpoch)) {
+      this.clearBrowserPageEvidence(active)
+    }
+    const duplicateEvidencePage = active.browserEvidencePages.some((page) => (
+      page.snapshotId === snapshot.snapshotId
+      && page.cursor === snapshot.cursor
+      && page.nodes.length === snapshot.nodes.length
+      && page.nodes.every((node, index) => node.ref === snapshot.nodes[index]?.ref)
+    ))
+    if (!duplicateEvidencePage) {
+      active.browserEvidencePages.push(snapshot)
+      active.browserPageEvidenceRevision += 1
+      active.browserPageEvidenceMatchRevision = undefined
+      active.browserPageEvidenceSelection = undefined
     }
     active.browserSnapshots.set(snapshot.snapshotId, snapshot)
     for (const evidence of privateFieldEvidence) {
@@ -1799,6 +1835,73 @@ export class AgentOrchestrator {
       }
     }
     if (evidenceChanged) active.browserEvidenceRevision += 1
+  }
+
+  private clearBrowserPageEvidence(active: ActiveAgentRun): void {
+    if (active.browserEvidencePages.length > 0) active.browserPageEvidenceRevision += 1
+    active.browserEvidencePages.length = 0
+    active.browserPageEvidenceMatchRevision = undefined
+    active.browserPageEvidenceSelection = undefined
+  }
+
+  private browserPageAnswerFromSelection(
+    active: ActiveAgentRun,
+    selection: BrowserPageEvidenceResolution | undefined,
+  ): string | undefined {
+    if (!selection || selection.selectedNodeIds.length === 0) return undefined
+    const located = active.browserEvidencePages.flatMap((page, pageIndex) => (
+      page.nodes.map((node, nodeIndex) => ({ page, pageIndex, node, nodeIndex }))
+    ))
+    const byRef = new Map(located.map((entry) => [entry.node.ref, entry]))
+    const selected = selection.selectedNodeIds.flatMap((ref) => {
+      const entry = byRef.get(ref)
+      return entry?.node.answerable === true ? [entry] : []
+    })
+    if (selected.length !== selection.selectedNodeIds.length
+      || (selection.shape === 'scalar' && selected.length !== 1)) return undefined
+    selected.sort((left, right) => left.pageIndex - right.pageIndex || left.nodeIndex - right.nodeIndex)
+    const values = selected.map(({ node }) => safeAnswerText(node.value ?? node.name)).filter(Boolean)
+    if (values.length !== selected.length) return undefined
+    const firstPage = selected[0]?.page
+    if (!firstPage) return undefined
+    const pageLabel = safeAnswerText(active.browserCandidate?.pageLabel ?? firstPage.title)
+    const provenance = `（来源：${pageLabel} / ${firstPage.origin}；读取时间：${firstPage.capturedAt}）。`
+    if (selection.shape === 'scalar') {
+      return `页面“${pageLabel}”中的相关内容：${values[0]}${provenance}`
+    }
+    return `根据页面“${pageLabel}”，已确认的相关内容有：\n`
+      + `${values.map((value) => `- ${value}`).join('\n')}\n${provenance}`
+  }
+
+  private async matchedBrowserPageAnswer(active: ActiveAgentRun): Promise<string | undefined> {
+    const pages = active.browserEvidencePages
+    if (pages.length === 0
+      || pages.at(-1)?.cursor !== undefined
+      || !pages.some((page) => page.nodes.some(({ answerable }) => answerable === true))) return undefined
+    if (active.browserPageEvidenceMatchRevision === active.browserPageEvidenceRevision) {
+      return this.browserPageAnswerFromSelection(active, active.browserPageEvidenceSelection)
+    }
+    const revision = active.browserPageEvidenceRevision
+    const selection = await resolveBrowserPageEvidence({
+      trustedRequest: active.browserAuthorization.trustedRequest,
+      pages: Object.freeze([...pages]),
+      providerSnapshot: active.providerSnapshot,
+      providerUsage: this.dependencies.providerUsage,
+      model: active.model,
+      userId: active.userId,
+      requestId: active.requestId,
+      evidenceRevision: revision,
+      chatRunId: active.runId,
+      signal: active.controller.signal,
+      id: this.id,
+      now: this.now,
+    })
+    if (selection.usage) this.addUsage(active, selection.usage)
+    if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+    if (active.browserPageEvidenceRevision !== revision) return undefined
+    active.browserPageEvidenceMatchRevision = revision
+    active.browserPageEvidenceSelection = selection
+    return this.browserPageAnswerFromSelection(active, selection)
   }
 
   private async matchedBrowserEvidenceAnswer(active: ActiveAgentRun): Promise<string | undefined> {
@@ -1850,6 +1953,8 @@ export class AgentOrchestrator {
   }
 
   private async browserAnswer(active: ActiveAgentRun): Promise<string> {
+    const pageMatched = await this.matchedBrowserPageAnswer(active)
+    if (pageMatched !== undefined) return pageMatched
     const matched = await this.matchedBrowserEvidenceAnswer(active)
     if (matched !== undefined) return matched
     if (active.browserHandoffCode === 'AUTH_REQUIRED') {
