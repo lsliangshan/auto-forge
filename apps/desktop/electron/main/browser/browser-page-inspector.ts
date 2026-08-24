@@ -205,6 +205,7 @@ interface SnapshotIdentity {
 
 interface RefState extends SnapshotIdentity, SafeCandidate {
   readonly ref: string
+  readonly pageCursor?: string
 }
 
 interface CursorState extends SnapshotIdentity {
@@ -223,6 +224,7 @@ const maxImagePixels = 1_000_000
 const maxVisualTiles = 3
 const maxVisualNodes = 200
 const maxVisualTilePixels = 1_000_000
+const maxVisualTileDimension = 10_000
 const maxTextLength = 512
 const maxStaticFieldLabelLength = 80
 const maxStaticFieldValueLength = 256
@@ -508,11 +510,16 @@ function authNode(node: BrowserInspectionNode): boolean {
 }
 
 function imageRestrictedNode(node: BrowserInspectionNode): boolean {
-  const combined = `${node.name} ${node.dom.inputType ?? ''}`
+  const combined = [node.name, node.value, node.dom.inputType, node.dom.autocomplete]
+    .filter((value): value is string => value !== undefined)
+    .join(' ')
   return authNode(node)
     || node.dom.inputType?.toLowerCase() === 'file'
+    || authenticationText.test(combined)
+    || loginText.test(combined)
     || paymentText.test(combined)
     || signatureText.test(combined)
+    || sensitiveText(combined)
 }
 
 function rectanglesIntersect(left: BrowserInspectionNodeBox, right: BrowserInspectionNodeBox): boolean {
@@ -529,6 +536,20 @@ function validVisualBox(value: BrowserInspectionNodeBox | undefined): value is B
     && value.y >= 0
     && value.width > 0
     && value.height > 0
+}
+
+function rectangleContains(outer: BrowserInspectionNodeBox, inner: BrowserInspectionNodeBox): boolean {
+  return outer.x <= inner.x
+    && outer.y <= inner.y
+    && outer.x + outer.width >= inner.x + inner.width
+    && outer.y + outer.height >= inner.y + inner.height
+}
+
+function sameActions(
+  left: BrowserSemanticNode['actions'],
+  right: BrowserSemanticNode['actions'],
+): boolean {
+  return left.length === right.length && left.every((action, index) => action === right[index])
 }
 
 function relevantValue(name: string, intent: string): boolean {
@@ -696,12 +717,15 @@ export class BrowserPageInspector {
     if (!binding.browserContinuation?.readableRegions?.length) throw failure('UNSUPPORTED_CONTROL')
     const [firstPage] = input.pages
     if (!firstPage
-      || input.pages.some((page) => page.cursor !== undefined
-        || page.snapshotId !== firstPage.snapshotId
+      || input.pages.some((page) => page.snapshotId !== firstPage.snapshotId
         || page.bindingId !== firstPage.bindingId
         || page.origin !== firstPage.origin
         || page.navigationEpoch !== firstPage.navigationEpoch)) {
       throw failure('INVALID_INPUT')
+    }
+    if (input.pages.at(-1)?.cursor !== undefined
+      || input.pages.slice(0, -1).some((page) => page.cursor === undefined)) {
+      throw failure('PAGE_CHANGED')
     }
 
     const located = input.pages.flatMap((page) => page.nodes.map((node) => ({
@@ -722,6 +746,38 @@ export class BrowserPageInspector {
     if (located.some(({ state }) => !state || !this.sameIdentity(state, identity))) {
       throw failure('PAGE_CHANGED')
     }
+    const owned = [...this.refs.values()].filter((state) => this.sameIdentity(state, identity))
+    const ownedRefByBackendNodeId = new Map(owned.map((state) => [state.backendNodeId, state.ref]))
+    if (owned.length !== located.length
+      || [...this.cursors.values()].some((state) => this.sameIdentity(state, identity))
+      || located.some(({ node }, index) => {
+        const state = owned[index]
+        const parentRef = state?.parentBackendNodeId === undefined
+          ? undefined
+          : ownedRefByBackendNodeId.get(state.parentBackendNodeId)
+        return !state
+          || node.ref !== state.ref
+          || node.parentRef !== parentRef
+          || node.role !== state.role
+          || node.name !== state.name
+          || node.value !== state.value
+          || node.enabled !== state.enabled
+          || node.checked !== state.checked
+          || node.selected !== state.selected
+          || !sameActions(node.actions, state.actions)
+          || node.answerable !== (state.answerable === true ? true : undefined)
+      })) throw failure('PAGE_CHANGED')
+    let ownedIndex = 0
+    for (const submittedPage of input.pages) {
+      const pageStates = owned.slice(ownedIndex, ownedIndex + submittedPage.nodes.length)
+      const expectedCursor = pageStates[0]?.pageCursor
+      if (pageStates.length === 0
+        || submittedPage.cursor !== expectedCursor
+        || pageStates.some((state) => state.pageCursor !== expectedCursor)) {
+        throw failure('PAGE_CHANGED')
+      }
+      ownedIndex += submittedPage.nodes.length
+    }
     if (binding.bindingId !== firstPage.bindingId
       || binding.tabId !== input.tabId
       || input.navigationEpoch !== firstPage.navigationEpoch
@@ -736,6 +792,21 @@ export class BrowserPageInspector {
     ).map((node) => node.backendNodeId))
     const restrictedIds = this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes)
     const currentByBackendNodeId = new Map(visibleNodes.map((node) => [node.backendNodeId, node]))
+    const boxByBackendNodeId = new Map<number, BrowserInspectionNodeBox | undefined>()
+    const getBox = async (backendNodeId: number): Promise<BrowserInspectionNodeBox | undefined> => {
+      if (boxByBackendNodeId.has(backendNodeId)) return boxByBackendNodeId.get(backendNodeId)
+      const box = await this.port.getNodeBox({
+        tabId: input.tabId,
+        runId: input.lease.ownerRunId,
+        expectedOrigin: input.origin,
+        expectedNavigationEpoch: input.navigationEpoch,
+        backendNodeId,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        deadlineAt,
+      })
+      boxByBackendNodeId.set(backendNodeId, box)
+      return box
+    }
     const placed: Array<{
       readonly nodeId: string
       readonly box: BrowserInspectionNodeBox
@@ -755,15 +826,7 @@ export class BrowserPageInspector {
         || current.enabled !== retained.enabled
         || current.checked !== retained.checked
         || current.selected !== retained.selected) throw failure('PAGE_CHANGED')
-      const box = await this.port.getNodeBox({
-        tabId: retained.tabId,
-        runId: retained.runId,
-        expectedOrigin: retained.origin,
-        expectedNavigationEpoch: retained.navigationEpoch,
-        backendNodeId: retained.backendNodeId,
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
-        deadlineAt,
-      })
+      const box = await getBox(retained.backendNodeId)
       if (!validVisualBox(box)) {
         if (node.answerable) throw failure('PAGE_CHANGED')
         continue
@@ -774,17 +837,21 @@ export class BrowserPageInspector {
       && !placed.some(({ nodeId }) => nodeId === node.ref))) throw failure('PAGE_CHANGED')
     if (placed.length === 0) throw failure('UNSUPPORTED_CONTROL')
 
-    const documentX = Math.min(...placed.map(({ box }) => box.x))
-    const documentY = Math.min(...placed.map(({ box }) => box.y))
-    const documentRight = Math.max(...placed.map(({ box }) => box.x + box.width))
-    const documentBottom = Math.max(...placed.map(({ box }) => box.y + box.height))
+    const documentX = Math.floor(Math.min(...placed.map(({ box }) => box.x)))
+    const documentY = Math.floor(Math.min(...placed.map(({ box }) => box.y)))
+    const documentRight = Math.ceil(Math.max(...placed.map(({ box }) => box.x + box.width)))
+    const documentBottom = Math.ceil(Math.max(...placed.map(({ box }) => box.y + box.height)))
     const width = documentRight - documentX
     const height = documentBottom - documentY
-    const maxTileHeight = Math.floor(maxVisualTilePixels / width)
+    const maxTileHeight = Math.min(
+      maxVisualTileDimension,
+      Math.floor(maxVisualTilePixels / width),
+    )
     if (!Number.isFinite(width)
       || !Number.isFinite(height)
       || width <= 0
       || height <= 0
+      || width > maxVisualTileDimension
       || maxTileHeight <= 0) throw failure('ACTION_LIMIT_EXCEEDED')
     const tileCount = Math.ceil(height / maxTileHeight)
     if (tileCount > maxVisualTiles) throw failure('ACTION_LIMIT_EXCEEDED')
@@ -799,28 +866,48 @@ export class BrowserPageInspector {
         height: Math.min(maxTileHeight, documentBottom - y),
       })
     }))
+    if (tilePlans.some(({ x, y, width: tileWidth, height: tileHeight }) => (
+      ![x, y, tileWidth, tileHeight].every(Number.isFinite)
+      || !Number.isInteger(tileWidth)
+      || !Number.isInteger(tileHeight)
+      || tileWidth <= 0
+      || tileHeight <= 0
+      || tileWidth > maxVisualTileDimension
+      || tileHeight > maxVisualTileDimension
+      || tileWidth * tileHeight > maxVisualTilePixels
+    ))) throw failure('ACTION_LIMIT_EXCEEDED')
+
+    const readableLocators = new Set(binding.browserContinuation.readableRegions)
+    const mainFrameBackendNodeIds = new Set(mainFrameNodes.map((node) => node.backendNodeId))
+    const readableRootIds = new Set(page.locatorMatches.flatMap(({ locator, backendNodeIds }) => (
+      readableLocators.has(locator)
+        ? backendNodeIds.filter((backendNodeId) => mainFrameBackendNodeIds.has(backendNodeId))
+        : []
+    )))
+    const readableRootBoxes: BrowserInspectionNodeBox[] = []
+    for (const backendNodeId of readableRootIds) {
+      const box = await getBox(backendNodeId)
+      if (!validVisualBox(box)) throw failure('UNSUPPORTED_CONTROL')
+      readableRootBoxes.push(box)
+    }
     const protectedBoxes: BrowserInspectionNodeBox[] = []
     for (const node of visibleNodes.filter(imageRestrictedNode)) {
-      const box = await this.port.getNodeBox({
-        tabId: input.tabId,
-        runId: input.lease.ownerRunId,
-        expectedOrigin: input.origin,
-        expectedNavigationEpoch: input.navigationEpoch,
-        backendNodeId: node.backendNodeId,
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
-        deadlineAt,
-      })
+      const box = await getBox(node.backendNodeId)
       if (!validVisualBox(box)) throw failure('UNSUPPORTED_CONTROL')
       protectedBoxes.push(box)
     }
-    if (tilePlans.some((tile) => protectedBoxes.some((box) => rectanglesIntersect({
+    const tileBoxes = tilePlans.map((tile): BrowserInspectionNodeBox => ({
       x: tile.x,
       y: tile.y,
       width: tile.width,
       height: tile.height,
       viewportWidth: 0,
       viewportHeight: 0,
-    }, box)))) throw failure('UNSUPPORTED_CONTROL')
+    }))
+    if (tileBoxes.some((tile) => protectedBoxes.some((box) => rectanglesIntersect(tile, box)))
+      || tileBoxes.some((tile) => !readableRootBoxes.some((root) => rectangleContains(root, tile)))) {
+      throw failure('UNSUPPORTED_CONTROL')
+    }
 
     const placements: BrowserVisualNodePlacement[] = placed.map(({ nodeId, box }) => {
       const tile = tilePlans.reduce((best, candidate) => {
@@ -991,6 +1078,7 @@ export class BrowserPageInspector {
       const answerable = !parentsWithRetainedChildren.has(candidate.backendNodeId)
         && candidate.actions.length === 0
         && candidate.fieldValue === undefined
+        && !candidate.imageRestricted
         && !structuralRoles.has(candidate.role)
         && !interactiveRoles.has(candidate.role)
         && !instructionLikeText.test(renderValue)
@@ -1098,8 +1186,13 @@ export class BrowserPageInspector {
       nextIndex += 1
     }
     if (nodes.length === 0 && nextIndex < input.candidates.length) throw failure('UNSUPPORTED_CONTROL')
-    for (const state of acceptedRefs) this.refs.set(state.ref, state)
     const hasMore = nextIndex < input.candidates.length
+    for (const state of acceptedRefs) {
+      this.refs.set(state.ref, Object.freeze({
+        ...state,
+        ...(hasMore ? { pageCursor: possibleCursor } : {}),
+      }))
+    }
     if (hasMore) {
       this.cursors.set(possibleCursor, Object.freeze({ ...input, cursor: possibleCursor, nextIndex }))
     }

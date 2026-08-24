@@ -237,7 +237,6 @@ describe('BrowserPageInspector', () => {
   })
 
   it.each([
-    ['cursor', (snapshot: BrowserPageSnapshot) => [{ ...snapshot, cursor: 'cursor_more' }]],
     ['snapshot', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, snapshotId: 'snapshot_other' }]],
     ['binding', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, bindingId: 'binding_other' }]],
     ['origin', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, origin: 'https://other.example.cn' }]],
@@ -250,6 +249,83 @@ describe('BrowserPageInspector', () => {
       tabId: 'tab_1', navigationEpoch: 4, origin,
       pages: pages(snapshot),
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('builds visual evidence from a complete ordered two-page semantic chain', async () => {
+    const exactBinding = binding({ readableRegions: ['role=main'] })
+    const authority = input(exactBinding)
+    const port = new FakeCdpPort([
+      node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      ...Array.from({ length: 100 }, (_, index) => (
+        node(index + 11, 'statictext', `${'公'.repeat(500)}${index}`)
+      )),
+    ])
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 10
+        ? { x: 0, y: 0, width: 1_000, height: 800, viewportWidth: 1_200, viewportHeight: 800 }
+        : { x: 20, y: 20, width: 200, height: 20, viewportWidth: 1_200, viewportHeight: 800 }
+    ))
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const first = await inspector.inspect(authority)
+    expect(first.cursor).toEqual(expect.any(String))
+    const second = await inspector.inspect({ ...authority, cursor: first.cursor })
+    expect(second.cursor).toBeUndefined()
+
+    const bundle = await inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [first, second],
+    })
+
+    expect(bundle.pages).toEqual([first, second])
+    expect(bundle.placements).toHaveLength(first.nodes.length + second.nodes.length)
+    expect(port.capturePageScreenshot).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['incomplete', (first: BrowserPageSnapshot, second: BrowserPageSnapshot) => [second]],
+    ['reordered', (first: BrowserPageSnapshot, second: BrowserPageSnapshot) => [
+      second, { ...first, cursor: undefined },
+    ]],
+    ['tampered-cursor', (first: BrowserPageSnapshot, second: BrowserPageSnapshot) => [
+      { ...first, cursor: 'cursor_tampered' }, second,
+    ]],
+  ])('visual evidence rejects an %s semantic page chain', async (_case, submitted) => {
+    const exactBinding = binding({ readableRegions: ['role=main'] })
+    const authority = input(exactBinding)
+    const port = new FakeCdpPort([
+      node(10, 'main', '查询结果', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      ...Array.from({ length: 100 }, (_, index) => (
+        node(index + 11, 'statictext', `${'公'.repeat(500)}${index}`)
+      )),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const first = await inspector.inspect(authority)
+    const second = await inspector.inspect({ ...authority, cursor: first.cursor })
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin,
+      pages: submitted(first, second),
+    })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['text', (snapshot: BrowserPageSnapshot) => snapshot.nodes.map((candidate) => (
+      candidate.answerable ? { ...candidate, name: '篡改文本' } : candidate
+    ))],
+    ['answerable', (snapshot: BrowserPageSnapshot) => snapshot.nodes.map((candidate) => (
+      candidate.answerable ? { ...candidate, answerable: false } : candidate
+    ))],
+  ])('visual evidence rejects tampered authoritative node %s', async (_field, nodes) => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin,
+      pages: [{ ...snapshot, nodes: nodes(snapshot) }],
+    })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
     expect(port.capturePageScreenshot).not.toHaveBeenCalled()
   })
 
@@ -307,6 +383,9 @@ describe('BrowserPageInspector', () => {
       if (backendNodeId === 11) {
         return { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
       }
+      if (backendNodeId === 10) {
+        return { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+      }
       return { x: 100, y: 100, width: 200, height: 40, viewportWidth: 1_200, viewportHeight: 800 }
     })
 
@@ -314,6 +393,122 @@ describe('BrowserPageInspector', () => {
       lease: authority.lease,
       tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
     })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['secret token', node(12, 'statictext', '系统状态', { value: 'access_token=visible-secret' })],
+    ['Chinese identity', node(12, 'statictext', '身份证号 110101199001010000')],
+    ['OTP text', node(12, 'statictext', '短信验证码 848204')],
+  ])('visual evidence rejects visible %s geometry before capture', async (_case, restricted) => {
+    const { authority, inspector, port, snapshot } = await visualFixture([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '已通过'),
+      restricted,
+    ])
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 11
+        ? { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+        : backendNodeId === 10
+          ? { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+          : { x: 100, y: 100, width: 200, height: 40, viewportWidth: 1_200, viewportHeight: 800 }
+    ))
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects a tile spanning the gap between configured readable roots', async () => {
+    const exactBinding = binding({ readableRegions: ['css=#left', 'css=#right'] })
+    const authority = input(exactBinding)
+    const port = new FakeCdpPort([
+      node(20, 'region', '左区', { axNodeId: 'ax_left', parentAxNodeId: undefined }),
+      node(21, 'statictext', '左侧公开值', { parentAxNodeId: 'ax_left' }),
+      node(30, 'region', '右区', { axNodeId: 'ax_right', parentAxNodeId: undefined }),
+      node(31, 'statictext', '右侧公开值', { parentAxNodeId: 'ax_right' }),
+    ], {
+      locatorMatches: [
+        { locator: 'css=#left', backendNodeIds: [20] },
+        { locator: 'css=#right', backendNodeIds: [30] },
+      ],
+    })
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => {
+      if (backendNodeId === 20) return { x: 0, y: 0, width: 400, height: 400, viewportWidth: 1_200, viewportHeight: 800 }
+      if (backendNodeId === 30) return { x: 600, y: 0, width: 400, height: 400, viewportWidth: 1_200, viewportHeight: 800 }
+      if (backendNodeId === 21) return { x: 20, y: 20, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }
+      return { x: 620, y: 20, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }
+    })
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const snapshot = await inspector.inspect(authority)
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rounds fractional document geometry to integer tile metadata', async () => {
+    const exactBinding = binding({ readableRegions: ['role=main'] })
+    const authority = input(exactBinding)
+    const port = new FakeCdpPort([
+      node(10, 'none', '', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '已通过'),
+      node(12, 'statictext', '线上办理'),
+    ])
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 10
+        ? { x: 10, y: 20, width: 1_000, height: 200, viewportWidth: 1_200, viewportHeight: 800 }
+        : backendNodeId === 11
+          ? { x: 10.25, y: 20.75, width: 999.1, height: 100.1, viewportWidth: 1_200, viewportHeight: 800 }
+          : { x: 40.4, y: 60.6, width: 200.2, height: 20.2, viewportWidth: 1_200, viewportHeight: 800 }
+    ))
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const snapshot = await inspector.inspect(authority)
+
+    const bundle = await inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })
+
+    expect(bundle.tiles).toEqual([expect.objectContaining({
+      documentX: 10, documentY: 20, width: 1_000, height: 101,
+    })])
+    expect(bundle.tiles.every(({ width, height }) => (
+      Number.isInteger(width) && Number.isInteger(height)
+      && width <= 10_000 && height <= 10_000 && width * height <= 1_000_000
+    ))).toBe(true)
+  })
+
+  it('visual evidence rejects integer rounding that escapes a fractional readable root', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 10
+        ? { x: 10.25, y: 20.75, width: 999.1, height: 100.1, viewportWidth: 1_200, viewportHeight: 800 }
+        : { x: 40.4, y: 60.6, width: 200.2, height: 20.2, viewportWidth: 1_200, viewportHeight: 800 }
+    ))
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects document geometry wider than 10,000 pixels', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+    port.getNodeBox.mockResolvedValue({
+      x: 0, y: 0, width: 10_001, height: 1,
+      viewportWidth: 12_000, viewportHeight: 800,
+    })
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
     expect(port.capturePageScreenshot).not.toHaveBeenCalled()
   })
 
