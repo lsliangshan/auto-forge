@@ -1231,7 +1231,6 @@ describe('ElectronBrowserWorkspace', () => {
   })
 
   it('observes only suspended physical input and page activity', async () => {
-    let targetContents: FakeWebContents | undefined
     const harness = createHarness((method) => {
       if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
       if (method === 'Accessibility.queryAXTree') {
@@ -1259,7 +1258,7 @@ describe('ElectronBrowserWorkspace', () => {
     const lease = await registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_activity',
     })
-    targetContents = views[1]!.webContents
+    const targetContents = views[1]!.webContents
     targetContents.currentUrl = 'https://www.baidu.com/login'
     const activities: Array<{ kind: string }> = []
     const unsubscribe = workspace.onContinuationActivity((activity) => { activities.push(activity) })

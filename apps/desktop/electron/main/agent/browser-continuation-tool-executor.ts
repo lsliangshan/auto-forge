@@ -659,7 +659,6 @@ export class BrowserContinuationToolExecutor {
             state, context, page.origin, 'inspect', 'page', 'sensitive_read',
             terminal.code === 'CANCELLED' ? 'cancelled' : 'failed', terminal.code,
           )
-          audited = true
           throw terminalError
         }
         try {
@@ -671,7 +670,6 @@ export class BrowserContinuationToolExecutor {
             state, context, handoffPage.origin, 'inspect', 'page',
             'sensitive_read', 'handed_off', 'MANUAL_INTERVENTION_REQUIRED',
           )
-          audited = true
           return result
         } catch (handoffError) {
           const handoffFailure = toSafeAppError(handoffError)
@@ -683,7 +681,6 @@ export class BrowserContinuationToolExecutor {
             state, context, handoffPage.origin, 'handoff', 'page',
             'external_action', 'failed', handoffFailure.code,
           )
-          audited = true
           throw handoffError
         }
       }
@@ -842,7 +839,6 @@ export class BrowserContinuationToolExecutor {
               state, context, page.origin, normalized, target,
               terminal.code === 'CANCELLED' ? 'cancelled' : 'failed', terminal.code,
             )
-            audited = true
             throw terminalError
           }
           try {
@@ -863,7 +859,6 @@ export class BrowserContinuationToolExecutor {
               state, context, handoffPage.origin, 'handoff', targetSummary(target),
               'external_action', 'failed', handoffFailure.code,
             )
-            audited = true
             throw handoffError
           }
         }

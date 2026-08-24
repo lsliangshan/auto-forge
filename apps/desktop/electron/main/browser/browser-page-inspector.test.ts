@@ -82,9 +82,12 @@ class FakeCdpPort implements BrowserPageCdpPort {
   readonly readNode = vi.fn(async (input: { backendNodeId: number }) => (
     this.page.nodes.find((candidate) => candidate.backendNodeId === input.backendNodeId)
   ))
-  readonly getNodeBox = vi.fn(async (_input: { readonly backendNodeId: number }) => ({
-    x: 20, y: 30, width: 320, height: 200, viewportWidth: 1200, viewportHeight: 800,
-  }))
+  readonly getNodeBox = vi.fn(async (input: { readonly backendNodeId: number }) => {
+    void input
+    return {
+      x: 20, y: 30, width: 320, height: 200, viewportWidth: 1200, viewportHeight: 800,
+    }
+  })
   readonly captureNodeScreenshot = vi.fn(async () => 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')
   readonly capturePageScreenshot = vi.fn(async () => 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')
   private readonly invalidationListeners = new Set<(tabId: string) => void>()
