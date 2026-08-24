@@ -29,6 +29,7 @@ import type {
   BrowserPageSnapshot,
   BrowserSemanticNode,
   BrowserValueSource,
+  BrowserVisualEvidenceBundle,
 } from '../browser/browser-continuation-types.js'
 import type { BrowserLoginWaitCoordinator } from '../browser/browser-login-wait-coordinator.js'
 import type { BrowserManualResumeCoordinator } from '../browser/browser-manual-resume-coordinator.js'
@@ -123,7 +124,7 @@ interface BrowserActionAuditRepository {
 
 interface BrowserContinuationToolExecutorDependencies {
   readonly registry: Pick<BrowserContinuationRegistry, 'acquire'>
-  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'endRun'>
+  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'captureVisualEvidence' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
   readonly loginWait: Pick<BrowserLoginWaitCoordinator, 'wait' | 'cancel'>
   readonly manualWait?: Pick<BrowserManualResumeCoordinator, 'wait' | 'cancel'>
@@ -175,6 +176,10 @@ export type BrowserManualWaitResult =
 
 export type BrowserContinuationValidationResult =
   | { readonly kind: 'valid' }
+  | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
+
+export type BrowserVisualEvidenceResult =
+  | { readonly kind: 'success'; readonly data: BrowserVisualEvidenceBundle }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
 function failure(code: AppErrorCode): AppError {
@@ -274,7 +279,7 @@ export class BrowserContinuationToolExecutor {
     rawInput: unknown,
     context: BrowserContinuationRunContext,
   ): Promise<BrowserContinuationToolResult> {
-    if (!this.runAdmitted(context.runId) || this.isTerminalRun(context.runId)) {
+    if (!this.isRunActive(context.runId) || this.isTerminalRun(context.runId)) {
       return { kind: 'tool_error', code: 'CANCELLED' }
     }
     if (tool !== 'browser_session_inspect'
@@ -314,6 +319,62 @@ export class BrowserContinuationToolExecutor {
 
   async takeOver(runId: string): Promise<void> {
     await this.endRun(runId)
+  }
+
+  async captureVisualEvidence(
+    input: {
+      readonly bindingId: string
+      readonly snapshotId: string
+      readonly pages: readonly BrowserPageSnapshot[]
+    },
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserVisualEvidenceResult> {
+    try {
+      const state = this.runs.get(context.runId)
+      if (!state || state.runId !== context.runId || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension) {
+        throw failure('CANCELLED')
+      }
+      if (state.bindingId !== input.bindingId) throw failure('NO_BOUND_PAGE')
+      const lease = state.lease
+      if (!lease) throw failure('CANCELLED')
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      const snapshot = state.snapshots.get(input.snapshotId)
+      const finalPage = input.pages.at(-1)
+      if (!snapshot || !finalPage
+        || input.pages.some((page) => page.snapshotId !== input.snapshotId
+          || page.bindingId !== input.bindingId
+          || page.origin !== snapshot.origin
+          || page.navigationEpoch !== snapshot.navigationEpoch)
+        || finalPage !== snapshot) {
+        throw failure('PAGE_CHANGED')
+      }
+      const page = await this.dependencies.workspace.getContinuationState(
+        lease.binding.tabId,
+        context.runId,
+      )
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      if (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch) {
+        throw failure('PAGE_CHANGED')
+      }
+      const captureInput = {
+        lease,
+        tabId: lease.binding.tabId,
+        navigationEpoch: page.navigationEpoch,
+        origin: page.origin,
+        pages: input.pages,
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
+      }
+      const data = await this.dependencies.inspector.captureVisualEvidence(captureInput)
+      if (!this.isRunActive(context.runId) || context.signal?.aborted) {
+        return { kind: 'tool_error', code: 'CANCELLED' }
+      }
+      return { kind: 'success', data }
+    } catch (error) {
+      return { kind: 'tool_error', code: toSafeAppError(error).code }
+    }
   }
 
   async waitForAuthentication(
@@ -1063,7 +1124,7 @@ export class BrowserContinuationToolExecutor {
     return true
   }
 
-  private runAdmitted(runId: string): boolean {
+  private isRunActive(runId: string): boolean {
     try {
       return this.dependencies.isRunActive(runId)
     } catch {

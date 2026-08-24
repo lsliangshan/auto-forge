@@ -4,6 +4,7 @@ import type {
   BrowserContinuationBinding,
   BrowserContinuationLease,
   BrowserPageSnapshot,
+  BrowserVisualEvidenceBundle,
 } from '../browser/browser-continuation-types.js'
 import {
   BrowserContinuationToolExecutor,
@@ -53,8 +54,22 @@ function run(overrides: Partial<BrowserContinuationRunContext> = {}): BrowserCon
   }
 }
 
+function visualBundle(page: BrowserPageSnapshot): BrowserVisualEvidenceBundle {
+  return Object.freeze({
+    snapshotId: page.snapshotId,
+    bindingId: page.bindingId,
+    origin: page.origin,
+    navigationEpoch: page.navigationEpoch,
+    capturedAt: '2026-08-24T00:00:00.000Z',
+    pages: Object.freeze([page]),
+    tiles: Object.freeze([]),
+    placements: Object.freeze([]),
+  })
+}
+
 function harness(options: {
   snapshots?: BrowserPageSnapshot[]
+  visualEvidenceBundle?: BrowserVisualEvidenceBundle
   now?: () => number
   terminalRunLimit?: number
   terminalRunTtlMs?: number
@@ -101,6 +116,7 @@ function harness(options: {
       auth: 'authenticated',
       semanticFingerprint: semanticFingerprint(),
     })),
+    captureVisualEvidence: vi.fn(async () => options.visualEvidenceBundle ?? visualBundle(snapshot())),
     endRun: vi.fn(),
   }
   const state = {
@@ -232,6 +248,144 @@ describe('BrowserContinuationToolExecutor', () => {
       }],
     })
     expect(JSON.stringify(result.kind === 'success' ? result.data : {})).not.toContain('202111127927')
+  })
+
+  it('captures visual evidence only from the current run snapshot chain', async () => {
+    const page = snapshot()
+    const evidence = visualBundle(page)
+    const test = harness({ snapshots: [page], visualEvidenceBundle: evidence })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+    }, run())).resolves.toEqual({ kind: 'success', data: evidence })
+    expect(test.inspector.captureVisualEvidence).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ ownerRunId: 'agent_run_1' }),
+      tabId: 'tab_1', navigationEpoch: 1,
+      origin: 'https://service.example',
+      pages: [expect.objectContaining({ snapshotId: 'snapshot_1' })],
+    }))
+  })
+
+  it('rejects visual evidence capture for an unknown run', async () => {
+    const test = harness()
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [snapshot()],
+    }, run({ runId: 'agent_run_unknown' }))).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence capture when the run is no longer active', async () => {
+    let active = true
+    const page = snapshot()
+    const test = harness({ snapshots: [page], isRunActive: () => active })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    active = false
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence capture after its lease is no longer current', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    await test.lease.release()
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence capture with a different binding', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_other', snapshotId: 'snapshot_1', pages: [page],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'NO_BOUND_PAGE' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence capture without the stored latest snapshot', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_unknown', pages: [snapshot({ snapshotId: 'snapshot_unknown' })],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence capture after workspace state changes', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    test.state.navigationEpoch = 2
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects a visual evidence chain whose final page is not the stored snapshot', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [{ ...page, title: '篡改标题' }],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence capture for an aborted context', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+    }, run({ signal: controller.signal }))).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('returns a safe tool error when visual evidence capture fails', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    test.inspector.captureVisualEvidence.mockRejectedValueOnce({ code: 'INTERNAL_ERROR' })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    await expect(test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [page],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
   })
 
   it('rechecks development eligibility after a hung inspection before admitting its snapshot', async () => {
