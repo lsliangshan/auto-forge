@@ -95,6 +95,7 @@ export interface BrowserActionTargetContext {
 
 export interface BrowserSemanticNode {
   readonly ref: string
+  readonly parentRef?: string
   readonly role: string
   readonly name: string
   readonly value?: string
@@ -102,6 +103,7 @@ export interface BrowserSemanticNode {
   readonly checked?: boolean
   readonly selected?: boolean
   readonly actions: readonly ('fill' | 'select' | 'click' | 'check' | 'scroll')[]
+  readonly answerable?: boolean
 }
 
 export interface BrowserPageSnapshot {
