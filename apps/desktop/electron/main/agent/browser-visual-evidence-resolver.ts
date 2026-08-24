@@ -46,6 +46,7 @@ const resultSchema = z.object({
   selectedNodeIds: z.array(nodeIdSchema).max(100),
   supportingNodeIds: z.array(nodeIdSchema).max(200),
 }).strict()
+const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
 const tileSchema = z.object({
   tileId: nodeIdSchema,
   mediaType: z.literal('image/png'),
@@ -58,7 +59,19 @@ const tileSchema = z.object({
   height: z.number().int().positive().max(10_000),
   documentX: z.number().finite().nonnegative(),
   documentY: z.number().finite().nonnegative(),
-}).strict().refine(({ width, height }) => width * height <= 1_000_000)
+}).strict()
+  .refine(({ width, height }) => width * height <= 1_000_000)
+  .refine(({ dataBase64, width, height }) => {
+    const bytes = Buffer.from(dataBase64, 'base64')
+    return bytes.length >= 29
+      && bytes.subarray(0, pngSignature.length).equals(pngSignature)
+      && bytes.readUInt32BE(8) === 13
+      && bytes.subarray(12, 16).toString('ascii') === 'IHDR'
+      && bytes.readUInt32BE(16) > 0
+      && bytes.readUInt32BE(20) > 0
+      && bytes.readUInt32BE(16) === width
+      && bytes.readUInt32BE(20) === height
+  })
 const placementSchema = z.object({
   nodeId: nodeIdSchema,
   tileId: nodeIdSchema,

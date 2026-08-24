@@ -270,6 +270,80 @@ describe('BrowserContinuationToolExecutor', () => {
     }))
   })
 
+  it('revalidates current visual evidence without recapturing or auditing', async () => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    const auditCount = test.audits.length
+
+    await expect(test.executor.validateVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())).resolves.toEqual({ kind: 'valid' })
+
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+    expect(test.audits).toHaveLength(auditCount)
+  })
+
+  it.each([
+    ['workspace navigation epoch changes', async (test: ReturnType<typeof harness>) => {
+      test.state.navigationEpoch = 2
+    }, 'PAGE_CHANGED'],
+    ['the latest snapshot is replaced', async (test: ReturnType<typeof harness>) => {
+      test.inspector.inspect.mockResolvedValueOnce(snapshot({ snapshotId: 'snapshot_2' }))
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '重新查看表单',
+      }, run())
+    }, 'PAGE_CHANGED'],
+    ['run cleanup wins the race', async (test: ReturnType<typeof harness>) => {
+      await test.executor.endRun('agent_run_1')
+    }, 'CANCELLED'],
+  ] as const)('rejects visual evidence revalidation after %s', async (_case, change, code) => {
+    const page = snapshot()
+    const test = harness({ snapshots: [page] })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    await change(test)
+
+    await expect(test.executor.validateVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code })
+    expect(test.inspector.captureVisualEvidence).not.toHaveBeenCalled()
+  })
+
+  it('rejects visual evidence revalidation when the run becomes inactive during workspace lookup', async () => {
+    let active = true
+    let finishLookup!: (value: {
+      origin: string
+      url: string
+      navigationEpoch: number
+      activityRevision: number
+    }) => void
+    const lookup = new Promise<{
+      origin: string
+      url: string
+      navigationEpoch: number
+      activityRevision: number
+    }>((resolve) => { finishLookup = resolve })
+    const page = snapshot()
+    const test = harness({ snapshots: [page], isRunActive: () => active })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+    test.workspace.getContinuationState.mockImplementationOnce(async () => lookup)
+
+    const validation = test.executor.validateVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())
+    await vi.waitFor(() => expect(test.workspace.getContinuationState).toHaveBeenCalledOnce())
+    active = false
+    finishLookup({ ...test.state })
+
+    await expect(validation).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+  })
+
   it('captures a cloned complete semantic page chain in its original order', async () => {
     const first = snapshot({
       cursor: 'cursor_1',

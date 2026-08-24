@@ -424,6 +424,43 @@ describe('BrowserPageInspector', () => {
     expect(port.capturePageScreenshot).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['child-frame evidence', node(12, 'textbox', '公开字段', { frameId: 'frame_child' })],
+    ['an iframe owner', node(12, 'generic', '嵌入内容', { dom: { tagName: 'iframe' } })],
+    ['a canvas owner', node(12, 'img', '结果图', { dom: { tagName: 'canvas' } })],
+    ['an AX-offscreen password', node(12, 'textbox', '账户口令', {
+      ignored: true, dom: { tagName: 'input', inputType: 'password' },
+    })],
+    ['an AX-offscreen OTP', node(12, 'textbox', '短信验证码', {
+      ignored: true, dom: { tagName: 'input', autocomplete: 'one-time-code' },
+    })],
+    ['an AX-offscreen identity number', node(12, 'statictext', '身份证号 110101199001010000', {
+      ignored: true,
+    })],
+    ['an AX-offscreen secret', node(12, 'statictext', '系统状态', {
+      ignored: true, value: 'access_token=visible-secret',
+    })],
+  ])('visual evidence rejects %s before the first capture', async (_case, restricted) => {
+    const { authority, inspector, port, snapshot } = await visualFixture([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '已通过'),
+      restricted,
+    ])
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 11
+        ? { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+        : backendNodeId === 10
+          ? { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+          : { x: 100, y: 100, width: 200, height: 40, viewportWidth: 1_200, viewportHeight: 800 }
+    ))
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
   it('visual evidence rejects a tile spanning the gap between configured readable roots', async () => {
     const exactBinding = binding({ readableRegions: ['css=#left', 'css=#right'] })
     const authority = input(exactBinding)

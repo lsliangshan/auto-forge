@@ -414,6 +414,56 @@ export class BrowserContinuationToolExecutor {
     }
   }
 
+  async validateVisualEvidence(
+    input: {
+      readonly bindingId: string
+      readonly snapshotId: string
+      readonly pages: readonly BrowserPageSnapshot[]
+    },
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserContinuationValidationResult> {
+    try {
+      const state = this.runs.get(context.runId)
+      if (!state || state.runId !== context.runId || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension) {
+        throw failure('CANCELLED')
+      }
+      if (state.bindingId !== input.bindingId) throw failure('NO_BOUND_PAGE')
+      const lease = state.lease
+      if (!lease) throw failure('CANCELLED')
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      const snapshot = state.latestSnapshot
+      const finalPage = input.pages.at(-1)
+      if (!snapshot || input.snapshotId !== snapshot.snapshotId || !finalPage
+        || input.pages.some((page) => page.snapshotId !== input.snapshotId
+          || page.bindingId !== input.bindingId
+          || page.origin !== snapshot.origin
+          || page.navigationEpoch !== snapshot.navigationEpoch)
+        || !sameSnapshot(finalPage, snapshot)) {
+        throw failure('PAGE_CHANGED')
+      }
+      const page = await this.dependencies.workspace.getContinuationState(
+        lease.binding.tabId,
+        context.runId,
+      )
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      if (this.runs.get(context.runId) !== state || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension || state.bindingId !== input.bindingId
+        || state.lease !== lease) throw failure('CANCELLED')
+      if (state.latestSnapshot !== snapshot) {
+        throw failure(state.latestSnapshot === undefined ? 'CANCELLED' : 'PAGE_CHANGED')
+      }
+      if (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch) {
+        throw failure('PAGE_CHANGED')
+      }
+      return { kind: 'valid' }
+    } catch (error) {
+      return { kind: 'tool_error', code: toSafeAppError(error).code }
+    }
+  }
+
   async waitForAuthentication(
     runId: string,
     context: BrowserContinuationRunContext,

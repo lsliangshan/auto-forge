@@ -14,6 +14,8 @@ import {
 } from '../database/repositories.js'
 import { resolveBrowserVisualEvidence } from './browser-visual-evidence-resolver.js'
 
+const minimalPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+
 const page: BrowserPageSnapshot = {
   snapshotId: 'snapshot_1',
   bindingId: 'binding_1',
@@ -45,17 +47,17 @@ const bundle: BrowserVisualEvidenceBundle = {
   tiles: [{
     tileId: 'tile_1',
     mediaType: 'image/png',
-    dataBase64: 'cG5n',
-    width: 400,
-    height: 200,
+    dataBase64: minimalPngBase64,
+    width: 1,
+    height: 1,
     documentX: 0,
-    documentY: 100,
+    documentY: 0,
   }],
   placements: [
-    { nodeId: 'ref_degree', tileId: 'tile_1', x: 10, y: 10, width: 100, height: 20 },
-    { nodeId: 'ref_uploaded_1', tileId: 'tile_1', x: 200, y: 10, width: 80, height: 20 },
-    { nodeId: 'ref_degree_type', tileId: 'tile_1', x: 10, y: 50, width: 100, height: 20 },
-    { nodeId: 'ref_uploaded_2', tileId: 'tile_1', x: 200, y: 50, width: 80, height: 20 },
+    { nodeId: 'ref_degree', tileId: 'tile_1', x: 0.05, y: 0.05, width: 0.4, height: 0.1 },
+    { nodeId: 'ref_uploaded_1', tileId: 'tile_1', x: 0.55, y: 0.05, width: 0.4, height: 0.1 },
+    { nodeId: 'ref_degree_type', tileId: 'tile_1', x: 0.05, y: 0.5, width: 0.4, height: 0.1 },
+    { nodeId: 'ref_uploaded_2', tileId: 'tile_1', x: 0.55, y: 0.5, width: 0.4, height: 0.1 },
   ],
 }
 
@@ -141,7 +143,7 @@ describe('resolveBrowserVisualEvidence', () => {
       role: 'user',
       content: [
         expect.objectContaining({ type: 'text', text: expect.stringContaining('我上传了哪些附件') }),
-        { type: 'media', kind: 'image', mimeType: 'image/png', dataBase64: 'cG5n' },
+        { type: 'media', kind: 'image', mimeType: 'image/png', dataBase64: minimalPngBase64 },
       ],
     })
     const userContent = request.messages.at(-1)?.content
@@ -152,11 +154,11 @@ describe('resolveBrowserVisualEvidence', () => {
       pages: [page],
       placements: bundle.placements,
       tiles: [{
-        tileId: 'tile_1', mediaType: 'image/png', width: 400, height: 200,
-        documentX: 0, documentY: 100,
+        tileId: 'tile_1', mediaType: 'image/png', width: 1, height: 1,
+        documentX: 0, documentY: 0,
       }],
     })
-    expect(userContent[0].text).not.toContain('cG5n')
+    expect(userContent[0].text).not.toContain(minimalPngBase64)
     expect(request.tools).toEqual([expect.objectContaining({
       function: expect.objectContaining({
         name: 'report_browser_visual_evidence',
@@ -185,13 +187,29 @@ describe('resolveBrowserVisualEvidence', () => {
     ['non-canonical base64', withBundle({
       tiles: [{ ...bundle.tiles[0]!, dataBase64: 'cG5n====' }],
     }), '我上传了哪些附件'],
+    ['an invalid PNG signature', withBundle({
+      tiles: [{ ...bundle.tiles[0]!, dataBase64: Buffer.from('not a png').toString('base64') }],
+    }), '我上传了哪些附件'],
+    ['a missing IHDR chunk', withBundle({
+      tiles: [{
+        ...bundle.tiles[0]!,
+        dataBase64: (() => {
+          const bytes = Buffer.from(minimalPngBase64, 'base64')
+          bytes.write('IDAT', 12, 'ascii')
+          return bytes.toString('base64')
+        })(),
+      }],
+    }), '我上传了哪些附件'],
+    ['PNG dimensions that disagree with tile metadata', withBundle({
+      tiles: [{ ...bundle.tiles[0]!, width: 2 }],
+    }), '我上传了哪些附件'],
     ['more than 200 placements', withBundle({
       placements: Array.from({ length: 201 }, (_, index) => ({
         nodeId: `ref_${index}`, tileId: 'tile_1', x: 0, y: 0, width: 1, height: 1,
       })),
     }), '我上传了哪些附件'],
     ['a placement outside its tile', withBundle({
-      placements: [{ nodeId: 'ref_degree', tileId: 'tile_1', x: 399, y: 0, width: 2, height: 1 }],
+      placements: [{ nodeId: 'ref_degree', tileId: 'tile_1', x: 0.9, y: 0, width: 0.2, height: 1 }],
     }), '我上传了哪些附件'],
     ['an unknown placement node ID', withBundle({
       placements: [{ nodeId: 'ref_missing', tileId: 'tile_1', x: 0, y: 0, width: 1, height: 1 }],

@@ -786,8 +786,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const allRawNodes = accessibility.nodes ?? []
       if (allRawNodes.length > MAX_BROWSER_INSPECTION_RAW_NODES) throw failure('ACTION_LIMIT_EXCEEDED')
       const rawNodes = allRawNodes
-        .filter((node) => node.frameId === undefined || node.frameId === frameId)
         .filter((node) => typeof node.nodeId === 'string' && typeof node.backendDOMNodeId === 'number')
+      const mainFrameRawNodes = rawNodes.filter((node) => (
+        node.frameId === undefined || node.frameId === frameId
+      ))
       const nodes: BrowserInspectionNode[] = []
       for (const rawNode of rawNodes) {
         const backendNodeId = rawNode.backendDOMNodeId!
@@ -802,7 +804,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const locatorMatches = []
       let locatorMatchCount = 0
       for (const locator of input.locators) {
-        const backendNodeIds = await this.resolveLocatorMatches(state, locator, rawNodes, budget)
+        const backendNodeIds = await this.resolveLocatorMatches(state, locator, mainFrameRawNodes, budget)
         this.assertContinuationState(state, input)
         locatorMatchCount += backendNodeIds.length
         if (locatorMatchCount > maxBrowserInspectionTotalLocatorMatches) {

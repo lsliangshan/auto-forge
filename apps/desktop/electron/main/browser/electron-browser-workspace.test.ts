@@ -422,6 +422,9 @@ describe('ElectronBrowserWorkspace', () => {
         if (input?.backendNodeId === 12) {
           return { node: { backendNodeId: 12, nodeName: 'INPUT', attributes: ['type', 'hidden', 'value', 'hidden-token'] } }
         }
+        if (input?.backendNodeId === 99) {
+          return { node: { backendNodeId: 99, nodeName: 'INPUT', attributes: ['type', 'password'] } }
+        }
         return { node: { backendNodeId: input?.backendNodeId, nodeName: input?.backendNodeId === 11 ? 'INPUT' : 'MAIN', attributes: input?.backendNodeId === 11 ? ['type', 'date', 'readonly', ''] : [] } }
       }
       if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
@@ -447,7 +450,7 @@ describe('ElectronBrowserWorkspace', () => {
       runId: 'agent_run_1',
       expectedOrigin: 'https://www.baidu.com',
       expectedNavigationEpoch: tab.navigationEpoch,
-      locators: ['role=main', 'css=main', 'css=form#login'],
+      locators: ['role=main', 'role=textbox', 'css=main', 'css=form#login'],
     })
 
     expect(result).toMatchObject({
@@ -463,10 +466,15 @@ describe('ElectronBrowserWorkspace', () => {
       expect.objectContaining({ backendNodeId: 10, role: 'main', name: '办事详情', dom: { tagName: 'main' } }),
       expect.objectContaining({ backendNodeId: 11, role: 'textbox', name: '有效期至', value: '2028-06-30', dom: { tagName: 'input', inputType: 'date', readOnly: true } }),
       expect.objectContaining({ backendNodeId: 12, dom: { tagName: 'input', inputType: 'hidden', hidden: true } }),
+      expect.objectContaining({
+        backendNodeId: 99, frameId: 'frame_other', role: 'textbox', name: '其他 frame',
+        dom: { tagName: 'input', inputType: 'password' },
+      }),
     ])
     expect(JSON.stringify(result)).not.toContain('hidden-token')
     expect(result.locatorMatches).toEqual([
       { locator: 'role=main', backendNodeIds: [10] },
+      { locator: 'role=textbox', backendNodeIds: [11, 12] },
       { locator: 'css=main', backendNodeIds: [10] },
       { locator: 'css=form#login', backendNodeIds: [] },
     ])

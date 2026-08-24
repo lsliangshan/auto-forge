@@ -513,7 +513,10 @@ function imageRestrictedNode(node: BrowserInspectionNode): boolean {
   const combined = [node.name, node.value, node.dom.inputType, node.dom.autocomplete]
     .filter((value): value is string => value !== undefined)
     .join(' ')
-  return authNode(node)
+  const tagName = node.dom.tagName.toLowerCase()
+  return tagName === 'iframe'
+    || tagName === 'canvas'
+    || authNode(node)
     || node.dom.inputType?.toLowerCase() === 'file'
     || authenticationText.test(combined)
     || loginText.test(combined)
@@ -784,13 +787,16 @@ export class BrowserPageInspector {
       || input.origin !== firstPage.origin) throw failure('PAGE_CHANGED')
 
     const { page, visibleNodes } = await this.readLivePageContext(input, deadlineAt)
+    if (page.nodes.some((node) => node.frameId !== undefined && node.frameId !== page.frameId)) {
+      throw failure('UNSUPPORTED_CONTROL')
+    }
     const mainFrameNodes = page.nodes.filter((node) => (
       node.frameId === undefined || node.frameId === page.frameId
     ))
     const readableIds = new Set(this.readableNodes(
       binding, page, mainFrameNodes, visibleNodes,
     ).map((node) => node.backendNodeId))
-    const restrictedIds = this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes)
+    const restrictedIds = this.restrictedRegionBackendIds(mainFrameNodes)
     const currentByBackendNodeId = new Map(visibleNodes.map((node) => [node.backendNodeId, node]))
     const boxByBackendNodeId = new Map<number, BrowserInspectionNodeBox | undefined>()
     const getBox = async (backendNodeId: number): Promise<BrowserInspectionNodeBox | undefined> => {
@@ -891,7 +897,9 @@ export class BrowserPageInspector {
       readableRootBoxes.push(box)
     }
     const protectedBoxes: BrowserInspectionNodeBox[] = []
-    for (const node of visibleNodes.filter(imageRestrictedNode)) {
+    for (const node of mainFrameNodes.filter((candidate) => (
+      !candidate.dom.hidden && imageRestrictedNode(candidate)
+    ))) {
       const box = await getBox(node.backendNodeId)
       if (!validVisualBox(box)) throw failure('UNSUPPORTED_CONTROL')
       protectedBoxes.push(box)
@@ -1016,7 +1024,7 @@ export class BrowserPageInspector {
     const visibleNodes = mainFrameNodes.filter((node) => !node.ignored && !node.dom.hidden)
     const auth = this.classifyAuth(binding, page, visibleNodes)
     const readable = this.readableNodes(binding, page, mainFrameNodes, visibleNodes)
-    const restrictedRegions = this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes)
+    const restrictedRegions = this.restrictedRegionBackendIds(mainFrameNodes)
     const preliminaryCandidates = readable.flatMap((node): SafeCandidate[] => {
       const role = normalizedRole(node.role)
       if (!semanticRoles.has(role) || authNode(node)) return []
@@ -1299,7 +1307,7 @@ export class BrowserPageInspector {
     const readableIds = new Set(readable.map((node) => node.backendNodeId))
     if (!current
       || !readableIds.has(current.backendNodeId)
-      || this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes).has(current.backendNodeId)) {
+      || this.restrictedRegionBackendIds(mainFrameNodes).has(current.backendNodeId)) {
       throw failure('UNSUPPORTED_CONTROL')
     }
     const box = await this.port.getNodeBox({
@@ -1558,7 +1566,6 @@ export class BrowserPageInspector {
 
   private restrictedRegionBackendIds(
     mainFrameNodes: readonly BrowserInspectionNode[],
-    visibleNodes: readonly BrowserInspectionNode[],
   ): ReadonlySet<number> {
     const byAxId = new Map(mainFrameNodes.map((node) => [node.axNodeId, node]))
     const childrenByAxId = new Map<string, BrowserInspectionNode[]>()
@@ -1569,7 +1576,9 @@ export class BrowserPageInspector {
       else childrenByAxId.set(node.parentAxNodeId, [node])
     }
     const restricted = new Set<number>()
-    for (const node of visibleNodes.filter(imageRestrictedNode)) {
+    for (const node of mainFrameNodes.filter((candidate) => (
+      !candidate.dom.hidden && imageRestrictedNode(candidate)
+    ))) {
       let current: BrowserInspectionNode | undefined = node
       const seen = new Set<string>()
       while (current && !seen.has(current.axNodeId)) {
