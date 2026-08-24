@@ -1,7 +1,31 @@
 import { describe, expect, it, vi } from 'vitest'
-import { completeApplicationShutdown } from './application-shutdown-completion.js'
+import {
+  closeDesktopApplicationResources,
+  completeApplicationShutdown,
+} from './application-shutdown-completion.js'
 
 describe('application shutdown completion', () => {
+  it('closes and resets user stores after application close rejects while preserving that error', async () => {
+    const applicationFailure = new Error('application close failed')
+    const userStoreFailure = new Error('user store close failed')
+    const order: string[] = []
+
+    const completion = closeDesktopApplicationResources({
+      closeApplication: async () => {
+        order.push('application')
+        throw applicationFailure
+      },
+      resetUserDataStores: () => { order.push('reset-user-stores') },
+      closeUserDataStores: () => {
+        order.push('close-user-stores')
+        throw userStoreFailure
+      },
+    })
+
+    await expect(completion).rejects.toBe(applicationFailure)
+    expect(order).toEqual(['application', 'reset-user-stores', 'close-user-stores'])
+  })
+
   it('defers the final development quit until the scheduled callback runs', async () => {
     const scheduled: Array<() => void> = []
     const quit = vi.fn()

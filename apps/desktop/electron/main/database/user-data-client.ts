@@ -5,6 +5,7 @@ import { mkdirSync, rmSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 import userCacheMigration from '../../../resources/user-cache-migrations/0001_user_cache.sql?raw'
+import outboxEnqueueSequenceMigration from '../../../resources/user-cache-migrations/0002_outbox_enqueue_sequence.sql?raw'
 import {
   createUserDataRepositories,
   type UserDataRepositories,
@@ -12,7 +13,10 @@ import {
 
 const USER_CACHE_DOMAIN = 'autoforge-user-cache-v1\0'
 const USER_CACHE_FILE_PATTERN = /^[0-9a-f]{32}\.sqlite$/
-const USER_CACHE_MIGRATIONS = [{ version: 1, source: userCacheMigration }] as const
+const USER_CACHE_MIGRATIONS = [
+  { version: 1, source: userCacheMigration },
+  { version: 2, source: outboxEnqueueSequenceMigration },
+] as const
 
 export type UserDataStore = UserDataRepositories
 

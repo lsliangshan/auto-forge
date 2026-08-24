@@ -6,7 +6,9 @@ import {
   chatBlockSchema,
   chatMessageSchema,
   conversationSummarySchema,
+  conversationTitleStateSchema,
   opaqueCursorSchema,
+  syncStateSchema,
   syncMutationKindSchema,
   syncMutationSchema,
   type ConversationPage,
@@ -57,15 +59,15 @@ const remotePageEnvelopeSchema = z.object({
 const conversationRowSchema = z.object({
   id: z.string().trim().min(1),
   title: z.string().trim().min(1),
-  titleState: z.string(),
+  titleState: conversationTitleStateSchema,
   revision: z.number().int().nonnegative(),
-  syncState: z.string(),
+  syncState: syncStateSchema,
   createdAt: z.number().int().nonnegative(),
   lastActivityAt: z.number().int().nonnegative(),
   metadataUpdatedAt: z.number().int().nonnegative(),
   deletedAt: z.number().int().nonnegative().nullable().optional(),
   userId: z.string().nullable(),
-}).passthrough()
+}).strict()
 
 const messageRowSchema = z.object({
   id: z.string().trim().min(1),
@@ -236,13 +238,25 @@ function assertOutboxCapacity(database: SqliteDatabase): void {
 
 function insertOutbox(database: SqliteDatabase, mutation: SyncMutation): void {
   const createdAt = Date.now()
+  const sequence = database.prepare(`
+    UPDATE outbox_enqueue_counter
+    SET value = value + 1
+    WHERE id = 1
+    RETURNING value
+  `).get() as { value: unknown } | undefined
+  if (
+    sequence === undefined
+    || typeof sequence.value !== 'number'
+    || !Number.isSafeInteger(sequence.value)
+    || sequence.value < 1
+  ) throw new UserDataConsistencyError()
   database.prepare(`
     INSERT INTO outbox_mutations (
       id, kind, entity_id, base_revision, payload_json, state,
-      occurred_at, created_at
+      occurred_at, created_at, enqueue_sequence
     ) VALUES (
       @id, @kind, @entityId, @baseRevision, @payloadJson, 'pending',
-      @occurredAt, @createdAt
+      @occurredAt, @createdAt, @enqueueSequence
     )
   `).run({
     id: mutation.id,
@@ -252,6 +266,7 @@ function insertOutbox(database: SqliteDatabase, mutation: SyncMutation): void {
     payloadJson: JSON.stringify(mutation.payload),
     occurredAt: timestamp(mutation.occurredAt),
     createdAt,
+    enqueueSequence: sequence.value,
   })
 }
 
@@ -1239,7 +1254,7 @@ export function createUserDataRepositories(
           FROM outbox_mutations
           WHERE state IN ('pending', 'failed')
             AND (next_attempt_at IS NULL OR next_attempt_at <= @now)
-          ORDER BY created_at, id
+          ORDER BY enqueue_sequence
           LIMIT @limit
         `).all({ now, limit }) as Query[]).map(outboxFromRow)
       },
@@ -1264,7 +1279,7 @@ export function createUserDataRepositories(
                  next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
                  occurred_at AS occurredAt, created_at AS createdAt
           FROM outbox_mutations
-          ORDER BY created_at, id
+          ORDER BY enqueue_sequence
           LIMIT @limit
         `).all({ limit }) as Query[]).map(outboxFromRow)
       },

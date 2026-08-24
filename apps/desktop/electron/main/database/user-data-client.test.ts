@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import type { SyncMutation } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
@@ -117,6 +117,30 @@ afterEach(() => {
 })
 
 describe('UserDataStoreManager', () => {
+  it('preserves enqueue FIFO when timestamps are frozen and IDs sort in reverse', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_777_000_000_000)
+    const manager = new UserDataStoreManager(temporaryRoot())
+    try {
+      const store = manager.open('cloud-alice')
+      store.outbox.recordWithConversation(
+        createConversationMutation('z_create_first', 'fifo_conversation'),
+      )
+      store.outbox.recordWithMessage(
+        appendMessageMutation('y_message_second', 'fifo_conversation', 'fifo_message'),
+      )
+      store.outbox.recordWithConversation(
+        renameConversationMutation('x_rename_third', 'fifo_conversation', 2, 'FIFO title'),
+      )
+
+      const expected = ['z_create_first', 'y_message_second', 'x_rename_third']
+      expect(store.outbox.list(10).map(({ id }) => id)).toEqual(expected)
+      expect(store.outbox.listReady(Date.now(), 10).map(({ id }) => id)).toEqual(expected)
+    } finally {
+      manager.close()
+      now.mockRestore()
+    }
+  })
+
   it('isolates users behind domain-separated hash-only filenames', () => {
     const root = temporaryRoot()
     const manager = new UserDataStoreManager(root)
@@ -545,6 +569,62 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('rejects invalid conversation enums without partially applying a remote page', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const existing = createConversationMutation('strict_existing_create', 'strict_existing')
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_strict_initial',
+      mutations: [pulledMutation(existing, 1)],
+    }, 1)
+    const sqlite = new Database(cachePath(root, 'cloud-alice'))
+    sqlite.pragma('ignore_check_constraints = ON')
+    sqlite.prepare("UPDATE conversations SET sync_state = 'not_a_sync_state' WHERE id = 'strict_existing'")
+      .run()
+    sqlite.close()
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_strict_rejected',
+      mutations: [
+        pulledMutation(
+          createConversationMutation('strict_prior_create', 'strict_prior_conversation'),
+          1,
+        ),
+        pulledMutation({ ...existing, id: 'strict_existing_replay' }, 1),
+      ],
+    }, 2)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.conversations.get('strict_prior_conversation')).toBeUndefined()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_strict_initial')
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_bad_remote_enum',
+      mutations: [
+        pulledMutation(
+          createConversationMutation('before_bad_enum', 'before_bad_enum_conversation'),
+          1,
+        ),
+        {
+          ...pulledMutation(
+            createConversationMutation('bad_enum_create', 'bad_enum_conversation'),
+            1,
+          ),
+          payload: {
+            ...createConversationMutation('unused', 'bad_enum_conversation').payload,
+            titleState: 'not_a_title_state',
+          },
+        },
+      ],
+    }, 3)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.conversations.get('before_bad_enum_conversation')).toBeUndefined()
+    expect(store.conversations.get('bad_enum_conversation')).toBeUndefined()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_strict_initial')
+    manager.close()
+  })
+
   it('acknowledges only a canonically matching local outbox receipt', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')
@@ -868,7 +948,7 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }])
+      .toEqual([{ version: 1 }, { version: 2 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     inspection.close()

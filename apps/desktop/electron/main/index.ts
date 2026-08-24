@@ -19,7 +19,10 @@ import {
 } from 'electron'
 import { chatEventSchema, executionEventSchema, ipcChannels } from '@autoforge/shared'
 import { createApplicationRuntime } from './application.js'
-import { completeApplicationShutdown } from './application-shutdown-completion.js'
+import {
+  closeDesktopApplicationResources,
+  completeApplicationShutdown,
+} from './application-shutdown-completion.js'
 import { registerDesktopIpc, type RendererTarget } from './ipc/register-ipc.js'
 import { startDesktopApplication } from './startup.js'
 import {
@@ -203,9 +206,12 @@ async function shutdown(): Promise<void> {
   disposeIpc = undefined
   const current = runtime
   runtime = undefined
-  if (current) await current.close()
-  userDataStores?.close()
-  userDataStores = undefined
+  const currentUserDataStores = userDataStores
+  await closeDesktopApplicationResources({
+    ...(current ? { closeApplication: () => current.close() } : {}),
+    ...(currentUserDataStores ? { closeUserDataStores: () => currentUserDataStores.close() } : {}),
+    resetUserDataStores: () => { userDataStores = undefined },
+  })
 }
 
 if (!app.requestSingleInstanceLock()) {
