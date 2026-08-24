@@ -244,6 +244,7 @@ function textRunInput(
     assetIds: [],
     currentMedia: [],
     allowTools: true,
+    supportsImageInput: false,
   }
 }
 

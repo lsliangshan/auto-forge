@@ -382,6 +382,7 @@ export interface AgentRunInput extends UsageAttribution {
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
   allowTools: boolean
+  supportsImageInput: boolean
   provider: ModelProviderId
   model: string
   requestId?: string
@@ -424,6 +425,7 @@ interface ActiveAgentRun {
   userId: string
   model: string
   contextLength?: number
+  supportsImageInput: boolean
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]
@@ -764,6 +766,7 @@ export class AgentOrchestrator {
         userId: input.userId,
         model: input.model,
         ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
+        supportsImageInput: input.supportsImageInput,
         blocks: [],
         messages: [],
         tools: [],

@@ -257,6 +257,22 @@ describe('resolveChatRoute', () => {
     expect(resolveChatRoute(input({ requestedModel: modelWithTools.id, requestedOutput: 'audio', models: [modelWithTools] }))).toMatchObject({ supportsTools: false })
   })
 
+  it('reports image-input support from the exact selected text model', () => {
+    const vision = model({
+      id: 'openrouter/vision', inputModalities: ['text', 'image'],
+      outputModalities: ['text'], supportsTools: true,
+    })
+    const textOnly = model({
+      id: 'openrouter/text', inputModalities: ['text'],
+      outputModalities: ['text'], supportsTools: true,
+    })
+
+    expect(resolveChatRoute(input({ requestedModel: vision.id, models: [vision] })))
+      .toMatchObject({ supportsImageInput: true })
+    expect(resolveChatRoute(input({ requestedModel: textOnly.id, models: [textOnly] })))
+      .toMatchObject({ supportsImageInput: false })
+  })
+
   it('validates count, total bytes, duplicate IDs, and resolved asset shape before route selection', () => {
     const many = Array.from({ length: 6 }, (_, index) => asset('image', { id: `asset_${index}` }))
     expect(() => resolveChatRoute(input({ assets: many }))).toThrow(expect.objectContaining({ code: 'MEDIA_ATTACHMENT_LIMIT_EXCEEDED' }))

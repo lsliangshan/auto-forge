@@ -34,6 +34,7 @@ export interface ResolvedChatRoute {
   model: string
   contextLength?: number
   supportsTools: boolean
+  supportsImageInput: boolean
   outputType: ConcreteOutput
   assets: ResolvedMediaAsset[]
   generation: GenerationOptions
@@ -330,6 +331,7 @@ function route(input: ResolveChatRouteInput, model: ModelInfo, output: ConcreteO
     model: model.id,
     ...(model.contextLength === undefined ? {} : { contextLength: model.contextLength }),
     supportsTools: output === 'text' && model.supportsTools && model.inputModalities.includes('text'),
+    supportsImageInput: output === 'text' && model.inputModalities.includes('image'),
     outputType: output,
     assets: input.assets.slice(),
     generation: normalizeGeneration(input.requestedGeneration, model, output),
