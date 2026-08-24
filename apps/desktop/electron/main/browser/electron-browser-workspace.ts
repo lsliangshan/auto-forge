@@ -1813,9 +1813,11 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     state: TargetTabState,
     expected: BrowserContinuationPageState,
   ): void {
+    const url = state.view.webContents.getURL()
     if (state.navigationEpoch !== expected.navigationEpoch
       || state.activityRevision !== expected.activityRevision
-      || originOf(state.view.webContents.getURL()) !== expected.origin) throw failure('PAGE_CHANGED')
+      || url !== expected.url
+      || originOf(url) !== expected.origin) throw failure('PAGE_CHANGED')
   }
 
   private assertContinuationState(

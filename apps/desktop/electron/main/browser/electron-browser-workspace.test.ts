@@ -1273,6 +1273,44 @@ describe('ElectronBrowserWorkspace', () => {
     await lease.release()
   })
 
+  it('keeps promotion suspended when only the URL changes while the input shield loads', async () => {
+    const shieldLoad = deferred<void>()
+    let shieldLoads = 0
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')
+          && ++shieldLoads === 2) {
+          await shieldLoad.promise
+        }
+      },
+    )
+    const { workspace, views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_url_promoting',
+    })
+    const [toolbar, target, shield] = views
+    target!.webContents.currentUrl = 'https://www.baidu.com/login'
+    await workspace.suspendContinuation(binding.tabId, 'run_url_promoting')
+    const expectedPage = await workspace.getContinuationState(binding.tabId, 'run_url_promoting')
+    shield!.webContents.close()
+
+    const promotion = workspace.resumeContinuation(binding.tabId, 'run_url_promoting', expectedPage)
+    await vi.waitFor(() => expect(views).toHaveLength(4))
+    target!.webContents.currentUrl = 'https://www.baidu.com/dashboard'
+    shieldLoad.resolve()
+
+    await expect(promotion).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(windows[0]!.children).toEqual([target, toolbar])
+    const suspendedInput = { preventDefault: vi.fn() }
+    target!.webContents.emit('before-input-event', suspendedInput, { type: 'keyDown', key: 'A' })
+    expect(suspendedInput.preventDefault).not.toHaveBeenCalled()
+    await lease.release()
+  })
+
   it('keeps a continuation suspended when its authenticated page changes before resume', async () => {
     const harness = createHarness()
     const { workspace, views, windows } = harness
