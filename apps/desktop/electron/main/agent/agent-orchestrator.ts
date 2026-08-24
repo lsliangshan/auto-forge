@@ -1118,7 +1118,11 @@ export class AgentOrchestrator {
         return this.continuePendingTool(active)
       }
       if (finishReason === 'stop') {
-        if (!active.browserRead && !active.browserTerminal && active.browserCatalog.bindings.size > 0) {
+        const mayRecoverBrowserRoute = !active.browserRead
+          && !active.browserTerminal
+          && active.actualExecutions.length === 0
+          && active.browserCatalog.bindings.size > 0
+        if (mayRecoverBrowserRoute) {
           const route = await routeBrowserContinuationRequest({
             trustedRequest: active.browserAuthorization.trustedRequest,
             candidates: [...active.browserCatalog.bindings.values()].map((candidate) => ({

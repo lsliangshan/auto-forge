@@ -4862,6 +4862,77 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(answer)
   })
 
+  it('does not auto-inspect a bound page after the current run executes a workflow', async () => {
+    const finalText = '已打开北京工作居住证页面。'
+    const dependencies = harness([
+      toolTurn,
+      [
+        { type: 'text_delta', choiceIndex: 0, text: finalText },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+      [
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'unexpected_route',
+          name: 'report_browser_continuation_route', arguments: { bindingId: 'binding_1' },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ],
+    ])
+    dependencies.workflows.list = async () => [{
+      ...workflow,
+      name: '北京工作居住证',
+      activationExamples: ['查询北京工作居住证'],
+    }]
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+    const browser = attachBrowserContinuation(dependencies)
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '查询北京工作居住证',
+      provider: 'openrouter', model: 'model', requestId: 'workflow_open_only',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    expect(browser.executor.execute).not.toHaveBeenCalled()
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(finalText)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('workflow_provenance')
+  })
+
+  it('still honors an explicit browser inspect emitted after a workflow execution', async () => {
+    const dependencies = harness([
+      toolTurn,
+      [
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'explicit_after_workflow',
+          name: 'browser_session_inspect',
+          arguments: { bindingId: 'binding_1', intent: '读取附件管理页面' },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ],
+      [
+        { type: 'text_delta', choiceIndex: 0, text: '网页已读取。' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    dependencies.workflows.list = async () => [{
+      ...workflow,
+      name: '北京工作居住证',
+      activationExamples: ['运行查询并读取附件页面'],
+    }]
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+    const browser = attachBrowserContinuation(dependencies)
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '运行查询并读取附件页面',
+      provider: 'openrouter', model: 'model', requestId: 'workflow_then_explicit_read',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).toHaveBeenCalledWith(
+      'browser_session_inspect',
+      { bindingId: 'binding_1', intent: '运行查询并读取附件页面' },
+      expect.any(Object),
+    )
+  })
+
   it('answers an attachment question from full-page row context', async () => {
     const inspected = await inspectedAttachmentTable()
     if (inspected.kind !== 'success') throw new Error('expected attachment snapshot')
