@@ -380,10 +380,32 @@ export const conversationSummarySchema = z.object({
 export type ConversationSummary = z.infer<typeof conversationSummarySchema>
 
 export const conversationPageSchema = z.object({
-  items: z.array(conversationSummarySchema),
+  items: z.array(conversationSummarySchema).max(50),
   nextCursor: opaqueCursorSchema.optional(),
 }).strict()
 export type ConversationPage = z.infer<typeof conversationPageSchema>
+
+export const conversationCreateMutationPayloadSchema = z.object({
+  title: nonEmptyStringSchema,
+  titleState: conversationTitleStateSchema,
+  createdAt: timestampSchema,
+  lastActivityAt: timestampSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+export type ConversationCreateMutationPayload = z.infer<typeof conversationCreateMutationPayloadSchema>
+
+export const conversationRenameMutationPayloadSchema = z.object({
+  title: nonEmptyStringSchema,
+  titleState: conversationTitleStateSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+export type ConversationRenameMutationPayload = z.infer<typeof conversationRenameMutationPayloadSchema>
+
+export const conversationDeleteMutationPayloadSchema = z.object({}).strict()
+export type ConversationDeleteMutationPayload = z.infer<typeof conversationDeleteMutationPayloadSchema>
+
+export const conversationRestoreMutationPayloadSchema = z.object({}).strict()
+export type ConversationRestoreMutationPayload = z.infer<typeof conversationRestoreMutationPayloadSchema>
 
 export const chatMessageSchema = z.object({
   id: identifierSchema,
@@ -397,58 +419,13 @@ export const chatMessageSchema = z.object({
 export interface ChatMessage extends Omit<z.infer<typeof chatMessageSchema>, 'blocks'> { blocks: ChatBlock[] }
 
 export const messagePageSchema = z.object({
-  items: z.array(chatMessageSchema),
+  items: z.array(chatMessageSchema).max(100),
   previousCursor: opaqueCursorSchema.optional(),
 }).strict()
 export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { items: ChatMessage[] }
 
-const sensitiveMutationPayloadKeys = new Set([
-  'apikey',
-  'apikeyfingerprint',
-  'authorization',
-  'credential',
-  'credentials',
-  'owner',
-  'ownerid',
-  'owneruserid',
-  'password',
-  'refreshtoken',
-  'secret',
-  'servicekey',
-  'token',
-  'accesstoken',
-  'uid',
-  'userid',
-])
-
-function findSensitiveMutationPayloadPath(value: unknown, path: Array<string | number> = []): Array<string | number> | undefined {
-  if (Array.isArray(value)) {
-    for (const [index, item] of value.entries()) {
-      const match = findSensitiveMutationPayloadPath(item, [...path, index])
-      if (match !== undefined) return match
-    }
-    return undefined
-  }
-  if (typeof value !== 'object' || value === null) return undefined
-  for (const [key, item] of Object.entries(value)) {
-    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '')
-    if (sensitiveMutationPayloadKeys.has(normalizedKey) || normalizedKey.endsWith('secret')) return [...path, key]
-    const match = findSensitiveMutationPayloadPath(item, [...path, key])
-    if (match !== undefined) return match
-  }
-  return undefined
-}
-
-const syncMutationPayloadSchema = z.record(z.string(), z.json()).superRefine((payload, context) => {
-  const sensitivePath = findSensitiveMutationPayloadPath(payload)
-  if (sensitivePath !== undefined) {
-    context.addIssue({
-      code: 'custom',
-      path: sensitivePath,
-      message: 'Sync mutation payloads cannot include owner or credential fields',
-    })
-  }
-})
+export const messageAppendMutationPayloadSchema = chatMessageSchema
+export type MessageAppendMutationPayload = z.infer<typeof messageAppendMutationPayloadSchema>
 
 export const syncMutationKindSchema = z.enum([
   'conversation.create',
@@ -462,16 +439,6 @@ export const syncMutationKindSchema = z.enum([
   'usage.record',
 ])
 export type SyncMutationKind = z.infer<typeof syncMutationKindSchema>
-
-export const syncMutationSchema = z.object({
-  id: identifierSchema,
-  kind: syncMutationKindSchema,
-  entityId: identifierSchema,
-  baseRevision: z.number().int().nonnegative(),
-  occurredAt: timestampSchema,
-  payload: syncMutationPayloadSchema,
-}).strict()
-export type SyncMutation = z.infer<typeof syncMutationSchema>
 
 export const syncMutationStatusSchema = z.enum(['applied', 'duplicate', 'conflict', 'rejected'])
 export type SyncMutationStatus = z.infer<typeof syncMutationStatusSchema>
@@ -927,7 +894,7 @@ export const remoteUsageStatusSchema = z.enum([
 ])
 export type RemoteUsageStatus = z.infer<typeof remoteUsageStatusSchema>
 
-export const byokUsageEventSchema = z.object({
+const byokUsageEventShape = {
   id: identifierSchema,
   operationId: identifierSchema,
   purpose: nonEmptyStringSchema.max(64),
@@ -936,21 +903,79 @@ export const byokUsageEventSchema = z.object({
   provider: modelProviderIdSchema,
   model: nonEmptyStringSchema,
   modality: providerUsageModalitySchema,
-  costStatus: z.enum(['estimated', 'unavailable']),
   inputTokens: safeTokenCountSchema.optional(),
   outputTokens: safeTokenCountSchema.optional(),
-  estimatedCost: usdDecimalSchema.optional(),
   occurredAt: timestampSchema,
-}).strict().superRefine((event, context) => {
-  if (event.costStatus === 'unavailable' && event.estimatedCost !== undefined) {
-    context.addIssue({
-      code: 'custom',
-      path: ['estimatedCost'],
-      message: 'Unavailable BYOK cost cannot include an estimate',
-    })
-  }
-})
+}
+
+export const byokUsageEventSchema = z.discriminatedUnion('costStatus', [
+  z.object({
+    ...byokUsageEventShape,
+    costStatus: z.literal('estimated'),
+    estimatedCostUsd: usdDecimalSchema,
+  }).strict(),
+  z.object({
+    ...byokUsageEventShape,
+    costStatus: z.literal('unavailable'),
+  }).strict(),
+])
 export type ByokUsageEvent = z.infer<typeof byokUsageEventSchema>
+
+const syncMutationBaseShape = {
+  id: identifierSchema,
+  entityId: identifierSchema,
+  baseRevision: z.number().int().nonnegative(),
+  occurredAt: timestampSchema,
+}
+
+export const syncMutationSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.create'),
+    payload: conversationCreateMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.rename'),
+    payload: conversationRenameMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.delete'),
+    payload: conversationDeleteMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.restore'),
+    payload: conversationRestoreMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('message.append'),
+    payload: messageAppendMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('legacy.import'),
+    payload: legacyImportConfirmRequestSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('privacy.consent'),
+    payload: privacyConsentSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('preferences.update'),
+    payload: accountDataPreferencesSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('usage.record'),
+    payload: byokUsageEventSchema,
+  }).strict(),
+])
+export type SyncMutation = z.infer<typeof syncMutationSchema>
 
 export const modelTokenUsageSchema = z.object({
   provider: modelProviderIdSchema,

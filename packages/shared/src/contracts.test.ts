@@ -79,6 +79,9 @@ describe('cross-process contracts', () => {
     expect(conversationSummarySchema.parse(summary)).toEqual(summary)
     expect(conversationPageSchema.parse({ items: [summary], nextCursor: cursor }))
       .toEqual({ items: [summary], nextCursor: cursor })
+    expect.soft(conversationPageSchema.safeParse({
+      items: Array.from({ length: 51 }, (_, index) => ({ ...summary, id: `conv_${index}` })),
+    }).success).toBe(false)
     expect(ipcRequestSchemas[ipcChannels.chatListConversations].parse({ limit: 50 }))
       .toEqual({ limit: 50 })
     expect(ipcResponseSchemas[ipcChannels.chatListConversations].parse({ items: [summary] }))
@@ -92,29 +95,154 @@ describe('cross-process contracts', () => {
     }
     expect(messagePageSchema.parse({ items: [message], previousCursor: cursor }))
       .toEqual({ items: [message], previousCursor: cursor })
+    expect.soft(messagePageSchema.safeParse({
+      items: Array.from({ length: 101 }, (_, index) => ({ ...message, id: `message_${index}` })),
+    }).success).toBe(false)
     expect(ipcResponseSchemas[ipcChannels.chatListMessages].parse({ items: [message] }))
       .toEqual({ items: [message] })
   })
 
-  it('rejects owner and secret injection from sync mutations', () => {
-    const mutation = {
+  it('enforces strict per-kind sync mutation payloads', () => {
+    const mutationBase = {
       id: 'mut_1',
-      kind: 'conversation.create' as const,
       entityId: 'conv_1',
       baseRevision: 0,
       occurredAt: '2026-08-24T00:00:00.000Z',
-      payload: { title: '新会话' },
     }
-    expect(syncMutationSchema.parse(mutation)).toEqual(mutation)
-    expect(syncMutationSchema.safeParse({ ...mutation, userId: 'forged' }).success).toBe(false)
-    expect(syncMutationSchema.safeParse({ ...mutation, ownerUserId: 'forged' }).success).toBe(false)
-    expect(syncMutationSchema.safeParse({ ...mutation, uid: 'forged' }).success).toBe(false)
-    expect(syncMutationSchema.safeParse({ ...mutation, payload: { nested: { ownerUserId: 'forged' } } }).success)
-      .toBe(false)
-    expect(syncMutationSchema.safeParse({ ...mutation, payload: { apiKey: 'secret' } }).success).toBe(false)
-    expect(syncMutationSchema.safeParse({ ...mutation, payload: { nested: { clientSecret: 'secret' } } }).success)
-      .toBe(false)
-    expect(syncMutationSchema.safeParse({ ...mutation, payload: [] }).success).toBe(false)
+    const conversationCreate = {
+      ...mutationBase,
+      kind: 'conversation.create' as const,
+      payload: {
+        title: '新会话',
+        titleState: 'pending' as const,
+        createdAt: '2026-08-24T00:00:00.000Z',
+        lastActivityAt: '2026-08-24T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-24T00:00:00.000Z',
+      },
+    }
+    expect(syncMutationSchema.parse(conversationCreate)).toEqual(conversationCreate)
+    expect(syncMutationSchema.safeParse({ ...conversationCreate, userId: 'forged' }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({ ...conversationCreate, ownerUserId: 'forged' }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({ ...conversationCreate, uid: 'forged' }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({
+      ...conversationCreate,
+      payload: { ...conversationCreate.payload, ownerUserId: 'forged' },
+    }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({
+      ...conversationCreate,
+      payload: { ...conversationCreate.payload, clientSecret: 'secret' },
+    }).success).toBe(false)
+
+    const messageAppend = {
+      ...mutationBase,
+      kind: 'message.append' as const,
+      entityId: 'message_1',
+      payload: {
+        id: 'message_1',
+        conversationId: 'conv_1',
+        role: 'user' as const,
+        blocks: [],
+        createdAt: '2026-08-24T00:00:30.000Z',
+      },
+    }
+    expect(syncMutationSchema.parse(messageAppend)).toEqual(messageAppend)
+    expect(syncMutationSchema.safeParse({
+      ...messageAppend, payload: { ...messageAppend.payload, userId: 'forged' },
+    }).success).toBe(false)
+
+    const conversationMutations = [
+      {
+        ...mutationBase,
+        kind: 'conversation.rename' as const,
+        payload: {
+          title: '手动命名',
+          titleState: 'user_named' as const,
+          metadataUpdatedAt: '2026-08-24T00:01:00.000Z',
+        },
+      },
+      { ...mutationBase, kind: 'conversation.delete' as const, payload: {} },
+      { ...mutationBase, kind: 'conversation.restore' as const, payload: {} },
+    ]
+    for (const conversationMutation of conversationMutations) {
+      expect(syncMutationSchema.parse(conversationMutation)).toEqual(conversationMutation)
+      expect(syncMutationSchema.safeParse({
+        ...conversationMutation,
+        payload: { ...conversationMutation.payload, ownerUserId: 'forged' },
+      }).success).toBe(false)
+    }
+
+    const cloudSyncConsent = {
+      purpose: 'cloud_sync' as const,
+      documentVersion: 'privacy-2026-08',
+      consentedAt: '2026-08-24T00:00:00.000Z',
+      clientVersion: '2.0.0',
+    }
+    const unownedImportConsent = {
+      ...cloudSyncConsent,
+      purpose: 'legacy_unowned_import' as const,
+      documentVersion: 'legacy-import-2026-08',
+    }
+    expect(syncMutationSchema.parse({
+      ...mutationBase,
+      kind: 'privacy.consent',
+      entityId: 'privacy-2026-08',
+      payload: cloudSyncConsent,
+    })).toMatchObject({ kind: 'privacy.consent' })
+    expect(syncMutationSchema.parse({
+      ...mutationBase,
+      kind: 'legacy.import',
+      entityId: 'batch_1',
+      payload: {
+        batchId: 'batch_1', includeUnowned: true, cloudSyncConsent, unownedImportConsent,
+      },
+    })).toMatchObject({ kind: 'legacy.import' })
+    expect(syncMutationSchema.safeParse({
+      ...mutationBase,
+      kind: 'legacy.import',
+      entityId: 'batch_1',
+      payload: { batchId: 'batch_1', includeUnowned: true, cloudSyncConsent },
+    }).success).toBe(false)
+
+    expect(syncMutationSchema.parse({
+      ...mutationBase,
+      kind: 'preferences.update',
+      entityId: 'preferences',
+      payload: { timezone: 'Asia/Shanghai', displayCurrency: 'CNY' },
+    })).toMatchObject({ kind: 'preferences.update' })
+    expect(syncMutationSchema.safeParse({
+      ...mutationBase,
+      kind: 'preferences.update',
+      entityId: 'preferences',
+      payload: { timezone: 'Asia/Shanghai', displayCurrency: 'EUR' },
+    }).success).toBe(false)
+
+    const usagePayload = {
+      id: 'usage_1',
+      operationId: 'operation_1',
+      purpose: 'chat_reply',
+      credentialOwner: 'user' as const,
+      billable: false as const,
+      provider: 'openrouter' as const,
+      model: 'openai/gpt-5',
+      modality: 'text' as const,
+      costStatus: 'estimated' as const,
+      inputTokens: 12,
+      outputTokens: 4,
+      estimatedCostUsd: '0.0012',
+      occurredAt: '2026-08-24T00:00:00.000Z',
+    }
+    expect(syncMutationSchema.parse({
+      ...mutationBase, kind: 'usage.record', entityId: 'usage_1', payload: usagePayload,
+    })).toMatchObject({ kind: 'usage.record' })
+    for (const invalidUsage of [
+      { ...usagePayload, credentialOwner: 'platform' },
+      { ...usagePayload, billable: true },
+      { ...usagePayload, costStatus: 'reported' },
+    ]) {
+      expect(syncMutationSchema.safeParse({
+        ...mutationBase, kind: 'usage.record', entityId: 'usage_1', payload: invalidUsage,
+      }).success).toBe(false)
+    }
 
     expect(syncMutationResultSchema.parse({ id: 'mut_1', status: 'applied', revision: 1 }))
       .toEqual({ id: 'mut_1', status: 'applied', revision: 1 })
@@ -186,17 +314,22 @@ describe('cross-process contracts', () => {
       costStatus: 'estimated' as const,
       inputTokens: 12,
       outputTokens: 4,
-      estimatedCost: '0.0012',
+      estimatedCostUsd: '0.0012',
       occurredAt: '2026-08-24T00:00:00.000Z',
     }
     expect(providerUsageModalitySchema.parse('video')).toBe('video')
     expect(byokUsageEventSchema.parse(usage)).toEqual(usage)
-    expect(byokUsageEventSchema.parse({
-      ...usage, costStatus: 'unavailable', estimatedCost: undefined,
-    })).toMatchObject({ costStatus: 'unavailable' })
+    const unavailableUsage = { ...usage, costStatus: 'unavailable' as const }
+    Reflect.deleteProperty(unavailableUsage, 'estimatedCostUsd')
+    expect(byokUsageEventSchema.parse(unavailableUsage)).toMatchObject({ costStatus: 'unavailable' })
+    expect(byokUsageEventSchema.safeParse({ ...usage, estimatedCostUsd: undefined }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({
+      ...usage, costStatus: 'unavailable', estimatedCostUsd: '0.0012',
+    }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, credentialOwner: 'platform' }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, billable: true }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, costStatus: 'reported' }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, displayCurrency: 'CNY' }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, apiKey: 'secret' }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, apiKeyFingerprint: 'fingerprint' }).success).toBe(false)
   })
