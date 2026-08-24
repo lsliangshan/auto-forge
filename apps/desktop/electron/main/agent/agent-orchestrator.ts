@@ -59,6 +59,7 @@ import {
   resolveBrowserPageEvidence,
   type BrowserPageEvidenceResolution,
 } from './browser-page-evidence-resolver.js'
+import { resolveBrowserVisualEvidence } from './browser-visual-evidence-resolver.js'
 import { WorkflowRouter, type WorkflowRoutingRequest } from './workflow-router.js'
 import {
   APPROVAL_EXPIRY_MS,
@@ -359,7 +360,7 @@ export interface AgentOrchestratorDependencies {
     catalog: Pick<BrowserContinuationCatalog, 'create' | 'refresh'>
     executor: Pick<BrowserContinuationToolExecutor,
       'execute' | 'waitForAuthentication' | 'waitForManualIntervention' | 'validateContinuation'
-      | 'endRun' | 'cancel' | 'takeOver'>
+      | 'captureVisualEvidence' | 'endRun' | 'cancel' | 'takeOver'>
   }
   emit: (event: ChatEvent) => void
   id?: () => string
@@ -449,6 +450,8 @@ interface ActiveAgentRun {
   browserPageEvidenceRevision: number
   browserPageEvidenceMatchRevision?: number
   browserPageEvidenceSelection?: BrowserPageEvidenceResolution
+  browserVisualEvidenceMatchRevision?: number
+  browserVisualEvidenceSelection?: BrowserPageEvidenceResolution
   browserSnapshotToolMessages: Map<string, Array<Extract<ModelMessage, { role: 'tool' }>>>
   browserEvidence: BrowserFieldEvidence[]
   browserEvidenceRevision: number
@@ -1427,6 +1430,7 @@ export class AgentOrchestrator {
           && active.browserAuthorization.navigationUrls.size === 0) {
           earlyBrowserAnswer = await this.matchedBrowserEvidenceAnswer(active)
             ?? await this.matchedBrowserPageAnswer(active)
+            ?? await this.matchedBrowserVisualPageAnswer(active)
         }
       }
     }
@@ -1866,6 +1870,8 @@ export class AgentOrchestrator {
       active.browserPageEvidenceRevision += 1
       active.browserPageEvidenceMatchRevision = undefined
       active.browserPageEvidenceSelection = undefined
+      active.browserVisualEvidenceMatchRevision = undefined
+      active.browserVisualEvidenceSelection = undefined
     }
     active.browserSnapshots.set(snapshot.snapshotId, snapshot)
     for (const evidence of privateFieldEvidence) {
@@ -1905,6 +1911,8 @@ export class AgentOrchestrator {
     active.browserEvidencePages.length = 0
     active.browserPageEvidenceMatchRevision = undefined
     active.browserPageEvidenceSelection = undefined
+    active.browserVisualEvidenceMatchRevision = undefined
+    active.browserVisualEvidenceSelection = undefined
   }
 
   private browserPageAnswerFromSelection(
@@ -1967,6 +1975,63 @@ export class AgentOrchestrator {
     return this.browserPageAnswerFromSelection(active, selection)
   }
 
+  private async matchedBrowserVisualPageAnswer(active: ActiveAgentRun): Promise<string | undefined> {
+    if (!active.supportsImageInput
+      || active.browserEvidencePages.length === 0
+      || active.browserEvidencePages.at(-1)?.cursor !== undefined
+      || !active.browserEvidencePages.some((page) => (
+        page.nodes.some(({ answerable }) => answerable === true)
+      ))
+      || active.browserAuthorization.mutationTypes.length > 0
+      || active.browserAuthorization.navigationUrls.size > 0
+      || active.cancelled
+      || active.controller.signal.aborted) return undefined
+
+    if (active.browserVisualEvidenceMatchRevision === active.browserPageEvidenceRevision) {
+      return this.browserPageAnswerFromSelection(active, active.browserVisualEvidenceSelection)
+    }
+    const revision = active.browserPageEvidenceRevision
+    const snapshot = active.browserEvidencePages[0]!
+    const browser = this.dependencies.browserContinuation
+    if (!browser) return undefined
+    const captured = await browser.executor.captureVisualEvidence({
+      bindingId: snapshot.bindingId,
+      snapshotId: snapshot.snapshotId,
+      pages: Object.freeze([...active.browserEvidencePages]),
+    }, {
+      userId: active.userId,
+      conversationId: active.conversationId,
+      runId: active.runId,
+      currentUser: active.currentUser,
+      signal: active.controller.signal,
+    })
+    if (captured.kind !== 'success') {
+      active.browserVisualEvidenceMatchRevision = revision
+      active.browserVisualEvidenceSelection = undefined
+      return undefined
+    }
+    const selection = await resolveBrowserVisualEvidence({
+      trustedRequest: active.browserAuthorization.trustedRequest,
+      bundle: captured.data,
+      providerSnapshot: active.providerSnapshot,
+      providerUsage: this.dependencies.providerUsage,
+      model: active.model,
+      userId: active.userId,
+      requestId: active.requestId,
+      evidenceRevision: revision,
+      chatRunId: active.runId,
+      signal: active.controller.signal,
+      id: this.id,
+      now: this.now,
+    })
+    if (selection.usage) this.addUsage(active, selection.usage)
+    if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+    if (active.browserPageEvidenceRevision !== revision) return undefined
+    active.browserVisualEvidenceMatchRevision = revision
+    active.browserVisualEvidenceSelection = selection
+    return this.browserPageAnswerFromSelection(active, selection)
+  }
+
   private async matchedBrowserEvidenceAnswer(active: ActiveAgentRun): Promise<string | undefined> {
     const unique = new Map<string, BrowserFieldEvidence>()
     for (const evidence of active.browserEvidence) {
@@ -2016,10 +2081,10 @@ export class AgentOrchestrator {
   }
 
   private async browserAnswer(active: ActiveAgentRun): Promise<string> {
-    const matched = await this.matchedBrowserEvidenceAnswer(active)
-    if (matched !== undefined) return matched
-    const pageMatched = await this.matchedBrowserPageAnswer(active)
-    if (pageMatched !== undefined) return pageMatched
+    const answer = await this.matchedBrowserEvidenceAnswer(active)
+      ?? await this.matchedBrowserPageAnswer(active)
+      ?? await this.matchedBrowserVisualPageAnswer(active)
+    if (answer !== undefined) return answer
     if (active.browserHandoffCode === 'AUTH_REQUIRED') {
       return '网页需要你先完成登录；目前无法唯一确认请求的字段。'
     }
