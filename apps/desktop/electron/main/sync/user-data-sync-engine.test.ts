@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AppErrorCode, SyncMutation } from '@autoforge/shared'
+import type { SyncMutation } from '@autoforge/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { UserDataStoreManager, type UserDataStore } from '../database/user-data-client.js'
 import type {
@@ -9,11 +9,13 @@ import type {
   RemoteSyncMutation,
   SyncPullData,
   SyncPushData,
+  UserDataErrorCode,
   UserDataFunctionResponse,
 } from '../cloud/cloudbase-user-data-port.js'
 import { UserDataSyncEngine } from './user-data-sync-engine.js'
 
 const roots: string[] = []
+const MAX_EVENT_BYTES = 1_048_576
 
 function createManager(): UserDataStoreManager {
   const root = mkdtempSync(join(tmpdir(), 'autoforge-sync-engine-'))
@@ -22,6 +24,7 @@ function createManager(): UserDataStoreManager {
 }
 
 type CreateMutation = Extract<SyncMutation, { kind: 'conversation.create' }>
+type PulledCreateMutation = Extract<RemoteSyncMutation, { kind: 'conversation.create' }>
 
 function createMutation(index: number, prefix = 'alice'): CreateMutation {
   const suffix = String(index).padStart(3, '0')
@@ -42,7 +45,18 @@ function createMutation(index: number, prefix = 'alice'): CreateMutation {
   }
 }
 
-function pulled(mutation: SyncMutation, resultRevision = 1): RemoteSyncMutation {
+function mutationAtEventSize(mutation: CreateMutation, targetBytes: number): CreateMutation {
+  const emptyTitle = { ...mutation, payload: { ...mutation.payload, title: '' } }
+  const fixedBytes = Buffer.byteLength(JSON.stringify({
+    action: 'syncPush', protocolVersion: 1, deviceId: 'device-a', mutations: [emptyTitle],
+  }), 'utf8')
+  return {
+    ...mutation,
+    payload: { ...mutation.payload, title: 'x'.repeat(targetBytes - fixedBytes) },
+  }
+}
+
+function pulled(mutation: CreateMutation, resultRevision = 1): PulledCreateMutation {
   return {
     id: mutation.id,
     kind: mutation.kind,
@@ -58,7 +72,7 @@ function success(data: SyncPushData | SyncPullData): UserDataFunctionResponse {
   return { ok: true, data }
 }
 
-function failure(code: AppErrorCode): UserDataFunctionResponse {
+function failure(code: UserDataErrorCode): UserDataFunctionResponse {
   return { ok: false, error: { code } }
 }
 
@@ -136,7 +150,7 @@ describe('UserDataSyncEngine', () => {
       return success({ mutations: [pulled(mutation)], cursor: 'cursor_pull_0001' })
     })
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(store.outbox.find(mutation.id)).toBeUndefined()
@@ -155,12 +169,12 @@ describe('UserDataSyncEngine', () => {
       store.outbox.recordWithConversation(createMutation(index))
     }
     const batchSizes: number[] = []
-    const pushed: SyncMutation[] = []
+    const pushed: CreateMutation[] = []
     let pullIndex = 0
     const { engine } = createEngine(manager, async (input) => {
       if (input.action === 'syncPush') {
         batchSizes.push(input.mutations.length)
-        pushed.push(...input.mutations)
+        pushed.push(...input.mutations as CreateMutation[])
         return success({ results: input.mutations.map((item) => ({
           id: item.id, status: 'applied', revision: 1,
         })), cursor: `cursor_push_${batchSizes.length}` })
@@ -170,11 +184,67 @@ describe('UserDataSyncEngine', () => {
       return success({ mutations: page.map((item) => pulled(item)), cursor: `cursor_pull_page_${pullIndex}` })
     })
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(batchSizes).toEqual([100, 1])
     expect(store.outbox.countPending()).toBe(0)
+  })
+
+  it('builds the largest FIFO push prefix within the exact one-mebibyte event limit', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const first = mutationAtEventSize(createMutation(20), 600_000)
+    const second = mutationAtEventSize(createMutation(21), 600_000)
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(second)
+    const eventBytes: number[] = []
+    const batchIds: string[][] = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPull') return success({ mutations: [], cursor: null })
+      eventBytes.push(Buffer.byteLength(JSON.stringify(input), 'utf8'))
+      batchIds.push(input.mutations.map(({ id }) => id))
+      return success({
+        results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
+        cursor: `cursor_byte_batch_${batchIds.length}`,
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(batchIds).toEqual([[first.id], [second.id]])
+    expect(eventBytes.every((bytes) => bytes <= MAX_EVENT_BYTES)).toBe(true)
+    expect(store.outbox.countPending()).toBe(0)
+  })
+
+  it('never sends an oversized head row and continues FIFO after quarantining it', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const oversized = mutationAtEventSize(createMutation(22), MAX_EVENT_BYTES + 1)
+    const later = createMutation(23)
+    store.outbox.recordWithConversation(oversized)
+    store.outbox.recordWithConversation(later)
+    const pushedIds: string[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPull') return success({ mutations: [], cursor: null })
+      expect(Buffer.byteLength(JSON.stringify(input), 'utf8')).toBeLessThanOrEqual(MAX_EVENT_BYTES)
+      pushedIds.push(...input.mutations.map(({ id }) => id))
+      return success({
+        results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
+        cursor: 'cursor_after_oversize',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(pushedIds).toEqual([later.id])
+    expect(store.outbox.find(oversized.id)).toMatchObject({
+      state: 'failed', lastErrorCode: 'OUTBOX_LIMIT_EXCEEDED',
+    })
+    expect(store.outbox.find(later.id)).toBeUndefined()
+    expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
   })
 
   it('treats an identical duplicate receipt as replay-safe', async () => {
@@ -184,9 +254,9 @@ describe('UserDataSyncEngine', () => {
     store.outbox.recordWithConversation(mutation)
     const { engine } = createEngine(manager, async (input) => input.action === 'syncPush'
       ? success({ results: [{ id: mutation.id, status: 'duplicate', revision: 1 }], cursor: 'cursor_duplicate_push' })
-      : success({ mutations: [pulled(mutation)], cursor: 'cursor_duplicate_pull' }))
+      : success({ mutations: [], cursor: null }))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(store.outbox.find(mutation.id)).toBeUndefined()
@@ -203,12 +273,13 @@ describe('UserDataSyncEngine', () => {
       cursor: 'cursor_conflict',
     }))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(store.outbox.find(mutation.id)).toMatchObject({
       state: 'failed', lastErrorCode: 'SYNC_CONFLICT',
     })
+    expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
     expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'SYNC_CONFLICT' })
     expect(JSON.stringify(engine.status())).not.toContain(mutation.entityId)
   })
@@ -219,7 +290,7 @@ describe('UserDataSyncEngine', () => {
     store.outbox.record(createMutation(4))
     const call = vi.fn().mockRejectedValue({ code: 'SERVICE_UNAVAILABLE' })
     const { engine, clock } = createEngine(manager, call)
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
 
     for (const expectedDelay of [1_000, 2_000, 4_000, 8_000]) {
       await engine.flush()
@@ -239,7 +310,7 @@ describe('UserDataSyncEngine', () => {
     const store = manager.open('alice')
     store.outbox.record(createMutation(5))
     const { engine, clock } = createEngine(manager, vi.fn().mockRejectedValue({ code: 'SERVICE_UNAVAILABLE' }))
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
 
     for (let attempt = 0; attempt < 11; attempt += 1) {
       await engine.flush()
@@ -256,7 +327,7 @@ describe('UserDataSyncEngine', () => {
     store.outbox.record(mutation)
     const { engine, clock } = createEngine(manager, async () => failure('AUTH_REQUIRED'))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(engine.status()).toEqual({ state: 'paused', errorCode: 'AUTH_REQUIRED' })
@@ -271,12 +342,44 @@ describe('UserDataSyncEngine', () => {
     store.outbox.record(mutation)
     const { engine, clock } = createEngine(manager, vi.fn().mockRejectedValue({ code: 'INVALID_INPUT' }))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(store.outbox.find(mutation.id)).toMatchObject({ state: 'failed', lastErrorCode: 'INVALID_INPUT' })
+    expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
     expect(clock.timerCount()).toBe(0)
     expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INVALID_INPUT' })
+  })
+
+  it('durably quarantines upgrade-required and rejected push rows', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const upgrade = createMutation(30)
+    store.outbox.record(upgrade)
+    const upgradeEngine = createEngine(manager, async () => failure('UPGRADE_REQUIRED')).engine
+    await upgradeEngine.start('alice', 'device-a')
+    await upgradeEngine.flush()
+
+    expect(store.outbox.find(upgrade.id)).toMatchObject({
+      state: 'failed', lastErrorCode: 'UPGRADE_REQUIRED',
+    })
+    expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
+
+    const rejected = createMutation(31)
+    store.outbox.record(rejected)
+    const rejectedEngine = createEngine(manager, async (input) => input.action === 'syncPush'
+      ? success({
+          results: [{ id: rejected.id, status: 'rejected', errorCode: 'INVALID_INPUT' }],
+          cursor: 'cursor_rejected',
+        })
+      : success({ mutations: [], cursor: null })).engine
+    await rejectedEngine.start('alice', 'device-b')
+    await rejectedEngine.flush()
+
+    expect(store.outbox.find(rejected.id)).toMatchObject({
+      state: 'failed', lastErrorCode: 'INVALID_INPUT',
+    })
+    expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
   })
 
   it('quarantines malformed remote output without advancing the checkpoint', async () => {
@@ -284,7 +387,7 @@ describe('UserDataSyncEngine', () => {
     const store = manager.open('alice')
     const { engine } = createEngine(manager, vi.fn().mockRejectedValue({ code: 'INTERNAL_ERROR' }))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.pull()
 
     expect(store.sync.getCheckpoint()).toBeUndefined()
@@ -312,17 +415,18 @@ describe('UserDataSyncEngine', () => {
       return success({ mutations: [], cursor: null })
     })
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     const staleFlush = engine.flush()
     await vi.waitFor(() => expect(calls).toHaveLength(1))
-    engine.start('bob', 'device-a')
-    const bob = manager.current() as UserDataStore
-    const bobMutation = createMutation(1, 'bob')
-    bob.outbox.record(bobMutation)
+    const switchToBob = engine.start('bob', 'device-a')
     resolveAlice(success({
       results: [{ id: aliceMutation.id, status: 'applied', revision: 1 }], cursor: 'cursor_alice_push',
     }))
     await staleFlush
+    await switchToBob
+    const bob = manager.current() as UserDataStore
+    const bobMutation = createMutation(1, 'bob')
+    bob.outbox.recordWithConversation(bobMutation)
     await engine.flush()
 
     const callsAfterSwitch = calls.slice(1)
@@ -332,7 +436,95 @@ describe('UserDataSyncEngine', () => {
     expect(callsAfterSwitch.some((input) => (
       input.action === 'syncPush' && input.mutations.some(({ id }) => id === bobMutation.id)
     ))).toBe(true)
-    expect(bob.outbox.find(bobMutation.id)).toMatchObject({ state: 'syncing' })
+    expect(bob.outbox.find(bobMutation.id)).toBeUndefined()
+  })
+
+  it('queues a flush requested during pull and runs it after the pull completes', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    let resolvePull!: (response: UserDataFunctionResponse) => void
+    const deferredPull = new Promise<UserDataFunctionResponse>((resolve) => { resolvePull = resolve })
+    const actions: string[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      actions.push(input.action)
+      if (actions.length === 1) return deferredPull
+      if (input.action === 'syncPush') {
+        return success({
+          results: input.mutations.map(({ id }) => ({ id, status: 'applied', revision: 1 })),
+          cursor: 'cursor_queued_flush',
+        })
+      }
+      return success({ mutations: [], cursor: null })
+    })
+
+    await engine.start('alice', 'device-a')
+    const pulling = engine.pull()
+    await vi.waitFor(() => expect(actions).toEqual(['syncPull']))
+    const mutation = createMutation(24)
+    store.outbox.recordWithConversation(mutation)
+    const flushing = engine.flush()
+    resolvePull(success({ mutations: [], cursor: null }))
+    await Promise.all([pulling, flushing])
+
+    expect(actions).toEqual(['syncPull', 'syncPush', 'syncPull'])
+    expect(store.outbox.find(mutation.id)).toBeUndefined()
+  })
+
+  it('coalesces a pull requested during push into the pull after that push', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const mutation = createMutation(29)
+    store.outbox.recordWithConversation(mutation)
+    let resolvePush!: (response: UserDataFunctionResponse) => void
+    const deferredPush = new Promise<UserDataFunctionResponse>((resolve) => { resolvePush = resolve })
+    const actions: string[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      actions.push(input.action)
+      if (input.action === 'syncPush') return deferredPush
+      return success({ mutations: [], cursor: null })
+    })
+
+    await engine.start('alice', 'device-a')
+    const flushing = engine.flush()
+    await vi.waitFor(() => expect(actions).toEqual(['syncPush']))
+    const pulling = engine.pull()
+    resolvePush(success({
+      results: [{ id: mutation.id, status: 'applied', revision: 1 }],
+      cursor: 'cursor_queued_pull',
+    }))
+    await Promise.all([flushing, pulling])
+
+    expect(actions).toEqual(['syncPush', 'syncPull'])
+    expect(store.outbox.find(mutation.id)).toBeUndefined()
+  })
+
+  it.each([
+    { nextUser: 'alice', label: 'same UID' },
+    { nextUser: 'bob', label: 'different UID' },
+  ])('drains and restores the old generation before $label start handoff', async ({ nextUser }) => {
+    const manager = createManager()
+    const alice = manager.open('alice')
+    const mutation = createMutation(nextUser === 'alice' ? 25 : 26)
+    alice.outbox.recordWithConversation(mutation)
+    let resolvePush!: (response: UserDataFunctionResponse) => void
+    const deferredPush = new Promise<UserDataFunctionResponse>((resolve) => { resolvePush = resolve })
+    const { engine } = createEngine(manager, vi.fn().mockReturnValue(deferredPush))
+
+    await engine.start('alice', 'device-a')
+    const flushing = engine.flush()
+    await vi.waitFor(() => expect(alice.outbox.find(mutation.id)).toMatchObject({ state: 'syncing' }))
+    let handedOff = false
+    const handoff = Promise.resolve(engine.start(nextUser, 'device-b')).then(() => { handedOff = true })
+    await Promise.resolve()
+    expect(handedOff).toBe(false)
+    resolvePush(success({
+      results: [{ id: mutation.id, status: 'applied', revision: 1 }], cursor: 'cursor_stale_handoff',
+    }))
+    await flushing
+    await handoff
+
+    const reopenedAlice = manager.open('alice')
+    expect(reopenedAlice.outbox.find(mutation.id)).toMatchObject({ state: 'pending' })
   })
 
   it('pause clears retry timers and drains an in-flight call', async () => {
@@ -341,7 +533,7 @@ describe('UserDataSyncEngine', () => {
     store.outbox.record(createMutation(9))
     const clock = new FakeClock()
     const failed = createEngine(manager, vi.fn().mockRejectedValue({ code: 'SERVICE_UNAVAILABLE' }), clock)
-    failed.engine.start('alice', 'device-a')
+    await failed.engine.start('alice', 'device-a')
     await failed.engine.flush()
     expect(clock.timerCount()).toBe(1)
     await failed.engine.pause()
@@ -352,7 +544,7 @@ describe('UserDataSyncEngine', () => {
     let resolveCall!: (response: UserDataFunctionResponse) => void
     const pending = new Promise<UserDataFunctionResponse>((resolve) => { resolveCall = resolve })
     const active = createEngine(manager, vi.fn().mockReturnValue(pending), clock)
-    active.engine.start('alice', 'device-a')
+    await active.engine.start('alice', 'device-a')
     const flush = active.engine.flush()
     let paused = false
     const pause = active.engine.pause().then(() => { paused = true })
@@ -364,6 +556,41 @@ describe('UserDataSyncEngine', () => {
     expect(paused).toBe(true)
     expect(clock.timerCount()).toBe(0)
     expect(store.outbox.find(createMutation(90).id)).toMatchObject({ state: 'pending' })
+  })
+
+  it('clears an existing retry timer before a pull enters quarantine', async () => {
+    const manager = createManager()
+    manager.open('alice').outbox.record(createMutation(27))
+    const call = vi.fn()
+      .mockRejectedValueOnce({ code: 'SERVICE_UNAVAILABLE' })
+      .mockRejectedValueOnce({ code: 'INTERNAL_ERROR' })
+    const { engine, clock } = createEngine(manager, call)
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+    expect(clock.timerCount()).toBe(1)
+
+    await engine.pull()
+
+    expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INTERNAL_ERROR' })
+    expect(clock.timerCount()).toBe(0)
+  })
+
+  it('maps a timer-driven repository failure to safe quarantine without rejection', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    store.outbox.record(createMutation(28))
+    const { engine, clock } = createEngine(
+      manager,
+      vi.fn().mockRejectedValue({ code: 'SERVICE_UNAVAILABLE' }),
+    )
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+    store.outbox.listReady = () => { throw new Error('private row payload') }
+
+    await clock.fireNext()
+    await vi.waitFor(() => expect(engine.status()).toEqual({
+      state: 'quarantined', errorCode: 'INTERNAL_ERROR',
+    }))
   })
 
   it('rolls back an earlier remote mutation and checkpoint when a later row is inconsistent', async () => {
@@ -384,7 +611,7 @@ describe('UserDataSyncEngine', () => {
       mutations: [pulled(first), invalid], cursor: 'cursor_must_rollback',
     }))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.pull()
 
     expect(store.conversations.get(first.entityId)).toBeUndefined()
@@ -392,7 +619,7 @@ describe('UserDataSyncEngine', () => {
     expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INTERNAL_ERROR' })
   })
 
-  it('quarantines a mismatched duplicate receipt instead of deleting the local row', async () => {
+  it('quarantines a mismatched replay after direct duplicate acknowledgement', async () => {
     const manager = createManager()
     const store = manager.open('alice')
     const local = createMutation(12)
@@ -405,10 +632,10 @@ describe('UserDataSyncEngine', () => {
       ? success({ results: [{ id: local.id, status: 'duplicate', revision: 1 }], cursor: 'cursor_duplicate' })
       : success({ mutations: [mismatched], cursor: 'cursor_collision' }))
 
-    engine.start('alice', 'device-a')
+    await engine.start('alice', 'device-a')
     await engine.flush()
 
-    expect(store.outbox.find(local.id)).toBeDefined()
+    expect(store.outbox.find(local.id)).toBeUndefined()
     expect(store.sync.getCheckpoint()).toBeUndefined()
     expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INTERNAL_ERROR' })
   })

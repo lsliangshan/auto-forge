@@ -1,13 +1,11 @@
 import {
-  appErrorCodeSchema,
   opaqueCursorSchema,
-  syncMutationKindSchema,
+  pulledMutationSchema,
   syncMutationResultSchema,
   syncMutationSchema,
   toSafeAppError,
   type AppError,
-  type AppErrorCode,
-  type SyncMutation,
+  type PulledMutation,
   type SyncMutationResult,
 } from '@autoforge/shared'
 import { z } from 'zod'
@@ -15,6 +13,19 @@ import type { CloudBaseFunctionPort } from '../auth/cloudbase-auth-port.js'
 
 const protocolVersionSchema = z.literal(1)
 const identifierSchema = z.string().trim().min(1).max(128)
+const maximumRequestBytes = 1_048_576
+const userDataErrorCodeSchema = z.enum([
+  'AUTH_REQUIRED',
+  'FORBIDDEN',
+  'INVALID_INPUT',
+  'SYNC_CONFLICT',
+  'UPGRADE_REQUIRED',
+  'IMPORT_CONFIRMATION_REQUIRED',
+  'OUTBOX_LIMIT_EXCEEDED',
+  'SERVICE_UNAVAILABLE',
+  'INTERNAL_ERROR',
+])
+export type UserDataErrorCode = z.infer<typeof userDataErrorCodeSchema>
 
 const syncPushCallSchema = z.object({
   action: z.literal('syncPush'),
@@ -43,30 +54,8 @@ const syncPushDataSchema = z.object({
   cursor: opaqueCursorSchema.optional(),
 }).strict()
 
-const remoteMutationSchema = z.object({
-  id: identifierSchema,
-  kind: syncMutationKindSchema,
-  entityId: identifierSchema,
-  baseRevision: z.number().int().nonnegative(),
-  resultRevision: z.number().int().nonnegative().nullable(),
-  payload: z.unknown(),
-  receivedAt: z.string().datetime(),
-}).strict().superRefine((remote, context) => {
-  const mutation = syncMutationSchema.safeParse({
-    id: remote.id,
-    kind: remote.kind,
-    entityId: remote.entityId,
-    baseRevision: remote.baseRevision,
-    payload: remote.payload,
-    occurredAt: remote.receivedAt,
-  })
-  if (!mutation.success) {
-    context.addIssue({ code: 'custom', message: 'Invalid remote mutation' })
-  }
-})
-
 const syncPullDataSchema = z.object({
-  mutations: z.array(remoteMutationSchema).max(100),
+  mutations: z.array(pulledMutationSchema).max(100),
   cursor: opaqueCursorSchema.nullable(),
 }).strict()
 
@@ -75,15 +64,7 @@ export interface SyncPushData {
   cursor?: string
 }
 
-export interface RemoteSyncMutation {
-  id: string
-  kind: SyncMutation['kind']
-  entityId: string
-  baseRevision: number
-  resultRevision: number | null
-  payload: SyncMutation['payload']
-  receivedAt: string
-}
+export type RemoteSyncMutation = PulledMutation
 
 export interface SyncPullData {
   mutations: RemoteSyncMutation[]
@@ -92,17 +73,17 @@ export interface SyncPullData {
 
 export type UserDataFunctionResponse =
   | { ok: true; data: SyncPushData | SyncPullData }
-  | { ok: false; error: { code: AppErrorCode } }
+  | { ok: false; error: { code: UserDataErrorCode } }
 
 const functionResponseSchema = z.object({ result: z.unknown() }).passthrough()
 const errorEnvelopeSchema = z.object({
   ok: z.literal(false),
-  error: z.object({ code: appErrorCodeSchema }).strict(),
+  error: z.object({ code: userDataErrorCodeSchema }).strict(),
 }).strict()
 
 function invocationError(error: unknown): AppError {
   if (typeof error === 'object' && error !== null) {
-    const stable = appErrorCodeSchema.safeParse((error as { code?: unknown }).code)
+    const stable = userDataErrorCodeSchema.safeParse((error as { code?: unknown }).code)
     if (stable.success) return toSafeAppError({ code: stable.data })
     const status = (error as { statusCode?: unknown; status?: unknown }).statusCode
       ?? (error as { status?: unknown }).status
@@ -129,6 +110,9 @@ export class CloudBaseUserDataPort {
   async call(input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> {
     const parsedInput = cloudBaseUserDataCallSchema.safeParse(input)
     if (!parsedInput.success) throw toSafeAppError({ code: 'INVALID_INPUT' })
+    if (Buffer.byteLength(JSON.stringify(parsedInput.data), 'utf8') > maximumRequestBytes) {
+      throw toSafeAppError({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+    }
 
     let raw: unknown
     try {

@@ -14,6 +14,7 @@ import type {
 
 const PROTOCOL_VERSION = 1 as const
 const BATCH_LIMIT = 100
+const MAX_EVENT_BYTES = 1_048_576
 const MAX_RETRY_DELAY = 5 * 60 * 1_000
 
 type TimerHandle = unknown
@@ -73,7 +74,10 @@ export class UserDataSyncEngine {
   #binding?: ActiveBinding
   #status: UserDataSyncStatus = { state: 'paused' }
   #timer?: TimerHandle
-  #operations = new Map<number, Promise<void>>()
+  #drainPromise?: Promise<void>
+  #lifecycleTail: Promise<void> = Promise.resolve()
+  #flushRequested = false
+  #pullRequested = false
   #syncingIds = new Map<number, Set<string>>()
   #pullFailureAttempt = 0
   readonly #dependencies: SyncEngineDependencies
@@ -86,15 +90,17 @@ export class UserDataSyncEngine {
     this.#dependencies = { ...defaultDependencies, ...dependencies }
   }
 
-  start(userId: string, deviceId: string): void {
+  start(userId: string, deviceId: string): Promise<void> {
     if (!validIdentifier(userId) || !validIdentifier(deviceId)) {
-      throw toSafeAppError({ code: 'INVALID_INPUT' })
+      return Promise.reject(toSafeAppError({ code: 'INVALID_INPUT' }))
     }
-    this.#clearTimer()
-    const generation = ++this.#generation
-    this.#binding = { generation, deviceId, store: this.stores.open(userId) }
-    this.#pullFailureAttempt = 0
-    this.#status = { state: 'idle' }
+    return this.#queueLifecycle(async () => {
+      await this.#handoff()
+      const generation = ++this.#generation
+      this.#binding = { generation, deviceId, store: this.stores.open(userId) }
+      this.#pullFailureAttempt = 0
+      this.#status = { state: 'idle' }
+    })
   }
 
   flush(): Promise<void> {
@@ -103,9 +109,10 @@ export class UserDataSyncEngine {
       return Promise.resolve()
     }
     if (this.#status.state === 'retrying') {
-      return this.#operations.get(binding.generation) ?? Promise.resolve()
+      return this.#drainPromise ?? Promise.resolve()
     }
-    return this.#runExclusive(binding, () => this.#flush(binding))
+    this.#flushRequested = true
+    return this.#ensureDrain(binding)
   }
 
   pull(): Promise<void> {
@@ -113,44 +120,72 @@ export class UserDataSyncEngine {
     if (!binding || this.#status.state === 'paused' || this.#status.state === 'quarantined') {
       return Promise.resolve()
     }
-    return this.#runExclusive(binding, async () => {
-      this.#status = { state: 'running' }
-      const outcome = await this.#pull(binding)
-      if (outcome === 'success' && this.#isCurrent(binding)) this.#status = { state: 'idle' }
-    })
+    this.#pullRequested = true
+    return this.#ensureDrain(binding)
   }
 
-  async pause(): Promise<void> {
-    const binding = this.#binding
-    const pausedGeneration = ++this.#generation
-    this.#binding = undefined
-    this.#clearTimer()
-    this.#status = { state: 'paused' }
-    await Promise.allSettled([...this.#operations.values()])
-    if (binding && this.#generation === pausedGeneration) {
-      for (const id of this.#syncingIds.get(binding.generation) ?? []) {
-        if (binding.store.outbox.find(id)?.state === 'syncing') {
-          binding.store.outbox.markPending(id)
-        }
-      }
-      this.#syncingIds.delete(binding.generation)
-    }
+  pause(): Promise<void> {
+    return this.#queueLifecycle(async () => {
+      await this.#handoff()
+      this.#status = { state: 'paused' }
+    })
   }
 
   status(): UserDataSyncStatus {
     return { ...this.#status }
   }
 
-  #runExclusive(binding: ActiveBinding, operation: () => Promise<void>): Promise<void> {
-    const existing = this.#operations.get(binding.generation)
-    if (existing) return existing
-    const running = operation().finally(() => {
-      if (this.#operations.get(binding.generation) === running) {
-        this.#operations.delete(binding.generation)
+  #queueLifecycle(operation: () => Promise<void>): Promise<void> {
+    const queued = this.#lifecycleTail.then(operation, operation)
+    this.#lifecycleTail = queued.catch(() => undefined)
+    return queued
+  }
+
+  async #handoff(): Promise<void> {
+    const binding = this.#binding
+    ++this.#generation
+    this.#binding = undefined
+    this.#flushRequested = false
+    this.#pullRequested = false
+    this.#clearTimer()
+    await this.#drainPromise
+    if (binding) {
+      for (const id of this.#syncingIds.get(binding.generation) ?? []) {
+        if (binding.store.outbox.find(id)?.state === 'syncing') binding.store.outbox.markPending(id)
       }
-    })
-    this.#operations.set(binding.generation, running)
-    return running
+      this.#syncingIds.delete(binding.generation)
+    }
+  }
+
+  #ensureDrain(binding: ActiveBinding): Promise<void> {
+    if (this.#drainPromise) return this.#drainPromise
+    const drain = this.#drain(binding)
+      .catch(() => {
+        if (this.#isCurrent(binding)) this.#quarantine('INTERNAL_ERROR')
+      })
+      .finally(() => {
+        if (this.#drainPromise === drain) this.#drainPromise = undefined
+      })
+    this.#drainPromise = drain
+    return drain
+  }
+
+  async #drain(binding: ActiveBinding): Promise<void> {
+    while (this.#isCurrent(binding)) {
+      if (this.#flushRequested) {
+        this.#flushRequested = false
+        await this.#flush(binding)
+        continue
+      }
+      if (this.#pullRequested) {
+        this.#pullRequested = false
+        this.#status = { state: 'running' }
+        const outcome = await this.#pull(binding)
+        if (outcome === 'success' && this.#isCurrent(binding)) this.#status = { state: 'idle' }
+        continue
+      }
+      return
+    }
   }
 
   async #flush(binding: ActiveBinding): Promise<void> {
@@ -159,10 +194,9 @@ export class UserDataSyncEngine {
     let quarantineCode: AppErrorCode | undefined
 
     while (this.#isCurrent(binding)) {
-      const batch = binding.store.outbox.listReady(this.#dependencies.now(), BATCH_LIMIT)
-      if (batch.length === 0) break
-      const ids = batch.map(({ id }) => id)
-      const mutations = batch.map((item): SyncMutation => ({
+      const ready = binding.store.outbox.listReady(this.#dependencies.now(), BATCH_LIMIT)
+      if (ready.length === 0) break
+      const candidates = ready.map((item): SyncMutation => ({
         id: item.id,
         kind: item.kind,
         entityId: item.entityId,
@@ -170,6 +204,20 @@ export class UserDataSyncEngine {
         payload: item.payload,
         occurredAt: item.occurredAt,
       } as SyncMutation))
+      let batchLength = 0
+      while (batchLength < candidates.length) {
+        const nextLength = batchLength + 1
+        if (this.#pushEventBytes(binding.deviceId, candidates.slice(0, nextLength)) > MAX_EVENT_BYTES) break
+        batchLength = nextLength
+      }
+      if (batchLength === 0) {
+        binding.store.outbox.markFailed(ready[0]!.id, 'OUTBOX_LIMIT_EXCEEDED')
+        quarantineCode ??= 'OUTBOX_LIMIT_EXCEEDED'
+        continue
+      }
+      const batch = ready.slice(0, batchLength)
+      const mutations = candidates.slice(0, batchLength)
+      const ids = batch.map(({ id }) => id)
       binding.store.outbox.markSyncing(ids)
       this.#trackSyncing(binding, ids)
 
@@ -193,7 +241,7 @@ export class UserDataSyncEngine {
         } else {
           for (const id of ids) binding.store.outbox.markFailed(id, code)
           this.#untrackSyncing(binding, ids)
-          this.#status = { state: 'quarantined', errorCode: code }
+          this.#quarantine(code)
         }
         return
       }
@@ -210,7 +258,7 @@ export class UserDataSyncEngine {
         } else {
           for (const id of ids) binding.store.outbox.markFailed(id, code)
           this.#untrackSyncing(binding, ids)
-          this.#status = { state: 'quarantined', errorCode: code }
+          this.#quarantine(code)
         }
         return
       }
@@ -219,7 +267,21 @@ export class UserDataSyncEngine {
       if (!data || !this.#validResults(ids, data.results)) {
         for (const id of ids) binding.store.outbox.markFailed(id, 'SYNC_FAILED')
         this.#untrackSyncing(binding, ids)
-        this.#status = { state: 'quarantined', errorCode: 'SYNC_FAILED' }
+        this.#quarantine('SYNC_FAILED')
+        return
+      }
+
+      try {
+        binding.store.outbox.acknowledgePushResults(mutations, data.results)
+        this.#pruneSyncing(binding)
+      } catch {
+        for (const id of ids) {
+          if (binding.store.outbox.find(id)?.state === 'syncing') {
+            binding.store.outbox.markFailed(id, 'SYNC_FAILED')
+          }
+        }
+        this.#untrackSyncing(binding, ids)
+        this.#quarantine('SYNC_FAILED')
         return
       }
 
@@ -236,17 +298,26 @@ export class UserDataSyncEngine {
           quarantineCode ??= code
         }
       }
-      if (quarantineCode) break
     }
 
     if (!this.#isCurrent(binding)) return
+    this.#pullRequested = false
     const pullOutcome = await this.#pull(binding)
     if (!this.#isCurrent(binding)) return
     if (quarantineCode) {
-      this.#status = { state: 'quarantined', errorCode: quarantineCode }
+      this.#quarantine(quarantineCode)
     } else if (pullOutcome === 'success') {
       this.#status = { state: 'idle' }
     }
+  }
+
+  #pushEventBytes(deviceId: string, mutations: readonly SyncMutation[]): number {
+    return Buffer.byteLength(JSON.stringify({
+      action: 'syncPush',
+      protocolVersion: PROTOCOL_VERSION,
+      deviceId,
+      mutations,
+    }), 'utf8')
   }
 
   #validResults(ids: readonly string[], results: readonly SyncMutationResult[]): boolean {
@@ -286,7 +357,7 @@ export class UserDataSyncEngine {
       }
       const data = pullData(response)
       if (!data || (data.mutations.length === BATCH_LIMIT && data.cursor === previousCursor)) {
-        this.#status = { state: 'quarantined', errorCode: 'INTERNAL_ERROR' }
+        this.#quarantine('INTERNAL_ERROR')
         return 'stopped'
       }
       try {
@@ -297,7 +368,7 @@ export class UserDataSyncEngine {
         }, this.#dependencies.now())
         this.#pruneSyncing(binding)
       } catch {
-        this.#status = { state: 'quarantined', errorCode: 'INTERNAL_ERROR' }
+        this.#quarantine('INTERNAL_ERROR')
         return 'stopped'
       }
       this.#pullFailureAttempt = 0
@@ -314,7 +385,7 @@ export class UserDataSyncEngine {
     } else if (code === 'AUTH_REQUIRED') {
       this.#status = { state: 'paused', errorCode: 'AUTH_REQUIRED' }
     } else {
-      this.#status = { state: 'quarantined', errorCode: code }
+      this.#quarantine(code)
     }
   }
 
@@ -339,7 +410,9 @@ export class UserDataSyncEngine {
       this.#timer = undefined
       if (this.#isCurrent(binding)) {
         this.#status = { state: 'idle' }
-        void this.flush()
+        void this.flush().catch(() => {
+          if (this.#isCurrent(binding)) this.#quarantine('INTERNAL_ERROR')
+        })
       }
     }, delay)
   }
@@ -352,6 +425,11 @@ export class UserDataSyncEngine {
 
   #isCurrent(binding: ActiveBinding): boolean {
     return this.#binding === binding && this.#generation === binding.generation
+  }
+
+  #quarantine(errorCode: AppErrorCode): void {
+    this.#clearTimer()
+    this.#status = { state: 'quarantined', errorCode }
   }
 
   #trackSyncing(binding: ActiveBinding, ids: readonly string[]): void {

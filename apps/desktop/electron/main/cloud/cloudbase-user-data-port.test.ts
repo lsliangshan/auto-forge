@@ -74,6 +74,60 @@ describe('CloudBaseUserDataPort', () => {
     expect(callFunction).not.toHaveBeenCalled()
   })
 
+  it('enforces the Task 3 one-mebibyte serialized event boundary', async () => {
+    const callFunction = vi.fn().mockResolvedValue({
+      result: { ok: true, data: { results: [], cursor: 'cursor_boundary_01' } },
+    })
+    const port = new CloudBaseUserDataPort({ callFunction })
+    const event = {
+      action: 'syncPush' as const,
+      protocolVersion: 1 as const,
+      deviceId: 'device-a',
+      mutations: [{ ...mutation, payload: { ...mutation.payload, title: '' } }],
+    }
+    const fixedBytes = Buffer.byteLength(JSON.stringify(event), 'utf8')
+    const exact = {
+      ...event,
+      mutations: [{
+        ...mutation,
+        payload: { ...mutation.payload, title: 'x'.repeat(1_048_576 - fixedBytes) },
+      }],
+    }
+
+    await port.call(exact)
+    await expect(port.call({
+      ...exact,
+      mutations: [{
+        ...exact.mutations[0],
+        payload: { ...exact.mutations[0].payload, title: `${exact.mutations[0].payload.title}x` },
+      }],
+    })).rejects.toMatchObject({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+    expect(callFunction).toHaveBeenCalledOnce()
+    expect(Buffer.byteLength(JSON.stringify(callFunction.mock.calls[0]?.[0].data), 'utf8'))
+      .toBe(1_048_576)
+  })
+
+  it('accepts Task 3 reduced legacy receipts on pull', async () => {
+    const receipt = {
+      id: 'legacy_receipt_1',
+      kind: 'legacy.import' as const,
+      entityId: 'legacy_batch_1',
+      baseRevision: 0,
+      resultRevision: 0,
+      payload: { batchId: 'legacy_batch_1', includeUnowned: false },
+      receivedAt: '2026-08-25T00:00:00.000Z',
+    }
+    const port = new CloudBaseUserDataPort({
+      callFunction: vi.fn().mockResolvedValue({
+        result: { ok: true, data: { mutations: [receipt], cursor: 'cursor_legacy_pull_1' } },
+      }),
+    })
+
+    await expect(port.call({
+      action: 'syncPull', protocolVersion: 1, deviceId: 'device-a', limit: 100,
+    })).resolves.toEqual({ ok: true, data: { mutations: [receipt], cursor: 'cursor_legacy_pull_1' } })
+  })
+
   it('returns only strict safe error envelopes', async () => {
     const port = new CloudBaseUserDataPort({
       callFunction: vi.fn().mockResolvedValue({
@@ -84,6 +138,18 @@ describe('CloudBaseUserDataPort', () => {
     await expect(port.call({
       action: 'syncPull', protocolVersion: 1, deviceId: 'device-a', limit: 100,
     })).resolves.toEqual({ ok: false, error: { code: 'AUTH_REQUIRED' } })
+  })
+
+  it('rejects safe application codes outside Task 3 user-data errors', async () => {
+    const port = new CloudBaseUserDataPort({
+      callFunction: vi.fn().mockResolvedValue({
+        result: { ok: false, error: { code: 'SYNC_FAILED' } },
+      }),
+    })
+
+    await expect(port.call({
+      action: 'syncPull', protocolVersion: 1, deviceId: 'device-a', limit: 100,
+    })).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
   })
 
   it('discards CloudBase transport metadata outside the strict result envelope', async () => {

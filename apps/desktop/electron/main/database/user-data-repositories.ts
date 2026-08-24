@@ -8,13 +8,16 @@ import {
   conversationSummarySchema,
   conversationTitleStateSchema,
   opaqueCursorSchema,
+  pulledMutationSchema,
   syncStateSchema,
-  syncMutationKindSchema,
+  syncMutationResultSchema,
   syncMutationSchema,
   type ConversationPage,
   type AppErrorCode,
   type MessagePage,
+  type PulledMutation,
   type SyncMutation,
+  type SyncMutationResult,
 } from '@autoforge/shared'
 import {
   createRepositories,
@@ -40,20 +43,10 @@ const checkpointSchema = z.object({
   updatedAt: z.number().int().nonnegative(),
 }).strict()
 
-const remoteMutationEnvelopeSchema = z.object({
-  id: z.string().trim().min(1),
-  kind: syncMutationKindSchema,
-  entityId: z.string().trim().min(1),
-  baseRevision: z.number().int().nonnegative(),
-  resultRevision: z.number().int().nonnegative().nullable(),
-  payload: z.unknown(),
-  receivedAt: z.string().datetime(),
-}).strict()
-
 const remotePageEnvelopeSchema = z.object({
   protocolVersion: z.number().int().positive(),
   cursor: opaqueCursorSchema.nullable(),
-  mutations: z.array(z.unknown()).max(100),
+  mutations: z.array(pulledMutationSchema).max(100),
 }).strict()
 
 const conversationRowSchema = z.object({
@@ -93,11 +86,7 @@ export interface SyncCheckpoint {
   updatedAt: number
 }
 
-type StoredRemoteMutation<T extends SyncMutation = SyncMutation> = T extends SyncMutation
-  ? Omit<T, 'occurredAt'> & { resultRevision: number | null; receivedAt: string }
-  : never
-
-export type RemoteMutation = StoredRemoteMutation
+export type RemoteMutation = PulledMutation
 
 export interface RemoteMutationPage {
   protocolVersion: number
@@ -131,6 +120,10 @@ export interface UserDataRepositories {
     markSyncing(ids: readonly string[]): void
     markPending(id: string, nextAttemptAt?: number): void
     markFailed(id: string, errorCode: AppErrorCode, nextAttemptAt?: number): void
+    acknowledgePushResults(
+      sent: readonly SyncMutation[],
+      results: readonly SyncMutationResult[],
+    ): void
     delete(id: string): void
   }
 }
@@ -194,27 +187,7 @@ function isoTimestamp(value: number): string {
 }
 
 function parseRemotePage(value: unknown): RemoteMutationPage {
-  return parsePersisted(() => {
-    const envelope = remotePageEnvelopeSchema.parse(value)
-    const mutations = envelope.mutations.map((raw): RemoteMutation => {
-      const remote = remoteMutationEnvelopeSchema.parse(raw)
-      const validated = syncMutationSchema.parse({
-        id: remote.id,
-        kind: remote.kind,
-        entityId: remote.entityId,
-        baseRevision: remote.baseRevision,
-        payload: remote.payload,
-        occurredAt: remote.receivedAt,
-      })
-      const { occurredAt, ...mutation } = validated
-      return {
-        ...mutation,
-        resultRevision: remote.resultRevision,
-        receivedAt: occurredAt,
-      }
-    })
-    return { ...envelope, mutations }
-  })
+  return parsePersisted(() => remotePageEnvelopeSchema.parse(value))
 }
 
 function encodeCursor(value: Record<string, string | number>): string {
@@ -368,7 +341,17 @@ function optimisticMessageMutation(
   `).run({ conversationId: payload.conversationId, createdAt: timestamp(payload.createdAt) })
 }
 
-function requireRemoteRevision(mutation: RemoteMutation): number {
+interface MutationReceipt {
+  id: string
+  kind: SyncMutation['kind']
+  entityId: string
+  baseRevision: number
+  resultRevision: number | null
+  payload: unknown
+  receivedAt: string
+}
+
+function requireRemoteRevision(mutation: MutationReceipt): number {
   if (mutation.resultRevision === null) throw new UserDataConsistencyError()
   return mutation.resultRevision
 }
@@ -388,7 +371,7 @@ function requireOwnedConversation(
   assertStoredOwner(owner.userId ?? undefined, ownerUserId)
 }
 
-function sameMutationIdentity(local: SyncMutation, remote: RemoteMutation): boolean {
+function sameMutationIdentity(local: SyncMutation, remote: MutationReceipt): boolean {
   return local.id === remote.id
     && local.kind === remote.kind
     && local.entityId === remote.entityId
@@ -396,7 +379,7 @@ function sameMutationIdentity(local: SyncMutation, remote: RemoteMutation): bool
     && isDeepStrictEqual(local.payload, remote.payload)
 }
 
-function requireValidRemoteResult(mutation: RemoteMutation): number {
+function requireValidRemoteResult(mutation: MutationReceipt): number {
   const result = requireRemoteRevision(mutation)
   const valid = (() => {
     switch (mutation.kind) {
@@ -421,8 +404,9 @@ function requireValidRemoteResult(mutation: RemoteMutation): number {
 
 function validateOutboxReceipt(
   database: SqliteDatabase,
-  mutation: RemoteMutation,
-): SyncMutation | undefined {
+  mutation: MutationReceipt,
+  validateRevision = true,
+): OutboxMutationRecord | undefined {
   const row = database.prepare(`
     SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
            payload_json AS payloadJson, state, attempts,
@@ -434,7 +418,7 @@ function validateOutboxReceipt(
   if (row === undefined) return undefined
   const local = outboxFromRow(row)
   if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
-  requireValidRemoteResult(mutation)
+  if (validateRevision) requireValidRemoteResult(mutation)
   return local
 }
 
@@ -479,7 +463,7 @@ function acknowledgeLocalMutation(
   database: SqliteDatabase,
   ownerUserId: string,
   local: SyncMutation,
-  remote: RemoteMutation,
+  remote: MutationReceipt,
 ): void {
   const resultRevision = requireValidRemoteResult(remote)
   let conversationId: string | undefined
@@ -887,6 +871,46 @@ function writeCheckpoint(database: SqliteDatabase, checkpoint: SyncCheckpoint): 
   `).run({ ...validated, remoteCursor: validated.remoteCursor ?? null })
 }
 
+function acknowledgePushResults(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  sentInput: readonly SyncMutation[],
+  resultInput: readonly SyncMutationResult[],
+): void {
+  const sent = parsePersisted(() => sentInput.map((mutation) => syncMutationSchema.parse(mutation)))
+  const results = parsePersisted(() => resultInput.map((result) => syncMutationResultSchema.parse(result)))
+  if (sent.length === 0 || sent.length > 100 || sent.length !== results.length) {
+    throw new UserDataConsistencyError()
+  }
+  const sentById = new Map(sent.map((mutation) => [mutation.id, mutation]))
+  const resultById = new Map(results.map((result) => [result.id, result]))
+  if (sentById.size !== sent.length || resultById.size !== results.length) {
+    throw new UserDataConsistencyError()
+  }
+
+  transaction(database, () => {
+    for (const [id, mutation] of sentById) {
+      const result = resultById.get(id)
+      if (!result) throw new UserDataConsistencyError()
+      const receipt: MutationReceipt = {
+        id: mutation.id,
+        kind: mutation.kind,
+        entityId: mutation.entityId,
+        baseRevision: mutation.baseRevision,
+        resultRevision: result.revision ?? null,
+        payload: mutation.payload,
+        receivedAt: mutation.occurredAt,
+      }
+      const local = validateOutboxReceipt(database, receipt, false)
+      if (local?.state !== 'syncing') throw new UserDataConsistencyError()
+      if (result.status === 'applied' || result.status === 'duplicate') {
+        requireValidRemoteResult(receipt)
+        acknowledgeLocalMutation(database, ownerUserId, local, receipt)
+      }
+    }
+  })
+}
+
 function assertEveryMessageOwned(database: SqliteDatabase, ownerUserId: string): void {
   const foreign = database.prepare(`
     SELECT 1
@@ -1252,8 +1276,8 @@ export function createUserDataRepositories(
                  next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
                  occurred_at AS occurredAt, created_at AS createdAt
           FROM outbox_mutations
-          WHERE state IN ('pending', 'failed')
-            AND (next_attempt_at IS NULL OR next_attempt_at <= @now)
+          WHERE (state = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= @now))
+            OR (state = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= @now)
           ORDER BY enqueue_sequence
           LIMIT @limit
         `).all({ now, limit }) as Query[]).map(outboxFromRow)
@@ -1310,6 +1334,9 @@ export function createUserDataRepositories(
           SET state = 'failed', next_attempt_at = @nextAttemptAt, last_error_code = @errorCode
           WHERE id = @id
         `).run({ id, errorCode: validatedErrorCode, nextAttemptAt: nextAttemptAt ?? null }))
+      },
+      acknowledgePushResults(sent, results) {
+        acknowledgePushResults(database, ownerUserId, sent, results)
       },
       delete(id) {
         transaction(database, () => database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id }))

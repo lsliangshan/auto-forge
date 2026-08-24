@@ -998,6 +998,90 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
 })
 export type SyncMutation = z.infer<typeof syncMutationSchema>
 
+export const storedLegacyImportReceiptPayloadSchema = z.object({
+  batchId: identifierSchema,
+  includeUnowned: z.boolean(),
+}).strict()
+export type StoredLegacyImportReceiptPayload = z.infer<typeof storedLegacyImportReceiptPayloadSchema>
+
+const pulledMutationBaseShape = {
+  id: identifierSchema,
+  entityId: identifierSchema,
+  baseRevision: z.number().int().nonnegative(),
+  resultRevision: z.number().int().nonnegative().nullable(),
+  receivedAt: timestampSchema,
+}
+
+export const pulledMutationSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.create'),
+    payload: conversationCreateMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.rename'),
+    payload: conversationRenameMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.delete'),
+    payload: conversationDeleteMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.restore'),
+    payload: conversationRestoreMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('message.append'),
+    payload: messageAppendMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('legacy.import'),
+    payload: storedLegacyImportReceiptPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('privacy.consent'),
+    payload: privacyConsentSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('preferences.update'),
+    payload: accountDataPreferencesSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('usage.record'),
+    payload: byokUsageEventSchema,
+  }).strict(),
+]).superRefine((mutation, context) => {
+  let payloadEntityId: string | undefined
+  switch (mutation.kind) {
+    case 'message.append':
+    case 'usage.record':
+      payloadEntityId = mutation.payload.id
+      break
+    case 'legacy.import':
+      payloadEntityId = mutation.payload.batchId
+      break
+    case 'privacy.consent':
+      payloadEntityId = mutation.payload.documentVersion
+      break
+  }
+  if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
+    context.addIssue({
+      code: 'custom',
+      path: ['entityId'],
+      message: 'Mutation entity identity does not match its payload.',
+    })
+  }
+})
+export type PulledMutation = z.infer<typeof pulledMutationSchema>
+
 export const modelTokenUsageSchema = z.object({
   provider: modelProviderIdSchema,
   model: nonEmptyStringSchema,

@@ -38,6 +38,7 @@ import {
   providerUsageModalitySchema,
   providerCredentialStatusSchema,
   proxySettingsSchema,
+  pulledMutationSchema,
   toSafeAppError,
   tokenUsageSnapshotSchema,
   syncMutationResultSchema,
@@ -271,6 +272,36 @@ describe('cross-process contracts', () => {
     expect(syncMutationResultSchema.parse({ id: 'mut_1', status: 'duplicate', revision: 1 }))
       .toEqual({ id: 'mut_1', status: 'duplicate', revision: 1 })
     expect(syncMutationResultSchema.safeParse({ id: 'mut_1', status: 'unknown' }).success).toBe(false)
+  })
+
+  it('separates reduced pulled legacy receipts from strict push mutations', () => {
+    const receipt = {
+      id: 'legacy_receipt_1',
+      kind: 'legacy.import' as const,
+      entityId: 'legacy_batch_1',
+      baseRevision: 0,
+      resultRevision: 0,
+      payload: { batchId: 'legacy_batch_1', includeUnowned: true },
+      receivedAt: '2026-08-24T00:00:00.000Z',
+    }
+
+    expect(pulledMutationSchema.parse(receipt)).toEqual(receipt)
+    expect(syncMutationSchema.safeParse({
+      id: receipt.id,
+      kind: receipt.kind,
+      entityId: receipt.entityId,
+      baseRevision: receipt.baseRevision,
+      payload: receipt.payload,
+      occurredAt: receipt.receivedAt,
+    }).success).toBe(false)
+    expect(pulledMutationSchema.safeParse({
+      ...receipt,
+      payload: { ...receipt.payload, clientSecret: 'secret' },
+    }).success).toBe(false)
+    expect(pulledMutationSchema.safeParse({
+      ...receipt,
+      entityId: 'different_batch',
+    }).success).toBe(false)
   })
 
   it('keeps cloud-sync and unowned legacy import consent distinct', () => {

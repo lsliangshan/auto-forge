@@ -272,6 +272,94 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('keeps quarantined failures out of ready FIFO until a due retry is explicit', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const quarantined = createConversationMutation('quarantined_mutation', 'quarantined_conversation')
+    const retryable = createConversationMutation('retryable_mutation', 'retryable_conversation')
+    const pendingRetry = createConversationMutation('pending_retry_mutation', 'pending_retry_conversation')
+    store.outbox.record(quarantined)
+    store.outbox.record(retryable)
+    store.outbox.record(pendingRetry)
+
+    store.outbox.markFailed(quarantined.id, 'SYNC_CONFLICT')
+    store.outbox.markFailed(retryable.id, 'SYNC_FAILED', 2_000)
+    store.outbox.markPending(pendingRetry.id, 2_000)
+
+    expect(store.outbox.listReady(1_999, 10)).toEqual([])
+    expect(store.outbox.listReady(2_000, 10).map(({ id }) => id)).toEqual([
+      retryable.id, pendingRetry.id,
+    ])
+    manager.close()
+  })
+
+  it('atomically acknowledges exact successful push results without waiting for pull', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const first = createConversationMutation('push_ack_first', 'push_ack_conversation_first')
+    const second = createConversationMutation('push_ack_second', 'push_ack_conversation_second')
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(second)
+    store.outbox.markSyncing([first.id, second.id])
+
+    store.outbox.acknowledgePushResults([first, second], [
+      { id: first.id, status: 'applied', revision: 1 },
+      { id: second.id, status: 'duplicate', revision: 1 },
+    ])
+
+    expect(store.outbox.find(first.id)).toBeUndefined()
+    expect(store.outbox.find(second.id)).toBeUndefined()
+    expect(store.conversations.listPage({ limit: 50 }).items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: first.entityId, revision: 1, syncState: 'synced' }),
+      expect.objectContaining({ id: second.entityId, revision: 1, syncState: 'synced' }),
+    ]))
+    manager.close()
+  })
+
+  it('rolls back all push acknowledgements when one result mismatches the sent batch', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const first = createConversationMutation('push_mismatch_first', 'push_mismatch_conversation_first')
+    const second = createConversationMutation('push_mismatch_second', 'push_mismatch_conversation_second')
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(second)
+    store.outbox.markSyncing([first.id, second.id])
+
+    expect(() => store.outbox.acknowledgePushResults([first, second], [
+      { id: first.id, status: 'applied', revision: 1 },
+      { id: 'different_result', status: 'duplicate', revision: 1 },
+    ])).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.outbox.find(first.id)).toMatchObject({ state: 'syncing' })
+    expect(store.outbox.find(second.id)).toMatchObject({ state: 'syncing' })
+    manager.close()
+  })
+
+  it('accepts the exact reduced legacy-import receipt and advances the checkpoint', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_legacy_receipt_1',
+      mutations: [{
+        id: 'legacy_receipt_1',
+        kind: 'legacy.import',
+        entityId: 'legacy_batch_1',
+        baseRevision: 0,
+        resultRevision: 0,
+        payload: { batchId: 'legacy_batch_1', includeUnowned: false },
+        receivedAt: '2026-08-24T00:00:00.000Z',
+      }],
+    }, 1)
+
+    expect(store.sync.getCheckpoint()).toEqual({
+      protocolVersion: 1,
+      remoteCursor: 'cursor_legacy_receipt_1',
+      updatedAt: 1,
+    })
+    manager.close()
+  })
+
   it('applies a validated remote page and advances its checkpoint atomically', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')
