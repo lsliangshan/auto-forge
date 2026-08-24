@@ -40,6 +40,7 @@ import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
 import { BrowserLoginWaitCoordinator } from './browser/browser-login-wait-coordinator.js'
+import { BrowserManualResumeCoordinator } from './browser/browser-manual-resume-coordinator.js'
 import { BrowserPageInspector } from './browser/browser-page-inspector.js'
 import { EncryptedBrowserSessionStorageStore } from './browser/browser-session-storage-store.js'
 import type { ApplicationBrowserWorkspacePort } from './browser/electron-browser-workspace.js'
@@ -772,12 +773,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const browserLoginWait = new BrowserLoginWaitCoordinator({
     onPageInvalidated: (listener) => options.browserWorkspace.onPageInvalidated(listener),
   })
+  const browserManualWait = new BrowserManualResumeCoordinator({
+    onActivity: (listener) => options.browserWorkspace.onContinuationActivity(listener),
+  })
   let isBrowserRunActive: (runId: string) => boolean = () => false
   const browserContinuationExecutor = new BrowserContinuationToolExecutor({
     registry: browserContinuations,
     inspector: browserInspector,
     workspace: options.browserWorkspace,
     loginWait: browserLoginWait,
+    manualWait: browserManualWait,
     audits: database.browserActionAudits,
     isRunActive: (runId) => isBrowserRunActive(runId),
   })
@@ -1810,6 +1815,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await capture('continuation-shutdown', async () => {
           try { await browserContinuations.shutdown() } finally {
             browserLoginWait.dispose()
+            browserManualWait.dispose()
             browserInspector.dispose()
           }
         })

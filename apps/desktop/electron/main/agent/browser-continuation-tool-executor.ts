@@ -126,7 +126,7 @@ interface BrowserContinuationToolExecutorDependencies {
   readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
   readonly loginWait: Pick<BrowserLoginWaitCoordinator, 'wait' | 'cancel'>
-  readonly manualWait?: Pick<BrowserManualResumeCoordinator, 'wait' | 'cancel'>
+  readonly manualWait: Pick<BrowserManualResumeCoordinator, 'wait' | 'cancel'>
   readonly audits: BrowserActionAuditRepository
   readonly guard?: BrowserActionGuard
   readonly id?: () => string
@@ -409,10 +409,8 @@ export class BrowserContinuationToolExecutor {
     }
     const lease = state.lease
     try {
-      const manualWait = this.dependencies.manualWait
-      if (!manualWait) throw failure('INTERNAL_ERROR')
       this.assertActive(state, context)
-      await manualWait.wait({
+      await this.dependencies.manualWait.wait({
         runId,
         tabId: lease.binding.tabId,
         baselineActivityRevision: suspension.baselineActivityRevision,
@@ -1051,7 +1049,7 @@ export class BrowserContinuationToolExecutor {
     if (state?.waitersCancelled) return
     if (state) state.waitersCancelled = true
     this.dependencies.loginWait.cancel(runId)
-    this.dependencies.manualWait?.cancel(runId)
+    this.dependencies.manualWait.cancel(runId)
   }
 
   private isTerminalRun(runId: string): boolean {

@@ -838,6 +838,25 @@ describe('chat interactions', () => {
   })
 
   it.each([
+    'MANUAL_ACTION_REQUIRED',
+    'UNSUPPORTED_CONTROL',
+    'MANUAL_INTERVENTION_REQUIRED',
+  ] as const)('renders browser %s as resumable manual waiting without duplicate error copy', (errorCode) => {
+    const actionSummary = '自动操作暂时无法继续，请在网页中手动操作。停止操作 5 秒后将自动继续。'
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('awaiting_user', { errorCode, actionSummary }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="browser-status"]').text()).toContain('等待你手动操作')
+    expect(wrapper.get('[data-testid="browser-action-summary"]').text()).toBe(actionSummary)
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="take-over-browser"]').exists()).toBe(false)
+    expect((wrapper.get('[data-testid="stop-browser"]').element as HTMLButtonElement).disabled)
+      .toBe(false)
+  })
+
+  it.each([
     ['awaiting_user', '需要你在浏览器中操作', true],
     ['completed', '浏览器自动操作已完成', true],
     ['failed', '浏览器自动操作失败', true],

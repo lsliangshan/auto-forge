@@ -61,7 +61,6 @@ function harness(options: {
   isRunActive?: (runId: string) => boolean
   waitForLogin?: (input: { probe: () => Promise<'authenticated' | 'required' | 'unknown'> }) => Promise<void>
   waitForManual?: (input: BrowserManualResumeWaitInput) => Promise<void>
-  includeManualWait?: boolean
 } = {}) {
   const liveBinding = binding()
   let current = true
@@ -142,7 +141,7 @@ function harness(options: {
     inspector: inspector as never,
     workspace,
     loginWait,
-    ...(options.includeManualWait === false ? {} : { manualWait }),
+    manualWait,
     audits: {
       list: vi.fn(() => [...audits]),
       insert: vi.fn((entry: BrowserActionAuditEntry) => { audits.push(entry); return entry }),
@@ -797,19 +796,6 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.loginWait.cancel).toHaveBeenCalledOnce()
     expect(test.manualWait.cancel).toHaveBeenCalledOnce()
     expect(test.release).toHaveBeenCalledOnce()
-  })
-
-  it('fails closed and terminates when the incremental manual coordinator dependency is absent', async () => {
-    const test = harness({ includeManualWait: false })
-    await test.executor.execute('browser_session_handoff', {
-      bindingId: 'binding_1', reason: 'manual_action',
-    }, run())
-
-    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
-      .resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
-
-    expect(test.release).toHaveBeenCalledOnce()
-    expect(test.executor['runs'].has('agent_run_1')).toBe(false)
   })
 
   it.each([

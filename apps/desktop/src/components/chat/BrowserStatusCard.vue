@@ -36,7 +36,7 @@
         停止
       </el-button>
       <el-button
-        v-if="!awaitingLogin"
+        v-if="!awaitingUser"
         size="small"
         type="primary"
         plain
@@ -106,7 +106,17 @@ interface AsyncIdentity {
 
 const awaitingLogin = computed(() => props.block.state === 'awaiting_user'
   && props.block.errorCode === 'AUTH_REQUIRED')
-const statusLabel = computed(() => awaitingLogin.value ? '等待你登录' : ({
+const manualCodes = [
+  'MANUAL_ACTION_REQUIRED',
+  'UNSUPPORTED_CONTROL',
+  'MANUAL_INTERVENTION_REQUIRED',
+] as const
+const awaitingManual = computed(() => props.block.state === 'awaiting_user'
+  && manualCodes.some((code) => code === props.block.errorCode))
+const awaitingUser = computed(() => awaitingLogin.value || awaitingManual.value)
+const statusLabel = computed(() => awaitingLogin.value
+  ? '等待你登录'
+  : awaitingManual.value ? '等待你手动操作' : ({
   inspecting: 'AI 正在读取网页',
   acting: 'AI 正在操作',
   awaiting_user: '需要你在浏览器中操作',
@@ -117,11 +127,11 @@ const statusLabel = computed(() => awaitingLogin.value ? '等待你登录' : ({
 const statusTone = computed(() => props.block.state === 'completed'
   ? 'success'
   : ['failed', 'cancelled'].includes(props.block.state) ? 'danger' : 'warning')
-const terminal = computed(() => !awaitingLogin.value
+const terminal = computed(() => !awaitingUser.value
   && ['awaiting_user', 'completed', 'failed', 'cancelled'].includes(props.block.state))
 const actionsDisabled = computed(() => terminal.value || actionBusy.value || actionSettled.value)
 const statusError = computed(() => actionError.value
-  || (!awaitingLogin.value && props.block.errorCode ? displayError({ code: props.block.errorCode }) : ''))
+  || (!awaitingUser.value && props.block.errorCode ? displayError({ code: props.block.errorCode }) : ''))
 
 watch(() => [props.block.requestId, props.block.bindingId], () => {
   identityGeneration += 1

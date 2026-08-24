@@ -32,6 +32,7 @@ import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
 import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
+import { BrowserManualResumeCoordinator } from './browser/browser-manual-resume-coordinator.js'
 import type {
   BrowserContinuationActivity,
   BrowserContinuationBindingInput,
@@ -5713,6 +5714,29 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('wires one reusable manual resume coordinator and disposes it only at final shutdown', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-manual-resume-lifecycle-'))
+    directories.push(root)
+    const workspace = createBrowserWorkspace()
+    const unsubscribe = vi.fn()
+    vi.mocked(workspace.onContinuationActivity).mockReturnValue(unsubscribe)
+    const dispose = vi.spyOn(BrowserManualResumeCoordinator.prototype, 'dispose')
+    const runtime = createApplicationRuntime(options(root, { browserWorkspace: workspace }))
+
+    expect(workspace.onContinuationActivity).toHaveBeenCalledOnce()
+    expect(workspace.onContinuationActivity).toHaveBeenCalledWith(expect.any(Function))
+    await authenticate(runtime, 'ManualResumeLifecycle')
+    await runtime.services.auth.logout()
+    expect(dispose).not.toHaveBeenCalled()
+    expect(unsubscribe).not.toHaveBeenCalled()
+
+    await runtime.close()
+    await runtime.close()
+
+    expect(dispose).toHaveBeenCalledOnce()
+    expect(unsubscribe).toHaveBeenCalledOnce()
+  })
+
   it('checks exact current user, conversation, request, and live binding before takeover or audit access', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-ownership-'))
     directories.push(root)
@@ -5883,6 +5907,7 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-takeover-race-'))
     directories.push(root)
     const workspace = createBrowserWorkspace()
+    const cancelManualWait = vi.spyOn(BrowserManualResumeCoordinator.prototype, 'cancel')
     const releaseInspectors = [deferred<void>(), deferred<void>()]
     const inspectorStarted = [false, false]
     const bindingIds: string[] = []
@@ -5972,6 +5997,7 @@ describe('createApplicationRuntime', () => {
     releaseInspectors[0]!.resolve()
 
     const racing = await startActiveRun(1)
+    cancelManualWait.mockClear()
     const completeRelease = deferred<void>()
     let releaseDidStart = false
     vi.mocked(workspace.releaseContinuation).mockImplementationOnce(async () => {
@@ -5987,6 +6013,7 @@ describe('createApplicationRuntime', () => {
     completeRelease.resolve()
     await expect(takeover).rejects.toMatchObject({ code: 'NOT_FOUND' })
     await cancelling
+    expect(cancelManualWait).toHaveBeenCalledWith(racing.run.id)
     expect(registry.currentLease(racing.live.bindingId)).toBeUndefined()
     releaseInspectors[1]!.resolve()
     await vi.waitFor(() => {

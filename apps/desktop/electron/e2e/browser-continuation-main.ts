@@ -42,6 +42,7 @@ import type {
 } from '../main/chat/model-provider.js'
 import { BrowserContinuationRegistry } from '../main/browser/browser-continuation-registry.js'
 import { BrowserLoginWaitCoordinator } from '../main/browser/browser-login-wait-coordinator.js'
+import { BrowserManualResumeCoordinator } from '../main/browser/browser-manual-resume-coordinator.js'
 import type {
   BrowserContinuationBinding,
   BrowserContinuationBindingInput,
@@ -696,9 +697,13 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
   const loginWait = new BrowserLoginWaitCoordinator({
     onPageInvalidated: (listener) => workspace.onPageInvalidated(listener),
   })
+  const manualWait = new BrowserManualResumeCoordinator({
+    onActivity: (listener) => workspace.onContinuationActivity(listener),
+  })
   let runActive = true
   const executor = new BrowserContinuationToolExecutor({
-    registry: registry(), inspector, workspace, loginWait, audits: database.browserActionAudits,
+    registry: registry(), inspector, workspace, loginWait, manualWait,
+    audits: database.browserActionAudits,
     isRunActive: (runId) => runActive && runId === current.runId,
   })
   const inspect = () => executor.execute('browser_session_inspect', {
@@ -795,6 +800,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
     runActive = false
     await executor.endRun(current.runId)
     loginWait.dispose()
+    manualWait.dispose()
     inspector.dispose()
     database.close()
   }
