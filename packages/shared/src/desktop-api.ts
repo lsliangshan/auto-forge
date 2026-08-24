@@ -76,7 +76,8 @@ function nonEmptyUniqueArraySchema<T extends z.ZodType>(schema: T) {
   })
 }
 
-const modalitySchema = z.enum(['text', 'image', 'audio', 'video'])
+export const providerUsageModalitySchema = z.enum(['text', 'image', 'audio', 'video'])
+export type ProviderUsageModality = z.infer<typeof providerUsageModalitySchema>
 
 export const authAccountSchema = z.string().trim().regex(/^[A-Za-z0-9_]{5,24}$/)
 export const authPhoneSchema = z.string().trim().regex(/^1[3-9]\d{9}$/)
@@ -346,14 +347,43 @@ export const conversationGenerationPreferencesSchema = z.object({
 }).strict()
 export type ConversationGenerationPreferences = z.infer<typeof conversationGenerationPreferencesSchema>
 
+export const syncStateSchema = z.enum(['synced', 'pending', 'syncing', 'failed'])
+export type SyncState = z.infer<typeof syncStateSchema>
+
+export const opaqueCursorSchema = z.string().min(16).max(2048)
+
+export interface CursorPage<T> {
+  items: T[]
+  nextCursor?: string
+  previousCursor?: string
+}
+
+export const conversationTitleStateSchema = z.enum([
+  'pending',
+  'generating',
+  'ai_named',
+  'user_named',
+  'failed',
+])
+
 export const conversationSummarySchema = z.object({
   id: identifierSchema,
   title: nonEmptyStringSchema,
+  titleState: conversationTitleStateSchema,
+  revision: z.number().int().nonnegative(),
+  syncState: syncStateSchema,
   createdAt: timestampSchema,
-  updatedAt: timestampSchema,
+  lastActivityAt: timestampSchema,
+  metadataUpdatedAt: timestampSchema,
 }).strict()
 
 export type ConversationSummary = z.infer<typeof conversationSummarySchema>
+
+export const conversationPageSchema = z.object({
+  items: z.array(conversationSummarySchema),
+  nextCursor: opaqueCursorSchema.optional(),
+}).strict()
+export type ConversationPage = z.infer<typeof conversationPageSchema>
 
 export const chatMessageSchema = z.object({
   id: identifierSchema,
@@ -365,6 +395,150 @@ export const chatMessageSchema = z.object({
 }).strict()
 
 export interface ChatMessage extends Omit<z.infer<typeof chatMessageSchema>, 'blocks'> { blocks: ChatBlock[] }
+
+export const messagePageSchema = z.object({
+  items: z.array(chatMessageSchema),
+  previousCursor: opaqueCursorSchema.optional(),
+}).strict()
+export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { items: ChatMessage[] }
+
+const sensitiveMutationPayloadKeys = new Set([
+  'apikey',
+  'apikeyfingerprint',
+  'authorization',
+  'credential',
+  'credentials',
+  'owner',
+  'ownerid',
+  'owneruserid',
+  'password',
+  'refreshtoken',
+  'secret',
+  'servicekey',
+  'token',
+  'accesstoken',
+  'uid',
+  'userid',
+])
+
+function findSensitiveMutationPayloadPath(value: unknown, path: Array<string | number> = []): Array<string | number> | undefined {
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      const match = findSensitiveMutationPayloadPath(item, [...path, index])
+      if (match !== undefined) return match
+    }
+    return undefined
+  }
+  if (typeof value !== 'object' || value === null) return undefined
+  for (const [key, item] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '')
+    if (sensitiveMutationPayloadKeys.has(normalizedKey) || normalizedKey.endsWith('secret')) return [...path, key]
+    const match = findSensitiveMutationPayloadPath(item, [...path, key])
+    if (match !== undefined) return match
+  }
+  return undefined
+}
+
+const syncMutationPayloadSchema = z.record(z.string(), z.json()).superRefine((payload, context) => {
+  const sensitivePath = findSensitiveMutationPayloadPath(payload)
+  if (sensitivePath !== undefined) {
+    context.addIssue({
+      code: 'custom',
+      path: sensitivePath,
+      message: 'Sync mutation payloads cannot include owner or credential fields',
+    })
+  }
+})
+
+export const syncMutationKindSchema = z.enum([
+  'conversation.create',
+  'conversation.rename',
+  'conversation.delete',
+  'conversation.restore',
+  'message.append',
+  'legacy.import',
+  'privacy.consent',
+  'preferences.update',
+  'usage.record',
+])
+export type SyncMutationKind = z.infer<typeof syncMutationKindSchema>
+
+export const syncMutationSchema = z.object({
+  id: identifierSchema,
+  kind: syncMutationKindSchema,
+  entityId: identifierSchema,
+  baseRevision: z.number().int().nonnegative(),
+  occurredAt: timestampSchema,
+  payload: syncMutationPayloadSchema,
+}).strict()
+export type SyncMutation = z.infer<typeof syncMutationSchema>
+
+export const syncMutationStatusSchema = z.enum(['applied', 'duplicate', 'conflict', 'rejected'])
+export type SyncMutationStatus = z.infer<typeof syncMutationStatusSchema>
+
+export const syncMutationResultSchema = z.object({
+  id: identifierSchema,
+  status: syncMutationStatusSchema,
+  revision: z.number().int().nonnegative().optional(),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict()
+export type SyncMutationResult = z.infer<typeof syncMutationResultSchema>
+
+export const legacyImportPreviewSchema = z.object({
+  ownedCount: z.number().int().nonnegative(),
+  unownedCount: z.number().int().nonnegative(),
+  requiresUnownedConfirmation: z.boolean(),
+}).strict().superRefine((preview, context) => {
+  if (preview.requiresUnownedConfirmation !== (preview.unownedCount > 0)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['requiresUnownedConfirmation'],
+      message: 'Unowned history requires explicit import confirmation',
+    })
+  }
+})
+export type LegacyImportPreview = z.infer<typeof legacyImportPreviewSchema>
+
+export const privacyConsentPurposeSchema = z.enum(['cloud_sync', 'legacy_unowned_import'])
+export type PrivacyConsentPurpose = z.infer<typeof privacyConsentPurposeSchema>
+
+export const privacyConsentSchema = z.object({
+  purpose: privacyConsentPurposeSchema,
+  documentVersion: nonEmptyStringSchema.max(128),
+  consentedAt: timestampSchema,
+  clientVersion: nonEmptyStringSchema.max(64),
+}).strict()
+export type PrivacyConsent = z.infer<typeof privacyConsentSchema>
+
+export const legacyImportConfirmRequestSchema = z.object({
+  batchId: identifierSchema,
+  includeUnowned: z.boolean(),
+  cloudSyncConsent: privacyConsentSchema,
+  unownedImportConsent: privacyConsentSchema.optional(),
+}).strict().superRefine((request, context) => {
+  if (request.cloudSyncConsent.purpose !== 'cloud_sync') {
+    context.addIssue({
+      code: 'custom',
+      path: ['cloudSyncConsent', 'purpose'],
+      message: 'Cloud sync consent is required separately from legacy import consent',
+    })
+  }
+  if (request.includeUnowned && request.unownedImportConsent?.purpose !== 'legacy_unowned_import') {
+    context.addIssue({
+      code: 'custom',
+      path: ['unownedImportConsent'],
+      message: 'Importing unowned history requires separate confirmation',
+    })
+  }
+  if (!request.includeUnowned && request.unownedImportConsent !== undefined) {
+    context.addIssue({
+      code: 'custom',
+      path: ['unownedImportConsent'],
+      message: 'Unowned import consent must accompany an unowned import',
+    })
+  }
+})
+export type LegacyImportConfirmRequest = z.infer<typeof legacyImportConfirmRequestSchema>
 
 export const chatSendInputSchema = z.object({
   conversationId: identifierSchema,
@@ -646,6 +820,17 @@ export type PermissionGrant = z.infer<typeof permissionGrantSchema>
 export const modelProviderIdSchema = z.enum(['deepseek', 'openrouter'])
 export type ModelProviderId = z.infer<typeof modelProviderIdSchema>
 
+export const accountDataPreferencesDefaults = {
+  timezone: 'Asia/Shanghai',
+  displayCurrency: 'CNY',
+} as const
+
+export const accountDataPreferencesSchema = z.object({
+  timezone: nonEmptyStringSchema.max(128).default(accountDataPreferencesDefaults.timezone),
+  displayCurrency: z.enum(['CNY', 'USD']).default(accountDataPreferencesDefaults.displayCurrency),
+}).strict()
+export type AccountDataPreferences = z.infer<typeof accountDataPreferencesSchema>
+
 export const providerDefaultModelsSchema = z.object({
   deepseek: z.object({ text: nonEmptyStringSchema }).strict(),
   openrouter: z.object({
@@ -692,8 +877,8 @@ export const modelInfoSchema = z.object({
   contextLength: z.number().int().positive().optional(),
   inputCostPerMillion: z.number().nonnegative().optional(),
   outputCostPerMillion: z.number().nonnegative().optional(),
-  inputModalities: z.array(modalitySchema),
-  outputModalities: z.array(modalitySchema),
+  inputModalities: z.array(providerUsageModalitySchema),
+  outputModalities: z.array(providerUsageModalitySchema),
   supportsTools: z.boolean(),
   generation: z.object({
     image: z.object({
@@ -732,6 +917,40 @@ const tokenUsageShape = {
   outputTokens: safeTokenCountSchema,
   totalTokens: safeTokenCountSchema,
 }
+
+export const remoteUsageStatusSchema = z.enum([
+  'pending',
+  'reported',
+  'calculated',
+  'estimated',
+  'unavailable',
+])
+export type RemoteUsageStatus = z.infer<typeof remoteUsageStatusSchema>
+
+export const byokUsageEventSchema = z.object({
+  id: identifierSchema,
+  operationId: identifierSchema,
+  purpose: nonEmptyStringSchema.max(64),
+  credentialOwner: z.literal('user'),
+  billable: z.literal(false),
+  provider: modelProviderIdSchema,
+  model: nonEmptyStringSchema,
+  modality: providerUsageModalitySchema,
+  costStatus: z.enum(['estimated', 'unavailable']),
+  inputTokens: safeTokenCountSchema.optional(),
+  outputTokens: safeTokenCountSchema.optional(),
+  estimatedCost: usdDecimalSchema.optional(),
+  occurredAt: timestampSchema,
+}).strict().superRefine((event, context) => {
+  if (event.costStatus === 'unavailable' && event.estimatedCost !== undefined) {
+    context.addIssue({
+      code: 'custom',
+      path: ['estimatedCost'],
+      message: 'Unavailable BYOK cost cannot include an estimate',
+    })
+  }
+})
+export type ByokUsageEvent = z.infer<typeof byokUsageEventSchema>
 
 export const modelTokenUsageSchema = z.object({
   provider: modelProviderIdSchema,
@@ -960,7 +1179,17 @@ export const ipcChannels = {
 export type IpcChannel = (typeof ipcChannels)[keyof typeof ipcChannels]
 
 export const createConversationRequestSchema = z.undefined()
-export const listMessagesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const listConversationsRequestSchema = z.object({
+  limit: z.literal(50),
+  cursor: opaqueCursorSchema.optional(),
+}).strict()
+export type ListConversationsRequest = z.infer<typeof listConversationsRequestSchema>
+export const listMessagesRequestSchema = z.object({
+  conversationId: identifierSchema,
+  limit: z.literal(100),
+  cursor: opaqueCursorSchema.optional(),
+}).strict()
+export type ListMessagesRequest = z.infer<typeof listMessagesRequestSchema>
 export const renameConversationRequestSchema = z.object({
   conversationId: identifierSchema,
   title: nonEmptyStringSchema,
@@ -1056,7 +1285,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.profileGet]: z.undefined(),
   [ipcChannels.profileUpdate]: userProfileUpdateSchema,
   [ipcChannels.profilePickAndUploadAvatar]: z.undefined(),
-  [ipcChannels.chatListConversations]: z.undefined(),
+  [ipcChannels.chatListConversations]: listConversationsRequestSchema,
   [ipcChannels.chatListMessages]: listMessagesRequestSchema,
   [ipcChannels.chatCreateConversation]: createConversationRequestSchema,
   [ipcChannels.chatRenameConversation]: renameConversationRequestSchema,
@@ -1126,8 +1355,8 @@ export const ipcResponseSchemas = {
   [ipcChannels.profileGet]: userProfileSchema,
   [ipcChannels.profileUpdate]: userProfileSchema,
   [ipcChannels.profilePickAndUploadAvatar]: profileAvatarUploadResultSchema.nullable(),
-  [ipcChannels.chatListConversations]: z.array(conversationSummarySchema),
-  [ipcChannels.chatListMessages]: z.array(chatMessageSchema),
+  [ipcChannels.chatListConversations]: conversationPageSchema,
+  [ipcChannels.chatListMessages]: messagePageSchema,
   [ipcChannels.chatCreateConversation]: conversationSummarySchema,
   [ipcChannels.chatRenameConversation]: conversationSummarySchema,
   [ipcChannels.chatDeleteConversation]: voidResponseSchema,
@@ -1200,8 +1429,8 @@ export interface DesktopAPI {
     updateRole(input: UserAdminUpdateRoleRequest): Promise<UserAdminUpdateRoleResponse>
   }
   chat: {
-    listConversations(): Promise<ConversationSummary[]>
-    listMessages(conversationId: string): Promise<ChatMessage[]>
+    listConversations(input: ListConversationsRequest): Promise<ConversationPage>
+    listMessages(input: ListMessagesRequest): Promise<MessagePage>
     createConversation(): Promise<ConversationSummary>
     renameConversation(conversationId: string, title: string): Promise<ConversationSummary>
     deleteConversation(conversationId: string): Promise<void>
