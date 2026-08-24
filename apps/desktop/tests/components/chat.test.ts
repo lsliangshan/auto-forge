@@ -857,6 +857,21 @@ describe('chat interactions', () => {
   })
 
   it.each([
+    ['inspecting', true],
+    ['acting', false],
+  ] as const)('renders the dedicated loader for browser %s only', (state, loading) => {
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock(state) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const loader = wrapper.find('[data-testid="browser-status-loader"]')
+    expect(loader.exists()).toBe(loading)
+    expect(wrapper.find('.af-status-dot').exists()).toBe(!loading)
+    if (loading) expect(loader.attributes('aria-hidden')).toBe('true')
+  })
+
+  it.each([
     ['awaiting_user', '需要你在浏览器中操作', true],
     ['completed', '浏览器自动操作已完成', true],
     ['failed', '浏览器自动操作失败', true],

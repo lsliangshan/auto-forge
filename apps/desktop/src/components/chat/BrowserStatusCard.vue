@@ -5,7 +5,16 @@
     aria-live="polite"
   >
     <div class="status-heading">
-      <span :class="['af-status-dot', statusTone]" />
+      <span
+        v-if="block.state === 'inspecting'"
+        class="browser-status-loader"
+        data-testid="browser-status-loader"
+        aria-hidden="true"
+      />
+      <span
+        v-else
+        :class="['af-status-dot', statusTone]"
+      />
       <strong>{{ statusLabel }}</strong>
     </div>
     <div class="site-meta">
@@ -215,6 +224,10 @@ function outcomeLabel(outcome: BrowserActionAuditEntry['outcome']): string {
 .browser-status { max-width: 640px; border: 1px solid var(--af-border); border-left: 3px solid var(--af-cobalt); padding: 13px 14px; background: var(--af-surface-muted); }
 .status-heading, .site-meta, .status-actions { display: flex; align-items: center; }
 .status-heading { gap: 8px; }
+.browser-status-loader { position: relative; width: 14px; height: 14px; flex: 0 0 14px; }
+.browser-status-loader::before, .browser-status-loader::after { position: absolute; border-radius: 50%; content: ''; }
+.browser-status-loader::before { inset: 0; border: 2px solid var(--af-cobalt-soft); border-top-color: var(--af-cobalt); border-right-color: var(--af-cobalt); box-shadow: inset 0 0 0 1px var(--af-surface); animation: browser-status-orbit .85s linear infinite; }
+.browser-status-loader::after { inset: 5px; background: var(--af-cobalt); box-shadow: 0 0 0 2px var(--af-cobalt-soft); animation: browser-status-pulse 1.2s ease-in-out infinite; }
 .site-meta { flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; color: var(--af-text-muted); font-size: 11px; overflow-wrap: anywhere; }
 .site-meta span + span::before { margin-right: 12px; content: '·'; }
 .action-summary, .status-error, .browser-audit p { margin: 8px 0 0; font-size: 12px; overflow-wrap: anywhere; }
@@ -226,4 +239,11 @@ function outcomeLabel(outcome: BrowserActionAuditEntry['outcome']): string {
 .browser-audit ol { display: grid; gap: 8px; margin: 9px 0 0; padding-left: 20px; }
 .browser-audit li { overflow-wrap: anywhere; }
 .browser-audit li span { display: block; margin-top: 2px; color: var(--af-text-muted); }
+
+@keyframes browser-status-orbit { to { transform: rotate(360deg); } }
+@keyframes browser-status-pulse { 0%, 100% { opacity: .45; transform: scale(.72); } 50% { opacity: 1; transform: scale(1); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-status-loader::before, .browser-status-loader::after { animation: none; }
+}
 </style>
