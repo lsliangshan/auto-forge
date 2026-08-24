@@ -282,6 +282,10 @@ function attachBrowserContinuation(
       runId: string,
       context: BrowserContinuationRunContext,
     ) => Promise<{ kind: 'resumed' } | { kind: 'tool_error'; code: AppErrorCode }>
+    validateContinuation?: (
+      runId: string,
+      context: BrowserContinuationRunContext,
+    ) => Promise<{ kind: 'valid' } | { kind: 'tool_error'; code: AppErrorCode }>
   } = {},
 ) {
   const bindings = options.bindings ?? [continuationBinding()]
@@ -316,6 +320,9 @@ function attachBrowserContinuation(
     }))),
     waitForManualIntervention: vi.fn(options.waitForManualIntervention ?? (async () => ({
       kind: 'resumed' as const,
+    }))),
+    validateContinuation: vi.fn(options.validateContinuation ?? (async () => ({
+      kind: 'valid' as const,
     }))),
   }
   const create = vi.spyOn(catalog, 'create')
@@ -3782,6 +3789,137 @@ describe('AgentOrchestrator', () => {
     ])
     const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
     expect(JSON.stringify(terminal.blocks)).toContain('工作居住证有效期：2032-08-24')
+  })
+
+  it('keeps manual intervention cancelled when Stop wins a delayed catalog refresh', async () => {
+    let refreshStarted!: () => void
+    let finishRefresh!: () => void
+    const started = new Promise<void>((resolve) => { refreshStarted = resolve })
+    const refresh = new Promise<void>((resolve) => { finishRefresh = resolve })
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'delayed_refresh_handoff',
+        name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }),
+    })
+    const create = BrowserContinuationCatalog.prototype.create.bind(browser.catalog)
+    let creates = 0
+    browser.create.mockImplementation(async (input) => {
+      creates += 1
+      if (creates === 2) {
+        refreshStarted()
+        await refresh
+      }
+      return create(input)
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'browser_conversation', content: '继续读取证件',
+      provider: 'openrouter', model: 'model', requestId: 'manual_delayed_refresh_stop',
+    }))
+
+    await started
+    await orchestrator.cancel('manual_delayed_refresh_stop')
+    finishRefresh()
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } })
+
+    const states = dependencies.records.events.flatMap((event) => (
+      typeof event === 'object' && event !== null
+      && 'type' in event && event.type === 'block'
+      && 'block' in event && typeof event.block === 'object' && event.block !== null
+      && 'type' in event.block && event.block.type === 'browser_status'
+      && 'state' in event.block && typeof event.block.state === 'string'
+        ? [event.block.state]
+        : []
+    ))
+    const cancelledAt = states.lastIndexOf('cancelled')
+    expect(cancelledAt).toBeGreaterThanOrEqual(0)
+    expect(states.slice(cancelledAt + 1)).not.toContain('inspecting')
+    expect(browser.executor.execute.mock.calls.map(([tool]) => tool)).toEqual(['browser_session_handoff'])
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+  })
+
+  it('keeps PAGE_CLOSED precise when the promoted manual intervention page leaves the catalog', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'closed_after_promotion_handoff',
+        name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let validations = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => tool === 'browser_session_handoff'
+        ? { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }
+        : inspectedSnapshot([]),
+      validateContinuation: async () => (++validations === 1
+        ? { kind: 'valid' }
+        : { kind: 'tool_error', code: 'PAGE_CLOSED' }),
+    })
+    const create = BrowserContinuationCatalog.prototype.create.bind(browser.catalog)
+    browser.create.mockImplementation(async (input) => {
+      if (browser.create.mock.calls.length === 2) browser.bindings.length = 0
+      return create(input)
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '继续读取证件', provider: 'openrouter',
+      model: 'model', requestId: 'manual_page_closed_after_promotion',
+    }))
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'PAGE_CLOSED' } })
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
+    expect(terminal.blocks).toContainEqual(expect.objectContaining({
+      type: 'browser_status', state: 'failed', errorCode: 'PAGE_CLOSED',
+    }))
+    expect(browser.executor.execute.mock.calls.map(([tool]) => tool)).toEqual(['browser_session_handoff'])
+    expect(browser.executor.validateContinuation).toHaveBeenCalledTimes(2)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+  })
+
+  it('keeps WORKFLOW_CHANGED precise when manual intervention authority detects workflow identity change after promotion', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'changed_after_promotion_handoff',
+        name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let validations = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => tool === 'browser_session_handoff'
+        ? { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }
+        : inspectedSnapshot([]),
+      validateContinuation: async () => (++validations === 1
+        ? { kind: 'valid' }
+        : { kind: 'tool_error', code: 'WORKFLOW_CHANGED' }),
+    })
+    const create = BrowserContinuationCatalog.prototype.create.bind(browser.catalog)
+    browser.create.mockImplementation(async (input) => {
+      if (browser.create.mock.calls.length === 2) browser.bindings.length = 0
+      return create(input)
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '继续读取证件', provider: 'openrouter',
+      model: 'model', requestId: 'manual_workflow_changed_after_promotion',
+    }))
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'WORKFLOW_CHANGED' } })
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
+    expect(terminal.blocks).toContainEqual(expect.objectContaining({
+      type: 'browser_status', state: 'failed', errorCode: 'WORKFLOW_CHANGED',
+    }))
+    expect(browser.executor.execute.mock.calls.map(([tool]) => tool)).toEqual(['browser_session_handoff'])
+    expect(browser.executor.validateContinuation).toHaveBeenCalledTimes(2)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
   })
 
   it('makes a binding created by a workflow available in the same user turn', async () => {

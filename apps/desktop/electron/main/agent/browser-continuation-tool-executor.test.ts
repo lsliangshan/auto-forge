@@ -620,6 +620,32 @@ describe('BrowserContinuationToolExecutor', () => {
     }, run())).resolves.toMatchObject({ kind: 'success' })
   })
 
+  it('validates live continuation authority without taking a fresh browser snapshot', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '读取工作居住证有效期',
+    }, run())
+    const inspections = test.inspector.inspect.mock.calls.length
+    const result = await test.executor.validateContinuation('agent_run_1', run())
+
+    expect(result).toEqual({ kind: 'valid' })
+    expect(test.inspector.inspect).toHaveBeenCalledTimes(inspections)
+  })
+
+  it.each(['PAGE_CLOSED', 'WORKFLOW_CHANGED'] as const)(
+    'preserves %s while validating continuation authority',
+    async (code) => {
+      const test = harness()
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '读取工作居住证有效期',
+      }, run())
+      test.assertEligible.mockRejectedValueOnce({ code })
+      const result = await test.executor.validateContinuation('agent_run_1', run())
+
+      expect(result).toEqual({ kind: 'tool_error', code })
+    },
+  )
+
   it('terminates manual suspension when the user navigates outside binding policy', async () => {
     const test = harness()
     await test.executor.execute('browser_session_handoff', {

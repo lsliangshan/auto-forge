@@ -218,6 +218,22 @@ describe('BrowserContinuationRegistry', () => {
     expect(live.owners.has(binding.tabId)).toBe(false)
   })
 
+  it('preserves the precise registry terminal reason through the live lease', async () => {
+    for (const code of ['PAGE_CLOSED', 'WORKFLOW_CHANGED'] as const) {
+      const test = createHarness()
+      const binding = test.registry.bind(bindingInput())
+      const lease = await test.registry.acquire(binding.bindingId, {
+        userId: binding.userId, conversationId: binding.conversationId, runId: `run_${code}`,
+      })
+
+      if (code === 'PAGE_CLOSED') test.registry.markClosed(binding.tabId, code)
+      else await test.registry.revokeBinding(binding.bindingId, code)
+
+      await expect(lease.assertEligible()).rejects.toMatchObject({ code })
+      await expect(lease.release()).resolves.toBeUndefined()
+    }
+  })
+
   it('persists close and revoke transitions while removing live authority and releasing leases', async () => {
     const test = createHarness()
     const closedBinding = test.registry.bind(bindingInput())

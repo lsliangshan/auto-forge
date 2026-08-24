@@ -173,6 +173,10 @@ export type BrowserManualWaitResult =
   | { readonly kind: 'resumed' }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
+export type BrowserContinuationValidationResult =
+  | { readonly kind: 'valid' }
+  | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
+
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
 }
@@ -430,6 +434,31 @@ export class BrowserContinuationToolExecutor {
       })
       this.completeSuspension(state)
       return { kind: 'resumed' }
+    } catch (error) {
+      const safe = toSafeAppError(error)
+      if (this.runs.get(runId) === state) await this.terminate(state)
+      return { kind: 'tool_error', code: safe.code }
+    }
+  }
+
+  async validateContinuation(
+    runId: string,
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserContinuationValidationResult> {
+    const state = this.runs.get(runId)
+    const lease = state?.lease
+    if (!state || state.runId !== context.runId || state.suspension || !lease) {
+      return { kind: 'tool_error', code: 'CANCELLED' }
+    }
+    try {
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      const page = await this.dependencies.workspace.getContinuationState(
+        lease.binding.tabId,
+        context.runId,
+      )
+      if (!this.currentPageAllowed(lease, page)) throw failure('DOMAIN_BLOCKED')
+      return { kind: 'valid' }
     } catch (error) {
       const safe = toSafeAppError(error)
       if (this.runs.get(runId) === state) await this.terminate(state)

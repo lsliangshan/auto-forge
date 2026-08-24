@@ -358,7 +358,8 @@ export interface AgentOrchestratorDependencies {
   browserContinuation?: {
     catalog: Pick<BrowserContinuationCatalog, 'create' | 'refresh'>
     executor: Pick<BrowserContinuationToolExecutor,
-      'execute' | 'waitForAuthentication' | 'waitForManualIntervention' | 'endRun' | 'cancel' | 'takeOver'>
+      'execute' | 'waitForAuthentication' | 'waitForManualIntervention' | 'validateContinuation'
+      | 'endRun' | 'cancel' | 'takeOver'>
   }
   emit: (event: ChatEvent) => void
   id?: () => string
@@ -1506,30 +1507,13 @@ export class AgentOrchestrator {
       const inactiveAfterWait = await this.inactiveBrowserResult(active)
       if (inactiveAfterWait) return inactiveAfterWait
       if (resumed.kind === 'tool_error') {
-        active.browserTerminal = true
-        const error = appFailure(resumed.code)
-        const actionSummary = resumed.code === 'PAGE_CLOSED'
-          ? '目标网页已关闭'
-          : resumed.code === 'DOMAIN_BLOCKED'
-            ? '网页已离开允许的操作范围'
-            : resumed.code === 'WORKFLOW_CHANGED'
-              ? '网页绑定的工作流已发生变化'
-              : resumed.code === 'CANCELLED'
-                ? '等待已取消'
-                : handoffCode === 'AUTH_REQUIRED' ? '等待登录已结束' : '等待手动操作已结束'
-        this.updateBrowserStatus(
-          active,
-          candidate,
-          resumed.code === 'CANCELLED' ? 'cancelled' : 'failed',
-          actionSummary,
-          resumed.code,
-        )
-        return this.terminalize(
-          active,
-          resumed.code === 'CANCELLED' ? 'cancelled' : 'failed',
-          error,
-          resumed.code === 'CANCELLED' ? 'cancel' : 'endRun',
-        )
+        return this.terminalizeBrowserResumeFailure(active, candidate, resumed.code, handoffCode)
+      }
+      const validation = await browser.executor.validateContinuation(active.runId, waitContext)
+      const inactiveAfterValidation = await this.inactiveBrowserResult(active)
+      if (inactiveAfterValidation) return inactiveAfterValidation
+      if (validation.kind === 'tool_error') {
+        return this.terminalizeBrowserResumeFailure(active, candidate, validation.code, handoffCode)
       }
       active.browserHandoffCode = undefined
       active.browserTerminal = false
@@ -1541,9 +1525,24 @@ export class AgentOrchestrator {
       active.browserEvidenceMatchRevision = undefined
       active.browserEvidenceMatchedCandidateId = undefined
       await this.refreshBrowserCatalog(active)
+      const inactiveAfterRefresh = await this.inactiveBrowserResult(active)
+      if (inactiveAfterRefresh) return inactiveAfterRefresh
       const refreshed = active.browserCatalog.bindings.get(candidate.bindingId)
-      if (!refreshed || refreshed.workflowVersion !== candidate.workflowVersion) {
-        return this.terminalize(active, 'failed', appFailure('WORKFLOW_CHANGED'))
+      if (!refreshed) {
+        const missingValidation = await browser.executor.validateContinuation(active.runId, waitContext)
+        const inactiveAfterMissingValidation = await this.inactiveBrowserResult(active)
+        if (inactiveAfterMissingValidation) return inactiveAfterMissingValidation
+        return this.terminalizeBrowserResumeFailure(
+          active,
+          candidate,
+          missingValidation.kind === 'tool_error' ? missingValidation.code : 'INTERNAL_ERROR',
+          handoffCode,
+        )
+      }
+      if (refreshed.workflowVersion !== candidate.workflowVersion) {
+        return this.terminalizeBrowserResumeFailure(
+          active, candidate, 'WORKFLOW_CHANGED', handoffCode,
+        )
       }
       active.browserCandidate = refreshed
       active.browserBindingId = refreshed.bindingId
@@ -1572,6 +1571,37 @@ export class AgentOrchestrator {
       return this.terminalize(active, 'completed')
     }
     return this.drive(active)
+  }
+
+  private terminalizeBrowserResumeFailure(
+    active: ActiveAgentRun,
+    candidate: BrowserContinuationCandidate,
+    code: AppError['code'],
+    handoffCode: NonNullable<ActiveAgentRun['browserHandoffCode']>,
+  ): Promise<AgentRunResult> {
+    active.browserTerminal = true
+    const actionSummary = code === 'PAGE_CLOSED'
+      ? '目标网页已关闭'
+      : code === 'DOMAIN_BLOCKED'
+        ? '网页已离开允许的操作范围'
+        : code === 'WORKFLOW_CHANGED'
+          ? '网页绑定的工作流已发生变化'
+          : code === 'CANCELLED'
+            ? '等待已取消'
+            : handoffCode === 'AUTH_REQUIRED' ? '等待登录已结束' : '等待手动操作已结束'
+    this.updateBrowserStatus(
+      active,
+      candidate,
+      code === 'CANCELLED' ? 'cancelled' : 'failed',
+      actionSummary,
+      code,
+    )
+    return this.terminalize(
+      active,
+      code === 'CANCELLED' ? 'cancelled' : 'failed',
+      appFailure(code),
+      code === 'CANCELLED' ? 'cancel' : 'endRun',
+    )
   }
 
   private async continuePendingTool(active: ActiveAgentRun): Promise<AgentRunResult> {
