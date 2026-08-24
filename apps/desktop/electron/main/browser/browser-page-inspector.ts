@@ -163,7 +163,10 @@ interface InspectorOptions {
 }
 
 interface SafeCandidate {
+  readonly axNodeId: string
+  readonly parentAxNodeId: string | undefined
   readonly backendNodeId: number
+  readonly parentBackendNodeId?: number
   readonly role: string
   readonly name: string
   readonly value?: string
@@ -176,6 +179,7 @@ interface SafeCandidate {
   readonly inputType?: string
   readonly href?: string
   readonly fieldValue?: string
+  readonly answerable?: boolean
 }
 
 interface SnapshotIdentity {
@@ -215,7 +219,7 @@ const maxBrowserInspectionPolicyLocators = 128
 const defaultInspectionTimeoutMs = 5_000
 
 const semanticRoles = new Set([
-  'article', 'banner', 'button', 'cell', 'checkbox', 'combobox', 'complementary', 'contentinfo',
+  'article', 'banner', 'button', 'cell', 'checkbox', 'columnheader', 'combobox', 'complementary', 'contentinfo',
   'dialog', 'document', 'form', 'grid', 'gridcell', 'group', 'heading', 'img', 'link', 'list',
   'listbox', 'listitem', 'main', 'menu', 'menuitem', 'navigation', 'option', 'paragraph', 'radio',
   'region', 'row', 'rowheader', 'search', 'searchbox', 'slider', 'spinbutton', 'statictext', 'status',
@@ -226,6 +230,13 @@ const selectRoles = new Set(['combobox', 'listbox'])
 const clickRoles = new Set(['button', 'link', 'menuitem', 'option', 'tab', 'treeitem'])
 const checkRoles = new Set(['checkbox', 'radio', 'switch'])
 const valueRoles = new Set([...fillRoles, ...selectRoles, 'meter', 'progressbar', 'slider'])
+const structuralRoles = new Set([
+  'article', 'banner', 'columnheader', 'complementary', 'contentinfo', 'dialog', 'document', 'form',
+  'grid', 'group', 'heading', 'list', 'main', 'navigation', 'region', 'row', 'rowheader', 'table',
+])
+const interactiveRoles = new Set([
+  ...fillRoles, ...selectRoles, ...clickRoles, ...checkRoles, 'img', 'slider', 'spinbutton',
+])
 const authenticationText = /(?:captcha|one[ -]?time|verification code|动态码|短信码|校验码|验证码)/iu
 const loginText = /(?:^|\s)(?:log[ -]?in|sign[ -]?in)(?:\s|$)|登录|登陆/iu
 const paymentText = /(?:payment|credit card|debit card|银行卡|信用卡|借记卡|支付|付款)/iu
@@ -672,7 +683,7 @@ export class BrowserPageInspector {
     const auth = this.classifyAuth(binding, page, visibleNodes)
     const readable = this.readableNodes(binding, page, mainFrameNodes, visibleNodes)
     const restrictedRegions = this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes)
-    const candidates = readable.flatMap((node): SafeCandidate[] => {
+    const preliminaryCandidates = readable.flatMap((node): SafeCandidate[] => {
       const role = normalizedRole(node.role)
       if (!semanticRoles.has(role) || authNode(node)) return []
       const rawValue = node.value === undefined ? undefined : safeText(node.value)
@@ -693,6 +704,8 @@ export class BrowserPageInspector {
           : undefined
       ) : undefined
       return [{
+        axNodeId: node.axNodeId,
+        parentAxNodeId: node.parentAxNodeId,
         backendNodeId: node.backendNodeId,
         role,
         name,
@@ -709,6 +722,32 @@ export class BrowserPageInspector {
           : {}),
         ...(structuredField === undefined ? {} : { fieldValue: structuredField.value }),
       }]
+    })
+    const nodesByAxId = new Map(mainFrameNodes.map((node) => [node.axNodeId, node]))
+    const retainedByAxId = new Map(preliminaryCandidates.map((candidate) => [candidate.axNodeId, candidate]))
+    const withParents = preliminaryCandidates.map((candidate) => {
+      let parentAxNodeId = candidate.parentAxNodeId
+      const seen = new Set<string>()
+      while (parentAxNodeId && !seen.has(parentAxNodeId)) {
+        const retained = retainedByAxId.get(parentAxNodeId)
+        if (retained) return { ...candidate, parentBackendNodeId: retained.backendNodeId }
+        seen.add(parentAxNodeId)
+        parentAxNodeId = nodesByAxId.get(parentAxNodeId)?.parentAxNodeId
+      }
+      return candidate
+    })
+    const parentsWithRetainedChildren = new Set(withParents.flatMap((candidate) => (
+      candidate.parentBackendNodeId === undefined ? [] : [candidate.parentBackendNodeId]
+    )))
+    const candidates = withParents.map((candidate): SafeCandidate => {
+      const renderValue = candidate.value ?? candidate.name
+      const answerable = !parentsWithRetainedChildren.has(candidate.backendNodeId)
+        && candidate.actions.length === 0
+        && candidate.fieldValue === undefined
+        && !structuralRoles.has(candidate.role)
+        && !interactiveRoles.has(candidate.role)
+        && !instructionLikeText.test(renderValue)
+      return Object.freeze({ ...candidate, ...(answerable ? { answerable: true } : {}) })
     })
     const snapshotId = this.opaque('snapshot')
     const capturedAt = new Date(this.now()).toISOString()
@@ -759,13 +798,20 @@ export class BrowserPageInspector {
   private pageFromCandidates(input: Omit<CursorState, 'cursor'>): BrowserPageSnapshot {
     const nodes: BrowserSemanticNode[] = []
     const acceptedRefs: RefState[] = []
+    const refsByBackendNodeId = new Map([...this.refs.values()].flatMap((state) => (
+      state.snapshotId === input.snapshotId ? [[state.backendNodeId, state.ref] as const] : []
+    )))
     const possibleCursor = this.opaque('cursor')
     let nextIndex = input.nextIndex
     while (nextIndex < input.candidates.length && nodes.length < maxSemanticNodes) {
       const candidate = input.candidates[nextIndex]!
       const ref = this.opaque('ref')
+      const parentRef = candidate.parentBackendNodeId === undefined
+        ? undefined
+        : refsByBackendNodeId.get(candidate.parentBackendNodeId)
       const semanticNode = Object.freeze({
         ref,
+        ...(parentRef === undefined ? {} : { parentRef }),
         role: candidate.role,
         name: candidate.name,
         ...(candidate.value === undefined ? {} : { value: candidate.value }),
@@ -773,6 +819,7 @@ export class BrowserPageInspector {
         ...(candidate.checked === undefined ? {} : { checked: candidate.checked }),
         ...(candidate.selected === undefined ? {} : { selected: candidate.selected }),
         actions: candidate.actions,
+        ...(candidate.answerable === true ? { answerable: true } : {}),
       })
       const trialNodes = Object.freeze([...nodes, semanticNode])
       const hasMore = nextIndex + 1 < input.candidates.length
@@ -800,6 +847,7 @@ export class BrowserPageInspector {
         ...candidate,
         ref,
       }))
+      refsByBackendNodeId.set(candidate.backendNodeId, ref)
       nextIndex += 1
     }
     if (nodes.length === 0 && nextIndex < input.candidates.length) throw failure('UNSUPPORTED_CONTROL')

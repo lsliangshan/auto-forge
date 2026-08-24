@@ -176,6 +176,37 @@ function idSequence(): () => string {
 }
 
 describe('BrowserPageInspector', () => {
+  it('preserves table context and marks only safe leaf values answerable', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '附件管理', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(20, 'table', '附件列表', { axNodeId: 'ax_table', parentAxNodeId: 'ax_main' }),
+      node(21, 'row', '表头', { axNodeId: 'ax_header', parentAxNodeId: 'ax_table' }),
+      node(22, 'columnheader', '附件名称', { axNodeId: 'ax_name_header', parentAxNodeId: 'ax_header' }),
+      node(23, 'columnheader', '当前状态', { axNodeId: 'ax_status_header', parentAxNodeId: 'ax_header' }),
+      node(30, 'row', '学历证书 已上传', { axNodeId: 'ax_row_1', parentAxNodeId: 'ax_table' }),
+      node(31, 'cell', '学历证书', { axNodeId: 'ax_name_cell_1', parentAxNodeId: 'ax_row_1' }),
+      node(32, 'StaticText', '学历证书', { axNodeId: 'ax_name_1', parentAxNodeId: 'ax_name_cell_1' }),
+      node(33, 'cell', '已上传', { axNodeId: 'ax_status_cell_1', parentAxNodeId: 'ax_row_1' }),
+      node(34, 'StaticText', '已上传', { axNodeId: 'ax_status_1', parentAxNodeId: 'ax_status_cell_1' }),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input(binding(), { intent: '我上传了哪些附件' }))
+
+    const table = snapshot.nodes.find(({ name }) => name === '附件列表')!
+    const row = snapshot.nodes.find(({ name }) => name === '学历证书 已上传')!
+    const nameCell = snapshot.nodes.find(({ role, name }) => role === 'cell' && name === '学历证书')!
+    const nameText = snapshot.nodes.find(({ role, name }) => role === 'statictext' && name === '学历证书')!
+    expect(snapshot.nodes).toContainEqual(expect.objectContaining({ role: 'columnheader', name: '附件名称' }))
+    expect(row.parentRef).toBe(table.ref)
+    expect(nameCell.parentRef).toBe(row.ref)
+    expect(nameText.parentRef).toBe(nameCell.ref)
+    expect(nameText.answerable).toBe(true)
+    expect(table.answerable).not.toBe(true)
+    expect(row.answerable).not.toBe(true)
+    expect(nameCell.answerable).not.toBe(true)
+  })
+
   it('fails closed before emitting any partial snapshot for oversized raw trees or locator fan-out', async () => {
     const oversized = new FakeCdpPort(Array.from(
       { length: MAX_BROWSER_INSPECTION_RAW_NODES + 1 },
@@ -777,9 +808,11 @@ describe('BrowserPageInspector', () => {
     const inspector = new BrowserPageInspector(port, { id: idSequence() })
 
     const snapshot = await inspector.inspect(input())
+    const main = snapshot.nodes.find(({ role }) => role === 'main')!
 
     expect(snapshot.nodes.find(({ name }) => name === '北京市政务服务')).toEqual({
-      ref: expect.any(String), role: 'statictext', name: '北京市政务服务', enabled: true, actions: [],
+      ref: expect.any(String), parentRef: main.ref, role: 'statictext', name: '北京市政务服务',
+      enabled: true, actions: [], answerable: true,
     })
   })
 
