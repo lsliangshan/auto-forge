@@ -30,6 +30,7 @@ import type {
   BrowserSemanticNode,
   BrowserValueSource,
 } from '../browser/browser-continuation-types.js'
+import type { BrowserLoginWaitCoordinator } from '../browser/browser-login-wait-coordinator.js'
 import { classifyBrowserActionRisk } from './capability-risk.js'
 
 const identifier = z.string().trim().min(1).max(128)
@@ -106,6 +107,12 @@ export interface BrowserContinuationWorkspacePort {
     target: BrowserContinuationResolvedTargetInput,
   ): Promise<void>
   clearContinuationHighlight(tabId: string): Promise<void>
+  suspendContinuation(tabId: string, runId: string): Promise<void>
+  resumeContinuation(
+    tabId: string,
+    runId: string,
+    expectedPage: BrowserContinuationPageState,
+  ): Promise<void>
 }
 
 interface BrowserActionAuditRepository {
@@ -117,6 +124,7 @@ interface BrowserContinuationToolExecutorDependencies {
   readonly registry: Pick<BrowserContinuationRegistry, 'acquire'>
   readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
+  readonly loginWait: Pick<BrowserLoginWaitCoordinator, 'wait' | 'cancel'>
   readonly audits: BrowserActionAuditRepository
   readonly guard?: BrowserActionGuard
   readonly id?: () => string
@@ -130,6 +138,10 @@ interface ActiveRunState {
   readonly runId: string
   readonly bindingId: string
   readonly startedAt: number
+  pausedAt?: number
+  pausedDurationMs: number
+  suspendedForAuthentication: boolean
+  authenticationRequiredPage?: BrowserContinuationPageState
   lease?: BrowserContinuationLease
   nextAuditSequence?: number
   readonly snapshots: Map<string, BrowserPageSnapshot>
@@ -144,12 +156,25 @@ export type BrowserContinuationToolResult =
   | { readonly kind: 'handoff'; readonly code: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL' }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
+export type BrowserAuthenticationWaitResult =
+  | { readonly kind: 'authenticated' }
+  | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
+
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
 }
 
 function trimmedText(value: string): string {
   return value.trim()
+}
+
+function samePage(
+  left: BrowserContinuationPageState,
+  right: BrowserContinuationPageState,
+): boolean {
+  return left.origin === right.origin
+    && left.url === right.url
+    && left.navigationEpoch === right.navigationEpoch
 }
 
 function validCalendarDate(year: number, month: number, day: number): boolean {
@@ -253,6 +278,7 @@ export class BrowserContinuationToolExecutor {
   }
 
   async endRun(runId: string): Promise<void> {
+    this.dependencies.loginWait.cancel(runId)
     const state = this.runs.get(runId)
     if (state) await this.cleanupAuthority(state)
     this.runs.delete(runId)
@@ -265,6 +291,89 @@ export class BrowserContinuationToolExecutor {
 
   async takeOver(runId: string): Promise<void> {
     await this.endRun(runId)
+  }
+
+  async waitForAuthentication(
+    runId: string,
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserAuthenticationWaitResult> {
+    const state = this.runs.get(runId)
+    if (!state || state.runId !== context.runId || !state.suspendedForAuthentication || !state.lease) {
+      return { kind: 'tool_error', code: 'CANCELLED' }
+    }
+    const lease = state.lease
+    try {
+      let unknownCandidate: BrowserContinuationPageState | undefined
+      while (true) {
+        this.assertActive(state, context)
+        let authenticatedPage: BrowserContinuationPageState | undefined
+        await this.dependencies.loginWait.wait({
+          runId,
+          tabId: lease.binding.tabId,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+          probe: async () => {
+            await lease.assertEligible()
+            this.assertActive(state, context)
+            const page = await this.dependencies.workspace.getContinuationState(
+              lease.binding.tabId,
+              context.runId,
+            )
+            const live = await this.dependencies.inspector.currentPageContext({
+              lease,
+              tabId: lease.binding.tabId,
+              navigationEpoch: page.navigationEpoch,
+              origin: page.origin,
+              allowAuthLoginUrls: true,
+              ...(context.signal === undefined ? {} : { signal: context.signal }),
+            })
+            if (live.auth === 'required') {
+              state.authenticationRequiredPage = page
+              unknownCandidate = undefined
+              authenticatedPage = undefined
+              return live.auth
+            }
+            if (live.auth === 'authenticated') {
+              authenticatedPage = page
+              return live.auth
+            }
+            if (state.authenticationRequiredPage
+              && !samePage(page, state.authenticationRequiredPage)
+              && unknownCandidate
+              && samePage(page, unknownCandidate)) {
+              authenticatedPage = page
+              return 'authenticated'
+            }
+            unknownCandidate = page
+            authenticatedPage = undefined
+            return live.auth
+          },
+        })
+        await lease.assertEligible()
+        this.assertActive(state, context)
+        if (!authenticatedPage) throw failure('PAGE_CHANGED')
+        try {
+          await this.dependencies.workspace.resumeContinuation(
+            lease.binding.tabId,
+            context.runId,
+            authenticatedPage,
+          )
+          break
+        } catch (error) {
+          if (toSafeAppError(error).code !== 'PAGE_CHANGED') throw error
+          unknownCandidate = undefined
+        }
+      }
+      const resumedAt = this.now()
+      state.pausedDurationMs += state.pausedAt === undefined ? 0 : resumedAt - state.pausedAt
+      state.pausedAt = undefined
+      state.suspendedForAuthentication = false
+      state.authenticationRequiredPage = undefined
+      return { kind: 'authenticated' }
+    } catch (error) {
+      const safe = toSafeAppError(error)
+      if (this.runs.get(runId) === state) await this.terminate(state)
+      return { kind: 'tool_error', code: safe.code }
+    }
   }
 
   private parse(tool: BrowserContinuationToolName, input: unknown) {
@@ -283,6 +392,8 @@ export class BrowserContinuationToolExecutor {
       runId: context.runId,
       bindingId,
       startedAt: this.now(),
+      pausedDurationMs: 0,
+      suspendedForAuthentication: false,
       snapshots: new Map(),
     }
     this.runs.set(context.runId, state)
@@ -291,7 +402,10 @@ export class BrowserContinuationToolExecutor {
 
   private assertActive(state: ActiveRunState, context: BrowserContinuationRunContext): void {
     if (context.signal?.aborted) throw failure('CANCELLED')
-    if (this.now() - state.startedAt >= 300_000) throw failure('ACTION_LIMIT_EXCEEDED')
+    const now = this.now()
+    const pausedDuration = state.pausedDurationMs
+      + (state.pausedAt === undefined ? 0 : now - state.pausedAt)
+    if (now - state.startedAt - pausedDuration >= 300_000) throw failure('ACTION_LIMIT_EXCEEDED')
     if (state.lease && !state.lease.isCurrent(state.lease.binding)) throw failure('CANCELLED')
   }
 
@@ -562,7 +676,16 @@ export class BrowserContinuationToolExecutor {
         },
       )
     }
-    await this.cleanupAuthority(state, true)
+    if (decision.code === 'AUTH_REQUIRED') {
+      state.snapshots.clear()
+      this.dependencies.inspector.endRun(state.runId)
+      await this.dependencies.workspace.suspendContinuation(lease.binding.tabId, context.runId)
+      state.suspendedForAuthentication = true
+      state.authenticationRequiredPage = page
+      state.pausedAt = this.now()
+    } else {
+      await this.cleanupAuthority(state, true)
+    }
     if (trigger) {
       this.auditAction(
         state, context, page.origin, trigger.action, trigger.target, 'handed_off', decision.code,
@@ -572,8 +695,10 @@ export class BrowserContinuationToolExecutor {
       state, context, page.origin, 'handoff', targetSummary(target),
       'external_action', 'handed_off', decision.code,
     )
-    this.runs.delete(context.runId)
-    this.rememberTerminalRun(context.runId)
+    if (decision.code !== 'AUTH_REQUIRED') {
+      this.runs.delete(context.runId)
+      this.rememberTerminalRun(context.runId)
+    }
     return { kind: 'handoff', code: decision.code }
   }
 
@@ -707,6 +832,7 @@ export class BrowserContinuationToolExecutor {
   }
 
   private async terminate(state: ActiveRunState): Promise<void> {
+    this.dependencies.loginWait.cancel(state.runId)
     await this.cleanupAuthority(state)
     this.runs.delete(state.runId)
     this.rememberTerminalRun(state.runId)

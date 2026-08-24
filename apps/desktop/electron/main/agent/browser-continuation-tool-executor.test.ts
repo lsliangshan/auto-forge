@@ -58,15 +58,17 @@ function harness(options: {
   terminalRunLimit?: number
   terminalRunTtlMs?: number
   isRunActive?: (runId: string) => boolean
+  waitForLogin?: (input: { probe: () => Promise<'authenticated' | 'required' | 'unknown'> }) => Promise<void>
 } = {}) {
   const liveBinding = binding()
   let current = true
   const release = vi.fn(async () => { current = false })
+  const assertEligible = vi.fn(async () => undefined)
   const lease: BrowserContinuationLease = Object.freeze({
     binding: liveBinding,
     ownerRunId: 'agent_run_1',
     isCurrent: (candidate: BrowserContinuationBinding) => current && candidate === liveBinding,
-    assertEligible: vi.fn(async () => undefined),
+    assertEligible,
     release,
   })
   const snapshots = [...(options.snapshots ?? [snapshot()])]
@@ -89,8 +91,11 @@ function harness(options: {
         targetContext: input.ref === 'ref_help' ? { href: 'https://service.example/help' } : {},
       }
     }),
-    currentPageContext: vi.fn(async () => ({
-      auth: 'authenticated' as const,
+    currentPageContext: vi.fn(async (): Promise<{
+      auth: 'authenticated' | 'required' | 'unknown'
+      semanticFingerprint: string
+    }> => ({
+      auth: 'authenticated',
       semanticFingerprint: semanticFingerprint(),
     })),
     endRun: vi.fn(),
@@ -102,12 +107,29 @@ function harness(options: {
     focusContinuation: vi.fn(async () => undefined),
     highlightContinuationTarget: vi.fn(async () => undefined),
     clearContinuationHighlight: vi.fn(async () => undefined),
+    suspendContinuation: vi.fn(async () => undefined),
+    resumeContinuation: vi.fn(async (
+      tabId: string,
+      runId: string,
+      expected?: { origin: string; navigationEpoch: number },
+    ) => {
+      void tabId
+      void runId
+      void expected
+    }),
+  }
+  const loginWait = {
+    wait: vi.fn(options.waitForLogin ?? (async (input) => {
+      if (await input.probe() !== 'authenticated') throw { code: 'AUTH_REQUIRED' }
+    })),
+    cancel: vi.fn(),
   }
   const audits: BrowserActionAuditEntry[] = []
   const executor = new BrowserContinuationToolExecutor({
     registry: { acquire: vi.fn(async () => lease) },
     inspector: inspector as never,
     workspace,
+    loginWait,
     audits: {
       list: vi.fn(() => [...audits]),
       insert: vi.fn((entry: BrowserActionAuditEntry) => { audits.push(entry); return entry }),
@@ -118,7 +140,7 @@ function harness(options: {
     ...(options.terminalRunLimit === undefined ? {} : { terminalRunLimit: options.terminalRunLimit }),
     ...(options.terminalRunTtlMs === undefined ? {} : { terminalRunTtlMs: options.terminalRunTtlMs }),
   })
-  return { executor, inspector, workspace, audits, lease, release, state }
+  return { executor, inspector, workspace, loginWait, audits, lease, release, assertEligible, state }
 }
 
 describe('BrowserContinuationToolExecutor', () => {
@@ -393,6 +415,35 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(liveAuth.workspace.performContinuationAction).not.toHaveBeenCalled()
   })
 
+  it('suspends for authentication, resumes automatically, and excludes login wait from the active limit', async () => {
+    let now = 0
+    const test = harness({ now: () => now })
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '读取工作居住证有效期',
+    }, run())
+
+    await expect(test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'login',
+    }, run())).resolves.toEqual({ kind: 'handoff', code: 'AUTH_REQUIRED' })
+
+    expect(test.workspace.suspendContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1')
+    expect(test.release).not.toHaveBeenCalled()
+    expect(test.lease.isCurrent(test.lease.binding)).toBe(true)
+    now = 600_000
+
+    await expect(test.executor.waitForAuthentication('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'authenticated' })
+
+    expect(test.loginWait.wait).toHaveBeenCalledOnce()
+    expect(test.workspace.resumeContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1', {
+      origin: 'https://service.example', url: 'https://service.example/form', navigationEpoch: 1,
+    })
+    now = 600_001
+    await expect(test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '读取工作居住证有效期',
+    }, run())).resolves.toMatchObject({ kind: 'success' })
+  })
+
   it.each([
     { text: '不同意须知', checked: true },
     { text: '不要勾选同意须知', checked: true },
@@ -410,6 +461,72 @@ describe('BrowserContinuationToolExecutor', () => {
       kind: 'tool_error', code: 'INVALID_INPUT',
     })
     expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
+  })
+
+  it('keeps waiting when the page redirects after an authenticated probe but before resume', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '读取工作居住证有效期',
+    }, run())
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'login',
+    }, run())
+    test.assertEligible.mockClear()
+    let eligibilityChecks = 0
+    test.assertEligible.mockImplementation(async () => {
+      eligibilityChecks += 1
+      if (eligibilityChecks === 2) {
+        test.state.url = 'https://service.example/callback'
+        test.state.navigationEpoch = 2
+      }
+    })
+    test.workspace.resumeContinuation.mockImplementation(async (_tabId, _runId, expected) => {
+      if (!expected
+        || expected.origin !== test.state.origin
+        || expected.navigationEpoch !== test.state.navigationEpoch) throw { code: 'PAGE_CHANGED' }
+    })
+
+    await expect(test.executor.waitForAuthentication('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'authenticated' })
+
+    expect(test.loginWait.wait).toHaveBeenCalledTimes(2)
+    expect(test.workspace.resumeContinuation).toHaveBeenCalledTimes(2)
+    expect(test.workspace.resumeContinuation).toHaveBeenLastCalledWith('tab_1', 'agent_run_1', {
+      origin: 'https://service.example', url: 'https://service.example/callback', navigationEpoch: 2,
+    })
+    expect(test.release).not.toHaveBeenCalled()
+  })
+
+  it('resumes from a stable post-login page without a configured logged-in marker', async () => {
+    const test = harness()
+    test.state.url = 'https://service.example/login'
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '读取工作居住证有效期',
+    }, run())
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'login',
+    }, run())
+    test.inspector.currentPageContext
+      .mockResolvedValueOnce({ auth: 'required', semanticFingerprint: 'login' })
+      .mockResolvedValueOnce({ auth: 'unknown', semanticFingerprint: 'dashboard' })
+      .mockResolvedValueOnce({ auth: 'unknown', semanticFingerprint: 'dashboard' })
+    test.loginWait.wait.mockImplementationOnce(async (input) => {
+      expect(await input.probe()).toBe('required')
+      test.state.url = 'https://service.example/dashboard'
+      test.state.navigationEpoch = 2
+      expect(await input.probe()).toBe('unknown')
+      if (await input.probe() !== 'authenticated') throw { code: 'AUTH_REQUIRED' }
+    })
+
+    await expect(test.executor.waitForAuthentication('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'authenticated' })
+
+    expect(test.workspace.resumeContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1', {
+      origin: 'https://service.example',
+      url: 'https://service.example/dashboard',
+      navigationEpoch: 2,
+    })
+    expect(test.release).not.toHaveBeenCalled()
   })
 
   it('rejects invalid calendar dates but preserves explicitly quoted values', async () => {
