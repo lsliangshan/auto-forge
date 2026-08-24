@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { describe, expect, it, vi } from 'vitest'
 import {
   createPostgresRpcClient,
@@ -7,6 +8,7 @@ import {
 
 const authenticatedContext = { auth: { uid: 'real_uid' } }
 const occurredAt = '2026-08-24T00:00:00.000Z'
+const opaqueCursor = '123e4567-e89b-12d3-a456-426614174000'
 
 const consent = {
   purpose: 'cloud_sync',
@@ -22,6 +24,23 @@ const consentMutation = {
   occurredAt,
   kind: 'privacy.consent',
   payload: consent,
+}
+
+function messageMutation(blocks: unknown[]) {
+  return {
+    id: 'message_mutation_1',
+    entityId: 'message_1',
+    baseRevision: 0,
+    occurredAt,
+    kind: 'message.append',
+    payload: {
+      id: 'message_1',
+      conversationId: 'conv_1',
+      role: 'user',
+      blocks,
+      createdAt: occurredAt,
+    },
+  }
 }
 
 describe('CloudBase user data function', () => {
@@ -88,7 +107,7 @@ describe('CloudBase user data function', () => {
   })
 
   it('maps every strict action to the existing service-role RPC contract', async () => {
-    const rpc = vi.fn().mockResolvedValue({ accepted: true })
+    const rpc = vi.fn()
     const handler = createUserDataHandler({ rpc })
     const conversation = {
       id: 'conv_1',
@@ -110,6 +129,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [consentMutation] },
         rpcName: 'autoforge_sync_push',
+        output: { results: [{ id: 'mutation_1', status: 'applied', revision: 0 }], cursor: opaqueCursor },
         parameters: {
           p_caller_user_id: 'real_uid', p_protocol_version: 1,
           p_device_id: 'dev_1', p_mutations: [consentMutation],
@@ -118,6 +138,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'syncPull', protocolVersion: 1, deviceId: 'dev_1', cursor: 'opaque-cursor-0001', limit: 25 },
         rpcName: 'autoforge_sync_pull',
+        output: { mutations: [], cursor: 'opaque-cursor-0001' },
         parameters: {
           p_caller_user_id: 'real_uid', p_protocol_version: 1, p_device_id: 'dev_1',
           p_cursor: 'opaque-cursor-0001', p_limit: 25,
@@ -126,6 +147,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'listConversations', limit: 50, cursor: 'opaque-cursor-0001' },
         rpcName: 'autoforge_list_conversations',
+        output: { items: [] },
         parameters: {
           p_caller_user_id: 'real_uid', p_limit: 50,
           p_cursor: 'opaque-cursor-0001', p_include_deleted: false,
@@ -134,6 +156,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'listMessages', conversationId: 'conv_1', limit: 100 },
         rpcName: 'autoforge_list_messages',
+        output: { items: [] },
         parameters: {
           p_caller_user_id: 'real_uid', p_conversation_id: 'conv_1',
           p_limit: 100, p_cursor: null,
@@ -142,6 +165,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'previewLegacyImport', ownedCount: 1, unownedCount: 2 },
         rpcName: 'autoforge_preview_legacy_import',
+        output: { ownedCount: 1, unownedCount: 2, requiresUnownedConfirmation: true },
         parameters: { p_caller_user_id: 'real_uid', p_owned_count: 1, p_unowned_count: 2 },
       },
       {
@@ -151,6 +175,7 @@ describe('CloudBase user data function', () => {
           cloudSyncConsent: consent,
         },
         rpcName: 'autoforge_import_legacy_batch',
+        output: { batchId: 'batch_1', status: 'applied', importedConversations: 1, importedMessages: 1 },
         parameters: {
           p_caller_user_id: 'real_uid', p_protocol_version: 1, p_device_id: 'dev_1',
           p_batch_id: 'batch_1', p_include_unowned: false,
@@ -161,6 +186,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'recordConsent', protocolVersion: 1, deviceId: 'dev_1', mutation: consentMutation },
         rpcName: 'autoforge_sync_push',
+        output: { results: [{ id: 'mutation_1', status: 'applied', revision: 0 }], cursor: opaqueCursor },
         parameters: {
           p_caller_user_id: 'real_uid', p_protocol_version: 1,
           p_device_id: 'dev_1', p_mutations: [consentMutation],
@@ -169,6 +195,7 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'getUserDataPreferences' },
         rpcName: 'autoforge_get_user_data_preferences',
+        output: { timezone: 'Asia/Shanghai', displayCurrency: 'CNY', revision: 0, updatedAt: occurredAt },
         parameters: { p_caller_user_id: 'real_uid' },
       },
       {
@@ -177,6 +204,7 @@ describe('CloudBase user data function', () => {
           displayCurrency: 'CNY', expectedRevision: 2,
         },
         rpcName: 'autoforge_update_user_data_preferences',
+        output: { timezone: 'Asia/Shanghai', displayCurrency: 'CNY', revision: 3 },
         parameters: {
           p_caller_user_id: 'real_uid', p_timezone: 'Asia/Shanghai',
           p_display_currency: 'CNY', p_expected_revision: 2,
@@ -185,6 +213,15 @@ describe('CloudBase user data function', () => {
       {
         event: { action: 'getUsageSnapshot', startedAt: occurredAt, endedAt: '2026-08-25T00:00:00.000Z' },
         rpcName: 'autoforge_get_usage_snapshot',
+        output: {
+          startedAt: occurredAt,
+          endedAt: '2026-08-25T00:00:00.000Z',
+          inputTokens: 12,
+          outputTokens: 4,
+          estimatedCostUsd: '0.001200000000',
+          estimatedCount: 1,
+          unavailableCount: 0,
+        },
         parameters: {
           p_caller_user_id: 'real_uid', p_started_at: occurredAt,
           p_ended_at: '2026-08-25T00:00:00.000Z',
@@ -192,9 +229,10 @@ describe('CloudBase user data function', () => {
       },
     ]
 
-    for (const { event, rpcName, parameters } of cases) {
+    for (const { event, rpcName, parameters, output } of cases) {
       rpc.mockClear()
-      await expect(handler(event, authenticatedContext)).resolves.toEqual({ ok: true, data: { accepted: true } })
+      rpc.mockResolvedValueOnce(output)
+      await expect(handler(event, authenticatedContext)).resolves.toEqual({ ok: true, data: output })
       expect(rpc).toHaveBeenCalledOnce()
       expect(rpc).toHaveBeenCalledWith(rpcName, parameters)
     }
@@ -224,6 +262,172 @@ describe('CloudBase user data function', () => {
       })
     }
     expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('rejects an extra key on every action branch', async () => {
+    const rpc = vi.fn()
+    const handler = createUserDataHandler({ rpc })
+    const conversation = {
+      id: 'conv_1', title: 'title', titleState: 'user_named', createdAt: occurredAt,
+      lastActivityAt: occurredAt, metadataUpdatedAt: occurredAt,
+    }
+
+    const validEvents = [
+      { action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [consentMutation] },
+      { action: 'syncPull', protocolVersion: 1, deviceId: 'dev_1' },
+      { action: 'listConversations', limit: 50 },
+      { action: 'listMessages', conversationId: 'conv_1', limit: 100 },
+      { action: 'previewLegacyImport', ownedCount: 1, unownedCount: 0 },
+      {
+        action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'dev_1', batchId: 'batch_1',
+        includeUnowned: false, conversations: [conversation], messages: [], cloudSyncConsent: consent,
+      },
+      { action: 'recordConsent', protocolVersion: 1, deviceId: 'dev_1', mutation: consentMutation },
+      { action: 'getUserDataPreferences' },
+      {
+        action: 'updateUserDataPreferences', timezone: 'Asia/Shanghai',
+        displayCurrency: 'CNY', expectedRevision: 0,
+      },
+      { action: 'getUsageSnapshot', startedAt: occurredAt, endedAt: '2026-08-25T00:00:00.000Z' },
+    ]
+
+    for (const event of validEvents) {
+      await expect(handler({ ...event, unexpected: true }, authenticatedContext)).resolves.toEqual({
+        ok: false, error: { code: 'INVALID_INPUT' },
+      })
+    }
+    expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('mirrors canonical nested message block and BYOK decimal validation', async () => {
+    const rpc = vi.fn()
+    const handler = createUserDataHandler({ rpc })
+    const invalidMutations = [
+      messageMutation([{
+        type: 'browser_status',
+        blockId: 'block_1',
+        requestId: 'request_1',
+        bindingId: 'binding_1',
+        siteLabel: 'Unsafe site',
+        origin: 'http://example.com',
+        state: 'inspecting',
+      }]),
+      messageMutation([{ type: 'error', code: 'NOT_AN_APP_ERROR', message: 'failed' }]),
+      messageMutation([{
+        type: 'workflow_status',
+        blockId: 'block_1',
+        executionId: 'execution_1',
+        status: 'queued',
+        executionAvailable: true,
+        executionIndex: 1,
+        executionLimit: 1,
+        workflowId: 'workflow_1',
+        workflowName: 'Workflow',
+        workflowVersion: '1.0.0',
+        source: 'installed',
+      }]),
+      messageMutation([{
+        type: 'workflow_status',
+        blockId: 'block_1',
+        executionId: 'execution_1',
+        status: 'running',
+        executionAvailable: true,
+        executionIndex: 1,
+        executionLimit: 1,
+        workflowId: 'workflow_1',
+        workflowName: 'Workflow',
+        workflowVersion: '1.0.0',
+        source: 'installed',
+        errorCode: 'INTERNAL_ERROR',
+        errorSummary: 'must not accompany an active state',
+      }]),
+      {
+        id: 'usage_mutation_1',
+        entityId: 'usage_1',
+        baseRevision: 0,
+        occurredAt,
+        kind: 'usage.record',
+        payload: {
+          id: 'usage_1',
+          operationId: 'operation_1',
+          purpose: 'chat_reply',
+          credentialOwner: 'user',
+          billable: false,
+          provider: 'openrouter',
+          model: 'openai/gpt-5',
+          modality: 'text',
+          costStatus: 'estimated',
+          estimatedCostUsd: '0.0010',
+          occurredAt,
+        },
+      },
+    ]
+
+    for (const mutation of invalidMutations) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [mutation],
+      }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    }
+    expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('does not invent text limits absent from the Task 1 wire contract', async () => {
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({
+        results: [{ id: 'conversation_mutation_1', status: 'rejected', errorCode: 'INVALID_INPUT' }],
+      })
+      .mockResolvedValueOnce({
+        results: [{ id: 'usage_mutation_1', status: 'applied', revision: 0 }],
+        cursor: opaqueCursor,
+      })
+    const handler = createUserDataHandler({ rpc })
+    const longTitleMutation = {
+      id: 'conversation_mutation_1',
+      entityId: 'conv_1',
+      baseRevision: 0,
+      occurredAt,
+      kind: 'conversation.create',
+      payload: {
+        title: 't'.repeat(501),
+        titleState: 'user_named',
+        createdAt: occurredAt,
+        lastActivityAt: occurredAt,
+        metadataUpdatedAt: occurredAt,
+      },
+    }
+    const longModelMutation = {
+      id: 'usage_mutation_1',
+      entityId: 'usage_1',
+      baseRevision: 0,
+      occurredAt,
+      kind: 'usage.record',
+      payload: {
+        id: 'usage_1',
+        operationId: 'operation_1',
+        purpose: 'chat_reply',
+        credentialOwner: 'user',
+        billable: false,
+        provider: 'openrouter',
+        model: 'm'.repeat(255),
+        modality: 'text',
+        costStatus: 'unavailable',
+        occurredAt,
+      },
+    }
+
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [longTitleMutation],
+    }, authenticatedContext)).resolves.toEqual({
+      ok: true,
+      data: { results: [{ id: 'conversation_mutation_1', status: 'rejected', errorCode: 'INVALID_INPUT' }] },
+    })
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [longModelMutation],
+    }, authenticatedContext)).resolves.toEqual({
+      ok: true,
+      data: { results: [{ id: 'usage_mutation_1', status: 'applied', revision: 0 }], cursor: opaqueCursor },
+    })
+    expect(rpc).toHaveBeenCalledTimes(2)
   })
 
   it('enforces protocol, identifier, batch, and request-size limits before RPC', async () => {
@@ -280,6 +484,9 @@ describe('CloudBase user data function', () => {
 
   it('returns only stable errors and never returns upstream or SQL details', async () => {
     const stable = createUserDataHandler({ rpc: vi.fn().mockRejectedValue({ code: 'SYNC_CONFLICT' }) })
+    const importConfirmation = createUserDataHandler({
+      rpc: vi.fn().mockRejectedValue({ message: 'IMPORT_CONFIRMATION_REQUIRED' }),
+    })
     const unknown = createUserDataHandler({ rpc: vi.fn().mockRejectedValue({
       code: 'SQL_FAILURE', message: 'select service_key from secrets',
       details: { token: 'secret', payload: 'private', path: '/internal/rpc' },
@@ -288,39 +495,311 @@ describe('CloudBase user data function', () => {
     await expect(stable({ action: 'getUserDataPreferences' }, authenticatedContext)).resolves.toEqual({
       ok: false, error: { code: 'SYNC_CONFLICT' },
     })
+    await expect(importConfirmation({ action: 'getUserDataPreferences' }, authenticatedContext)).resolves.toEqual({
+      ok: false, error: { code: 'IMPORT_CONFIRMATION_REQUIRED' },
+    })
     await expect(unknown({ action: 'getUserDataPreferences' }, authenticatedContext)).resolves.toEqual({
       ok: false, error: { code: 'INTERNAL_ERROR' },
     })
   })
+
+  it('returns a safe envelope when function environment configuration is missing', async () => {
+    const require = createRequire(import.meta.url)
+    const entryPath = require.resolve('../../cloudbase/user-data/function/index.js')
+    const previousBaseUrl = process.env.AUTOFORGE_PG_RPC_BASE_URL
+    const previousServiceKey = process.env.AUTOFORGE_PG_SERVICE_KEY
+    delete process.env.AUTOFORGE_PG_RPC_BASE_URL
+    delete process.env.AUTOFORGE_PG_SERVICE_KEY
+    delete require.cache[entryPath]
+
+    try {
+      const { main } = require(entryPath) as { main: (event: unknown, context: unknown) => Promise<unknown> }
+      await expect(main({ action: 'getUserDataPreferences' }, authenticatedContext)).resolves.toEqual({
+        ok: false, error: { code: 'SERVICE_UNAVAILABLE' },
+      })
+    } finally {
+      if (previousBaseUrl === undefined) delete process.env.AUTOFORGE_PG_RPC_BASE_URL
+      else process.env.AUTOFORGE_PG_RPC_BASE_URL = previousBaseUrl
+      if (previousServiceKey === undefined) delete process.env.AUTOFORGE_PG_SERVICE_KEY
+      else process.env.AUTOFORGE_PG_SERVICE_KEY = previousServiceKey
+      delete require.cache[entryPath]
+    }
+  })
 })
 
 describe('CloudBase PostgreSQL user data RPC client', () => {
-  it('uses the service key only in the bearer header and returns successful JSON', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: vi.fn().mockResolvedValue({ items: [] }),
-    })
+  const validOutputs = {
+    autoforge_sync_push: {
+      results: [{ id: 'mutation_1', status: 'applied', revision: 0 }],
+      cursor: opaqueCursor,
+    },
+    autoforge_sync_pull: {
+      mutations: [{
+        id: 'mutation_1',
+        kind: 'privacy.consent',
+        entityId: 'privacy-2026-08',
+        baseRevision: 0,
+        resultRevision: 0,
+        payload: consent,
+        receivedAt: occurredAt,
+      }],
+      cursor: opaqueCursor,
+    },
+    autoforge_list_conversations: {
+      items: [{
+        id: 'conv_1',
+        title: 'Conversation',
+        titleState: 'user_named',
+        revision: 2,
+        syncState: 'synced',
+        createdAt: occurredAt,
+        lastActivityAt: occurredAt,
+        metadataUpdatedAt: occurredAt,
+      }],
+      nextCursor: opaqueCursor,
+    },
+    autoforge_list_messages: {
+      items: [{
+        id: 'message_1',
+        conversationId: 'conv_1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: 'safe response' }],
+        executionId: 'execution_1',
+        createdAt: occurredAt,
+      }],
+      previousCursor: opaqueCursor,
+    },
+    autoforge_preview_legacy_import: {
+      ownedCount: 2,
+      unownedCount: 1,
+      requiresUnownedConfirmation: true,
+    },
+    autoforge_import_legacy_batch: {
+      batchId: 'batch_1',
+      status: 'applied',
+      importedConversations: 2,
+      importedMessages: 3,
+    },
+    autoforge_get_usage_snapshot: {
+      startedAt: occurredAt,
+      endedAt: '2026-08-25T00:00:00.000Z',
+      inputTokens: 12,
+      outputTokens: 4,
+      estimatedCostUsd: '0.001200000000',
+      estimatedCount: 1,
+      unavailableCount: 0,
+    },
+    autoforge_get_user_data_preferences: {
+      timezone: 'Asia/Shanghai',
+      displayCurrency: 'CNY',
+      revision: 2,
+      updatedAt: occurredAt,
+    },
+    autoforge_update_user_data_preferences: {
+      timezone: 'Asia/Shanghai',
+      displayCurrency: 'CNY',
+      revision: 3,
+    },
+  } as const
+
+  it('parses a realistic explicit safe output for every allowlisted RPC', async () => {
+    for (const [name, output] of Object.entries(validOutputs)) {
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue(output),
+      })
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest/',
+        serviceKey: 'server-secret',
+        fetchImpl,
+      })
+
+      await expect(rpc(name, { p_caller_user_id: 'real_uid' })).resolves.toEqual(output)
+      expect(fetchImpl).toHaveBeenCalledWith(
+        `https://autoforge.example/v1/rdb/rest/rpc/${name}`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer server-secret',
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ p_caller_user_id: 'real_uid' }),
+          signal: expect.any(AbortSignal),
+        },
+      )
+      expect(fetchImpl.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    }
+  })
+
+  it('rejects arbitrary, missing, and extra-key 2xx bodies for every allowlisted RPC', async () => {
+    for (const [name, output] of Object.entries(validOutputs)) {
+      for (const body of [{ accepted: true }, { ...output, unexpected: true }]) {
+        const rpc = createPostgresRpcClient({
+          baseUrl: 'https://autoforge.example/v1/rdb/rest',
+          serviceKey: 'server-secret',
+          fetchImpl: vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: vi.fn().mockResolvedValue(body),
+          }),
+        })
+        await expect(rpc(name, {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+      }
+    }
+  })
+
+  it('rejects forbidden keys nested inside otherwise unknown contract fields', async () => {
     const rpc = createPostgresRpcClient({
-      baseUrl: 'https://autoforge.example/v1/rdb/rest/',
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
       serviceKey: 'server-secret',
-      fetchImpl,
+      fetchImpl: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({
+          items: [{
+            id: 'message_1',
+            conversationId: 'conv_1',
+            role: 'assistant',
+            blocks: [{
+              type: 'workflow_proposal',
+              workflowId: 'workflow_1',
+              workflowName: 'Workflow',
+              args: { token: 'must-not-cross-the-boundary' },
+            }],
+            createdAt: occurredAt,
+          }],
+        }),
+      }),
     })
 
-    await expect(rpc('autoforge_get_user_data_preferences', {
-      p_caller_user_id: 'real_uid',
-    })).resolves.toEqual({ items: [] })
-    expect(fetchImpl).toHaveBeenCalledWith(
-      'https://autoforge.example/v1/rdb/rest/rpc/autoforge_get_user_data_preferences',
-      {
-        method: 'POST',
-        headers: {
-          authorization: 'Bearer server-secret',
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({ p_caller_user_id: 'real_uid' }),
-      },
-    )
+    await expect(rpc('autoforge_list_messages', {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+  })
+
+  it('rejects pulled mutations whose entity identity disagrees with the strict payload', async () => {
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({
+          mutations: [{
+            id: 'mutation_1',
+            kind: 'privacy.consent',
+            entityId: 'forged-document-version',
+            baseRevision: 0,
+            resultRevision: 0,
+            payload: consent,
+            receivedAt: occurredAt,
+          }],
+          cursor: opaqueCursor,
+        }),
+      }),
+    })
+
+    await expect(rpc('autoforge_sync_pull', {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+  })
+
+  it('maps a 2xx JSON parse failure to a stable unavailable error', async () => {
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockRejectedValue(new SyntaxError('private upstream response body')),
+      }),
+    })
+
+    await expect(rpc('autoforge_get_user_data_preferences', {})).rejects.toEqual({
+      code: 'SERVICE_UNAVAILABLE',
+    })
+  })
+
+  it('aborts a timed-out fetch and clears its timer', async () => {
+    vi.useFakeTimers()
+    let requestSignal: AbortSignal | undefined
+    let rejectFetch: ((error: Error) => void) | undefined
+    const fetchImpl = vi.fn((_url: string, init: { signal: AbortSignal }) => {
+      requestSignal = init.signal
+      return new Promise((_resolve, reject) => {
+        rejectFetch = reject
+        init.signal.addEventListener('abort', () => {
+          const error = new Error('timed out')
+          error.name = 'AbortError'
+          reject(error)
+        }, { once: true })
+      })
+    })
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl,
+      timeoutMs: 50,
+    })
+    const pending = rpc('autoforge_get_user_data_preferences', {})
+    const rejected = expect(pending).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+
+    try {
+      await vi.advanceTimersByTimeAsync(50)
+      expect(requestSignal?.aborted).toBe(true)
+      await rejected
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      rejectFetch?.(new Error('test cleanup'))
+      await pending.catch(() => undefined)
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('times out body parsing and clears timers on both timeout and success', async () => {
+    vi.useFakeTimers()
+    let requestSignal: AbortSignal | undefined
+    let rejectBody: ((error: Error) => void) | undefined
+    const hangingBodyRpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      timeoutMs: 50,
+      fetchImpl: vi.fn((_url: string, init: { signal: AbortSignal }) => {
+        requestSignal = init.signal
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => new Promise((_resolve, reject) => { rejectBody = reject }),
+        })
+      }),
+    })
+    const pending = hangingBodyRpc('autoforge_get_user_data_preferences', {})
+    const rejected = expect(pending).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+
+    try {
+      await vi.advanceTimersByTimeAsync(50)
+      expect(requestSignal?.aborted).toBe(true)
+      await rejected
+      expect(vi.getTimerCount()).toBe(0)
+
+      const successfulRpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest',
+        serviceKey: 'server-secret',
+        timeoutMs: 50,
+        fetchImpl: vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: vi.fn().mockResolvedValue(validOutputs.autoforge_get_user_data_preferences),
+        }),
+      })
+      await expect(successfulRpc('autoforge_get_user_data_preferences', {})).resolves.toEqual(
+        validOutputs.autoforge_get_user_data_preferences,
+      )
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      rejectBody?.(new Error('test cleanup'))
+      await pending.catch(() => undefined)
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
   })
 
   it('maps only stable upstream errors without exposing response bodies', async () => {

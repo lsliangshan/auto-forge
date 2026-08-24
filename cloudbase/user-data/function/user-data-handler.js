@@ -1,4 +1,4 @@
-/* global Buffer, fetch, module */
+/* global AbortController, Buffer, URL, clearTimeout, fetch, module, setTimeout */
 
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
@@ -6,9 +6,34 @@ const stableErrorCodes = new Set([
   'INVALID_INPUT',
   'SYNC_CONFLICT',
   'UPGRADE_REQUIRED',
+  'IMPORT_CONFIRMATION_REQUIRED',
   'OUTBOX_LIMIT_EXCEEDED',
   'SERVICE_UNAVAILABLE',
   'INTERNAL_ERROR',
+])
+
+const appErrorCodes = new Set([
+  'INVALID_INPUT', 'UNTRUSTED_SENDER', 'INTERNAL_ERROR', 'AUTH_REQUIRED',
+  'AUTH_INVALID_CREDENTIALS', 'AUTH_ACCOUNT_EXISTS', 'AUTH_INVALID_OTP',
+  'AUTH_OTP_EXPIRED', 'AUTH_OTP_RATE_LIMITED', 'AUTH_ACCOUNT_NOT_FOUND', 'FORBIDDEN',
+  'USER_NOT_FOUND', 'ROLE_CONFLICT', 'SELF_ROLE_CHANGE_FORBIDDEN', 'LAST_SUPER_ADMIN',
+  'REQUEST_ID_CONFLICT', 'SERVICE_UNAVAILABLE', 'NOT_FOUND', 'CONFLICT', 'SYNC_CONFLICT',
+  'SYNC_FAILED', 'UPGRADE_REQUIRED', 'IMPORT_CONFIRMATION_REQUIRED', 'OUTBOX_LIMIT_EXCEEDED',
+  'CANCELLED', 'PATH_OUTSIDE_PROJECT', 'CAPABILITY_SCOPE_DENIED', 'PERMISSION_DENIED',
+  'WORKFLOW_INTEGRITY_FAILED', 'WORKER_PROTOCOL_INVALID', 'WORKER_TIMEOUT',
+  'CREDENTIAL_UNAVAILABLE', 'CREDENTIAL_INVALID', 'MODEL_PROVIDER_ACCESS_DENIED',
+  'MODEL_PROVIDER_INVALID_REQUEST', 'MODEL_PROVIDER_PAYMENT_REQUIRED',
+  'MODEL_PROVIDER_RATE_LIMITED', 'MODEL_PROVIDER_TIMEOUT', 'MODEL_PROVIDER_UNAVAILABLE',
+  'OPENROUTER_REQUEST_FAILED', 'MODEL_PROVIDER_REQUEST_FAILED', 'CONTEXT_LIMIT_EXCEEDED',
+  'MEDIA_TYPE_UNSUPPORTED', 'MEDIA_ATTACHMENT_LIMIT_EXCEEDED', 'MEDIA_SIZE_LIMIT_EXCEEDED',
+  'MEDIA_MIME_MISMATCH', 'MEDIA_IMPORT_FAILED', 'MEDIA_ASSET_UNAVAILABLE',
+  'MEDIA_STORAGE_FULL', 'MODEL_MODALITY_UNSUPPORTED', 'MEDIA_GENERATION_FAILED',
+  'MEDIA_DOWNLOAD_FAILED', 'MEDIA_GENERATION_TIMEOUT', 'PROFILE_AVATAR_UPLOAD_FAILED',
+  'NETWORK_PROXY_APPLY_FAILED', 'CITY_REQUIRED', 'CITY_NOT_SUPPORTED', 'WORKFLOW_CHANGED',
+  'INVALID_TOOL_SEQUENCE', 'TOOL_CALL_LIMIT', 'INVALID_OUTPUT', 'RESULT_TOO_LARGE',
+  'NO_BOUND_PAGE', 'PAGE_CLOSED', 'PAGE_BUSY', 'AUTH_STATE_UNKNOWN', 'TARGET_AMBIGUOUS',
+  'DOMAIN_BLOCKED', 'MANUAL_ACTION_REQUIRED', 'MANUAL_INTERVENTION_REQUIRED', 'PAGE_CHANGED',
+  'UNSUPPORTED_CONTROL', 'ACTION_LIMIT_EXCEEDED',
 ])
 
 const allowedRpcNames = new Set([
@@ -37,6 +62,11 @@ const executionStatuses = new Set([
 ])
 const maximumRequestBytes = 1_048_576
 const maximumBatchItems = 100
+const forbiddenResponseKeys = new Set([
+  'apiKey', 'api_key', 'accessToken', 'access_token', 'refreshToken', 'refresh_token',
+  'authorization', 'cookie', 'details', 'password', 'path', 'query', 'secret',
+  'serviceKey', 'service_key', 'sql', 'token', 'uid', 'userId', 'ownerUserId', 'owner_user_id',
+])
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -50,7 +80,7 @@ function hasStrictShape(value, requiredKeys, optionalKeys = []) {
     && actualKeys.every((key) => allowedKeys.has(key))
 }
 
-function nonEmptyString(value, maximum = 128) {
+function nonEmptyString(value, maximum = maximumRequestBytes) {
   return typeof value === 'string'
     && value.length > 0
     && value.length <= maximum
@@ -107,19 +137,62 @@ function withinRequestLimit(value) {
   }
 }
 
+function containsForbiddenResponseKey(value) {
+  if (Array.isArray(value)) return value.some(containsForbiddenResponseKey)
+  if (!isRecord(value)) return false
+  return Object.entries(value).some(([key, child]) => (
+    forbiddenResponseKeys.has(key) || containsForbiddenResponseKey(child)
+  ))
+}
+
+function cloneValidatedJson(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
 function validateConsent(value, requiredPurpose) {
   return hasStrictShape(value, ['purpose', 'documentVersion', 'consentedAt', 'clientVersion'])
     && consentPurposes.has(value.purpose)
     && (requiredPurpose === undefined || value.purpose === requiredPurpose)
-    && nonEmptyString(value.documentVersion)
+    && nonEmptyString(value.documentVersion, 128)
     && timestamp(value.consentedAt)
     && nonEmptyString(value.clientVersion, 64)
 }
 
 function validatePreferences(value) {
   return hasStrictShape(value, ['timezone', 'displayCurrency'])
-    && nonEmptyString(value.timezone)
+    && nonEmptyString(value.timezone, 128)
     && ['CNY', 'USD'].includes(value.displayCurrency)
+}
+
+function httpsOrigin(value) {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.username === ''
+      && url.password === ''
+      && url.pathname === '/'
+      && url.search === ''
+      && url.hash === ''
+      && url.origin === value
+  } catch {
+    return false
+  }
+}
+
+function httpsUrlPattern(value) {
+  if (!nonEmptyString(value)
+    || value.includes('?')
+    || value.includes('#')
+    || value.includes('\\')) return false
+  const candidate = value.includes('://') ? value : `https://${value}`
+  if (!candidate.startsWith('https://')) return false
+  try {
+    const url = new URL(candidate.replaceAll('*', 'wildcard'))
+    return url.protocol === 'https:' && url.username === '' && url.password === '' && Boolean(url.hostname)
+  } catch {
+    return false
+  }
 }
 
 function validateScope(capability, scope) {
@@ -128,13 +201,13 @@ function validateScope(capability, scope) {
     return hasStrictShape(scope, ['origins'])
       && Array.isArray(scope.origins)
       && scope.origins.length > 0
-      && scope.origins.every((origin) => nonEmptyString(origin, 2048))
+      && scope.origins.every(httpsUrlPattern)
   }
   if (capability.startsWith('filesystem.')) {
     return hasStrictShape(scope, ['paths'])
       && Array.isArray(scope.paths)
       && scope.paths.length > 0
-      && scope.paths.every((path) => nonEmptyString(path, 2048))
+      && scope.paths.every((path) => nonEmptyString(path))
   }
   return hasStrictShape(scope, [])
 }
@@ -160,7 +233,7 @@ function validateChatBlock(block) {
     case 'text':
       return hasStrictShape(block, ['type', 'text']) && typeof block.text === 'string'
     case 'reasoning_status':
-      return hasStrictShape(block, ['type', 'label']) && nonEmptyString(block.label, 500)
+      return hasStrictShape(block, ['type', 'label']) && nonEmptyString(block.label)
     case 'workflow_proposal':
       return hasStrictShape(block, ['type', 'workflowId', 'workflowName', 'args'])
         && identifier(block.workflowId) && nonEmptyString(block.workflowName)
@@ -210,6 +283,16 @@ function validateChatBlock(block) {
         ...(block.buildHash === undefined ? {} : { buildHash: block.buildHash }),
         ...(block.city === undefined ? {} : { city: block.city }),
       }
+      const hasError = block.errorCode !== undefined || block.errorSummary !== undefined
+      if ((block.errorCode === undefined) !== (block.errorSummary === undefined)) return false
+      if (hasError && (!appErrorCodes.has(block.errorCode) || !nonEmptyString(block.errorSummary, 500))) {
+        return false
+      }
+      if (['queued', 'awaiting_approval'].includes(block.status) && block.executionAvailable) return false
+      if (['running', 'completed', 'interrupted'].includes(block.status) && !block.executionAvailable) return false
+      if (hasError && ['queued', 'awaiting_approval', 'running'].includes(block.status)) return false
+      if (block.errorCode === 'RESULT_TOO_LARGE' && block.status !== 'completed') return false
+      if (block.status === 'completed' && hasError && block.errorCode !== 'RESULT_TOO_LARGE') return false
       return identifier(block.blockId)
         && identifier(block.executionId)
         && executionStatuses.has(block.status)
@@ -219,8 +302,6 @@ function validateChatBlock(block) {
         && block.executionLimit <= 5
         && block.executionIndex <= block.executionLimit
         && validateWorkflowContext(workflowContext)
-        && ((block.errorCode === undefined && block.errorSummary === undefined)
-          || (nonEmptyString(block.errorCode, 128) && nonEmptyString(block.errorSummary, 500)))
     }
     case 'workflow_provenance':
       return hasStrictShape(block, ['type', 'blockId', 'entries'])
@@ -246,7 +327,7 @@ function validateChatBlock(block) {
         && identifier(block.executionId) && typeof block.summary === 'string'
     case 'error':
       return hasStrictShape(block, ['type', 'code', 'message'])
-        && nonEmptyString(block.code, 128) && nonEmptyString(block.message, 1000)
+        && appErrorCodes.has(block.code) && nonEmptyString(block.message)
     case 'browser_status':
       return hasStrictShape(
         block,
@@ -257,10 +338,10 @@ function validateChatBlock(block) {
         && identifier(block.requestId)
         && identifier(block.bindingId)
         && nonEmptyString(block.siteLabel, 500)
-        && nonEmptyString(block.origin, 2048)
+        && httpsOrigin(block.origin)
         && ['inspecting', 'acting', 'awaiting_user', 'completed', 'failed', 'cancelled'].includes(block.state)
         && (block.actionSummary === undefined || nonEmptyString(block.actionSummary, 500))
-        && (block.errorCode === undefined || nonEmptyString(block.errorCode, 128))
+        && (block.errorCode === undefined || appErrorCodes.has(block.errorCode))
     case 'media':
       return hasStrictShape(
         block,
@@ -287,7 +368,7 @@ function validateChatBlock(block) {
         && identifier(block.jobId)
         && ['image', 'audio', 'video'].includes(block.kind)
         && ['pending', 'in_progress', 'downloading', 'paused', 'failed'].includes(block.status)
-        && (block.errorCode === undefined || nonEmptyString(block.errorCode, 128))
+        && (block.errorCode === undefined || appErrorCodes.has(block.errorCode))
     default:
       return false
   }
@@ -338,13 +419,13 @@ function validateUsage(value) {
     && value.credentialOwner === 'user'
     && value.billable === false
     && providers.has(value.provider)
-    && nonEmptyString(value.model, 254)
+    && nonEmptyString(value.model)
     && modalities.has(value.modality)
     && ['estimated', 'unavailable'].includes(value.costStatus)
     && (value.inputTokens === undefined || nonnegativeInteger(value.inputTokens))
     && (value.outputTokens === undefined || nonnegativeInteger(value.outputTokens))
     && (!isEstimated || (typeof value.estimatedCostUsd === 'string'
-      && /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value.estimatedCostUsd)))
+      && /^(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/.test(value.estimatedCostUsd)))
     && timestamp(value.occurredAt)
 }
 
@@ -355,14 +436,14 @@ function validateMutationPayload(kind, payload) {
         payload,
         ['title', 'titleState', 'createdAt', 'lastActivityAt', 'metadataUpdatedAt'],
       )
-        && nonEmptyString(payload.title, 500)
+        && nonEmptyString(payload.title)
         && titleStates.has(payload.titleState)
         && timestamp(payload.createdAt)
         && timestamp(payload.lastActivityAt)
         && timestamp(payload.metadataUpdatedAt)
     case 'conversation.rename':
       return hasStrictShape(payload, ['title', 'titleState', 'metadataUpdatedAt'])
-        && nonEmptyString(payload.title, 500)
+        && nonEmptyString(payload.title)
         && titleStates.has(payload.titleState)
         && timestamp(payload.metadataUpdatedAt)
     case 'conversation.delete':
@@ -383,6 +464,13 @@ function validateMutationPayload(kind, payload) {
   }
 }
 
+function mutationEntityMatches(kind, entityId, payload) {
+  if (['message.append', 'usage.record'].includes(kind)) return entityId === payload.id
+  if (kind === 'legacy.import') return entityId === payload.batchId
+  if (kind === 'privacy.consent') return entityId === payload.documentVersion
+  return true
+}
+
 function validateMutation(value) {
   if (!hasStrictShape(
     value,
@@ -392,10 +480,7 @@ function validateMutation(value) {
     || !nonnegativeInteger(value.baseRevision)
     || !timestamp(value.occurredAt)
     || !validateMutationPayload(value.kind, value.payload)) return false
-  if (['message.append', 'usage.record'].includes(value.kind)) return value.entityId === value.payload.id
-  if (value.kind === 'legacy.import') return value.entityId === value.payload.batchId
-  if (value.kind === 'privacy.consent') return value.entityId === value.payload.documentVersion
-  return true
+  return mutationEntityMatches(value.kind, value.entityId, value.payload)
 }
 
 function validateLegacyConversation(value) {
@@ -405,12 +490,221 @@ function validateLegacyConversation(value) {
     ['sourceUnowned'],
   )
     && identifier(value.id)
-    && nonEmptyString(value.title, 500)
+    && nonEmptyString(value.title)
     && titleStates.has(value.titleState)
     && timestamp(value.createdAt)
     && timestamp(value.lastActivityAt)
     && timestamp(value.metadataUpdatedAt)
     && (value.sourceUnowned === undefined || typeof value.sourceUnowned === 'boolean')
+}
+
+function parseMutationResult(value) {
+  if (!hasStrictShape(value, ['id', 'status'], ['revision', 'errorCode'])
+    || !identifier(value.id)
+    || !['applied', 'duplicate', 'conflict', 'rejected'].includes(value.status)
+    || (value.revision !== undefined && !nonnegativeInteger(value.revision))
+    || (value.errorCode !== undefined && !appErrorCodes.has(value.errorCode))) return undefined
+  return {
+    id: value.id,
+    status: value.status,
+    ...(value.revision === undefined ? {} : { revision: value.revision }),
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+  }
+}
+
+function parseSyncPushResponse(value) {
+  if (!hasStrictShape(value, ['results'], ['cursor'])
+    || !Array.isArray(value.results)
+    || value.results.length > maximumBatchItems
+    || (value.cursor !== undefined && !opaqueCursor(value.cursor))) return undefined
+  const results = value.results.map(parseMutationResult)
+  if (results.some((result) => result === undefined)) return undefined
+  return {
+    results,
+    ...(value.cursor === undefined ? {} : { cursor: value.cursor }),
+  }
+}
+
+function parsePulledMutation(value) {
+  if (!hasStrictShape(
+    value,
+    ['id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'payload', 'receivedAt'],
+  )
+    || !identifier(value.id)
+    || !identifier(value.entityId)
+    || !nonnegativeInteger(value.baseRevision)
+    || (value.resultRevision !== null && !nonnegativeInteger(value.resultRevision))
+    || !validateMutationPayload(value.kind, value.payload)
+    || !mutationEntityMatches(value.kind, value.entityId, value.payload)
+    || !timestamp(value.receivedAt)) return undefined
+  return {
+    id: value.id,
+    kind: value.kind,
+    entityId: value.entityId,
+    baseRevision: value.baseRevision,
+    resultRevision: value.resultRevision,
+    payload: cloneValidatedJson(value.payload),
+    receivedAt: value.receivedAt,
+  }
+}
+
+function parseSyncPullResponse(value) {
+  if (!hasStrictShape(value, ['mutations', 'cursor'])
+    || !Array.isArray(value.mutations)
+    || value.mutations.length > maximumBatchItems
+    || (value.cursor !== null && !opaqueCursor(value.cursor))) return undefined
+  const mutations = value.mutations.map(parsePulledMutation)
+  if (mutations.some((mutation) => mutation === undefined)) return undefined
+  return { mutations, cursor: value.cursor }
+}
+
+function parseConversationSummary(value) {
+  if (!hasStrictShape(value, [
+    'id', 'title', 'titleState', 'revision', 'syncState', 'createdAt',
+    'lastActivityAt', 'metadataUpdatedAt',
+  ])
+    || !identifier(value.id)
+    || !nonEmptyString(value.title)
+    || !titleStates.has(value.titleState)
+    || !nonnegativeInteger(value.revision)
+    || !['synced', 'pending', 'syncing', 'failed'].includes(value.syncState)
+    || !timestamp(value.createdAt)
+    || !timestamp(value.lastActivityAt)
+    || !timestamp(value.metadataUpdatedAt)) return undefined
+  return {
+    id: value.id,
+    title: value.title,
+    titleState: value.titleState,
+    revision: value.revision,
+    syncState: value.syncState,
+    createdAt: value.createdAt,
+    lastActivityAt: value.lastActivityAt,
+    metadataUpdatedAt: value.metadataUpdatedAt,
+  }
+}
+
+function parseConversationPage(value) {
+  if (!hasStrictShape(value, ['items'], ['nextCursor'])
+    || !Array.isArray(value.items)
+    || value.items.length > 50
+    || (value.nextCursor !== undefined && !opaqueCursor(value.nextCursor))) return undefined
+  const items = value.items.map(parseConversationSummary)
+  if (items.some((item) => item === undefined)) return undefined
+  return { items, ...(value.nextCursor === undefined ? {} : { nextCursor: value.nextCursor }) }
+}
+
+function parseMessage(value) {
+  if (!validateMessage(value)) return undefined
+  return {
+    id: value.id,
+    conversationId: value.conversationId,
+    role: value.role,
+    blocks: value.blocks.map(cloneValidatedJson),
+    ...(value.executionId === undefined ? {} : { executionId: value.executionId }),
+    createdAt: value.createdAt,
+  }
+}
+
+function parseMessagePage(value) {
+  if (!hasStrictShape(value, ['items'], ['previousCursor'])
+    || !Array.isArray(value.items)
+    || value.items.length > maximumBatchItems
+    || (value.previousCursor !== undefined && !opaqueCursor(value.previousCursor))) return undefined
+  const items = value.items.map(parseMessage)
+  if (items.some((item) => item === undefined)) return undefined
+  return { items, ...(value.previousCursor === undefined ? {} : { previousCursor: value.previousCursor }) }
+}
+
+function parseLegacyPreview(value) {
+  if (!hasStrictShape(value, ['ownedCount', 'unownedCount', 'requiresUnownedConfirmation'])
+    || !nonnegativeInteger(value.ownedCount)
+    || !nonnegativeInteger(value.unownedCount)
+    || value.requiresUnownedConfirmation !== (value.unownedCount > 0)) return undefined
+  return {
+    ownedCount: value.ownedCount,
+    unownedCount: value.unownedCount,
+    requiresUnownedConfirmation: value.requiresUnownedConfirmation,
+  }
+}
+
+function parseLegacyImportResult(value) {
+  if (!isRecord(value) || !identifier(value.batchId)) return undefined
+  if (value.status === 'duplicate' && hasStrictShape(value, ['batchId', 'status'])) {
+    return { batchId: value.batchId, status: value.status }
+  }
+  if (value.status === 'rejected'
+    && hasStrictShape(value, ['batchId', 'status', 'errorCode'])
+    && appErrorCodes.has(value.errorCode)) {
+    return { batchId: value.batchId, status: value.status, errorCode: value.errorCode }
+  }
+  if (value.status === 'applied'
+    && hasStrictShape(value, ['batchId', 'status', 'importedConversations', 'importedMessages'])
+    && nonnegativeInteger(value.importedConversations)
+    && nonnegativeInteger(value.importedMessages)) {
+    return {
+      batchId: value.batchId,
+      status: value.status,
+      importedConversations: value.importedConversations,
+      importedMessages: value.importedMessages,
+    }
+  }
+  return undefined
+}
+
+function parseUsageSnapshot(value) {
+  if (!hasStrictShape(value, [
+    'startedAt', 'endedAt', 'inputTokens', 'outputTokens', 'estimatedCostUsd',
+    'estimatedCount', 'unavailableCount',
+  ])
+    || !timestamp(value.startedAt)
+    || !timestamp(value.endedAt)
+    || Date.parse(value.startedAt) >= Date.parse(value.endedAt)
+    || !nonnegativeInteger(value.inputTokens)
+    || !nonnegativeInteger(value.outputTokens)
+    || typeof value.estimatedCostUsd !== 'string'
+    || !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value.estimatedCostUsd)
+    || !nonnegativeInteger(value.estimatedCount)
+    || !nonnegativeInteger(value.unavailableCount)) return undefined
+  return {
+    startedAt: value.startedAt,
+    endedAt: value.endedAt,
+    inputTokens: value.inputTokens,
+    outputTokens: value.outputTokens,
+    estimatedCostUsd: value.estimatedCostUsd,
+    estimatedCount: value.estimatedCount,
+    unavailableCount: value.unavailableCount,
+  }
+}
+
+function parsePreferences(value, includeUpdatedAt) {
+  const required = ['timezone', 'displayCurrency', 'revision']
+  if (includeUpdatedAt) required.push('updatedAt')
+  if (!hasStrictShape(value, required)
+    || !validatePreferences({ timezone: value.timezone, displayCurrency: value.displayCurrency })
+    || !nonnegativeInteger(value.revision)
+    || (includeUpdatedAt && !timestamp(value.updatedAt))) return undefined
+  return {
+    timezone: value.timezone,
+    displayCurrency: value.displayCurrency,
+    revision: value.revision,
+    ...(includeUpdatedAt ? { updatedAt: value.updatedAt } : {}),
+  }
+}
+
+function parseRpcResponse(name, value) {
+  if (containsForbiddenResponseKey(value)) return undefined
+  switch (name) {
+    case 'autoforge_sync_push': return parseSyncPushResponse(value)
+    case 'autoforge_sync_pull': return parseSyncPullResponse(value)
+    case 'autoforge_list_conversations': return parseConversationPage(value)
+    case 'autoforge_list_messages': return parseMessagePage(value)
+    case 'autoforge_preview_legacy_import': return parseLegacyPreview(value)
+    case 'autoforge_import_legacy_batch': return parseLegacyImportResult(value)
+    case 'autoforge_get_usage_snapshot': return parseUsageSnapshot(value)
+    case 'autoforge_get_user_data_preferences': return parsePreferences(value, true)
+    case 'autoforge_update_user_data_preferences': return parsePreferences(value, false)
+    default: return undefined
+  }
 }
 
 function safeErrorCode(error) {
@@ -607,29 +901,56 @@ function createUserDataHandler({ rpc }) {
   }
 }
 
-function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
+function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch, timeoutMs = 10_000 }) {
   if (!baseUrl || !serviceKey) throw new Error('CloudBase PostgreSQL RPC is not configured')
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
   return async (name, parameters) => {
     if (!allowedRpcNames.has(name)) throw { code: 'INTERNAL_ERROR' }
-    let response
+    const controller = new AbortController()
+    const effectiveTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 10_000
+    let timeoutId
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort()
+        reject({ code: 'SERVICE_UNAVAILABLE' })
+      }, effectiveTimeoutMs)
+    })
     try {
-      response = await fetchImpl(`${normalizedBaseUrl}/rpc/${name}`, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${serviceKey}`,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify(parameters),
-      })
-    } catch {
-      throw { code: 'SERVICE_UNAVAILABLE' }
+      let response
+      try {
+        response = await Promise.race([
+          fetchImpl(`${normalizedBaseUrl}/rpc/${name}`, {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${serviceKey}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify(parameters),
+            signal: controller.signal,
+          }),
+          timeout,
+        ])
+      } catch {
+        throw { code: 'SERVICE_UNAVAILABLE' }
+      }
+      let body
+      try {
+        body = await Promise.race([response.json(), timeout])
+      } catch {
+        throw { code: 'SERVICE_UNAVAILABLE' }
+      }
+      if (response.ok) {
+        const parsed = parseRpcResponse(name, body)
+        if (parsed === undefined) throw { code: 'SERVICE_UNAVAILABLE' }
+        return parsed
+      }
+      const code = safeErrorCode(body)
+      if (code !== 'INTERNAL_ERROR') throw { code }
+      throw { code: response.status >= 500 ? 'SERVICE_UNAVAILABLE' : 'INTERNAL_ERROR' }
+    } finally {
+      clearTimeout(timeoutId)
+      controller.abort()
     }
-    const body = await response.json().catch(() => undefined)
-    if (response.ok) return body
-    const code = safeErrorCode(body)
-    if (code !== 'INTERNAL_ERROR') throw { code }
-    throw { code: response.status >= 500 ? 'SERVICE_UNAVAILABLE' : 'INTERNAL_ERROR' }
   }
 }
 
