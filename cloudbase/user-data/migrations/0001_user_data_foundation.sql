@@ -1,7 +1,7 @@
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS app_conversations (
-  id varchar(128) PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
+  id varchar(128) NOT NULL CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
   owner_user_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   title varchar(500) NOT NULL CHECK (length(title) BETWEEN 1 AND 500 AND title = btrim(title)),
   title_state varchar(32) NOT NULL
@@ -13,11 +13,11 @@ CREATE TABLE IF NOT EXISTS app_conversations (
   last_activity_at timestamptz NOT NULL,
   metadata_updated_at timestamptz NOT NULL,
   cursor_token uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
-  UNIQUE (owner_user_id, id)
+  PRIMARY KEY (owner_user_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS app_messages (
-  id varchar(128) PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
+  id varchar(128) NOT NULL CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
   owner_user_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   conversation_id varchar(128) NOT NULL,
   ordinal bigint NOT NULL CHECK (ordinal > 0),
@@ -29,12 +29,11 @@ CREATE TABLE IF NOT EXISTS app_messages (
   cursor_token uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
   FOREIGN KEY (owner_user_id, conversation_id)
     REFERENCES app_conversations(owner_user_id, id) ON DELETE CASCADE,
-  UNIQUE (owner_user_id, id),
-  UNIQUE (conversation_id, ordinal)
+  PRIMARY KEY (owner_user_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS app_model_runs (
-  id varchar(128) PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
+  id varchar(128) NOT NULL CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
   owner_user_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   conversation_id varchar(128) NOT NULL,
   operation_id varchar(128) NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 128),
@@ -47,11 +46,12 @@ CREATE TABLE IF NOT EXISTS app_model_runs (
   updated_at timestamptz NOT NULL DEFAULT now(),
   FOREIGN KEY (owner_user_id, conversation_id)
     REFERENCES app_conversations(owner_user_id, id) ON DELETE CASCADE,
+  PRIMARY KEY (owner_user_id, id),
   UNIQUE (owner_user_id, operation_id)
 );
 
 CREATE TABLE IF NOT EXISTS app_usage_events (
-  id varchar(128) PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
+  id varchar(128) NOT NULL CHECK (length(id) BETWEEN 1 AND 128 AND id = btrim(id)),
   owner_user_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   conversation_id varchar(128),
   operation_id varchar(128) NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 128),
@@ -71,7 +71,9 @@ CREATE TABLE IF NOT EXISTS app_usage_events (
   currency varchar(3) CHECK (currency IS NULL OR currency ~ '^[A-Z]{3}$'),
   occurred_at timestamptz NOT NULL,
   received_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (owner_user_id, id),
+  FOREIGN KEY (owner_user_id, conversation_id)
+    REFERENCES app_conversations(owner_user_id, id) ON DELETE RESTRICT,
+  PRIMARY KEY (owner_user_id, id),
   CHECK (
     credential_owner <> 'user'
     OR (billable = false AND status IN ('estimated', 'unavailable') AND charged_amount IS NULL)
@@ -139,14 +141,12 @@ CREATE TABLE IF NOT EXISTS app_user_data_preferences (
 
 CREATE INDEX IF NOT EXISTS app_conversations_owner_activity_idx
   ON app_conversations(owner_user_id, last_activity_at DESC, id);
-CREATE INDEX IF NOT EXISTS app_messages_owner_conversation_ordinal_idx
-  ON app_messages(owner_user_id, conversation_id, ordinal DESC);
-CREATE UNIQUE INDEX app_messages_conversation_ordinal_key
-  ON app_messages(conversation_id, ordinal);
-CREATE UNIQUE INDEX app_active_run_per_conversation
-  ON app_model_runs(conversation_id)
+CREATE UNIQUE INDEX IF NOT EXISTS app_messages_conversation_ordinal_key
+  ON app_messages(owner_user_id, conversation_id, ordinal);
+CREATE UNIQUE INDEX IF NOT EXISTS app_active_run_per_conversation
+  ON app_model_runs(owner_user_id, conversation_id)
   WHERE status IN ('queued', 'running', 'cancelling');
-CREATE UNIQUE INDEX app_usage_operation_key
+CREATE UNIQUE INDEX IF NOT EXISTS app_usage_operation_key
   ON app_usage_events(owner_user_id, operation_id, provider, purpose);
 CREATE INDEX IF NOT EXISTS app_usage_owner_occurred_idx
   ON app_usage_events(owner_user_id, occurred_at DESC);
@@ -280,6 +280,8 @@ DECLARE
   result_revision_value bigint;
   assigned_ordinal bigint;
   latest_cursor text;
+  result_id text;
+  receipt_ready boolean;
   results jsonb := '[]'::jsonb;
 BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
@@ -313,6 +315,9 @@ BEGIN
     FROM jsonb_array_elements(p_mutations) WITH ORDINALITY AS item(value, ordinality)
     ORDER BY item.ordinality
   LOOP
+    BEGIN
+    result_id := 'invalid-' || mutation_record.ordinality::text;
+    receipt_ready := false;
     mutation := mutation_record.value;
     IF jsonb_typeof(mutation) <> 'object'
       OR EXISTS (
@@ -320,6 +325,10 @@ BEGIN
         WHERE supplied_key NOT IN ('id', 'entityId', 'baseRevision', 'occurredAt', 'kind', 'payload')
       )
       OR NOT (mutation ?& ARRAY['id', 'entityId', 'baseRevision', 'occurredAt', 'kind', 'payload'])
+      OR jsonb_typeof(mutation->'id') <> 'string'
+      OR jsonb_typeof(mutation->'entityId') <> 'string'
+      OR jsonb_typeof(mutation->'kind') <> 'string'
+      OR jsonb_typeof(mutation->'baseRevision') <> 'number'
       OR mutation ? 'ownerUserId'
       OR mutation ? 'owner_user_id'
       OR jsonb_typeof(mutation->'payload') <> 'object' THEN
@@ -331,6 +340,7 @@ BEGIN
     entity_id := mutation->>'entityId';
     payload := mutation->'payload';
     PERFORM autoforge_require_identifier(mutation_id, 128);
+    result_id := mutation_id;
     PERFORM autoforge_require_identifier(entity_id, 128);
     IF mutation_kind NOT IN (
       'conversation.create', 'conversation.rename', 'conversation.delete', 'conversation.restore',
@@ -338,13 +348,14 @@ BEGIN
     )
       OR mutation->>'baseRevision' !~ '^(0|[1-9][0-9]{0,18})$'
       OR (mutation->>'baseRevision')::numeric > 9223372036854775807
-      OR NOT (mutation ? 'occurredAt') THEN
+      OR jsonb_typeof(mutation->'occurredAt') <> 'string' THEN
       RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
     END IF;
     PERFORM (mutation->>'occurredAt')::timestamptz;
 
     base_revision_value := (mutation->>'baseRevision')::bigint;
     request_hash_value := md5(mutation::text);
+    receipt_ready := true;
     mutation_status := 'applied';
     mutation_error := NULL;
     result_revision_value := NULL;
@@ -543,7 +554,8 @@ BEGIN
       IF payload->>'id' IS DISTINCT FROM entity_id
         OR base_revision_value <> 0
         OR payload->>'credentialOwner' <> 'user'
-        OR COALESCE((payload->>'billable')::boolean, true)
+        OR jsonb_typeof(payload->'billable') <> 'boolean'
+        OR payload->'billable' <> 'false'::jsonb
         OR payload->>'costStatus' NOT IN ('estimated', 'unavailable')
         OR payload->>'provider' NOT IN ('deepseek', 'openrouter')
         OR payload->>'modality' NOT IN ('text', 'image', 'audio', 'video') THEN
@@ -578,14 +590,15 @@ BEGIN
 
     ELSE
       IF payload->>'batchId' IS DISTINCT FROM entity_id OR base_revision_value <> 0
-        OR (payload->>'includeUnowned')::boolean
+        OR jsonb_typeof(payload->'includeUnowned') <> 'boolean'
+        OR payload->'includeUnowned' = 'true'::jsonb
           AND COALESCE(payload->'unownedImportConsent'->>'purpose', '') <> 'legacy_unowned_import'
         OR COALESCE(payload->'cloudSyncConsent'->>'purpose', '') <> 'cloud_sync' THEN
         mutation_status := 'rejected';
         mutation_error := 'INVALID_INPUT';
       ELSE
         PERFORM autoforge_record_consent(auth_user_id, payload->'cloudSyncConsent');
-        IF (payload->>'includeUnowned')::boolean THEN
+        IF payload->'includeUnowned' = 'true'::jsonb THEN
           PERFORM autoforge_record_consent(auth_user_id, payload->'unownedImportConsent');
         END IF;
         result_revision_value := 0;
@@ -607,6 +620,29 @@ BEGIN
       'revision', result_revision_value,
       'errorCode', mutation_error
     )));
+    EXCEPTION WHEN OTHERS THEN
+      IF receipt_ready THEN
+        BEGIN
+          PERFORM pg_advisory_xact_lock(
+            hashtextextended(auth_user_id::text || ':mutation:' || mutation_id, 0)
+          );
+          INSERT INTO app_sync_mutations(
+            owner_user_id, mutation_id, device_id, kind, entity_id, base_revision,
+            status, error_code, mutation_payload, request_hash
+          ) VALUES (
+            auth_user_id, mutation_id, p_device_id, mutation_kind, entity_id,
+            base_revision_value, 'rejected', 'INVALID_INPUT', mutation, request_hash_value
+          )
+          ON CONFLICT (owner_user_id, mutation_id) DO NOTHING
+          RETURNING cursor_token::text INTO latest_cursor;
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+      END IF;
+      results := results || jsonb_build_array(jsonb_build_object(
+        'id', result_id, 'status', 'rejected', 'errorCode', 'INVALID_INPUT'
+      ));
+    END;
   END LOOP;
 
   UPDATE app_sync_devices SET last_push_at = clock_timestamp()
@@ -733,7 +769,11 @@ BEGIN
     FROM app_conversations conversation
     WHERE conversation.owner_user_id = auth_user_id
       AND (p_include_deleted OR conversation.deleted_at IS NULL)
-      AND (p_cursor IS NULL OR (conversation.last_activity_at, conversation.id) < (anchor_activity, anchor_id))
+      AND (
+        p_cursor IS NULL
+        OR conversation.last_activity_at < anchor_activity
+        OR (conversation.last_activity_at = anchor_activity AND conversation.id > anchor_id)
+      )
     ORDER BY conversation.last_activity_at DESC, conversation.id
     LIMIT 51
   ), page AS (
@@ -754,7 +794,7 @@ BEGIN
       'deletedAt', CASE WHEN page.deleted_at IS NULL THEN NULL ELSE autoforge_iso_timestamp(page.deleted_at) END
     ) ORDER BY page.last_activity_at DESC, page.id), '[]'::jsonb),
     'nextCursor', CASE WHEN (SELECT count(*) FROM candidates) > 50
-      THEN (array_agg(page.cursor_token::text ORDER BY page.last_activity_at, page.id))[1]
+      THEN (array_agg(page.cursor_token::text ORDER BY page.last_activity_at, page.id DESC))[1]
       ELSE NULL END
   )) INTO result
   FROM page;
@@ -869,11 +909,14 @@ AS $$
 DECLARE
   auth_user_id bigint;
   item jsonb;
+  device_row app_sync_devices%ROWTYPE;
+  receipt app_sync_mutations%ROWTYPE;
   conversation_row app_conversations%ROWTYPE;
   imported_conversations integer := 0;
   imported_messages integer := 0;
   inserted_count integer;
   next_ordinal bigint;
+  legacy_request_hash text;
 BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
   PERFORM autoforge_require_identifier(p_device_id, 128);
@@ -892,27 +935,45 @@ BEGIN
     RAISE EXCEPTION USING MESSAGE = 'IMPORT_CONFIRMATION_REQUIRED', ERRCODE = 'P0001';
   END IF;
 
-  PERFORM pg_advisory_xact_lock(hashtextextended(auth_user_id::text || ':legacy:' || p_batch_id, 0));
-  IF EXISTS (
-    SELECT 1 FROM app_sync_mutations receipt
-    WHERE receipt.owner_user_id = auth_user_id
-      AND receipt.mutation_id = p_batch_id
-      AND receipt.kind = 'legacy.import'
-  ) THEN
-    RETURN jsonb_build_object('batchId', p_batch_id, 'status', 'duplicate');
+  SELECT * INTO device_row
+  FROM app_sync_devices device
+  WHERE device.owner_user_id = auth_user_id
+    AND device.device_id = p_device_id
+  FOR UPDATE;
+  IF FOUND AND device_row.revoked_at IS NOT NULL THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
   END IF;
-
   INSERT INTO app_sync_devices(owner_user_id, device_id, protocol_version)
   VALUES (auth_user_id, p_device_id, p_protocol_version)
   ON CONFLICT (owner_user_id, device_id) DO UPDATE SET
     protocol_version = EXCLUDED.protocol_version;
-  IF EXISTS (
-    SELECT 1 FROM app_sync_devices device
-    WHERE device.owner_user_id = auth_user_id
-      AND device.device_id = p_device_id
-      AND device.revoked_at IS NOT NULL
-  ) THEN
-    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+
+  legacy_request_hash := md5(jsonb_build_object(
+    'protocolVersion', p_protocol_version,
+    'deviceId', p_device_id,
+    'batchId', p_batch_id,
+    'includeUnowned', p_include_unowned,
+    'conversations', p_conversations,
+    'messages', p_messages,
+    'cloudSyncConsent', p_cloud_sync_consent,
+    'unownedImportConsent', p_unowned_import_consent
+  )::text);
+  PERFORM pg_advisory_xact_lock(hashtextextended(auth_user_id::text || ':legacy:' || p_batch_id, 0));
+  SELECT * INTO receipt
+  FROM app_sync_mutations stored_receipt
+  WHERE stored_receipt.owner_user_id = auth_user_id
+    AND stored_receipt.mutation_id = p_batch_id
+  FOR UPDATE;
+  IF FOUND THEN
+    IF receipt.kind = 'legacy.import'
+      AND receipt.request_hash = legacy_request_hash THEN
+      RETURN jsonb_build_object('batchId', p_batch_id, 'status', 'duplicate');
+    END IF;
+    RETURN jsonb_build_object(
+      'batchId', p_batch_id,
+      'status', 'rejected',
+      'errorCode', 'SYNC_CONFLICT'
+    );
   END IF;
 
   PERFORM autoforge_record_consent(auth_user_id, p_cloud_sync_consent);
@@ -923,7 +984,8 @@ BEGIN
   FOR item IN SELECT value FROM jsonb_array_elements(p_conversations)
   LOOP
     IF item ? 'ownerUserId' OR item ? 'owner_user_id'
-      OR COALESCE((item->>'sourceUnowned')::boolean, false) AND NOT p_include_unowned THEN
+      OR (item ? 'sourceUnowned' AND jsonb_typeof(item->'sourceUnowned') <> 'boolean')
+      OR (item->'sourceUnowned' = 'true'::jsonb AND NOT p_include_unowned) THEN
       RAISE EXCEPTION USING MESSAGE = 'IMPORT_CONFIRMATION_REQUIRED', ERRCODE = 'P0001';
     END IF;
     PERFORM autoforge_require_identifier(item->>'id', 128);
@@ -934,7 +996,7 @@ BEGIN
       item->>'id', auth_user_id, item->>'title', item->>'titleState', 1,
       (item->>'createdAt')::timestamptz, (item->>'lastActivityAt')::timestamptz,
       (item->>'metadataUpdatedAt')::timestamptz
-    ) ON CONFLICT (id) DO NOTHING;
+    ) ON CONFLICT (owner_user_id, id) DO NOTHING;
     GET DIAGNOSTICS inserted_count = ROW_COUNT;
     imported_conversations := imported_conversations + inserted_count;
   END LOOP;
@@ -942,7 +1004,8 @@ BEGIN
   FOR item IN SELECT value FROM jsonb_array_elements(p_messages)
   LOOP
     IF item ? 'ownerUserId' OR item ? 'owner_user_id'
-      OR COALESCE((item->>'sourceUnowned')::boolean, false) AND NOT p_include_unowned THEN
+      OR (item ? 'sourceUnowned' AND jsonb_typeof(item->'sourceUnowned') <> 'boolean')
+      OR (item->'sourceUnowned' = 'true'::jsonb AND NOT p_include_unowned) THEN
       RAISE EXCEPTION USING MESSAGE = 'IMPORT_CONFIRMATION_REQUIRED', ERRCODE = 'P0001';
     END IF;
     PERFORM autoforge_require_identifier(item->>'id', 128);
@@ -965,7 +1028,7 @@ BEGIN
       item->>'id', auth_user_id, item->>'conversationId', next_ordinal,
       item->>'role', item->'blocks', NULLIF(item->>'executionId', ''),
       (item->>'createdAt')::timestamptz
-    ) ON CONFLICT (id) DO NOTHING;
+    ) ON CONFLICT (owner_user_id, id) DO NOTHING;
     GET DIAGNOSTICS inserted_count = ROW_COUNT;
     imported_messages := imported_messages + inserted_count;
   END LOOP;
@@ -981,7 +1044,7 @@ BEGIN
         'batchId', p_batch_id, 'includeUnowned', p_include_unowned
       )
     ),
-    md5(p_batch_id || ':' || jsonb_array_length(p_conversations)::text || ':' || jsonb_array_length(p_messages)::text)
+    legacy_request_hash
   );
 
   RETURN jsonb_build_object(

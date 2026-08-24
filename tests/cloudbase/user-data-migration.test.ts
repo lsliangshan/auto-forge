@@ -37,6 +37,22 @@ const rpcNames = [
   'autoforge_update_user_data_preferences',
 ] as const
 
+function extractTable(sql: string, tableName: string): string {
+  const match = sql.match(new RegExp(
+    `CREATE TABLE IF NOT EXISTS ${tableName} \\([\\s\\S]*?\\n\\);`,
+  ))
+  expect(match, `missing table ${tableName}`).not.toBeNull()
+  return match![0]
+}
+
+function extractFunction(sql: string, functionName: string): string {
+  const match = sql.match(new RegExp(
+    `CREATE OR REPLACE FUNCTION ${functionName}\\([\\s\\S]*?\\n\\$\\$;`,
+  ))
+  expect(match, `missing function ${functionName}`).not.toBeNull()
+  return match![0]
+}
+
 describe('CloudBase user data migration', () => {
   it('keeps the canonical and deployable migrations byte-identical', async () => {
     const [canonical, featureCopy] = await Promise.all([
@@ -56,17 +72,43 @@ describe('CloudBase user data migration', () => {
     }
     expect(canonical).toContain('owner_user_id bigint NOT NULL REFERENCES auth.users(id)')
     expect(canonical).toContain('UNIQUE (owner_user_id, mutation_id)')
-    expect(canonical).toContain('UNIQUE (conversation_id, ordinal)')
     expect(canonical).toContain('revision bigint NOT NULL')
     expect(canonical).toContain('deleted_at timestamptz')
-    expect(canonical).toContain('CREATE UNIQUE INDEX app_active_run_per_conversation')
+    expect(canonical).toContain('CREATE UNIQUE INDEX IF NOT EXISTS app_active_run_per_conversation')
     expect(canonical).toContain("WHERE status IN ('queued', 'running', 'cancelling')")
-    expect(canonical).toContain('CREATE UNIQUE INDEX app_usage_operation_key')
+    expect(canonical).toContain('CREATE UNIQUE INDEX IF NOT EXISTS app_usage_operation_key')
     expect(canonical).toContain('ON app_usage_events(owner_user_id, operation_id, provider, purpose)')
+  })
+
+  it('scopes every client identity and conversation dependency to its owner', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const conversations = extractTable(canonical, 'app_conversations')
+    const messages = extractTable(canonical, 'app_messages')
+    const runs = extractTable(canonical, 'app_model_runs')
+    const usage = extractTable(canonical, 'app_usage_events')
+    const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
+
+    for (const table of [conversations, messages, runs, usage]) {
+      expect(table).toContain('PRIMARY KEY (owner_user_id, id)')
+      expect(table).not.toMatch(/\bid varchar\(128\) PRIMARY KEY/)
+    }
+    for (const table of [messages, runs, usage]) {
+      expect(table).toContain('FOREIGN KEY (owner_user_id, conversation_id)')
+      expect(table).toContain('REFERENCES app_conversations(owner_user_id, id)')
+    }
+    expect(canonical).toContain(
+      'ON app_messages(owner_user_id, conversation_id, ordinal)',
+    )
+    expect(canonical).toContain(
+      'ON app_model_runs(owner_user_id, conversation_id)',
+    )
+    expect(legacyImport).toContain('ON CONFLICT (owner_user_id, id) DO NOTHING')
+    expect(legacyImport).not.toContain('ON CONFLICT (id) DO NOTHING')
   })
 
   it('implements bounded owner-scoped transactional sync with opaque cursors', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
 
     expect(canonical).toContain('jsonb_array_length(p_mutations) > 100')
     expect(canonical).toContain('pg_column_size(p_mutations) > 1048576')
@@ -78,6 +120,53 @@ describe('CloudBase user data migration', () => {
     expect(canonical).toContain('cursor_token::text')
     expect(canonical).not.toMatch(/jsonb_extract_path_text\([^)]*,\s*'owner(?:UserId|_user_id)'/i)
     expect(canonical).not.toMatch(/(?:cursor|nextCursor|previousCursor)'\s*,\s*(?:mutation\.)?server_sequence/i)
+    expect(syncPush).toMatch(/LOOP\s+BEGIN\s/)
+    expect(syncPush).toContain('EXCEPTION WHEN OTHERS THEN')
+    expect(syncPush).toContain("'status', 'rejected'")
+    expect(syncPush).toContain("'errorCode', 'INVALID_INPUT'")
+    expect(syncPush).not.toMatch(/SQLERRM|SQLSTATE|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL/)
+  })
+
+  it('uses rerunnable named indexes and the correct conversation cursor tie break', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const messages = extractTable(canonical, 'app_messages')
+    const listConversations = extractFunction(canonical, 'autoforge_list_conversations')
+    const namedIndexes = canonical.match(/CREATE (?:UNIQUE )?INDEX[^;]+;/g) ?? []
+
+    expect(namedIndexes.length).toBeGreaterThan(0)
+    for (const index of namedIndexes) {
+      expect(index).toMatch(/^CREATE (?:UNIQUE )?INDEX IF NOT EXISTS /)
+    }
+    expect(messages).not.toContain('UNIQUE (conversation_id, ordinal)')
+    expect(listConversations).toContain('conversation.last_activity_at < anchor_activity')
+    expect(listConversations).toContain(
+      'conversation.last_activity_at = anchor_activity AND conversation.id > anchor_id',
+    )
+    expect(listConversations).not.toContain(
+      '(conversation.last_activity_at, conversation.id) < (anchor_activity, anchor_id)',
+    )
+    expect(listConversations).toContain(
+      '(array_agg(page.cursor_token::text ORDER BY page.last_activity_at, page.id DESC))[1]',
+    )
+  })
+
+  it('validates legacy devices before idempotency and hashes the complete batch', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
+    const deviceCheck = legacyImport.indexOf('device_row.revoked_at IS NOT NULL')
+    const duplicateCheck = legacyImport.indexOf("receipt.kind = 'legacy.import'")
+
+    expect(deviceCheck).toBeGreaterThan(-1)
+    expect(duplicateCheck).toBeGreaterThan(deviceCheck)
+    expect(legacyImport).toContain('legacy_request_hash := md5(jsonb_build_object(')
+    expect(legacyImport).toContain("'conversations', p_conversations")
+    expect(legacyImport).toContain("'messages', p_messages")
+    expect(legacyImport).toContain("'cloudSyncConsent', p_cloud_sync_consent")
+    expect(legacyImport).toContain("'unownedImportConsent', p_unowned_import_consent")
+    expect(legacyImport).toContain('receipt.request_hash = legacy_request_hash')
+    expect(legacyImport).not.toContain(
+      "md5(p_batch_id || ':' || jsonb_array_length(p_conversations)::text",
+    )
   })
 
   it('exposes only service-role RPC execution and no direct table access', async () => {
