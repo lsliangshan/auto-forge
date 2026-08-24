@@ -61,6 +61,68 @@ describe('CloudBaseUserDataPort', () => {
     })
   })
 
+  it('strictly forwards the existing legacy import, preference, and usage actions without an owner', async () => {
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        batchId: 'batch_1-0', status: 'applied', importedConversations: 1, importedMessages: 0,
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        timezone: 'Asia/Shanghai', displayCurrency: 'CNY', revision: 1,
+        updatedAt: '2026-08-25T00:00:00.000Z',
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
+        inputTokens: 10, outputTokens: 5, estimatedCostUsd: '0.01',
+        estimatedCount: 1, unavailableCount: 2,
+      } } })
+    const port = new CloudBaseUserDataPort({ callFunction })
+    const consent = {
+      purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    }
+
+    await expect(port.call({
+      action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'device-a', batchId: 'batch_1-0',
+      includeUnowned: false, conversations: [{
+        id: 'legacy_1', title: 'Legacy', titleState: 'user_named',
+        createdAt: '2026-08-01T00:00:00.000Z', lastActivityAt: '2026-08-01T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-01T00:00:00.000Z',
+      }], messages: [], cloudSyncConsent: consent,
+    })).resolves.toMatchObject({ ok: true, data: { status: 'applied' } })
+    await expect(port.call({ action: 'getUserDataPreferences' }))
+      .resolves.toMatchObject({ ok: true, data: { revision: 1 } })
+    await expect(port.call({
+      action: 'getUsageSnapshot', startedAt: '2026-08-01T00:00:00.000Z',
+      endedAt: '2026-08-25T00:00:00.000Z',
+    })).resolves.toMatchObject({ ok: true, data: { estimatedCount: 1 } })
+    expect(JSON.stringify(callFunction.mock.calls)).not.toContain('ownerUserId')
+    expect(JSON.stringify(callFunction.mock.calls)).not.toContain('userId')
+  })
+
+  it('rejects oversized or secret-bearing dedicated action payloads before transport', async () => {
+    const callFunction = vi.fn()
+    const port = new CloudBaseUserDataPort({ callFunction })
+    const base = {
+      action: 'importLegacyBatch' as const, protocolVersion: 1 as const, deviceId: 'device-a',
+      batchId: 'batch_1-0', includeUnowned: false, conversations: [], messages: [],
+      cloudSyncConsent: {
+        purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    await expect(port.call({ ...base, apiKey: 'secret' } as never))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(port.call({
+      ...base,
+      conversations: Array.from({ length: 101 }, (_, index) => ({
+        id: `legacy_${index}`, title: 'Legacy', titleState: 'user_named' as const,
+        createdAt: '2026-08-01T00:00:00.000Z', lastActivityAt: '2026-08-01T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-01T00:00:00.000Z',
+      })),
+    })).rejects.toMatchObject({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+    expect(callFunction).not.toHaveBeenCalled()
+  })
+
   it('maps an oversized mutation count to the Task 3 outbox limit', async () => {
     const callFunction = vi.fn()
     const port = new CloudBaseUserDataPort({ callFunction })

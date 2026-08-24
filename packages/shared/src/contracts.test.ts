@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   appErrorCodeSchema,
   accountDataPreferencesSchema,
+  accountDataPreferencesRecordSchema,
   appSettingsSchema,
   approvalDecisionSchema,
   authCredentialsSchema,
@@ -23,6 +24,7 @@ import {
   ipcResponseSchemas,
   ipcChannels,
   legacyImportConfirmRequestSchema,
+  legacyImportResultSchema,
   legacyImportPreviewSchema,
   listConversationsRequestSchema,
   listMessagesRequestSchema,
@@ -36,6 +38,7 @@ import {
   parseProxyBypassText,
   permissionGrantSchema,
   privacyConsentSchema,
+  remoteUsageSnapshotSchema,
   providerUsageModalitySchema,
   providerCredentialStatusSchema,
   proxySettingsSchema,
@@ -446,6 +449,32 @@ describe('cross-process contracts', () => {
     expect(byokUsageEventSchema.safeParse({ ...usage, displayCurrency: 'CNY' }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, apiKey: 'secret' }).success).toBe(false)
     expect(byokUsageEventSchema.safeParse({ ...usage, apiKeyFingerprint: 'fingerprint' }).success).toBe(false)
+  })
+
+  it('defines strict owner-free public legacy, preference, and remote usage responses', () => {
+    expect(legacyImportResultSchema.parse({
+      batchId: 'batch_1-0', status: 'applied', importedConversations: 2, importedMessages: 4,
+    })).toEqual({
+      batchId: 'batch_1-0', status: 'applied', importedConversations: 2, importedMessages: 4,
+    })
+    expect(accountDataPreferencesRecordSchema.parse({
+      timezone: 'Asia/Shanghai', displayCurrency: 'CNY', revision: 2,
+      updatedAt: '2026-08-25T00:00:00.000Z',
+    })).toMatchObject({ revision: 2 })
+    const usage = {
+      startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
+      inputTokens: 10, outputTokens: 5, totalTokens: 15,
+      confirmedPlatformCost: null, pendingCount: 1,
+      byokEstimatedCostUsd: '0.01', byokEstimatedCount: 2, byokUnavailableCount: 1,
+      timezone: 'Asia/Shanghai', displayCurrency: 'CNY',
+      lastSyncAt: '2026-08-25T00:00:00.000Z',
+    }
+    expect(remoteUsageSnapshotSchema.parse(usage)).toEqual(usage)
+    for (const unsafe of [
+      { ...usage, ownerUserId: 'alice' },
+      { ...usage, apiKey: 'secret' },
+      { ...usage, apiKeyFingerprint: 'fingerprint' },
+    ]) expect(remoteUsageSnapshotSchema.safeParse(unsafe).success).toBe(false)
   })
 
   it('exposes safe cloud-sync errors', () => {

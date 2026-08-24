@@ -144,6 +144,7 @@ export async function resolveBrowserPageEvidence(
   try {
     for await (const event of trackProviderStream({
       operationKey: `agent:${input.requestId}:browser-page-evidence:${input.evidenceRevision}`,
+      purpose: 'browser_page_evidence',
       attribution: {
         userId: input.userId,
         requestId: input.requestId,

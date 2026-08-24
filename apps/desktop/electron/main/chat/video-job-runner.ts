@@ -63,7 +63,8 @@ export interface VideoJobRunnerDependencies {
     AppRepositories,
     'conversations' | 'mediaGenerationJobs' | 'mediaAssets' | 'messages' | 'chatRuns'
   >
-  providerUsage: Pick<ProviderUsageRepository, 'find' | 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
+  providerUsage: Pick<ProviderUsageRepository,
+    'find' | 'start' | 'bindIdentity' | 'report' | 'markUnknown' | 'recordByokUsage'>
   providers: VideoJobProviderRegistryPort
   media: Pick<
     MediaAssetService,
@@ -885,15 +886,29 @@ export class VideoJobRunner {
     }
     if (result.costUsd === undefined) {
       this.dependencies.providerUsage.markUnknown(operationKey, this.now())
-      return
+    } else {
+      this.dependencies.providerUsage.report(operationKey, {
+        ...(result.generationId === undefined
+          ? {}
+          : { generationId: result.generationId }),
+        costUsd: result.costUsd,
+        endedAt: this.now(),
+      })
     }
-    this.dependencies.providerUsage.report(operationKey, {
-      ...(result.generationId === undefined
-        ? {}
-        : { generationId: result.generationId }),
-      costUsd: result.costUsd,
-      endedAt: this.now(),
-    })
+    const common = {
+      id: usage.event.id,
+      operationId: operationKey,
+      purpose: 'media_generation',
+      credentialOwner: 'user' as const,
+      billable: false as const,
+      provider: usage.event.provider,
+      model: usage.event.model,
+      modality: 'video' as const,
+      occurredAt: new Date(usage.event.startedAt).toISOString(),
+    }
+    this.dependencies.providerUsage.recordByokUsage?.(result.costUsd === undefined
+      ? { ...common, costStatus: 'unavailable' }
+      : { ...common, costStatus: 'estimated', estimatedCostUsd: result.costUsd })
   }
 
   private async download(

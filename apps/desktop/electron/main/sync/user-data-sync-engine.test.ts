@@ -174,6 +174,49 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
+  it('serializes dedicated legacy imports on the active UID and supplies only its device binding', async () => {
+    const manager = createManager()
+    let releaseFirst!: () => void
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const calls: CloudBaseUserDataCall[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      calls.push(input)
+      if (input.action === 'importLegacyBatch') {
+        if (input.batchId === 'batch_1-0') await first
+        return { ok: true, data: {
+          batchId: input.batchId, status: 'applied',
+          importedConversations: input.conversations.length,
+          importedMessages: input.messages.length,
+        } }
+      }
+      return success({ mutations: [], cursor: null })
+    })
+    await engine.start('alice', 'device-a')
+    const request = {
+      includeUnowned: false,
+      cloudSyncConsent: {
+        purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+      conversations: [], messages: [],
+    }
+
+    const importingFirst = engine.importLegacyBatch({ ...request, batchId: 'batch_1-0' })
+    const importingSecond = engine.importLegacyBatch({ ...request, batchId: 'batch_1-1' })
+    await vi.waitFor(() => expect(calls).toHaveLength(1))
+    expect(calls[0]).toMatchObject({
+      action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'device-a', batchId: 'batch_1-0',
+    })
+    expect(JSON.stringify(calls[0])).not.toContain('alice')
+    releaseFirst()
+
+    await expect(Promise.all([importingFirst, importingSecond])).resolves.toEqual([
+      expect.objectContaining({ batchId: 'batch_1-0', status: 'applied' }),
+      expect.objectContaining({ batchId: 'batch_1-1', status: 'applied' }),
+    ])
+    expect(calls.map((call) => call.action)).toEqual(['importLegacyBatch', 'importLegacyBatch'])
+  })
+
   it('notifies exact conversation projections through failure, retry, and success', async () => {
     const manager = createManager()
     const store = manager.open('alice')
@@ -361,6 +404,7 @@ describe('UserDataSyncEngine', () => {
           cursor: 'cursor_byte_pull',
         })
       }
+      if (input.action !== 'syncPush') throw new Error('Unexpected sync action')
       eventBytes.push(Buffer.byteLength(JSON.stringify(input), 'utf8'))
       batchIds.push(input.mutations.map(({ id }) => id))
       pushed.push(...input.mutations)
@@ -390,6 +434,7 @@ describe('UserDataSyncEngine', () => {
       if (input.action === 'syncPull') {
         return success({ mutations: [pulled(later)], cursor: 'cursor_after_oversize_pull' })
       }
+      if (input.action !== 'syncPush') throw new Error('Unexpected sync action')
       expect(Buffer.byteLength(JSON.stringify(input), 'utf8')).toBeLessThanOrEqual(MAX_EVENT_BYTES)
       pushedIds.push(...input.mutations.map(({ id }) => id))
       return success({

@@ -19,6 +19,19 @@
       </el-button>
     </header>
     <div class="billing-body">
+      <dl
+        v-if="remoteUsage"
+        class="remote-usage-summary"
+        data-testid="remote-usage-summary"
+      >
+        <div><dt>平台已确认消费</dt><dd>{{ remoteUsage.confirmedPlatformCost ? `${remoteUsage.confirmedPlatformCost.amount} ${remoteUsage.confirmedPlatformCost.currency}` : '—' }}</dd></div>
+        <div><dt>待同步 {{ formatTokens(remoteUsage.pendingCount) }} 笔</dt></div>
+        <div><dt>BYOK 估算</dt><dd>{{ formatUsd(remoteUsage.byokEstimatedCostUsd) }} · {{ formatTokens(remoteUsage.byokEstimatedCount) }} 笔</dd></div>
+        <div><dt>BYOK 费用不可用</dt><dd>{{ formatTokens(remoteUsage.byokUnavailableCount) }} 笔</dd></div>
+        <div><dt>云端 Token</dt><dd>{{ formatTokens(remoteUsage.totalTokens) }}</dd></div>
+        <div><dt>时区与显示币种</dt><dd>{{ remoteUsage.timezone }} · {{ remoteUsage.displayCurrency }}</dd></div>
+        <div><dt>上次同步</dt><dd>{{ remoteUsage.lastSyncAt ? rangeFormatter.format(new Date(remoteUsage.lastSyncAt)) : '—' }}</dd></div>
+      </dl>
       <p
         v-if="error"
         class="billing-error"
@@ -214,7 +227,7 @@
 
 <script setup lang="ts">
 import { QuestionFilled, Refresh } from '@element-plus/icons-vue'
-import type { TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '@autoforge/shared'
+import type { RemoteUsageSnapshot, TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '@autoforge/shared'
 import { computed, ref } from 'vue'
 import TokenUsageBarChart from './TokenUsageBarChart.vue'
 import TokenUsageLineChart from './TokenUsageLineChart.vue'
@@ -222,6 +235,7 @@ import { tokenColors } from './token-usage-chart-options'
 
 const props = defineProps<{
   usage?: TokenUsageSnapshot
+  remoteUsage?: RemoteUsageSnapshot
   loading: boolean
   error: string
 }>()
@@ -343,6 +357,29 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   margin: 0 0 16px;
 }
 
+.remote-usage-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 16px;
+}
+
+.remote-usage-summary div {
+  padding: 10px;
+  border: 1px solid var(--af-border);
+  border-radius: 10px;
+}
+
+.remote-usage-summary dt {
+  color: var(--af-text-muted);
+  font-size: 12px;
+}
+
+.remote-usage-summary dd {
+  margin: 4px 0 0;
+  font-weight: 600;
+}
+
 .billing-summary div {
   padding: 14px;
   border: 1px solid var(--af-border);
@@ -437,6 +474,10 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   }
 
   .billing-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-usage-summary {
     grid-template-columns: 1fr;
   }
 

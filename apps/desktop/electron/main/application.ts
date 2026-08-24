@@ -2,12 +2,20 @@ import { randomUUID } from 'node:crypto'
 import { copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
+  accountDataPreferencesDefaults,
+  accountDataPreferencesRecordSchema,
+  accountDataPreferencesSchema,
+  byokUsageEventSchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  legacyImportConfirmRequestSchema,
   openExternalRequestSchema,
+  privacyConsentSchema,
+  remoteUsageSnapshotSchema,
   toSafeAppError,
   type AppError,
   type AppSettings,
+  type AccountDataPreferences,
   type AuthorizationSnapshot,
   type AuthSession,
   type ChatBlock,
@@ -64,6 +72,7 @@ import { openAppDatabase } from './database/client.js'
 import { UserDataStoreManager, type UserDataStore } from './database/user-data-client.js'
 import { CloudBaseUserDataPort } from './cloud/cloudbase-user-data-port.js'
 import { UserDataSyncEngine } from './sync/user-data-sync-engine.js'
+import { LegacyUserDataImporter } from './sync/legacy-user-data-import.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
@@ -137,6 +146,8 @@ type ApplicationFailureSource =
   | 'sync-pause'
   | 'user-cache-close'
   | 'database-close'
+
+const CLOUD_SYNC_DOCUMENT_VERSION = 'cloud-sync-2026-08'
 
 interface ApplicationFailureRecord {
   error: unknown
@@ -670,6 +681,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores, {
     onConversationChanged: (conversationIds) => { notifyConversationChanges(conversationIds) },
   })
+  const legacyUserDataImporter = new LegacyUserDataImporter(database, userDataSync)
   const storedDeviceId = database.appSettings.get('user-data.device-id.v1')?.value
   const deviceId = typeof storedDeviceId === 'string'
     && storedDeviceId.length > 0
@@ -832,6 +844,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
     },
   }) as AppRepositories['chatRuns']
+  const cachedProviderUsage = userRepository('providerUsage')
+  const providerUsage = new Proxy(cachedProviderUsage, {
+    get(target, property, receiver) {
+      if (property === 'recordByokUsage') {
+        return (input: unknown) => {
+          const event = byokUsageEventSchema.parse(input)
+          const store = currentUserData()
+          store.outbox.record({
+            id: event.id,
+            kind: 'usage.record',
+            entityId: event.id,
+            baseRevision: 0,
+            occurredAt: event.occurredAt,
+            payload: event,
+          })
+          queueUserDataFlush()
+        }
+      }
+      return Reflect.get(target, property, receiver)
+    },
+  }) as AppRepositories['providerUsage']
   const chatDatabase: AppRepositories = {
     ...database,
     conversations: chatConversations,
@@ -840,7 +873,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     mediaAssets: userRepository('mediaAssets'),
     mediaGenerationJobs: userRepository('mediaGenerationJobs'),
     chatRuns,
-    providerUsage: userRepository('providerUsage'),
+    providerUsage,
   }
   const providerUsageReconciler = new ProviderUsageReconciler({
     providerUsage: chatDatabase.providerUsage,
@@ -1475,6 +1508,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       createConversation: async () => {
         await requireAuthenticatedSession()
         const store = currentUserData()
+        if (store.account.getConsent('cloud_sync')?.documentVersion
+          !== CLOUD_SYNC_DOCUMENT_VERSION) {
+          throw failure('IMPORT_CONFIRMATION_REQUIRED')
+        }
         const id = randomUUID()
         const occurredAt = new Date().toISOString()
         store.outbox.recordWithConversation({
@@ -2033,6 +2070,132 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           (query) => chatDatabase.chatRuns.summarizeTokenUsage(query),
           (query) => chatDatabase.providerUsage.summarize(query),
         )
+      },
+      recordPrivacyConsent: async (input) => {
+        await requireAuthenticatedSession()
+        const consent = privacyConsentSchema.safeParse(input)
+        if (!consent.success
+          || consent.data.purpose !== 'cloud_sync'
+          || consent.data.documentVersion !== CLOUD_SYNC_DOCUMENT_VERSION) {
+          throw failure('INVALID_INPUT')
+        }
+        const store = currentUserData()
+        if (JSON.stringify(store.account.getConsent('cloud_sync')) === JSON.stringify(consent.data)) return
+        store.outbox.recordWithConsent({
+          id: randomUUID(), kind: 'privacy.consent', entityId: consent.data.documentVersion,
+          baseRevision: 0, occurredAt: consent.data.consentedAt, payload: consent.data,
+        })
+        queueUserDataFlush()
+      },
+      previewLegacyImport: async () => {
+        const session = await requireAuthenticatedSession()
+        return legacyUserDataImporter.preview(session.user.id)
+      },
+      importLegacyData: async (input) => {
+        const session = await requireAuthenticatedSession()
+        const confirmation = legacyImportConfirmRequestSchema.safeParse(input)
+        const store = currentUserData()
+        const storedCloudConsent = store.account.getConsent('cloud_sync')
+        if (!confirmation.success
+          || confirmation.data.cloudSyncConsent.documentVersion !== CLOUD_SYNC_DOCUMENT_VERSION
+          || JSON.stringify(storedCloudConsent) !== JSON.stringify(confirmation.data.cloudSyncConsent)) {
+          throw failure('IMPORT_CONFIRMATION_REQUIRED')
+        }
+        if (confirmation.data.includeUnowned) {
+          const consent = confirmation.data.unownedImportConsent
+          if (!consent) throw failure('IMPORT_CONFIRMATION_REQUIRED')
+          if (JSON.stringify(store.account.getConsent('legacy_unowned_import'))
+            !== JSON.stringify(consent)) {
+            store.outbox.recordWithConsent({
+              id: randomUUID(), kind: 'privacy.consent', entityId: consent.documentVersion,
+              baseRevision: 0, occurredAt: consent.consentedAt, payload: consent,
+            })
+            await userDataSync.flush()
+          }
+        }
+        return legacyUserDataImporter.import(session.user.id, confirmation.data)
+      },
+      getAccountDataPreferences: async (): Promise<AccountDataPreferences> => {
+        await requireAuthenticatedSession()
+        const store = currentUserData()
+        let preferences = store.account.getPreferences()
+        if (!preferences) {
+          const response = await userDataSyncPort.call({ action: 'getUserDataPreferences' })
+          if (!response.ok) throw failure(response.error.code)
+          const parsed = accountDataPreferencesRecordSchema.safeParse(response.data)
+          if (!parsed.success) throw failure('INTERNAL_ERROR')
+          store.account.projectPreferences(parsed.data)
+          preferences = parsed.data
+        }
+        return accountDataPreferencesSchema.parse({
+          timezone: preferences.timezone,
+          displayCurrency: preferences.displayCurrency,
+        })
+      },
+      updateAccountDataPreferences: async (input) => {
+        await requireAuthenticatedSession()
+        const preferences = accountDataPreferencesSchema.safeParse(input)
+        if (!preferences.success) throw failure('INVALID_INPUT')
+        try {
+          new Intl.DateTimeFormat('en-US', { timeZone: preferences.data.timezone }).format()
+        } catch {
+          throw failure('INVALID_INPUT')
+        }
+        const store = currentUserData()
+        const current = store.account.getPreferences()
+        const occurredAt = new Date().toISOString()
+        store.outbox.recordWithPreferences({
+          id: randomUUID(), kind: 'preferences.update', entityId: 'account-preferences',
+          baseRevision: current?.revision ?? 0, occurredAt, payload: preferences.data,
+        })
+        queueUserDataFlush()
+        return preferences.data
+      },
+      getRemoteUsage: async () => {
+        await requireAuthenticatedSession()
+        const store = currentUserData()
+        let storedPreferences = store.account.getPreferences()
+        if (!storedPreferences) {
+          const preferencesResponse = await userDataSyncPort.call({
+            action: 'getUserDataPreferences',
+          })
+          if (!preferencesResponse.ok) throw failure(preferencesResponse.error.code)
+          const parsed = accountDataPreferencesRecordSchema.safeParse(preferencesResponse.data)
+          if (!parsed.success) throw failure('INTERNAL_ERROR')
+          store.account.projectPreferences(parsed.data)
+          storedPreferences = parsed.data
+        }
+        const preferences = storedPreferences
+          ? accountDataPreferencesSchema.parse({
+              timezone: storedPreferences.timezone,
+              displayCurrency: storedPreferences.displayCurrency,
+            })
+          : accountDataPreferencesSchema.parse(accountDataPreferencesDefaults)
+        const endedAt = new Date()
+        const startedAt = new Date(Date.UTC(endedAt.getUTCFullYear(), endedAt.getUTCMonth(), 1))
+        const response = await userDataSyncPort.call({
+          action: 'getUsageSnapshot',
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+        })
+        if (!response.ok) throw failure(response.error.code)
+        if (!('estimatedCostUsd' in response.data)) throw failure('INTERNAL_ERROR')
+        const checkpoint = store.sync.getCheckpoint()
+        return remoteUsageSnapshotSchema.parse({
+          startedAt: response.data.startedAt,
+          endedAt: response.data.endedAt,
+          inputTokens: response.data.inputTokens,
+          outputTokens: response.data.outputTokens,
+          totalTokens: response.data.inputTokens + response.data.outputTokens,
+          confirmedPlatformCost: null,
+          pendingCount: store.outbox.countPending('usage.record'),
+          byokEstimatedCostUsd: response.data.estimatedCostUsd,
+          byokEstimatedCount: response.data.estimatedCount,
+          byokUnavailableCount: response.data.unavailableCount,
+          timezone: preferences.timezone,
+          displayCurrency: preferences.displayCurrency,
+          ...(checkpoint ? { lastSyncAt: new Date(checkpoint.updatedAt).toISOString() } : {}),
+        })
       },
       clearLocalData: async (scope) => {
         await maintenance.runExclusive(

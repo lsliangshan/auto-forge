@@ -11,6 +11,10 @@ import type {
   SyncPushData,
   UserDataFunctionResponse,
 } from '../cloud/cloudbase-user-data-port.js'
+import type {
+  LegacyImportBatchRequest,
+  LegacyImportBatchResult,
+} from './legacy-user-data-import.js'
 
 const PROTOCOL_VERSION = 1 as const
 const BATCH_LIMIT = 100
@@ -141,6 +145,29 @@ export class UserDataSyncEngine {
     }
     this.#pullRequested = true
     return this.#ensureDrain(binding)
+  }
+
+  async importLegacyBatch(input: LegacyImportBatchRequest): Promise<LegacyImportBatchResult> {
+    let result: LegacyImportBatchResult | undefined
+    await this.#queueLifecycle(async () => {
+      const binding = this.#binding
+      if (!binding) throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+      await this.#drainPromise
+      if (!this.#isCurrent(binding)) throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+      const response = await this.port.call({
+        action: 'importLegacyBatch',
+        protocolVersion: PROTOCOL_VERSION,
+        deviceId: binding.deviceId,
+        ...input,
+      })
+      if (!response.ok) throw toSafeAppError({ code: response.error.code })
+      if (!('batchId' in response.data) || !('status' in response.data)) {
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }
+      result = response.data
+    })
+    if (!result) throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+    return result
   }
 
   retry(entityId?: string): Promise<void> {

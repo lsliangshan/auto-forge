@@ -118,6 +118,32 @@ describe('preload desktop bridge', () => {
     expect(app.api).not.toHaveProperty('invoke')
   })
 
+  it('maps owner-free cloud consent, legacy import, preferences, and remote usage methods', async () => {
+    const app = harness()
+    const cloudSyncConsent = {
+      purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    }
+    const importRequest = { batchId: 'batch_1', includeUnowned: false, cloudSyncConsent }
+
+    await app.api.settings.recordPrivacyConsent(cloudSyncConsent)
+    await app.api.settings.previewLegacyImport()
+    await app.api.settings.importLegacyData(importRequest)
+    await app.api.settings.getAccountDataPreferences()
+    await app.api.settings.updateAccountDataPreferences({ timezone: 'UTC', displayCurrency: 'USD' })
+    await app.api.settings.getRemoteUsage()
+
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+      [ipcChannels.settingsRecordPrivacyConsent, cloudSyncConsent],
+      [ipcChannels.settingsPreviewLegacyImport, undefined],
+      [ipcChannels.settingsImportLegacyData, importRequest],
+      [ipcChannels.settingsGetAccountDataPreferences, undefined],
+      [ipcChannels.settingsUpdateAccountDataPreferences, { timezone: 'UTC', displayCurrency: 'USD' }],
+      [ipcChannels.settingsGetRemoteUsage, undefined],
+    ])
+    expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toMatch(/owner|userId|uid/i)
+  })
+
   it('removes an exact workflow version through its fixed channel', async () => {
     const app = harness()
     await app.api.workflows.remove('browser.search.baidu', '1.0.0')

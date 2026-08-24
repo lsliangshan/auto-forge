@@ -7,6 +7,7 @@ import Database from 'better-sqlite3'
 import userCacheMigration from '../../../resources/user-cache-migrations/0001_user_cache.sql?raw'
 import outboxEnqueueSequenceMigration from '../../../resources/user-cache-migrations/0002_outbox_enqueue_sequence.sql?raw'
 import syncReceiptEvidenceMigration from '../../../resources/user-cache-migrations/0003_sync_receipt_evidence.sql?raw'
+import accountSyncProjectionMigration from '../../../resources/user-cache-migrations/0004_account_sync_projection.sql?raw'
 import {
   createUserDataRepositories,
   type UserDataRepositories,
@@ -18,6 +19,7 @@ const USER_CACHE_MIGRATIONS = [
   { version: 1, source: userCacheMigration },
   { version: 2, source: outboxEnqueueSequenceMigration },
   { version: 3, source: syncReceiptEvidenceMigration },
+  { version: 4, source: accountSyncProjectionMigration },
 ] as const
 
 export type UserDataStore = UserDataRepositories

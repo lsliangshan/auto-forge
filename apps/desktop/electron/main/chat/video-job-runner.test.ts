@@ -535,6 +535,8 @@ describe('VideoJobRunner', () => {
     const harness = createHarness()
     const bindIdentity = vi.spyOn(harness.dependencies.providerUsage, 'bindIdentity')
     const report = vi.spyOn(harness.dependencies.providerUsage, 'report')
+    const recordByokUsage = vi.fn()
+    harness.dependencies.providerUsage.recordByokUsage = recordByokUsage
     vi.mocked(harness.provider.pollVideo!).mockResolvedValue({
       status: 'completed',
       generationId: 'generation_paid',
@@ -556,6 +558,13 @@ describe('VideoJobRunner', () => {
       costUsd: '0.42',
       endedAt: 3_000,
     })
+    expect(recordByokUsage).toHaveBeenCalledWith({
+      id: 'unexpected_id', operationId: 'video:request_video_1', purpose: 'media_generation',
+      credentialOwner: 'user', billable: false, provider: 'openrouter', model: 'video-model',
+      modality: 'video', costStatus: 'estimated', estimatedCostUsd: '0.42',
+      occurredAt: '1970-01-01T00:00:01.000Z',
+    })
+    expect(JSON.stringify(recordByokUsage.mock.calls)).not.toMatch(/apiKey|fingerprint/i)
     expect(bindIdentity.mock.invocationCallOrder.at(-1)).toBeLessThan(
       report.mock.invocationCallOrder[0]!,
     )

@@ -409,6 +409,7 @@ function chatInput(conversationId: string, content: string): ChatSendInput {
 async function authenticate(
   runtime: ReturnType<typeof createApplicationRuntime>,
   account = 'TestUser',
+  consent = true,
 ) {
   const challenge = await runtime.services.auth.sendOtp({
     intent: 'register',
@@ -417,10 +418,17 @@ async function authenticate(
     account,
     password: 'password',
   })
-  return runtime.services.auth.verifyOtp({
+  const session = await runtime.services.auth.verifyOtp({
     challengeId: challenge.challengeId,
     code: '123456',
   })
+  if (consent) {
+    await runtime.services.settings.recordPrivacyConsent({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    })
+  }
+  return session
 }
 
 async function listConversations(runtime: ReturnType<typeof createApplicationRuntime>) {
@@ -783,6 +791,33 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('requires persisted cloud-sync consent before the first conversation without mutating cache or outbox', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cloud-consent-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    const session = await authenticate(runtime, 'ConsentAlice', false)
+
+    await expect(runtime.services.chat.createConversation())
+      .rejects.toMatchObject({ code: 'IMPORT_CONFIRMATION_REQUIRED' })
+    expect(withUserData(root, session.user.id, (store) => ({
+      conversations: store.conversations.list(), pending: store.outbox.countPending(),
+    }))).toEqual({ conversations: [], pending: 0 })
+    await expect(runtime.services.settings.updateAccountDataPreferences({
+      timezone: 'Not/A_Timezone', displayCurrency: 'CNY',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(withUserData(root, session.user.id, (store) => store.outbox.countPending())).toBe(0)
+
+    await runtime.services.settings.recordPrivacyConsent({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    })
+    await expect(runtime.services.chat.createConversation())
+      .resolves.toMatchObject({ title: '新会话', syncState: 'pending' })
+    expect(withUserData(root, session.user.id, (store) => store.account.getConsent('cloud_sync')))
+      .toMatchObject({ documentVersion: 'cloud-sync-2026-08' })
+    await runtime.close()
+  })
+
   it('rejects selector-less resolution instead of using an id and version fallback', async () => {
     const vault = createWorkflowSourceSelectorVault()
     const installed = {
@@ -6817,6 +6852,15 @@ describe('createApplicationRuntime', () => {
         call: vi.fn(async (input) => {
           if (input.action === 'syncPush') {
             const mutation = input.mutations[0]!
+            if (mutation.kind === 'privacy.consent') {
+              return {
+                ok: true as const,
+                data: {
+                  results: [{ id: mutation.id, status: 'duplicate' as const, revision: 0 }],
+                  cursor: 'cursor_sync_event_consent',
+                },
+              }
+            }
             if (rejectPush) {
               return {
                 ok: true as const,
@@ -6891,8 +6935,10 @@ describe('createApplicationRuntime', () => {
             return {
               ok: true as const,
               data: {
-                results: input.mutations.map(({ id }) => ({
-                  id, status: 'applied' as const, revision: 1,
+                results: input.mutations.map(({ id, kind }) => ({
+                  id,
+                  status: kind === 'privacy.consent' ? 'duplicate' as const : 'applied' as const,
+                  revision: kind === 'privacy.consent' ? 0 : 1,
                 })),
                 cursor: 'cursor_remove_push',
               },
@@ -6961,10 +7007,13 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-cache-message-'))
     directories.push(root)
     const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const userDataSyncCall = vi.fn(async () => {
+      throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
+    })
     const runtime = createApplicationRuntime(options(root, {
       userDataStores,
       userDataSyncPort: {
-        call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
+        call: userDataSyncCall,
       },
       modelProviders: snapshotProviders({ deepseek: {
         listModels: async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')],
@@ -6976,6 +7025,8 @@ describe('createApplicationRuntime', () => {
       } }),
     }))
     await authenticate(runtime, 'CacheMessage')
+    await vi.waitFor(() => expect(userDataSyncCall).toHaveBeenCalled())
+    await new Promise<void>((resolve) => setImmediate(resolve))
     const first = await runtime.services.chat.createConversation()
     const second = await runtime.services.chat.createConversation()
 
@@ -6990,19 +7041,14 @@ describe('createApplicationRuntime', () => {
       .find((mutation) => mutation.entityId === second.id)
     expect(failedMutation).toBeDefined()
     userDataStores.current()?.outbox.markFailed(failedMutation!.id, 'SYNC_CONFLICT')
-    expect(await runtime.services.chat.listConversations({ limit: 50 })).toMatchObject({
-      items: [
-        expect.objectContaining({ id: first.id }),
-        expect.objectContaining({ id: second.id, syncState: 'failed' }),
-      ],
+    expect(userDataStores.current()?.outbox.find(failedMutation!.id)).toMatchObject({
+      state: 'failed', lastErrorCode: 'SYNC_CONFLICT',
     })
-
+    expect(userDataStores.current()?.conversations.getSummary(second.id))
+      .toMatchObject({ syncState: 'failed' })
     await runtime.services.chat.retrySync(second.id)
-    expect(await runtime.services.chat.listConversations({ limit: 50 })).toMatchObject({
-      items: expect.arrayContaining([
-        expect.objectContaining({ id: second.id, syncState: 'pending' }),
-      ]),
-    })
+    expect(userDataStores.current()?.conversations.getSummary(second.id))
+      .toMatchObject({ syncState: 'pending' })
     await runtime.close()
   })
 })

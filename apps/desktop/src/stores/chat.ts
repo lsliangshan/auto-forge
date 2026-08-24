@@ -11,6 +11,7 @@ import type {
   MediaAsset,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
+import { ElMessageBox } from 'element-plus'
 
 export type UiChatBlock = ChatBlock & { id: string }
 export interface UiChatMessage { id: string; role: 'user' | 'assistant'; blocks: UiChatBlock[] }
@@ -413,7 +414,30 @@ export const useChatStore = defineStore('chat', {
     async createConversation() {
       this.error = ''
       try {
-        const conversation = await getDesktopApi().chat.createConversation()
+        const api = getDesktopApi()
+        let conversation: ConversationSummary
+        try {
+          conversation = await api.chat.createConversation()
+        } catch (error) {
+          if (typeof error !== 'object' || error === null
+            || !('code' in error) || error.code !== 'IMPORT_CONFIRMATION_REQUIRED') throw error
+          try {
+            await ElMessageBox.confirm(
+              '开启云同步后，新会话会保存到当前 AutoForge 账户。',
+              '开启账户云同步',
+              { type: 'warning', confirmButtonText: '同意并创建', cancelButtonText: '取消' },
+            )
+          } catch (confirmationError) {
+            if (confirmationError === 'cancel' || confirmationError === 'close') return
+            throw confirmationError
+          }
+          const appInfo = await api.system.getAppInfo()
+          await api.settings.recordPrivacyConsent({
+            purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+            consentedAt: new Date().toISOString(), clientVersion: appInfo.version,
+          })
+          conversation = await api.chat.createConversation()
+        }
         this._loadVersion += 1
         this.loading = false
         this.conversations = mergeConversationPages(this.conversations, [conversation])

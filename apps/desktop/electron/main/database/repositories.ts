@@ -11,6 +11,7 @@ import {
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
   type AppErrorCode,
+  type ByokUsageEvent,
   type ChatBlock,
   type ConversationGenerationPreferences,
   type MediaKind,
@@ -197,6 +198,7 @@ export interface ProviderUsageRepository {
   listReconcilable(now: number): ProviderUsageEvent[]
   recordReconcileFailure(operationKey: string, nextReconcileAt?: number): ProviderUsageEvent
   summarize(input: ProviderUsageQueryRecord): ProviderCostSnapshotRecord
+  recordByokUsage?(event: ByokUsageEvent): void
 }
 
 export interface ModelTokenUsageRecord {

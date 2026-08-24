@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import {
+  accountDataPreferencesRecordSchema,
   appErrorCodeSchema,
   chatBlockSchema,
   chatMessageSchema,
@@ -14,12 +15,17 @@ import {
   syncStateSchema,
   syncMutationResultSchema,
   syncMutationSchema,
+  privacyConsentSchema,
   type ConversationPage,
   type AppErrorCode,
   type MessagePage,
   type PulledMutation,
   type SyncMutation,
+  type SyncMutationKind,
   type SyncMutationResult,
+  type AccountDataPreferencesRecord,
+  type PrivacyConsent,
+  type PrivacyConsentPurpose,
 } from '@autoforge/shared'
 import {
   createRepositories,
@@ -109,6 +115,11 @@ export interface UserDataRepositories {
   mediaGenerationJobs: AppRepositories['mediaGenerationJobs']
   chatRuns: AppRepositories['chatRuns']
   providerUsage: AppRepositories['providerUsage']
+  account: {
+    getConsent(purpose: PrivacyConsentPurpose): PrivacyConsent | undefined
+    getPreferences(): AccountDataPreferencesRecord | undefined
+    projectPreferences(preferences: AccountDataPreferencesRecord): void
+  }
   sync: {
     getCheckpoint(): SyncCheckpoint | undefined
     updateCheckpoint(checkpoint: SyncCheckpoint): void
@@ -118,10 +129,12 @@ export interface UserDataRepositories {
     record(mutation: SyncMutation): void
     recordWithConversation(mutation: SyncMutation): void
     recordWithMessage(mutation: SyncMutation, assetIds?: readonly string[]): void
+    recordWithConsent(mutation: Extract<SyncMutation, { kind: 'privacy.consent' }>): void
+    recordWithPreferences(mutation: Extract<SyncMutation, { kind: 'preferences.update' }>): void
     listReady(now: number, limit: number): OutboxMutationRecord[]
     find(id: string): OutboxMutationRecord | undefined
     list(limit: number): OutboxMutationRecord[]
-    countPending(): number
+    countPending(kind?: SyncMutationKind): number
     markSyncing(ids: readonly string[]): void
     markPending(id: string, nextAttemptAt?: number): void
     markFailed(id: string, errorCode: AppErrorCode, nextAttemptAt?: number): void
@@ -190,6 +203,62 @@ function timestamp(value: string): number {
 
 function isoTimestamp(value: number): string {
   return new Date(value).toISOString()
+}
+
+function storedConsent(
+  database: SqliteDatabase,
+  purpose: PrivacyConsentPurpose,
+): PrivacyConsent | undefined {
+  const row = database.prepare(`
+    SELECT purpose, document_version AS documentVersion,
+           consented_at AS consentedAt, client_version AS clientVersion
+    FROM privacy_consents WHERE purpose = @purpose
+  `).get({ purpose }) as Query | undefined
+  return row === undefined ? undefined : parsePersisted(() => privacyConsentSchema.parse({
+    ...row, consentedAt: isoTimestamp(z.number().int().nonnegative().parse(row.consentedAt)),
+  }))
+}
+
+function projectConsent(database: SqliteDatabase, consent: PrivacyConsent): void {
+  const value = privacyConsentSchema.parse(consent)
+  database.prepare(`
+    INSERT INTO privacy_consents(purpose, document_version, consented_at, client_version)
+    VALUES (@purpose, @documentVersion, @consentedAt, @clientVersion)
+    ON CONFLICT(purpose) DO UPDATE SET
+      document_version = excluded.document_version,
+      consented_at = excluded.consented_at,
+      client_version = excluded.client_version
+  `).run({ ...value, consentedAt: timestamp(value.consentedAt) })
+}
+
+function storedPreferences(database: SqliteDatabase): AccountDataPreferencesRecord | undefined {
+  const row = database.prepare(`
+    SELECT timezone, display_currency AS displayCurrency, revision, updated_at AS updatedAt
+    FROM account_data_preferences WHERE id = 1
+  `).get() as Query | undefined
+  return row === undefined ? undefined : parsePersisted(() => accountDataPreferencesRecordSchema.parse({
+    ...row, updatedAt: isoTimestamp(z.number().int().nonnegative().parse(row.updatedAt)),
+  }))
+}
+
+function projectPreferences(
+  database: SqliteDatabase,
+  preferences: Extract<SyncMutation, { kind: 'preferences.update' }>['payload'],
+  revision: number,
+  updatedAt: string,
+): void {
+  const value = accountDataPreferencesRecordSchema.parse({
+    ...preferences, revision, updatedAt,
+  })
+  database.prepare(`
+    INSERT INTO account_data_preferences(id, timezone, display_currency, revision, updated_at)
+    VALUES (1, @timezone, @displayCurrency, @revision, @updatedAt)
+    ON CONFLICT(id) DO UPDATE SET
+      timezone = excluded.timezone,
+      display_currency = excluded.display_currency,
+      revision = excluded.revision,
+      updated_at = excluded.updated_at
+  `).run({ ...value, updatedAt: timestamp(value.updatedAt) })
 }
 
 function parseRemotePage(value: unknown): RemoteMutationPage {
@@ -579,6 +648,12 @@ function acknowledgeLocalMutation(
         throw new UserDataConsistencyError()
       }
       break
+    case 'privacy.consent':
+      projectConsent(database, local.payload)
+      break
+    case 'preferences.update':
+      projectPreferences(database, local.payload, resultRevision, remote.receivedAt)
+      break
     default:
       break
   }
@@ -817,6 +892,12 @@ function applyRemoteMutation(
       if (updatedConversation.changes !== 1) throw new UserDataConsistencyError()
       break
     }
+    case 'privacy.consent':
+      projectConsent(database, mutation.payload)
+      break
+    case 'preferences.update':
+      projectPreferences(database, mutation.payload, revision, mutation.receivedAt)
+      break
     default:
       break
   }
@@ -1614,6 +1695,14 @@ export function createUserDataRepositories(
     mediaGenerationJobs,
     chatRuns,
     providerUsage,
+    account: {
+      getConsent: (purpose) => storedConsent(database, purpose),
+      getPreferences: () => storedPreferences(database),
+      projectPreferences(preferences) {
+        const value = accountDataPreferencesRecordSchema.parse(preferences)
+        projectPreferences(database, value, value.revision, value.updatedAt)
+      },
+    },
     sync: {
       getCheckpoint: () => readCheckpoint(database),
       updateCheckpoint(checkpoint) {
@@ -1670,6 +1759,20 @@ export function createUserDataRepositories(
           })
         },
       ),
+      recordWithConsent: (mutation) => recordMutation(
+        mutation,
+        (validated) => {
+          if (validated.kind !== 'privacy.consent') throw new UserDataConsistencyError()
+          projectConsent(database, validated.payload)
+        },
+      ),
+      recordWithPreferences: (mutation) => recordMutation(
+        mutation,
+        (validated) => {
+          if (validated.kind !== 'preferences.update') throw new UserDataConsistencyError()
+          projectPreferences(database, validated.payload, validated.baseRevision, validated.occurredAt)
+        },
+      ),
       listReady(now, limit) {
         if (!Number.isSafeInteger(now) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
           throw new Error('Invalid outbox page request')
@@ -1703,9 +1806,12 @@ export function createUserDataRepositories(
           LIMIT @limit
         `).all({ limit }) as Query[]).map(outboxFromRow)
       },
-      countPending: () => (
-        database.prepare('SELECT COUNT(*) AS count FROM outbox_mutations').get() as { count: number }
-      ).count,
+      countPending: (kind) => ((
+        kind === undefined
+          ? database.prepare('SELECT COUNT(*) AS count FROM outbox_mutations').get()
+          : database.prepare('SELECT COUNT(*) AS count FROM outbox_mutations WHERE kind = @kind')
+            .get({ kind })
+      ) as { count: number }).count,
       markSyncing(ids) {
         transaction(database, () => {
           const mutations = ids.map((id) => findOutboxMutation(database, id))

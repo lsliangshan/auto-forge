@@ -3,11 +3,14 @@ import type {
   AppInfo,
   AppSettings,
   AppSettingsPatch,
+  AccountDataPreferences,
+  LegacyImportPreview,
   ModelInfo,
   ModelProviderId,
   PermissionGrant,
   ProviderCredentialStatus,
   TokenUsageSnapshot,
+  RemoteUsageSnapshot,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
@@ -58,12 +61,16 @@ export const useSettingsStore = defineStore('settings', {
     grants: [] as PermissionGrant[],
     appInfo: undefined as AppInfo | undefined,
     tokenUsage: undefined as TokenUsageSnapshot | undefined,
+    remoteUsage: undefined as RemoteUsageSnapshot | undefined,
+    accountDataPreferences: undefined as AccountDataPreferences | undefined,
+    legacyImportPreview: undefined as LegacyImportPreview | undefined,
     loading: false,
     modelsLoading: false,
     tokenUsageLoading: false,
     saving: false,
     error: '',
     tokenUsageError: '',
+    cloudDataError: '',
     _loadVersion: 0,
     _tokenUsageVersion: 0,
     _credentialVersions: { deepseek: 0, openrouter: 0 } as Record<ModelProviderId, number>,
@@ -118,6 +125,31 @@ export const useSettingsStore = defineStore('settings', {
         }
       } finally {
         if (version === this._tokenUsageVersion) this.tokenUsageLoading = false
+      }
+    },
+    async loadCloudData() {
+      this.cloudDataError = ''
+      try {
+        const [remoteUsage, accountDataPreferences, legacyImportPreview] = await Promise.all([
+          getDesktopApi().settings.getRemoteUsage(),
+          getDesktopApi().settings.getAccountDataPreferences(),
+          getDesktopApi().settings.previewLegacyImport(),
+        ])
+        this.remoteUsage = remoteUsage
+        this.accountDataPreferences = accountDataPreferences
+        this.legacyImportPreview = legacyImportPreview
+      } catch (error) {
+        this.cloudDataError = displayError(error, '云端账户数据加载失败')
+      }
+    },
+    async updateAccountDataPreferences(input: AccountDataPreferences) {
+      this.error = ''
+      try {
+        this.accountDataPreferences = await getDesktopApi().settings
+          .updateAccountDataPreferences(input)
+        await this.loadCloudData()
+      } catch (error) {
+        this.error = displayError(error, '账户数据偏好保存失败')
       }
     },
     async load() {

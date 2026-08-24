@@ -106,6 +106,19 @@ function services(): DesktopIpcServices {
       getTokenUsage: vi.fn().mockResolvedValue(emptyUsageSnapshot()),
       clearLocalData: vi.fn(),
       clearBrowserData: vi.fn(),
+      recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
+      previewLegacyImport: vi.fn().mockResolvedValue({
+        ownedCount: 1, unownedCount: 1, requiresUnownedConfirmation: true,
+      }),
+      importLegacyData: vi.fn().mockResolvedValue([{ batchId: 'batch_1-0', status: 'applied' }]),
+      getAccountDataPreferences: vi.fn().mockResolvedValue({ timezone: 'UTC', displayCurrency: 'USD' }),
+      updateAccountDataPreferences: vi.fn().mockResolvedValue({ timezone: 'UTC', displayCurrency: 'USD' }),
+      getRemoteUsage: vi.fn().mockResolvedValue({
+        startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
+        inputTokens: 1, outputTokens: 2, totalTokens: 3, confirmedPlatformCost: null,
+        pendingCount: 0, byokEstimatedCostUsd: '0', byokEstimatedCount: 0,
+        byokUnavailableCount: 0, timezone: 'UTC', displayCurrency: 'USD',
+      }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
@@ -144,6 +157,24 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('validates owner-free cloud account methods before invoking Main services', async () => {
+    const app = harness()
+    const consent = {
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    }
+    await expect(app.invoke(ipcChannels.settingsRecordPrivacyConsent, consent)).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.settingsPreviewLegacyImport)).resolves.toMatchObject({ ownedCount: 1 })
+    await expect(app.invoke(ipcChannels.settingsImportLegacyData, {
+      batchId: 'batch_1', includeUnowned: false, cloudSyncConsent: consent,
+    })).resolves.toEqual([{ batchId: 'batch_1-0', status: 'applied' }])
+    await expect(app.invoke(ipcChannels.settingsUpdateAccountDataPreferences, {
+      timezone: 'UTC', displayCurrency: 'USD', ownerUserId: 'forged',
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(app.dependencies.settings.updateAccountDataPreferences).not.toHaveBeenCalled()
+    await expect(app.invoke(ipcChannels.settingsGetRemoteUsage)).resolves.toMatchObject({ totalTokens: 3 })
+  })
+
   it('allows the fixed authentication operations without an existing session', async () => {
     const app = harness()
 

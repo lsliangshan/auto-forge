@@ -424,6 +424,7 @@ export class MediaGenerationOrchestrator {
     const operationKey = `audio:${input.requestId}`
     for await (const event of trackProviderStream({
       operationKey,
+      purpose: 'media_generation',
       attribution: {
         userId: input.userId,
         requestId: input.requestId,

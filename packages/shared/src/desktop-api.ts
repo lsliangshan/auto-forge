@@ -507,6 +507,15 @@ export const legacyImportConfirmRequestSchema = z.object({
 })
 export type LegacyImportConfirmRequest = z.infer<typeof legacyImportConfirmRequestSchema>
 
+export const legacyImportResultSchema = z.object({
+  batchId: identifierSchema,
+  status: z.enum(['applied', 'duplicate', 'rejected']),
+  importedConversations: z.number().int().nonnegative().optional(),
+  importedMessages: z.number().int().nonnegative().optional(),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict()
+export type LegacyImportResult = z.infer<typeof legacyImportResultSchema>
+
 export const chatSendInputSchema = z.object({
   conversationId: identifierSchema,
   content: z.string().trim(),
@@ -798,6 +807,12 @@ export const accountDataPreferencesSchema = z.object({
 }).strict()
 export type AccountDataPreferences = z.infer<typeof accountDataPreferencesSchema>
 
+export const accountDataPreferencesRecordSchema = accountDataPreferencesSchema.extend({
+  revision: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+}).strict()
+export type AccountDataPreferencesRecord = z.infer<typeof accountDataPreferencesRecordSchema>
+
 export const providerDefaultModelsSchema = z.object({
   deepseek: z.object({ text: nonEmptyStringSchema }).strict(),
   openrouter: z.object({
@@ -920,6 +935,30 @@ export const byokUsageEventSchema = z.discriminatedUnion('costStatus', [
   }).strict(),
 ])
 export type ByokUsageEvent = z.infer<typeof byokUsageEventSchema>
+
+export const remoteUsageSnapshotSchema = z.object({
+  startedAt: timestampSchema,
+  endedAt: timestampSchema,
+  inputTokens: safeTokenCountSchema,
+  outputTokens: safeTokenCountSchema,
+  totalTokens: safeTokenCountSchema,
+  confirmedPlatformCost: z.object({
+    amount: usdDecimalSchema,
+    currency: z.enum(['CNY', 'USD']),
+  }).strict().nullable(),
+  pendingCount: safeTokenCountSchema,
+  byokEstimatedCostUsd: usdDecimalSchema,
+  byokEstimatedCount: safeTokenCountSchema,
+  byokUnavailableCount: safeTokenCountSchema,
+  timezone: nonEmptyStringSchema.max(128),
+  displayCurrency: z.enum(['CNY', 'USD']),
+  lastSyncAt: timestampSchema.optional(),
+}).strict().superRefine((snapshot, context) => {
+  if (snapshot.totalTokens !== snapshot.inputTokens + snapshot.outputTokens) {
+    context.addIssue({ code: 'custom', path: ['totalTokens'], message: 'Token totals must match' })
+  }
+})
+export type RemoteUsageSnapshot = z.infer<typeof remoteUsageSnapshotSchema>
 
 const syncMutationBaseShape = {
   id: identifierSchema,
@@ -1301,6 +1340,12 @@ export const ipcChannels = {
   settingsValidateProviderCredential: 'settings:validate-provider-credential',
   settingsListProviderModels: 'settings:list-provider-models',
   settingsGetTokenUsage: 'settings:get-token-usage',
+  settingsRecordPrivacyConsent: 'settings:record-privacy-consent',
+  settingsPreviewLegacyImport: 'settings:preview-legacy-import',
+  settingsImportLegacyData: 'settings:import-legacy-data',
+  settingsGetAccountDataPreferences: 'settings:get-account-data-preferences',
+  settingsUpdateAccountDataPreferences: 'settings:update-account-data-preferences',
+  settingsGetRemoteUsage: 'settings:get-remote-usage',
   settingsClearLocalData: 'settings:clear-local-data',
   settingsClearBrowserData: 'settings:clear-browser-data',
   systemOpenExternal: 'system:open-external',
@@ -1468,6 +1513,12 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsValidateProviderCredential]: providerRequestSchema,
   [ipcChannels.settingsListProviderModels]: listProviderModelsRequestSchema,
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
+  [ipcChannels.settingsRecordPrivacyConsent]: privacyConsentSchema,
+  [ipcChannels.settingsPreviewLegacyImport]: z.undefined(),
+  [ipcChannels.settingsImportLegacyData]: legacyImportConfirmRequestSchema,
+  [ipcChannels.settingsGetAccountDataPreferences]: z.undefined(),
+  [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
+  [ipcChannels.settingsGetRemoteUsage]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.settingsClearBrowserData]: z.undefined(),
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
@@ -1539,6 +1590,12 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsValidateProviderCredential]: providerCredentialStatusSchema,
   [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
+  [ipcChannels.settingsRecordPrivacyConsent]: voidResponseSchema,
+  [ipcChannels.settingsPreviewLegacyImport]: legacyImportPreviewSchema,
+  [ipcChannels.settingsImportLegacyData]: z.array(legacyImportResultSchema),
+  [ipcChannels.settingsGetAccountDataPreferences]: accountDataPreferencesSchema,
+  [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
+  [ipcChannels.settingsGetRemoteUsage]: remoteUsageSnapshotSchema,
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
@@ -1631,6 +1688,12 @@ export interface DesktopAPI {
     validateProviderCredential(provider: ModelProviderId): Promise<ProviderCredentialStatus>
     listProviderModels(provider: ModelProviderId, refresh?: boolean): Promise<ModelInfo[]>
     getTokenUsage(): Promise<TokenUsageSnapshot>
+    recordPrivacyConsent(input: PrivacyConsent): Promise<void>
+    previewLegacyImport(): Promise<LegacyImportPreview>
+    importLegacyData(input: LegacyImportConfirmRequest): Promise<LegacyImportResult[]>
+    getAccountDataPreferences(): Promise<AccountDataPreferences>
+    updateAccountDataPreferences(input: AccountDataPreferences): Promise<AccountDataPreferences>
+    getRemoteUsage(): Promise<RemoteUsageSnapshot>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
     clearBrowserData(): Promise<void>
   }

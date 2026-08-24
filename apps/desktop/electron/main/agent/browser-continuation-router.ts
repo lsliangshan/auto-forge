@@ -108,6 +108,7 @@ export async function routeBrowserContinuationRequest(
   try {
     for await (const event of trackProviderStream({
       operationKey: `agent:${input.requestId}:browser-route`,
+      purpose: 'browser_routing',
       attribution: {
         userId: input.userId,
         requestId: input.requestId,

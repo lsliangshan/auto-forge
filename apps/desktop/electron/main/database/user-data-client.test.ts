@@ -1622,7 +1622,7 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
@@ -1661,6 +1661,50 @@ describe('UserDataStoreManager', () => {
     )).toThrow(expect.objectContaining({ code: 'OUTBOX_LIMIT_EXCEEDED' }))
     expect(store.conversations.get('conversation_over_limit')).toBeUndefined()
     expect(store.outbox.countPending()).toBe(10_000)
+    manager.close()
+  })
+
+  it('atomically projects consent and preferences per UID and restores pulled values after restart', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const alice = manager.open('cloud-alice')
+    const consent: Extract<SyncMutation, { kind: 'privacy.consent' }> = {
+      id: 'consent_mutation_1', kind: 'privacy.consent', entityId: 'cloud-sync-2026-08',
+      baseRevision: 0, occurredAt: '2026-08-25T00:00:00.000Z', payload: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+    alice.outbox.recordWithConsent(consent)
+    expect(alice.account.getConsent('cloud_sync')).toEqual(consent.payload)
+    expect(alice.outbox.find(consent.id)).toBeDefined()
+
+    const preferences: Extract<SyncMutation, { kind: 'preferences.update' }> = {
+      id: 'preferences_mutation_1', kind: 'preferences.update', entityId: 'account-preferences',
+      baseRevision: 0, occurredAt: '2026-08-25T00:01:00.000Z',
+      payload: { timezone: 'America/New_York', displayCurrency: 'USD' },
+    }
+    alice.outbox.recordWithPreferences(preferences)
+    expect(alice.account.getPreferences()).toEqual({
+      timezone: 'America/New_York', displayCurrency: 'USD', revision: 0,
+      updatedAt: '2026-08-25T00:01:00.000Z',
+    })
+    manager.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(reopened.account.getConsent('cloud_sync')).toEqual(consent.payload)
+    reopened.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_account_0001', mutations: [
+        pulledMutation(preferences, 1, '2026-08-25T00:02:00.000Z'),
+      ],
+    }, 2)
+    expect(reopened.account.getPreferences()).toEqual({
+      timezone: 'America/New_York', displayCurrency: 'USD', revision: 1,
+      updatedAt: '2026-08-25T00:02:00.000Z',
+    })
+    manager.open('cloud-bob')
+    expect(manager.current()?.account.getConsent('cloud_sync')).toBeUndefined()
+    expect(manager.current()?.account.getPreferences()).toBeUndefined()
     manager.close()
   })
 

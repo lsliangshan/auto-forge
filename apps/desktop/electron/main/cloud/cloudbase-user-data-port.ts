@@ -1,4 +1,9 @@
 import {
+  accountDataPreferencesRecordSchema,
+  chatBlockSchema,
+  conversationTitleStateSchema,
+  legacyImportConfirmRequestSchema,
+  legacyImportResultSchema,
   opaqueCursorSchema,
   pulledMutationSchema,
   syncMutationResultSchema,
@@ -7,6 +12,8 @@ import {
   type AppError,
   type PulledMutation,
   type SyncMutationResult,
+  type AccountDataPreferencesRecord,
+  type LegacyImportResult,
 } from '@autoforge/shared'
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
@@ -43,9 +50,58 @@ const syncPullCallSchema = z.object({
   limit: z.number().int().positive().max(100).optional(),
 }).strict()
 
+const legacyConversationSchema = z.object({
+  id: identifierSchema,
+  title: z.string().trim().min(1),
+  titleState: conversationTitleStateSchema,
+  createdAt: z.iso.datetime({ offset: true }),
+  lastActivityAt: z.iso.datetime({ offset: true }),
+  metadataUpdatedAt: z.iso.datetime({ offset: true }),
+  sourceUnowned: z.boolean().optional(),
+}).strict()
+const legacyMessageSchema = z.object({
+  id: identifierSchema,
+  conversationId: identifierSchema,
+  role: z.enum(['user', 'assistant']),
+  blocks: z.array(chatBlockSchema),
+  executionId: identifierSchema.optional(),
+  createdAt: z.iso.datetime({ offset: true }),
+  sourceUnowned: z.boolean().optional(),
+}).strict()
+const importLegacyBatchCallSchema = legacyImportConfirmRequestSchema.extend({
+  action: z.literal('importLegacyBatch'),
+  protocolVersion: protocolVersionSchema,
+  deviceId: identifierSchema,
+  conversations: z.array(legacyConversationSchema),
+  messages: z.array(legacyMessageSchema),
+}).strict().superRefine((input, context) => {
+  if (input.conversations.length + input.messages.length > 100) {
+    context.addIssue({ code: 'custom', message: 'Legacy batch exceeds record limit' })
+  }
+  if (!input.includeUnowned && [...input.conversations, ...input.messages]
+    .some((item) => item.sourceUnowned === true)) {
+    context.addIssue({ code: 'custom', message: 'Unowned rows require confirmation' })
+  }
+})
+const getUserDataPreferencesCallSchema = z.object({
+  action: z.literal('getUserDataPreferences'),
+}).strict()
+const getUsageSnapshotCallSchema = z.object({
+  action: z.literal('getUsageSnapshot'),
+  startedAt: z.iso.datetime({ offset: true }),
+  endedAt: z.iso.datetime({ offset: true }),
+}).strict().superRefine((input, context) => {
+  if (Date.parse(input.startedAt) >= Date.parse(input.endedAt)) {
+    context.addIssue({ code: 'custom', path: ['endedAt'], message: 'Usage period is invalid' })
+  }
+})
+
 const cloudBaseUserDataCallSchema = z.discriminatedUnion('action', [
   syncPushCallSchema,
   syncPullCallSchema,
+  importLegacyBatchCallSchema,
+  getUserDataPreferencesCallSchema,
+  getUsageSnapshotCallSchema,
 ])
 
 export type CloudBaseUserDataCall = z.infer<typeof cloudBaseUserDataCallSchema>
@@ -60,6 +116,17 @@ const syncPullDataSchema = z.object({
   cursor: opaqueCursorSchema.nullable(),
 }).strict()
 
+const remoteUsageDataSchema = z.object({
+  startedAt: z.iso.datetime({ offset: true }),
+  endedAt: z.iso.datetime({ offset: true }),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  estimatedCostUsd: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/),
+  estimatedCount: z.number().int().nonnegative(),
+  unavailableCount: z.number().int().nonnegative(),
+}).strict()
+export type RemoteUsageData = z.infer<typeof remoteUsageDataSchema>
+
 export interface SyncPushData {
   results: SyncMutationResult[]
   cursor?: string
@@ -73,7 +140,7 @@ export interface SyncPullData {
 }
 
 export type UserDataFunctionResponse =
-  | { ok: true; data: SyncPushData | SyncPullData }
+  | { ok: true; data: SyncPushData | SyncPullData | LegacyImportResult | AccountDataPreferencesRecord | RemoteUsageData }
   | { ok: false; error: { code: UserDataErrorCode } }
 
 const functionResponseSchema = z.object({ result: z.unknown() }).passthrough()
@@ -158,7 +225,19 @@ export class CloudBaseUserDataPort {
         ['cursor', 'limit'],
       )) throw toSafeAppError({ code: 'INVALID_INPUT' })
       if (input.protocolVersion !== 1) throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
-    } else {
+    } else if (input.action === 'importLegacyBatch') {
+      if (!hasStrictShape(input, [
+        'action', 'protocolVersion', 'deviceId', 'batchId', 'includeUnowned',
+        'conversations', 'messages', 'cloudSyncConsent',
+      ], ['unownedImportConsent'])) throw toSafeAppError({ code: 'INVALID_INPUT' })
+      if (input.protocolVersion !== 1) throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+      if (!Array.isArray(input.conversations) || !Array.isArray(input.messages)) {
+        throw toSafeAppError({ code: 'INVALID_INPUT' })
+      }
+      if (input.conversations.length + input.messages.length > 100) {
+        throw toSafeAppError({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+      }
+    } else if (input.action !== 'getUserDataPreferences' && input.action !== 'getUsageSnapshot') {
       throw toSafeAppError({ code: 'INVALID_INPUT' })
     }
     const parsedInput = cloudBaseUserDataCallSchema.safeParse(input)
@@ -183,7 +262,13 @@ export class CloudBaseUserDataPort {
 
     const dataSchema = parsedInput.data.action === 'syncPush'
       ? syncPushDataSchema
-      : syncPullDataSchema
+      : parsedInput.data.action === 'syncPull'
+        ? syncPullDataSchema
+        : parsedInput.data.action === 'importLegacyBatch'
+          ? legacyImportResultSchema
+          : parsedInput.data.action === 'getUserDataPreferences'
+            ? accountDataPreferencesRecordSchema
+            : remoteUsageDataSchema
     const succeeded = z.object({ ok: z.literal(true), data: dataSchema }).strict()
       .safeParse(response.data.result)
     if (!succeeded.success) throw malformedResponse()

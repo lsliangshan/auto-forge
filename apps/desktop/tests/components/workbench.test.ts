@@ -168,6 +168,21 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       })),
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
       getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
+      recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
+      previewLegacyImport: vi.fn().mockResolvedValue({
+        ownedCount: 2, unownedCount: 1, requiresUnownedConfirmation: true,
+      }),
+      importLegacyData: vi.fn().mockResolvedValue([{ batchId: 'batch_1-0', status: 'applied' }]),
+      getAccountDataPreferences: vi.fn().mockResolvedValue({ timezone: 'Asia/Shanghai', displayCurrency: 'CNY' }),
+      updateAccountDataPreferences: vi.fn().mockResolvedValue({ timezone: 'Asia/Shanghai', displayCurrency: 'CNY' }),
+      getRemoteUsage: vi.fn().mockResolvedValue({
+        startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
+        inputTokens: 10, outputTokens: 5, totalTokens: 15,
+        confirmedPlatformCost: null, pendingCount: 2,
+        byokEstimatedCostUsd: '0.01', byokEstimatedCount: 1, byokUnavailableCount: 1,
+        timezone: 'Asia/Shanghai', displayCurrency: 'CNY',
+        lastSyncAt: '2026-08-25T00:00:00.000Z',
+      }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
@@ -213,6 +228,46 @@ async function mountApp(path = '/chat', api = createApi()) {
 }
 
 describe('workbench', () => {
+  it('shows remote usage classifications and requires separate confirmation for unowned legacy history', async () => {
+    const confirm = vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValueOnce('confirm')
+      .mockResolvedValueOnce('confirm')
+    const { wrapper, api } = await mountApp('/settings')
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="remote-usage-summary"]').text())
+      .toContain('BYOK 估算'))
+    const text = wrapper.get('[data-testid="remote-usage-summary"]').text()
+    expect(text).toContain('平台已确认消费')
+    expect(text).toContain('待同步 2 笔')
+    expect(text).toContain('$0.01')
+    expect(text).toContain('Asia/Shanghai')
+    expect(text).not.toContain('BYOK 已确认')
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.importLegacyData).toHaveBeenCalledOnce())
+    expect(confirm).toHaveBeenCalledTimes(2)
+    expect(api.settings.importLegacyData).toHaveBeenCalledWith(expect.objectContaining({
+      includeUnowned: true,
+      cloudSyncConsent: expect.objectContaining({ purpose: 'cloud_sync' }),
+      unownedImportConsent: expect.objectContaining({ purpose: 'legacy_unowned_import' }),
+    }))
+  })
+
+  it('does not persist either consent when unowned legacy import confirmation is cancelled', async () => {
+    vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValueOnce('confirm')
+      .mockRejectedValueOnce('cancel')
+    const { wrapper, api } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="legacy-import-button"]').exists())
+      .toBe(true))
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await Promise.resolve()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
     setActivePinia(createPinia())
@@ -426,6 +481,48 @@ describe('workbench', () => {
     }] })
     await loading
     expect(store.conversations.map(({ id }) => id)).toEqual(['new'])
+  })
+
+  it('asks for cloud-sync consent once before retrying the first conversation create', async () => {
+    const api = createApi()
+    vi.mocked(api.chat.createConversation)
+      .mockRejectedValueOnce({
+        code: 'IMPORT_CONFIRMATION_REQUIRED',
+        message: 'Importing this local history requires confirmation.',
+      })
+      .mockResolvedValueOnce({
+        ...conversationSummary('new', '2026-08-25T00:00:00.000Z', 'pending'),
+        title: '新会话',
+      })
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValueOnce('confirm')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+
+    await store.createConversation()
+
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(api.settings.recordPrivacyConsent).toHaveBeenCalledWith(expect.objectContaining({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08', clientVersion: '0.1.0',
+    }))
+    expect(api.chat.createConversation).toHaveBeenCalledTimes(2)
+    expect(store.selectedConversationId).toBe('new')
+  })
+
+  it('leaves the first conversation unwritten when cloud-sync consent is cancelled', async () => {
+    const api = createApi()
+    vi.mocked(api.chat.createConversation).mockRejectedValueOnce({
+      code: 'IMPORT_CONFIRMATION_REQUIRED',
+      message: 'Importing this local history requires confirmation.',
+    })
+    vi.spyOn(ElMessageBox, 'confirm').mockRejectedValueOnce('cancel')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+
+    await store.createConversation()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.chat.createConversation).toHaveBeenCalledOnce()
+    expect(store.conversations).toEqual([])
   })
 
   it('appends cursor pages once, removes duplicate rows, and preserves selection order', async () => {
