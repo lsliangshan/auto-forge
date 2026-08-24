@@ -17,6 +17,41 @@ function openAppDatabase(path: string) {
   const sqlite = new Database(path)
   sqlite.pragma('foreign_keys = ON')
   const repositories = createRepositories(sqlite)
+  repositories.messages.upgradeLegacyApprovals()
+  const recoverInterrupted = () => sqlite.transaction(() => {
+    const endedAt = Date.now()
+    const executions = sqlite.prepare(`
+      UPDATE executions
+      SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ?
+      WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')
+    `).run(endedAt).changes
+    const preservedRequestIds = new Set(repositories.mediaGenerationJobs.reconcileInterrupted(endedAt))
+    let chatRuns = 0
+    const interruptedRuns = sqlite.prepare(`
+      SELECT id, request_id AS requestId
+      FROM chat_runs
+      WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `).all() as Array<{ id: string; requestId: string }>
+    const failRun = sqlite.prepare(`
+      UPDATE chat_runs
+      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
+      WHERE id = @id
+        AND status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `)
+    const failedRequestIds: string[] = []
+    for (const run of interruptedRuns) {
+      if (preservedRequestIds.has(run.requestId)) continue
+      const changes = failRun.run({ id: run.id, endedAt }).changes
+      chatRuns += changes
+      if (changes === 1) failedRequestIds.push(run.requestId)
+    }
+    repositories.messages.failInterruptedBrowserStatuses(failedRequestIds)
+    repositories.messages.invalidatePendingAgentApprovals()
+    repositories.messages.failInterruptedMediaGenerations()
+    repositories.conversations.failInterruptedTitleGenerations()
+    return { executions, chatRuns }
+  })()
+  recoverInterrupted()
   const clearConversations = () => sqlite.transaction(() => {
     sqlite.prepare('DELETE FROM conversations').run()
   })()
@@ -27,6 +62,11 @@ function openAppDatabase(path: string) {
   return {
     ...production,
     conversations: repositories.conversations,
+    messages: repositories.messages,
+    conversationContexts: repositories.conversationContexts,
+    chatRuns: repositories.chatRuns,
+    providerUsage: repositories.providerUsage,
+    recoverInterrupted,
     clearConversations,
     clearLocalData,
     close() {
@@ -284,6 +324,112 @@ describe('openAppDatabase', () => {
     database.clearLocalData('executions')
     expect(database.executions.get('legacy_execution')).toBeUndefined()
     database.close()
+  })
+
+  it('keeps every sensitive legacy surface byte-for-byte stable across open and recovery', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-legacy-sensitive-read-only-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    openProductionAppDatabase(path).close()
+    const seed = new Database(path)
+    seed.prepare(`
+      INSERT INTO conversations (
+        id, title, title_state, created_at, updated_at
+      ) VALUES ('legacy_sensitive', 'Legacy sensitive', 'generating', 1, 1)
+    `).run()
+    const legacyApproval = JSON.stringify([{
+      type: 'approval', executionId: 'legacy_sensitive_execution',
+      workflowId: 'legacy.workflow', workflowVersion: '1.0.0', permissionIndex: 0,
+      capability: 'browser.open', scope: { origins: ['https://example.com'] },
+      scopeHash: 'a'.repeat(64),
+    }])
+    seed.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, blocks_json, ordinal, created_at
+      ) VALUES ('legacy_sensitive_message', 'legacy_sensitive', 'assistant', ?, 1, 1)
+    `).run(legacyApproval)
+    seed.prepare(`
+      INSERT INTO conversation_contexts (
+        conversation_id, summary_text, through_ordinal, estimated_tokens, updated_at
+      ) VALUES ('legacy_sensitive', 'private legacy summary', 1, 3, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO chat_runs (
+        id, conversation_id, request_id, model, status, started_at
+      ) VALUES ('legacy_sensitive_run', 'legacy_sensitive', 'legacy_sensitive_request',
+        'model', 'running', 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO local_users (
+        id, account, account_normalized, password_digest, created_at, updated_at
+      ) VALUES ('legacy-user', 'Legacy user', 'legacy user', 'digest', 1, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO provider_usage_events (
+        id, operation_key, user_id, provider, request_id, model, modality, status,
+        reconcile_attempts, started_at
+      ) VALUES ('legacy_sensitive_usage', 'legacy_sensitive_operation', 'legacy-user',
+        'openrouter', 'legacy_sensitive_usage_request', 'model', 'text', 'pending', 0, 1)
+    `).run()
+    const sensitiveSnapshot = (sqlite: Database.Database) => JSON.stringify([
+      'conversations',
+      'messages',
+      'conversation_contexts',
+      'chat_runs',
+      'provider_usage_events',
+    ].map((table) => [table, sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]))
+    const before = sensitiveSnapshot(seed)
+    seed.close()
+
+    const database = openProductionAppDatabase(path)
+    const expected = {
+      code: 'CONFLICT',
+      message: 'The requested operation conflicts with existing state.',
+    }
+    expect(database.messages.get('legacy_sensitive_message')).toBeDefined()
+    expect(database.conversationContexts.get('legacy_sensitive')).toBeDefined()
+    expect(database.chatRuns.get('legacy_sensitive_run')).toBeDefined()
+    expect(database.providerUsage.find('legacy_sensitive_operation')).toBeDefined()
+    for (const mutate of [
+      () => database.messages.insert({
+        id: 'forbidden_message', conversationId: 'legacy_sensitive', role: 'user',
+        blocks: [{ type: 'text', text: 'forbidden' }], createdAt: 2,
+      }),
+      () => database.messages.update('legacy_sensitive_message', { executionId: 'forbidden' }),
+      () => database.messages.replaceBlock(
+        'legacy_sensitive_message', 'forbidden', { type: 'text', text: 'forbidden' },
+      ),
+      () => database.messages.upgradeLegacyApprovals(),
+      () => database.messages.invalidatePendingAgentApprovals(),
+      () => database.messages.failInterruptedMediaGenerations(),
+      () => database.messages.failInterruptedBrowserStatuses(['legacy_sensitive_request']),
+      () => database.conversationContexts.advance({
+        conversationId: 'legacy_sensitive', expectedThroughOrdinal: 1,
+        summaryText: 'forbidden', throughOrdinal: 2, estimatedTokens: 1, updatedAt: 2,
+      }),
+      () => database.chatRuns.insert({
+        id: 'forbidden_run', conversationId: 'legacy_sensitive', requestId: 'forbidden_request',
+        model: 'model', status: 'running', startedAt: 2,
+      }),
+      () => database.chatRuns.startMediaGeneration({} as never),
+      () => database.chatRuns.update('legacy_sensitive_run', { status: 'failed' }),
+      () => database.chatRuns.finalizeWithMessage(
+        'legacy_sensitive_run', 'legacy_sensitive_message', 'legacy_sensitive_request', {} as never,
+      ),
+      () => database.providerUsage.start({} as never),
+      () => database.providerUsage.bindIdentity('legacy_sensitive_operation', {}),
+      () => database.providerUsage.report('legacy_sensitive_operation', {} as never),
+      () => database.providerUsage.markUnknown('legacy_sensitive_operation', 2),
+      () => database.providerUsage.recordReconcileFailure('legacy_sensitive_operation', 2),
+    ]) expect(mutate).toThrow(expect.objectContaining(expected))
+
+    expect(database.providerUsage.recoverPending(2)).toBe(0)
+    expect(database.providerUsage.listReconcilable(2)).toEqual([])
+    expect(database.recoverInterrupted()).toEqual({ executions: 0, chatRuns: 0 })
+    database.close()
+    const inspection = new Database(path, { readonly: true })
+    expect(sensitiveSnapshot(inspection)).toBe(before)
+    inspection.close()
   })
 
   it('packages migrations where the migration runner resolves them', () => {

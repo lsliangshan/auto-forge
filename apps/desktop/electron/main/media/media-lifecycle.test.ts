@@ -43,6 +43,10 @@ function setup() {
   const database = {
     ...productionDatabase,
     conversations: repositories.conversations,
+    messages: repositories.messages,
+    conversationContexts: repositories.conversationContexts,
+    chatRuns: repositories.chatRuns,
+    providerUsage: repositories.providerUsage,
     clearConversations: () => sqlite.transaction(() => {
       sqlite.prepare('DELETE FROM conversations').run()
     })(),

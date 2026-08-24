@@ -18,7 +18,6 @@ export function openAppDatabase(path: string) {
   const localAuth = createLocalAuthRepository(sqlite)
   const userProfiles = createUserProfileRepository(sqlite)
   const cloudBaseIdentities = createCloudBaseIdentityRepository(sqlite)
-  repositories.messages.upgradeLegacyApprovals()
   const legacyReadOnly = (): never => {
     throw toSafeAppError({ code: 'CONFLICT' })
   }
@@ -35,38 +34,44 @@ export function openAppDatabase(path: string) {
     updateGenerationPreferences: legacyReadOnly,
     delete: legacyReadOnly,
   }
+  const legacyMessages: AppRepositories['messages'] = {
+    ...repositories.messages,
+    insert: legacyReadOnly,
+    insertWithAssets: legacyReadOnly,
+    update: legacyReadOnly,
+    replaceBlock: legacyReadOnly,
+    upgradeLegacyApprovals: legacyReadOnly,
+    invalidatePendingAgentApprovals: legacyReadOnly,
+    failInterruptedMediaGenerations: legacyReadOnly,
+    failInterruptedBrowserStatuses: legacyReadOnly,
+  }
+  const legacyConversationContexts: AppRepositories['conversationContexts'] = {
+    ...repositories.conversationContexts,
+    advance: legacyReadOnly,
+  }
+  const legacyChatRuns: AppRepositories['chatRuns'] = {
+    ...repositories.chatRuns,
+    insert: legacyReadOnly,
+    startMediaGeneration: legacyReadOnly,
+    update: legacyReadOnly,
+    finalizeWithMessage: legacyReadOnly,
+  }
+  const legacyProviderUsage: AppRepositories['providerUsage'] = {
+    ...repositories.providerUsage,
+    start: legacyReadOnly,
+    bindIdentity: legacyReadOnly,
+    report: legacyReadOnly,
+    markUnknown: legacyReadOnly,
+    recoverPending: () => 0,
+    listReconcilable: () => [],
+    recordReconcileFailure: legacyReadOnly,
+  }
 
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
     repositories.browserTabBindings.markActiveStale(endedAt)
     const executions = sqlite.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ? WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run(endedAt).changes
-    const preservedRequestIds = new Set(
-      repositories.mediaGenerationJobs.reconcileInterrupted(endedAt),
-    )
-    let chatRuns = 0
-    const interruptedRuns = sqlite.prepare(`
-      SELECT id, request_id AS requestId
-      FROM chat_runs
-      WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
-    `).all() as Array<{ id: string; requestId: string }>
-    const failRun = sqlite.prepare(`
-      UPDATE chat_runs
-      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
-      WHERE id = @id
-        AND status IN ('queued', 'awaiting_approval', 'running', 'streaming')
-    `)
-    const failedRequestIds: string[] = []
-    for (const run of interruptedRuns) {
-      if (preservedRequestIds.has(run.requestId)) continue
-      const changes = failRun.run({ id: run.id, endedAt }).changes
-      chatRuns += changes
-      if (changes === 1) failedRequestIds.push(run.requestId)
-    }
-    repositories.messages.failInterruptedBrowserStatuses(failedRequestIds)
-    repositories.messages.invalidatePendingAgentApprovals()
-    repositories.messages.failInterruptedMediaGenerations()
-    repositories.conversations.failInterruptedTitleGenerations()
-    return { executions, chatRuns }
+    return { executions, chatRuns: 0 }
   })()
 
   const clearConversations = legacyReadOnly
@@ -91,5 +96,9 @@ export function openAppDatabase(path: string) {
     clearLocalData,
     ...repositories,
     conversations: legacyConversations,
+    messages: legacyMessages,
+    conversationContexts: legacyConversationContexts,
+    chatRuns: legacyChatRuns,
+    providerUsage: legacyProviderUsage,
   }
 }

@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3'
+import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import {
+  appErrorCodeSchema,
   chatBlockSchema,
   chatMessageSchema,
   conversationSummarySchema,
@@ -8,6 +10,7 @@ import {
   syncMutationKindSchema,
   syncMutationSchema,
   type ConversationPage,
+  type AppErrorCode,
   type MessagePage,
   type SyncMutation,
 } from '@autoforge/shared'
@@ -25,7 +28,7 @@ const outboxMetadataSchema = z.object({
   state: z.enum(['pending', 'syncing', 'failed']),
   attempts: z.number().int().nonnegative(),
   nextAttemptAt: z.number().int().nonnegative().nullable(),
-  lastErrorCode: z.string().nullable(),
+  lastErrorCode: appErrorCodeSchema.nullable(),
   createdAt: z.number().int().nonnegative(),
 }).strict()
 
@@ -77,7 +80,7 @@ export type OutboxMutationRecord = SyncMutation & {
   state: 'pending' | 'syncing' | 'failed'
   attempts: number
   nextAttemptAt?: number
-  lastErrorCode?: string
+  lastErrorCode?: AppErrorCode
   createdAt: number
 }
 
@@ -124,7 +127,7 @@ export interface UserDataRepositories {
     countPending(): number
     markSyncing(ids: readonly string[]): void
     markPending(id: string, nextAttemptAt?: number): void
-    markFailed(id: string, errorCode: string, nextAttemptAt?: number): void
+    markFailed(id: string, errorCode: AppErrorCode, nextAttemptAt?: number): void
     delete(id: string): void
   }
 }
@@ -369,21 +372,102 @@ function requireOwnedConversation(
   assertStoredOwner(owner.userId ?? undefined, ownerUserId)
 }
 
+function sameMutationIdentity(local: SyncMutation, remote: RemoteMutation): boolean {
+  return local.id === remote.id
+    && local.kind === remote.kind
+    && local.entityId === remote.entityId
+    && local.baseRevision === remote.baseRevision
+    && timestamp(local.occurredAt) === timestamp(remote.receivedAt)
+    && isDeepStrictEqual(local.payload, remote.payload)
+}
+
+function validateOutboxReceipt(database: SqliteDatabase, mutation: RemoteMutation): boolean {
+  const row = database.prepare(`
+    SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
+           payload_json AS payloadJson, state, attempts,
+           next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
+           occurred_at AS occurredAt, created_at AS createdAt
+    FROM outbox_mutations
+    WHERE id = @id
+  `).get({ id: mutation.id }) as Query | undefined
+  if (row === undefined) return false
+  if (!sameMutationIdentity(outboxFromRow(row), mutation)) throw new UserDataConsistencyError()
+  return true
+}
+
+function sameConversationCreate(
+  row: z.infer<typeof conversationRowSchema>,
+  mutation: Extract<RemoteMutation, { kind: 'conversation.create' }>,
+): boolean {
+  return row.title === mutation.payload.title
+    && row.titleState === mutation.payload.titleState
+    && row.createdAt === timestamp(mutation.payload.createdAt)
+    && row.lastActivityAt === timestamp(mutation.payload.lastActivityAt)
+    && row.metadataUpdatedAt === timestamp(mutation.payload.metadataUpdatedAt)
+}
+
+function storedMessage(database: SqliteDatabase, id: string) {
+  const row = database.prepare(`
+    SELECT id, conversation_id AS conversationId, role, blocks_json AS blocksJson,
+           ordinal, execution_id AS executionId, created_at AS createdAt
+    FROM messages
+    WHERE id = @id
+  `).get({ id }) as Query | undefined
+  if (row === undefined) return undefined
+  const parsed = parsePersisted(() => messageRowSchema.parse(row))
+  return parsePersisted(() => chatMessageSchema.parse({
+    id: parsed.id,
+    conversationId: parsed.conversationId,
+    role: parsed.role,
+    blocks: chatBlockSchema.array().parse(JSON.parse(parsed.blocksJson)),
+    ...(parsed.executionId === null ? {} : { executionId: parsed.executionId }),
+    createdAt: isoTimestamp(parsed.createdAt),
+  }))
+}
+
+function sameMessageAppend(
+  stored: NonNullable<ReturnType<typeof storedMessage>>,
+  mutation: Extract<RemoteMutation, { kind: 'message.append' }>,
+): boolean {
+  return stored.id === mutation.payload.id
+    && stored.conversationId === mutation.payload.conversationId
+    && stored.role === mutation.payload.role
+    && stored.executionId === mutation.payload.executionId
+    && timestamp(stored.createdAt) === timestamp(mutation.payload.createdAt)
+    && isDeepStrictEqual(stored.blocks, mutation.payload.blocks)
+}
+
 function applyRemoteMutation(
   database: SqliteDatabase,
   ownerUserId: string,
   mutation: RemoteMutation,
 ): void {
+  const matchingOutboxReceipt = validateOutboxReceipt(database, mutation)
   switch (mutation.kind) {
     case 'conversation.create': {
       const revision = requireRemoteRevision(mutation)
       const createdAt = timestamp(mutation.payload.createdAt)
-      const existing = database.prepare(`
-        SELECT user_id AS userId FROM conversations WHERE id = @id
+      const existingRaw = database.prepare(`
+        SELECT id, title, title_state AS titleState, revision, sync_state AS syncState,
+               created_at AS createdAt, last_activity_at AS lastActivityAt,
+               metadata_updated_at AS metadataUpdatedAt, user_id AS userId
+        FROM conversations
+        WHERE id = @id
       `).get({ id: mutation.entityId }) as Query | undefined
+      const existing = existingRaw === undefined
+        ? undefined
+        : parsePersisted(() => conversationRowSchema.parse(existingRaw))
       if (existing !== undefined) {
-        const owner = parsePersisted(() => z.object({ userId: z.string().nullable() }).parse(existing))
-        assertStoredOwner(owner.userId ?? undefined, ownerUserId)
+        assertStoredOwner(existing.userId ?? undefined, ownerUserId)
+        if (!sameConversationCreate(existing, mutation)) throw new UserDataConsistencyError()
+        if (matchingOutboxReceipt) {
+          database.prepare(`
+            UPDATE conversations
+            SET revision = @revision, sync_state = 'synced'
+            WHERE id = @id
+          `).run({ id: mutation.entityId, revision })
+        }
+        break
       }
       database.prepare(`
         INSERT INTO conversations (
@@ -393,16 +477,6 @@ function applyRemoteMutation(
           @id, @title, @titleState, @ownerUserId, @revision, 'synced', @createdAt, @metadataUpdatedAt,
           @lastActivityAt, @metadataUpdatedAt
         )
-        ON CONFLICT(id) DO UPDATE SET
-          title = excluded.title,
-          title_state = excluded.title_state,
-          user_id = excluded.user_id,
-          revision = excluded.revision,
-          sync_state = 'synced',
-          deleted_at = NULL,
-          last_activity_at = excluded.last_activity_at,
-          metadata_updated_at = excluded.metadata_updated_at,
-          updated_at = excluded.updated_at
       `).run({
         id: mutation.entityId,
         ownerUserId,
@@ -461,22 +535,29 @@ function applyRemoteMutation(
     case 'message.append': {
       requireOwnedConversation(database, ownerUserId, mutation.payload.conversationId)
       const createdAt = timestamp(mutation.payload.createdAt)
-      database.prepare(`
-        INSERT INTO messages (
-          id, conversation_id, role, blocks_json, ordinal, execution_id, created_at
-        ) VALUES (
-          @id, @conversationId, @role, @blocksJson,
-          COALESCE((SELECT MAX(ordinal) + 1 FROM messages WHERE conversation_id = @conversationId), 1),
-          @executionId, @createdAt
-        ) ON CONFLICT(id) DO NOTHING
-      `).run({
-        id: mutation.payload.id,
-        conversationId: mutation.payload.conversationId,
-        role: mutation.payload.role,
-        blocksJson: JSON.stringify(mutation.payload.blocks),
-        executionId: mutation.payload.executionId ?? null,
-        createdAt,
-      })
+      const existing = storedMessage(database, mutation.payload.id)
+      if (existing !== undefined && !sameMessageAppend(existing, mutation)) {
+        throw new UserDataConsistencyError()
+      }
+      if (existing === undefined) {
+        database.prepare(`
+          INSERT INTO messages (
+            id, conversation_id, role, blocks_json, ordinal, execution_id, created_at
+          ) VALUES (
+            @id, @conversationId, @role, @blocksJson,
+            COALESCE((SELECT MAX(ordinal) + 1 FROM messages WHERE conversation_id = @conversationId), 1),
+            @executionId, @createdAt
+          )
+        `).run({
+          id: mutation.payload.id,
+          conversationId: mutation.payload.conversationId,
+          role: mutation.payload.role,
+          blocksJson: JSON.stringify(mutation.payload.blocks),
+          executionId: mutation.payload.executionId ?? null,
+          createdAt,
+        })
+      }
+      if (existing !== undefined && !matchingOutboxReceipt) break
       const conversation = database.prepare(`
         UPDATE conversations
         SET revision = @revision,
@@ -495,7 +576,9 @@ function applyRemoteMutation(
     default:
       break
   }
-  database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: mutation.id })
+  if (matchingOutboxReceipt) {
+    database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: mutation.id })
+  }
 }
 
 function conversationPage(
@@ -652,6 +735,34 @@ function writeCheckpoint(database: SqliteDatabase, checkpoint: SyncCheckpoint): 
   `).run({ ...validated, remoteCursor: validated.remoteCursor ?? null })
 }
 
+function assertEveryMessageOwned(database: SqliteDatabase, ownerUserId: string): void {
+  const foreign = database.prepare(`
+    SELECT 1
+    FROM messages AS message
+    JOIN conversations AS conversation ON conversation.id = message.conversation_id
+    WHERE conversation.user_id IS NULL OR conversation.user_id <> @ownerUserId
+    LIMIT 1
+  `).get({ ownerUserId })
+  if (foreign !== undefined) throw new UserDataOwnerMismatchError()
+}
+
+function assertWorkflowApprovalOwned(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  executionId: string,
+): void {
+  const row = database.prepare(`
+    SELECT conversation.user_id AS userId
+    FROM agent_workflow_approvals AS approval
+    JOIN messages AS message ON message.id = approval.message_id
+    JOIN conversations AS conversation ON conversation.id = message.conversation_id
+    WHERE approval.execution_id = @executionId
+  `).get({ executionId }) as Query | undefined
+  if (row === undefined) return
+  const parsed = parsePersisted(() => z.object({ userId: z.string().nullable() }).parse(row))
+  assertStoredOwner(parsed.userId ?? undefined, ownerUserId)
+}
+
 export function createUserDataRepositories(
   database: SqliteDatabase,
   ownerUserId: string,
@@ -676,7 +787,7 @@ export function createUserDataRepositories(
     },
     claimLegacyAndListForUser(userId: string) {
       assertOwner(userId, ownerUserId)
-      return repositories.conversations.claimLegacyAndListForUser(ownerUserId)
+      return conversations.list()
     },
     insert(value: Parameters<AppRepositories['conversations']['insert']>[0]) {
       assertOwner(value.userId, ownerUserId)
@@ -708,11 +819,112 @@ export function createUserDataRepositories(
         updatedAt,
       }
     },
+    renameByUser(id: string, title: string) {
+      if (!conversations.get(id)) return undefined
+      return repositories.conversations.renameByUser(id, title)
+    },
+    claimTitleGeneration(id: string) {
+      if (!conversations.get(id)) return false
+      return repositories.conversations.claimTitleGeneration(id)
+    },
+    completeTitleGeneration(id: string, title: string) {
+      if (!conversations.get(id)) return undefined
+      return repositories.conversations.completeTitleGeneration(id, title)
+    },
+    failTitleGeneration(id: string) {
+      if (!conversations.get(id)) return
+      repositories.conversations.failTitleGeneration(id)
+    },
+    failPendingTitleGeneration(id: string) {
+      if (!conversations.get(id)) return
+      repositories.conversations.failPendingTitleGeneration(id)
+    },
+    failInterruptedTitleGenerations() {
+      return transaction(database, () => database.prepare(`
+        UPDATE conversations
+        SET title_state = 'failed', updated_at = @updatedAt
+        WHERE user_id = @ownerUserId AND title_state = 'generating'
+      `).run({ ownerUserId, updatedAt: Date.now() }).changes)
+    },
+    updateGenerationPreferences(
+      id: string,
+      preferences: Parameters<AppRepositories['conversations']['updateGenerationPreferences']>[1],
+    ) {
+      if (!conversations.get(id)) return undefined
+      return repositories.conversations.updateGenerationPreferences(id, preferences)
+    },
+    delete(id: string) {
+      if (!conversations.get(id)) return
+      repositories.conversations.delete(id)
+    },
     listPage: (input: { limit: 50; cursor?: string }) => conversationPage(database, ownerUserId, input),
+  }
+  const getOwnedMessage = (id: string) => {
+    const stored = repositories.messages.get(id)
+    if (stored) requireOwnedConversation(database, ownerUserId, stored.conversationId)
+    return stored
   }
   const messages = {
     ...repositories.messages,
-    listPage: (input: { conversationId: string; limit: 100; cursor?: string }) => messagePage(database, input),
+    insert(value: Parameters<AppRepositories['messages']['insert']>[0]) {
+      requireOwnedConversation(database, ownerUserId, value.conversationId)
+      return repositories.messages.insert(value)
+    },
+    insertWithAssets(
+      value: Parameters<AppRepositories['messages']['insertWithAssets']>[0],
+      assetIds: string[],
+    ) {
+      requireOwnedConversation(database, ownerUserId, value.conversationId)
+      return repositories.messages.insertWithAssets(value, assetIds)
+    },
+    get: getOwnedMessage,
+    listForConversation(conversationId: string) {
+      requireOwnedConversation(database, ownerUserId, conversationId)
+      return repositories.messages.listForConversation(conversationId)
+    },
+    listBeforeOrdinal(conversationId: string, beforeOrdinal: number) {
+      requireOwnedConversation(database, ownerUserId, conversationId)
+      return repositories.messages.listBeforeOrdinal(conversationId, beforeOrdinal)
+    },
+    update(
+      id: string,
+      value: Parameters<AppRepositories['messages']['update']>[1],
+    ) {
+      if (!getOwnedMessage(id)) return undefined
+      return repositories.messages.update(id, value)
+    },
+    replaceBlock(
+      messageId: string,
+      blockId: string,
+      replacement: unknown,
+    ) {
+      if (!getOwnedMessage(messageId)) throw new UserDataConsistencyError()
+      return repositories.messages.replaceBlock(messageId, blockId, replacement)
+    },
+    upgradeLegacyApprovals() {
+      assertEveryMessageOwned(database, ownerUserId)
+      return repositories.messages.upgradeLegacyApprovals()
+    },
+    invalidatePendingAgentApprovals() {
+      assertEveryMessageOwned(database, ownerUserId)
+      return repositories.messages.invalidatePendingAgentApprovals()
+    },
+    hasWorkflowApproval(executionId: string) {
+      assertWorkflowApprovalOwned(database, ownerUserId, executionId)
+      return repositories.messages.hasWorkflowApproval(executionId)
+    },
+    failInterruptedMediaGenerations() {
+      assertEveryMessageOwned(database, ownerUserId)
+      return repositories.messages.failInterruptedMediaGenerations()
+    },
+    failInterruptedBrowserStatuses(requestIds: readonly string[]) {
+      assertEveryMessageOwned(database, ownerUserId)
+      return repositories.messages.failInterruptedBrowserStatuses(requestIds)
+    },
+    listPage(input: { conversationId: string; limit: 100; cursor?: string }) {
+      requireOwnedConversation(database, ownerUserId, input.conversationId)
+      return messagePage(database, input)
+    },
   }
   const conversationContexts = {
     ...repositories.conversationContexts,
@@ -940,11 +1152,12 @@ export function createUserDataRepositories(
         `).run({ id, nextAttemptAt: nextAttemptAt ?? null }))
       },
       markFailed(id, errorCode, nextAttemptAt) {
+        const validatedErrorCode = parsePersisted(() => appErrorCodeSchema.parse(errorCode))
         transaction(database, () => database.prepare(`
           UPDATE outbox_mutations
           SET state = 'failed', next_attempt_at = @nextAttemptAt, last_error_code = @errorCode
           WHERE id = @id
-        `).run({ id, errorCode, nextAttemptAt: nextAttemptAt ?? null }))
+        `).run({ id, errorCode: validatedErrorCode, nextAttemptAt: nextAttemptAt ?? null }))
       },
       delete(id) {
         transaction(database, () => database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id }))

@@ -345,6 +345,15 @@ describe('UserDataStoreManager', () => {
       ) VALUES ('bob_conversation', 'private bob context', 1, 1, 1)
     `).run()
     raw.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, blocks_json, ordinal, created_at
+      ) VALUES ('bob_message', 'bob_conversation', 'assistant', ?, 1, 1)
+    `).run(JSON.stringify([{ type: 'text', text: 'private bob message' }]))
+    raw.prepare(`
+      INSERT INTO agent_workflow_approvals (execution_id, message_id, block_id)
+      VALUES ('bob_execution', 'bob_message', 'bob_block')
+    `).run()
+    raw.prepare(`
       INSERT INTO chat_runs (
         id, conversation_id, request_id, model, status, started_at, user_id, provider
       ) VALUES ('bob_run', 'bob_conversation', 'bob_request', 'model', 'completed', 1, 'cloud-bob', 'openrouter')
@@ -363,6 +372,38 @@ describe('UserDataStoreManager', () => {
 
     expect(() => store.conversationContexts.get('bob_conversation'))
       .toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    for (const mutate of [
+      () => store.conversations.renameByUser('bob_conversation', 'Stolen'),
+      () => store.conversations.claimTitleGeneration('bob_conversation'),
+      () => store.conversations.completeTitleGeneration('bob_conversation', 'Stolen'),
+      () => store.conversations.failTitleGeneration('bob_conversation'),
+      () => store.conversations.failPendingTitleGeneration('bob_conversation'),
+      () => store.conversations.updateGenerationPreferences('bob_conversation', {} as never),
+      () => store.conversations.delete('bob_conversation'),
+    ]) expect(mutate).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    for (const access of [
+      () => store.messages.get('bob_message'),
+      () => store.messages.listForConversation('bob_conversation'),
+      () => store.messages.listBeforeOrdinal('bob_conversation', 2),
+      () => store.messages.listPage({ conversationId: 'bob_conversation', limit: 100 }),
+      () => store.messages.insert({
+        id: 'alice_message_on_bob', conversationId: 'bob_conversation', role: 'user',
+        blocks: [{ type: 'text', text: 'forbidden' }], createdAt: 2,
+      }),
+      () => store.messages.insertWithAssets({
+        id: 'alice_asset_message_on_bob', conversationId: 'bob_conversation', role: 'user',
+        blocks: [{ type: 'text', text: 'forbidden' }], createdAt: 2,
+      }, []),
+      () => store.messages.update('bob_message', { executionId: 'stolen' }),
+      () => store.messages.replaceBlock('bob_message', 'bob_block', { type: 'text', text: 'stolen' }),
+      () => store.messages.hasWorkflowApproval('bob_execution'),
+    ]) expect(access).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    for (const bulkMutation of [
+      () => store.messages.upgradeLegacyApprovals(),
+      () => store.messages.invalidatePendingAgentApprovals(),
+      () => store.messages.failInterruptedMediaGenerations(),
+      () => store.messages.failInterruptedBrowserStatuses(['bob_request']),
+    ]) expect(bulkMutation).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
     expect(() => store.chatRuns.get('bob_run'))
       .toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
     expect(() => store.chatRuns.insert({
@@ -396,6 +437,134 @@ describe('UserDataStoreManager', () => {
       SELECT status FROM provider_usage_events WHERE operation_key = 'bob_pending_operation'
     `).get()).toEqual({ status: 'pending' })
     inspection.close()
+    manager.close()
+  })
+
+  it('accepts identical remote duplicates and rejects mismatched entity content atomically', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('remote_duplicate_create', 'duplicate_conversation')
+    const append = appendMessageMutation(
+      'remote_duplicate_message',
+      'duplicate_conversation',
+      'duplicate_message',
+    )
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_duplicate_01',
+      mutations: [pulledMutation(create, 1)],
+    }, 1)
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_duplicate_02',
+      mutations: [pulledMutation({ ...create, id: 'remote_duplicate_create_replay' }, 1)],
+    }, 2)
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_duplicate_03',
+      mutations: [pulledMutation(append, 2)],
+    }, 3)
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_duplicate_04',
+      mutations: [pulledMutation({ ...append, id: 'remote_duplicate_message_replay' }, 2)],
+    }, 4)
+    expect(store.messages.listForConversation('duplicate_conversation')).toHaveLength(1)
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_duplicate_04')
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_duplicate_05',
+      mutations: [
+        pulledMutation(
+          createConversationMutation('rolled_back_before_duplicate', 'rolled_back_duplicate'),
+          1,
+        ),
+        pulledMutation({
+          ...create,
+          id: 'remote_duplicate_create_mismatch',
+          payload: { ...create.payload, title: 'Mismatched title' },
+        }, 3),
+      ],
+    }, 5)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.conversations.get('rolled_back_duplicate')).toBeUndefined()
+    expect(store.conversations.get('duplicate_conversation')?.title).toBe(create.payload.title)
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_duplicate_04')
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_duplicate_06',
+      mutations: [pulledMutation({
+        ...append,
+        id: 'remote_duplicate_message_mismatch',
+        payload: {
+          ...append.payload,
+          blocks: [{ type: 'text', text: 'mismatched message' }],
+        },
+      }, 3)],
+    }, 6)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.messages.get('duplicate_message')?.blocks)
+      .toEqual([{ type: 'text', text: 'duplicate_message' }])
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_duplicate_04')
+    manager.close()
+  })
+
+  it('acknowledges only a canonically matching local outbox receipt', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const matching = createConversationMutation('receipt_match', 'receipt_conversation')
+    store.outbox.recordWithConversation(matching)
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_receipt_01',
+      mutations: [pulledMutation(matching, 1)],
+    }, 1)
+    expect(store.outbox.find('receipt_match')).toBeUndefined()
+    expect(store.conversations.listPage({ limit: 50 }).items)
+      .toContainEqual(expect.objectContaining({
+        id: 'receipt_conversation', revision: 1, syncState: 'synced',
+      }))
+
+    const collision = createConversationMutation('receipt_collision', 'collision_conversation')
+    store.outbox.recordWithConversation(collision)
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_receipt_02',
+      mutations: [pulledMutation({
+        ...collision,
+        entityId: 'forged_collision_conversation',
+        payload: { ...collision.payload, title: 'Forged collision' },
+      }, 1)],
+    }, 2)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.outbox.find('receipt_collision')).toBeDefined()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_receipt_01')
+    manager.close()
+  })
+
+  it('validates persisted and newly assigned outbox error codes', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    store.outbox.record(createConversationMutation('error_code_mutation', 'error_code_conversation'))
+
+    expect(() => store.outbox.markFailed(
+      'error_code_mutation',
+      'NOT_A_SAFE_ERROR' as never,
+    )).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.outbox.find('error_code_mutation')).toMatchObject({ state: 'pending' })
+    manager.close()
+
+    const raw = new Database(cachePath(root, 'cloud-alice'))
+    raw.prepare(`
+      UPDATE outbox_mutations SET last_error_code = 'NOT_A_SAFE_ERROR'
+      WHERE id = 'error_code_mutation'
+    `).run()
+    raw.close()
+    const reopened = manager.open('cloud-alice')
+    expect(() => reopened.outbox.find('error_code_mutation'))
+      .toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
     manager.close()
   })
 
