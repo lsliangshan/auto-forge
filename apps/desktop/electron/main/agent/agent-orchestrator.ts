@@ -165,7 +165,9 @@ const browserActSuccessSchema = z.object({
 
 const browserHandoffResultSchema = z.object({
   kind: z.literal('handoff'),
-  code: z.enum(['AUTH_REQUIRED', 'MANUAL_ACTION_REQUIRED', 'UNSUPPORTED_CONTROL']),
+  code: z.enum([
+    'AUTH_REQUIRED', 'MANUAL_ACTION_REQUIRED', 'MANUAL_INTERVENTION_REQUIRED', 'UNSUPPORTED_CONTROL',
+  ]),
 }).strict()
 
 const browserToolErrorResultSchema = z.object({
@@ -439,7 +441,7 @@ interface ActiveAgentRun {
   browserEvidenceRevision: number
   browserEvidenceMatchRevision?: number
   browserEvidenceMatchedCandidateId?: string
-  browserHandoffCode?: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL'
+  browserHandoffCode?: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'MANUAL_INTERVENTION_REQUIRED' | 'UNSUPPORTED_CONTROL'
   browserCleanup?: Promise<void>
   currentUser: BrowserContinuationRunContext['currentUser']
   controller: AbortController

@@ -13,6 +13,7 @@ import type {
   BrowserPrivateFieldEvidence,
   BrowserResolvedElementReference,
 } from '../browser/browser-page-inspector.js'
+import type { BrowserManualResumeWaitInput } from '../browser/browser-manual-resume-coordinator.js'
 
 function binding(): BrowserContinuationBinding {
   return Object.freeze({
@@ -59,6 +60,8 @@ function harness(options: {
   terminalRunTtlMs?: number
   isRunActive?: (runId: string) => boolean
   waitForLogin?: (input: { probe: () => Promise<'authenticated' | 'required' | 'unknown'> }) => Promise<void>
+  waitForManual?: (input: BrowserManualResumeWaitInput) => Promise<void>
+  includeManualWait?: boolean
 } = {}) {
   const liveBinding = binding()
   let current = true
@@ -127,12 +130,19 @@ function harness(options: {
     })),
     cancel: vi.fn(),
   }
+  const manualWait = {
+    wait: vi.fn(options.waitForManual ?? (async (input: BrowserManualResumeWaitInput) => {
+      await input.promote()
+    })),
+    cancel: vi.fn(),
+  }
   const audits: BrowserActionAuditEntry[] = []
   const executor = new BrowserContinuationToolExecutor({
     registry: { acquire: vi.fn(async () => lease) },
     inspector: inspector as never,
     workspace,
     loginWait,
+    ...(options.includeManualWait === false ? {} : { manualWait }),
     audits: {
       list: vi.fn(() => [...audits]),
       insert: vi.fn((entry: BrowserActionAuditEntry) => { audits.push(entry); return entry }),
@@ -143,7 +153,10 @@ function harness(options: {
     ...(options.terminalRunLimit === undefined ? {} : { terminalRunLimit: options.terminalRunLimit }),
     ...(options.terminalRunTtlMs === undefined ? {} : { terminalRunTtlMs: options.terminalRunTtlMs }),
   })
-  return { executor, inspector, workspace, loginWait, audits, lease, release, assertEligible, state }
+  return {
+    executor, inspector, workspace, loginWait, manualWait,
+    audits, lease, release, assertEligible, state,
+  }
 }
 
 describe('BrowserContinuationToolExecutor', () => {
@@ -284,7 +297,8 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.workspace.highlightContinuationTarget).toHaveBeenCalledWith(
       'tab_1', 'ref_submit', expect.objectContaining({ backendNodeId: 99 }),
     )
-    expect(test.release).toHaveBeenCalledOnce()
+    expect(test.workspace.suspendContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1')
+    expect(test.release).not.toHaveBeenCalled()
     expect(test.inspector.endRun).toHaveBeenCalledWith('agent_run_1')
     expect(test.audits.slice(1)).toEqual([
       expect.objectContaining({ action: 'click', targetSummary: 'button control', outcome: 'handed_off' }),
@@ -418,6 +432,100 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(liveAuth.workspace.performContinuationAction).not.toHaveBeenCalled()
   })
 
+  it.each(['TARGET_AMBIGUOUS', 'AUTH_STATE_UNKNOWN'] as const)(
+    'normalizes an owned live-page inspection failure %s to resumable manual intervention',
+    async (code) => {
+      const test = harness()
+      test.inspector.inspect.mockRejectedValueOnce({ code })
+
+      await expect(test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '读取页面',
+      }, run())).resolves.toEqual({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' })
+
+      expect(test.workspace.suspendContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1')
+      expect(test.release).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['TARGET_AMBIGUOUS', 'AUTH_STATE_UNKNOWN'] as const)(
+    'normalizes an owned live-page action failure %s to resumable manual intervention',
+    async (code) => {
+      const test = harness()
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '保存',
+      }, run())
+      test.workspace.performContinuationAction.mockRejectedValueOnce({ code })
+
+      await expect(test.executor.execute('browser_session_act', {
+        bindingId: 'binding_1', snapshotId: 'snapshot_1',
+        actions: [{ type: 'click', ref: 'ref_save' }],
+      }, run())).resolves.toEqual({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' })
+
+      expect(test.workspace.suspendContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1')
+      expect(test.release).not.toHaveBeenCalled()
+    },
+  )
+
+  it('keeps a normalizable blocker terminal after continuation eligibility is lost', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '保存',
+    }, run())
+    test.assertEligible.mockClear()
+    test.assertEligible
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce({ code: 'WORKFLOW_CHANGED' })
+    test.inspector.currentPageContext.mockRejectedValueOnce({ code: 'TARGET_AMBIGUOUS' })
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1',
+      actions: [{ type: 'click', ref: 'ref_save' }],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'WORKFLOW_CHANGED' })
+
+    expect(test.workspace.suspendContinuation).not.toHaveBeenCalled()
+    expect(test.release).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a normalizable blocker terminal after the live page leaves policy', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '保存',
+    }, run())
+    test.workspace.performContinuationAction.mockImplementationOnce(async () => {
+      test.state.origin = 'https://outside.example'
+      test.state.url = 'https://outside.example/landing'
+      throw { code: 'AUTH_STATE_UNKNOWN' }
+    })
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1', snapshotId: 'snapshot_1',
+      actions: [{ type: 'click', ref: 'ref_save' }],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'DOMAIN_BLOCKED' })
+
+    expect(test.workspace.suspendContinuation).not.toHaveBeenCalled()
+    expect(test.release).toHaveBeenCalledOnce()
+  })
+
+  it.each(['PAGE_CLOSED', 'INTERNAL_ERROR'] as const)(
+    'keeps the terminal live-page failure %s terminal',
+    async (code) => {
+      const test = harness()
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '保存',
+      }, run())
+      test.inspector.currentPageContext.mockRejectedValueOnce({ code })
+
+      await expect(test.executor.execute('browser_session_act', {
+        bindingId: 'binding_1', snapshotId: 'snapshot_1',
+        actions: [{ type: 'click', ref: 'ref_save' }],
+      }, run())).resolves.toEqual({ kind: 'tool_error', code })
+
+      expect(test.workspace.suspendContinuation).not.toHaveBeenCalled()
+      expect(test.release).toHaveBeenCalledOnce()
+    },
+  )
+
   it('suspends for authentication, resumes automatically, and excludes login wait from the active limit', async () => {
     let now = 0
     const test = harness({ now: () => now })
@@ -446,6 +554,138 @@ describe('BrowserContinuationToolExecutor', () => {
     await expect(test.executor.execute('browser_session_inspect', {
       bindingId: 'binding_1', intent: '读取工作居住证有效期',
     }, run())).resolves.toMatchObject({ kind: 'success' })
+  })
+
+  it.each([
+    ['manual_action', 'MANUAL_ACTION_REQUIRED'],
+    ['unsupported_control', 'UNSUPPORTED_CONTROL'],
+  ] as const)('suspends an explicit %s handoff without releasing authority', async (reason, code) => {
+    const test = harness()
+
+    await expect(test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason,
+    }, run())).resolves.toEqual({ kind: 'handoff', code })
+
+    expect(test.workspace.suspendContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1')
+    expect(test.release).not.toHaveBeenCalled()
+    expect(test.lease.isCurrent(test.lease.binding)).toBe(true)
+  })
+
+  it('resumes manual intervention from the exact activity-aware page and excludes the wait from the limit', async () => {
+    let now = 0
+    const test = harness({ now: () => now })
+    test.state.activityRevision = 7
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+    now = 600_000
+
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'resumed' })
+
+    expect(test.manualWait.wait).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'agent_run_1', tabId: 'tab_1', baselineActivityRevision: 7,
+    }))
+    expect(test.workspace.resumeContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1', {
+      origin: 'https://service.example', url: 'https://service.example/form',
+      navigationEpoch: 1, activityRevision: 7,
+    })
+    expect(test.release).not.toHaveBeenCalled()
+    now = 600_001
+    await expect(test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '继续读取',
+    }, run())).resolves.toMatchObject({ kind: 'success' })
+  })
+
+  it('lets the manual coordinator retry PAGE_CHANGED promotion without terminating authority', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+    test.workspace.resumeContinuation.mockRejectedValueOnce({ code: 'PAGE_CHANGED' })
+    test.manualWait.wait.mockImplementationOnce(async (input) => {
+      await expect(input.promote()).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+      test.state.url = 'https://service.example/after-manual'
+      test.state.navigationEpoch = 2
+      test.state.activityRevision = 3
+      await input.promote()
+    })
+
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'resumed' })
+
+    expect(test.manualWait.wait).toHaveBeenCalledOnce()
+    expect(test.workspace.resumeContinuation).toHaveBeenCalledTimes(2)
+    expect(test.workspace.resumeContinuation).toHaveBeenLastCalledWith('tab_1', 'agent_run_1', {
+      origin: 'https://service.example', url: 'https://service.example/after-manual',
+      navigationEpoch: 2, activityRevision: 3,
+    })
+    expect(test.release).not.toHaveBeenCalled()
+  })
+
+  it('requires a fresh wait after every manual handoff', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'resumed' })
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+
+    test.state.activityRevision = 2
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'resumed' })
+
+    expect(test.manualWait.wait).toHaveBeenCalledTimes(2)
+    expect(test.manualWait.wait.mock.calls.map(([input]) => input.baselineActivityRevision))
+      .toEqual([0, 2])
+  })
+
+  it.each(['endRun', 'cancel'] as const)(
+    '%s cancels login and manual coordinators exactly once',
+    async (method) => {
+      const test = harness()
+      await test.executor.execute('browser_session_handoff', {
+        bindingId: 'binding_1', reason: 'manual_action',
+      }, run())
+
+      await test.executor[method]('agent_run_1')
+
+      expect(test.loginWait.cancel).toHaveBeenCalledOnce()
+      expect(test.manualWait.cancel).toHaveBeenCalledOnce()
+      expect(test.release).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('terminates manual suspension when the coordinator reports a terminal failure', async () => {
+    const test = harness({ waitForManual: async () => { throw { code: 'PAGE_CLOSED' } } })
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CLOSED' })
+
+    expect(test.loginWait.cancel).toHaveBeenCalledOnce()
+    expect(test.manualWait.cancel).toHaveBeenCalledOnce()
+    expect(test.release).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed and terminates when the incremental manual coordinator dependency is absent', async () => {
+    const test = harness({ includeManualWait: false })
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
+
+    expect(test.release).toHaveBeenCalledOnce()
+    expect(test.executor['runs'].has('agent_run_1')).toBe(false)
   })
 
   it.each([
@@ -714,14 +954,14 @@ describe('BrowserContinuationToolExecutor', () => {
     { phase: 'resolve', code: 'PAGE_CHANGED' as const },
     { phase: 'focus', code: 'PAGE_CLOSED' as const },
     { phase: 'highlight', code: 'PAGE_CHANGED' as const },
-    { phase: 'release', code: 'PAGE_BUSY' as const },
+    { phase: 'suspend', code: 'PAGE_BUSY' as const },
   ])('records exactly one failed explicit handoff audit when $phase fails', async ({ phase, code }) => {
     const test = harness()
     await test.executor.execute('browser_session_inspect', { bindingId: 'binding_1', intent: '提交' }, run())
     if (phase === 'resolve') test.inspector.resolveRef.mockRejectedValueOnce({ code })
     if (phase === 'focus') test.workspace.focusContinuation.mockRejectedValueOnce({ code })
     if (phase === 'highlight') test.workspace.highlightContinuationTarget.mockRejectedValueOnce({ code })
-    if (phase === 'release') test.release.mockRejectedValueOnce({ code })
+    if (phase === 'suspend') test.workspace.suspendContinuation.mockRejectedValueOnce({ code })
 
     await expect(test.executor.execute('browser_session_handoff', {
       bindingId: 'binding_1', reason: 'manual_action', ref: 'ref_submit',

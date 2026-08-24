@@ -29,7 +29,10 @@ export interface BrowserActionGuardContext {
 export type BrowserActionDecision =
   | { readonly kind: 'allowed' }
   | { readonly kind: 'blocked'; readonly code: AppErrorCode }
-  | { readonly kind: 'handoff'; readonly code: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL' }
+  | {
+      readonly kind: 'handoff'
+      readonly code: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'MANUAL_INTERVENTION_REQUIRED' | 'UNSUPPORTED_CONTROL'
+    }
 
 const loginText = /(?:^|\s)(?:log[ -]?in|sign[ -]?in)(?:\s|$)|登录|登陆/iu
 const logoutText = /退出登录|注销登录|log[ -]?out|sign[ -]?out/iu
@@ -196,7 +199,9 @@ export class BrowserActionGuard {
       return { kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' }
     }
     if (context.target?.enabled === false || !actionSupported(context.action, context.target)) {
-      return { kind: 'blocked', code: context.target ? 'UNSUPPORTED_CONTROL' : 'PAGE_CHANGED' }
+      return context.target
+        ? { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }
+        : { kind: 'blocked', code: 'PAGE_CHANGED' }
     }
     if (context.action.type === 'click') {
       if (context.targetContext?.formOwned && context.targetContext.expectedNavigation) {

@@ -31,6 +31,7 @@ import type {
   BrowserValueSource,
 } from '../browser/browser-continuation-types.js'
 import type { BrowserLoginWaitCoordinator } from '../browser/browser-login-wait-coordinator.js'
+import type { BrowserManualResumeCoordinator } from '../browser/browser-manual-resume-coordinator.js'
 import { classifyBrowserActionRisk } from './capability-risk.js'
 
 const identifier = z.string().trim().min(1).max(128)
@@ -125,6 +126,7 @@ interface BrowserContinuationToolExecutorDependencies {
   readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
   readonly loginWait: Pick<BrowserLoginWaitCoordinator, 'wait' | 'cancel'>
+  readonly manualWait?: Pick<BrowserManualResumeCoordinator, 'wait' | 'cancel'>
   readonly audits: BrowserActionAuditRepository
   readonly guard?: BrowserActionGuard
   readonly id?: () => string
@@ -134,14 +136,18 @@ interface BrowserContinuationToolExecutorDependencies {
   readonly terminalRunTtlMs?: number
 }
 
+type BrowserSuspension =
+  | { readonly kind: 'authentication'; readonly requiredPage: BrowserContinuationPageState }
+  | { readonly kind: 'manual_intervention'; readonly baselineActivityRevision: number }
+
 interface ActiveRunState {
   readonly runId: string
   readonly bindingId: string
   readonly startedAt: number
   pausedAt?: number
   pausedDurationMs: number
-  suspendedForAuthentication: boolean
-  authenticationRequiredPage?: BrowserContinuationPageState
+  suspension?: BrowserSuspension
+  waitersCancelled: boolean
   lease?: BrowserContinuationLease
   nextAuditSequence?: number
   readonly snapshots: Map<string, BrowserPageSnapshot>
@@ -153,11 +159,18 @@ export type BrowserContinuationToolResult =
       readonly data: Readonly<Record<string, unknown>>
       readonly privateFieldEvidence?: readonly BrowserPrivateFieldEvidence[]
     }
-  | { readonly kind: 'handoff'; readonly code: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL' }
+  | {
+      readonly kind: 'handoff'
+      readonly code: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'MANUAL_INTERVENTION_REQUIRED' | 'UNSUPPORTED_CONTROL'
+    }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
 export type BrowserAuthenticationWaitResult =
   | { readonly kind: 'authenticated' }
+  | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
+
+export type BrowserManualWaitResult =
+  | { readonly kind: 'resumed' }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
 function failure(code: AppErrorCode): AppError {
@@ -284,8 +297,8 @@ export class BrowserContinuationToolExecutor {
   }
 
   async endRun(runId: string): Promise<void> {
-    this.dependencies.loginWait.cancel(runId)
     const state = this.runs.get(runId)
+    this.cancelWaiters(runId, state)
     if (state) await this.cleanupAuthority(state)
     this.runs.delete(runId)
     this.rememberTerminalRun(runId)
@@ -304,11 +317,14 @@ export class BrowserContinuationToolExecutor {
     context: BrowserContinuationRunContext,
   ): Promise<BrowserAuthenticationWaitResult> {
     const state = this.runs.get(runId)
-    if (!state || state.runId !== context.runId || !state.suspendedForAuthentication || !state.lease) {
+    const suspension = state?.suspension
+    if (!state || state.runId !== context.runId
+      || suspension?.kind !== 'authentication' || !state.lease) {
       return { kind: 'tool_error', code: 'CANCELLED' }
     }
     const lease = state.lease
     try {
+      let authenticationRequiredPage = suspension.requiredPage
       let unknownCandidate: BrowserContinuationPageState | undefined
       while (true) {
         this.assertActive(state, context)
@@ -333,7 +349,7 @@ export class BrowserContinuationToolExecutor {
               ...(context.signal === undefined ? {} : { signal: context.signal }),
             })
             if (live.auth === 'required') {
-              state.authenticationRequiredPage = page
+              authenticationRequiredPage = page
               unknownCandidate = undefined
               authenticatedPage = undefined
               return live.auth
@@ -342,8 +358,7 @@ export class BrowserContinuationToolExecutor {
               authenticatedPage = page
               return live.auth
             }
-            if (state.authenticationRequiredPage
-              && !samePage(page, state.authenticationRequiredPage)
+            if (!samePage(page, authenticationRequiredPage)
               && unknownCandidate
               && samePage(page, unknownCandidate)) {
               authenticatedPage = page
@@ -369,12 +384,51 @@ export class BrowserContinuationToolExecutor {
           unknownCandidate = undefined
         }
       }
-      const resumedAt = this.now()
-      state.pausedDurationMs += state.pausedAt === undefined ? 0 : resumedAt - state.pausedAt
-      state.pausedAt = undefined
-      state.suspendedForAuthentication = false
-      state.authenticationRequiredPage = undefined
+      this.completeSuspension(state)
       return { kind: 'authenticated' }
+    } catch (error) {
+      const safe = toSafeAppError(error)
+      if (this.runs.get(runId) === state) await this.terminate(state)
+      return { kind: 'tool_error', code: safe.code }
+    }
+  }
+
+  async waitForManualIntervention(
+    runId: string,
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserManualWaitResult> {
+    const state = this.runs.get(runId)
+    const suspension = state?.suspension
+    if (!state || state.runId !== context.runId
+      || suspension?.kind !== 'manual_intervention' || !state.lease) {
+      return { kind: 'tool_error', code: 'CANCELLED' }
+    }
+    const lease = state.lease
+    try {
+      const manualWait = this.dependencies.manualWait
+      if (!manualWait) throw failure('INTERNAL_ERROR')
+      this.assertActive(state, context)
+      await manualWait.wait({
+        runId,
+        tabId: lease.binding.tabId,
+        baselineActivityRevision: suspension.baselineActivityRevision,
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
+        promote: async () => {
+          await lease.assertEligible()
+          this.assertActive(state, context)
+          const expected = await this.dependencies.workspace.getContinuationState(
+            lease.binding.tabId,
+            context.runId,
+          )
+          await this.dependencies.workspace.resumeContinuation(
+            lease.binding.tabId,
+            context.runId,
+            expected,
+          )
+        },
+      })
+      this.completeSuspension(state)
+      return { kind: 'resumed' }
     } catch (error) {
       const safe = toSafeAppError(error)
       if (this.runs.get(runId) === state) await this.terminate(state)
@@ -399,7 +453,7 @@ export class BrowserContinuationToolExecutor {
       bindingId,
       startedAt: this.now(),
       pausedDurationMs: 0,
-      suspendedForAuthentication: false,
+      waitersCancelled: false,
       snapshots: new Map(),
     }
     this.runs.set(context.runId, state)
@@ -463,8 +517,46 @@ export class BrowserContinuationToolExecutor {
           : { privateFieldEvidence: Object.freeze([...privateFieldEvidence]) }),
       }
     } catch (error) {
+      const safe = toSafeAppError(error)
+      if (!audited && this.isManualInterventionBlocker(safe.code)) {
+        let handoffPage: BrowserContinuationPageState
+        try {
+          handoffPage = await this.manualInterventionPage(state, context, { type: 'focus' })
+        } catch (terminalError) {
+          const terminal = toSafeAppError(terminalError)
+          this.audit(
+            state, context, page.origin, 'inspect', 'page', 'sensitive_read',
+            terminal.code === 'CANCELLED' ? 'cancelled' : 'failed', terminal.code,
+          )
+          audited = true
+          throw terminalError
+        }
+        try {
+          const result = await this.performHandoff(
+            state, context, handoffPage, undefined, undefined,
+            { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' },
+          )
+          this.audit(
+            state, context, handoffPage.origin, 'inspect', 'page',
+            'sensitive_read', 'handed_off', 'MANUAL_INTERVENTION_REQUIRED',
+          )
+          audited = true
+          return result
+        } catch (handoffError) {
+          const handoffFailure = toSafeAppError(handoffError)
+          this.audit(
+            state, context, handoffPage.origin, 'inspect', 'page', 'sensitive_read',
+            handoffFailure.code === 'CANCELLED' ? 'cancelled' : 'failed', handoffFailure.code,
+          )
+          this.audit(
+            state, context, handoffPage.origin, 'handoff', 'page',
+            'external_action', 'failed', handoffFailure.code,
+          )
+          audited = true
+          throw handoffError
+        }
+      }
       if (!audited) {
-        const safe = toSafeAppError(error)
         this.audit(
           state, context, page.origin, 'inspect', 'page', 'sensitive_read',
           safe.code === 'CANCELLED' ? 'cancelled' : 'failed', safe.code,
@@ -608,8 +700,43 @@ export class BrowserContinuationToolExecutor {
         this.auditAction(state, context, page.origin, normalized, target, 'completed')
         audited = true
       } catch (error) {
+        const safe = toSafeAppError(error)
+        if (!audited && this.isManualInterventionBlocker(safe.code)) {
+          let handoffPage: BrowserContinuationPageState
+          try {
+            handoffPage = await this.manualInterventionPage(state, context, normalized)
+          } catch (terminalError) {
+            const terminal = toSafeAppError(terminalError)
+            this.auditAction(
+              state, context, page.origin, normalized, target,
+              terminal.code === 'CANCELLED' ? 'cancelled' : 'failed', terminal.code,
+            )
+            audited = true
+            throw terminalError
+          }
+          try {
+            const result = await this.performHandoff(
+              state, context, handoffPage, target, undefined,
+              { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' },
+              { action: normalized, target },
+            )
+            audited = true
+            return result
+          } catch (handoffError) {
+            const handoffFailure = toSafeAppError(handoffError)
+            this.auditAction(
+              state, context, handoffPage.origin, normalized, target,
+              handoffFailure.code === 'CANCELLED' ? 'cancelled' : 'failed', handoffFailure.code,
+            )
+            this.audit(
+              state, context, handoffPage.origin, 'handoff', targetSummary(target),
+              'external_action', 'failed', handoffFailure.code,
+            )
+            audited = true
+            throw handoffError
+          }
+        }
         if (!audited) {
-          const safe = toSafeAppError(error)
           this.auditAction(
             state, context, page.origin, normalized, target,
             safe.code === 'CANCELLED' ? 'cancelled' : 'failed', safe.code,
@@ -684,16 +811,13 @@ export class BrowserContinuationToolExecutor {
         },
       )
     }
-    if (decision.code === 'AUTH_REQUIRED') {
-      state.snapshots.clear()
-      this.dependencies.inspector.endRun(state.runId)
-      await this.dependencies.workspace.suspendContinuation(lease.binding.tabId, context.runId)
-      state.suspendedForAuthentication = true
-      state.authenticationRequiredPage = page
-      state.pausedAt = this.now()
-    } else {
-      await this.cleanupAuthority(state, true)
-    }
+    state.snapshots.clear()
+    this.dependencies.inspector.endRun(state.runId)
+    await this.dependencies.workspace.suspendContinuation(lease.binding.tabId, context.runId)
+    state.suspension = decision.code === 'AUTH_REQUIRED'
+      ? { kind: 'authentication', requiredPage: page }
+      : { kind: 'manual_intervention', baselineActivityRevision: page.activityRevision }
+    state.pausedAt = this.now()
     if (trigger) {
       this.auditAction(
         state, context, page.origin, trigger.action, trigger.target, 'handed_off', decision.code,
@@ -703,10 +827,6 @@ export class BrowserContinuationToolExecutor {
       state, context, page.origin, 'handoff', targetSummary(target),
       'external_action', 'handed_off', decision.code,
     )
-    if (decision.code !== 'AUTH_REQUIRED') {
-      this.runs.delete(context.runId)
-      this.rememberTerminalRun(context.runId)
-    }
     return { kind: 'handoff', code: decision.code }
   }
 
@@ -752,6 +872,34 @@ export class BrowserContinuationToolExecutor {
     }
     return (lease.binding.permissionMatrix[capability] ?? [])
       .some((pattern) => matchesHttpsUrlPattern(pattern, page.url))
+  }
+
+  private isManualInterventionBlocker(code: AppErrorCode): boolean {
+    return code === 'TARGET_AMBIGUOUS' || code === 'AUTH_STATE_UNKNOWN'
+  }
+
+  private async manualInterventionPage(
+    state: ActiveRunState,
+    context: BrowserContinuationRunContext,
+    action: BrowserAction,
+  ): Promise<BrowserContinuationPageState> {
+    const lease = state.lease
+    if (!lease) throw failure('CANCELLED')
+    await lease.assertEligible()
+    this.assertActive(state, context)
+    const page = await this.dependencies.workspace.getContinuationState(
+      lease.binding.tabId,
+      context.runId,
+    )
+    if (!this.postActionAllowed(action, lease, page)) throw failure('DOMAIN_BLOCKED')
+    return page
+  }
+
+  private completeSuspension(state: ActiveRunState): void {
+    const resumedAt = this.now()
+    state.pausedDurationMs += state.pausedAt === undefined ? 0 : resumedAt - state.pausedAt
+    state.pausedAt = undefined
+    state.suspension = undefined
   }
 
   private sourceEvidence(
@@ -840,10 +988,17 @@ export class BrowserContinuationToolExecutor {
   }
 
   private async terminate(state: ActiveRunState): Promise<void> {
-    this.dependencies.loginWait.cancel(state.runId)
+    this.cancelWaiters(state.runId, state)
     await this.cleanupAuthority(state)
     this.runs.delete(state.runId)
     this.rememberTerminalRun(state.runId)
+  }
+
+  private cancelWaiters(runId: string, state?: ActiveRunState): void {
+    if (state?.waitersCancelled) return
+    if (state) state.waitersCancelled = true
+    this.dependencies.loginWait.cancel(runId)
+    this.dependencies.manualWait?.cancel(runId)
   }
 
   private isTerminalRun(runId: string): boolean {

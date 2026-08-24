@@ -140,13 +140,16 @@ describe('BrowserActionGuard', () => {
     }))).toEqual({ kind: 'handoff', code: 'MANUAL_ACTION_REQUIRED' })
   })
 
-  it('fails stale and unsupported target semantics closed', () => {
+  it('keeps stale target semantics terminal', () => {
     expect(guard.decide(context({ snapshotFresh: false })))
       .toEqual({ kind: 'blocked', code: 'PAGE_CHANGED' })
+  })
+
+  it('hands a live unsupported target to manual intervention', () => {
     expect(guard.decide(context({
       action: { type: 'click', ref: 'ref_text' },
       target: node('textbox', '说明', { ref: 'ref_text', actions: ['fill'] }),
-    }))).toEqual({ kind: 'blocked', code: 'UNSUPPORTED_CONTROL' })
+    }))).toEqual({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' })
   })
 
   it('allows scrolling an exact static text target without a declared scroll action', () => {
@@ -168,14 +171,18 @@ describe('BrowserActionGuard', () => {
   })
 
   it.each([
-    ['a missing target', undefined, 'PAGE_CHANGED'],
-    ['a mismatched ref', node('statictext', '居住证有效期', { ref: 'ref_other', actions: [] }), 'UNSUPPORTED_CONTROL'],
-    ['a disabled target', node('statictext', '居住证有效期', { ref: 'ref_expiry', enabled: false, actions: [] }), 'UNSUPPORTED_CONTROL'],
-  ] as const)('blocks targeted scrolling for %s', (_case, target, code) => {
+    ['a missing target', undefined, { kind: 'blocked', code: 'PAGE_CHANGED' }],
+    ['an ambiguous ref', node('statictext', '居住证有效期', { ref: 'ref_other', actions: [] }), {
+      kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED',
+    }],
+    ['a disabled live target', node('statictext', '居住证有效期', { ref: 'ref_expiry', enabled: false, actions: [] }), {
+      kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED',
+    }],
+  ] as const)('handles targeted scrolling for %s', (_case, target, decision) => {
     expect(guard.decide(context({
       action: { type: 'scroll', ref: 'ref_expiry', direction: 'down' },
       target,
-    }))).toEqual({ kind: 'blocked', code })
+    }))).toEqual(decision)
   })
 
   it.each([
@@ -207,7 +214,7 @@ describe('BrowserActionGuard', () => {
   it('never dispatches a disabled control even if stale action metadata advertises click', () => {
     expect(guard.decide(context({
       target: node('button', '保存草稿', { ref: 'ref_save', enabled: false, actions: ['click'] }),
-    }))).toEqual({ kind: 'blocked', code: 'UNSUPPORTED_CONTROL' })
+    }))).toEqual({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' })
   })
 
   it('honors exact declared manual role locators and fails unresolved CSS manual locators closed', () => {
