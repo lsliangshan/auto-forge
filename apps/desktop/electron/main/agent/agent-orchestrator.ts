@@ -591,6 +591,22 @@ function normalizedTrustedText(value: string): string {
   return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
+const WORKFLOW_LAUNCH_PREFIXES = [
+  '', '查询', '查询一下', '打开', '运行', '执行', '启动', '使用', '办理',
+  '请查询', '请打开', '帮我查询', '帮我打开',
+] as const
+
+function workflowLaunchOnlyRequest(
+  content: string,
+  candidates: readonly WorkflowCandidate[],
+): boolean {
+  const request = normalizedTrustedText(content)
+  const matches = candidates.filter(({ workflow }) => WORKFLOW_LAUNCH_PREFIXES.some((prefix) => (
+    request === normalizedTrustedText(`${prefix}${workflow.name}`)
+  )))
+  return matches.length === 1
+}
+
 function trustedRequestNamesTarget(request: string, target: BrowserSemanticNode): boolean {
   const name = normalizedTrustedText(target.name)
   return name.length > 0 && normalizedTrustedText(request).includes(name)
@@ -824,6 +840,12 @@ export class AgentOrchestrator {
           ? undefined
           : { type: 'function', function: { name: exactCandidate.toolName } }
         active.workflows = new Map(candidates.map((candidate) => [candidate.toolName, candidate]))
+        if (workflowLaunchOnlyRequest(input.content, candidates)) {
+          active.browserToolsAllowed = false
+          active.browserCatalog = EMPTY_BROWSER_CATALOG
+          active.browserExplicitBindingId = undefined
+          active.browserPolicyAdded = false
+        }
       }
       active.tools = [...active.workflowCatalogTools, ...active.browserCatalog.tools]
       const policyMessage: ModelMessage = {

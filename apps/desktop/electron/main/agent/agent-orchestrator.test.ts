@@ -3922,6 +3922,47 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
   })
 
+  it('keeps browser tools hidden when a workflow-only request creates a binding', async () => {
+    const finalText = '已打开北京工作居住证页面。'
+    const dependencies = harness([
+      toolTurn,
+      [
+        { type: 'text_delta', choiceIndex: 0, text: finalText },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ],
+    ])
+    dependencies.workflows.list = async () => [{
+      ...workflow,
+      name: '北京工作居住证',
+      activationExamples: ['北京工作居住证'],
+    }]
+    dependencies.policy.evaluate = () => ({ allowed: true, requiresApproval: false })
+    const liveBindings: BrowserContinuationBinding[] = []
+    const browser = attachBrowserContinuation(dependencies, { bindings: liveBindings })
+    const startReserved = dependencies.executions.startReserved
+    dependencies.executions.startReserved = async (reservation, input) => {
+      liveBindings.push(continuationBinding({ conversationId: 'workflow_launch_only' }))
+      return startReserved(reservation, input)
+    }
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'workflow_launch_only', content: '查询北京工作居住证',
+      provider: 'openrouter', model: 'model', requestId: 'workflow_launch_only_request',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls
+      .map(([request]) => request)
+    expect(requests).toHaveLength(2)
+    for (const request of requests) {
+      const offeredBrowserTools = (request.tools ?? [])
+        .map((tool) => tool.function.name)
+        .filter((name) => name.startsWith('browser_session_'))
+      expect(offeredBrowserTools).toEqual([])
+    }
+    expect(browser.executor.execute).not.toHaveBeenCalled()
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain(finalText)
+  })
+
   it('makes a binding created by a workflow available in the same user turn', async () => {
     const dependencies = harness([
       toolTurn,
