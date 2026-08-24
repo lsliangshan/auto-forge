@@ -2005,6 +2005,8 @@ export class AgentOrchestrator {
       currentUser: active.currentUser,
       signal: active.controller.signal,
     })
+    if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
+    if (active.browserPageEvidenceRevision !== revision) return undefined
     if (captured.kind !== 'success') {
       active.browserVisualEvidenceMatchRevision = revision
       active.browserVisualEvidenceSelection = undefined

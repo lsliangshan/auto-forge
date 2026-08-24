@@ -5202,6 +5202,105 @@ describe('AgentOrchestrator', () => {
       .toHaveBeenCalledTimes(captureError ? 3 : 4)
   })
 
+  it.each([
+    { name: 'success', staleResult: 'success' as const },
+    { name: 'tool error', staleResult: 'tool_error' as const },
+  ])('discards a stale visual fallback capture $name before resolver or cache commit', async ({
+    staleResult,
+  }) => {
+    const snapshot = (ref: string, name: string): BrowserPageSnapshot => ({
+      snapshotId: `snapshot_${ref}`, bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+      url: 'https://permit.example.gov.cn/detail', title: '证件详情',
+      capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1, auth: 'authenticated',
+      nodes: [{ ref, role: 'statictext', name, enabled: true, actions: [], answerable: true }],
+      serializedBytes: 1_000,
+    })
+    const oldSnapshot = snapshot('old_value', '旧页面值')
+    const newSnapshot = snapshot('new_value', '新页面值')
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => []
+    let mainTurn = 0
+    let visualResolverTurns = 0
+    dependencies.providerInstances.openrouter.stream = vi.fn((request: ModelStreamRequest) => {
+      const toolNames = request.tools?.map(({ function: { name } }) => name) ?? []
+      if (toolNames.includes('report_browser_page_evidence')) return events([{
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_semantic_empty',
+        name: 'report_browser_page_evidence',
+        arguments: { shape: 'list', selectedNodeIds: [], supportingNodeIds: [] },
+      }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+      if (toolNames.includes('report_browser_visual_evidence')) {
+        visualResolverTurns += 1
+        const selectedNodeId = JSON.stringify(request.messages).includes('new_value')
+          ? 'new_value'
+          : 'old_value'
+        return events([{
+          type: 'tool_call', choiceIndex: 0, index: 0, id: `stale_visual_${selectedNodeId}`,
+          name: 'report_browser_visual_evidence',
+          arguments: { shape: 'scalar', selectedNodeIds: [selectedNodeId], supportingNodeIds: [] },
+        }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+      }
+      mainTurn += 1
+      return mainTurn === 1
+        ? events([{
+            type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_inspect',
+            name: 'browser_session_inspect',
+            arguments: { bindingId: 'binding_1', intent: '读取页面值' },
+          }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+        : events([{ type: 'finish', choiceIndex: 0, reason: 'stop' }])
+    })
+    let resolveOldCapture!: (result: BrowserVisualEvidenceResult) => void
+    let resolveNewCapture!: (result: BrowserVisualEvidenceResult) => void
+    const oldCapture = new Promise<BrowserVisualEvidenceResult>((resolve) => { resolveOldCapture = resolve })
+    const newCapture = new Promise<BrowserVisualEvidenceResult>((resolve) => { resolveNewCapture = resolve })
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({
+        kind: 'success', data: { trust: 'untrusted_page_data', snapshot: oldSnapshot },
+      }),
+      captureVisualEvidence: async () => (
+        browser.executor.captureVisualEvidence.mock.calls.length === 1 ? oldCapture : newCapture
+      ),
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const requestId = `stale_visual_capture_${staleResult}`
+    const running = orchestrator.run({
+      ...textRunInput({
+        conversationId: 'browser_conversation', content: '读取页面值',
+        provider: 'openrouter', model: 'model', requestId,
+      }),
+      supportsImageInput: true,
+    })
+
+    await vi.waitFor(() => expect(browser.executor.captureVisualEvidence).toHaveBeenCalledOnce())
+    const active = (Reflect.get(orchestrator, 'activeByRequest') as Map<string, {
+      browserCandidate: unknown
+      browserPageEvidenceRevision: number
+      browserVisualEvidenceMatchRevision?: number
+    }>).get(requestId)!
+    const staleRevision = active.browserPageEvidenceRevision
+    Reflect.get(orchestrator, 'rememberBrowserEvidence').call(
+      orchestrator,
+      active,
+      active.browserCandidate,
+      newSnapshot,
+      Object.freeze([]),
+    )
+    expect(active.browserPageEvidenceRevision).toBeGreaterThan(staleRevision)
+    resolveOldCapture(staleResult === 'success'
+      ? { kind: 'success', data: visualBundleFor([oldSnapshot], ['old_value']) }
+      : { kind: 'tool_error', code: 'INTERNAL_ERROR' })
+
+    await vi.waitFor(() => expect(browser.executor.captureVisualEvidence).toHaveBeenCalledTimes(2))
+    expect(visualResolverTurns).toBe(0)
+    expect(active.browserVisualEvidenceMatchRevision).not.toBe(staleRevision)
+    resolveNewCapture({ kind: 'success', data: visualBundleFor([newSnapshot], ['new_value']) })
+
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+    expect(visualResolverTurns).toBe(1)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('新页面值')
+    expect(terminal).not.toContain('旧页面值')
+  })
+
   it('answers an attachment question from full-page row context', async () => {
     const inspected = await inspectedAttachmentTable()
     if (inspected.kind !== 'success') throw new Error('expected attachment snapshot')
