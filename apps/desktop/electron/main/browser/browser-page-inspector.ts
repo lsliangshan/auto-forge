@@ -218,12 +218,16 @@ const maxBrowserInspectionTotalLocatorMatches = 2_048
 const maxBrowserInspectionPolicyLocators = 128
 const defaultInspectionTimeoutMs = 5_000
 
+const layoutStructuralRoles = [
+  'generic', 'layouttable', 'layouttablecell', 'layouttablerow',
+] as const
 const semanticRoles = new Set([
   'article', 'banner', 'button', 'cell', 'checkbox', 'columnheader', 'combobox', 'complementary', 'contentinfo',
   'dialog', 'document', 'form', 'grid', 'gridcell', 'group', 'heading', 'img', 'link', 'list',
   'listbox', 'listitem', 'main', 'menu', 'menuitem', 'navigation', 'option', 'paragraph', 'radio',
   'region', 'row', 'rowheader', 'search', 'searchbox', 'slider', 'spinbutton', 'statictext', 'status',
   'switch', 'tab', 'table', 'tabpanel', 'textbox', 'tree', 'treeitem',
+  ...layoutStructuralRoles,
 ])
 const fillRoles = new Set(['searchbox', 'spinbutton', 'textbox'])
 const selectRoles = new Set(['combobox', 'listbox'])
@@ -233,6 +237,7 @@ const valueRoles = new Set([...fillRoles, ...selectRoles, 'meter', 'progressbar'
 const structuralRoles = new Set([
   'article', 'banner', 'columnheader', 'complementary', 'contentinfo', 'dialog', 'document', 'form',
   'grid', 'group', 'heading', 'list', 'main', 'navigation', 'region', 'row', 'rowheader', 'table',
+  ...layoutStructuralRoles,
 ])
 const interactiveRoles = new Set([
   ...fillRoles, ...selectRoles, ...clickRoles, ...checkRoles, 'img', 'slider', 'spinbutton',
@@ -327,6 +332,7 @@ function failure(code: AppErrorCode): AppError {
 function normalizedRole(value: string): string {
   const role = value.replaceAll(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
   if (role === 'static-text') return 'statictext'
+  if (role.startsWith('layout-')) return role.replaceAll('-', '')
   return role
 }
 
@@ -693,8 +699,8 @@ export class BrowserPageInspector {
           ? validatedStructuredField(normalizedText(node.name), normalizedText(rawValue))
           : undefined
       if (structuredField === null) return []
-      const name = structuredField?.name ?? safeText(node.name)
-      if (!name) return []
+      const name = structuredField?.name ?? safeText(node.name) ?? ''
+      if (!name && !structuralRoles.has(role)) return []
       const value = structuredField === undefined ? (
         valueRoles.has(role)
           && rawValue !== undefined

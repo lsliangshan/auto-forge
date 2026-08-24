@@ -176,6 +176,37 @@ function idSequence(): () => string {
 }
 
 describe('BrowserPageInspector', () => {
+  it('preserves unnamed generic and layout-table ancestors as context only', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '附件管理', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(20, 'generic', '', { axNodeId: 'ax_wrapper', parentAxNodeId: 'ax_main' }),
+      node(21, 'LayoutTable', '', { axNodeId: 'ax_table', parentAxNodeId: 'ax_wrapper' }),
+      node(22, 'LayoutTableRow', '', { axNodeId: 'ax_row', parentAxNodeId: 'ax_table' }),
+      node(23, 'LayoutTableCell', '', { axNodeId: 'ax_name_cell', parentAxNodeId: 'ax_row' }),
+      node(24, 'StaticText', '学历证书', { axNodeId: 'ax_name', parentAxNodeId: 'ax_name_cell' }),
+      node(25, 'LayoutTableCell', '', { axNodeId: 'ax_status_cell', parentAxNodeId: 'ax_row' }),
+      node(26, 'StaticText', '已上传', { axNodeId: 'ax_status', parentAxNodeId: 'ax_status_cell' }),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const snapshot = await inspector.inspect(input(binding(), { intent: '我上传了哪些附件' }))
+    const wrapper = snapshot.nodes.find(({ role }) => role === 'generic')!
+    const table = snapshot.nodes.find(({ role }) => role === 'layouttable')!
+    const row = snapshot.nodes.find(({ role }) => role === 'layouttablerow')!
+    const cells = snapshot.nodes.filter(({ role }) => role === 'layouttablecell')
+    const name = snapshot.nodes.find(({ name }) => name === '学历证书')!
+    const status = snapshot.nodes.find(({ name }) => name === '已上传')!
+
+    expect(table.parentRef).toBe(wrapper.ref)
+    expect(row.parentRef).toBe(table.ref)
+    expect(name.parentRef).toBe(cells[0]!.ref)
+    expect(status.parentRef).toBe(cells[1]!.ref)
+    expect(wrapper.answerable).not.toBe(true)
+    expect(table.answerable).not.toBe(true)
+    expect(row.answerable).not.toBe(true)
+    expect(name.answerable).toBe(true)
+    expect(status.answerable).toBe(true)
+  })
+
   it('preserves table context and marks only safe leaf values answerable', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '附件管理', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
