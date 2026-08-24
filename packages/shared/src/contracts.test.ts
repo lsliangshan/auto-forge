@@ -1323,6 +1323,22 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('carries only a conversation ID in a strict removal event', () => {
+    const event = {
+      type: 'conversation_removed',
+      conversationId: 'conversation_1',
+    }
+    expect(chatEventSchema.parse(event)).toEqual(event)
+    for (const privateField of [
+      { uid: 'private-owner' },
+      { ownerUserId: 'private-owner' },
+      { revision: 3 },
+      { tombstone: { deletedAt: '2026-08-25T00:00:00.000Z' } },
+    ]) {
+      expect(() => chatEventSchema.parse({ ...event, ...privateField })).toThrow()
+    }
+  })
+
   it('allows attachment-only understanding but rejects empty or encoded sends', () => {
     expect(chatSendInputSchema.parse({
       conversationId: 'conversation_1',

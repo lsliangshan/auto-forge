@@ -39,6 +39,7 @@ import type {
   BrowserContinuationActivity,
   BrowserContinuationBindingInput,
 } from './browser/browser-continuation-types.js'
+import type { CloudBaseUserDataCall } from './cloud/cloudbase-user-data-port.js'
 import type { BrowserPageCdpPort } from './browser/browser-page-inspector.js'
 import {
   browserSessionStorageSecretKey,
@@ -6870,6 +6871,89 @@ describe('createApplicationRuntime', () => {
       conversation: expect.objectContaining({ id: conversation.id, syncState: 'synced' }),
     })))
     expect(JSON.stringify(events)).not.toMatch(/owner|userId|uid|path|secret/i)
+    await runtime.close()
+  })
+
+  it('emits an owner-free removal event after a real sync pull applies a conversation tombstone', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-sync-remove-event-'))
+    directories.push(root)
+    const events: ChatEvent[] = []
+    let pushedCreate: SyncMutation | undefined
+    let createReceiptPending = false
+    let deletePending = false
+    const runtime = createApplicationRuntime(options(root, {
+      emitChat: (event) => { events.push(event) },
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall) => {
+          if (input.action === 'syncPush') {
+            pushedCreate = input.mutations.find(({ kind }) => kind === 'conversation.create')
+            createReceiptPending = pushedCreate !== undefined
+            return {
+              ok: true as const,
+              data: {
+                results: input.mutations.map(({ id }) => ({
+                  id, status: 'applied' as const, revision: 1,
+                })),
+                cursor: 'cursor_remove_push',
+              },
+            }
+          }
+          if (deletePending && pushedCreate) {
+            deletePending = false
+            return {
+              ok: true as const,
+              data: {
+                mutations: [{
+                  id: 'remote_delete_mutation',
+                  kind: 'conversation.delete' as const,
+                  entityId: pushedCreate.entityId,
+                  baseRevision: 1,
+                  resultRevision: 2,
+                  payload: {},
+                  receivedAt: '2026-08-25T01:00:00.000Z',
+                }],
+                cursor: 'cursor_remove_tombstone',
+              },
+            }
+          }
+          if (createReceiptPending && pushedCreate) {
+            createReceiptPending = false
+            const { occurredAt, ...receipt } = pushedCreate
+            return {
+              ok: true as const,
+              data: {
+                mutations: [{ ...receipt, resultRevision: 1, receivedAt: occurredAt }],
+                cursor: 'cursor_remove_create_receipt',
+              },
+            }
+          }
+          return {
+            ok: true as const,
+            data: { mutations: [], cursor: 'cursor_remove_empty' },
+          }
+        }),
+      },
+    }))
+    await authenticate(runtime, 'SyncRemoveAlice')
+    const conversation = await runtime.services.chat.createConversation()
+    await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+      type: 'conversation_updated',
+      conversationId: conversation.id,
+      conversation: expect.objectContaining({ syncState: 'synced', revision: 1 }),
+    })))
+
+    events.length = 0
+    deletePending = true
+    await runtime.services.chat.listConversations({ limit: 50 })
+    await vi.waitFor(() => expect(events).toContainEqual({
+      type: 'conversation_removed',
+      conversationId: conversation.id,
+    }))
+
+    const removal = events.find((event) => event.type === 'conversation_removed')
+    expect(removal).toEqual({ type: 'conversation_removed', conversationId: conversation.id })
+    expect(JSON.stringify(removal)).not.toMatch(/owner|userId|uid|revision|tombstone|deletedAt/i)
+    expect((await runtime.services.chat.listConversations({ limit: 50 })).items).toEqual([])
     await runtime.close()
   })
 

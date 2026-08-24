@@ -2142,7 +2142,9 @@ describe('AgentOrchestrator', () => {
             ? event.block.type
             : event.type === 'conversation_title_updated'
               ? event.title
-              : event.conversation.title
+              : event.type === 'conversation_updated'
+                ? event.conversation.title
+                : event.conversationId
       order.push(`emit:${event.type}:${detail}`)
     }
 

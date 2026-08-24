@@ -1189,11 +1189,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   notifyConversationChanges = (conversationIds) => {
     for (const conversationId of conversationIds) {
       const conversation = currentUserData().conversations.getSummary(conversationId)
-      if (conversation) emitChat({
-        type: 'conversation_updated',
-        conversationId,
-        conversation,
-      })
+      if (conversation) {
+        emitChat({ type: 'conversation_updated', conversationId, conversation })
+      } else {
+        emitChat({ type: 'conversation_removed', conversationId })
+      }
     }
   }
   const conversationContext = createConversationContextManager(chatDatabase)

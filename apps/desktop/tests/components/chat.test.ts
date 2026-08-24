@@ -9,6 +9,8 @@ import {
   type BrowserActionAuditEntry,
   type ChatBlock,
   type ChatEvent,
+  type ChatMessage,
+  type ConversationSummary,
   type ConversationGenerationPreferences,
   type DesktopAPI,
   type ExecutionEvent,
@@ -131,6 +133,29 @@ function deferred<T>() {
   let reject!: (reason: unknown) => void
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
   return { promise, resolve, reject }
+}
+
+function conversationSummary(id: string, lastActivityAt: string): ConversationSummary {
+  return {
+    id,
+    title: id,
+    titleState: 'user_named',
+    revision: 1,
+    syncState: 'synced',
+    createdAt: lastActivityAt,
+    lastActivityAt,
+    metadataUpdatedAt: lastActivityAt,
+  }
+}
+
+function storedMessage(id: string, conversationId: string, text: string): ChatMessage {
+  return {
+    id,
+    conversationId,
+    role: 'assistant',
+    blocks: [{ type: 'text', text }],
+    createdAt: '2026-07-20T00:00:00.000Z',
+  }
 }
 
 function modelInfo(id: string, outputs: ModelInfo['outputModalities']): ModelInfo {
@@ -279,6 +304,141 @@ describe('chat history pagination', () => {
     await newRequest
     await store.loadConversations()
     expect(api.chat.listConversations).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not merge an old identity conversation page that uses the new identity cursor', async () => {
+    const { api } = createEventApi()
+    const oldPage = deferred<{ items: ConversationSummary[]; nextCursor?: string }>()
+    const newPage = deferred<{ items: ConversationSummary[]; nextCursor?: string }>()
+    vi.mocked(api.chat.listConversations)
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(newPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const sharedCursor = 'shared-non-empty-cursor'
+
+    store.conversations = [conversationSummary('old-current', '2026-07-20T00:00:00.000Z')]
+    store.nextConversationCursor = sharedCursor
+    const oldRequest = store.loadMoreConversations()
+    store.resetLocalData()
+    store.conversations = [conversationSummary('new-current', '2026-07-21T00:00:00.000Z')]
+    store.nextConversationCursor = sharedCursor
+    const newRequest = store.loadMoreConversations()
+
+    oldPage.resolve({
+      items: [conversationSummary('old-stale-row', '2026-07-22T00:00:00.000Z')],
+      nextCursor: 'old-next',
+    })
+    await oldRequest
+    expect(store.conversations.map(({ id }) => id)).toEqual(['new-current'])
+    expect(store.nextConversationCursor).toBe(sharedCursor)
+
+    newPage.resolve({
+      items: [conversationSummary('new-row', '2026-07-23T00:00:00.000Z')],
+      nextCursor: 'new-next',
+    })
+    await newRequest
+    expect(store.conversations.map(({ id }) => id)).toEqual(['new-row', 'new-current'])
+    expect(store.nextConversationCursor).toBe('new-next')
+  })
+
+  it('does not surface an old identity conversation page rejection in the new identity', async () => {
+    const { api } = createEventApi()
+    const oldPage = deferred<{ items: ConversationSummary[] }>()
+    const newPage = deferred<{ items: ConversationSummary[] }>()
+    vi.mocked(api.chat.listConversations)
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(newPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const sharedCursor = 'shared-non-empty-cursor'
+
+    store.nextConversationCursor = sharedCursor
+    const oldRequest = store.loadMoreConversations()
+    store.resetLocalData()
+    store.nextConversationCursor = sharedCursor
+    const newRequest = store.loadMoreConversations()
+
+    oldPage.reject(new Error('old user failed'))
+    await oldRequest
+    expect(store.error).toBe('')
+
+    newPage.resolve({ items: [] })
+    await newRequest
+  })
+
+  it('does not merge old identity messages that use the new identity older-page cursor', async () => {
+    const { api } = createEventApi()
+    const oldPage = deferred<{ items: ChatMessage[]; previousCursor?: string }>()
+    const newPage = deferred<{ items: ChatMessage[]; previousCursor?: string }>()
+    vi.mocked(api.chat.listMessages)
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(newPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const conversationId = 'conversation_1'
+    const sharedCursor = 'shared-non-empty-cursor'
+
+    store.selectedConversationId = conversationId
+    store.messagesByConversation[conversationId] = [{
+      id: 'old-current', role: 'assistant',
+      blocks: [{ id: 'old-current:text:0', type: 'text', text: 'old current' }],
+    }]
+    store.previousMessageCursorByConversation[conversationId] = sharedCursor
+    const oldRequest = store.loadOlderMessages(conversationId)
+    store.resetLocalData()
+    store.selectedConversationId = conversationId
+    store.messagesByConversation[conversationId] = [{
+      id: 'new-current', role: 'assistant',
+      blocks: [{ id: 'new-current:text:0', type: 'text', text: 'new current' }],
+    }]
+    store.previousMessageCursorByConversation[conversationId] = sharedCursor
+    const newRequest = store.loadOlderMessages(conversationId)
+
+    oldPage.resolve({
+      items: [storedMessage('old-stale-row', conversationId, 'old stale')],
+      previousCursor: 'old-next',
+    })
+    await oldRequest
+    expect(store.messagesByConversation[conversationId]?.map(({ id }) => id)).toEqual(['new-current'])
+    expect(store.previousMessageCursorByConversation[conversationId]).toBe(sharedCursor)
+
+    newPage.resolve({
+      items: [storedMessage('new-row', conversationId, 'new row')],
+      previousCursor: 'new-next',
+    })
+    await newRequest
+    expect(store.messagesByConversation[conversationId]?.map(({ id }) => id))
+      .toEqual(['new-row', 'new-current'])
+    expect(store.previousMessageCursorByConversation[conversationId]).toBe('new-next')
+  })
+
+  it('does not surface an old identity older-message rejection in the new identity', async () => {
+    const { api } = createEventApi()
+    const oldPage = deferred<{ items: ChatMessage[] }>()
+    const newPage = deferred<{ items: ChatMessage[] }>()
+    vi.mocked(api.chat.listMessages)
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(newPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const conversationId = 'conversation_1'
+    const sharedCursor = 'shared-non-empty-cursor'
+
+    store.selectedConversationId = conversationId
+    store.previousMessageCursorByConversation[conversationId] = sharedCursor
+    const oldRequest = store.loadOlderMessages(conversationId)
+    store.resetLocalData()
+    store.selectedConversationId = conversationId
+    store.previousMessageCursorByConversation[conversationId] = sharedCursor
+    const newRequest = store.loadOlderMessages(conversationId)
+
+    oldPage.reject(new Error('old user failed'))
+    await oldRequest
+    expect(store.error).toBe('')
+
+    newPage.resolve({ items: [] })
+    await newRequest
   })
 })
 
@@ -1597,6 +1757,51 @@ describe('chat interactions', () => {
     expect(store.selectedConversationId).toBe('conv_1')
     expect(store.messagesByConversation.conv_1).toEqual([{ id: 'local_1', role: 'user', blocks: [] }])
     expect(api.chat.listConversations).not.toHaveBeenCalled()
+  })
+
+  it('removes a selected tombstoned conversation and selects the deterministic next visible row', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
+      conversationSummary('conv_3', '2026-08-25T00:01:00.000Z'),
+    ]
+    store.selectedConversationId = 'conv_2'
+    store.messagesByConversation.conv_2 = [{ id: 'message_2', role: 'assistant', blocks: [] }]
+    store.previousMessageCursorByConversation.conv_2 = 'older-cursor'
+    store.ensureSubscriptions()
+
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+
+    expect(store.conversations.map(({ id }) => id)).toEqual(['conv_1', 'conv_3'])
+    expect(store.selectedConversationId).toBe('conv_3')
+    expect(store.messagesByConversation.conv_2).toBeUndefined()
+    expect(store.previousMessageCursorByConversation.conv_2).toBeUndefined()
+    expect(api.chat.listConversations).not.toHaveBeenCalled()
+    expect(api.chat.listMessages).not.toHaveBeenCalled()
+  })
+
+  it('removes a nonselected tombstoned conversation without changing selection', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
+    ]
+    store.selectedConversationId = 'conv_1'
+    store.messagesByConversation.conv_2 = [{ id: 'message_2', role: 'assistant', blocks: [] }]
+    store.previousMessageCursorByConversation.conv_2 = 'older-cursor'
+    store.ensureSubscriptions()
+
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+
+    expect(store.conversations.map(({ id }) => id)).toEqual(['conv_1'])
+    expect(store.selectedConversationId).toBe('conv_1')
+    expect(store.messagesByConversation.conv_2).toBeUndefined()
+    expect(store.previousMessageCursorByConversation.conv_2).toBeUndefined()
   })
 
   it('does not let a loading snapshot overwrite a newer streamed delta', async () => {

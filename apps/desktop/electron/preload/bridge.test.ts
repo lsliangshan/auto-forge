@@ -296,4 +296,20 @@ describe('preload desktop bridge', () => {
     expect(listener).toHaveBeenCalledOnce()
     expect(listener).toHaveBeenCalledWith(event)
   })
+
+  it('forwards only the strict owner-free conversation removal event', () => {
+    const app = harness()
+    const listener = vi.fn()
+    app.api.chat.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.chatEvent)!][0]!
+    const event = { type: 'conversation_removed', conversationId: 'conversation_1' }
+
+    wrapped({}, event)
+    wrapped({}, { ...event, uid: 'private-owner' })
+    wrapped({}, { ...event, revision: 3 })
+    wrapped({}, { ...event, tombstone: { deletedAt: '2026-08-25T00:00:00.000Z' } })
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
+  })
 })

@@ -288,6 +288,10 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     conversationId: identifierSchema,
     conversation: conversationEventSummarySchema,
   }).strict(),
+  z.object({
+    type: z.literal('conversation_removed'),
+    conversationId: identifierSchema,
+  }).strict(),
 ]).superRefine((event, context) => {
   if (event.type === 'block_update' && event.blockId !== event.block.blockId) {
     context.addIssue({
