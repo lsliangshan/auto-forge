@@ -21,7 +21,7 @@ import type { CloudBaseFunctionPort } from '../auth/cloudbase-auth-port.js'
 
 const protocolVersionSchema = z.literal(1)
 const identifierSchema = z.string().min(1).max(128).refine((value) => value.trim() === value)
-const maximumRequestBytes = 1_048_576
+export const maximumUserDataCallBytes = 1_048_576
 const userDataErrorCodeSchema = z.enum([
   'AUTH_REQUIRED',
   'FORBIDDEN',
@@ -105,6 +105,21 @@ const cloudBaseUserDataCallSchema = z.discriminatedUnion('action', [
 ])
 
 export type CloudBaseUserDataCall = z.infer<typeof cloudBaseUserDataCallSchema>
+
+export function serializedUserDataCallBytes(input: unknown): number {
+  let serialized: string | undefined
+  try {
+    serialized = JSON.stringify(input)
+  } catch {
+    throw toSafeAppError({ code: 'INVALID_INPUT' })
+  }
+  if (typeof serialized !== 'string') throw toSafeAppError({ code: 'INVALID_INPUT' })
+  return Buffer.byteLength(serialized, 'utf8')
+}
+
+export function userDataCallFitsWireLimit(input: unknown): boolean {
+  return serializedUserDataCallBytes(input) <= maximumUserDataCallBytes
+}
 
 const syncPushDataSchema = z.object({
   results: z.array(syncMutationResultSchema).max(100),
@@ -196,14 +211,7 @@ export class CloudBaseUserDataPort {
   ) {}
 
   async call(input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> {
-    let serialized: string | undefined
-    try {
-      serialized = JSON.stringify(input)
-    } catch {
-      throw toSafeAppError({ code: 'INVALID_INPUT' })
-    }
-    if (typeof serialized !== 'string'
-      || Buffer.byteLength(serialized, 'utf8') > maximumRequestBytes) {
+    if (!userDataCallFitsWireLimit(input)) {
       throw toSafeAppError({ code: 'INVALID_INPUT' })
     }
     if (!isRecord(input)) throw toSafeAppError({ code: 'INVALID_INPUT' })

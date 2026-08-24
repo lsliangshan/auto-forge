@@ -6,11 +6,13 @@ import {
 } from '@autoforge/shared'
 import type { UserDataStore, UserDataStoreManager } from '../database/user-data-client.js'
 import type {
+  CloudBaseUserDataCall,
   CloudBaseUserDataPort,
   SyncPullData,
   SyncPushData,
   UserDataFunctionResponse,
 } from '../cloud/cloudbase-user-data-port.js'
+import { userDataCallFitsWireLimit } from '../cloud/cloudbase-user-data-port.js'
 import type {
   LegacyImportBatchRequest,
   LegacyImportBatchResult,
@@ -42,6 +44,20 @@ interface ActiveBinding {
   userId: string
   deviceId: string
   store: UserDataStore
+}
+
+type LegacyImportCall = Extract<CloudBaseUserDataCall, { action: 'importLegacyBatch' }>
+
+function legacyImportCall(
+  binding: ActiveBinding,
+  input: LegacyImportBatchRequest,
+): LegacyImportCall {
+  return {
+    action: 'importLegacyBatch',
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: binding.deviceId,
+    ...input,
+  }
 }
 
 export interface UserDataBindingToken {
@@ -159,30 +175,28 @@ export class UserDataSyncEngine {
     return { userId: binding.userId, generation: binding.generation }
   }
 
+  canImportLegacyBatch(
+    expected: UserDataBindingToken,
+    input: LegacyImportBatchRequest,
+  ): boolean {
+    const binding = this.#expectedBinding(expected)
+    return userDataCallFitsWireLimit(legacyImportCall(binding, input))
+  }
+
   async importLegacyBatch(
     expected: UserDataBindingToken,
     input: LegacyImportBatchRequest,
   ): Promise<LegacyImportBatchResult> {
     let result: LegacyImportBatchResult | undefined
     await this.#queueLifecycle(async () => {
-      const binding = this.#binding
-      if (!binding
-        || binding.userId !== expected.userId
-        || binding.generation !== expected.generation) {
-        throw toSafeAppError({ code: 'AUTH_REQUIRED' })
-      }
+      const binding = this.#expectedBinding(expected)
       await this.#drainPromise
       if (!this.#isCurrent(binding)
         || binding.userId !== expected.userId
         || binding.generation !== expected.generation) {
         throw toSafeAppError({ code: 'AUTH_REQUIRED' })
       }
-      const response = await this.port.call({
-        action: 'importLegacyBatch',
-        protocolVersion: PROTOCOL_VERSION,
-        deviceId: binding.deviceId,
-        ...input,
-      })
+      const response = await this.port.call(legacyImportCall(binding, input))
       if (!response.ok) throw toSafeAppError({ code: response.error.code })
       if (!('batchId' in response.data) || !('status' in response.data)) {
         throw toSafeAppError({ code: 'INTERNAL_ERROR' })
@@ -222,6 +236,16 @@ export class UserDataSyncEngine {
 
   status(): UserDataSyncStatus {
     return { ...this.#status }
+  }
+
+  #expectedBinding(expected: UserDataBindingToken): ActiveBinding {
+    const binding = this.#binding
+    if (!binding
+      || binding.userId !== expected.userId
+      || binding.generation !== expected.generation) {
+      throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+    }
+    return binding
   }
 
   #queueLifecycle(operation: () => Promise<void>): Promise<void> {

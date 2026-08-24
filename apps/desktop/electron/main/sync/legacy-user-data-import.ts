@@ -12,7 +12,6 @@ import type { AppRepositories, Conversation } from '../database/repositories.js'
 import type { UserDataBindingToken } from './user-data-sync-engine.js'
 
 const MAX_BATCH_RECORDS = 100
-const MAX_BATCH_BYTES = 1_048_576
 
 export interface LegacyImportBatchRequest extends LegacyImportConfirmRequest {
   conversations: Array<{
@@ -39,6 +38,7 @@ export type LegacyImportBatchResult = LegacyImportResult
 
 interface LegacyImportCoordinator {
   captureBinding(userId: string): UserDataBindingToken
+  canImportLegacyBatch(expected: UserDataBindingToken, input: LegacyImportBatchRequest): boolean
   importLegacyBatch(
     expected: UserDataBindingToken,
     input: LegacyImportBatchRequest,
@@ -149,11 +149,11 @@ export class LegacyUserDataImporter {
       append(candidate)
       const count = candidate.conversations.length + candidate.messages.length
       if (count > MAX_BATCH_RECORDS
-        || Buffer.byteLength(JSON.stringify(candidate), 'utf8') > MAX_BATCH_BYTES) {
+        || !this.coordinator.canImportLegacyBatch(binding, candidate)) {
         batch = this.emptyBatch(confirmation.data, batches.length)
         batches.push(batch)
         append(batch)
-        if (Buffer.byteLength(JSON.stringify(batch), 'utf8') > MAX_BATCH_BYTES) {
+        if (!this.coordinator.canImportLegacyBatch(binding, batch)) {
           throw toSafeAppError({ code: 'INVALID_INPUT' })
         }
       } else {

@@ -18,6 +18,7 @@
 - Local OpenRouter BYOK labels now say estimate/unavailable rather than confirmed/pending confirmation. Only the separately trusted platform-cost field retains “confirmed” language.
 - CloudBase usage responses canonicalize SQL numeric strings such as `0.010000000000` to `0.01` before the strict public decimal schema. Monthly bounds use the saved IANA timezone, including east/west UTC month-boundary coverage.
 - Imported conversation activity is the maximum of its conversation timestamps and latest selected message timestamp.
+- Review round 2 centralizes the one-MiB wire limit in the strict CloudBase port. The Task 5 engine constructs and measures the exact final `importLegacyBatch` call, including action, protocol version, and the active device binding; the importer uses that same measurement before accepting a record into a batch. Near-limit batches therefore split before transport, without UUID-specific byte reservations, while an individually oversized record still fails safely.
 
 ## TDD evidence
 
@@ -30,6 +31,7 @@ RED was observed before implementation:
 - Renderer first-create consent: no confirmation was shown and no consent-backed retry occurred.
 - Video completion: no remote-safe BYOK event was emitted for terminal video cost.
 - Review round 1: seven focused failures reproduced non-canonical SQL cost, stale imported activity, rejected import continuation, missing binding-generation verification, and non-sequential preference projections/receipt overwrite. Additional RED tests reproduced the renderer-controlled import identity, missing persisted root, and confirmed-cost BYOK labels.
+- Review round 2: the real importer -> engine -> strict-port threshold test failed with `INVALID_INPUT` because the importer admitted a request whose final authenticated call was one byte above 1,048,576 bytes.
 
 GREEN verification is listed below.
 
@@ -83,6 +85,7 @@ Review follow-up verification:
 - Renderer workbench + BYOK label suites: 81/81 passed.
 - All workspace typechecks: passed.
 - ESLint over all review-changed TypeScript/Vue files: 0 errors; the same four pre-existing compact-markup warnings remain in `SettingsView.vue`.
+- Review round 2 focused importer/engine/port suite: 60/60 passed; Desktop typecheck, focused lint, and `git diff --check` passed.
 
 ## Remaining staging-only gaps
 

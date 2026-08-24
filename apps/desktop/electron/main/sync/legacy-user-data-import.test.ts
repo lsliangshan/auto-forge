@@ -1,7 +1,16 @@
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LegacyImportConfirmRequest } from '@autoforge/shared'
 import type { AppRepositories, Conversation, Message } from '../database/repositories.js'
+import { CloudBaseUserDataPort, type CloudBaseUserDataCall } from '../cloud/cloudbase-user-data-port.js'
+import { UserDataStoreManager } from '../database/user-data-client.js'
+import { UserDataSyncEngine } from './user-data-sync-engine.js'
 import { LegacyUserDataImporter } from './legacy-user-data-import.js'
+
+const roots: string[] = []
+const MAX_WIRE_BYTES = 1_048_576
 
 const cloudConsent = {
   purpose: 'cloud_sync' as const,
@@ -40,7 +49,12 @@ function harness(conversations: Conversation[], messages: Message[] = []) {
     batchId: 'batch_1-0', status: 'applied', importedConversations: 1, importedMessages: 1,
   })
   const captureBinding = vi.fn(() => ({ userId: 'alice', generation: 1 }))
-  const importer = new LegacyUserDataImporter(legacy, { captureBinding, importLegacyBatch })
+  const canImportLegacyBatch = vi.fn((_binding, input) => Buffer.byteLength(JSON.stringify({
+    action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'device-a', ...input,
+  }), 'utf8') <= MAX_WIRE_BYTES)
+  const importer = new LegacyUserDataImporter(legacy, {
+    captureBinding, canImportLegacyBatch, importLegacyBatch,
+  })
   return { importer, legacy, importLegacyBatch }
 }
 
@@ -50,6 +64,10 @@ function confirmation(includeUnowned: boolean): LegacyImportConfirmRequest {
     ...(includeUnowned ? { unownedImportConsent: unownedConsent } : {}),
   }
 }
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
 
 describe('LegacyUserDataImporter', () => {
   it('previews owned and unowned conversations without claiming rows or exposing foreign owners', () => {
@@ -159,5 +177,64 @@ describe('LegacyUserDataImporter', () => {
     await expect(test.importer.import('alice', confirmation(false)))
       .rejects.toMatchObject({ code: 'SYNC_CONFLICT' })
     expect(test.importLegacyBatch).toHaveBeenCalledTimes(1)
+  })
+
+  it('splits at the exact final wire-call threshold through the real engine and strict port', async () => {
+    const calibration = harness([
+      conversation('owned', 'alice', 'Small', 1_000),
+      conversation('large', 'alice', 'x', 2_000),
+    ])
+    await calibration.importer.import('alice', confirmation(false))
+    const template = calibration.importLegacyBatch.mock.calls[0]![1]
+    const templateCall = {
+      action: 'importLegacyBatch' as const,
+      protocolVersion: 1 as const,
+      deviceId: 'device-a',
+      ...template,
+    }
+    const padding = MAX_WIRE_BYTES - Buffer.byteLength(JSON.stringify(templateCall), 'utf8') + 1
+    expect(padding).toBeGreaterThan(0)
+
+    const legacy = harness([
+      conversation('owned', 'alice', 'Small', 1_000),
+      conversation('large', 'alice', 'x'.repeat(padding + 1), 2_000),
+    ]).legacy
+    const wireCalls: CloudBaseUserDataCall[] = []
+    const port = new CloudBaseUserDataPort({
+      callFunction: vi.fn(async ({ data }) => {
+        wireCalls.push(structuredClone(data as CloudBaseUserDataCall))
+        const batch = data as Extract<CloudBaseUserDataCall, { action: 'importLegacyBatch' }>
+        return { result: { ok: true, data: { batchId: batch.batchId, status: 'applied' } } }
+      }),
+    })
+    const root = mkdtempSync(join(tmpdir(), 'autoforge-legacy-wire-limit-'))
+    roots.push(root)
+    const stores = new UserDataStoreManager(root)
+    const engine = new UserDataSyncEngine(port, stores)
+    await engine.start('alice', 'device-a')
+    const importer = new LegacyUserDataImporter(legacy, engine)
+
+    await expect(importer.import('alice', confirmation(false))).resolves.toHaveLength(2)
+    expect(wireCalls).toHaveLength(2)
+    expect(wireCalls.map((call) => Buffer.byteLength(JSON.stringify(call), 'utf8')))
+      .toEqual([expect.any(Number), expect.any(Number)])
+    for (const call of wireCalls) {
+      expect(Buffer.byteLength(JSON.stringify(call), 'utf8')).toBeLessThanOrEqual(MAX_WIRE_BYTES)
+    }
+    expect(wireCalls.map((call) => (
+      call.action === 'importLegacyBatch' ? call.conversations.length : 0
+    ))).toEqual([1, 1])
+    await engine.pause()
+    stores.close()
+  })
+
+  it('rejects one legacy record whose final wire call cannot fit', async () => {
+    const test = harness([
+      conversation('oversized', 'alice', 'x'.repeat(MAX_WIRE_BYTES), 1_000),
+    ])
+
+    await expect(test.importer.import('alice', confirmation(false)))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(test.importLegacyBatch).not.toHaveBeenCalled()
   })
 })
