@@ -1689,6 +1689,97 @@ describe('chat interactions', () => {
     ])
   })
 
+  it('hydrates the original pending A request after selecting B and reselecting A', async () => {
+    const { api } = createEventApi()
+    const pendingMessages = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const pendingPreferences = deferred<ConversationGenerationPreferences>()
+    const preferences = generationPreferences({ outputType: 'video' })
+    vi.mocked(api.chat.listMessages).mockReturnValue(pendingMessages.promise)
+    vi.mocked(api.chat.getGenerationPreferences).mockReturnValue(pendingPreferences.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_a', '2026-08-25T00:02:00.000Z'),
+      conversationSummary('conv_b', '2026-08-25T00:01:00.000Z'),
+    ]
+    store.messagesByConversation.conv_b = [{ id: 'message_b', role: 'assistant', blocks: [] }]
+    store.preferencesByConversation.conv_b = generationPreferences({ outputType: 'text' })
+
+    const firstSelection = store.selectConversation('conv_a')
+    await vi.waitFor(() => {
+      expect(api.chat.listMessages).toHaveBeenCalledOnce()
+      expect(api.chat.getGenerationPreferences).toHaveBeenCalledOnce()
+    })
+    await store.selectConversation('conv_b')
+    await store.selectConversation('conv_a')
+    expect(api.chat.listMessages).toHaveBeenCalledOnce()
+    expect(api.chat.getGenerationPreferences).toHaveBeenCalledOnce()
+
+    pendingMessages.resolve({
+      items: [storedMessage('message_a', 'conv_a', 'real A row')],
+      previousCursor: 'a-previous-cursor',
+    })
+    pendingPreferences.resolve(preferences)
+    await firstSelection
+
+    expect(store.selectedConversationId).toBe('conv_a')
+    expect(store.messagesByConversation.conv_a?.map(({ id }) => id)).toEqual(['message_a'])
+    expect(store.previousMessageCursorByConversation.conv_a).toBe('a-previous-cursor')
+    expect(store.preferencesByConversation.conv_a).toEqual(preferences)
+  })
+
+  it('does not apply pending A rows while B remains selected', async () => {
+    const { api } = createEventApi()
+    const pendingMessages = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const pendingPreferences = deferred<ConversationGenerationPreferences>()
+    vi.mocked(api.chat.listMessages).mockReturnValue(pendingMessages.promise)
+    vi.mocked(api.chat.getGenerationPreferences).mockReturnValue(pendingPreferences.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.messagesByConversation.conv_b = [{ id: 'message_b', role: 'assistant', blocks: [] }]
+    store.preferencesByConversation.conv_b = generationPreferences({ outputType: 'text' })
+
+    const firstSelection = store.selectConversation('conv_a')
+    await vi.waitFor(() => expect(api.chat.getGenerationPreferences).toHaveBeenCalledOnce())
+    await store.selectConversation('conv_b')
+    pendingMessages.resolve({ items: [storedMessage('message_a', 'conv_a', 'stale A row')] })
+    pendingPreferences.resolve(generationPreferences({ outputType: 'audio' }))
+    await firstSelection
+
+    expect(store.selectedConversationId).toBe('conv_b')
+    expect(store.messagesByConversation.conv_a).toBeUndefined()
+    expect(store.preferencesByConversation.conv_a).toBeUndefined()
+  })
+
+  it('rejects a pending A request after A to B to A when the UID generation resets', async () => {
+    const { api } = createEventApi()
+    const pendingMessages = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const pendingPreferences = deferred<ConversationGenerationPreferences>()
+    vi.mocked(api.chat.listMessages).mockReturnValue(pendingMessages.promise)
+    vi.mocked(api.chat.getGenerationPreferences).mockReturnValue(pendingPreferences.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.messagesByConversation.conv_b = [{ id: 'message_b', role: 'assistant', blocks: [] }]
+    store.preferencesByConversation.conv_b = generationPreferences({ outputType: 'text' })
+
+    const oldSelection = store.selectConversation('conv_a')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledOnce())
+    await store.selectConversation('conv_b')
+    await store.selectConversation('conv_a')
+    store.resetLocalData()
+    store.selectedConversationId = 'conv_a'
+    store.messagesByConversation.conv_a = [{ id: 'new-user-message', role: 'assistant', blocks: [] }]
+    store.preferencesByConversation.conv_a = generationPreferences({ outputType: 'image' })
+
+    pendingMessages.resolve({ items: [storedMessage('old-user-message', 'conv_a', 'old UID row')] })
+    pendingPreferences.resolve(generationPreferences({ outputType: 'audio' }))
+    await oldSelection
+
+    expect(store.messagesByConversation.conv_a?.map(({ id }) => id)).toEqual(['new-user-message'])
+    expect(store.preferencesByConversation.conv_a?.outputType).toBe('image')
+    expect(store.error).toBe('')
+  })
+
   it('updates the matching sidebar conversation from an AI title event', () => {
     const { api, emitChat } = createEventApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
@@ -2848,7 +2939,7 @@ describe('chat interactions', () => {
 
     expect(store.selectedConversationId).toBe('conv_2')
     expect(store.preferences).toEqual(secondPreferences)
-    expect(store.preferencesByConversation.conv_1).toEqual(firstPreferences)
+    expect(store.preferencesByConversation.conv_1).toBeUndefined()
 
     const imageUpdate = generationPreferences({ outputType: 'image', models: { image: 'image/new' } })
     const audioUpdate = generationPreferences({ outputType: 'audio', models: { audio: 'audio/new' } })

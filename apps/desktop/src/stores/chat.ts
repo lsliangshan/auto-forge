@@ -491,7 +491,6 @@ export const useChatStore = defineStore('chat', {
     async loadMessages(conversationId: string) {
       const requestKey = `${conversationId}:latest`
       if (this._messagePageRequests[requestKey]) return
-      const selectionVersion = this._selectionVersion
       const mutationVersion = this._messageVersions[conversationId] ?? 0
       const loadVersion = (this._messageLoadVersions[conversationId] ?? 0) + 1
       this._messageLoadVersions[conversationId] = loadVersion
@@ -503,7 +502,6 @@ export const useChatStore = defineStore('chat', {
         if (dataGeneration !== this._dataGeneration
           || this._messagePageRequests[requestKey] !== requestToken
           || this.selectedConversationId !== conversationId
-          || selectionVersion !== this._selectionVersion
           || loadVersion !== this._messageLoadVersions[conversationId]) return
         const snapshot = page.items.map(persistedMessage)
         this.previousMessageCursorByConversation[conversationId] = page.previousCursor
@@ -518,8 +516,7 @@ export const useChatStore = defineStore('chat', {
       } catch (error) {
         if (dataGeneration === this._dataGeneration
           && this._messagePageRequests[requestKey] === requestToken
-          && this.selectedConversationId === conversationId
-          && selectionVersion === this._selectionVersion) {
+          && this.selectedConversationId === conversationId) {
           this.error = displayError(error, '消息记录加载失败')
         }
       } finally {
@@ -584,6 +581,7 @@ export const useChatStore = defineStore('chat', {
         if (dataGeneration !== this._dataGeneration
           || this._preferenceLoadRequests[conversationId] !== requestToken
           || epoch !== this._stateEpoch
+          || this.selectedConversationId !== conversationId
           || version !== this._preferenceVersions[conversationId]) return
         this.preferencesByConversation[conversationId] = preferences
       } catch (error) {
