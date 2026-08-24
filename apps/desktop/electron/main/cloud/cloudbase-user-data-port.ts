@@ -8,11 +8,12 @@ import {
   type PulledMutation,
   type SyncMutationResult,
 } from '@autoforge/shared'
+import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import type { CloudBaseFunctionPort } from '../auth/cloudbase-auth-port.js'
 
 const protocolVersionSchema = z.literal(1)
-const identifierSchema = z.string().trim().min(1).max(128)
+const identifierSchema = z.string().min(1).max(128).refine((value) => value.trim() === value)
 const maximumRequestBytes = 1_048_576
 const userDataErrorCodeSchema = z.enum([
   'AUTH_REQUIRED',
@@ -101,6 +102,22 @@ function malformedResponse(): AppError {
   return toSafeAppError({ code: 'INTERNAL_ERROR' })
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasStrictShape(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): value is Record<string, unknown> {
+  if (!isRecord(value)) return false
+  const keys = Object.keys(value)
+  const allowed = new Set([...required, ...optional])
+  return required.every((key) => Object.hasOwn(value, key))
+    && keys.every((key) => allowed.has(key))
+}
+
 export class CloudBaseUserDataPort {
   constructor(
     private readonly functions: CloudBaseFunctionPort,
@@ -118,15 +135,36 @@ export class CloudBaseUserDataPort {
       || Buffer.byteLength(serialized, 'utf8') > maximumRequestBytes) {
       throw toSafeAppError({ code: 'INVALID_INPUT' })
     }
-    if (typeof input === 'object'
-      && input !== null
-      && (input as { action?: unknown }).action === 'syncPush'
-      && Array.isArray((input as { mutations?: unknown }).mutations)
-      && ((input as { mutations: unknown[] }).mutations.length > 100)) {
-      throw toSafeAppError({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+    if (!isRecord(input)) throw toSafeAppError({ code: 'INVALID_INPUT' })
+    if (input.action === 'syncPush') {
+      if (!hasStrictShape(input, ['action', 'protocolVersion', 'deviceId', 'mutations'])) {
+        throw toSafeAppError({ code: 'INVALID_INPUT' })
+      }
+      if (input.protocolVersion !== 1) throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+      if (typeof input.deviceId !== 'string'
+        || input.deviceId.length === 0
+        || input.deviceId.length > 128
+        || input.deviceId.trim() !== input.deviceId
+        || !Array.isArray(input.mutations)) {
+        throw toSafeAppError({ code: 'INVALID_INPUT' })
+      }
+      if (input.mutations.length > 100) {
+        throw toSafeAppError({ code: 'OUTBOX_LIMIT_EXCEEDED' })
+      }
+    } else if (input.action === 'syncPull') {
+      if (!hasStrictShape(
+        input,
+        ['action', 'protocolVersion', 'deviceId'],
+        ['cursor', 'limit'],
+      )) throw toSafeAppError({ code: 'INVALID_INPUT' })
+      if (input.protocolVersion !== 1) throw toSafeAppError({ code: 'UPGRADE_REQUIRED' })
+    } else {
+      throw toSafeAppError({ code: 'INVALID_INPUT' })
     }
     const parsedInput = cloudBaseUserDataCallSchema.safeParse(input)
-    if (!parsedInput.success) throw toSafeAppError({ code: 'INVALID_INPUT' })
+    if (!parsedInput.success || !isDeepStrictEqual(parsedInput.data, input)) {
+      throw toSafeAppError({ code: 'INVALID_INPUT' })
+    }
 
     let raw: unknown
     try {

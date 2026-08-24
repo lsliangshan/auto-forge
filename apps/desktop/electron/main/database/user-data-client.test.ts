@@ -110,6 +110,13 @@ function deleteConversationMutation(index: number): SyncMutation {
   }
 }
 
+function projectedConversation(
+  store: ReturnType<UserDataStoreManager['open']>,
+  id: string,
+) {
+  return store.conversations.listPage({ limit: 50 }).items.find((conversation) => conversation.id === id)
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })
@@ -409,9 +416,128 @@ describe('UserDataStoreManager', () => {
     expect(store.outbox.find(first.id)).toMatchObject({ state: 'syncing' })
     expect(store.outbox.find(second.id)).toBeUndefined()
     expect(store.conversations.listPage({ limit: 50 }).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: first.entityId, revision: 0, syncState: 'pending' }),
+      expect.objectContaining({ id: first.entityId, revision: 0, syncState: 'syncing' }),
       expect.objectContaining({ id: second.entityId, revision: 1, syncState: 'synced' }),
     ]))
+    manager.close()
+  })
+
+  it('moves a duplicate acknowledgement to durable non-sendable receipt evidence', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('evidence_create', 'evidence_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_evidence_create', mutations: [pulledMutation(create, 1)],
+    }, 1)
+    const first = renameConversationMutation(
+      'evidence_first', create.entityId, 1, 'First remote title',
+    )
+    const later = renameConversationMutation(
+      'evidence_later', create.entityId, 2, 'Later local title',
+    )
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(later)
+    store.outbox.markSyncing([first.id])
+    store.outbox.markPending(first.id)
+    store.outbox.markSyncing([first.id])
+
+    store.outbox.acknowledgePushResults(
+      [first],
+      [{ id: first.id, status: 'duplicate', revision: 2 }],
+    )
+
+    expect(store.outbox.find(first.id)).toBeUndefined()
+    expect(store.outbox.countPending()).toBe(1)
+    expect(store.outbox.listReady(Date.now(), 10).map(({ id }) => id)).toEqual([later.id])
+    expect(projectedConversation(store, create.entityId)).toMatchObject({
+      title: 'Later local title', revision: 2, syncState: 'pending',
+    })
+    const inspection = new Database(cachePath(root, 'cloud-alice'))
+    expect(inspection.prepare('SELECT mutation_id AS mutationId FROM sync_receipt_evidence').all())
+      .toEqual([{ mutationId: first.id }])
+    inspection.close()
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_evidence_behind', mutations: [],
+    }, 2)
+    manager.close()
+    const behind = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(behind.prepare('SELECT mutation_id AS mutationId FROM sync_receipt_evidence').all())
+      .toEqual([{ mutationId: first.id }])
+    behind.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(() => reopened.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_evidence_rolled_back',
+      mutations: [
+        pulledMutation(first, 2),
+        pulledMutation(renameConversationMutation(
+          'evidence_invalid_later', 'missing_conversation', 1, 'Invalid',
+        ), 2),
+      ],
+    }, 3)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(reopened.sync.getCheckpoint()?.remoteCursor).toBe('cursor_evidence_behind')
+    const rolledBack = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(rolledBack.prepare('SELECT mutation_id AS mutationId FROM sync_receipt_evidence').all())
+      .toEqual([{ mutationId: first.id }])
+    rolledBack.close()
+
+    reopened.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_evidence_receipt',
+      mutations: [pulledMutation(first, 2)],
+    }, 4)
+    expect(projectedConversation(reopened, create.entityId)).toMatchObject({
+      title: 'Later local title', revision: 2, syncState: 'pending',
+    })
+    expect(reopened.outbox.find(later.id)).toBeDefined()
+    manager.close()
+    const consumed = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(consumed.prepare('SELECT COUNT(*) AS count FROM sync_receipt_evidence').get())
+      .toEqual({ count: 0 })
+    consumed.close()
+  })
+
+  it('recomputes one conversation projection from all mixed outbox rows', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('mixed_create', 'mixed_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1, cursor: 'cursor_mixed_create', mutations: [pulledMutation(create, 1)],
+    }, 1)
+    const first = appendMessageMutation('mixed_first', create.entityId, 'mixed_message_first')
+    const second = appendMessageMutation('mixed_second', create.entityId, 'mixed_message_second')
+    store.outbox.recordWithMessage(first)
+    store.outbox.recordWithMessage(second)
+    store.outbox.markSyncing([first.id, second.id])
+    expect(projectedConversation(store, create.entityId)?.syncState).toBe('syncing')
+
+    store.outbox.markFailed(first.id, 'SYNC_CONFLICT')
+    store.outbox.markFailed(second.id, 'INVALID_INPUT')
+    expect(projectedConversation(store, create.entityId)?.syncState).toBe('failed')
+    manager.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(projectedConversation(reopened, create.entityId)?.syncState).toBe('failed')
+    expect(reopened.outbox.retryFailed(first.entityId)).toEqual([first.id])
+    expect(projectedConversation(reopened, create.entityId)?.syncState).toBe('failed')
+    reopened.outbox.markSyncing([first.id])
+    expect(projectedConversation(reopened, create.entityId)?.syncState).toBe('failed')
+    expect(reopened.outbox.retryFailed(second.entityId)).toEqual([second.id])
+    expect(projectedConversation(reopened, create.entityId)?.syncState).toBe('syncing')
+    reopened.outbox.markPending(first.id)
+    expect(projectedConversation(reopened, create.entityId)?.syncState).toBe('pending')
+
+    reopened.outbox.markSyncing([first.id, second.id])
+    reopened.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_mixed_receipts',
+      mutations: [pulledMutation(first, 1), pulledMutation(second, 1)],
+    }, 2)
+    expect(projectedConversation(reopened, create.entityId)?.syncState).toBe('synced')
     manager.close()
   })
 
@@ -1191,8 +1317,10 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
+      .toBeDefined()
+    expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
       .toBeDefined()
     inspection.close()
   })
@@ -1200,6 +1328,25 @@ describe('UserDataStoreManager', () => {
   it('enforces the pending outbox cap before optimistic conversation state commits', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')
+    const acknowledged: SyncMutation = {
+      id: 'acknowledged_cap_evidence',
+      kind: 'privacy.consent',
+      entityId: 'privacy-2026-08',
+      baseRevision: 0,
+      occurredAt: '2026-08-24T00:00:00.000Z',
+      payload: {
+        purpose: 'cloud_sync',
+        documentVersion: 'privacy-2026-08',
+        consentedAt: '2026-08-24T00:00:00.000Z',
+        clientVersion: '2.0.0',
+      },
+    }
+    store.outbox.record(acknowledged)
+    store.outbox.markSyncing([acknowledged.id])
+    store.outbox.acknowledgePushResults(
+      [acknowledged],
+      [{ id: acknowledged.id, status: 'duplicate', revision: 0 }],
+    )
     for (let index = 0; index < 10_000; index += 1) {
       store.outbox.record(deleteConversationMutation(index))
     }

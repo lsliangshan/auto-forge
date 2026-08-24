@@ -74,6 +74,50 @@ describe('CloudBaseUserDataPort', () => {
     expect(callFunction).not.toHaveBeenCalled()
   })
 
+  it('validates the exact push object before classifying its mutation count', async () => {
+    const callFunction = vi.fn()
+    const port = new CloudBaseUserDataPort({ callFunction })
+
+    await expect(port.call({
+      action: 'syncPush',
+      protocolVersion: 1,
+      deviceId: 'device-a',
+      mutations: Array.from({ length: 101 }, () => mutation),
+      secret: 'must-not-be-accepted',
+    } as never)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(callFunction).not.toHaveBeenCalled()
+  })
+
+  it('classifies unsupported protocol versions before schema validation', async () => {
+    const callFunction = vi.fn()
+    const port = new CloudBaseUserDataPort({ callFunction })
+
+    await expect(port.call({
+      action: 'syncPull', protocolVersion: 2, deviceId: 'device-a', limit: 100,
+    } as never)).rejects.toMatchObject({ code: 'UPGRADE_REQUIRED' })
+    expect(callFunction).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      label: 'device identifier',
+      call: { action: 'syncPull', protocolVersion: 1, deviceId: ' device-a', limit: 100 },
+    },
+    {
+      label: 'mutation identifier',
+      call: {
+        action: 'syncPush', protocolVersion: 1, deviceId: 'device-a',
+        mutations: [{ ...mutation, id: ' mutation_1' }],
+      },
+    },
+  ])('rejects rather than trims a whitespace-padded $label', async ({ call }) => {
+    const callFunction = vi.fn()
+    const port = new CloudBaseUserDataPort({ callFunction })
+
+    await expect(port.call(call as never)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(callFunction).not.toHaveBeenCalled()
+  })
+
   it('enforces the Task 3 one-mebibyte serialized event boundary', async () => {
     const callFunction = vi.fn().mockResolvedValue({
       result: { ok: true, data: { results: [], cursor: 'cursor_boundary_01' } },

@@ -528,7 +528,7 @@ describe('UserDataSyncEngine', () => {
     const retrying = engine.retry(mutation.entityId)
     await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(2))
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
-      expect.objectContaining({ id: mutation.entityId, syncState: 'pending' }),
+      expect.objectContaining({ id: mutation.entityId, syncState: 'syncing' }),
     )
     resolveRetryPush(success({
       results: [{ id: mutation.id, status: 'applied', revision: 1 }],
@@ -793,6 +793,26 @@ describe('UserDataSyncEngine', () => {
 
     expect(engine.status()).toEqual({ state: 'quarantined', errorCode: 'INTERNAL_ERROR' })
     expect(clock.timerCount()).toBe(0)
+  })
+
+  it('clears an existing retry timer before a pull pauses for authentication', async () => {
+    const manager = createManager()
+    manager.open('alice').outbox.record(createMutation(29))
+    const call = vi.fn()
+      .mockRejectedValueOnce({ code: 'SERVICE_UNAVAILABLE' })
+      .mockResolvedValueOnce(failure('AUTH_REQUIRED'))
+    const { engine, clock } = createEngine(manager, call)
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+    expect(engine.status()).toMatchObject({ state: 'retrying' })
+    expect(clock.timerCount()).toBe(1)
+
+    await engine.pull()
+
+    expect(engine.status()).toEqual({ state: 'paused', errorCode: 'AUTH_REQUIRED' })
+    expect(clock.timerCount()).toBe(0)
+    await expect(clock.fireNext()).rejects.toThrow('No timer scheduled')
+    expect(call).toHaveBeenCalledTimes(2)
   })
 
   it('maps a timer-driven repository failure to safe quarantine without rejection', async () => {

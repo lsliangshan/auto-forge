@@ -441,6 +441,61 @@ function validateOutboxReceipt(
   return local
 }
 
+function evidenceFromRow(row: Query): SyncMutation {
+  return parsePersisted(() => syncMutationSchema.parse({
+    id: row.id,
+    kind: row.kind,
+    entityId: row.entityId,
+    baseRevision: row.baseRevision,
+    payload: JSON.parse(z.string().parse(row.payloadJson)),
+    occurredAt: isoTimestamp(z.number().int().nonnegative().parse(row.occurredAt)),
+  }))
+}
+
+function findReceiptEvidence(database: SqliteDatabase, id: string): SyncMutation | undefined {
+  const row = database.prepare(`
+    SELECT mutation_id AS id, kind, entity_id AS entityId, base_revision AS baseRevision,
+           payload_json AS payloadJson, occurred_at AS occurredAt
+    FROM sync_receipt_evidence
+    WHERE mutation_id = @id
+  `).get({ id }) as Query | undefined
+  return row === undefined ? undefined : evidenceFromRow(row)
+}
+
+function validateReceiptEvidence(
+  database: SqliteDatabase,
+  mutation: MutationReceipt,
+): SyncMutation | undefined {
+  const local = findReceiptEvidence(database, mutation.id)
+  if (local === undefined) return undefined
+  if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
+  requireValidRemoteResult(mutation)
+  return local
+}
+
+function preserveReceiptEvidence(database: SqliteDatabase, mutation: SyncMutation): void {
+  const existing = findReceiptEvidence(database, mutation.id)
+  if (existing !== undefined) {
+    if (!isDeepStrictEqual(existing, mutation)) throw new UserDataConsistencyError()
+    return
+  }
+  database.prepare(`
+    INSERT INTO sync_receipt_evidence (
+      mutation_id, kind, entity_id, base_revision, payload_json, occurred_at, created_at
+    ) VALUES (
+      @id, @kind, @entityId, @baseRevision, @payloadJson, @occurredAt, @createdAt
+    )
+  `).run({
+    id: mutation.id,
+    kind: mutation.kind,
+    entityId: mutation.entityId,
+    baseRevision: mutation.baseRevision,
+    payloadJson: JSON.stringify(mutation.payload),
+    occurredAt: timestamp(mutation.occurredAt),
+    createdAt: Date.now(),
+  })
+}
+
 function remoteConversation(
   database: SqliteDatabase,
   ownerUserId: string,
@@ -460,42 +515,40 @@ function remoteConversation(
   return conversation
 }
 
-function hasPendingConversationMutation(
+function recomputeConversationSyncState(
   database: SqliteDatabase,
-  mutationId: string,
+  ownerUserId: string,
   conversationId: string,
-): boolean {
-  return database.prepare(`
-    SELECT 1
+): void {
+  if (remoteConversation(database, ownerUserId, conversationId) === undefined) return
+  const aggregate = database.prepare(`
+    SELECT COUNT(*) AS total,
+           MAX(CASE WHEN state = 'failed' AND next_attempt_at IS NULL THEN 1 ELSE 0 END)
+             AS hasTerminalFailure,
+           MAX(CASE WHEN state = 'syncing' THEN 1 ELSE 0 END) AS hasSyncing
     FROM outbox_mutations
-    WHERE id <> @mutationId
-      AND (
+    WHERE (
         (entity_id = @conversationId AND kind LIKE 'conversation.%')
         OR (kind = 'message.append'
           AND json_extract(payload_json, '$.conversationId') = @conversationId)
       )
-    LIMIT 1
-  `).get({ mutationId, conversationId }) !== undefined
-}
-
-function hasTerminalConversationMutation(
-  database: SqliteDatabase,
-  mutationId: string,
-  conversationId: string,
-): boolean {
-  return database.prepare(`
-    SELECT 1
-    FROM outbox_mutations
-    WHERE id <> @mutationId
-      AND state = 'failed'
-      AND next_attempt_at IS NULL
-      AND (
-        (entity_id = @conversationId AND kind LIKE 'conversation.%')
-        OR (kind = 'message.append'
-          AND json_extract(payload_json, '$.conversationId') = @conversationId)
-      )
-    LIMIT 1
-  `).get({ mutationId, conversationId }) !== undefined
+  `).get({ conversationId }) as {
+    total: number
+    hasTerminalFailure: number | null
+    hasSyncing: number | null
+  }
+  const syncState = aggregate.hasTerminalFailure === 1
+    ? 'failed'
+    : aggregate.hasSyncing === 1
+      ? 'syncing'
+      : aggregate.total > 0
+        ? 'pending'
+        : 'synced'
+  database.prepare(`
+    UPDATE conversations
+    SET sync_state = @syncState
+    WHERE id = @conversationId
+  `).run({ conversationId, syncState })
 }
 
 function acknowledgeLocalMutation(
@@ -503,6 +556,7 @@ function acknowledgeLocalMutation(
   ownerUserId: string,
   local: SyncMutation,
   remote: MutationReceipt,
+  source: 'outbox' | 'evidence' = 'outbox',
 ): void {
   const resultRevision = requireValidRemoteResult(remote)
   let conversationId: string | undefined
@@ -524,22 +578,20 @@ function acknowledgeLocalMutation(
     default:
       break
   }
-  database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: local.id })
+  const deleted = source === 'outbox'
+    ? database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: local.id })
+    : database.prepare('DELETE FROM sync_receipt_evidence WHERE mutation_id = @id').run({ id: local.id })
+  if (deleted.changes !== 1) throw new UserDataConsistencyError()
   if (conversationId !== undefined) {
     database.prepare(`
       UPDATE conversations
-      SET revision = MAX(revision, @revision),
-          sync_state = @syncState
+      SET revision = MAX(revision, @revision)
       WHERE id = @conversationId
     `).run({
       conversationId,
       revision: resultRevision,
-      syncState: hasTerminalConversationMutation(database, local.id, conversationId)
-        ? 'failed'
-        : hasPendingConversationMutation(database, local.id, conversationId)
-          ? 'pending'
-          : 'synced',
     })
+    recomputeConversationSyncState(database, ownerUserId, conversationId)
   }
 }
 
@@ -596,6 +648,11 @@ function applyRemoteMutation(
   const matchingOutboxReceipt = validateOutboxReceipt(database, mutation)
   if (matchingOutboxReceipt !== undefined) {
     acknowledgeLocalMutation(database, ownerUserId, matchingOutboxReceipt, mutation)
+    return
+  }
+  const matchingEvidence = validateReceiptEvidence(database, mutation)
+  if (matchingEvidence !== undefined) {
+    acknowledgeLocalMutation(database, ownerUserId, matchingEvidence, mutation, 'evidence')
     return
   }
   const revision = requireValidRemoteResult(mutation)
@@ -759,6 +816,10 @@ function applyRemoteMutation(
     default:
       break
   }
+  const conversationId = affectedConversationId(mutation)
+  if (conversationId !== undefined) {
+    recomputeConversationSyncState(database, ownerUserId, conversationId)
+  }
 }
 
 function conversationPage(
@@ -895,7 +956,7 @@ function findOutboxMutation(database: SqliteDatabase, id: string): OutboxMutatio
   return row === undefined ? undefined : outboxFromRow(row)
 }
 
-function affectedConversationId(mutation: SyncMutation): string | undefined {
+function affectedConversationId(mutation: SyncMutation | RemoteMutation): string | undefined {
   switch (mutation.kind) {
     case 'conversation.create':
     case 'conversation.rename':
@@ -909,20 +970,17 @@ function affectedConversationId(mutation: SyncMutation): string | undefined {
   }
 }
 
-function projectOutboxConversation(
+function recomputeAffectedConversations(
   database: SqliteDatabase,
   ownerUserId: string,
-  mutation: SyncMutation,
-  syncState: 'pending' | 'failed',
+  mutations: readonly SyncMutation[],
 ): void {
-  const conversationId = affectedConversationId(mutation)
-  if (conversationId === undefined) return
-  if (remoteConversation(database, ownerUserId, conversationId) === undefined) return
-  database.prepare(`
-    UPDATE conversations
-    SET sync_state = @syncState
-    WHERE id = @conversationId
-  `).run({ conversationId, syncState })
+  const conversationIds = new Set(mutations.map(affectedConversationId).filter(
+    (conversationId): conversationId is string => conversationId !== undefined,
+  ))
+  for (const conversationId of conversationIds) {
+    recomputeConversationSyncState(database, ownerUserId, conversationId)
+  }
 }
 
 function checkpointFromRow(row: Query | undefined): SyncCheckpoint | undefined {
@@ -993,6 +1051,7 @@ function acknowledgePushResults(
         requireValidRemoteResult(receipt)
       } else if (result.status === 'duplicate') {
         requireValidRemoteResult(receipt)
+        preserveReceiptEvidence(database, local)
         acknowledgeLocalMutation(database, ownerUserId, local, receipt)
       }
     }
@@ -1031,11 +1090,22 @@ export function createUserDataRepositories(
   database: SqliteDatabase,
   ownerUserId: string,
 ): UserDataRepositories {
-  database.prepare(`
-    UPDATE outbox_mutations
-    SET state = 'pending', next_attempt_at = NULL, last_error_code = 'SYNC_FAILED'
-    WHERE state = 'syncing'
-  `).run()
+  transaction(database, () => {
+    const interrupted = (database.prepare(`
+      SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
+             payload_json AS payloadJson, state, attempts,
+             next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
+             occurred_at AS occurredAt, created_at AS createdAt
+      FROM outbox_mutations
+      WHERE state = 'syncing'
+    `).all() as Query[]).map(outboxFromRow)
+    database.prepare(`
+      UPDATE outbox_mutations
+      SET state = 'pending', next_attempt_at = NULL, last_error_code = 'SYNC_FAILED'
+      WHERE state = 'syncing'
+    `).run()
+    recomputeAffectedConversations(database, ownerUserId, interrupted)
+  })
   const repositories = createRepositories(database)
   const conversations = {
     ...repositories.conversations,
@@ -1315,6 +1385,7 @@ export function createUserDataRepositories(
       assertOutboxCapacity(database)
       optimisticWrite?.(mutation)
       insertOutbox(database, mutation)
+      recomputeAffectedConversations(database, ownerUserId, [mutation])
     })
   }
   return {
@@ -1392,12 +1463,15 @@ export function createUserDataRepositories(
       ).count,
       markSyncing(ids) {
         transaction(database, () => {
+          const mutations = ids.map((id) => findOutboxMutation(database, id))
+            .filter((mutation): mutation is OutboxMutationRecord => mutation !== undefined)
           const update = database.prepare(`
             UPDATE outbox_mutations
             SET state = 'syncing', attempts = attempts + 1, last_error_code = NULL
             WHERE id = @id AND state IN ('pending', 'failed')
           `)
           for (const id of ids) update.run({ id })
+          recomputeAffectedConversations(database, ownerUserId, mutations)
         })
       },
       markPending(id, nextAttemptAt) {
@@ -1408,7 +1482,7 @@ export function createUserDataRepositories(
             SET state = 'pending', next_attempt_at = @nextAttemptAt, last_error_code = NULL
             WHERE id = @id
           `).run({ id, nextAttemptAt: nextAttemptAt ?? null })
-          if (local) projectOutboxConversation(database, ownerUserId, local, 'pending')
+          if (local) recomputeAffectedConversations(database, ownerUserId, [local])
         })
       },
       markFailed(id, errorCode, nextAttemptAt) {
@@ -1420,14 +1494,7 @@ export function createUserDataRepositories(
             SET state = 'failed', next_attempt_at = @nextAttemptAt, last_error_code = @errorCode
             WHERE id = @id
           `).run({ id, errorCode: validatedErrorCode, nextAttemptAt: nextAttemptAt ?? null })
-          if (local) {
-            projectOutboxConversation(
-              database,
-              ownerUserId,
-              local,
-              nextAttemptAt === undefined ? 'failed' : 'pending',
-            )
-          }
+          if (local) recomputeAffectedConversations(database, ownerUserId, [local])
         })
       },
       acknowledgePushResults(sent, results) {
@@ -1458,13 +1525,17 @@ export function createUserDataRepositories(
           `)
           for (const mutation of failed) {
             update.run({ id: mutation.id })
-            projectOutboxConversation(database, ownerUserId, mutation, 'pending')
           }
+          recomputeAffectedConversations(database, ownerUserId, failed)
           return failed.map(({ id }) => id)
         })
       },
       delete(id) {
-        transaction(database, () => database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id }))
+        transaction(database, () => {
+          const local = findOutboxMutation(database, id)
+          database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id })
+          if (local) recomputeAffectedConversations(database, ownerUserId, [local])
+        })
       },
     },
   }

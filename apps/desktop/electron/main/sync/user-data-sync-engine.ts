@@ -258,7 +258,7 @@ export class UserDataSyncEngine {
         } else if (code === 'AUTH_REQUIRED') {
           for (const id of ids) binding.store.outbox.markPending(id)
           this.#untrackSyncing(binding, ids)
-          this.#status = { state: 'paused', errorCode: 'AUTH_REQUIRED' }
+          this.#pauseForAuth()
         } else {
           for (const id of ids) binding.store.outbox.markFailed(id, code)
           this.#untrackSyncing(binding, ids)
@@ -275,7 +275,7 @@ export class UserDataSyncEngine {
         } else if (code === 'AUTH_REQUIRED') {
           for (const id of ids) binding.store.outbox.markPending(id)
           this.#untrackSyncing(binding, ids)
-          this.#status = { state: 'paused', errorCode: 'AUTH_REQUIRED' }
+          this.#pauseForAuth()
         } else {
           for (const id of ids) binding.store.outbox.markFailed(id, code)
           this.#untrackSyncing(binding, ids)
@@ -409,7 +409,7 @@ export class UserDataSyncEngine {
       this.#pullFailureAttempt += 1
       this.#scheduleRetry(binding, this.#pullFailureAttempt)
     } else if (code === 'AUTH_REQUIRED') {
-      this.#status = { state: 'paused', errorCode: 'AUTH_REQUIRED' }
+      this.#pauseForAuth()
     } else {
       this.#quarantine(code)
     }
@@ -456,6 +456,11 @@ export class UserDataSyncEngine {
   #quarantine(errorCode: AppErrorCode): void {
     this.#clearTimer()
     this.#status = { state: 'quarantined', errorCode }
+  }
+
+  #pauseForAuth(): void {
+    this.#clearTimer()
+    this.#status = { state: 'paused', errorCode: 'AUTH_REQUIRED' }
   }
 
   #stopRequestedWork(): boolean {
