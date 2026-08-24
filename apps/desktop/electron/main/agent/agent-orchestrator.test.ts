@@ -427,6 +427,7 @@ function attachCombinedBrowserContinuation(
     origin: 'https://permit.example.gov.cn',
     url: 'https://permit.example.gov.cn/detail',
     navigationEpoch: 1,
+    activityRevision: 0,
   }
   const snapshot = (): BrowserPageSnapshot => Object.freeze({
     snapshotId: 'snapshot_1', bindingId: binding.bindingId,
@@ -475,16 +476,29 @@ function attachCombinedBrowserContinuation(
     performContinuationAction: vi.fn(async (input: { action: { type: string; url?: string } }) => {
       if (input.action.type !== 'navigate' || input.action.url === undefined) return
       const destination = new URL(input.action.url)
-      state = { origin: destination.origin, url: destination.href, navigationEpoch: state.navigationEpoch + 1 }
+      state = {
+        origin: destination.origin,
+        url: destination.href,
+        navigationEpoch: state.navigationEpoch + 1,
+        activityRevision: state.activityRevision,
+      }
     }),
     focusContinuation: vi.fn(async () => undefined),
     highlightContinuationTarget: vi.fn(async () => undefined),
     clearContinuationHighlight: vi.fn(async () => undefined),
+    suspendContinuation: vi.fn(async () => undefined),
+    resumeContinuation: vi.fn(async () => undefined),
   }
   const executor = new BrowserContinuationToolExecutor({
     registry: { acquire },
     inspector: inspector as never,
     workspace,
+    loginWait: {
+      wait: vi.fn(async (input) => {
+        if (await input.probe() !== 'authenticated') throw { code: 'AUTH_REQUIRED' }
+      }),
+      cancel: vi.fn(),
+    },
     audits: {
       list: vi.fn(() => []),
       insert: vi.fn((entry) => entry),

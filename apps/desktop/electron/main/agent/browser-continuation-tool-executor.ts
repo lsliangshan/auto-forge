@@ -495,6 +495,7 @@ export class BrowserContinuationToolExecutor {
         : snapshot.nodes.find((node) => node.ref === targetRef)
       let page: BrowserContinuationPageState = {
         origin: snapshot.origin, url: snapshot.url, navigationEpoch: snapshot.navigationEpoch,
+        activityRevision: 0,
       }
       let normalized = action
       let audited = false

@@ -1127,6 +1127,177 @@ describe('ElectronBrowserWorkspace', () => {
     await lease.release()
   })
 
+  it('keeps a suspended continuation reserved while restoring physical user input', async () => {
+    const harness = createHarness()
+    const { workspace, views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_suspended',
+    })
+    const [toolbar, target, shield] = views
+    target!.webContents.currentUrl = 'https://www.baidu.com/login'
+    target!.webContents.emit('did-navigate', {}, target!.webContents.currentUrl)
+    expect(windows[0]!.children).toEqual([target, shield, toolbar])
+
+    await workspace.suspendContinuation(binding.tabId, 'run_suspended')
+
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(windows[0]!.children).toEqual([target, toolbar])
+    const pointer = { preventDefault: vi.fn() }
+    const keyboard = { preventDefault: vi.fn() }
+    target!.webContents.emit('before-mouse-event', pointer, { type: 'mouseDown' })
+    target!.webContents.emit('before-input-event', keyboard, { type: 'keyDown', key: 'A' })
+    expect(pointer.preventDefault).not.toHaveBeenCalled()
+    expect(keyboard.preventDefault).not.toHaveBeenCalled()
+    await expect(workspace.acquireContinuation(binding.tabId, 'run_competing'))
+      .rejects.toMatchObject({ code: 'PAGE_BUSY' })
+
+    const current = await workspace.getContinuationState(binding.tabId, 'run_suspended')
+    await workspace.resumeContinuation(binding.tabId, 'run_suspended', current)
+
+    expect(windows[0]!.children).toEqual([target, shield, toolbar])
+    const resumedKeyboard = { preventDefault: vi.fn() }
+    target!.webContents.emit('before-input-event', resumedKeyboard, { type: 'keyDown', key: 'B' })
+    expect(resumedKeyboard.preventDefault).toHaveBeenCalledOnce()
+    await lease.release()
+    expect(windows[0]!.children).toEqual([target, toolbar])
+  })
+
+  it('observes only suspended physical input and page activity', async () => {
+    let targetContents: FakeWebContents | undefined
+    const harness = createHarness((method) => {
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
+      if (method === 'Accessibility.queryAXTree') {
+        return {
+          nodes: [{
+            backendDOMNodeId: 80, ignored: false,
+            role: { value: 'button' }, name: { value: '继续' },
+          }],
+        }
+      }
+      if (method === 'DOM.getBoxModel') {
+        return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } }
+      }
+      if (method === 'Input.dispatchMouseEvent') {
+        targetContents?.emit(
+          'before-mouse-event',
+          { preventDefault: vi.fn() },
+          { type: 'mouseDown' },
+        )
+      }
+      return {}
+    })
+    const { workspace, views } = harness
+    const { tab, binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_activity',
+    })
+    targetContents = views[1]!.webContents
+    targetContents.currentUrl = 'https://www.baidu.com/login'
+    const activities: Array<{ kind: string }> = []
+    const unsubscribe = workspace.onContinuationActivity((activity) => { activities.push(activity) })
+    await workspace.suspendContinuation(binding.tabId, 'run_activity')
+
+    targetContents.emit(
+      'before-mouse-event',
+      { preventDefault: vi.fn() },
+      { type: 'mouseMove' },
+    )
+    targetContents.emit(
+      'before-mouse-event',
+      { preventDefault: vi.fn() },
+      { type: 'mouseDown' },
+    )
+    targetContents.emit(
+      'before-input-event',
+      { preventDefault: vi.fn() },
+      { type: 'keyDown', key: 'A' },
+    )
+    targetContents.emit('did-navigate', {}, targetContents.currentUrl)
+
+    expect(activities.map(({ kind }) => kind)).toEqual([
+      'physical_input',
+      'physical_input',
+      'page_change',
+    ])
+    const suspendedPage = await workspace.getContinuationState(binding.tabId, 'run_activity')
+    expect(suspendedPage.activityRevision).toBe(3)
+
+    await workspace.resumeContinuation(binding.tabId, 'run_activity', suspendedPage)
+    await tab.click('role=button[name="继续"]', 'https://www.baidu.com')
+    expect(activities).toHaveLength(3)
+
+    unsubscribe()
+    await lease.release()
+  })
+
+  it('keeps promotion suspended when activity changes while the input shield loads', async () => {
+    const shieldLoad = deferred<void>()
+    let shieldLoads = 0
+    const harness = createHarness(
+      () => ({}), false,
+      async (url) => {
+        if (url.startsWith('data:text/html')
+          && decodeURIComponent(url).includes('<body aria-hidden="true">')
+          && ++shieldLoads === 2) {
+          await shieldLoad.promise
+        }
+      },
+    )
+    const { workspace, views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_promoting',
+    })
+    const [toolbar, target, shield] = views
+    target!.webContents.currentUrl = 'https://www.baidu.com/login'
+    await workspace.suspendContinuation(binding.tabId, 'run_promoting')
+    const expectedPage = await workspace.getContinuationState(binding.tabId, 'run_promoting')
+    shield!.webContents.close()
+
+    const promotion = workspace.resumeContinuation(binding.tabId, 'run_promoting', expectedPage)
+    await vi.waitFor(() => expect(views).toHaveLength(4))
+    target!.webContents.emit(
+      'before-mouse-event',
+      { preventDefault: vi.fn() },
+      { type: 'mouseDown' },
+    )
+    shieldLoad.resolve()
+
+    await expect(promotion).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(lease.isCurrent(binding)).toBe(true)
+    expect(windows[0]!.children).toEqual([target, toolbar])
+    const suspendedInput = { preventDefault: vi.fn() }
+    target!.webContents.emit('before-input-event', suspendedInput, { type: 'keyDown', key: 'A' })
+    expect(suspendedInput.preventDefault).not.toHaveBeenCalled()
+    await lease.release()
+  })
+
+  it('keeps a continuation suspended when its authenticated page changes before resume', async () => {
+    const harness = createHarness()
+    const { workspace, views, windows } = harness
+    const { binding, registry } = await bindIdleContinuation(harness)
+    const [, target] = views
+    target!.webContents.currentUrl = 'https://www.baidu.com/login'
+    target!.webContents.emit('did-navigate', {}, target!.webContents.currentUrl)
+    const lease = await registry.acquire(binding.bindingId, {
+      userId: 'user_1', conversationId: 'conversation_1', runId: 'run_redirecting',
+    })
+    await workspace.suspendContinuation(binding.tabId, 'run_redirecting')
+    const authenticated = await workspace.getContinuationState(binding.tabId, 'run_redirecting')
+
+    target!.webContents.currentUrl = 'https://www.baidu.com/login/callback'
+    target!.webContents.emit('did-navigate', {}, target!.webContents.currentUrl)
+    await expect(workspace.resumeContinuation(binding.tabId, 'run_redirecting', authenticated))
+      .rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+
+    expect(windows[0]!.children).toEqual([target, views[0]])
+    const redirected = await workspace.getContinuationState(binding.tabId, 'run_redirecting')
+    await workspace.resumeContinuation(binding.tabId, 'run_redirecting', redirected)
+    expect(windows[0]!.children).toEqual([target, views[2], views[0]])
+    await lease.release()
+  })
+
   it('keeps the owned shield attached and below the full-height toolbar while loading repaint is pending', async () => {
     const toolbarLoad = deferred<void>()
     let pauseToolbar = false

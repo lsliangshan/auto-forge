@@ -528,6 +528,11 @@ describe('cross-process contracts', () => {
       type: 'browser_status', blockId: 'browser_status_port', requestId: 'request_1', bindingId: 'binding_1',
       siteLabel: '北京市工作居住证', origin: 'https://fw.bjrcgz.gov.cn:8443', state: 'acting',
     })).toMatchObject({ origin: 'https://fw.bjrcgz.gov.cn:8443' })
+    expect(chatBlockSchema.parse({
+      type: 'browser_status', blockId: 'browser_status_manual', requestId: 'request_1',
+      bindingId: 'binding_1', siteLabel: '事项办理', origin: 'https://service.example',
+      state: 'awaiting_user', errorCode: 'MANUAL_INTERVENTION_REQUIRED',
+    })).toMatchObject({ errorCode: 'MANUAL_INTERVENTION_REQUIRED' })
     expect(chatBlockSchema.safeParse({
       type: 'browser_status', blockId: 'browser_status_1', requestId: 'request_1', bindingId: 'binding_1',
       siteLabel: '北京市工作居住证', origin: 'https://fw.bjrcgz.gov.cn?token=secret', state: 'acting',

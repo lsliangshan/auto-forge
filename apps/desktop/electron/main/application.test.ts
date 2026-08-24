@@ -32,7 +32,10 @@ import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
 import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
-import type { BrowserContinuationBindingInput } from './browser/browser-continuation-types.js'
+import type {
+  BrowserContinuationActivity,
+  BrowserContinuationBindingInput,
+} from './browser/browser-continuation-types.js'
 import type { BrowserPageCdpPort } from './browser/browser-page-inspector.js'
 import {
   browserSessionStorageSecretKey,
@@ -102,6 +105,7 @@ interface ApplicationBrowserWorkspaceTestPort extends BrowserWorkspacePort,
   BrowserContinuationWorkspacePort {
   acquireContinuation(tabId: string, runId: string): Promise<void>
   releaseContinuation(tabId: string, runId: string): Promise<void>
+  onContinuationActivity(listener: (activity: BrowserContinuationActivity) => void): () => void
   closeContinuation(tabId: string): Promise<void>
   describeContinuation(tabId: string): Promise<{
     pageLabel: string
@@ -137,11 +141,15 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspaceTestPort {
     markContinuationBound: vi.fn(),
     acquireContinuation: vi.fn(async () => undefined),
     releaseContinuation: vi.fn(async () => undefined),
+    suspendContinuation: vi.fn(async () => undefined),
+    resumeContinuation: vi.fn(async () => undefined),
+    onContinuationActivity: vi.fn(() => () => undefined),
     closeContinuation: vi.fn(async () => undefined),
     getContinuationState: vi.fn(async () => ({
       origin: 'https://permit.example.gov.cn',
       url: 'https://permit.example.gov.cn/detail',
       navigationEpoch: 1,
+      activityRevision: 0,
     })),
     performContinuationAction: vi.fn(async () => undefined),
     focusContinuation: vi.fn(async () => undefined),

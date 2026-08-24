@@ -100,7 +100,10 @@ function harness(options: {
     })),
     endRun: vi.fn(),
   }
-  const state = { origin: 'https://service.example', url: 'https://service.example/form', navigationEpoch: 1 }
+  const state = {
+    origin: 'https://service.example', url: 'https://service.example/form',
+    navigationEpoch: 1, activityRevision: 0,
+  }
   const workspace = {
     getContinuationState: vi.fn(async () => ({ ...state })),
     performContinuationAction: vi.fn(async () => undefined),
@@ -436,7 +439,8 @@ describe('BrowserContinuationToolExecutor', () => {
 
     expect(test.loginWait.wait).toHaveBeenCalledOnce()
     expect(test.workspace.resumeContinuation).toHaveBeenCalledWith('tab_1', 'agent_run_1', {
-      origin: 'https://service.example', url: 'https://service.example/form', navigationEpoch: 1,
+      origin: 'https://service.example', url: 'https://service.example/form',
+      navigationEpoch: 1, activityRevision: 0,
     })
     now = 600_001
     await expect(test.executor.execute('browser_session_inspect', {
@@ -492,7 +496,8 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.loginWait.wait).toHaveBeenCalledTimes(2)
     expect(test.workspace.resumeContinuation).toHaveBeenCalledTimes(2)
     expect(test.workspace.resumeContinuation).toHaveBeenLastCalledWith('tab_1', 'agent_run_1', {
-      origin: 'https://service.example', url: 'https://service.example/callback', navigationEpoch: 2,
+      origin: 'https://service.example', url: 'https://service.example/callback',
+      navigationEpoch: 2, activityRevision: 0,
     })
     expect(test.release).not.toHaveBeenCalled()
   })
@@ -525,6 +530,7 @@ describe('BrowserContinuationToolExecutor', () => {
       origin: 'https://service.example',
       url: 'https://service.example/dashboard',
       navigationEpoch: 2,
+      activityRevision: 0,
     })
     expect(test.release).not.toHaveBeenCalled()
   })

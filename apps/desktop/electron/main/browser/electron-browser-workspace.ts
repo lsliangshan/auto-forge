@@ -11,6 +11,7 @@ import { canonicalJson } from '../workflows/workflow-security-fingerprint.js'
 import {
   frozenBrowserContinuationProvenance,
   type BrowserAction,
+  type BrowserContinuationActivity,
   type BrowserContinuationPageState,
   type BrowserContinuationProvenance,
   type BrowserContinuationResolvedTargetInput,
@@ -185,6 +186,13 @@ export interface ApplicationBrowserWorkspacePort extends BrowserWorkspacePort, B
   setSessionStorageStore?(store: BrowserSessionStorageStore): void
   acquireContinuation(tabId: string, runId: string): Promise<void>
   releaseContinuation(tabId: string, runId: string): Promise<void>
+  suspendContinuation(tabId: string, runId: string): Promise<void>
+  resumeContinuation(
+    tabId: string,
+    runId: string,
+    expectedPage: BrowserContinuationPageState,
+  ): Promise<void>
+  onContinuationActivity(listener: (activity: BrowserContinuationActivity) => void): () => void
   closeContinuation(tabId: string): Promise<void>
   getContinuationState(tabId: string, runId: string): Promise<BrowserContinuationPageState>
   focusContinuation(tabId: string, runId: string): Promise<void>
@@ -219,11 +227,13 @@ interface TargetTabState {
   view: WebContentsViewPort
   ownerExecutionId?: string
   ownerContinuationRunId?: string
+  continuationSuspended: boolean
   continuation?: BrowserContinuationProvenance
   reuseIdentity?: string
   continuationBound: boolean
   popupPatterns?: readonly string[]
   navigationEpoch: number
+  activityRevision: number
   automationOrigins?: readonly string[]
   allowedOrigins?: readonly string[]
   navigationViolation?: AppError
@@ -462,6 +472,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private continuationRegistry: BrowserWorkspaceContinuationRegistryPort | undefined
   private continuationCommandHandlers: BrowserContinuationCommandHandlers | undefined
   private readonly pageInvalidationListeners = new Set<(tabId: string) => void>()
+  private readonly continuationActivityListeners = new Set<(
+    activity: BrowserContinuationActivity,
+  ) => void>()
   private readonly highlightedContinuationTabs = new Set<string>()
   private sessionStorageStore: BrowserSessionStorageStore | undefined
 
@@ -562,6 +575,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       throw failure('PAGE_BUSY')
     }
     state.ownerContinuationRunId = runId
+    state.continuationSuspended = false
     this.layout()
     void this.renderToolbar().catch(() => undefined)
   }
@@ -570,6 +584,33 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const state = this.tabs.get(tabId)
     if (state?.ownerContinuationRunId !== runId) return
     state.ownerContinuationRunId = undefined
+    state.continuationSuspended = false
+    this.layout()
+    void this.renderToolbar().catch(() => undefined)
+  }
+
+  async suspendContinuation(tabId: string, runId: string): Promise<void> {
+    const state = this.continuationState({ tabId, runId })
+    if (state.continuationSuspended) return
+    await this.clearContinuationHighlight(tabId)
+    this.continuationState({ tabId, runId })
+    state.continuationSuspended = true
+    this.layout()
+    void this.renderToolbar().catch(() => undefined)
+  }
+
+  async resumeContinuation(
+    tabId: string,
+    runId: string,
+    expectedPage: BrowserContinuationPageState,
+  ): Promise<void> {
+    let state = this.continuationState({ tabId, runId })
+    if (!state.continuationSuspended) return
+    this.assertContinuationPage(state, expectedPage)
+    await this.ensureInputShield()
+    state = this.continuationState({ tabId, runId })
+    this.assertContinuationPage(state, expectedPage)
+    state.continuationSuspended = false
     this.layout()
     void this.renderToolbar().catch(() => undefined)
   }
@@ -579,12 +620,18 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     return () => { this.pageInvalidationListeners.delete(listener) }
   }
 
+  onContinuationActivity(listener: (activity: BrowserContinuationActivity) => void): () => void {
+    this.continuationActivityListeners.add(listener)
+    return () => { this.continuationActivityListeners.delete(listener) }
+  }
+
   async getContinuationState(tabId: string, runId: string): Promise<BrowserContinuationPageState> {
     const state = this.continuationState({ tabId, runId })
     return Object.freeze({
       origin: originOf(state.view.webContents.getURL()),
       url: state.view.webContents.getURL(),
       navigationEpoch: state.navigationEpoch,
+      activityRevision: state.activityRevision,
     })
   }
 
@@ -656,6 +703,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     input: BrowserContinuationResolvedTargetInput & { readonly tabId: string; readonly action: BrowserAction },
   ): Promise<void> {
     const state = this.continuationState(input)
+    if (state.continuationSuspended) throw failure('CANCELLED')
     this.assertContinuationState(state, input)
     const action = input.action
     if (action.type === 'focus') {
@@ -1184,7 +1232,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       continuation,
       reuseIdentity: continuation && continuationReuseIdentity(continuation),
       continuationBound: false,
+      continuationSuspended: false,
       navigationEpoch: 0,
+      activityRevision: 0,
       activeOperations: 0,
       syntheticInputOperations: 0,
       loading: false,
@@ -1192,7 +1242,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       closed: false,
     }
     this.tabs.set(state.id, state)
-    const guard = (event: NavigationEvent, url: string) => this.guardNavigation(state, event, url)
+    const guard = (event: NavigationEvent, url: string) => {
+      this.recordContinuationActivity(state, 'page_change')
+      this.guardNavigation(state, event, url)
+    }
     view.webContents.on('will-navigate', guard)
     view.webContents.on('will-redirect', guard)
     view.webContents.on('will-attach-webview', (event: NavigationEvent) => event.preventDefault())
@@ -1202,12 +1255,14 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const navigationChanged = () => {
       state.navigationEpoch += 1
       state.lastActiveAt = Date.now()
+      this.recordContinuationActivity(state, 'page_change')
       this.emitPageInvalidated(state.id)
       renderNavigationMetadata()
     }
     const navigationStarted = (...args: unknown[]) => {
       const details = args[0] as { isMainFrame?: boolean } | undefined
       if (details?.isMainFrame === false || args[3] === false) return
+      this.recordContinuationActivity(state, 'page_change')
       this.emitPageInvalidated(state.id)
     }
     view.webContents.on('page-title-updated', renderNavigationMetadata)
@@ -1216,11 +1271,21 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     view.webContents.on('did-navigate-in-page', navigationChanged)
     view.webContents.on('did-start-loading', () => { this.setLoading(state, true) })
     view.webContents.on('did-stop-loading', () => { this.setLoading(state, false) })
-    view.webContents.on('before-input-event', (event: NavigationEvent) => {
-      if (state.ownerContinuationRunId) event.preventDefault()
+    view.webContents.on('before-input-event', (...args: unknown[]) => {
+      const event = args[0] as NavigationEvent
+      const input = args[1] as { type?: unknown } | undefined
+      if (input?.type === 'keyDown') this.recordContinuationActivity(state, 'physical_input')
+      if (state.ownerContinuationRunId && !state.continuationSuspended) event.preventDefault()
     })
-    view.webContents.on('before-mouse-event', (event: NavigationEvent) => {
-      if (state.ownerContinuationRunId && state.syntheticInputOperations === 0) event.preventDefault()
+    view.webContents.on('before-mouse-event', (...args: unknown[]) => {
+      const event = args[0] as NavigationEvent
+      const input = args[1] as { type?: unknown } | undefined
+      if (input?.type === 'mouseDown' || input?.type === 'mouseUp' || input?.type === 'mouseWheel') {
+        this.recordContinuationActivity(state, 'physical_input')
+      }
+      if (state.ownerContinuationRunId
+        && !state.continuationSuspended
+        && state.syntheticInputOperations === 0) event.preventDefault()
     })
     view.webContents.on('render-process-gone', () => {
       if (!view.webContents.isDestroyed()) view.webContents.close()
@@ -1322,6 +1387,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const runId = state.ownerContinuationRunId
     if (!runId || (!force && state.syntheticInputOperations > 0)) return Promise.resolve()
     state.ownerContinuationRunId = undefined
+    state.continuationSuspended = false
     this.layout()
     this.emitPageInvalidated(state.id)
     void this.renderToolbar().catch(() => undefined)
@@ -1461,9 +1527,12 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     this.inputShieldAttached = false
     if (!this.closingViews && !this.shuttingDown && window && !window.isDestroyed()) {
       const owners = [...this.tabs.values()].filter((state) => (
-        !state.closed && state.ownerContinuationRunId !== undefined
+        !state.closed && state.ownerContinuationRunId !== undefined && !state.continuationSuspended
       ))
-      for (const state of owners) state.ownerContinuationRunId = undefined
+      for (const state of owners) {
+        state.ownerContinuationRunId = undefined
+        state.continuationSuspended = false
+      }
       for (const state of owners) {
         try { this.continuationRegistry?.markClosed(state.id, 'PAGE_CLOSED') } catch {
           /* Audit persistence cannot revive a lost input shield. */
@@ -1533,6 +1602,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const active = this.activeTabId ? this.tabs.get(this.activeTabId) : undefined
     const coveringTarget = active?.loading === true || active?.blockedOrigin !== undefined
     const shieldingTarget = active?.ownerContinuationRunId !== undefined
+      && !active.continuationSuspended
     toolbar.setBounds({
       x: 0, y: 0, width: bounds.width,
       height: coveringTarget ? bounds.height : toolbarHeight,
@@ -1566,6 +1636,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
   private setLoading(state: TargetTabState, loading: boolean): void {
     if (state.closed || state.loading === loading) return
     state.loading = loading
+    this.recordContinuationActivity(state, 'page_change')
     if (state.id !== this.activeTabId) return
     this.layout()
     void this.renderToolbar().catch(() => undefined)
@@ -1635,7 +1706,8 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const registry = this.continuationRegistry
     const continuation = state.continuation
     const ownerRunId = state.ownerContinuationRunId
-    if (!registry || !continuation || !state.continuationBound || !ownerRunId || state.closed) return undefined
+    if (!registry || !continuation || !state.continuationBound || !ownerRunId
+      || state.continuationSuspended || state.closed) return undefined
     const binding = registry.list(state.userId, continuation.conversationId)
       .find((candidate) => candidate.tabId === state.id)
     if (!binding) return undefined
@@ -1735,6 +1807,15 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       throw failure(state.ownerContinuationRunId ? 'PAGE_BUSY' : 'CANCELLED')
     }
     return state
+  }
+
+  private assertContinuationPage(
+    state: TargetTabState,
+    expected: BrowserContinuationPageState,
+  ): void {
+    if (state.navigationEpoch !== expected.navigationEpoch
+      || state.activityRevision !== expected.activityRevision
+      || originOf(state.view.webContents.getURL()) !== expected.origin) throw failure('PAGE_CHANGED')
   }
 
   private assertContinuationState(
@@ -2108,6 +2189,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     state.closed = true
     if (this.activeTabId === state.id) {
       state.ownerContinuationRunId = undefined
+      state.continuationSuspended = false
       this.layout()
     }
     this.highlightedContinuationTabs.delete(state.id)
@@ -2136,6 +2218,23 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     void this.clearContinuationHighlight(tabId).catch(() => undefined)
     for (const listener of this.pageInvalidationListeners) {
       try { listener(tabId) } catch { /* Inspector cleanup cannot interrupt browser lifecycle. */ }
+    }
+  }
+
+  private recordContinuationActivity(
+    state: TargetTabState,
+    kind: BrowserContinuationActivity['kind'],
+  ): void {
+    if (!state.ownerContinuationRunId || !state.continuationSuspended) return
+    if (kind === 'physical_input' && state.syntheticInputOperations > 0) return
+    state.activityRevision += 1
+    const activity = Object.freeze({
+      tabId: state.id,
+      revision: state.activityRevision,
+      kind,
+    })
+    for (const listener of this.continuationActivityListeners) {
+      try { listener(activity) } catch { /* Activity observers cannot interrupt browser lifecycle. */ }
     }
   }
 

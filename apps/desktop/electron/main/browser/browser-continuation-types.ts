@@ -66,6 +66,13 @@ export interface BrowserContinuationPageState {
   readonly origin: string
   readonly url: string
   readonly navigationEpoch: number
+  readonly activityRevision: number
+}
+
+export interface BrowserContinuationActivity {
+  readonly tabId: string
+  readonly revision: number
+  readonly kind: 'physical_input' | 'page_change'
 }
 
 export interface BrowserContinuationResolvedTargetInput {
