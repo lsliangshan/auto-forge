@@ -21,7 +21,7 @@ function binding(): BrowserContinuationBinding {
     executionId: 'execution_1', workflowId: 'workflow.one', workflowVersion: '1.0.0',
     source: 'installed', securityFingerprint: 'a'.repeat(64),
     permissionMatrix: {
-      'browser.open': ['https://service.example/*'],
+      'browser.open': ['https://service.example/*', 'https://details.example/*'],
       'browser.fill': ['https://service.example/*'],
       'browser.click': ['https://service.example/*'],
     },
@@ -583,6 +583,94 @@ describe('BrowserContinuationToolExecutor', () => {
     expect(test.inspector.endRun).toHaveBeenCalledWith('agent_run_1')
     expect(test.audits.at(-1)).toMatchObject({ action: 'fill', outcome: 'failed', errorCode: 'INVALID_INPUT' })
     expect(JSON.stringify(test.audits)).not.toMatch(/秘密值|张三|李四|王五|姓名|事项办理/u)
+  })
+
+  it.each([
+    { name: 'wait', action: { type: 'wait', milliseconds: 50 } },
+    { name: 'focus', action: { type: 'focus' } },
+    { name: 'page scroll', action: { type: 'scroll', direction: 'down' } },
+  ] as const)('continues a snapshot-independent $name after the page navigates', async ({ action }) => {
+    const test = harness()
+    await test.executor.execute(
+      'browser_session_inspect',
+      { bindingId: 'binding_1', intent: '读取证件编号' },
+      run(),
+    )
+    test.state.origin = 'https://details.example'
+    test.state.url = 'https://details.example/certificate'
+    test.state.navigationEpoch = 2
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1',
+      snapshotId: 'snapshot_1',
+      actions: [action],
+    }, run())).resolves.toEqual({ kind: 'success', data: { completedActions: 1 } })
+
+    expect(test.workspace.performContinuationAction).toHaveBeenCalledWith({
+      tabId: 'tab_1',
+      runId: 'agent_run_1',
+      expectedOrigin: 'https://details.example',
+      expectedNavigationEpoch: 2,
+      backendNodeId: 0,
+      action,
+    })
+    expect(test.audits.at(-1)).toMatchObject({
+      action: action.type,
+      origin: 'https://details.example',
+      outcome: 'completed',
+    })
+    expect(test.release).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { name: 'click', action: { type: 'click', ref: 'ref_save' } },
+    {
+      name: 'fill',
+      action: { type: 'fill', ref: 'ref_name', value: '李四', source: { kind: 'current_user' } },
+    },
+    { name: 'targeted scroll', action: { type: 'scroll', ref: 'ref_save', direction: 'down' } },
+  ] as const)('still rejects a snapshot-dependent $name after the page navigates', async ({ action }) => {
+    const test = harness()
+    await test.executor.execute(
+      'browser_session_inspect',
+      { bindingId: 'binding_1', intent: '保存' },
+      run(),
+    )
+    test.state.origin = 'https://details.example'
+    test.state.url = 'https://details.example/certificate'
+    test.state.navigationEpoch = 2
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1',
+      snapshotId: 'snapshot_1',
+      actions: [action],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+
+    expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { name: 'wait', action: { type: 'wait', milliseconds: 50 } },
+    { name: 'focus', action: { type: 'focus' } },
+    { name: 'page scroll', action: { type: 'scroll', direction: 'down' } },
+  ] as const)('blocks a snapshot-independent $name after a redirect to an unauthorized origin', async ({ action }) => {
+    const test = harness()
+    await test.executor.execute(
+      'browser_session_inspect',
+      { bindingId: 'binding_1', intent: '读取证件编号' },
+      run(),
+    )
+    test.state.origin = 'https://outside.example'
+    test.state.url = 'https://outside.example/certificate'
+    test.state.navigationEpoch = 2
+
+    await expect(test.executor.execute('browser_session_act', {
+      bindingId: 'binding_1',
+      snapshotId: 'snapshot_1',
+      actions: [action],
+    }, run())).resolves.toEqual({ kind: 'tool_error', code: 'DOMAIN_BLOCKED' })
+
+    expect(test.workspace.performContinuationAction).not.toHaveBeenCalled()
   })
 
   it('stops the suffix on stale refs and performs error cleanup', async () => {

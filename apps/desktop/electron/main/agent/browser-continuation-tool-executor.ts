@@ -229,6 +229,12 @@ function targetSummary(target: BrowserSemanticNode | undefined): string {
   return target ? `${target.role.slice(0, 80)} control` : 'page'
 }
 
+function isSnapshotIndependentAction(action: BrowserAction): boolean {
+  return action.type === 'wait'
+    || action.type === 'focus'
+    || (action.type === 'scroll' && action.ref === undefined)
+}
+
 export class BrowserContinuationToolExecutor {
   private readonly guard: BrowserActionGuard
   private readonly id: () => string
@@ -503,7 +509,8 @@ export class BrowserContinuationToolExecutor {
         this.assertActionBudget(state, action, context)
         await lease.assertEligible()
         page = await this.dependencies.workspace.getContinuationState(lease.binding.tabId, context.runId)
-        if (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch) {
+        if (!isSnapshotIndependentAction(action)
+          && (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch)) {
           throw failure('PAGE_CHANGED')
         }
         const resolved = target
