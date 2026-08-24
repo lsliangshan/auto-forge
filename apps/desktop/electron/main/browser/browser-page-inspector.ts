@@ -332,7 +332,9 @@ function failure(code: AppErrorCode): AppError {
 function normalizedRole(value: string): string {
   const role = value.replaceAll(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
   if (role === 'static-text') return 'statictext'
-  if (role.startsWith('layout-')) return role.replaceAll('-', '')
+  if (role === 'layout-table' || role === 'layout-table-row' || role === 'layout-table-cell') {
+    return role.replaceAll('-', '')
+  }
   return role
 }
 

@@ -207,6 +207,19 @@ describe('BrowserPageInspector', () => {
     expect(status.answerable).toBe(true)
   })
 
+  it('does not compact non-target layout roles', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '附件管理', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(20, 'LayoutText', '说明文字', { axNodeId: 'ax_layout_text', parentAxNodeId: 'ax_main' }),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input(binding(), { intent: '读取附件说明' }))
+
+    expect(snapshot.nodes.some(({ role }) => role === 'layouttext')).toBe(false)
+    expect(snapshot.nodes.some(({ role }) => role === 'layout-text')).toBe(false)
+  })
+
   it('preserves table context and marks only safe leaf values answerable', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '附件管理', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
