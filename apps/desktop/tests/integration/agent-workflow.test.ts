@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentOrchestrator, createAgentPersistence } from '../../electron/main/agent/agent-orchestrator.js'
 import { createWorkflowExecutionSourceResolver } from '../../electron/main/application.js'
 import { OpenRouterProvider } from '../../electron/main/chat/openrouter-provider.js'
-import { openAppDatabase } from '../../electron/main/database/client.js'
+import { openTestUserDataDatabase } from '../../electron/test-support/user-data-database.js'
 import { PolicyEngine, scopeHash } from '../../electron/main/permissions/policy-engine.js'
 import { SecretStore } from '../../electron/main/security/secret-store.js'
 import {
@@ -168,7 +168,7 @@ async function runtime(options: {
     inputSchema: workflow.inputSchema,
     outputSchema: workflow.outputSchema,
   }
-  const database = openAppDatabase(join(directory, 'app.sqlite'))
+  const database = openTestUserDataDatabase(directory, 'user_1')
   closeDatabases.push(database.close)
   database.localAuth.createUserAndSession({
     id: 'user_1', account: 'Alice', accountNormalized: 'alice',

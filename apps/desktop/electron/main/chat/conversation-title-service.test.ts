@@ -3,16 +3,18 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ChatEvent } from '@autoforge/shared'
-import { openAppDatabase } from '../database/client.js'
+import { openTestUserDataDatabase } from '../../test-support/user-data-database.js'
 import type { ModelProvider, ModelStreamRequest } from './model-provider.js'
 import { ConversationTitleService } from './conversation-title-service.js'
 
 const temporaryDirectories: string[] = []
+const closeDatabases: Array<() => void> = []
 
 function createHarness(stream: ModelProvider['stream']) {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-conversation-title-'))
   temporaryDirectories.push(directory)
-  const database = openAppDatabase(join(directory, 'autoforge.sqlite'))
+  const database = openTestUserDataDatabase(directory, 'user_1')
+  closeDatabases.push(database.close)
   database.conversations.insert({
     id: 'conversation_1',
     title: '新会话',
@@ -42,6 +44,7 @@ function createHarness(stream: ModelProvider['stream']) {
 }
 
 afterEach(() => {
+  for (const close of closeDatabases.splice(0)) close()
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true })
   }

@@ -27,7 +27,7 @@ GREEN evidence:
 
 - Focused boundary regression: 1 passed, 105 skipped.
 - Full database suite: 106 passed.
-- ExecutionService plus Agent workflow integration suites: 92 passed across 2 files.
+- With Task 8's authorized per-UID fixture migration present in the working tree, the ExecutionService plus Agent workflow integration suites: 92 passed across 2 files. This count is not reproducible from commit `a95c721` alone because that fixture migration is intentionally reserved for Task 8.
 - Desktop typecheck: `tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json` exited 0.
 - Focused ESLint for the changed TypeScript files exited 0.
 

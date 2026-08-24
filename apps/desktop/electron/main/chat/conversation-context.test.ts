@@ -1,5 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
-import { openAppDatabase } from '../database/client.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { openTestUserDataDatabase } from '../../test-support/user-data-database.js'
 import { DeepSeekProvider } from './deepseek-provider.js'
 import type {
   ConversationContextAdvanceInput,
@@ -18,6 +21,12 @@ import {
   type PrepareConversationContextInput,
   serializeHistoricalMessage,
 } from './conversation-context.js'
+
+const sqliteRoots: string[] = []
+
+afterEach(() => {
+  for (const root of sqliteRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
 
 describe('conversation context primitives', () => {
   it('uses 60 percent of a positive context length and the 32000 fallback otherwise', () => {
@@ -595,11 +604,9 @@ describe('conversation context manager', () => {
 })
 
 function sqliteContextHarness(eventsForRound: (round: number) => ModelStreamEvent[]) {
-  const database = openAppDatabase(':memory:')
-  database.localAuth.createUserAndSession({
-    id: 'user_1', account: 'Alice', accountNormalized: 'alice',
-    passwordDigest: 'digest', createdAt: 1, updatedAt: 1,
-  }, 1)
+  const root = mkdtempSync(join(tmpdir(), 'autoforge-context-user-cache-'))
+  sqliteRoots.push(root)
+  const database = openTestUserDataDatabase(root, 'user_1')
   database.conversations.insert({ id: 'c1', title: 'Context billing' })
   for (let index = 0; index < 10; index += 1) {
     database.messages.insert({
@@ -610,6 +617,16 @@ function sqliteContextHarness(eventsForRound: (round: number) => ModelStreamEven
       createdAt: index + 1,
     })
   }
+  database.chatRuns.insert({
+    id: 'run_summary',
+    conversationId: 'c1',
+    requestId: 'request_summary',
+    userId: 'user_1',
+    provider: 'openrouter',
+    model: 'tiny-model',
+    status: 'running',
+    startedAt: 1,
+  })
   let round = 0
   const requests: Parameters<ConversationContextProviderPort['stream']>[0][] = []
   const provider = {

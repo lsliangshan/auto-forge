@@ -14,7 +14,10 @@ import {
   createAgentPersistence,
   type AgentPersistencePort,
 } from '../agent/agent-orchestrator.js'
-import { openAppDatabase } from '../database/client.js'
+import {
+  openTestUserDataDatabase,
+  type TestUserDataDatabase,
+} from '../../test-support/user-data-database.js'
 import {
   ProviderUsageConsistencyError,
   type ProviderUsageRepository,
@@ -886,11 +889,13 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
     {
       failure: 'chat run',
       ids: ['user_atomic_run', 'run_atomic_conflict', 'assistant_atomic_run', 'block_atomic_run'],
-      arrange(database: ReturnType<typeof openAppDatabase>) {
+      arrange(database: TestUserDataDatabase) {
         database.chatRuns.insert({
           id: 'run_atomic_conflict',
           conversationId: 'conversation_atomic',
           requestId: 'request_existing',
+          userId: 'user_atomic',
+          provider: 'openrouter',
           model: 'image-model',
           status: 'completed',
           startedAt: 1,
@@ -905,7 +910,7 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
     {
       failure: 'assistant message',
       ids: ['user_atomic_assistant', 'run_atomic_assistant', 'assistant_atomic_conflict', 'block_atomic_assistant'],
-      arrange(database: ReturnType<typeof openAppDatabase>) {
+      arrange(database: TestUserDataDatabase) {
         database.messages.insert({
           id: 'assistant_atomic_conflict',
           conversationId: 'conversation_atomic',
@@ -928,7 +933,7 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
     kind,
   }) => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-media-start-'))
-    const database = openAppDatabase(join(root, 'database.sqlite'))
+    const database = openTestUserDataDatabase(root, 'user_atomic')
     const events: ChatEvent[] = []
     const provider = {
       listModels: vi.fn(async () => []),
@@ -1034,7 +1039,7 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
 
   it('persists independently padded audio deltas, transcript, usage, and ownership atomically', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-audio-orchestrator-'))
-    const database = openAppDatabase(join(root, 'database.sqlite'))
+    const database = openTestUserDataDatabase(root, 'user_audio_real')
     const mediaRoot = join(root, 'media')
     const mp3 = Buffer.concat([
       Buffer.from('ID3\u0004\u0000\u0000\u0000\u0000\u0000\u0000', 'binary'),
@@ -1043,14 +1048,6 @@ describe('MediaGenerationOrchestrator persistence integration', () => {
     const first = mp3.subarray(0, 11).toString('base64')
     const second = mp3.subarray(11).toString('base64')
     try {
-      database.localAuth.createUserAndSession({
-        id: 'user_audio_real',
-        account: 'Audio User',
-        accountNormalized: 'audio user',
-        passwordDigest: 'digest-audio-user',
-        createdAt: 1,
-        updatedAt: 1,
-      }, 1)
       database.conversations.insert({ id: 'conversation_audio_real', title: 'Audio real' })
       const media = createMediaAssetService({
         database,
