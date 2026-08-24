@@ -2,8 +2,8 @@
 
 ## Status
 
-Approved in chat on 2026-08-24, pending review of this written specification.
-This design extends `2026-08-24-browser-login-auto-resume-design.md` and
+Approved in chat and reviewed on 2026-08-24. This design extends
+`2026-08-24-browser-login-auto-resume-design.md` and
 supersedes its requirement that non-login browser handoffs are terminal. The
 existing browser-continuation security, privacy, provenance, and protected
 action rules remain unchanged.
