@@ -12,6 +12,9 @@ import type {
   BrowserPageSnapshot,
   BrowserRegionImage,
   BrowserSemanticNode,
+  BrowserVisualEvidenceBundle,
+  BrowserVisualEvidenceTile,
+  BrowserVisualNodePlacement,
 } from './browser-continuation-types.js'
 
 export interface BrowserInspectionDomSummary {
@@ -138,6 +141,10 @@ export interface BrowserPageContextInput {
   readonly signal?: AbortSignal
 }
 
+export interface BrowserVisualEvidenceInput extends BrowserPageContextInput {
+  readonly pages: readonly BrowserPageSnapshot[]
+}
+
 export interface BrowserLivePageContext {
   readonly auth: BrowserPageSnapshot['auth']
   readonly semanticFingerprint: string
@@ -213,6 +220,9 @@ interface CursorState extends SnapshotIdentity {
 const maxSerializedBytes = 128 * 1024
 const maxSemanticNodes = 500
 const maxImagePixels = 1_000_000
+const maxVisualTiles = 3
+const maxVisualNodes = 200
+const maxVisualTilePixels = 1_000_000
 const maxTextLength = 512
 const maxStaticFieldLabelLength = 80
 const maxStaticFieldValueLength = 256
@@ -505,6 +515,22 @@ function imageRestrictedNode(node: BrowserInspectionNode): boolean {
     || signatureText.test(combined)
 }
 
+function rectanglesIntersect(left: BrowserInspectionNodeBox, right: BrowserInspectionNodeBox): boolean {
+  return left.x < right.x + right.width
+    && left.x + left.width > right.x
+    && left.y < right.y + right.height
+    && left.y + left.height > right.y
+}
+
+function validVisualBox(value: BrowserInspectionNodeBox | undefined): value is BrowserInspectionNodeBox {
+  return value !== undefined
+    && [value.x, value.y, value.width, value.height].every(Number.isFinite)
+    && value.x >= 0
+    && value.y >= 0
+    && value.width > 0
+    && value.height > 0
+}
+
 function relevantValue(name: string, intent: string): boolean {
   const normalizedName = normalizedText(name).toLowerCase()
   const normalizedIntent = normalizedText(intent).toLowerCase()
@@ -644,6 +670,214 @@ export class BrowserPageInspector {
       const { auth, semanticFingerprint } = await this.readLivePageContext(input, deadlineAt)
       return Object.freeze({ auth, semanticFingerprint })
     })(), input.signal, deadlineAt)
+  }
+
+  async captureVisualEvidence(input: BrowserVisualEvidenceInput): Promise<BrowserVisualEvidenceBundle> {
+    if (input.signal?.aborted) throw failure('CANCELLED')
+    const deadlineAt = Date.now() + this.inspectionTimeoutMs
+    return this.withInspectionBudget(
+      this.captureVisualEvidenceWithinBudget(input, deadlineAt),
+      input.signal,
+      deadlineAt,
+    )
+  }
+
+  private async captureVisualEvidenceWithinBudget(
+    input: BrowserVisualEvidenceInput,
+    deadlineAt: number,
+  ): Promise<BrowserVisualEvidenceBundle> {
+    const binding = this.liveBinding(input.lease)
+    let exactOrigin: string | undefined
+    try {
+      const url = new URL(input.origin)
+      if (url.protocol === 'https:') exactOrigin = url.origin
+    } catch { /* rejected below as a safe invalid input */ }
+    if (input.origin !== exactOrigin) throw failure('INVALID_INPUT')
+    if (!binding.browserContinuation?.readableRegions?.length) throw failure('UNSUPPORTED_CONTROL')
+    const [firstPage] = input.pages
+    if (!firstPage
+      || input.pages.some((page) => page.cursor !== undefined
+        || page.snapshotId !== firstPage.snapshotId
+        || page.bindingId !== firstPage.bindingId
+        || page.origin !== firstPage.origin
+        || page.navigationEpoch !== firstPage.navigationEpoch)) {
+      throw failure('INVALID_INPUT')
+    }
+
+    const located = input.pages.flatMap((page) => page.nodes.map((node) => ({
+      node,
+      state: this.refs.get(node.ref),
+    })))
+    if (located.length === 0 || located.length > maxVisualNodes) {
+      throw failure('ACTION_LIMIT_EXCEEDED')
+    }
+    const identity = {
+      runId: input.lease.ownerRunId,
+      bindingId: firstPage.bindingId,
+      tabId: input.tabId,
+      snapshotId: firstPage.snapshotId,
+      navigationEpoch: firstPage.navigationEpoch,
+      origin: firstPage.origin,
+    }
+    if (located.some(({ state }) => !state || !this.sameIdentity(state, identity))) {
+      throw failure('PAGE_CHANGED')
+    }
+    if (binding.bindingId !== firstPage.bindingId
+      || binding.tabId !== input.tabId
+      || input.navigationEpoch !== firstPage.navigationEpoch
+      || input.origin !== firstPage.origin) throw failure('PAGE_CHANGED')
+
+    const { page, visibleNodes } = await this.readLivePageContext(input, deadlineAt)
+    const mainFrameNodes = page.nodes.filter((node) => (
+      node.frameId === undefined || node.frameId === page.frameId
+    ))
+    const readableIds = new Set(this.readableNodes(
+      binding, page, mainFrameNodes, visibleNodes,
+    ).map((node) => node.backendNodeId))
+    const restrictedIds = this.restrictedRegionBackendIds(mainFrameNodes, visibleNodes)
+    const currentByBackendNodeId = new Map(visibleNodes.map((node) => [node.backendNodeId, node]))
+    const placed: Array<{
+      readonly nodeId: string
+      readonly box: BrowserInspectionNodeBox
+    }> = []
+
+    for (const { node, state } of located) {
+      const retained = state!
+      if (retained.imageRestricted || restrictedIds.has(retained.backendNodeId)) continue
+      const current = currentByBackendNodeId.get(retained.backendNodeId)
+      if (!current
+        || !readableIds.has(current.backendNodeId)
+        || normalizedRole(current.role) !== retained.role
+        || safeText(current.name) !== retained.name
+        || current.dom.tagName.toLowerCase() !== retained.tagName
+        || current.dom.inputType?.toLowerCase() !== retained.inputType
+        || safeHref(current.dom.href, page.url) !== retained.href
+        || current.enabled !== retained.enabled
+        || current.checked !== retained.checked
+        || current.selected !== retained.selected) throw failure('PAGE_CHANGED')
+      const box = await this.port.getNodeBox({
+        tabId: retained.tabId,
+        runId: retained.runId,
+        expectedOrigin: retained.origin,
+        expectedNavigationEpoch: retained.navigationEpoch,
+        backendNodeId: retained.backendNodeId,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        deadlineAt,
+      })
+      if (!validVisualBox(box)) {
+        if (node.answerable) throw failure('PAGE_CHANGED')
+        continue
+      }
+      placed.push(Object.freeze({ nodeId: node.ref, box }))
+    }
+    if (located.some(({ node }) => node.answerable === true
+      && !placed.some(({ nodeId }) => nodeId === node.ref))) throw failure('PAGE_CHANGED')
+    if (placed.length === 0) throw failure('UNSUPPORTED_CONTROL')
+
+    const documentX = Math.min(...placed.map(({ box }) => box.x))
+    const documentY = Math.min(...placed.map(({ box }) => box.y))
+    const documentRight = Math.max(...placed.map(({ box }) => box.x + box.width))
+    const documentBottom = Math.max(...placed.map(({ box }) => box.y + box.height))
+    const width = documentRight - documentX
+    const height = documentBottom - documentY
+    const maxTileHeight = Math.floor(maxVisualTilePixels / width)
+    if (!Number.isFinite(width)
+      || !Number.isFinite(height)
+      || width <= 0
+      || height <= 0
+      || maxTileHeight <= 0) throw failure('ACTION_LIMIT_EXCEEDED')
+    const tileCount = Math.ceil(height / maxTileHeight)
+    if (tileCount > maxVisualTiles) throw failure('ACTION_LIMIT_EXCEEDED')
+
+    const tilePlans = Object.freeze(Array.from({ length: tileCount }, (_, index) => {
+      const y = documentY + index * maxTileHeight
+      return Object.freeze({
+        tileId: `tile_${this.id()}`,
+        x: documentX,
+        y,
+        width,
+        height: Math.min(maxTileHeight, documentBottom - y),
+      })
+    }))
+    const protectedBoxes: BrowserInspectionNodeBox[] = []
+    for (const node of visibleNodes.filter(imageRestrictedNode)) {
+      const box = await this.port.getNodeBox({
+        tabId: input.tabId,
+        runId: input.lease.ownerRunId,
+        expectedOrigin: input.origin,
+        expectedNavigationEpoch: input.navigationEpoch,
+        backendNodeId: node.backendNodeId,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        deadlineAt,
+      })
+      if (!validVisualBox(box)) throw failure('UNSUPPORTED_CONTROL')
+      protectedBoxes.push(box)
+    }
+    if (tilePlans.some((tile) => protectedBoxes.some((box) => rectanglesIntersect({
+      x: tile.x,
+      y: tile.y,
+      width: tile.width,
+      height: tile.height,
+      viewportWidth: 0,
+      viewportHeight: 0,
+    }, box)))) throw failure('UNSUPPORTED_CONTROL')
+
+    const placements: BrowserVisualNodePlacement[] = placed.map(({ nodeId, box }) => {
+      const tile = tilePlans.reduce((best, candidate) => {
+        const overlap = Math.max(0, Math.min(box.y + box.height, candidate.y + candidate.height)
+          - Math.max(box.y, candidate.y))
+        const bestOverlap = Math.max(0, Math.min(box.y + box.height, best.y + best.height)
+          - Math.max(box.y, best.y))
+        return overlap > bestOverlap ? candidate : best
+      })
+      const left = Math.max(box.x, tile.x)
+      const top = Math.max(box.y, tile.y)
+      const right = Math.min(box.x + box.width, tile.x + tile.width)
+      const bottom = Math.min(box.y + box.height, tile.y + tile.height)
+      return Object.freeze({
+        nodeId,
+        tileId: tile.tileId,
+        x: left - tile.x,
+        y: top - tile.y,
+        width: right - left,
+        height: bottom - top,
+      })
+    })
+
+    const tiles: BrowserVisualEvidenceTile[] = []
+    for (const tile of tilePlans) {
+      const dataBase64 = await this.port.capturePageScreenshot({
+        tabId: input.tabId,
+        runId: input.lease.ownerRunId,
+        expectedOrigin: input.origin,
+        expectedNavigationEpoch: input.navigationEpoch,
+        locators: this.policyLocators(binding),
+        clip: { x: tile.x, y: tile.y, width: tile.width, height: tile.height },
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        deadlineAt,
+      })
+      this.liveBinding(input.lease)
+      tiles.push(Object.freeze({
+        tileId: tile.tileId,
+        mediaType: 'image/png',
+        dataBase64,
+        width: tile.width,
+        height: tile.height,
+        documentX: tile.x,
+        documentY: tile.y,
+      }))
+    }
+
+    return Object.freeze({
+      snapshotId: firstPage.snapshotId,
+      bindingId: firstPage.bindingId,
+      origin: firstPage.origin,
+      navigationEpoch: firstPage.navigationEpoch,
+      capturedAt: new Date(this.now()).toISOString(),
+      pages: Object.freeze([...input.pages]),
+      tiles: Object.freeze(tiles),
+      placements: Object.freeze(placements),
+    })
   }
 
   fieldEvidence(snapshotId: string): readonly BrowserPrivateFieldEvidence[] {

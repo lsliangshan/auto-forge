@@ -82,7 +82,7 @@ class FakeCdpPort implements BrowserPageCdpPort {
   readonly readNode = vi.fn(async (input: { backendNodeId: number }) => (
     this.page.nodes.find((candidate) => candidate.backendNodeId === input.backendNodeId)
   ))
-  readonly getNodeBox = vi.fn(async () => ({
+  readonly getNodeBox = vi.fn(async (_input: { readonly backendNodeId: number }) => ({
     x: 20, y: 30, width: 320, height: 200, viewportWidth: 1200, viewportHeight: 800,
   }))
   readonly captureNodeScreenshot = vi.fn(async () => 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')
@@ -176,7 +176,175 @@ function idSequence(): () => string {
   return () => String(++current).padStart(4, '0')
 }
 
+async function visualFixture(
+  nodes: readonly BrowserInspectionNode[] = [
+    node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+    node(11, 'statictext', '已通过'),
+    node(12, 'statictext', '线上办理'),
+  ],
+) {
+  const exactBinding = binding({ readableRegions: ['role=main'] })
+  const authority = input(exactBinding)
+  const port = new FakeCdpPort(nodes)
+  port.capturePageScreenshot.mockResolvedValue('cG5n')
+  port.getNodeBox.mockImplementation(async ({ backendNodeId }) => {
+    const boxes = new Map([
+      [10, { x: 0, y: 0, width: 1_000, height: 800, viewportWidth: 1_200, viewportHeight: 800 }],
+      [11, { x: 40, y: 60, width: 240, height: 30, viewportWidth: 1_200, viewportHeight: 800 }],
+      [12, { x: 40, y: 120, width: 240, height: 30, viewportWidth: 1_200, viewportHeight: 800 }],
+    ])
+    return boxes.get(backendNodeId)!
+  })
+  const inspector = new BrowserPageInspector(port, {
+    id: idSequence(), now: () => 1_787_415_600_000,
+  })
+  const snapshot = await inspector.inspect(authority)
+  return { authority, inspector, port, snapshot }
+}
+
 describe('BrowserPageInspector', () => {
+  it('builds a visual evidence bundle from complete semantic pages', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+
+    const bundle = await inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1',
+      navigationEpoch: 4,
+      origin,
+      pages: [snapshot],
+    })
+
+    expect(bundle).toMatchObject({
+      snapshotId: snapshot.snapshotId,
+      bindingId: snapshot.bindingId,
+      origin: snapshot.origin,
+      navigationEpoch: snapshot.navigationEpoch,
+      capturedAt: '2026-08-22T16:20:00.000Z',
+      tiles: [expect.objectContaining({
+        mediaType: 'image/png', dataBase64: 'cG5n', width: 1_000,
+      })],
+    })
+    expect(bundle.pages).toEqual([snapshot])
+    expect(bundle.placements.map(({ nodeId }) => nodeId)).toEqual(expect.arrayContaining(
+      snapshot.nodes.filter(({ answerable }) => answerable).map(({ ref }) => ref),
+    ))
+    expect(port.readAccessibilitySnapshot).toHaveBeenLastCalledWith(expect.objectContaining({
+      locators: ['role=main'],
+    }))
+    expect(Object.isFrozen(bundle.pages)).toBe(true)
+    expect(Object.isFrozen(bundle.tiles)).toBe(true)
+    expect(Object.isFrozen(bundle.placements)).toBe(true)
+  })
+
+  it.each([
+    ['cursor', (snapshot: BrowserPageSnapshot) => [{ ...snapshot, cursor: 'cursor_more' }]],
+    ['snapshot', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, snapshotId: 'snapshot_other' }]],
+    ['binding', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, bindingId: 'binding_other' }]],
+    ['origin', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, origin: 'https://other.example.cn' }]],
+    ['navigation epoch', (snapshot: BrowserPageSnapshot) => [snapshot, { ...snapshot, navigationEpoch: 5 }]],
+  ])('visual evidence rejects pages with a mismatched %s identity', async (_kind, pages) => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin,
+      pages: pages(snapshot),
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects more than 200 placed nodes', async () => {
+    const nodes = [
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      ...Array.from({ length: 200 }, (_, index) => node(index + 11, 'statictext', `公开值 ${index}`)),
+    ]
+    const { authority, inspector, port, snapshot } = await visualFixture(nodes)
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects a union requiring more than three one-megapixel tiles', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 12
+        ? { x: 0, y: 3_000, width: 1_000, height: 1, viewportWidth: 1_200, viewportHeight: 4_000 }
+        : { x: 0, y: 0, width: 1_000, height: 1, viewportWidth: 1_200, viewportHeight: 4_000 }
+    ))
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'ACTION_LIMIT_EXCEEDED' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects missing answerable-node geometry', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => (
+      backendNodeId === 11
+        ? undefined as never
+        : { x: 0, y: 0, width: 1_000, height: 800, viewportWidth: 1_200, viewportHeight: 800 }
+    ))
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects protected geometry intersecting a tile before capture', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '已通过'),
+      node(12, 'textbox', '账户口令', { dom: { tagName: 'input', inputType: 'password' } }),
+    ])
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => {
+      if (backendNodeId === 11) {
+        return { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+      }
+      return { x: 100, y: 100, width: 200, height: 40, viewportWidth: 1_200, viewportHeight: 800 }
+    })
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects a non-HTTPS origin before capture', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture()
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4,
+      origin: 'http://fw.bjrcgz.gov.cn', pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
+  it('visual evidence rejects capture without a configured readable region', async () => {
+    const exactBinding = binding({})
+    const authority = input(exactBinding)
+    const port = new FakeCdpPort([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '已通过'),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const snapshot = await inspector.inspect(authority)
+
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
   it('preserves unnamed generic and layout-table ancestors as context only', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '附件管理', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
