@@ -182,20 +182,22 @@ describe('cross-process contracts', () => {
       purpose: 'legacy_unowned_import' as const,
       documentVersion: 'legacy-import-2026-08',
     }
-    expect(syncMutationSchema.parse({
+    const privacyConsentMutation = {
       ...mutationBase,
-      kind: 'privacy.consent',
+      kind: 'privacy.consent' as const,
       entityId: 'privacy-2026-08',
       payload: cloudSyncConsent,
-    })).toMatchObject({ kind: 'privacy.consent' })
-    expect(syncMutationSchema.parse({
+    }
+    expect(syncMutationSchema.parse(privacyConsentMutation)).toEqual(privacyConsentMutation)
+    const legacyImportMutation = {
       ...mutationBase,
-      kind: 'legacy.import',
+      kind: 'legacy.import' as const,
       entityId: 'batch_1',
       payload: {
         batchId: 'batch_1', includeUnowned: true, cloudSyncConsent, unownedImportConsent,
       },
-    })).toMatchObject({ kind: 'legacy.import' })
+    }
+    expect(syncMutationSchema.parse(legacyImportMutation)).toEqual(legacyImportMutation)
     expect(syncMutationSchema.safeParse({
       ...mutationBase,
       kind: 'legacy.import',
@@ -231,9 +233,10 @@ describe('cross-process contracts', () => {
       estimatedCostUsd: '0.0012',
       occurredAt: '2026-08-24T00:00:00.000Z',
     }
-    expect(syncMutationSchema.parse({
-      ...mutationBase, kind: 'usage.record', entityId: 'usage_1', payload: usagePayload,
-    })).toMatchObject({ kind: 'usage.record' })
+    const usageMutation = {
+      ...mutationBase, kind: 'usage.record' as const, entityId: 'usage_1', payload: usagePayload,
+    }
+    expect(syncMutationSchema.parse(usageMutation)).toEqual(usageMutation)
     for (const invalidUsage of [
       { ...usagePayload, credentialOwner: 'platform' },
       { ...usagePayload, billable: true },
@@ -242,6 +245,25 @@ describe('cross-process contracts', () => {
       expect(syncMutationSchema.safeParse({
         ...mutationBase, kind: 'usage.record', entityId: 'usage_1', payload: invalidUsage,
       }).success).toBe(false)
+    }
+
+    for (const mismatch of [
+      { ...messageAppend, entityId: 'different_message' },
+      { ...legacyImportMutation, entityId: 'different_batch' },
+      { ...privacyConsentMutation, entityId: 'different_document' },
+      { ...usageMutation, entityId: 'different_usage' },
+    ]) {
+      const result = syncMutationSchema.safeParse(mismatch)
+      expect.soft(result.success).toBe(false)
+      if (result.success) continue
+      expect.soft(result.error.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'custom',
+          path: ['entityId'],
+          message: 'Mutation entity identity does not match its payload.',
+        }),
+      ]))
+      expect.soft(JSON.stringify(result.error.issues)).not.toContain(mismatch.entityId)
     }
 
     expect(syncMutationResultSchema.parse({ id: 'mut_1', status: 'applied', revision: 1 }))

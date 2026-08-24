@@ -974,7 +974,28 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
     kind: z.literal('usage.record'),
     payload: byokUsageEventSchema,
   }).strict(),
-])
+]).superRefine((mutation, context) => {
+  let payloadEntityId: string | undefined
+  switch (mutation.kind) {
+    case 'message.append':
+    case 'usage.record':
+      payloadEntityId = mutation.payload.id
+      break
+    case 'legacy.import':
+      payloadEntityId = mutation.payload.batchId
+      break
+    case 'privacy.consent':
+      payloadEntityId = mutation.payload.documentVersion
+      break
+  }
+  if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
+    context.addIssue({
+      code: 'custom',
+      path: ['entityId'],
+      message: 'Mutation entity identity does not match its payload.',
+    })
+  }
+})
 export type SyncMutation = z.infer<typeof syncMutationSchema>
 
 export const modelTokenUsageSchema = z.object({
