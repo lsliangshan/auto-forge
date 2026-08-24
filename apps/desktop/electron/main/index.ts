@@ -149,6 +149,7 @@ async function initialize(): Promise<ApplicationRuntime> {
     },
     qiniuEnv: process.env,
     cloudbaseEnv: process.env,
+    userDataStores,
     readClipboardImage: () => {
       const image = clipboard.readImage()
       if (image.isEmpty()) return undefined

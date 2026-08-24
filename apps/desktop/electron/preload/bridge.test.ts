@@ -137,8 +137,21 @@ describe('preload desktop bridge', () => {
 
   it('reads persisted messages through the fixed conversation channel', async () => {
     const app = harness()
-    await app.api.chat.listMessages('conversation_1')
-    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.chatListMessages, { conversationId: 'conversation_1' })
+    await app.api.chat.listConversations({ limit: 50, cursor: 'opaque-cursor-0001' })
+    await app.api.chat.listMessages({
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0002',
+    })
+    await app.api.chat.retrySync('conversation_1')
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.chatListConversations, {
+      limit: 50, cursor: 'opaque-cursor-0001',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.chatListMessages, {
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0002',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.chatRetrySync, {
+      conversationId: 'conversation_1',
+    })
+    expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toContain('userId')
   })
 
   it('maps browser continuation takeover, redacted audit, and explicit data clearing to fixed channels', async () => {

@@ -172,6 +172,36 @@ function mergeMessageSnapshots(
   ]
 }
 
+function sortConversations(conversations: ConversationSummary[]): ConversationSummary[] {
+  return [...conversations].sort((left, right) => (
+    right.lastActivityAt.localeCompare(left.lastActivityAt) || left.id.localeCompare(right.id)
+  ))
+}
+
+function mergeConversationPages(
+  existing: ConversationSummary[],
+  incoming: ConversationSummary[],
+): ConversationSummary[] {
+  const byId = new Map(existing.map((conversation) => [conversation.id, conversation]))
+  for (const conversation of incoming) byId.set(conversation.id, conversation)
+  return sortConversations([...byId.values()])
+}
+
+function mergeHistoryPages(older: UiChatMessage[], current: UiChatMessage[]): UiChatMessage[] {
+  const order: string[] = []
+  const byId = new Map<string, UiChatMessage>()
+  for (const message of [...older, ...current]) {
+    const existing = byId.get(message.id)
+    if (!existing) {
+      order.push(message.id)
+      byId.set(message.id, message)
+      continue
+    }
+    byId.set(message.id, mergeMessageSnapshots([existing], [message])[0]!)
+  }
+  return order.map((id) => byId.get(id)!)
+}
+
 function closedAdmissions(store: object): Set<string> {
   let closed = closedMediaAdmissions.get(store)
   if (!closed) {
@@ -184,8 +214,10 @@ function closedAdmissions(store: object): Set<string> {
 export const useChatStore = defineStore('chat', {
   state: () => ({
     conversations: [] as ConversationSummary[],
+    nextConversationCursor: undefined as string | undefined,
     selectedConversationId: '' as string,
     messagesByConversation: {} as Record<string, UiChatMessage[]>,
+    previousMessageCursorByConversation: {} as Record<string, string | undefined>,
     draftsByConversation: {} as Record<string, MediaAsset[]>,
     preferencesByConversation: {} as Record<string, ConversationGenerationPreferences>,
     pendingRequestByConversation: {} as Record<string, true>,
@@ -199,6 +231,8 @@ export const useChatStore = defineStore('chat', {
     _selectionVersion: 0,
     _messageVersions: {} as Record<string, number>,
     _messageLoadVersions: {} as Record<string, number>,
+    _conversationPageRequests: {} as Record<string, true>,
+    _messagePageRequests: {} as Record<string, true>,
     _preferenceVersions: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
@@ -232,8 +266,10 @@ export const useChatStore = defineStore('chat', {
       storeReleases.delete(this)
       this._subscribed = false
       this.conversations = []
+      this.nextConversationCursor = undefined
       this.selectedConversationId = ''
       this.messagesByConversation = {}
+      this.previousMessageCursorByConversation = {}
       this.draftsByConversation = {}
       this.preferencesByConversation = {}
       this.pendingRequestByConversation = {}
@@ -243,6 +279,8 @@ export const useChatStore = defineStore('chat', {
       this._terminalRequests = {}
       this._messageVersions = {}
       this._messageLoadVersions = {}
+      this._conversationPageRequests = {}
+      this._messagePageRequests = {}
       this._preferenceVersions = {}
       closedMediaAdmissions.delete(this)
       this.loading = false
@@ -266,15 +304,20 @@ export const useChatStore = defineStore('chat', {
     },
     async loadConversations() {
       this.ensureSubscriptions()
+      const requestKey = 'initial'
+      if (this._conversationPageRequests[requestKey]) return
       const version = ++this._loadVersion
+      this._conversationPageRequests[requestKey] = true
       this.loading = true
       this.error = ''
       try {
-        const conversations = await getDesktopApi().chat.listConversations()
+        const page = await getDesktopApi().chat.listConversations({ limit: 50 })
         if (version !== this._loadVersion) return
-        this.conversations = conversations
-        if (!conversations.some(({ id }) => id === this.selectedConversationId)) {
-          this.selectedConversationId = conversations[0]?.id ?? ''
+        const selected = this.conversations.find(({ id }) => id === this.selectedConversationId)
+        this.conversations = mergeConversationPages(selected ? [selected] : [], page.items)
+        this.nextConversationCursor = page.nextCursor
+        if (!this.selectedConversationId) {
+          this.selectedConversationId = this.conversations[0]?.id ?? ''
           this._selectionVersion += 1
         }
         if (this.selectedConversationId) {
@@ -290,7 +333,23 @@ export const useChatStore = defineStore('chat', {
       } catch (error) {
         if (version === this._loadVersion) this.error = displayError(error, '会话加载失败')
       } finally {
+        delete this._conversationPageRequests[requestKey]
         if (version === this._loadVersion) this.loading = false
+      }
+    },
+    async loadMoreConversations() {
+      const cursor = this.nextConversationCursor
+      if (!cursor || this._conversationPageRequests[cursor]) return
+      this._conversationPageRequests[cursor] = true
+      try {
+        const page = await getDesktopApi().chat.listConversations({ limit: 50, cursor })
+        if (this.nextConversationCursor !== cursor) return
+        this.conversations = mergeConversationPages(this.conversations, page.items)
+        this.nextConversationCursor = page.nextCursor
+      } catch (error) {
+        this.error = displayError(error, '会话加载失败')
+      } finally {
+        delete this._conversationPageRequests[cursor]
       }
     },
     async createConversation() {
@@ -299,7 +358,7 @@ export const useChatStore = defineStore('chat', {
         const conversation = await getDesktopApi().chat.createConversation()
         this._loadVersion += 1
         this.loading = false
-        this.conversations.unshift(conversation)
+        this.conversations = mergeConversationPages(this.conversations, [conversation])
         closedAdmissions(this).delete(conversation.id)
         this.selectedConversationId = conversation.id
         this._selectionVersion += 1
@@ -314,7 +373,10 @@ export const useChatStore = defineStore('chat', {
         this._loadVersion += 1
         this.loading = false
         const index = this.conversations.findIndex((item) => item.id === id)
-        if (index >= 0) this.conversations[index] = updated
+        if (index >= 0) this.conversations = mergeConversationPages(
+          this.conversations.filter((item) => item.id !== id),
+          [updated],
+        )
       } catch (error) { this.error = displayError(error, '重命名失败') }
     },
     async deleteConversation(id: string) {
@@ -328,6 +390,7 @@ export const useChatStore = defineStore('chat', {
           this.loading = false
           this.conversations = this.conversations.filter((item) => item.id !== id)
           delete this.messagesByConversation[id]
+          delete this.previousMessageCursorByConversation[id]
           delete this.draftsByConversation[id]
           delete this.preferencesByConversation[id]
           delete this.pendingRequestByConversation[id]
@@ -368,16 +431,20 @@ export const useChatStore = defineStore('chat', {
       ])
     },
     async loadMessages(conversationId: string) {
+      const requestKey = `${conversationId}:latest`
+      if (this._messagePageRequests[requestKey]) return
       const selectionVersion = this._selectionVersion
       const mutationVersion = this._messageVersions[conversationId] ?? 0
       const loadVersion = (this._messageLoadVersions[conversationId] ?? 0) + 1
       this._messageLoadVersions[conversationId] = loadVersion
+      this._messagePageRequests[requestKey] = true
       try {
-        const messages = await getDesktopApi().chat.listMessages(conversationId)
+        const page = await getDesktopApi().chat.listMessages({ conversationId, limit: 100 })
         if (this.selectedConversationId !== conversationId
           || selectionVersion !== this._selectionVersion
           || loadVersion !== this._messageLoadVersions[conversationId]) return
-        const snapshot = messages.map(persistedMessage)
+        const snapshot = page.items.map(persistedMessage)
+        this.previousMessageCursorByConversation[conversationId] = page.previousCursor
         if (mutationVersion !== (this._messageVersions[conversationId] ?? 0)) {
           this.messagesByConversation[conversationId] = mergeMessageSnapshots(
             snapshot,
@@ -390,6 +457,41 @@ export const useChatStore = defineStore('chat', {
         if (this.selectedConversationId === conversationId && selectionVersion === this._selectionVersion) {
           this.error = displayError(error, '消息记录加载失败')
         }
+      } finally {
+        delete this._messagePageRequests[requestKey]
+      }
+    },
+    async loadOlderMessages(conversationId: string) {
+      const cursor = this.previousMessageCursorByConversation[conversationId]
+      const requestKey = `${conversationId}:${cursor ?? 'complete'}`
+      if (!cursor || this._messagePageRequests[requestKey]) return
+      this._messagePageRequests[requestKey] = true
+      try {
+        const page = await getDesktopApi().chat.listMessages({
+          conversationId,
+          limit: 100,
+          cursor,
+        })
+        if (this.previousMessageCursorByConversation[conversationId] !== cursor) return
+        this.messagesByConversation[conversationId] = mergeHistoryPages(
+          page.items.map(persistedMessage),
+          this.messagesByConversation[conversationId] ?? [],
+        )
+        this.previousMessageCursorByConversation[conversationId] = page.previousCursor
+      } catch (error) {
+        if (this.selectedConversationId === conversationId) {
+          this.error = displayError(error, '消息记录加载失败')
+        }
+      } finally {
+        delete this._messagePageRequests[requestKey]
+      }
+    },
+    async retrySync(conversationId: string) {
+      try {
+        await getDesktopApi().chat.retrySync(conversationId)
+        await this.loadConversations()
+      } catch (error) {
+        this.error = displayError(error, '同步重试失败')
       }
     },
     async loadGenerationPreferences(conversationId: string) {
@@ -680,11 +782,15 @@ export const useChatStore = defineStore('chat', {
       if (event.type === 'conversation_title_updated') {
         const index = this.conversations.findIndex(({ id }) => id === event.conversationId)
         if (index >= 0) {
-          this.conversations[index] = {
+          const updated = {
             ...this.conversations[index]!,
             title: event.title,
-            updatedAt: event.updatedAt,
+            metadataUpdatedAt: event.updatedAt,
           }
+          this.conversations = mergeConversationPages(
+            this.conversations.filter(({ id }) => id !== event.conversationId),
+            [updated],
+          )
         }
         return
       }

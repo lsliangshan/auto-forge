@@ -1,6 +1,7 @@
 import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -53,6 +54,7 @@ import type { ModelProvider, ModelProviderSnapshot, ModelStreamRequest } from '.
 import type { CredentialBoundModelProvider } from './chat/model-provider-registry.js'
 import { openAppDatabase } from './database/client.js'
 import { ProviderUsageConsistencyError, type Execution } from './database/repositories.js'
+import { UserDataStoreManager } from './database/user-data-client.js'
 import {
   NetworkProxyService,
   type NetworkProxyPort,
@@ -419,6 +421,35 @@ async function authenticate(
   })
 }
 
+async function listConversations(runtime: ReturnType<typeof createApplicationRuntime>) {
+  return (await runtime.services.chat.listConversations({ limit: 50 })).items
+}
+
+async function listMessages(
+  runtime: ReturnType<typeof createApplicationRuntime>,
+  conversationId: string,
+) {
+  return (await runtime.services.chat.listMessages({ conversationId, limit: 100 })).items
+}
+
+function withUserData<T>(root: string, userId: string, operation: (store: ReturnType<UserDataStoreManager['open']>) => T): T {
+  const manager = new UserDataStoreManager(join(root, 'user-caches'))
+  try {
+    return operation(manager.open(userId))
+  } finally {
+    manager.close()
+  }
+}
+
+function userCachePath(root: string, userId: string): string {
+  const scope = createHash('sha256')
+    .update('autoforge-user-cache-v1\0')
+    .update(userId)
+    .digest('hex')
+    .slice(0, 32)
+  return join(root, 'user-caches', `${scope}.sqlite`)
+}
+
 function capturedContinuationRegistry(
   workspace: ApplicationBrowserWorkspaceTestPort,
 ): BrowserContinuationRegistry {
@@ -473,9 +504,10 @@ function seedContinuationParents(
   binding: BrowserContinuationBindingInput,
   requestId = `request_${binding.chatRunId}`,
 ): void {
-  const database = openAppDatabase(databasePath)
-  if (!database.chatRuns.get(binding.chatRunId)) {
-    database.chatRuns.insert({
+  const userData = new UserDataStoreManager(join(dirname(databasePath), 'user-caches'))
+  const userStore = userData.open(binding.userId)
+  if (!userStore.chatRuns.get(binding.chatRunId)) {
+    userStore.chatRuns.insert({
       id: binding.chatRunId,
       conversationId: binding.conversationId,
       userId: binding.userId,
@@ -486,12 +518,13 @@ function seedContinuationParents(
       startedAt: 1,
     })
   }
+  userData.close()
+  const database = openAppDatabase(databasePath)
   if (!database.executions.get(binding.executionId)) {
     database.executions.insert({
       id: binding.executionId,
       workflowId: binding.workflowId,
       workflowVersion: binding.workflowVersion,
-      chatRunId: binding.chatRunId,
       status: 'completed',
       createdAt: 1,
     })
@@ -563,7 +596,7 @@ async function applicationHarness(input: {
       providerRequests.push(request)
       if (request.messages.some((message) => message.role === 'tool')) {
         if (input.failContinuationUsageReport) {
-          const tamper = new Database(join(root, 'autoforge.sqlite'))
+          const tamper = new Database(userCachePath(root, 'test_user_testuser'))
           try {
             expect(tamper.prepare(`
               DELETE FROM provider_usage_events
@@ -962,12 +995,11 @@ describe('createApplicationRuntime', () => {
   it('returns a token usage snapshot across five local-calendar periods', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-token-usage-'))
     directories.push(root)
-    const databasePath = join(root, 'autoforge.sqlite')
-    const database = openAppDatabase(databasePath)
-    database.localAuth.ensureExternalIdentity({ id: 'test_user_other', account: 'Other' }, 1)
-    database.localAuth.ensureExternalIdentity({ id: 'test_user_usage', account: 'Usage' }, 2)
-    database.conversations.insert({ id: 'usage_conversation', title: 'Usage' })
-    database.chatRuns.insert({
+    withUserData(root, 'test_user_usage', (database) => {
+      database.conversations.insert({
+        id: 'usage_conversation', title: 'Usage', userId: 'test_user_usage',
+      })
+      database.chatRuns.insert({
       id: 'usage_run',
       conversationId: 'usage_conversation',
       requestId: 'usage_request',
@@ -978,10 +1010,23 @@ describe('createApplicationRuntime', () => {
       startedAt: new Date(2026, 7, 17, 10).getTime(),
       inputTokens: 4,
       outputTokens: 6,
+      })
+      database.providerUsage.start({
+        id: 'usage_cost', operationKey: 'usage_cost', userId: 'test_user_usage',
+        provider: 'openrouter', requestId: 'usage_request', model: 'alpha/model', modality: 'text',
+        startedAt: new Date(2026, 7, 17, 10).getTime(),
+      })
+      database.providerUsage.report('usage_cost', {
+        costUsd: '0.25', endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
+      })
     })
-    database.chatRuns.insert({
+    withUserData(root, 'test_user_other', (database) => {
+      database.conversations.insert({
+        id: 'other_usage_conversation', title: 'Other', userId: 'test_user_other',
+      })
+      database.chatRuns.insert({
       id: 'other_usage_run',
-      conversationId: 'usage_conversation',
+      conversationId: 'other_usage_conversation',
       requestId: 'other_usage_request',
       userId: 'test_user_other',
       provider: 'deepseek',
@@ -990,22 +1035,8 @@ describe('createApplicationRuntime', () => {
       startedAt: new Date(2026, 7, 17, 10).getTime(),
       inputTokens: 40,
       outputTokens: 60,
-    })
-    database.providerUsage.start({
-      id: 'usage_cost',
-      operationKey: 'usage_cost',
-      userId: 'test_user_usage',
-      provider: 'openrouter',
-      requestId: 'usage_request',
-      model: 'alpha/model',
-      modality: 'text',
-      startedAt: new Date(2026, 7, 17, 10).getTime(),
-    })
-    database.providerUsage.report('usage_cost', {
-      costUsd: '0.25',
-      endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
-    })
-    database.providerUsage.start({
+      })
+      database.providerUsage.start({
       id: 'other_usage_cost',
       operationKey: 'other_usage_cost',
       userId: 'test_user_other',
@@ -1014,12 +1045,11 @@ describe('createApplicationRuntime', () => {
       model: 'other/model',
       modality: 'text',
       startedAt: new Date(2026, 7, 17, 10).getTime(),
+      })
+      database.providerUsage.report('other_usage_cost', {
+        costUsd: '9', endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
+      })
     })
-    database.providerUsage.report('other_usage_cost', {
-      costUsd: '9',
-      endedAt: new Date(2026, 7, 17, 10, 1).getTime(),
-    })
-    database.close()
 
     vi.useFakeTimers()
     vi.setSystemTime(new Date(2026, 7, 17, 12))
@@ -1120,41 +1150,45 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
-  it('claims legacy conversations for the first user and isolates conversation lists by user', async () => {
+  it('preserves legacy global conversations read-only and isolates new user-cache conversations', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-conversation-ownership-'))
     directories.push(root)
     const database = openAppDatabase(join(root, 'autoforge.sqlite'))
-    database.conversations.insert({ id: 'legacy_conversation', title: 'Legacy' })
     database.close()
+    const legacy = new Database(join(root, 'autoforge.sqlite'))
+    legacy.prepare(`
+      INSERT INTO conversations (id, title, title_state, user_id, created_at, updated_at)
+      VALUES ('legacy_conversation', 'Legacy', 'user_named', NULL, 1, 1)
+    `).run()
+    legacy.close()
     const runtime = createApplicationRuntime(options(root))
 
     const alice = await authenticate(runtime, 'Alice')
-    expect(await runtime.services.chat.listConversations()).toEqual([
-      expect.objectContaining({ id: 'legacy_conversation' }),
-    ])
+    expect(await listConversations(runtime)).toEqual([])
     const aliceConversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.renameConversation(aliceConversation.id, 'Alice conversation'))
       .not.toHaveProperty('userId')
 
     await runtime.services.auth.logout()
     await authenticate(runtime, 'Bobby')
-    expect(await runtime.services.chat.listConversations()).toEqual([])
+    expect(await listConversations(runtime)).toEqual([])
     const bobConversation = await runtime.services.chat.createConversation()
-    expect(await runtime.services.chat.listConversations()).toEqual([
+    expect(await listConversations(runtime)).toEqual([
       expect.objectContaining({ id: bobConversation.id }),
     ])
 
     await runtime.services.auth.logout()
     await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
-    expect(await runtime.services.chat.listConversations()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'legacy_conversation' }),
+    expect(await listConversations(runtime)).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: aliceConversation.id }),
     ]))
-    expect(await runtime.services.chat.listConversations()).toHaveLength(2)
+    expect(await listConversations(runtime)).toHaveLength(1)
 
     const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
     expect(inspection.prepare('SELECT user_id AS userId FROM conversations WHERE id = ?')
-      .get('legacy_conversation')).toEqual({ userId: alice.user.id })
+      .get('legacy_conversation')).toEqual({ userId: null })
+    expect(withUserData(root, alice.user.id, (store) => store.conversations.get('legacy_conversation')))
+      .toBeUndefined()
     inspection.close()
     await runtime.close()
   })
@@ -1178,7 +1212,7 @@ describe('createApplicationRuntime', () => {
       },
     }
     for (const operation of [
-      () => runtime.services.chat.listMessages(conversation.id),
+      () => listMessages(runtime, conversation.id),
       () => runtime.services.chat.getGenerationPreferences(conversation.id),
       () => runtime.services.chat.updateGenerationPreferences(conversation.id, preferences),
       () => runtime.services.chat.send(chatInput(conversation.id, 'not mine')),
@@ -1190,7 +1224,7 @@ describe('createApplicationRuntime', () => {
 
     await runtime.services.auth.logout()
     await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
-    expect(await runtime.services.chat.listConversations()).toEqual([
+    expect(await listConversations(runtime)).toEqual([
       expect.objectContaining({ id: conversation.id, title: '新会话' }),
     ])
     await runtime.close()
@@ -1377,7 +1411,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.auth.logout()
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'anonymous')))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
-    await expect(runtime.services.chat.listMessages(conversation.id))
+    await expect(listMessages(runtime, conversation.id))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(emitChat).not.toHaveBeenCalled()
 
@@ -1394,11 +1428,11 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.chat.send(chatInput(conversation.id, 'logged out')))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await settleEvents()
-    await expect(runtime.services.chat.listMessages(conversation.id))
+    await expect(listMessages(runtime, conversation.id))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(emitChat).toHaveBeenCalledTimes(forwardedCount)
     await runtime.services.auth.loginWithPassword({ account: 'Alice', password: 'password' })
-    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(2)
+    expect(await listMessages(runtime, conversation.id)).toHaveLength(2)
     await runtime.close()
   })
 
@@ -1442,9 +1476,19 @@ describe('createApplicationRuntime', () => {
     expect(chatEvents).toContainEqual(expect.objectContaining({
       type: 'status', requestId: first.requestId, status: 'completed',
     }))
-    expect(await runtime.services.chat.listConversations()).toEqual([
-      expect.objectContaining({ id: conversation.id, title: '北京工作居住证办理' }),
+    expect(await listConversations(runtime)).toEqual([
+      expect.objectContaining({
+        id: conversation.id, title: '北京工作居住证办理', syncState: 'pending',
+      }),
     ])
+    expect(withUserData(root, 'test_user_alice', (store) => store.outbox.list(100)))
+      .toContainEqual(expect.objectContaining({
+        kind: 'conversation.rename',
+        entityId: conversation.id,
+        payload: expect.objectContaining({
+          title: '北京工作居住证办理', titleState: 'ai_named',
+        }),
+      }))
     expect(requests).toHaveLength(2)
     expect(provider.acquireSnapshot).toHaveBeenCalledOnce()
 
@@ -1456,7 +1500,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.renameConversation(manuallyNamed.id, '我的自定义名称')
     await runtime.services.chat.send(chatInput(manuallyNamed.id, '测试手动名称'))
     await vi.waitFor(() => expect(requests).toHaveLength(4))
-    expect(await runtime.services.chat.listConversations()).toContainEqual(
+    expect(await listConversations(runtime)).toContainEqual(
       expect.objectContaining({ id: manuallyNamed.id, title: '我的自定义名称' }),
     )
     await runtime.close()
@@ -1511,9 +1555,8 @@ describe('createApplicationRuntime', () => {
     releaseTitle.resolve()
     await closing
 
-    const inspection = openAppDatabase(join(root, 'autoforge.sqlite'))
-    expect(inspection.conversations.get(conversation.id)).toMatchObject({ titleState: 'failed' })
-    inspection.close()
+    expect(withUserData(root, 'test_user_alice', (store) => store.conversations.get(conversation.id)))
+      .toMatchObject({ titleState: 'failed' })
   })
 
   it('does not forward a previous user conversation events after the active user changes', async () => {
@@ -1545,10 +1588,11 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.send(chatInput(conversation.id, 'Alice request'))
     await streamStarted.promise
 
-    await runtime.services.auth.logout()
+    const logout = runtime.services.auth.logout()
+    releaseStream.resolve()
+    await logout
     await authenticate(runtime, 'Bobby')
     emitChat.mockClear()
-    releaseStream.resolve()
     for (let index = 0; index < 10; index += 1) {
       await new Promise<void>((resolve) => { setImmediate(resolve) })
     }
@@ -1557,7 +1601,7 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
-  it('captures the authenticated user before route resolution and persists only the OpenRouter key fingerprint', async () => {
+  it('captures the authenticated user before route resolution and keeps provider secrets out of user caches', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-owner-'))
     directories.push(root)
     const catalog = deferred<ModelInfo[]>()
@@ -1596,16 +1640,17 @@ describe('createApplicationRuntime', () => {
 
     const sending = runtime.services.chat.send(chatInput(openRouterConversation.id, 'owned by Alice'))
     await vi.waitFor(() => expect(openrouter.listModels).toHaveBeenCalledTimes(1))
-    await runtime.services.auth.logout()
-    const bob = await authenticate(runtime, 'Bobby')
+    const logout = runtime.services.auth.logout()
     catalog.resolve([modelInfo('openai/gpt-4.1-mini', 'OpenRouter')])
+    await logout
+    const bob = await authenticate(runtime, 'Bobby')
     const openRouterRequest = await sending
     await vi.waitFor(() => {
-      const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+      const inspection = new Database(userCachePath(root, alice.user.id), { readonly: true })
       const run = inspection.prepare('SELECT status FROM chat_runs WHERE request_id = ?')
         .get(openRouterRequest.requestId)
       inspection.close()
-      expect(run).toEqual({ status: 'completed' })
+      expect(run).toEqual({ status: 'cancelled' })
     })
 
     await runtime.services.settings.update({ activeProvider: 'deepseek' })
@@ -1616,31 +1661,36 @@ describe('createApplicationRuntime', () => {
     })))
     await runtime.close()
 
-    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    const sqlite = new Database(userCachePath(root, alice.user.id), { readonly: true })
     try {
       const runs = sqlite.prepare(`
         SELECT request_id AS requestId, user_id AS userId, provider
         FROM chat_runs
       `).all()
-      expect(runs).toHaveLength(2)
-      expect(runs).toEqual(expect.arrayContaining([
+      expect(runs).toEqual([
         { requestId: openRouterRequest.requestId, userId: alice.user.id, provider: 'openrouter' },
-        { requestId: deepSeekRequest.requestId, userId: bob.user.id, provider: 'deepseek' },
-      ]))
+      ])
       const usage = sqlite.prepare(`
         SELECT user_id AS userId, api_key_fingerprint AS apiKeyFingerprint
         FROM provider_usage_events
       `).get()
-      expect(usage).toEqual({
-        userId: alice.user.id,
-        apiKeyFingerprint: 'fingerprint_test',
-      })
-      expect(JSON.stringify(usage)).not.toContain('sk-openrouter-user-a')
+      expect(usage).toBeUndefined()
     } finally {
       sqlite.close()
     }
+    const bobCache = new Database(userCachePath(root, bob.user.id), { readonly: true })
+    expect(bobCache.prepare(`
+      SELECT request_id AS requestId, user_id AS userId, provider FROM chat_runs
+    `).all()).toEqual([
+      { requestId: deepSeekRequest.requestId, userId: bob.user.id, provider: 'deepseek' },
+    ])
+    bobCache.close()
+    expect((await readFile(userCachePath(root, alice.user.id))).toString('utf8'))
+      .not.toContain('sk-openrouter-user-a')
+    expect((await readFile(userCachePath(root, bob.user.id))).toString('utf8'))
+      .not.toContain('sk-deepseek-user-b')
     expect(getSecret).not.toHaveBeenCalled()
-    expect(openrouter.stream).toHaveBeenCalledWith(expect.objectContaining({ endUserId: alice.user.id }))
+    expect(openrouter.stream).not.toHaveBeenCalled()
     expect(deepseek.stream).toHaveBeenCalledWith(expect.objectContaining({ endUserId: bob.user.id }))
   })
 
@@ -1732,7 +1782,7 @@ describe('createApplicationRuntime', () => {
     }))
     await runtime.close()
 
-    const sqlite = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+    const sqlite = new Database(userCachePath(root, session.user.id), { readonly: true })
     try {
       expect(sqlite.prepare(`
         SELECT user_id AS userId, api_key_fingerprint AS apiKeyFingerprint, cost_usd AS costUsd
@@ -1863,7 +1913,6 @@ describe('createApplicationRuntime', () => {
   it('latches a real timer-started video consistency failure before shutdown', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-video-background-consistency-'))
     directories.push(root)
-    const databasePath = join(root, 'autoforge.sqlite')
     const videoStop = vi.spyOn(VideoJobRunner.prototype, 'stop')
     const provider = snapshotProvider('openrouter', {
       listModels: vi.fn(async () => [videoModelInfo('openrouter/video')]),
@@ -1893,7 +1942,7 @@ describe('createApplicationRuntime', () => {
         ...chatInput(conversation.id, 'video'),
         outputType: 'video',
       })
-      const tamper = new Database(databasePath)
+      const tamper = new Database(userCachePath(root, 'test_user_testuser'))
       try {
         expect(tamper.prepare('DELETE FROM provider_usage_events WHERE operation_key = ?')
           .run(`video:${requestId}`).changes).toBe(1)
@@ -1991,16 +2040,13 @@ describe('createApplicationRuntime', () => {
 
     await runtime.close()
 
-    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
     try {
-      expect(database.chatRuns.getByRequestId(requestId)).toMatchObject({
+      expect(withUserData(root, 'test_user_testuser', (store) => store.chatRuns.getByRequestId(requestId))).toMatchObject({
         status: 'cancelled',
         errorCode: 'CANCELLED',
         endedAt: expect.any(Number),
       })
-    } finally {
-      database.close()
-    }
+    } finally { /* Cache inspection closes through withUserData. */ }
   })
 
   it('keeps development starts at zero when mode is off and runs the installed workflow instead', async () => {
@@ -2341,7 +2387,7 @@ describe('createApplicationRuntime', () => {
         scopeHash: approval.scopeHash,
         decision: 'once',
       })).rejects.toMatchObject({ code: 'CONFLICT' })
-      expect((await runtime.services.chat.listMessages(conversation.id))
+      expect((await listMessages(runtime, conversation.id))
         .find((message) => message.role === 'assistant')?.blocks).toContainEqual(expect.objectContaining({
         type: 'approval', blockId: approval.blockId, state: 'cancelled',
       }))
@@ -2389,13 +2435,17 @@ describe('createApplicationRuntime', () => {
       event.type === 'block' && event.block.type === 'approval'
     ))!.block
     if (approval.type !== 'approval') throw new Error('Expected pending approval')
+    await mkdir(join(restartedRoot, 'user-caches'), { recursive: true })
+    const sourceCache = new Database(userCachePath(root, 'test_user_restartapproval'), { readonly: true })
+    await sourceCache.backup(userCachePath(restartedRoot, 'test_user_restartapproval'))
+    sourceCache.close()
     await copyFile(join(root, 'autoforge.sqlite'), join(restartedRoot, 'autoforge.sqlite'))
     await runtime.close()
 
     const restarted = createApplicationRuntime(options(restartedRoot))
-    await restarted.recover()
     await authenticate(restarted, 'RestartApproval')
-    const recovered = (await restarted.services.chat.listMessages(conversation.id))
+    await restarted.recover()
+    const recovered = (await listMessages(restarted, conversation.id))
       .flatMap((message) => message.blocks)
       .find((block) => block.type === 'approval')
     expect(chatBlockSchema.parse(recovered)).toMatchObject({
@@ -2488,7 +2538,7 @@ describe('createApplicationRuntime', () => {
     expect(agentCancel).toHaveBeenCalledTimes(1)
     expect(mediaCancel).toHaveBeenCalledTimes(1)
     expect(executionShutdown).toHaveBeenCalledTimes(1)
-    expect(databaseClose).toHaveBeenCalledTimes(1)
+    expect(databaseClose).toHaveBeenCalledTimes(2)
   })
 
   it('memoizes close and rejects recover after shutdown starts', async () => {
@@ -2571,6 +2621,7 @@ describe('createApplicationRuntime', () => {
     const recoveryError = new Error('sk-sensitive-recovery-key')
     const runtime = createApplicationRuntime(options(root))
 
+    await authenticate(runtime, 'UsageRecovery')
     await expect(runtime.recover()).resolves.toBeUndefined()
     expect(recoveryProbe).toHaveBeenCalledTimes(1)
     interrupted.reject(recoveryError)
@@ -2580,16 +2631,11 @@ describe('createApplicationRuntime', () => {
   it('recovers pending usage locally without consuming retries when OpenRouter lacks generation usage capability', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-capability-'))
     directories.push(root)
-    const databasePath = join(root, 'autoforge.sqlite')
-    const database = openAppDatabase(databasePath)
-    database.localAuth.createUserAndSession({
-      id: 'user_capability', account: 'Capability', accountNormalized: 'capability',
-      passwordDigest: 'digest-capability', createdAt: 1, updatedAt: 1,
-    }, 1)
+    const userId = 'test_user_capability'
     const usage = (id: string, startedAt: number) => ({
       id,
       operationKey: `operation_${id}`,
-      userId: 'user_capability',
+      userId,
       provider: 'openrouter' as const,
       apiKeyFingerprint: '9990f372dd37cc8754019a4215e0dedc4ec55fd78e0b7e38ad73c7e152a9986c',
       requestId: `request_${id}`,
@@ -2597,12 +2643,13 @@ describe('createApplicationRuntime', () => {
       modality: 'text' as const,
       startedAt,
     })
-    database.providerUsage.start(usage('unknown', 100))
-    database.providerUsage.bindIdentity('operation_unknown', { generationId: 'generation_unknown' })
-    database.providerUsage.markUnknown('operation_unknown', 100)
-    database.providerUsage.start(usage('pending', 200))
-    database.providerUsage.bindIdentity('operation_pending', { generationId: 'generation_pending' })
-    database.close()
+    withUserData(root, userId, (store) => {
+      store.providerUsage.start(usage('unknown', 100))
+      store.providerUsage.bindIdentity('operation_unknown', { generationId: 'generation_unknown' })
+      store.providerUsage.markUnknown('operation_unknown', 100)
+      store.providerUsage.start(usage('pending', 200))
+      store.providerUsage.bindIdentity('operation_pending', { generationId: 'generation_pending' })
+    })
 
     vi.useFakeTimers()
     vi.setSystemTime(10_000)
@@ -2616,6 +2663,7 @@ describe('createApplicationRuntime', () => {
       } }),
     }))
     try {
+      await authenticate(runtime, 'Capability')
       await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-capability')
       await runtime.recover()
       await vi.advanceTimersByTimeAsync(100_000)
@@ -2624,7 +2672,7 @@ describe('createApplicationRuntime', () => {
       vi.useRealTimers()
     }
 
-    const sqlite = new Database(databasePath, { readonly: true })
+    const sqlite = new Database(userCachePath(root, userId), { readonly: true })
     try {
       expect(sqlite.prepare(`
         SELECT operation_key AS operationKey, status, reconcile_attempts AS reconcileAttempts,
@@ -2842,21 +2890,18 @@ describe('createApplicationRuntime', () => {
         })
       }),
     })
-    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
-    database.localAuth.createUserAndSession({
-      id: 'user_abort', account: 'Abort', accountNormalized: 'abort',
-      passwordDigest: 'digest-abort', createdAt: 1, updatedAt: 1,
-    }, 1)
-    database.providerUsage.start({
-      id: 'usage_abort', operationKey: 'operation_abort', userId: 'user_abort',
-      provider: 'openrouter', apiKeyFingerprint: 'fingerprint_test', requestId: 'request_abort',
-      model: 'openrouter/model', modality: 'text', startedAt: 0,
+    withUserData(root, 'test_user_abort', (store) => {
+      store.providerUsage.start({
+        id: 'usage_abort', operationKey: 'operation_abort', userId: 'test_user_abort',
+        provider: 'openrouter', apiKeyFingerprint: 'fingerprint_test', requestId: 'request_abort',
+        model: 'openrouter/model', modality: 'text', startedAt: 0,
+      })
+      store.providerUsage.bindIdentity('operation_abort', { generationId: 'generation_abort' })
+      store.providerUsage.markUnknown('operation_abort', 0)
     })
-    database.providerUsage.bindIdentity('operation_abort', { generationId: 'generation_abort' })
-    database.providerUsage.markUnknown('operation_abort', 0)
-    database.close()
     const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
     try {
+      await authenticate(runtime, 'Abort')
       await runtime.recover()
       await vi.advanceTimersByTimeAsync(1_000)
       const signal = await lookupStarted.promise
@@ -3285,7 +3330,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.media.reveal(picked!.id)
     expect(chooseMediaSavePath).toHaveBeenCalledWith(picked!.name)
     expect(revealPath).toHaveBeenCalledWith(expect.stringContaining(`${conversation.id}/`))
-    await expect(runtime.services.media.saveCopy('missing_asset')).rejects.toMatchObject({ code: 'MEDIA_ASSET_UNAVAILABLE' })
+    await expect(runtime.services.media.saveCopy('missing_asset')).rejects.toMatchObject({ code: 'NOT_FOUND' })
     await runtime.close()
   })
 
@@ -3453,7 +3498,7 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.chat.send(chatInput(conversation.id, '第一轮问题')))
       .resolves.toEqual({ requestId: expect.any(String) })
     await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(1))
-    await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
+    await vi.waitFor(async () => expect(await listMessages(runtime, conversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ role: 'assistant', blocks: [{ type: 'text', text: '第一轮回答' }] }),
       ])))
@@ -3575,7 +3620,7 @@ describe('createApplicationRuntime', () => {
 
     await runtime.services.chat.send(chatInput(conversation.id, '读取证件有效期'))
     await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
-    await vi.waitFor(async () => expect(JSON.stringify(await runtime.services.chat.listMessages(conversation.id)))
+    await vi.waitFor(async () => expect(JSON.stringify(await listMessages(runtime, conversation.id)))
       .toContain('2028-06-30'))
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(injection)
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(privateValue)
@@ -3615,20 +3660,22 @@ describe('createApplicationRuntime', () => {
   it('loads, persists, and safely continues a conversation with an exact legacy approval block', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-legacy-approval-'))
     directories.push(root)
-    const databasePath = join(root, 'autoforge.sqlite')
-    const seedDatabase = openAppDatabase(databasePath)
-    seedDatabase.conversations.insert({ id: 'legacy_approval_conversation', title: 'Legacy approval' })
-    seedDatabase.messages.insert({
-      id: 'legacy_approval_message', conversationId: 'legacy_approval_conversation',
-      role: 'assistant', blocks: [], createdAt: 1,
+    const userId = 'test_user_legacyapproval'
+    withUserData(root, userId, (store) => {
+      store.conversations.insert({
+        id: 'legacy_approval_conversation', title: 'Legacy approval', userId,
+      })
+      store.messages.insert({
+        id: 'legacy_approval_message', conversationId: 'legacy_approval_conversation',
+        role: 'assistant', blocks: [], createdAt: 1,
+      })
     })
-    seedDatabase.close()
     const legacyApproval = {
       type: 'approval', executionId: 'legacy_execution_secret', workflowId: 'legacy.workflow',
       workflowVersion: '1.0.0', permissionIndex: 0, capability: 'filesystem.write',
       scope: { paths: ['/Users/private/legacy-secret.txt'] }, scopeHash: 'a'.repeat(64),
     }
-    const seed = new Database(databasePath)
+    const seed = new Database(userCachePath(root, userId))
     seed.prepare('UPDATE messages SET blocks_json = ? WHERE id = ?')
       .run(JSON.stringify([legacyApproval]), 'legacy_approval_message')
     seed.close()
@@ -3644,23 +3691,24 @@ describe('createApplicationRuntime', () => {
     })
     const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
     await authenticate(runtime, 'LegacyApproval')
+    await runtime.recover()
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     const settings = await runtime.services.settings.get()
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
       defaultModels: { ...settings.defaultModels, openrouter: { text: 'openrouter/context' } },
     })
-    expect(await runtime.services.chat.listConversations()).toContainEqual(expect.objectContaining({
+    expect(await listConversations(runtime)).toContainEqual(expect.objectContaining({
       id: 'legacy_approval_conversation',
     }))
-    const listed = await runtime.services.chat.listMessages('legacy_approval_conversation')
+    const listed = await listMessages(runtime, 'legacy_approval_conversation')
     const approval = listed[0]?.blocks[0]
     expect(chatBlockSchema.parse(approval)).toMatchObject({
       type: 'approval', state: 'invalidated', source: 'installed',
       workflowId: 'legacy.workflow', workflowName: 'legacy.workflow',
       actionSummary: '历史权限审批已失效',
     })
-    const persisted = new Database(databasePath, { readonly: true })
+    const persisted = new Database(userCachePath(root, userId), { readonly: true })
     expect(JSON.parse((persisted.prepare('SELECT blocks_json AS blocksJson FROM messages WHERE id = ?')
       .get('legacy_approval_message') as { blocksJson: string }).blocksJson)[0]).toMatchObject({
       state: 'invalidated', actionSummary: '历史权限审批已失效',
@@ -3682,20 +3730,22 @@ describe('createApplicationRuntime', () => {
   it('bills real context-summary streams through the Application-supplied provider snapshot', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-summary-billing-'))
     directories.push(root)
-    const databasePath = join(root, 'autoforge.sqlite')
-    const database = openAppDatabase(databasePath)
-    database.conversations.insert({ id: 'conversation_summary_billing', title: 'Summary billing' })
-    for (let turn = 0; turn < 10; turn += 1) {
-      database.messages.insert({
-        id: `summary_user_${turn}`, conversationId: 'conversation_summary_billing', role: 'user',
-        blocks: [{ type: 'text', text: `问题 ${turn} ${'长内容'.repeat(80)}` }], createdAt: turn * 2 + 1,
+    const userId = 'test_user_testuser'
+    withUserData(root, userId, (store) => {
+      store.conversations.insert({
+        id: 'conversation_summary_billing', title: 'Summary billing', userId,
       })
-      database.messages.insert({
-        id: `summary_assistant_${turn}`, conversationId: 'conversation_summary_billing', role: 'assistant',
-        blocks: [{ type: 'text', text: `回答 ${turn} ${'历史'.repeat(80)}` }], createdAt: turn * 2 + 2,
-      })
-    }
-    database.close()
+      for (let turn = 0; turn < 10; turn += 1) {
+        store.messages.insert({
+          id: `summary_user_${turn}`, conversationId: 'conversation_summary_billing', role: 'user',
+          blocks: [{ type: 'text', text: `问题 ${turn} ${'长内容'.repeat(80)}` }], createdAt: turn * 2 + 1,
+        })
+        store.messages.insert({
+          id: `summary_assistant_${turn}`, conversationId: 'conversation_summary_billing', role: 'assistant',
+          blocks: [{ type: 'text', text: `回答 ${turn} ${'历史'.repeat(80)}` }], createdAt: turn * 2 + 2,
+        })
+      }
+    })
     let summaryCalls = 0
     const stream = vi.fn(async function* (request: ModelStreamRequest) {
       const summary = request.maxOutputTokens !== undefined
@@ -3722,7 +3772,7 @@ describe('createApplicationRuntime', () => {
       emitChat,
     }))
     const session = await authenticate(runtime)
-    await runtime.services.chat.listConversations()
+    await listConversations(runtime)
     await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
     await runtime.services.settings.update({
       activeProvider: 'openrouter',
@@ -3738,7 +3788,7 @@ describe('createApplicationRuntime', () => {
     })))
     await runtime.close()
 
-    const sqlite = new Database(databasePath, { readonly: true })
+    const sqlite = new Database(userCachePath(root, userId), { readonly: true })
     try {
       const events = sqlite.prepare(`
         SELECT operation_key AS operationKey, user_id AS userId, api_key_fingerprint AS apiKeyFingerprint,
@@ -3833,7 +3883,7 @@ describe('createApplicationRuntime', () => {
         error: expect.objectContaining({ code: 'CONFLICT' }),
       }),
     ])))
-    expect(await runtime.services.chat.listMessages(conversation.id)).toEqual([
+    expect(await listMessages(runtime, conversation.id)).toEqual([
       expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'first' }] }),
       expect.objectContaining({ role: 'assistant', blocks: [] }),
     ])
@@ -3847,7 +3897,7 @@ describe('createApplicationRuntime', () => {
       expect.objectContaining({ type: 'status', requestId: retry.requestId, status: 'completed' }),
     ])))
     expect(stream).toHaveBeenCalledTimes(2)
-    expect(await runtime.services.chat.listMessages(conversation.id)).toHaveLength(4)
+    expect(await listMessages(runtime, conversation.id)).toHaveLength(4)
     await runtime.close()
   })
 
@@ -3911,7 +3961,7 @@ describe('createApplicationRuntime', () => {
     })
     await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(1))
     expect(JSON.stringify(agentRequests(captured)[0]?.messages)).toContain(png.toString('base64'))
-    await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
+    await vi.waitFor(async () => expect(await listMessages(runtime, conversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ role: 'assistant', blocks: [{ type: 'text', text: '我看到了图片' }] }),
       ])))
@@ -4017,7 +4067,7 @@ describe('createApplicationRuntime', () => {
       route: { kind: 'direct' },
       signal: expect.any(AbortSignal),
     })))
-    await vi.waitFor(async () => expect(await runtime.services.chat.listMessages(conversation.id))
+    await vi.waitFor(async () => expect(await listMessages(runtime, conversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({
           role: 'assistant',
@@ -4144,7 +4194,7 @@ describe('createApplicationRuntime', () => {
         },
       ],
     })))
-    expect(JSON.stringify(await runtime.services.chat.listMessages(textConversation.id)))
+    expect(JSON.stringify(await listMessages(runtime, textConversation.id)))
       .not.toContain(png.toString('base64'))
 
     const audioConversation = await runtime.services.chat.createConversation()
@@ -4173,7 +4223,7 @@ describe('createApplicationRuntime', () => {
       ...chatInput(failedVideoConversation.id, 'fail this video'),
       outputType: 'video',
     })).resolves.toEqual({ requestId: expect.any(String) })
-    expect(await runtime.services.chat.listMessages(failedVideoConversation.id))
+    expect(await listMessages(runtime, failedVideoConversation.id))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ role: 'user' }),
         expect.objectContaining({
@@ -4362,11 +4412,11 @@ describe('createApplicationRuntime', () => {
     const preservedDirectory = join(root, 'media', preserved.id)
     await runtime.services.settings.clearLocalData('executions')
     await expect(access(preservedDirectory)).resolves.toBeUndefined()
-    expect(await runtime.services.chat.listConversations()).toHaveLength(1)
+    expect(await listConversations(runtime)).toHaveLength(1)
 
     await runtime.services.settings.clearLocalData('all')
     await expect(access(preservedDirectory)).rejects.toMatchObject({ code: 'ENOENT' })
-    expect(await runtime.services.chat.listConversations()).toEqual([])
+    expect(await listConversations(runtime)).toEqual([])
     await runtime.close()
   })
 
@@ -4435,6 +4485,7 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
 
     const restarted = createApplicationRuntime(options)
+    await restarted.recover()
     await expect(restarted.services.chat.getGenerationPreferences(conversation.id))
       .resolves.toMatchObject({
         outputType: 'image',
@@ -4709,30 +4760,34 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-image-recover-'))
     directories.push(root)
     const databasePath = join(root, 'autoforge.sqlite')
-    const database = openAppDatabase(databasePath)
-    database.conversations.insert({ id: 'conversation_interrupted_image', title: 'Interrupted' })
-    database.messages.insert({
-      id: 'assistant_interrupted_image',
-      conversationId: 'conversation_interrupted_image',
-      role: 'assistant',
-      blocks: [{
-        type: 'media_generation',
-        blockId: 'block_interrupted_image',
-        jobId: 'request_interrupted_image',
-        kind: 'image',
-        status: 'in_progress',
-      }],
-      createdAt: 1,
+    withUserData(root, 'test_user_testuser', (store) => {
+      store.conversations.insert({
+        id: 'conversation_interrupted_image', title: 'Interrupted', userId: 'test_user_testuser',
+      })
+      store.messages.insert({
+        id: 'assistant_interrupted_image',
+        conversationId: 'conversation_interrupted_image',
+        role: 'assistant',
+        blocks: [{
+          type: 'media_generation',
+          blockId: 'block_interrupted_image',
+          jobId: 'request_interrupted_image',
+          kind: 'image',
+          status: 'in_progress',
+        }],
+        createdAt: 1,
+      })
+      store.chatRuns.insert({
+        id: 'run_interrupted_image',
+        conversationId: 'conversation_interrupted_image',
+        requestId: 'request_interrupted_image',
+        userId: 'test_user_testuser',
+        provider: 'openrouter',
+        model: 'openrouter/image',
+        status: 'running',
+        startedAt: 1,
+      })
     })
-    database.chatRuns.insert({
-      id: 'run_interrupted_image',
-      conversationId: 'conversation_interrupted_image',
-      requestId: 'request_interrupted_image',
-      model: 'openrouter/image',
-      status: 'running',
-      startedAt: 1,
-    })
-    database.close()
 
     const runtime = createApplicationRuntime({
       authService: createTestAuthService(),
@@ -4758,9 +4813,9 @@ describe('createApplicationRuntime', () => {
       browserWorkspace: createBrowserWorkspace(),
     })
     await authenticate(runtime)
-    await runtime.services.chat.listConversations()
+    await listConversations(runtime)
     await runtime.recover()
-    await expect(runtime.services.chat.listMessages('conversation_interrupted_image'))
+    await expect(listMessages(runtime, 'conversation_interrupted_image'))
       .resolves.toEqual([
         expect.objectContaining({
           blocks: [{
@@ -5411,12 +5466,12 @@ describe('createApplicationRuntime', () => {
       },
     })
     const conversation = await runtime.services.chat.createConversation()
-    expect(await runtime.services.chat.listConversations()).toEqual([conversation])
-    expect(await runtime.services.chat.listMessages(conversation.id)).toEqual([])
+    expect(await listConversations(runtime)).toEqual([conversation])
+    expect(await listMessages(runtime, conversation.id)).toEqual([])
     expect(await runtime.services.chat.renameConversation(conversation.id, 'Renamed')).toMatchObject({ title: 'Renamed' })
     await runtime.services.chat.send(chatInput(conversation.id, 'persist me'))
     for (let index = 0; index < 30 && !chatEvents.some((event) => event.status === 'completed'); index += 1) await Promise.resolve()
-    expect(await runtime.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
+    expect(await listMessages(runtime, conversation.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
       expect.objectContaining({ role: 'assistant' }),
     ]))
@@ -5474,7 +5529,7 @@ describe('createApplicationRuntime', () => {
     })
     await authenticate(restarted)
     await restarted.recover()
-    expect(await restarted.services.chat.listMessages(conversation.id)).toEqual(expect.arrayContaining([
+    expect(await listMessages(restarted, conversation.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: 'user', blocks: [{ type: 'text', text: 'persist me' }] }),
     ]))
     await restarted.close()
@@ -5533,7 +5588,7 @@ describe('createApplicationRuntime', () => {
       .rejects.toMatchObject({ code: 'CONFLICT' })
     await expect(runtime.services.workflows.remove('workflow.active', '1.0.0'))
       .rejects.toMatchObject({ code: 'CONFLICT' })
-    expect(await runtime.services.chat.listConversations()).toHaveLength(1)
+    expect(await listConversations(runtime)).toHaveLength(1)
 
     finishStream()
     for (let index = 0; index < 20 && !chatEvents.some((event) => event.status === 'completed'); index += 1) {
@@ -5541,7 +5596,7 @@ describe('createApplicationRuntime', () => {
     }
     await new Promise<void>((resolve) => { setImmediate(resolve) })
     await runtime.services.settings.clearLocalData('conversations')
-    expect(await runtime.services.chat.listConversations()).toEqual([])
+    expect(await listConversations(runtime)).toEqual([])
     await runtime.close()
   })
 
@@ -5916,9 +5971,9 @@ describe('createApplicationRuntime', () => {
         `catalog-only-${index}`,
       ))
       await starts[index]!.promise
-      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
-      const run = database.chatRuns.getByRequestId(requestId)!
-      database.close()
+      const run = withUserData(root, session.user.id, (store) => (
+        store.chatRuns.getByRequestId(requestId)
+      ))!
       runs.push({ requestId, runId: run.id })
 
       if (index === 0) {
@@ -5949,13 +6004,9 @@ describe('createApplicationRuntime', () => {
     await Promise.all(leases.map((lease) => lease.release()))
     releases.forEach((release) => release.resolve())
     await vi.waitFor(() => {
-      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
-      try {
-        expect(runs.map(({ requestId }) => database.chatRuns.getByRequestId(requestId)?.status))
-          .toEqual(['completed', 'completed', 'completed'])
-      } finally {
-        database.close()
-      }
+      expect(withUserData(root, session.user.id, (store) => (
+        runs.map(({ requestId }) => store.chatRuns.getByRequestId(requestId)?.status)
+      ))).toEqual(['completed', 'completed', 'completed'])
     })
     await runtime.close()
   })
@@ -6026,9 +6077,9 @@ describe('createApplicationRuntime', () => {
       bindingIds[index] = live.bindingId
       const sent = await runtime.services.chat.send(chatInput(conversation.id, `读取状态 active-${index}`))
       await vi.waitFor(() => expect(inspectorStarted[index]).toBe(true))
-      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
-      const run = database.chatRuns.getByRequestId(sent.requestId)!
-      database.close()
+      const run = withUserData(root, session.user.id, (store) => (
+        store.chatRuns.getByRequestId(sent.requestId)
+      ))!
       expect(registry.currentLease(live.bindingId)?.runId).toBe(run.id)
       return { ...sent, live, run }
     }
@@ -6074,15 +6125,10 @@ describe('createApplicationRuntime', () => {
     expect(registry.currentLease(racing.live.bindingId)).toBeUndefined()
     releaseInspectors[1]!.resolve()
     await vi.waitFor(() => {
-      const database = openAppDatabase(join(root, 'autoforge.sqlite'))
-      try {
-        expect([
-          database.chatRuns.getByRequestId(exact.requestId)?.status,
-          database.chatRuns.getByRequestId(racing.requestId)?.status,
-        ]).toEqual(['cancelled', 'cancelled'])
-      } finally {
-        database.close()
-      }
+      expect(withUserData(root, session.user.id, (store) => [
+        store.chatRuns.getByRequestId(exact.requestId)?.status,
+        store.chatRuns.getByRequestId(racing.requestId)?.status,
+      ])).toEqual(['cancelled', 'cancelled'])
     })
     await runtime.close()
   })
@@ -6284,7 +6330,7 @@ describe('createApplicationRuntime', () => {
     seedContinuationParents(join(root, 'autoforge.sqlite'), binding)
     registry.bind(binding)
     vi.mocked(workspace.closeContinuation).mockImplementation(async () => {
-      const inspection = new Database(join(root, 'autoforge.sqlite'), { readonly: true })
+      const inspection = new Database(userCachePath(root, session.user.id), { readonly: true })
       expect(inspection.prepare('SELECT COUNT(*) AS count FROM conversations WHERE id = ?')
         .get(conversation.id)).toEqual({ count: 1 })
       inspection.close()
@@ -6293,7 +6339,7 @@ describe('createApplicationRuntime', () => {
     await runtime.services.chat.deleteConversation(conversation.id)
 
     expect(workspace.closeContinuation).toHaveBeenCalledWith(binding.tabId)
-    await expect(runtime.services.chat.listConversations()).resolves.toEqual([])
+    await expect(listConversations(runtime)).resolves.toEqual([])
     expect(registry.list(session.user.id, conversation.id)).toEqual([])
     await runtime.close()
   })
@@ -6622,5 +6668,97 @@ describe('createApplicationRuntime', () => {
     expect(order.indexOf('continuation')).toBeLessThan(order.indexOf('browser'))
     expect(order.indexOf('browser')).toBeLessThan(order.indexOf('database'))
     expect(closeDatabase).toHaveBeenCalled()
+  })
+
+  it('binds chat pages and mutations to the authenticated UID cache and one stable device', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-cache-'))
+    directories.push(root)
+    const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const syncCalls: Array<Record<string, unknown>> = []
+    const userDataSyncPort = {
+      call: vi.fn(async (input: Record<string, unknown>) => {
+        syncCalls.push(structuredClone(input))
+        throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
+      }),
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores,
+      userDataSyncPort,
+    }))
+
+    const alice = await authenticate(runtime, 'CacheAlice')
+    const aliceConversation = await runtime.services.chat.createConversation()
+    expect(await runtime.services.chat.listConversations({ limit: 50 })).toEqual({
+      items: [expect.objectContaining({
+        id: aliceConversation.id, syncState: 'pending', lastActivityAt: expect.any(String),
+      })],
+    })
+    expect(userDataStores.current()?.conversations.get(aliceConversation.id)?.userId)
+      .toBe(alice.user.id)
+
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'CacheBob')
+    expect(await runtime.services.chat.listConversations({ limit: 50 })).toEqual({ items: [] })
+
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'CacheAlice', password: 'password' })
+    expect(await runtime.services.chat.listConversations({ limit: 50 })).toEqual({
+      items: [expect.objectContaining({ id: aliceConversation.id })],
+    })
+    const deviceIds = new Set(syncCalls.map((call) => call.deviceId).filter(Boolean))
+    expect(deviceIds.size).toBe(1)
+    expect([...deviceIds][0]).toEqual(expect.any(String))
+    expect(JSON.stringify(syncCalls)).not.toContain(alice.user.id)
+
+    await runtime.close()
+  })
+
+  it('moves a conversation after a normal message append and keeps failed sync retryable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-cache-message-'))
+    directories.push(root)
+    const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores,
+      userDataSyncPort: {
+        call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
+      },
+      modelProviders: snapshotProviders({ deepseek: {
+        listModels: async () => [modelInfo('deepseek-v4-flash', 'DeepSeek')],
+        validateCredential: async () => ({ valid: true }),
+        stream: async function* () {
+          yield { type: 'text_delta' as const, choiceIndex: 0, text: 'reply' }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+        },
+      } }),
+    }))
+    await authenticate(runtime, 'CacheMessage')
+    const first = await runtime.services.chat.createConversation()
+    const second = await runtime.services.chat.createConversation()
+
+    await runtime.services.chat.send(chatInput(first.id, 'move first to the top'))
+    await vi.waitFor(async () => expect(
+      await listMessages(runtime, first.id),
+    ).toHaveLength(2))
+    expect((await runtime.services.chat.listConversations({ limit: 50 })).items.map(({ id }) => id))
+      .toEqual([first.id, second.id])
+
+    const failedMutation = userDataStores.current()?.outbox.list(100)
+      .find((mutation) => mutation.entityId === second.id)
+    expect(failedMutation).toBeDefined()
+    userDataStores.current()?.outbox.markFailed(failedMutation!.id, 'SYNC_CONFLICT')
+    expect(await runtime.services.chat.listConversations({ limit: 50 })).toMatchObject({
+      items: [
+        expect.objectContaining({ id: first.id }),
+        expect.objectContaining({ id: second.id, syncState: 'failed' }),
+      ],
+    })
+
+    await runtime.services.chat.retrySync(second.id)
+    expect(await runtime.services.chat.listConversations({ limit: 50 })).toMatchObject({
+      items: expect.arrayContaining([
+        expect.objectContaining({ id: second.id, syncState: 'pending' }),
+      ]),
+    })
+    await runtime.close()
   })
 })

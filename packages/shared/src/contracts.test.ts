@@ -26,6 +26,7 @@ import {
   legacyImportPreviewSchema,
   listConversationsRequestSchema,
   listMessagesRequestSchema,
+  retryConversationSyncRequestSchema,
   listProviderModelsRequestSchema,
   messagePageSchema,
   mediaAssetSchema,
@@ -67,6 +68,14 @@ describe('cross-process contracts', () => {
     expect(listConversationsRequestSchema.safeParse({ limit: 50, userId: 'forged' }).success).toBe(false)
     expect(listMessagesRequestSchema.safeParse({ conversationId: 'conv_1', limit: 100, cursor: 'short' }).success)
       .toBe(false)
+    expect(retryConversationSyncRequestSchema.parse({ conversationId: 'conv_1' }))
+      .toEqual({ conversationId: 'conv_1' })
+    for (const forged of [
+      { conversationId: 'conv_1', userId: 'forged' },
+      { conversationId: 'conv_1', mutationId: 'mutation_1' },
+      { conversationId: 'conv_1', force: true },
+      { conversationId: 'conv_1', error: { code: 'SYNC_CONFLICT' } },
+    ]) expect(retryConversationSyncRequestSchema.safeParse(forged).success).toBe(false)
 
     const summary = {
       id: 'conv_1',
@@ -102,6 +111,9 @@ describe('cross-process contracts', () => {
     }).success).toBe(false)
     expect(ipcResponseSchemas[ipcChannels.chatListMessages].parse({ items: [message] }))
       .toEqual({ items: [message] })
+    expect(ipcRequestSchemas[ipcChannels.chatRetrySync].parse({ conversationId: 'conv_1' }))
+      .toEqual({ conversationId: 'conv_1' })
+    expect(ipcResponseSchemas[ipcChannels.chatRetrySync].parse(undefined)).toBeUndefined()
   })
 
   it('enforces strict per-kind sync mutation payloads', () => {

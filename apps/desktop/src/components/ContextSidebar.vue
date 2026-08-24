@@ -45,33 +45,68 @@
         v-else
         class="context-list af-scrollbar"
       >
-        <template v-for="group in conversationGroups" :key="group.label">
-          <li class="conversation-group">{{ group.label }}</li>
-          <li v-for="conversation in group.items" :key="conversation.id">
-          <div :class="['conversation-row', { active: chat.selectedConversationId === conversation.id }]">
-            <button
-              class="conversation-select"
-              @click="chat.selectConversation(conversation.id)"
-            >
-              <el-icon><ChatDotRound /></el-icon><span class="af-truncate">{{ conversation.title }}</span>
-            </button>
-            <button
-              class="conversation-action"
-              :aria-label="`重命名${conversation.title}`"
-              @click="renameConversation(conversation.id, conversation.title)"
-            >
-              <el-icon><Edit /></el-icon>
-            </button>
-            <button
-              class="conversation-action danger"
-              :aria-label="`删除${conversation.title}`"
-              @click="deleteConversation(conversation.id, conversation.title)"
-            >
-              <el-icon><Delete /></el-icon>
-            </button>
-          </div>
+        <template
+          v-for="group in conversationGroups"
+          :key="group.label"
+        >
+          <li class="conversation-group">
+            {{ group.label }}
+          </li>
+          <li
+            v-for="conversation in group.items"
+            :key="conversation.id"
+          >
+            <div :class="['conversation-row', { active: chat.selectedConversationId === conversation.id }]">
+              <button
+                class="conversation-select"
+                @click="chat.selectConversation(conversation.id)"
+              >
+                <el-icon><ChatDotRound /></el-icon><span class="af-truncate">{{ conversation.title }}</span>
+                <span
+                  class="conversation-sync-status"
+                  :class="`is-${conversation.syncState}`"
+                  data-testid="conversation-sync-status"
+                  role="status"
+                  :aria-label="syncStateLabel[conversation.syncState]"
+                />
+              </button>
+              <button
+                v-if="conversation.syncState === 'failed'"
+                class="conversation-action sync-retry"
+                data-testid="retry-conversation-sync"
+                :aria-label="`重试同步${conversation.title}`"
+                @click="chat.retrySync(conversation.id)"
+              >
+                <el-icon><Refresh /></el-icon>
+              </button>
+              <button
+                class="conversation-action"
+                :aria-label="`重命名${conversation.title}`"
+                @click="renameConversation(conversation.id, conversation.title)"
+              >
+                <el-icon><Edit /></el-icon>
+              </button>
+              <button
+                class="conversation-action danger"
+                :aria-label="`删除${conversation.title}`"
+                @click="deleteConversation(conversation.id, conversation.title)"
+              >
+                <el-icon><Delete /></el-icon>
+              </button>
+            </div>
           </li>
         </template>
+        <li
+          v-if="chat.nextConversationCursor"
+          class="conversation-more"
+        >
+          <button
+            type="button"
+            @click="chat.loadMoreConversations"
+          >
+            加载更多会话
+          </button>
+        </li>
       </ul>
     </template>
 
@@ -214,8 +249,8 @@
 </template>
 
 <script setup lang="ts">
-import { ChatDotRound, Delete, Edit, Plus, Search } from '@element-plus/icons-vue'
-import type { ExecutionStatus } from '@autoforge/shared'
+import { ChatDotRound, Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
+import type { ExecutionStatus, SyncState } from '@autoforge/shared'
 import { ElMessageBox } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -235,11 +270,14 @@ const conversationGroups = computed(() => {
   const today = new Date().toDateString()
   const groups = new Map<string, typeof filtered>()
   for (const item of filtered) {
-    const label = new Date(item.updatedAt).toDateString() === today ? '今天' : '更早'
+    const label = new Date(item.lastActivityAt).toDateString() === today ? '今天' : '更早'
     groups.set(label, [...(groups.get(label) ?? []), item])
   }
   return [...groups].map(([label, items]) => ({ label, items }))
 })
+const syncStateLabel: Record<SyncState, string> = {
+  synced: '同步完成', pending: '等待同步', syncing: '正在同步', failed: '同步失败',
+}
 const workflowSearch = ref('')
 const workflowSource = ref<'installed' | 'development' | ''>('')
 const workflowEnabled = ref<'true' | 'false' | ''>('')
@@ -267,11 +305,11 @@ const settingsSections = [
 ] as const
 type SettingsSectionId = typeof settingsSections[number]['id']
 const activeSettingsSection = ref<SettingsSectionId>(settingsSections[0].id)
-let settingsScrollContainer: HTMLElement | null = null
+let settingsScrollContainer: ReturnType<typeof globalThis.document.querySelector> = null
 
 function scrollToSettingsSection(id: SettingsSectionId) {
   activeSettingsSection.value = id
-  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  globalThis.document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 function syncActiveSettingsSection() {
@@ -284,7 +322,7 @@ function syncActiveSettingsSection() {
   const decisionLine = settingsScrollContainer.getBoundingClientRect().top + 24
   let activeId: SettingsSectionId = settingsSections[0].id
   for (const section of settingsSections) {
-    const element = document.getElementById(section.id)
+    const element = globalThis.document.getElementById(section.id)
     if (!element) continue
     if (element.getBoundingClientRect().top > decisionLine) break
     activeId = section.id
@@ -303,7 +341,7 @@ function setupSettingsScrollSync() {
   if (route.name !== 'settings') return
   void nextTick(() => {
     if (route.name !== 'settings') return
-    settingsScrollContainer = document.querySelector<HTMLElement>('.workspace-content')
+    settingsScrollContainer = globalThis.document.querySelector('.workspace-content')
     settingsScrollContainer?.addEventListener('scroll', syncActiveSettingsSection, { passive: true })
     syncActiveSettingsSection()
   })
@@ -358,11 +396,14 @@ onBeforeUnmount(detachSettingsScrollSync)
 .context-list { min-height: 0; margin: 0 -4px; padding: 0 4px; overflow: auto; list-style: none; }
 .context-list li + li { margin-top: 2px; }
 .conversation-group { padding: 9px 7px 3px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.conversation-row { display: grid; grid-template-columns: minmax(0, 1fr) 26px 26px; align-items: center; border-radius: 5px; }
+.conversation-row { display: grid; grid-template-columns: minmax(0, 1fr) repeat(3, 26px); align-items: center; border-radius: 5px; }
 .conversation-row:hover { background: var(--af-hover); }.conversation-row.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .conversation-select { display: flex; min-width: 0; align-items: center; gap: 8px; border: 0; padding: 9px 8px; color: inherit; background: transparent; cursor: pointer; text-align: left; }
+.conversation-sync-status { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--af-text-muted); }
+.conversation-sync-status.is-synced { background: var(--af-success); }.conversation-sync-status.is-pending { background: var(--af-warning); }.conversation-sync-status.is-syncing { background: var(--af-cobalt); box-shadow: 0 0 0 2px var(--af-cobalt-soft); }.conversation-sync-status.is-failed { background: var(--af-danger); }
 .conversation-action { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 4px; color: var(--af-text-muted); background: transparent; cursor: pointer; opacity: 0; }
-.conversation-row:hover .conversation-action, .conversation-action:focus-visible { opacity: 1; }.conversation-action:hover { color: var(--af-cobalt); background: var(--af-surface); }.conversation-action.danger:hover { color: var(--af-danger); }
+.conversation-row:hover .conversation-action, .conversation-action:focus-visible, .conversation-action.sync-retry { opacity: 1; }.conversation-action:hover { color: var(--af-cobalt); background: var(--af-surface); }.conversation-action.danger:hover { color: var(--af-danger); }.conversation-action.sync-retry { color: var(--af-danger); }
+.conversation-more { padding: 8px 4px; text-align: center; }.conversation-more button { border: 0; color: var(--af-cobalt); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
 .sidebar-state { margin-top: 20px; color: var(--af-text-muted); font-size: 12px; line-height: 1.6; text-align: center; }
 .sidebar-state small { color: var(--af-text-muted); }.sidebar-error { color: var(--af-danger); font-size: 12px; }
 .field-label { margin-top: 4px; color: var(--af-text-muted); font-size: 11px; font-weight: 650; }

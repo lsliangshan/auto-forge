@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import {
@@ -97,12 +98,15 @@ export interface RemoteMutationPage {
 
 export interface UserDataRepositories {
   conversations: AppRepositories['conversations'] & {
+    getSummary(id: string): ConversationPage['items'][number] | undefined
     listPage(input: { limit: 50; cursor?: string }): ConversationPage
   }
   messages: AppRepositories['messages'] & {
     listPage(input: { conversationId: string; limit: 100; cursor?: string }): MessagePage
   }
   conversationContexts: AppRepositories['conversationContexts']
+  mediaAssets: AppRepositories['mediaAssets']
+  mediaGenerationJobs: AppRepositories['mediaGenerationJobs']
   chatRuns: AppRepositories['chatRuns']
   providerUsage: AppRepositories['providerUsage']
   sync: {
@@ -113,7 +117,7 @@ export interface UserDataRepositories {
   outbox: {
     record(mutation: SyncMutation): void
     recordWithConversation(mutation: SyncMutation): void
-    recordWithMessage(mutation: SyncMutation): void
+    recordWithMessage(mutation: SyncMutation, assetIds?: readonly string[]): void
     listReady(now: number, limit: number): OutboxMutationRecord[]
     find(id: string): OutboxMutationRecord | undefined
     list(limit: number): OutboxMutationRecord[]
@@ -336,8 +340,8 @@ function optimisticMessageMutation(
   })
   database.prepare(`
     UPDATE conversations
-    SET last_activity_at = MAX(last_activity_at, @createdAt),
-        updated_at = MAX(updated_at, @createdAt),
+    SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+        updated_at = MAX(updated_at, last_activity_at + 1, @createdAt),
         sync_state = 'pending'
     WHERE id = @conversationId
   `).run({ conversationId: payload.conversationId, createdAt: timestamp(payload.createdAt) })
@@ -1107,6 +1111,38 @@ export function createUserDataRepositories(
     recomputeAffectedConversations(database, ownerUserId, interrupted)
   })
   const repositories = createRepositories(database)
+  const conversationSummary = (id: string) => {
+    const row = database.prepare(`
+      SELECT id, title, title_state AS titleState, revision, sync_state AS syncState,
+             created_at AS createdAt, last_activity_at AS lastActivityAt,
+             metadata_updated_at AS metadataUpdatedAt
+      FROM conversations
+      WHERE id = @id AND user_id = @ownerUserId AND deleted_at IS NULL
+    `).get({ id, ownerUserId }) as Query | undefined
+    return row === undefined ? undefined : parsePersisted(() => conversationSummarySchema.parse({
+      ...row,
+      createdAt: isoTimestamp(z.number().parse(row.createdAt)),
+      lastActivityAt: isoTimestamp(z.number().parse(row.lastActivityAt)),
+      metadataUpdatedAt: isoTimestamp(z.number().parse(row.metadataUpdatedAt)),
+    }))
+  }
+  const messageMutation = (
+    message: Parameters<AppRepositories['messages']['insert']>[0],
+  ): SyncMutation => ({
+    id: randomUUID(),
+    kind: 'message.append',
+    entityId: message.id,
+    baseRevision: conversationSummary(message.conversationId)?.revision ?? 0,
+    payload: {
+      id: message.id,
+      conversationId: message.conversationId,
+      role: message.role === 'user' ? 'user' : 'assistant',
+      blocks: chatBlockSchema.array().parse(message.blocks),
+      ...(typeof message.executionId === 'string' ? { executionId: message.executionId } : {}),
+      createdAt: isoTimestamp(message.createdAt),
+    },
+    occurredAt: isoTimestamp(message.createdAt),
+  })
   const conversations = {
     ...repositories.conversations,
     get(id: string) {
@@ -1162,8 +1198,23 @@ export function createUserDataRepositories(
       return repositories.conversations.claimTitleGeneration(id)
     },
     completeTitleGeneration(id: string, title: string) {
-      if (!conversations.get(id)) return undefined
-      return repositories.conversations.completeTitleGeneration(id, title)
+      const summary = conversationSummary(id)
+      const current = conversations.get(id)
+      if (!summary || current?.titleState !== 'generating') return undefined
+      const occurredAt = isoTimestamp(Date.now())
+      recordMutation({
+        id: randomUUID(),
+        kind: 'conversation.rename',
+        entityId: id,
+        baseRevision: summary.revision,
+        occurredAt,
+        payload: {
+          title,
+          titleState: 'ai_named',
+          metadataUpdatedAt: occurredAt,
+        },
+      }, (mutation) => optimisticConversationMutation(database, ownerUserId, mutation))
+      return repositories.conversations.get(id)
     },
     failTitleGeneration(id: string) {
       if (!conversations.get(id)) return
@@ -1191,6 +1242,7 @@ export function createUserDataRepositories(
       if (!conversations.get(id)) return
       repositories.conversations.delete(id)
     },
+    getSummary: conversationSummary,
     listPage: (input: { limit: 50; cursor?: string }) => conversationPage(database, ownerUserId, input),
   }
   const getOwnedMessage = (id: string) => {
@@ -1271,6 +1323,99 @@ export function createUserDataRepositories(
       return repositories.conversationContexts.advance(input)
     },
   }
+  const mediaAssets: AppRepositories['mediaAssets'] = {
+    insert(value) {
+      requireOwnedConversation(database, ownerUserId, value.conversationId)
+      if (value.messageId !== undefined && !messages.get(value.messageId)) {
+        throw new UserDataConsistencyError()
+      }
+      return repositories.mediaAssets.insert(value)
+    },
+    get(id) {
+      const stored = repositories.mediaAssets.get(id)
+      if (stored) requireOwnedConversation(database, ownerUserId, stored.conversationId)
+      return stored
+    },
+    listForConversation(conversationId) {
+      requireOwnedConversation(database, ownerUserId, conversationId)
+      return repositories.mediaAssets.listForConversation(conversationId)
+    },
+    listUnclaimedBefore(before) {
+      const stored = repositories.mediaAssets.listUnclaimedBefore(before)
+      for (const asset of stored) {
+        requireOwnedConversation(database, ownerUserId, asset.conversationId)
+      }
+      return stored
+    },
+    update(id, patch) {
+      if (!mediaAssets.get(id)) return undefined
+      return repositories.mediaAssets.update(id, patch)
+    },
+    delete(id) {
+      if (!mediaAssets.get(id)) return
+      repositories.mediaAssets.delete(id)
+    },
+  }
+  const requireOwnedMediaJob = (id: string) => {
+    const stored = repositories.mediaGenerationJobs.get(id)
+    if (stored) requireOwnedConversation(database, ownerUserId, stored.conversationId)
+    return stored
+  }
+  const mediaGenerationJobs: AppRepositories['mediaGenerationJobs'] = {
+    insert(value) {
+      requireOwnedConversation(database, ownerUserId, value.conversationId)
+      if (!messages.get(value.assistantMessageId)) throw new UserDataConsistencyError()
+      return repositories.mediaGenerationJobs.insert(value)
+    },
+    startSubmissionIntent(value) {
+      requireOwnedConversation(database, ownerUserId, value.job.conversationId)
+      assertOwner(value.run.userId, ownerUserId)
+      return repositories.mediaGenerationJobs.startSubmissionIntent(value)
+    },
+    bindSubmitted(id, input) {
+      if (!requireOwnedMediaJob(id)) return undefined
+      return repositories.mediaGenerationJobs.bindSubmitted(id, input)
+    },
+    insertTurn(value) {
+      requireOwnedConversation(database, ownerUserId, value.run.conversationId)
+      assertOwner(value.run.userId, ownerUserId)
+      return repositories.mediaGenerationJobs.insertTurn(value)
+    },
+    get: requireOwnedMediaJob,
+    reconcileInterrupted(endedAt) {
+      for (const job of repositories.mediaGenerationJobs.listActive()) {
+        requireOwnedConversation(database, ownerUserId, job.conversationId)
+      }
+      return repositories.mediaGenerationJobs.reconcileInterrupted(endedAt)
+    },
+    listResumable(now) {
+      const jobs = repositories.mediaGenerationJobs.listResumable(now)
+      for (const job of jobs) requireOwnedConversation(database, ownerUserId, job.conversationId)
+      return jobs
+    },
+    listActive() {
+      const jobs = repositories.mediaGenerationJobs.listActive()
+      for (const job of jobs) requireOwnedConversation(database, ownerUserId, job.conversationId)
+      return jobs
+    },
+    update(id, patch) {
+      if (!requireOwnedMediaJob(id)) return undefined
+      return repositories.mediaGenerationJobs.update(id, patch)
+    },
+    transition(id, expectedStatuses, patch) {
+      if (!requireOwnedMediaJob(id)) return undefined
+      return repositories.mediaGenerationJobs.transition(id, expectedStatuses, patch)
+    },
+    complete(id, expectedStatuses, input) {
+      if (!requireOwnedMediaJob(id)) return undefined
+      if (!mediaAssets.get(input.assetId)) throw new UserDataConsistencyError()
+      return repositories.mediaGenerationJobs.complete(id, expectedStatuses, input)
+    },
+    fail(id, expectedStatuses, errorCode, endedAt) {
+      if (!requireOwnedMediaJob(id)) return undefined
+      return repositories.mediaGenerationJobs.fail(id, expectedStatuses, errorCode, endedAt)
+    },
+  }
   const chatRuns = {
     ...repositories.chatRuns,
     insert(value: Parameters<AppRepositories['chatRuns']['insert']>[0]) {
@@ -1281,9 +1426,23 @@ export function createUserDataRepositories(
     startMediaGeneration(value: Parameters<AppRepositories['chatRuns']['startMediaGeneration']>[0]) {
       assertOwner(value.run.userId, ownerUserId)
       if (!conversations.get(value.run.conversationId)) throw new UserDataConsistencyError()
-      return repositories.chatRuns.startMediaGeneration({
-        ...value,
-        run: { ...value.run, userId: ownerUserId },
+      const mutation = messageMutation(value.userMessage)
+      return recordMutation(mutation, () => {
+        repositories.chatRuns.startMediaGeneration({
+          ...value,
+          run: { ...value.run, userId: ownerUserId },
+        })
+        database.prepare(`
+          UPDATE conversations
+          SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+              updated_at = MAX(updated_at, last_activity_at + 1, @createdAt),
+              sync_state = 'pending'
+          WHERE id = @conversationId AND user_id = @ownerUserId
+        `).run({
+          conversationId: value.userMessage.conversationId,
+          ownerUserId,
+          createdAt: value.userMessage.createdAt,
+        })
       })
     },
     get(id: string) {
@@ -1314,7 +1473,21 @@ export function createUserDataRepositories(
       value: Parameters<AppRepositories['chatRuns']['finalizeWithMessage']>[3],
     ) {
       if (!chatRuns.get(id)) throw new UserDataConsistencyError()
-      return repositories.chatRuns.finalizeWithMessage(id, messageId, requestId, value)
+      const existing = messages.get(messageId)
+      if (!existing) throw new UserDataConsistencyError()
+      const mutation = messageMutation({ ...existing, blocks: value.blocks })
+      let finalized: ReturnType<AppRepositories['chatRuns']['finalizeWithMessage']> | undefined
+      recordMutation(mutation, () => {
+        finalized = repositories.chatRuns.finalizeWithMessage(id, messageId, requestId, value)
+        database.prepare(`
+          UPDATE conversations
+          SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+              updated_at = MAX(updated_at, last_activity_at + 1, @createdAt), sync_state = 'pending'
+          WHERE id = @conversationId AND user_id = @ownerUserId
+        `).run({ conversationId: existing.conversationId, ownerUserId, createdAt: existing.createdAt })
+      })
+      if (!finalized) throw new UserDataConsistencyError()
+      return finalized
     },
   }
   const providerUsage = {
@@ -1379,7 +1552,10 @@ export function createUserDataRepositories(
       return repositories.providerUsage.summarize(input)
     },
   }
-  const record = (mutationInput: SyncMutation, optimisticWrite?: (mutation: SyncMutation) => void) => {
+  function recordMutation(
+    mutationInput: SyncMutation,
+    optimisticWrite?: (mutation: SyncMutation) => void,
+  ): void {
     const mutation = syncMutationSchema.parse(mutationInput)
     transaction(database, () => {
       assertOutboxCapacity(database)
@@ -1392,6 +1568,8 @@ export function createUserDataRepositories(
     conversations,
     messages,
     conversationContexts,
+    mediaAssets,
+    mediaGenerationJobs,
     chatRuns,
     providerUsage,
     sync: {
@@ -1416,14 +1594,39 @@ export function createUserDataRepositories(
       },
     },
     outbox: {
-      record: (mutation) => record(mutation),
-      recordWithConversation: (mutation) => record(
+      record: (mutation) => recordMutation(mutation),
+      recordWithConversation: (mutation) => recordMutation(
         mutation,
         (validated) => optimisticConversationMutation(database, ownerUserId, validated),
       ),
-      recordWithMessage: (mutation) => record(
+      recordWithMessage: (mutation, assetIds = []) => recordMutation(
         mutation,
-        (validated) => optimisticMessageMutation(database, ownerUserId, validated),
+        (validated) => {
+          if (validated.kind !== 'message.append') throw new Error('Message mutation required')
+          if (assetIds.length === 0) {
+            optimisticMessageMutation(database, ownerUserId, validated)
+            return
+          }
+          const payload = validated.payload
+          repositories.messages.insertWithAssets({
+            id: payload.id,
+            conversationId: payload.conversationId,
+            role: payload.role,
+            blocks: payload.blocks,
+            ...(payload.executionId === undefined ? {} : { executionId: payload.executionId }),
+            createdAt: timestamp(payload.createdAt),
+          }, [...assetIds])
+          database.prepare(`
+            UPDATE conversations
+            SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+                updated_at = MAX(updated_at, last_activity_at + 1, @createdAt), sync_state = 'pending'
+            WHERE id = @conversationId AND user_id = @ownerUserId
+          `).run({
+            conversationId: payload.conversationId,
+            ownerUserId,
+            createdAt: timestamp(payload.createdAt),
+          })
+        },
       ),
       listReady(now, limit) {
         if (!Number.isSafeInteger(now) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {

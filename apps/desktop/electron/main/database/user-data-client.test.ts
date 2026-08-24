@@ -200,6 +200,53 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('moves an appended conversation ahead when both conversations share the same millisecond', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    store.outbox.recordWithConversation(
+      createConversationMutation('create_z', 'conversation_z'),
+    )
+    store.outbox.recordWithConversation(
+      createConversationMutation('create_a', 'conversation_a'),
+    )
+    expect(store.conversations.listPage({ limit: 50 }).items.map(({ id }) => id))
+      .toEqual(['conversation_a', 'conversation_z'])
+
+    const append = appendMessageMutation('append_z', 'conversation_z', 'message_z')
+    store.outbox.recordWithMessage({
+      ...append,
+      occurredAt: '2026-08-24T00:00:00.000Z',
+      payload: { ...append.payload, createdAt: '2026-08-24T00:00:00.000Z' },
+    })
+
+    expect(store.conversations.listPage({ limit: 50 }).items.map(({ id }) => id))
+      .toEqual(['conversation_z', 'conversation_a'])
+    manager.close()
+  })
+
+  it('atomically records an AI title completion as a rename mutation', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    store.outbox.recordWithConversation(
+      createConversationMutation('create_title', 'conversation_title'),
+    )
+    expect(store.conversations.claimTitleGeneration('conversation_title')).toBe(true)
+
+    expect(store.conversations.completeTitleGeneration('conversation_title', 'AI title'))
+      .toMatchObject({ title: 'AI title', titleState: 'ai_named' })
+    expect(store.outbox.list(10)).toEqual([
+      expect.objectContaining({ id: 'create_title', kind: 'conversation.create' }),
+      expect.objectContaining({
+        kind: 'conversation.rename',
+        entityId: 'conversation_title',
+        payload: expect.objectContaining({ title: 'AI title', titleState: 'ai_named' }),
+      }),
+    ])
+    expect(projectedConversation(store, 'conversation_title'))
+      .toMatchObject({ title: 'AI title', titleState: 'ai_named', syncState: 'pending' })
+    manager.close()
+  })
+
   it('keeps both owner caches isolated while switching without deletion', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     manager.open('cloud-alice').outbox.recordWithConversation(
@@ -865,6 +912,68 @@ describe('UserDataStoreManager', () => {
       SELECT status FROM provider_usage_events WHERE operation_key = 'bob_pending_operation'
     `).get()).toEqual({ status: 'pending' })
     inspection.close()
+    manager.close()
+  })
+
+  it('exposes media repositories only through the selected conversation owner', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    store.conversations.insert({ id: 'alice_media_conversation', title: 'Alice media' })
+    store.messages.insert({
+      id: 'alice_media_message', conversationId: 'alice_media_conversation', role: 'assistant',
+      blocks: [{
+        type: 'media_generation', blockId: 'alice_media_block', jobId: 'alice_media_job',
+        kind: 'video', status: 'pending',
+      }], createdAt: 1,
+    })
+    store.mediaAssets.insert({
+      id: 'alice_media_asset', conversationId: 'alice_media_conversation', source: 'upload',
+      kind: 'image', originalName: 'alice.png', status: 'staging', createdAt: 1, updatedAt: 1,
+    })
+    store.mediaGenerationJobs.insert({
+      id: 'alice_media_job', conversationId: 'alice_media_conversation',
+      assistantMessageId: 'alice_media_message', provider: 'openrouter', model: 'video-model',
+      kind: 'video', providerJobId: 'provider_alice_media_job', status: 'pending',
+      parameters: {}, createdAt: 1, updatedAt: 1,
+    })
+
+    expect(store.mediaAssets.get('alice_media_asset')?.conversationId)
+      .toBe('alice_media_conversation')
+    expect(store.mediaGenerationJobs.get('alice_media_job')?.conversationId)
+      .toBe('alice_media_conversation')
+
+    const raw = new Database(cachePath(root, 'cloud-alice'))
+    raw.prepare(`
+      INSERT INTO conversations (
+        id, title, title_state, user_id, revision, sync_state,
+        created_at, updated_at, last_activity_at, metadata_updated_at
+      ) VALUES ('bob_media_conversation', 'Bob media', 'user_named', 'cloud-bob', 1, 'synced', 1, 1, 1, 1)
+    `).run()
+    raw.prepare(`
+      INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at)
+      VALUES ('bob_media_message', 'bob_media_conversation', 'assistant', '[]', 1, 1)
+    `).run()
+    raw.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, source, kind, original_name, status, created_at, updated_at
+      ) VALUES ('bob_media_asset', 'bob_media_conversation', 'upload', 'image', 'bob.png', 'staging', 1, 1)
+    `).run()
+    raw.prepare(`
+      INSERT INTO media_generation_jobs (
+        id, conversation_id, assistant_message_id, provider, model, kind, provider_job_id,
+        status, parameters_json, created_at, updated_at
+      ) VALUES (
+        'bob_media_job', 'bob_media_conversation', 'bob_media_message', 'openrouter',
+        'video-model', 'video', 'provider_bob_media_job', 'pending', '{}', 1, 1
+      )
+    `).run()
+    raw.close()
+
+    expect(() => store.mediaAssets.get('bob_media_asset'))
+      .toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(() => store.mediaGenerationJobs.get('bob_media_job'))
+      .toThrow(expect.objectContaining({ code: 'FORBIDDEN' }))
     manager.close()
   })
 

@@ -3,7 +3,13 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
-import type { AppSettings, DesktopAPI, ModelInfo, TokenUsageSnapshot } from '@autoforge/shared'
+import type {
+  AppSettings,
+  ConversationSummary,
+  DesktopAPI,
+  ModelInfo,
+  TokenUsageSnapshot,
+} from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { tokenColors } from '../../src/components/settings/token-usage-chart-options'
@@ -82,6 +88,23 @@ function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSn
   }
 }
 
+function conversationSummary(
+  id: string,
+  lastActivityAt: string,
+  syncState: ConversationSummary['syncState'] = 'synced',
+): ConversationSummary {
+  return {
+    id,
+    title: id,
+    titleState: 'user_named',
+    revision: 1,
+    syncState,
+    createdAt: '2026-07-19T00:00:00.000Z',
+    lastActivityAt,
+    metadataUpdatedAt: lastActivityAt,
+  }
+}
+
 function computedColor(value: string) {
   const probe = document.createElement('span')
   probe.style.color = value
@@ -104,9 +127,19 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       pickAndUploadAvatar: vi.fn().mockResolvedValue(null),
     },
     chat: {
-      listConversations: vi.fn().mockResolvedValue([]), createConversation: vi.fn(),
-      listMessages: vi.fn().mockResolvedValue([]),
+      listConversations: vi.fn().mockResolvedValue({ items: [] }), createConversation: vi.fn(),
+      listMessages: vi.fn().mockResolvedValue({ items: [] }),
       renameConversation: vi.fn(), deleteConversation: vi.fn(), send: vi.fn(), cancel: vi.fn(),
+      retrySync: vi.fn().mockResolvedValue(undefined),
+      getGenerationPreferences: vi.fn().mockResolvedValue({
+        outputType: 'auto', models: {},
+        generation: {
+          image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+          audio: { format: 'mp3' },
+          video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+        },
+      }),
+      updateGenerationPreferences: vi.fn(),
       onEvent: vi.fn(() => vi.fn()),
     },
     workflows: {
@@ -381,14 +414,66 @@ describe('workbench', () => {
     const api = createApi()
     let resolveList!: (value: Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>) => void
     vi.mocked(api.chat.listConversations).mockReturnValue(new Promise((resolve) => { resolveList = resolve }))
-    vi.mocked(api.chat.createConversation).mockResolvedValue({ id: 'new', title: '新会话', createdAt: '2026-07-19T00:00:01.000Z', updatedAt: '2026-07-19T00:00:01.000Z' })
+    vi.mocked(api.chat.createConversation).mockResolvedValue({
+      ...conversationSummary('new', '2026-07-19T00:00:01.000Z', 'pending'), title: '新会话',
+    })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     const loading = store.loadConversations()
     await store.createConversation()
-    resolveList([{ id: 'old', title: '旧快照', createdAt: '2026-07-19T00:00:00.000Z', updatedAt: '2026-07-19T00:00:00.000Z' }])
+    resolveList({ items: [{
+      ...conversationSummary('old', '2026-07-19T00:00:00.000Z'), title: '旧快照',
+    }] })
     await loading
     expect(store.conversations.map(({ id }) => id)).toEqual(['new'])
+  })
+
+  it('appends cursor pages once, removes duplicate rows, and preserves selection order', async () => {
+    const api = createApi()
+    const older = conversationSummary('older', '2026-07-19T00:00:00.000Z')
+    const newer = conversationSummary('newer', '2026-07-20T00:00:00.000Z')
+    vi.mocked(api.chat.listConversations)
+      .mockResolvedValueOnce({ items: [newer], nextCursor: 'opaque-cursor-0001' })
+      .mockResolvedValueOnce({ items: [older, newer] })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [older]
+    store.selectedConversationId = 'older'
+
+    await store.loadConversations()
+    await Promise.all([store.loadMoreConversations(), store.loadMoreConversations()])
+
+    expect(api.chat.listConversations).toHaveBeenNthCalledWith(1, { limit: 50 })
+    expect(api.chat.listConversations).toHaveBeenNthCalledWith(2, {
+      limit: 50, cursor: 'opaque-cursor-0001',
+    })
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(2)
+    expect(store.conversations.map(({ id }) => id)).toEqual(['newer', 'older'])
+    expect(store.selectedConversationId).toBe('older')
+    expect(store.nextConversationCursor).toBeUndefined()
+  })
+
+  it('shows every sync state without exposing owner data and offers a targeted retry', async () => {
+    const api = createApi()
+    const failed = { ...conversationSummary('failed-conversation', '2026-07-20T00:00:00.000Z', 'failed'), title: '需重试' }
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [
+      failed,
+      conversationSummary('pending-conversation', '2026-07-19T00:00:03.000Z', 'pending'),
+      conversationSummary('syncing-conversation', '2026-07-19T00:00:02.000Z', 'syncing'),
+      conversationSummary('synced-conversation', '2026-07-19T00:00:01.000Z', 'synced'),
+    ] })
+    const { wrapper } = await mountApp('/chat', api)
+
+    await vi.waitFor(() => expect(new Set(wrapper
+      .findAll('[data-testid="conversation-sync-status"]')
+      .map((status) => status.attributes('aria-label')))).toEqual(new Set([
+      '同步失败', '等待同步', '正在同步', '同步完成',
+    ])))
+    const retry = wrapper.get('[data-testid="retry-conversation-sync"]')
+    expect(retry.attributes('aria-label')).toContain('需重试')
+    await retry.trigger('click')
+    await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('failed-conversation'))
+    expect(wrapper.html()).not.toContain('userId')
   })
 
   it('serializes settings patches so older full responses cannot roll back newer fields', async () => {

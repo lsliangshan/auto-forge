@@ -496,16 +496,16 @@ describe('openAppDatabase', () => {
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(12)
     const inspection = new Database(path, { readonly: true })
     expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
       .map(({ table, on_delete }) => ({ table, on_delete })))
       .toEqual(expect.arrayContaining([
         { table: 'local_users', on_delete: 'CASCADE' },
-        { table: 'conversations', on_delete: 'CASCADE' },
-        { table: 'chat_runs', on_delete: 'SET NULL' },
         { table: 'executions', on_delete: 'SET NULL' },
       ]))
+    expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string }>)
+      .map(({ table }) => table)).not.toEqual(expect.arrayContaining(['conversations', 'chat_runs']))
     expect((inspection.prepare('PRAGMA index_list(browser_action_audits)').all() as Array<{ name: string }>).map(({ name }) => name))
       .toEqual(expect.arrayContaining(['browser_action_audits_binding_sequence_idx']))
     expect((inspection.prepare('PRAGMA index_list(browser_tab_bindings)').all() as Array<{ name: string }>).map(({ name }) => name))
@@ -619,13 +619,15 @@ describe('openAppDatabase', () => {
     database.recoverInterrupted()
     expect(database.browserTabBindings.get(binding.id)).toMatchObject({ status: 'revoked', endedAt: 20 })
     database.conversations.delete(conversation.id)
-    expect(database.browserTabBindings.get(binding.id)).toBeUndefined()
+    expect(database.browserTabBindings.get(binding.id)).toMatchObject({
+      id: binding.id, conversationId: conversation.id, status: 'revoked',
+    })
   })
 
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(12)
     expect(database.conversations.get('conversation_v1')).toMatchObject({
       title: 'Persisted v1',
       titleState: 'user_named',
@@ -639,7 +641,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(12)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -650,7 +652,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(12)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -670,7 +672,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(12)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -1647,7 +1649,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(12)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)

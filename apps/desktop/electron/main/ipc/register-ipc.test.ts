@@ -72,11 +72,12 @@ function services(): DesktopIpcServices {
       pickAndUploadAvatar: vi.fn().mockResolvedValue({ url: 'https://cdn.example.com/avatar.png' }),
     },
     chat: {
-      listConversations: vi.fn().mockResolvedValue([]),
-      listMessages: vi.fn().mockResolvedValue([]),
+      listConversations: vi.fn().mockResolvedValue({ items: [] }),
+      listMessages: vi.fn().mockResolvedValue({ items: [] }),
       createConversation: vi.fn(),
       renameConversation: vi.fn(),
       deleteConversation: vi.fn(),
+      retrySync: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'request_1' }),
       cancel: vi.fn(),
       takeOverBrowser: vi.fn(),
@@ -194,9 +195,39 @@ describe('registerDesktopIpc', () => {
     vi.mocked(app.dependencies.auth.requireSession)
       .mockRejectedValueOnce(toSafeAppError({ code: 'AUTH_REQUIRED' }))
 
-    await expect(app.invoke(ipcChannels.chatListConversations))
+    await expect(app.invoke(ipcChannels.chatListConversations, { limit: 50 }))
       .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     expect(app.dependencies.chat.listConversations).not.toHaveBeenCalled()
+  })
+
+  it('forwards only strict owner-free chat page and retry inputs', async () => {
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.chatListConversations, {
+      limit: 50, cursor: 'opaque-cursor-0001',
+    })).resolves.toEqual({ items: [] })
+    await expect(app.invoke(ipcChannels.chatListMessages, {
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0002',
+    })).resolves.toEqual({ items: [] })
+    await expect(app.invoke(ipcChannels.chatRetrySync, {
+      conversationId: 'conversation_1',
+    })).resolves.toBeUndefined()
+
+    expect(app.dependencies.chat.listConversations).toHaveBeenCalledWith({
+      limit: 50, cursor: 'opaque-cursor-0001',
+    })
+    expect(app.dependencies.chat.listMessages).toHaveBeenCalledWith({
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0002',
+    })
+    expect(app.dependencies.chat.retrySync).toHaveBeenCalledWith('conversation_1')
+
+    for (const [channel, input] of [
+      [ipcChannels.chatListConversations, { limit: 50, userId: 'forged' }],
+      [ipcChannels.chatListMessages, { conversationId: 'conversation_1', limit: 100, ownerUserId: 'forged' }],
+      [ipcChannels.chatRetrySync, { conversationId: 'conversation_1', mutationId: 'forged' }],
+    ] as const) {
+      await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
   })
 
   it('guards and validates every profile operation', async () => {
@@ -497,7 +528,8 @@ describe('registerDesktopIpc', () => {
     const app = harness(trusted, { kind: 'production', filePath })
 
     app.setSenderUrl(`${trusted}#/settings`)
-    await expect(app.invoke(ipcChannels.chatListConversations)).resolves.toEqual([])
+    await expect(app.invoke(ipcChannels.chatListConversations, { limit: 50 }))
+      .resolves.toEqual({ items: [] })
 
     for (const url of [
       `file://attacker${new URL(trusted).pathname}`,
@@ -507,7 +539,7 @@ describe('registerDesktopIpc', () => {
       `${trusted}?host=attacker`,
     ]) {
       app.setSenderUrl(url)
-      await expect(app.invoke(ipcChannels.chatListConversations))
+      await expect(app.invoke(ipcChannels.chatListConversations, { limit: 50 }))
         .rejects.toMatchObject({ code: 'UNTRUSTED_SENDER' })
     }
   })
@@ -524,11 +556,15 @@ describe('registerDesktopIpc', () => {
 
   it('validates service output before returning it to the renderer', async () => {
     const app = harness()
-    vi.mocked(app.dependencies.chat.listConversations).mockResolvedValueOnce([
-      { id: 'c1', title: 'Conversation', createdAt: 'not-a-date', updatedAt: 'not-a-date' },
-    ])
+    vi.mocked(app.dependencies.chat.listConversations).mockResolvedValueOnce({ items: [
+      {
+        id: 'c1', title: 'Conversation', titleState: 'user_named', revision: 0,
+        syncState: 'synced', createdAt: 'not-a-date', lastActivityAt: 'not-a-date',
+        metadataUpdatedAt: 'not-a-date',
+      },
+    ] })
 
-    await expect(app.invoke(ipcChannels.chatListConversations))
+    await expect(app.invoke(ipcChannels.chatListConversations, { limit: 50 }))
       .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
   })
 

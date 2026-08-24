@@ -44,6 +44,14 @@
         >
           {{ settings.error }}
         </div>
+        <button
+          v-if="chat.previousMessageCursorByConversation[chat.selectedConversationId]"
+          class="older-messages"
+          type="button"
+          @click="loadOlderMessages"
+        >
+          加载更早消息
+        </button>
         <div
           v-if="!chat.messages.length && !chat.isAwaitingResponse"
           class="chat-empty"
@@ -120,6 +128,15 @@ function updateScrollFollowing() {
   shouldFollowLatest.value = distanceFromBottom <= BOTTOM_FOLLOW_THRESHOLD_PX
 }
 
+async function loadOlderMessages() {
+  const messages = messagesRef.value
+  const previousHeight = messages?.scrollHeight ?? 0
+  const previousTop = messages?.scrollTop ?? 0
+  await chat.loadOlderMessages(chat.selectedConversationId)
+  await nextTick()
+  if (messages) messages.scrollTop = previousTop + messages.scrollHeight - previousHeight
+}
+
 async function scrollToLatest(force = false) {
   if (force) shouldFollowLatest.value = true
   await nextTick()
@@ -187,6 +204,7 @@ onMounted(async () => {
 <style scoped>
 .chat-view { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--af-surface); }
 .messages { flex: 1; overflow: auto; padding: 18px clamp(20px, 5vw, 72px); }
+.older-messages { display: block; margin: 0 auto 4px; border: 0; color: var(--af-cobalt); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
 .message { display: grid; grid-template-columns: 74px minmax(0, 760px); gap: 12px; max-width: 920px; margin: 0 auto; padding: 16px 0; border-bottom: 1px solid var(--af-border); }
 .message-role { padding-top: 2px; color: var(--af-text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }.message.user .message-role { color: var(--af-cobalt); }
 .message-body { min-width: 0; font-size: 14px; }

@@ -1255,6 +1255,7 @@ export const ipcChannels = {
   chatCreateConversation: 'chat:create-conversation',
   chatRenameConversation: 'chat:rename-conversation',
   chatDeleteConversation: 'chat:delete-conversation',
+  chatRetrySync: 'chat:retry-sync',
   chatSend: 'chat:send',
   chatCancel: 'chat:cancel',
   chatTakeOverBrowser: 'chat:take-over-browser',
@@ -1325,6 +1326,9 @@ export const renameConversationRequestSchema = z.object({
   title: nonEmptyStringSchema,
 }).strict()
 export const deleteConversationRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const retryConversationSyncRequestSchema = z.object({
+  conversationId: identifierSchema,
+}).strict()
 export const cancelChatRequestSchema = z.object({ requestId: identifierSchema }).strict()
 export const generationPreferencesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const updateGenerationPreferencesRequestSchema = generationPreferencesRequestSchema.extend({
@@ -1420,6 +1424,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.chatCreateConversation]: createConversationRequestSchema,
   [ipcChannels.chatRenameConversation]: renameConversationRequestSchema,
   [ipcChannels.chatDeleteConversation]: deleteConversationRequestSchema,
+  [ipcChannels.chatRetrySync]: retryConversationSyncRequestSchema,
   [ipcChannels.chatSend]: chatSendInputSchema,
   [ipcChannels.chatCancel]: cancelChatRequestSchema,
   [ipcChannels.chatTakeOverBrowser]: takeOverBrowserRequestSchema,
@@ -1490,6 +1495,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.chatCreateConversation]: conversationSummarySchema,
   [ipcChannels.chatRenameConversation]: conversationSummarySchema,
   [ipcChannels.chatDeleteConversation]: voidResponseSchema,
+  [ipcChannels.chatRetrySync]: voidResponseSchema,
   [ipcChannels.chatSend]: requestIdResponseSchema,
   [ipcChannels.chatCancel]: voidResponseSchema,
   [ipcChannels.chatTakeOverBrowser]: voidResponseSchema,
@@ -1564,6 +1570,7 @@ export interface DesktopAPI {
     createConversation(): Promise<ConversationSummary>
     renameConversation(conversationId: string, title: string): Promise<ConversationSummary>
     deleteConversation(conversationId: string): Promise<void>
+    retrySync(conversationId: string): Promise<void>
     send(input: ChatSendInput): Promise<{ requestId: string }>
     cancel(requestId: string): Promise<void>
     takeOverBrowser(input: TakeOverBrowserRequest): Promise<void>

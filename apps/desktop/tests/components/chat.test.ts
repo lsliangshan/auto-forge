@@ -172,9 +172,10 @@ function createEventApi() {
       pickAndUploadAvatar: vi.fn().mockResolvedValue(null),
     },
     chat: {
-      listConversations: vi.fn().mockResolvedValue([]), createConversation: vi.fn(),
-      listMessages: vi.fn().mockResolvedValue([]),
+      listConversations: vi.fn().mockResolvedValue({ items: [] }), createConversation: vi.fn(),
+      listMessages: vi.fn().mockResolvedValue({ items: [] }),
       renameConversation: vi.fn(), deleteConversation: vi.fn(),
+      retrySync: vi.fn().mockResolvedValue(undefined),
       send: vi.fn().mockResolvedValue({ requestId: 'req_1' }), cancel: vi.fn(),
       takeOverBrowser: vi.fn().mockResolvedValue(undefined),
       listBrowserAudit: vi.fn().mockResolvedValue([]),
@@ -215,6 +216,46 @@ function createEventApi() {
     emitExecution: (event: ExecutionEvent) => executionListener?.(event),
   }
 }
+
+describe('chat history pagination', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+  afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+
+  it('prepends older cursor pages once and deduplicates messages by ID', async () => {
+    const { api } = createEventApi()
+    const newest = {
+      id: 'message_newest', conversationId: 'conversation_1', role: 'assistant' as const,
+      blocks: [{ type: 'text' as const, text: 'newest' }], createdAt: '2026-07-20T00:00:00.000Z',
+    }
+    const oldest = {
+      id: 'message_oldest', conversationId: 'conversation_1', role: 'user' as const,
+      blocks: [{ type: 'text' as const, text: 'oldest' }], createdAt: '2026-07-19T00:00:00.000Z',
+    }
+    vi.mocked(api.chat.listMessages)
+      .mockResolvedValueOnce({ items: [newest], previousCursor: 'opaque-cursor-0001' })
+      .mockResolvedValueOnce({ items: [oldest, newest] })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.selectedConversationId = 'conversation_1'
+
+    await store.loadMessages('conversation_1')
+    await Promise.all([
+      store.loadOlderMessages('conversation_1'),
+      store.loadOlderMessages('conversation_1'),
+    ])
+
+    expect(api.chat.listMessages).toHaveBeenNthCalledWith(1, {
+      conversationId: 'conversation_1', limit: 100,
+    })
+    expect(api.chat.listMessages).toHaveBeenNthCalledWith(2, {
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0001',
+    })
+    expect(api.chat.listMessages).toHaveBeenCalledTimes(2)
+    expect(store.messagesByConversation.conversation_1?.map(({ id }) => id))
+      .toEqual(['message_oldest', 'message_newest'])
+    expect(store.previousMessageCursorByConversation.conversation_1).toBeUndefined()
+  })
+})
 
 function mountScrollableChat() {
   const { api, emitChat } = createEventApi()
@@ -1413,11 +1454,11 @@ describe('chat interactions', () => {
 
   it('keeps a recovered invalidated approval disabled after transcript reload', async () => {
     const { api } = createEventApi()
-    vi.mocked(api.chat.listMessages).mockResolvedValue([{
+    vi.mocked(api.chat.listMessages).mockResolvedValue({ items: [{
       id: 'assistant_1', conversationId: 'conv_1', role: 'assistant',
       blocks: [approvalBlock({ state: 'invalidated' })],
       createdAt: '2026-08-22T00:00:00.000Z',
-    }])
+    }] })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     await store.selectConversation('conv_1')
@@ -1466,21 +1507,26 @@ describe('chat interactions', () => {
 
     expect(store.conversations).toEqual([{
       id: 'conv_1', title: '北京工作居住证办理',
-      createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:01:00.000Z',
+      createdAt: '2026-08-23T00:00:00.000Z', updatedAt: '2026-08-23T00:00:00.000Z',
+      metadataUpdatedAt: '2026-08-23T00:01:00.000Z',
     }])
   })
 
   it('does not let a loading snapshot overwrite a newer streamed delta', async () => {
     const { api, emitChat } = createEventApi()
     let resolveMessages!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
-    vi.mocked(api.chat.listConversations).mockResolvedValue([{ id: 'conv_1', title: '真实会话', createdAt: '2026-07-19T00:00:00.000Z', updatedAt: '2026-07-19T00:00:00.000Z' }])
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [{
+      id: 'conv_1', title: '真实会话', createdAt: '2026-07-19T00:00:00.000Z',
+      updatedAt: '2026-07-19T00:00:00.000Z', lastActivityAt: '2026-07-19T00:00:00.000Z',
+      revision: 1, syncState: 'synced',
+    }] })
     vi.mocked(api.chat.listMessages).mockReturnValue(new Promise((resolve) => { resolveMessages = resolve }))
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     const loading = store.loadConversations()
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
     emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'live_1', block: { type: 'text', text: '实时内容' } })
-    resolveMessages([{ id: 'old_1', conversationId: 'conv_1', role: 'assistant', blocks: [{ type: 'text', text: '旧快照' }], createdAt: '2026-07-19T00:00:00.000Z' }])
+    resolveMessages({ items: [{ id: 'old_1', conversationId: 'conv_1', role: 'assistant', blocks: [{ type: 'text', text: '旧快照' }], createdAt: '2026-07-19T00:00:00.000Z' }] })
     await loading
     expect(store.messagesByConversation.conv_1?.map(({ id }) => id)).toEqual(['old_1', 'live_1'])
   })
@@ -1493,7 +1539,7 @@ describe('chat interactions', () => {
     const store = useChatStore()
     store.ensureSubscriptions()
     const loading = store.selectConversation('conv_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
 
     emitChat({
       type: 'block',
@@ -1501,13 +1547,13 @@ describe('chat interactions', () => {
       messageId: 'assistant_1',
       block: { type: 'text', text: '新增' },
     })
-    resolveMessages([{
+    resolveMessages({ items: [{
       id: 'assistant_1',
       conversationId: 'conv_1',
       role: 'assistant',
       blocks: [{ type: 'text', text: '已有' }],
       createdAt: '2026-07-25T00:00:00.000Z',
-    }])
+    }] })
     await loading
 
     expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
@@ -1523,7 +1569,7 @@ describe('chat interactions', () => {
     const store = useChatStore()
     store.ensureSubscriptions()
     const loading = store.selectConversation('conv_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
 
     emitChat({
       type: 'block',
@@ -1531,13 +1577,13 @@ describe('chat interactions', () => {
       messageId: 'assistant_1',
       block: { type: 'text', text: '新增' },
     })
-    resolveMessages([{
+    resolveMessages({ items: [{
       id: 'assistant_1',
       conversationId: 'conv_1',
       role: 'assistant',
       blocks: [{ type: 'text', text: '已有新增' }],
       createdAt: '2026-07-25T00:00:00.000Z',
-    }])
+    }] })
     await loading
 
     expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
@@ -1553,7 +1599,7 @@ describe('chat interactions', () => {
     const store = useChatStore()
     store.ensureSubscriptions()
     const loading = store.selectConversation('conv_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
 
     emitChat({
       type: 'block',
@@ -1573,7 +1619,7 @@ describe('chat interactions', () => {
         status: 'pending',
       },
     })
-    resolveMessages([{
+    resolveMessages({ items: [{
       id: 'assistant_1',
       conversationId: 'conv_1',
       role: 'assistant',
@@ -1588,7 +1634,7 @@ describe('chat interactions', () => {
         },
       ],
       createdAt: '2026-07-25T00:00:00.000Z',
-    }])
+    }] })
     await loading
 
     expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
@@ -1609,7 +1655,7 @@ describe('chat interactions', () => {
     const store = useChatStore()
     store.ensureSubscriptions()
     const loading = store.selectConversation('conv_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
 
     emitChat({
       type: 'block',
@@ -1617,13 +1663,13 @@ describe('chat interactions', () => {
       messageId: 'assistant_1',
       block: { type: 'text', text: 'AB' },
     })
-    resolveMessages([{
+    resolveMessages({ items: [{
       id: 'assistant_1',
       conversationId: 'conv_1',
       role: 'assistant',
       blocks: [{ type: 'text', text: '已有A' }],
       createdAt: '2026-07-25T00:00:00.000Z',
-    }])
+    }] })
     await loading
 
     expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
@@ -1639,7 +1685,7 @@ describe('chat interactions', () => {
     const store = useChatStore()
     store.ensureSubscriptions()
     const loading = store.selectConversation('conv_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
 
     emitChat({
       type: 'block',
@@ -1647,7 +1693,7 @@ describe('chat interactions', () => {
       messageId: 'assistant_1',
       block: { type: 'text', text: '生成完成' },
     })
-    resolveMessages([{
+    resolveMessages({ items: [{
       id: 'assistant_1',
       conversationId: 'conv_1',
       role: 'assistant',
@@ -1659,7 +1705,7 @@ describe('chat interactions', () => {
         status: 'pending',
       }],
       createdAt: '2026-07-25T00:00:00.000Z',
-    }])
+    }] })
     await loading
 
     expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
@@ -1681,13 +1727,13 @@ describe('chat interactions', () => {
     let resolveFirst!: (value: Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>) => void
     vi.mocked(api.chat.listMessages)
       .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
-      .mockResolvedValueOnce([{ id: 'm2', conversationId: 'conv_2', role: 'assistant', blocks: [{ type: 'text', text: '第二个会话' }], createdAt: '2026-07-19T00:00:00.000Z' }])
+      .mockResolvedValueOnce({ items: [{ id: 'm2', conversationId: 'conv_2', role: 'assistant', blocks: [{ type: 'text', text: '第二个会话' }], createdAt: '2026-07-19T00:00:00.000Z' }] })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     const first = store.selectConversation('conv_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conv_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conv_1', limit: 100 }))
     await store.selectConversation('conv_2')
-    resolveFirst([{ id: 'm1', conversationId: 'conv_1', role: 'assistant', blocks: [{ type: 'text', text: '迟到响应' }], createdAt: '2026-07-19T00:00:00.000Z' }])
+    resolveFirst({ items: [{ id: 'm1', conversationId: 'conv_1', role: 'assistant', blocks: [{ type: 'text', text: '迟到响应' }], createdAt: '2026-07-19T00:00:00.000Z' }] })
     await first
     expect(store.selectedConversationId).toBe('conv_2')
     expect(store.messagesByConversation.conv_1).toBeUndefined()
@@ -2978,7 +3024,7 @@ describe('chat interactions', () => {
     const store = useChatStore()
     store.ensureSubscriptions()
     const loading = store.selectConversation('conversation_1')
-    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith('conversation_1'))
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledWith({ conversationId: 'conversation_1', limit: 100 }))
 
     emitChat({
       type: 'block_update',
@@ -2996,7 +3042,7 @@ describe('chat interactions', () => {
         byteSize: 100,
       },
     })
-    resolveMessages([
+    resolveMessages({ items: [
       {
         id: 'history_1',
         conversationId: 'conversation_1',
@@ -3017,7 +3063,7 @@ describe('chat interactions', () => {
         }],
         createdAt: '2026-07-25T00:00:00.000Z',
       },
-    ])
+    ] })
     await loading
 
     expect(store.messagesByConversation.conversation_1?.map(({ id }) => id))
