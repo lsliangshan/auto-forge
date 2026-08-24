@@ -66,6 +66,24 @@ export function openAppDatabase(path: string) {
     listReconcilable: () => [],
     recordReconcileFailure: legacyReadOnly,
   }
+  const legacyMediaAssets: AppRepositories['mediaAssets'] = {
+    ...repositories.mediaAssets,
+    insert: legacyReadOnly,
+    update: legacyReadOnly,
+    delete: legacyReadOnly,
+  }
+  const legacyMediaGenerationJobs: AppRepositories['mediaGenerationJobs'] = {
+    ...repositories.mediaGenerationJobs,
+    insert: legacyReadOnly,
+    startSubmissionIntent: legacyReadOnly,
+    bindSubmitted: legacyReadOnly,
+    insertTurn: legacyReadOnly,
+    reconcileInterrupted: legacyReadOnly,
+    update: legacyReadOnly,
+    transition: legacyReadOnly,
+    complete: legacyReadOnly,
+    fail: legacyReadOnly,
+  }
 
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
@@ -100,5 +118,7 @@ export function openAppDatabase(path: string) {
     conversationContexts: legacyConversationContexts,
     chatRuns: legacyChatRuns,
     providerUsage: legacyProviderUsage,
+    mediaAssets: legacyMediaAssets,
+    mediaGenerationJobs: legacyMediaGenerationJobs,
   }
 }

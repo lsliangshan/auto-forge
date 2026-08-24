@@ -2505,6 +2505,63 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.recover()).rejects.toMatchObject({ code: 'CONFLICT' })
   })
 
+  it('leaves legacy media rows and files untouched during startup recovery before user routing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-legacy-media-recovery-'))
+    directories.push(root)
+    const databasePath = join(root, 'autoforge.sqlite')
+    openAppDatabase(databasePath).close()
+    const sqlite = new Database(databasePath)
+    sqlite.prepare(`
+      INSERT INTO conversations (id, title, created_at, updated_at)
+      VALUES ('legacy_media_recovery', 'Legacy media recovery', 1, 1)
+    `).run()
+    sqlite.prepare(`
+      INSERT INTO messages (id, conversation_id, role, blocks_json, ordinal, created_at)
+      VALUES ('legacy_media_message', 'legacy_media_recovery', 'assistant', '[]', 1, 1)
+    `).run()
+    sqlite.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, source, kind, original_name, relative_path,
+        status, created_at, updated_at
+      ) VALUES ('legacy_media_asset', 'legacy_media_recovery',
+        'generated', 'image', 'legacy.png', 'legacy_media_recovery/legacy.png',
+        'staging', 1, 1)
+    `).run()
+    sqlite.prepare(`
+      INSERT INTO media_generation_jobs (
+        id, conversation_id, assistant_message_id, provider, model, kind,
+        provider_job_id, status, parameters_json, next_poll_at, poll_attempts,
+        created_at, updated_at
+      ) VALUES ('legacy_media_job', 'legacy_media_recovery', 'legacy_media_message',
+        'openrouter', 'video-model', 'video', 'provider-job', 'pending', '{}',
+        1, 0, 1, 1)
+    `).run()
+    const before = JSON.stringify([
+      sqlite.prepare('SELECT * FROM media_assets ORDER BY rowid').all(),
+      sqlite.prepare('SELECT * FROM media_generation_jobs ORDER BY rowid').all(),
+    ])
+    sqlite.close()
+    const mediaDirectory = join(root, 'media', 'legacy_media_recovery')
+    const mediaPath = join(mediaDirectory, 'legacy.png')
+    await mkdir(mediaDirectory, { recursive: true })
+    await writeFile(mediaPath, 'legacy-media-bytes')
+
+    const runtime = createApplicationRuntime(options(root))
+    try {
+      await runtime.recover()
+    } finally {
+      await runtime.close()
+    }
+
+    const inspection = new Database(databasePath, { readonly: true })
+    expect(JSON.stringify([
+      inspection.prepare('SELECT * FROM media_assets ORDER BY rowid').all(),
+      inspection.prepare('SELECT * FROM media_generation_jobs ORDER BY rowid').all(),
+    ])).toBe(before)
+    inspection.close()
+    expect(await readFile(mediaPath, 'utf8')).toBe('legacy-media-bytes')
+  })
+
   it('runs interrupted usage recovery without blocking startup and preserves the failure for close', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-recovery-'))
     directories.push(root)

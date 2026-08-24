@@ -45,6 +45,8 @@ function setup() {
     conversations: repositories.conversations,
     messages: repositories.messages,
     conversationContexts: repositories.conversationContexts,
+    mediaAssets: repositories.mediaAssets,
+    mediaGenerationJobs: repositories.mediaGenerationJobs,
     chatRuns: repositories.chatRuns,
     providerUsage: repositories.providerUsage,
     clearConversations: () => sqlite.transaction(() => {

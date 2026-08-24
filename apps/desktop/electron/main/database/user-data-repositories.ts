@@ -63,6 +63,7 @@ const conversationRowSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   lastActivityAt: z.number().int().nonnegative(),
   metadataUpdatedAt: z.number().int().nonnegative(),
+  deletedAt: z.number().int().nonnegative().nullable().optional(),
   userId: z.string().nullable(),
 }).passthrough()
 
@@ -377,11 +378,36 @@ function sameMutationIdentity(local: SyncMutation, remote: RemoteMutation): bool
     && local.kind === remote.kind
     && local.entityId === remote.entityId
     && local.baseRevision === remote.baseRevision
-    && timestamp(local.occurredAt) === timestamp(remote.receivedAt)
     && isDeepStrictEqual(local.payload, remote.payload)
 }
 
-function validateOutboxReceipt(database: SqliteDatabase, mutation: RemoteMutation): boolean {
+function requireValidRemoteResult(mutation: RemoteMutation): number {
+  const result = requireRemoteRevision(mutation)
+  const valid = (() => {
+    switch (mutation.kind) {
+      case 'conversation.create':
+        return mutation.baseRevision === 0 && result === 1
+      case 'conversation.rename':
+      case 'conversation.delete':
+      case 'conversation.restore':
+      case 'preferences.update':
+        return result === mutation.baseRevision + 1
+      case 'message.append':
+        return result === mutation.baseRevision || result === mutation.baseRevision + 1
+      case 'legacy.import':
+      case 'privacy.consent':
+      case 'usage.record':
+        return result === 0
+    }
+  })()
+  if (!valid) throw new UserDataConsistencyError()
+  return result
+}
+
+function validateOutboxReceipt(
+  database: SqliteDatabase,
+  mutation: RemoteMutation,
+): SyncMutation | undefined {
   const row = database.prepare(`
     SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
            payload_json AS payloadJson, state, attempts,
@@ -390,9 +416,91 @@ function validateOutboxReceipt(database: SqliteDatabase, mutation: RemoteMutatio
     FROM outbox_mutations
     WHERE id = @id
   `).get({ id: mutation.id }) as Query | undefined
-  if (row === undefined) return false
-  if (!sameMutationIdentity(outboxFromRow(row), mutation)) throw new UserDataConsistencyError()
-  return true
+  if (row === undefined) return undefined
+  const local = outboxFromRow(row)
+  if (!sameMutationIdentity(local, mutation)) throw new UserDataConsistencyError()
+  requireValidRemoteResult(mutation)
+  return local
+}
+
+function remoteConversation(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  conversationId: string,
+): z.infer<typeof conversationRowSchema> | undefined {
+  const raw = database.prepare(`
+    SELECT id, title, title_state AS titleState, revision, sync_state AS syncState,
+           created_at AS createdAt, last_activity_at AS lastActivityAt,
+           metadata_updated_at AS metadataUpdatedAt, deleted_at AS deletedAt,
+           user_id AS userId
+    FROM conversations
+    WHERE id = @conversationId
+  `).get({ conversationId }) as Query | undefined
+  if (raw === undefined) return undefined
+  const conversation = parsePersisted(() => conversationRowSchema.parse(raw))
+  assertStoredOwner(conversation.userId ?? undefined, ownerUserId)
+  return conversation
+}
+
+function hasPendingConversationMutation(
+  database: SqliteDatabase,
+  mutationId: string,
+  conversationId: string,
+): boolean {
+  return database.prepare(`
+    SELECT 1
+    FROM outbox_mutations
+    WHERE id <> @mutationId
+      AND (
+        (entity_id = @conversationId AND kind LIKE 'conversation.%')
+        OR (kind = 'message.append'
+          AND json_extract(payload_json, '$.conversationId') = @conversationId)
+      )
+    LIMIT 1
+  `).get({ mutationId, conversationId }) !== undefined
+}
+
+function acknowledgeLocalMutation(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  local: SyncMutation,
+  remote: RemoteMutation,
+): void {
+  const resultRevision = requireValidRemoteResult(remote)
+  let conversationId: string | undefined
+  switch (local.kind) {
+    case 'conversation.create':
+    case 'conversation.rename':
+    case 'conversation.delete':
+    case 'conversation.restore':
+      conversationId = local.entityId
+      requireOwnedConversation(database, ownerUserId, conversationId)
+      break
+    case 'message.append':
+      conversationId = local.payload.conversationId
+      requireOwnedConversation(database, ownerUserId, conversationId)
+      if (storedMessage(database, local.payload.id) === undefined) {
+        throw new UserDataConsistencyError()
+      }
+      break
+    default:
+      break
+  }
+  database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: local.id })
+  if (conversationId !== undefined) {
+    database.prepare(`
+      UPDATE conversations
+      SET revision = MAX(revision, @revision),
+          sync_state = @syncState
+      WHERE id = @conversationId
+    `).run({
+      conversationId,
+      revision: resultRevision,
+      syncState: hasPendingConversationMutation(database, local.id, conversationId)
+        ? 'pending'
+        : 'synced',
+    })
+  }
 }
 
 function sameConversationCreate(
@@ -443,9 +551,13 @@ function applyRemoteMutation(
   mutation: RemoteMutation,
 ): void {
   const matchingOutboxReceipt = validateOutboxReceipt(database, mutation)
+  if (matchingOutboxReceipt !== undefined) {
+    acknowledgeLocalMutation(database, ownerUserId, matchingOutboxReceipt, mutation)
+    return
+  }
+  const revision = requireValidRemoteResult(mutation)
   switch (mutation.kind) {
     case 'conversation.create': {
-      const revision = requireRemoteRevision(mutation)
       const createdAt = timestamp(mutation.payload.createdAt)
       const existingRaw = database.prepare(`
         SELECT id, title, title_state AS titleState, revision, sync_state AS syncState,
@@ -460,13 +572,6 @@ function applyRemoteMutation(
       if (existing !== undefined) {
         assertStoredOwner(existing.userId ?? undefined, ownerUserId)
         if (!sameConversationCreate(existing, mutation)) throw new UserDataConsistencyError()
-        if (matchingOutboxReceipt) {
-          database.prepare(`
-            UPDATE conversations
-            SET revision = @revision, sync_state = 'synced'
-            WHERE id = @id
-          `).run({ id: mutation.entityId, revision })
-        }
         break
       }
       database.prepare(`
@@ -490,7 +595,17 @@ function applyRemoteMutation(
       break
     }
     case 'conversation.rename': {
-      requireOwnedConversation(database, ownerUserId, mutation.entityId)
+      const current = remoteConversation(database, ownerUserId, mutation.entityId)
+      if (current === undefined) throw new UserDataConsistencyError()
+      if (current.revision === revision) {
+        if (
+          current.title !== mutation.payload.title
+          || current.titleState !== mutation.payload.titleState
+          || current.metadataUpdatedAt !== timestamp(mutation.payload.metadataUpdatedAt)
+        ) throw new UserDataConsistencyError()
+        break
+      }
+      if (current.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
       const result = database.prepare(`
         UPDATE conversations
         SET title = @title,
@@ -504,7 +619,7 @@ function applyRemoteMutation(
         id: mutation.entityId,
         title: mutation.payload.title,
         titleState: mutation.payload.titleState,
-        revision: requireRemoteRevision(mutation),
+        revision,
         metadataUpdatedAt: timestamp(mutation.payload.metadataUpdatedAt),
       })
       if (result.changes !== 1) throw new UserDataConsistencyError()
@@ -512,7 +627,19 @@ function applyRemoteMutation(
     }
     case 'conversation.delete':
     case 'conversation.restore': {
-      requireOwnedConversation(database, ownerUserId, mutation.entityId)
+      const current = remoteConversation(database, ownerUserId, mutation.entityId)
+      if (current === undefined) throw new UserDataConsistencyError()
+      const expectedDeleted = mutation.kind === 'conversation.delete'
+      if (current.revision === revision) {
+        if ((current.deletedAt !== null) !== expectedDeleted) {
+          throw new UserDataConsistencyError()
+        }
+        break
+      }
+      if (
+        current.revision !== mutation.baseRevision
+        || (mutation.kind === 'conversation.restore' && current.deletedAt === null)
+      ) throw new UserDataConsistencyError()
       const deletedAt = mutation.kind === 'conversation.delete'
         ? timestamp(mutation.receivedAt)
         : null
@@ -526,7 +653,7 @@ function applyRemoteMutation(
       `).run({
         id: mutation.entityId,
         deletedAt,
-        revision: requireRemoteRevision(mutation),
+        revision,
         updatedAt: timestamp(mutation.receivedAt),
       })
       if (result.changes !== 1) throw new UserDataConsistencyError()
@@ -539,6 +666,20 @@ function applyRemoteMutation(
       if (existing !== undefined && !sameMessageAppend(existing, mutation)) {
         throw new UserDataConsistencyError()
       }
+      const conversation = remoteConversation(
+        database,
+        ownerUserId,
+        mutation.payload.conversationId,
+      )
+      if (conversation === undefined) throw new UserDataConsistencyError()
+      if (existing !== undefined) {
+        if (conversation.revision < revision) throw new UserDataConsistencyError()
+        break
+      }
+      if (
+        conversation.revision !== mutation.baseRevision
+        || revision !== mutation.baseRevision + 1
+      ) throw new UserDataConsistencyError()
       if (existing === undefined) {
         database.prepare(`
           INSERT INTO messages (
@@ -557,8 +698,7 @@ function applyRemoteMutation(
           createdAt,
         })
       }
-      if (existing !== undefined && !matchingOutboxReceipt) break
-      const conversation = database.prepare(`
+      const updatedConversation = database.prepare(`
         UPDATE conversations
         SET revision = @revision,
             sync_state = 'synced',
@@ -567,17 +707,14 @@ function applyRemoteMutation(
         WHERE id = @conversationId
       `).run({
         conversationId: mutation.payload.conversationId,
-        revision: requireRemoteRevision(mutation),
+        revision,
         createdAt,
       })
-      if (conversation.changes !== 1) throw new UserDataConsistencyError()
+      if (updatedConversation.changes !== 1) throw new UserDataConsistencyError()
       break
     }
     default:
       break
-  }
-  if (matchingOutboxReceipt) {
-    database.prepare('DELETE FROM outbox_mutations WHERE id = @id').run({ id: mutation.id })
   }
 }
 

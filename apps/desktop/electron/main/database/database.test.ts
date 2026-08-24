@@ -64,6 +64,8 @@ function openAppDatabase(path: string) {
     conversations: repositories.conversations,
     messages: repositories.messages,
     conversationContexts: repositories.conversationContexts,
+    mediaAssets: repositories.mediaAssets,
+    mediaGenerationJobs: repositories.mediaGenerationJobs,
     chatRuns: repositories.chatRuns,
     providerUsage: repositories.providerUsage,
     recoverInterrupted,
@@ -371,12 +373,30 @@ describe('openAppDatabase', () => {
       ) VALUES ('legacy_sensitive_usage', 'legacy_sensitive_operation', 'legacy-user',
         'openrouter', 'legacy_sensitive_usage_request', 'model', 'text', 'pending', 0, 1)
     `).run()
+    seed.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, message_id, source, kind, original_name, relative_path,
+        status, created_at, updated_at
+      ) VALUES ('legacy_sensitive_asset', 'legacy_sensitive', 'legacy_sensitive_message',
+        'generated', 'image', 'legacy.png', 'legacy_sensitive/legacy.png',
+        'staging', 1, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO media_generation_jobs (
+        id, conversation_id, assistant_message_id, provider, model, kind,
+        provider_job_id, status, parameters_json, next_poll_at, poll_attempts,
+        created_at, updated_at
+      ) VALUES ('legacy_sensitive_job', 'legacy_sensitive', 'legacy_sensitive_message',
+        'openrouter', 'model', 'video', 'provider_job', 'pending', '{}', 1, 0, 1, 1)
+    `).run()
     const sensitiveSnapshot = (sqlite: Database.Database) => JSON.stringify([
       'conversations',
       'messages',
       'conversation_contexts',
       'chat_runs',
       'provider_usage_events',
+      'media_assets',
+      'media_generation_jobs',
     ].map((table) => [table, sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]))
     const before = sensitiveSnapshot(seed)
     seed.close()
@@ -390,6 +410,12 @@ describe('openAppDatabase', () => {
     expect(database.conversationContexts.get('legacy_sensitive')).toBeDefined()
     expect(database.chatRuns.get('legacy_sensitive_run')).toBeDefined()
     expect(database.providerUsage.find('legacy_sensitive_operation')).toBeDefined()
+    expect(database.mediaAssets.get('legacy_sensitive_asset')).toBeDefined()
+    expect(database.mediaAssets.listForConversation('legacy_sensitive')).toHaveLength(1)
+    expect(database.mediaAssets.listUnclaimedBefore(2)).toEqual([])
+    expect(database.mediaGenerationJobs.get('legacy_sensitive_job')).toBeDefined()
+    expect(database.mediaGenerationJobs.listResumable(2)).toHaveLength(1)
+    expect(database.mediaGenerationJobs.listActive()).toHaveLength(1)
     for (const mutate of [
       () => database.messages.insert({
         id: 'forbidden_message', conversationId: 'legacy_sensitive', role: 'user',
@@ -421,6 +447,20 @@ describe('openAppDatabase', () => {
       () => database.providerUsage.report('legacy_sensitive_operation', {} as never),
       () => database.providerUsage.markUnknown('legacy_sensitive_operation', 2),
       () => database.providerUsage.recordReconcileFailure('legacy_sensitive_operation', 2),
+      () => database.mediaAssets.insert({} as never),
+      () => database.mediaAssets.update('legacy_sensitive_asset', { status: 'failed' }),
+      () => database.mediaAssets.delete('legacy_sensitive_asset'),
+      () => database.mediaGenerationJobs.insert({} as never),
+      () => database.mediaGenerationJobs.startSubmissionIntent({} as never),
+      () => database.mediaGenerationJobs.bindSubmitted('legacy_sensitive_job', {} as never),
+      () => database.mediaGenerationJobs.insertTurn({} as never),
+      () => database.mediaGenerationJobs.reconcileInterrupted(2),
+      () => database.mediaGenerationJobs.update('legacy_sensitive_job', { status: 'failed' }),
+      () => database.mediaGenerationJobs.transition('legacy_sensitive_job', ['pending'], {} as never),
+      () => database.mediaGenerationJobs.complete('legacy_sensitive_job', ['pending'], {} as never),
+      () => database.mediaGenerationJobs.fail(
+        'legacy_sensitive_job', ['pending'], 'MEDIA_GENERATION_FAILED', 2,
+      ),
     ]) expect(mutate).toThrow(expect.objectContaining(expected))
 
     expect(database.providerUsage.recoverPending(2)).toBe(0)

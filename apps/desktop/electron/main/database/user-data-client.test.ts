@@ -16,7 +16,10 @@ function temporaryRoot(): string {
   return root
 }
 
-function createConversationMutation(id: string, entityId: string): SyncMutation {
+function createConversationMutation(
+  id: string,
+  entityId: string,
+): Extract<SyncMutation, { kind: 'conversation.create' }> {
   return {
     id,
     kind: 'conversation.create',
@@ -33,7 +36,11 @@ function createConversationMutation(id: string, entityId: string): SyncMutation 
   }
 }
 
-function appendMessageMutation(id: string, conversationId: string, messageId: string): SyncMutation {
+function appendMessageMutation(
+  id: string,
+  conversationId: string,
+  messageId: string,
+): Extract<SyncMutation, { kind: 'message.append' }> {
   return {
     id,
     kind: 'message.append',
@@ -50,6 +57,26 @@ function appendMessageMutation(id: string, conversationId: string, messageId: st
   }
 }
 
+function renameConversationMutation(
+  id: string,
+  conversationId: string,
+  baseRevision: number,
+  title: string,
+): Extract<SyncMutation, { kind: 'conversation.rename' }> {
+  return {
+    id,
+    kind: 'conversation.rename',
+    entityId: conversationId,
+    baseRevision,
+    occurredAt: '2026-08-24T00:02:00.000Z',
+    payload: {
+      title,
+      titleState: 'user_named',
+      metadataUpdatedAt: '2026-08-24T00:02:00.000Z',
+    },
+  }
+}
+
 function cachePath(root: string, userId: string): string {
   const scope = createHash('sha256')
     .update('autoforge-user-cache-v1\0')
@@ -59,9 +86,17 @@ function cachePath(root: string, userId: string): string {
   return join(root, `${scope}.sqlite`)
 }
 
-function pulledMutation(mutation: SyncMutation, resultRevision: number) {
-  const { occurredAt, ...stored } = mutation
-  return { ...stored, resultRevision, receivedAt: occurredAt }
+function pulledMutation<T extends SyncMutation>(
+  mutation: T,
+  resultRevision: number,
+  receivedAt = '2026-08-24T01:00:00.000Z',
+): Omit<T, 'occurredAt'> & { resultRevision: number; receivedAt: string } {
+  const stored: Partial<T> = { ...mutation }
+  delete stored.occurredAt
+  return { ...stored, resultRevision, receivedAt } as Omit<T, 'occurredAt'> & {
+    resultRevision: number
+    receivedAt: string
+  }
 }
 
 function deleteConversationMutation(index: number): SyncMutation {
@@ -485,7 +520,7 @@ describe('UserDataStoreManager', () => {
           ...create,
           id: 'remote_duplicate_create_mismatch',
           payload: { ...create.payload, title: 'Mismatched title' },
-        }, 3),
+        }, 1),
       ],
     }, 5)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
     expect(store.conversations.get('rolled_back_duplicate')).toBeUndefined()
@@ -502,7 +537,7 @@ describe('UserDataStoreManager', () => {
           ...append.payload,
           blocks: [{ type: 'text', text: 'mismatched message' }],
         },
-      }, 3)],
+      }, 2)],
     }, 6)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
     expect(store.messages.get('duplicate_message')?.blocks)
       .toEqual([{ type: 'text', text: 'duplicate_message' }])
@@ -540,6 +575,220 @@ describe('UserDataStoreManager', () => {
     }, 2)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
     expect(store.outbox.find('receipt_collision')).toBeDefined()
     expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_receipt_01')
+    manager.close()
+  })
+
+  it('acknowledges an immutable create receipt after later message and rename mutations', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const createBeforeMessage = createConversationMutation(
+      'create_before_message',
+      'conversation_before_message',
+    )
+    const laterMessage = appendMessageMutation(
+      'message_after_create',
+      'conversation_before_message',
+      'message_after_create_entity',
+    )
+    store.outbox.recordWithConversation(createBeforeMessage)
+    store.outbox.recordWithMessage(laterMessage)
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_evolved_001',
+      mutations: [pulledMutation(createBeforeMessage, 1)],
+    }, 1)
+
+    expect(store.outbox.find('create_before_message')).toBeUndefined()
+    expect(store.outbox.find('message_after_create')).toBeDefined()
+    expect(store.messages.get('message_after_create_entity')).toBeDefined()
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({
+        id: 'conversation_before_message',
+        revision: 1,
+        syncState: 'pending',
+        lastActivityAt: laterMessage.payload.createdAt,
+      }),
+    )
+
+    const createBeforeRename = createConversationMutation(
+      'create_before_rename',
+      'conversation_before_rename',
+    )
+    const laterRename = renameConversationMutation(
+      'rename_after_create',
+      'conversation_before_rename',
+      1,
+      'Later optimistic title',
+    )
+    store.outbox.recordWithConversation(createBeforeRename)
+    store.outbox.recordWithConversation(laterRename)
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_evolved_002',
+      mutations: [pulledMutation(createBeforeRename, 1)],
+    }, 2)
+
+    expect(store.outbox.find('create_before_rename')).toBeUndefined()
+    expect(store.outbox.find('rename_after_create')).toBeDefined()
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({
+        id: 'conversation_before_rename',
+        title: 'Later optimistic title',
+        revision: 1,
+        syncState: 'pending',
+      }),
+    )
+    manager.close()
+  })
+
+  it('preserves a later optimistic rename when acknowledging the earlier rename', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('rename_chain_create', 'rename_chain_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_rename_chain_01',
+      mutations: [pulledMutation(create, 1)],
+    }, 1)
+    const first = renameConversationMutation(
+      'rename_chain_first', 'rename_chain_conversation', 1, 'First title',
+    )
+    const second = renameConversationMutation(
+      'rename_chain_second', 'rename_chain_conversation', 2, 'Second title',
+    )
+    store.outbox.recordWithConversation(first)
+    store.outbox.recordWithConversation(second)
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_rename_chain_02',
+      mutations: [pulledMutation(first, 2)],
+    }, 2)
+
+    expect(store.outbox.find('rename_chain_first')).toBeUndefined()
+    expect(store.outbox.find('rename_chain_second')).toBeDefined()
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({
+        id: 'rename_chain_conversation',
+        title: 'Second title',
+        revision: 2,
+        syncState: 'pending',
+      }),
+    )
+    manager.close()
+  })
+
+  it('enforces monotonic remote conversation revisions and replay identity', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('monotonic_create', 'monotonic_conversation')
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_01',
+      mutations: [pulledMutation(create, 1)],
+    }, 1)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_bad_result',
+      mutations: [pulledMutation(
+        createConversationMutation('bad_result_create', 'bad_result_conversation'),
+        2,
+      )],
+    }, 2)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.conversations.get('bad_result_conversation')).toBeUndefined()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_monotonic_01')
+
+    const rename = renameConversationMutation(
+      'monotonic_rename', 'monotonic_conversation', 1, 'Monotonic title',
+    )
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_bad_rename',
+      mutations: [pulledMutation(rename, 3)],
+    }, 2)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_monotonic_01')
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_02',
+      mutations: [pulledMutation(rename, 2)],
+    }, 2)
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_03',
+      mutations: [pulledMutation({ ...rename, id: 'monotonic_rename_replay' }, 2)],
+    }, 3)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_04',
+      mutations: [pulledMutation({
+        ...rename,
+        id: 'monotonic_rename_stale_mismatch',
+        payload: { ...rename.payload, title: 'Stale overwrite' },
+      }, 2)],
+    }, 4)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_monotonic_03')
+
+    const deletion: SyncMutation = {
+      id: 'monotonic_delete',
+      kind: 'conversation.delete',
+      entityId: 'monotonic_conversation',
+      baseRevision: 2,
+      occurredAt: '2026-08-24T00:03:00.000Z',
+      payload: {},
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_05',
+      mutations: [pulledMutation(deletion, 3)],
+    }, 5)
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_06',
+      mutations: [pulledMutation({ ...deletion, id: 'monotonic_delete_replay' }, 3)],
+    }, 6)
+
+    const restoration: SyncMutation = {
+      id: 'monotonic_restore',
+      kind: 'conversation.restore',
+      entityId: 'monotonic_conversation',
+      baseRevision: 3,
+      occurredAt: '2026-08-24T00:04:00.000Z',
+      payload: {},
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_07',
+      mutations: [pulledMutation(restoration, 4)],
+    }, 7)
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_08',
+      mutations: [pulledMutation({ ...restoration, id: 'monotonic_restore_replay' }, 4)],
+    }, 8)
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_monotonic_09',
+      mutations: [pulledMutation({ ...deletion, id: 'monotonic_delete_stale' }, 3)],
+    }, 9)).toThrow(expect.objectContaining({ code: 'INTERNAL_ERROR' }))
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_monotonic_08')
+    expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
+      expect.objectContaining({
+        id: 'monotonic_conversation', title: 'Monotonic title', revision: 4,
+      }),
+    )
+
+    const inspection = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(inspection.prepare(`
+      SELECT revision, deleted_at AS deletedAt
+      FROM conversations WHERE id = 'monotonic_conversation'
+    `).get()).toEqual({ revision: 4, deletedAt: null })
+    inspection.close()
     manager.close()
   })
 

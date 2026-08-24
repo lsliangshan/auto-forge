@@ -1766,12 +1766,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     recover: async () => {
       if (closePromise) throw failure('CONFLICT')
       await options.networkProxy.initialize(settings.get().proxy)
-      await mediaLifecycle.recover()
       database.recoverInterrupted()
       providerUsageReconciliationLoop.start()
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
       await projects.recoverRemovalJournals()
-      await videoJobs.recover()
     },
     close: () => {
       if (closePromise) return closePromise
