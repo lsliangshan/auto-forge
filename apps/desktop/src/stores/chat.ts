@@ -887,7 +887,8 @@ export const useChatStore = defineStore('chat', {
     async refreshAfterConversationRemoval(
       dataGeneration: number,
       selectedBeforeRemoval: string,
-      selectedMessageLoadInvalidated: boolean,
+      selectedLatestLoadInvalidated: boolean,
+      selectedOlderCursorsInvalidated: readonly string[],
       selectedPreferenceLoadInvalidated: boolean,
     ) {
       try {
@@ -898,7 +899,7 @@ export const useChatStore = defineStore('chat', {
         const selectedConversationWasPreserved = conversationId === selectedBeforeRemoval
         await Promise.all([
           this.messagesByConversation[conversationId] === undefined
-            || (selectedConversationWasPreserved && selectedMessageLoadInvalidated)
+            || (selectedConversationWasPreserved && selectedLatestLoadInvalidated)
             ? this.loadMessages(conversationId)
             : undefined,
           this.preferencesByConversation[conversationId] === undefined
@@ -906,6 +907,13 @@ export const useChatStore = defineStore('chat', {
             ? this.loadGenerationPreferences(conversationId)
             : undefined,
         ])
+        if (dataGeneration !== this._dataGeneration
+          || this.selectedConversationId !== conversationId
+          || !selectedConversationWasPreserved) return
+        const previousCursor = this.previousMessageCursorByConversation[conversationId]
+        if (previousCursor && selectedOlderCursorsInvalidated.includes(previousCursor)) {
+          await this.loadOlderMessages(conversationId)
+        }
       } catch (error) {
         if (dataGeneration === this._dataGeneration) {
           this.error = displayError(error, '会话刷新失败')
@@ -922,9 +930,16 @@ export const useChatStore = defineStore('chat', {
       }
       if (event.type === 'conversation_removed') {
         const selectedBeforeRemoval = this.selectedConversationId
-        const selectedMessageLoadInvalidated = selectedBeforeRemoval !== ''
-          && Object.keys(this._messagePageRequests)
-            .some((requestKey) => requestKey.startsWith(`${selectedBeforeRemoval}:`))
+        const selectedMessageRequestPrefix = `${selectedBeforeRemoval}:`
+        const selectedLatestRequestKey = `${selectedBeforeRemoval}:latest`
+        const selectedLatestLoadInvalidated = selectedBeforeRemoval !== ''
+          && this._messagePageRequests[selectedLatestRequestKey] !== undefined
+        const selectedOlderCursorsInvalidated = selectedBeforeRemoval === '' ? [] : Object.keys(
+          this._messagePageRequests,
+        ).filter((requestKey) => (
+          requestKey.startsWith(selectedMessageRequestPrefix)
+          && requestKey !== selectedLatestRequestKey
+        )).map((requestKey) => requestKey.slice(selectedMessageRequestPrefix.length))
         const selectedPreferenceLoadInvalidated = selectedBeforeRemoval !== ''
           && this._preferenceLoadRequests[selectedBeforeRemoval] !== undefined
         const removedIndex = this.conversations.findIndex(({ id }) => id === event.conversationId)
@@ -957,7 +972,8 @@ export const useChatStore = defineStore('chat', {
         void this.refreshAfterConversationRemoval(
           dataGeneration,
           selectedBeforeRemoval,
-          selectedMessageLoadInvalidated,
+          selectedLatestLoadInvalidated,
+          selectedOlderCursorsInvalidated,
           selectedPreferenceLoadInvalidated,
         )
         return

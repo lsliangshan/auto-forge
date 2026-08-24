@@ -1870,6 +1870,108 @@ describe('chat interactions', () => {
     expect(store.preferencesByConversation.conv_1?.outputType).toBe('video')
   })
 
+  it('reissues only an invalidated older page without replacing loaded history', async () => {
+    const { api, emitChat } = createEventApi()
+    const staleOlderPage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const cursor = 'older-cursor'
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('conv_1', '2026-08-25T00:03:00.000Z')],
+    })
+    vi.mocked(api.chat.listMessages)
+      .mockReturnValueOnce(staleOlderPage.promise)
+      .mockResolvedValueOnce({
+        items: [storedMessage('replacement-older', 'conv_1', 'replacement older row')],
+        previousCursor: 'next-older-cursor',
+      })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
+    ]
+    store.selectedConversationId = 'conv_1'
+    store.messagesByConversation.conv_1 = [{ id: 'loaded-newest', role: 'assistant', blocks: [] }]
+    store.previousMessageCursorByConversation.conv_1 = cursor
+    store.preferencesByConversation.conv_1 = generationPreferences({ outputType: 'text' })
+    store.ensureSubscriptions()
+
+    const staleRequest = store.loadOlderMessages('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledOnce())
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledTimes(2))
+    staleOlderPage.reject(new Error('stale older request failed'))
+    await staleRequest
+    await flushPromises()
+
+    expect(api.chat.listMessages).toHaveBeenNthCalledWith(1, {
+      conversationId: 'conv_1', limit: 100, cursor,
+    })
+    expect(api.chat.listMessages).toHaveBeenNthCalledWith(2, {
+      conversationId: 'conv_1', limit: 100, cursor,
+    })
+    expect(store.messagesByConversation.conv_1?.map(({ id }) => id))
+      .toEqual(['replacement-older', 'loaded-newest'])
+    expect(store.previousMessageCursorByConversation.conv_1).toBe('next-older-cursor')
+    expect(api.chat.getGenerationPreferences).not.toHaveBeenCalled()
+    expect(store.error).toBe('')
+  })
+
+  it('reissues invalidated latest before older and keeps replacement markers token-owned', async () => {
+    const { api, emitChat } = createEventApi()
+    const staleLatest = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const staleOlder = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const replacementOlder = deferred<Awaited<ReturnType<DesktopAPI['chat']['listMessages']>>>()
+    const cursor = 'shared-older-cursor'
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('conv_1', '2026-08-25T00:03:00.000Z')],
+    })
+    vi.mocked(api.chat.listMessages)
+      .mockReturnValueOnce(staleLatest.promise)
+      .mockReturnValueOnce(staleOlder.promise)
+      .mockResolvedValueOnce({
+        items: [storedMessage('replacement-newest', 'conv_1', 'replacement newest row')],
+        previousCursor: cursor,
+      })
+      .mockReturnValueOnce(replacementOlder.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [
+      conversationSummary('conv_1', '2026-08-25T00:03:00.000Z'),
+      conversationSummary('conv_2', '2026-08-25T00:02:00.000Z'),
+    ]
+    store.selectedConversationId = 'conv_1'
+    store.messagesByConversation.conv_1 = [{ id: 'loaded-newest', role: 'assistant', blocks: [] }]
+    store.previousMessageCursorByConversation.conv_1 = cursor
+    store.preferencesByConversation.conv_1 = generationPreferences({ outputType: 'text' })
+    store.ensureSubscriptions()
+
+    const staleLatestRequest = store.loadMessages('conv_1')
+    const staleOlderRequest = store.loadOlderMessages('conv_1')
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledTimes(2))
+    emitChat({ type: 'conversation_removed', conversationId: 'conv_2' })
+    await vi.waitFor(() => expect(api.chat.listMessages).toHaveBeenCalledTimes(4))
+
+    expect(api.chat.listMessages).toHaveBeenNthCalledWith(3, {
+      conversationId: 'conv_1', limit: 100,
+    })
+    expect(api.chat.listMessages).toHaveBeenNthCalledWith(4, {
+      conversationId: 'conv_1', limit: 100, cursor,
+    })
+    staleLatest.resolve({ items: [storedMessage('stale-latest', 'conv_1', 'stale latest row')] })
+    staleOlder.reject(new Error('stale older request failed'))
+    await Promise.all([staleLatestRequest, staleOlderRequest])
+    await store.loadOlderMessages('conv_1')
+    expect(api.chat.listMessages).toHaveBeenCalledTimes(4)
+
+    replacementOlder.resolve({
+      items: [storedMessage('replacement-older', 'conv_1', 'replacement older row')],
+    })
+    await flushPromises()
+    expect(store.messagesByConversation.conv_1?.map(({ id }) => id))
+      .toEqual(['replacement-older', 'replacement-newest'])
+    expect(store.error).toBe('')
+  })
+
   it('clears selection and conversation state when a removed selected row has no replacement', async () => {
     const { api, emitChat } = createEventApi()
     vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [] })
