@@ -466,6 +466,29 @@ describe('BrowserContinuationToolExecutor', () => {
     },
   )
 
+  it.each(['TARGET_AMBIGUOUS', 'AUTH_STATE_UNKNOWN'] as const)(
+    'keeps a policy-external navigate terminal when pre-action inspection fails with %s',
+    async (code) => {
+      const test = harness()
+      const context = run({
+        currentUser: { messageId: 'message_current', text: '请打开 https://outside.example/landing' },
+      })
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '打开链接',
+      }, context)
+      test.inspector.currentPageContext.mockRejectedValueOnce({ code })
+
+      await expect(test.executor.execute('browser_session_act', {
+        bindingId: 'binding_1', snapshotId: 'snapshot_1', actions: [{
+          type: 'navigate', url: 'https://outside.example/landing', source: { kind: 'current_user' },
+        }],
+      }, context)).resolves.toEqual({ kind: 'tool_error', code: 'DOMAIN_BLOCKED' })
+
+      expect(test.workspace.suspendContinuation).not.toHaveBeenCalled()
+      expect(test.release).toHaveBeenCalledOnce()
+    },
+  )
+
   it('keeps a normalizable blocker terminal after continuation eligibility is lost', async () => {
     const test = harness()
     await test.executor.execute('browser_session_inspect', {
@@ -595,6 +618,23 @@ describe('BrowserContinuationToolExecutor', () => {
     await expect(test.executor.execute('browser_session_inspect', {
       bindingId: 'binding_1', intent: '继续读取',
     }, run())).resolves.toMatchObject({ kind: 'success' })
+  })
+
+  it('terminates manual suspension when the user navigates outside binding policy', async () => {
+    const test = harness()
+    await test.executor.execute('browser_session_handoff', {
+      bindingId: 'binding_1', reason: 'manual_action',
+    }, run())
+    test.state.origin = 'https://outside.example'
+    test.state.url = 'https://outside.example/landing'
+    test.state.navigationEpoch = 2
+    test.state.activityRevision = 1
+
+    await expect(test.executor.waitForManualIntervention('agent_run_1', run()))
+      .resolves.toEqual({ kind: 'tool_error', code: 'DOMAIN_BLOCKED' })
+
+    expect(test.workspace.resumeContinuation).not.toHaveBeenCalled()
+    expect(test.release).toHaveBeenCalledOnce()
   })
 
   it('lets the manual coordinator retry PAGE_CHANGED promotion without terminating authority', async () => {

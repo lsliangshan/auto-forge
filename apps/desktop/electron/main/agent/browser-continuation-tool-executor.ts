@@ -420,6 +420,7 @@ export class BrowserContinuationToolExecutor {
             lease.binding.tabId,
             context.runId,
           )
+          if (!this.currentPageAllowed(lease, expected)) throw failure('DOMAIN_BLOCKED')
           await this.dependencies.workspace.resumeContinuation(
             lease.binding.tabId,
             context.runId,
@@ -874,6 +875,27 @@ export class BrowserContinuationToolExecutor {
       .some((pattern) => matchesHttpsUrlPattern(pattern, page.url))
   }
 
+  private currentPageAllowed(
+    lease: BrowserContinuationLease,
+    page: BrowserContinuationPageState,
+  ): boolean {
+    return Object.values(lease.binding.permissionMatrix).flat()
+      .some((pattern) => matchesHttpsUrlPattern(pattern, page.url))
+  }
+
+  private preActionAllowed(
+    action: BrowserAction,
+    lease: BrowserContinuationLease,
+    page: BrowserContinuationPageState,
+  ): boolean {
+    if (!this.currentPageAllowed(lease, page)) return false
+    const capability = requiredCapability(action)
+    if (capability === undefined) return true
+    const targetUrl = action.type === 'navigate' ? action.url : page.url
+    return (lease.binding.permissionMatrix[capability] ?? [])
+      .some((pattern) => matchesHttpsUrlPattern(pattern, targetUrl))
+  }
+
   private isManualInterventionBlocker(code: AppErrorCode): boolean {
     return code === 'TARGET_AMBIGUOUS' || code === 'AUTH_STATE_UNKNOWN'
   }
@@ -891,7 +913,7 @@ export class BrowserContinuationToolExecutor {
       lease.binding.tabId,
       context.runId,
     )
-    if (!this.postActionAllowed(action, lease, page)) throw failure('DOMAIN_BLOCKED')
+    if (!this.preActionAllowed(action, lease, page)) throw failure('DOMAIN_BLOCKED')
     return page
   }
 
