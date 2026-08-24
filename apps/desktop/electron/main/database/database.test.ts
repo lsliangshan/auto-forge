@@ -942,10 +942,19 @@ describe('openAppDatabase', () => {
     }
 
     database.conversations.delete('conversation_usage_delete')
+    database.executions.insert({
+      id: 'execution_clear_all',
+      workflowId: 'workflow_clear_all',
+      workflowVersion: '1.0.0',
+      status: 'completed',
+    })
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
     database.clearConversations()
+    expect(database.conversations.get('conversation_usage_clear_conversations')).toBeDefined()
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
     database.clearLocalData('all')
+    expect(database.conversations.get('conversation_usage_clear_all')).toBeDefined()
+    expect(database.executions.get('execution_clear_all')).toBeUndefined()
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
   })
 
@@ -2025,7 +2034,7 @@ describe('openAppDatabase', () => {
       .toThrow('Owned chat run requires a provider')
   })
 
-  it('summarizes retained token usage by model across five periods', () => {
+  it('summarizes retained token usage and preserves it during global legacy clearing', () => {
     const database = openTestDatabase()
     insertLocalUser(database, 'usage_user', 'usage@example.com')
     database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
@@ -2086,13 +2095,8 @@ describe('openAppDatabase', () => {
     expect(usage.allTime.models.some(({ model }) => model === 'ignored/model')).toBe(false)
 
     database.clearLocalData('conversations')
-    expect(database.chatRuns.summarizeTokenUsage(query)).toEqual({
-      today: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      yesterday: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      week: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-    })
+    expect(database.chatRuns.summarizeTokenUsage(query)).toEqual(usage)
+    expect(database.conversations.get('conversation_usage')).toMatchObject({ id: 'conversation_usage' })
   })
 
   it('groups token usage trends by local calendar boundaries and excludes the query end point', () => {

@@ -18,6 +18,12 @@ export function openAppDatabase(path: string) {
   const userProfiles = createUserProfileRepository(sqlite)
   const cloudBaseIdentities = createCloudBaseIdentityRepository(sqlite)
   repositories.messages.upgradeLegacyApprovals()
+  const legacyConversations = {
+    ...repositories.conversations,
+    claimLegacyAndListForUser: (userId: string) => repositories.conversations
+      .list()
+      .filter((conversation) => conversation.userId === userId),
+  }
 
   const recoverInterrupted = () => sqlite.transaction(() => {
     const endedAt = Date.now()
@@ -52,13 +58,10 @@ export function openAppDatabase(path: string) {
     return { executions, chatRuns }
   })()
 
-  const clearConversations = () => sqlite.transaction(() => {
-    sqlite.prepare('DELETE FROM conversations').run()
-  })()
+  const clearConversations = () => undefined
 
   const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => sqlite.transaction(() => {
     if (scope === 'executions' || scope === 'all') sqlite.prepare('DELETE FROM executions').run()
-    if (scope === 'conversations' || scope === 'all') sqlite.prepare('DELETE FROM conversations').run()
   })()
 
   return {
@@ -73,5 +76,6 @@ export function openAppDatabase(path: string) {
     clearConversations,
     clearLocalData,
     ...repositories,
+    conversations: legacyConversations,
   }
 }

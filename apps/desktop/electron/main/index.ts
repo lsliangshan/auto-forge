@@ -29,6 +29,7 @@ import {
 import { createMediaProtocolHandler } from './media/media-protocol.js'
 import { NetworkProxyService } from './network/network-proxy-service.js'
 import { ElectronBrowserWorkspace } from './browser/electron-browser-workspace.js'
+import { UserDataStoreManager } from './database/user-data-client.js'
 import { createSecureWindow } from './window.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -37,6 +38,7 @@ let mainWindow: BrowserWindow | null = null
 let runtime: ApplicationRuntime | undefined
 let disposeIpc: (() => void) | undefined
 let disposeDevelopmentParentWatchdog: (() => void) | undefined
+let userDataStores: UserDataStoreManager | undefined
 let quitting = false
 let mediaProtocolRegistered = false
 
@@ -75,6 +77,7 @@ async function initialize(): Promise<ApplicationRuntime> {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
   const userData = app.getPath('userData')
+  userDataStores ??= new UserDataStoreManager(join(userData, 'user-caches'))
   const networkProxy = new NetworkProxyService({
     setProxy: (config) => session.defaultSession.setProxy(config),
     closeAllConnections: () => session.defaultSession.closeAllConnections(),
@@ -201,6 +204,8 @@ async function shutdown(): Promise<void> {
   const current = runtime
   runtime = undefined
   if (current) await current.close()
+  userDataStores?.close()
+  userDataStores = undefined
 }
 
 if (!app.requestSingleInstanceLock()) {
