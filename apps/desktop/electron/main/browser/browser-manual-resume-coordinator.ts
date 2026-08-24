@@ -13,6 +13,12 @@ interface BrowserManualResumeCoordinatorOptions {
   onActivity(listener: (activity: BrowserContinuationActivity) => void): () => void
 }
 
+interface TabActivityState {
+  latestRevision: number
+  latestPhysicalInputRevision?: number
+  latestActivityAt: number
+}
+
 interface Waiter {
   readonly input: BrowserManualResumeWaitInput
   readonly resolve: () => void
@@ -35,11 +41,22 @@ function failure(code: 'CANCELLED' | 'CONFLICT'): AppError {
 
 export class BrowserManualResumeCoordinator {
   private readonly waiters = new Map<string, Waiter>()
+  private readonly tabActivities = new Map<string, TabActivityState>()
   private readonly unsubscribe: () => void
   private disposed = false
 
   constructor(options: BrowserManualResumeCoordinatorOptions) {
     this.unsubscribe = options.onActivity((activity) => {
+      const previous = this.tabActivities.get(activity.tabId)
+      if (!previous || activity.revision > previous.latestRevision) {
+        this.tabActivities.set(activity.tabId, {
+          latestRevision: activity.revision,
+          latestPhysicalInputRevision: activity.kind === 'physical_input'
+            ? activity.revision
+            : previous?.latestPhysicalInputRevision,
+          latestActivityAt: Date.now(),
+        })
+      }
       for (const waiter of this.waiters.values()) {
         if (waiter.input.tabId !== activity.tabId || activity.revision <= waiter.latestRevision) continue
         waiter.latestRevision = activity.revision
@@ -62,20 +79,28 @@ export class BrowserManualResumeCoordinator {
     if (this.waiters.has(input.runId)) return Promise.reject(failure('CONFLICT'))
     if (input.signal?.aborted) return Promise.reject(failure('CANCELLED'))
     return new Promise<void>((resolve, reject) => {
+      const tabActivity = this.tabActivities.get(input.tabId)
+      const latestRevision = Math.max(input.baselineActivityRevision, tabActivity?.latestRevision ?? 0)
+      const armed = tabActivity?.latestPhysicalInputRevision !== undefined
+        && tabActivity.latestPhysicalInputRevision > input.baselineActivityRevision
       const waiter: Waiter = {
         input,
         resolve,
         reject,
         onAbort: () => this.finish(input.runId, failure('CANCELLED')),
-        armed: false,
-        latestRevision: input.baselineActivityRevision,
-        invalidationRevision: input.baselineActivityRevision,
+        armed,
+        latestRevision,
+        invalidationRevision: latestRevision,
         promoting: false,
         promotionQueued: false,
         settled: false,
       }
       this.waiters.set(input.runId, waiter)
       input.signal?.addEventListener('abort', waiter.onAbort, { once: true })
+      if (armed && tabActivity) {
+        const elapsed = Math.max(0, Date.now() - tabActivity.latestActivityAt)
+        this.scheduleQuietWindow(waiter, Math.max(0, QUIET_WINDOW_MS - elapsed))
+      }
     })
   }
 
@@ -88,15 +113,16 @@ export class BrowserManualResumeCoordinator {
     this.disposed = true
     this.unsubscribe()
     for (const runId of [...this.waiters.keys()]) this.cancel(runId)
+    this.tabActivities.clear()
   }
 
-  private scheduleQuietWindow(waiter: Waiter): void {
+  private scheduleQuietWindow(waiter: Waiter, delayMs = QUIET_WINDOW_MS): void {
     if (waiter.settled) return
     if (waiter.quietTimer !== undefined) clearTimeout(waiter.quietTimer)
     waiter.quietTimer = setTimeout(() => {
       waiter.quietTimer = undefined
       void this.promote(waiter)
-    }, QUIET_WINDOW_MS)
+    }, delayMs)
   }
 
   private async promote(waiter: Waiter): Promise<void> {

@@ -47,6 +47,26 @@ describe('BrowserManualResumeCoordinator', () => {
     await expect(waiting).resolves.toBeUndefined()
   })
 
+  it('observes physical input before wait registration and uses the remaining quiet time', async () => {
+    const promote = vi.fn().mockResolvedValue(undefined)
+
+    activity({ tabId: 'tab_1', revision: 5, kind: 'physical_input' })
+    await vi.advanceTimersByTimeAsync(1_000)
+    activity({ tabId: 'tab_1', revision: 6, kind: 'page_change' })
+    await vi.advanceTimersByTimeAsync(2_000)
+    const waiting = coordinator.wait({
+      runId: 'run_pre_registration', tabId: 'tab_1', baselineActivityRevision: 4, promote,
+    })
+    void waiting.catch(() => {})
+
+    await vi.advanceTimersByTimeAsync(2_999)
+    expect(promote).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+
+    expect(promote).toHaveBeenCalledOnce()
+    await expect(waiting).resolves.toBeUndefined()
+  })
+
   it('ignores other tabs and revisions at or below the latest observed revision', async () => {
     const promote = vi.fn().mockResolvedValue(undefined)
     const waiting = coordinator.wait({
