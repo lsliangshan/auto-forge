@@ -403,6 +403,9 @@ export class BrowserContinuationToolExecutor {
         || state.lease !== lease) {
         return { kind: 'tool_error', code: 'CANCELLED' }
       }
+      if (state.latestSnapshot !== snapshot) {
+        return { kind: 'tool_error', code: state.latestSnapshot === undefined ? 'CANCELLED' : 'PAGE_CHANGED' }
+      }
       await lease.assertEligible()
       this.assertActive(state, context)
       return { kind: 'success', data }

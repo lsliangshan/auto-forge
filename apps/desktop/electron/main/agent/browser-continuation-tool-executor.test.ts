@@ -432,6 +432,59 @@ describe('BrowserContinuationToolExecutor', () => {
     }, run())).resolves.toEqual({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
   })
 
+  it('does not return visual evidence while end-run cleanup has cleared the latest snapshot', async () => {
+    let finishCapture!: (value: BrowserVisualEvidenceBundle) => void
+    let finishCleanup!: () => void
+    const pendingCapture = new Promise<BrowserVisualEvidenceBundle>((resolve) => { finishCapture = resolve })
+    const pendingCleanup = new Promise<undefined>((resolve) => { finishCleanup = () => resolve(undefined) })
+    const page = snapshot()
+    const evidence = visualBundle(page)
+    const test = harness({ snapshots: [page] })
+    test.inspector.captureVisualEvidence.mockImplementationOnce(async () => pendingCapture)
+    test.workspace.clearContinuationHighlight.mockImplementationOnce(async () => pendingCleanup)
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    const captured = test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())
+    await vi.waitFor(() => expect(test.inspector.captureVisualEvidence).toHaveBeenCalledOnce())
+    const ending = test.executor.endRun('agent_run_1')
+    await vi.waitFor(() => expect(test.workspace.clearContinuationHighlight).toHaveBeenCalledOnce())
+    expect(test.executor['runs'].get('agent_run_1')?.latestSnapshot).toBeUndefined()
+    finishCapture(evidence)
+
+    await expect(captured).resolves.toEqual({ kind: 'tool_error', code: 'CANCELLED' })
+    finishCleanup()
+    await ending
+  })
+
+  it('does not return visual evidence after a newer semantic inspection replaces its snapshot', async () => {
+    let finishCapture!: (value: BrowserVisualEvidenceBundle) => void
+    const pendingCapture = new Promise<BrowserVisualEvidenceBundle>((resolve) => { finishCapture = resolve })
+    const page = snapshot()
+    const latest = snapshot({ snapshotId: 'snapshot_2' })
+    const evidence = visualBundle(page)
+    const test = harness({ snapshots: [page] })
+    test.inspector.captureVisualEvidence.mockImplementationOnce(async () => pendingCapture)
+    await test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '查看表单',
+    }, run())
+
+    const captured = test.executor.captureVisualEvidence({
+      bindingId: 'binding_1', snapshotId: 'snapshot_1', pages: [structuredClone(page)],
+    }, run())
+    await vi.waitFor(() => expect(test.inspector.captureVisualEvidence).toHaveBeenCalledOnce())
+    test.inspector.inspect.mockResolvedValueOnce(latest)
+    await expect(test.executor.execute('browser_session_inspect', {
+      bindingId: 'binding_1', intent: '重新查看表单',
+    }, run())).resolves.toMatchObject({ kind: 'success' })
+    finishCapture(evidence)
+
+    await expect(captured).resolves.toEqual({ kind: 'tool_error', code: 'PAGE_CHANGED' })
+  })
+
   it('does not return visual evidence after the run ends during capture', async () => {
     let finishCapture!: (value: BrowserVisualEvidenceBundle) => void
     const pendingCapture = new Promise<BrowserVisualEvidenceBundle>((resolve) => { finishCapture = resolve })
