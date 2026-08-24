@@ -172,6 +172,7 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspaceTestPort {
       x: 0, y: 0, width: 10, height: 10, viewportWidth: 1200, viewportHeight: 800,
     })),
     captureNodeScreenshot: vi.fn(async () => 'image'),
+    capturePageScreenshot: vi.fn(async () => 'image'),
     onPageInvalidated: vi.fn(() => () => undefined),
     describeContinuation: vi.fn(async () => ({
       pageLabel: 'permit.example.gov.cn',

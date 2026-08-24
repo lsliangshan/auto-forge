@@ -66,6 +66,10 @@ interface BrowserPageReadInput {
   readonly deadlineAt?: number
 }
 
+interface BrowserPageScreenshotInput extends BrowserPageReadInput {
+  readonly clip: Pick<BrowserInspectionNodeBox, 'x' | 'y' | 'width' | 'height'>
+}
+
 interface BrowserNodeReadInput {
   readonly tabId: string
   readonly runId: string
@@ -98,6 +102,7 @@ export interface BrowserPageCdpPort {
   readNode(input: BrowserNodeReadInput): Promise<BrowserInspectionNode | undefined>
   getNodeBox(input: BrowserNodeReadInput): Promise<BrowserInspectionNodeBox>
   captureNodeScreenshot(input: BrowserNodeScreenshotInput): Promise<string>
+  capturePageScreenshot(input: BrowserPageScreenshotInput): Promise<string>
   onPageInvalidated(listener: (tabId: string) => void): () => void
 }
 

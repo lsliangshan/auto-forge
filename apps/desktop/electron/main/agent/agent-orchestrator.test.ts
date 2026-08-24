@@ -401,6 +401,7 @@ async function inspectedStaticFields(fields: string[]): Promise<BrowserContinuat
     readNode: async ({ backendNodeId }) => nodes.find((candidate) => candidate.backendNodeId === backendNodeId),
     getNodeBox: async () => ({ x: 0, y: 0, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }),
     captureNodeScreenshot: async () => '',
+    capturePageScreenshot: async () => '',
     onPageInvalidated: () => () => undefined,
   }
   const lease: BrowserContinuationLease = Object.freeze({
@@ -490,6 +491,7 @@ async function inspectedAttachmentTable(): Promise<BrowserContinuationToolResult
     ),
     getNodeBox: async () => ({ x: 0, y: 0, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }),
     captureNodeScreenshot: async () => '',
+    capturePageScreenshot: async () => '',
     onPageInvalidated: () => () => undefined,
   }
   const lease: BrowserContinuationLease = Object.freeze({

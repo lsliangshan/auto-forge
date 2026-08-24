@@ -86,6 +86,7 @@ class FakeCdpPort implements BrowserPageCdpPort {
     x: 20, y: 30, width: 320, height: 200, viewportWidth: 1200, viewportHeight: 800,
   }))
   readonly captureNodeScreenshot = vi.fn(async () => 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')
+  readonly capturePageScreenshot = vi.fn(async () => 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')
   private readonly invalidationListeners = new Set<(tabId: string) => void>()
 
   constructor(nodes: readonly BrowserInspectionNode[], overrides: Partial<BrowserPageReadResult> = {}) {

@@ -495,6 +495,55 @@ describe('ElectronBrowserWorkspace', () => {
     expect(commands.some(({ method }) => method === 'Runtime.evaluate')).toBe(false)
   })
 
+  it('captures a bounded page clip for the current readable continuation', async () => {
+    const { workspace, views } = createHarness((method) => (
+      method === 'Page.captureScreenshot' ? { data: 'cG5n' } : {}
+    ))
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/detail', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'run_1')
+
+    await expect(workspace.capturePageScreenshot({
+      tabId: tab.id, runId: 'run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, locators: [],
+      clip: { x: 10, y: 20, width: 500, height: 300 },
+    })).resolves.toBe('cG5n')
+
+    expect(views[1]!.webContents.debugger.commands).toContainEqual({
+      method: 'Page.captureScreenshot',
+      params: {
+        format: 'png', fromSurface: true, captureBeyondViewport: true,
+        clip: { x: 10, y: 20, width: 500, height: 300, scale: 1 },
+      },
+    })
+  })
+
+  it('rejects page clip changes before the CDP response returns', async () => {
+    const screenshot = deferred<unknown>()
+    const { workspace, views } = createHarness((method) => (
+      method === 'Page.captureScreenshot' ? screenshot.promise : {}
+    ))
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/detail', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'run_1')
+
+    const pending = workspace.capturePageScreenshot({
+      tabId: tab.id, runId: 'run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, locators: [],
+      clip: { x: 10, y: 20, width: 500, height: 300 },
+    })
+    await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+      .toContainEqual(expect.objectContaining({ method: 'Page.captureScreenshot' })))
+    const target = views[1]!.webContents
+    target.currentUrl = 'https://www.baidu.com/changed'
+    target.emit('did-navigate', {}, target.currentUrl)
+    screenshot.resolve({ data: 'stale-png' })
+
+    await expect(pending).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
+  })
+
   it('fails closed before describing an oversized AX tree instead of returning a partial snapshot', async () => {
     const rawNodes = [
       {

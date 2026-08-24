@@ -917,6 +917,28 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     return this.captureContinuationNodeScreenshot(input)
   }
 
+  async capturePageScreenshot(
+    input: Parameters<BrowserPageCdpPort['capturePageScreenshot']>[0],
+  ): Promise<string> {
+    const state = this.continuationState(input)
+    return this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      const { x, y, width, height } = input.clip
+      if (![x, y, width, height].every(Number.isFinite)
+        || x < 0 || y < 0 || width <= 0 || height <= 0
+        || width * height > 1_000_000) throw failure('UNSUPPORTED_CONTROL')
+      const screenshot = await this.command(state, 'Page.captureScreenshot', {
+        format: 'png', fromSurface: true, captureBeyondViewport: true,
+        clip: { x, y, width, height, scale: 1 },
+      }) as { data?: unknown }
+      this.assertContinuationState(state, input)
+      if (typeof screenshot.data !== 'string' || screenshot.data.length === 0) {
+        throw failure('INTERNAL_ERROR')
+      }
+      return screenshot.data
+    })
+  }
+
   async closeContinuation(tabId: string): Promise<void> {
     const state = this.tabs.get(tabId)
     if (state) await this.closeTab(state)
