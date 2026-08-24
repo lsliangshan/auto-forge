@@ -358,7 +358,7 @@ export interface AgentOrchestratorDependencies {
   browserContinuation?: {
     catalog: Pick<BrowserContinuationCatalog, 'create' | 'refresh'>
     executor: Pick<BrowserContinuationToolExecutor,
-      'execute' | 'waitForAuthentication' | 'endRun' | 'cancel' | 'takeOver'>
+      'execute' | 'waitForAuthentication' | 'waitForManualIntervention' | 'endRun' | 'cancel' | 'takeOver'>
   }
   emit: (event: ChatEvent) => void
   id?: () => string
@@ -1471,14 +1471,16 @@ export class AgentOrchestrator {
       )
     } else if (result.kind === 'handoff') {
       active.browserHandoffCode = result.code
-      active.browserTerminal = result.code !== 'AUTH_REQUIRED'
+      active.browserTerminal = false
       this.updateBrowserStatus(
         active,
         candidate,
         'awaiting_user',
         result.code === 'AUTH_REQUIRED'
           ? '网页尚未登录，请在已打开页面完成登录。登录后将自动继续，无需再次提问。'
-          : '需要用户完成受保护操作',
+          : result.code === 'MANUAL_ACTION_REQUIRED'
+            ? '该操作需要你在网页中手动完成。停止操作 5 秒后将自动继续。'
+            : '自动操作暂时无法继续，请在网页中手动操作。停止操作 5 秒后将自动继续。',
         result.code,
       )
     } else {
@@ -1489,24 +1491,37 @@ export class AgentOrchestrator {
       this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', result.code)
     }
     this.appendBrowserToolExchange(active, call, assistantContent, result)
-    if (result.kind === 'handoff' && result.code === 'AUTH_REQUIRED') {
-      const resumed = await browser.executor.waitForAuthentication(active.runId, {
+    if (result.kind === 'handoff') {
+      const handoffCode = result.code
+      const waitContext = {
         userId: active.userId,
         conversationId: active.conversationId,
         runId: active.runId,
         currentUser: active.currentUser,
         signal: active.controller.signal,
-      })
+      }
+      const resumed = handoffCode === 'AUTH_REQUIRED'
+        ? await browser.executor.waitForAuthentication(active.runId, waitContext)
+        : await browser.executor.waitForManualIntervention(active.runId, waitContext)
       const inactiveAfterWait = await this.inactiveBrowserResult(active)
       if (inactiveAfterWait) return inactiveAfterWait
       if (resumed.kind === 'tool_error') {
         active.browserTerminal = true
         const error = appFailure(resumed.code)
+        const actionSummary = resumed.code === 'PAGE_CLOSED'
+          ? '目标网页已关闭'
+          : resumed.code === 'DOMAIN_BLOCKED'
+            ? '网页已离开允许的操作范围'
+            : resumed.code === 'WORKFLOW_CHANGED'
+              ? '网页绑定的工作流已发生变化'
+              : resumed.code === 'CANCELLED'
+                ? '等待已取消'
+                : handoffCode === 'AUTH_REQUIRED' ? '等待登录已结束' : '等待手动操作已结束'
         this.updateBrowserStatus(
           active,
           candidate,
           resumed.code === 'CANCELLED' ? 'cancelled' : 'failed',
-          resumed.code === 'PAGE_CLOSED' ? '目标网页已关闭' : '等待登录已结束',
+          actionSummary,
           resumed.code,
         )
         return this.terminalize(
@@ -1521,8 +1536,8 @@ export class AgentOrchestrator {
       active.browserSnapshots.clear()
       this.clearBrowserPageEvidence(active)
       this.supersedeBrowserSnapshots(active)
-      if (active.browserEvidence.length > 0) active.browserEvidenceRevision += 1
       active.browserEvidence.length = 0
+      active.browserEvidenceRevision += 1
       active.browserEvidenceMatchRevision = undefined
       active.browserEvidenceMatchedCandidateId = undefined
       await this.refreshBrowserCatalog(active)
@@ -1533,7 +1548,12 @@ export class AgentOrchestrator {
       active.browserCandidate = refreshed
       active.browserBindingId = refreshed.bindingId
       active.browserExplicitBindingId = refreshed.bindingId
-      this.updateBrowserStatus(active, refreshed, 'inspecting', '已检测到登录，正在继续读取网页')
+      this.updateBrowserStatus(
+        active,
+        refreshed,
+        'inspecting',
+        handoffCode === 'AUTH_REQUIRED' ? '已检测到登录，正在继续读取网页' : '正在重新读取网页',
+      )
       return this.executeBrowserTool(active, {
         type: 'tool_call',
         choiceIndex: 0,

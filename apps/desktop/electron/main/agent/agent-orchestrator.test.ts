@@ -278,6 +278,10 @@ function attachBrowserContinuation(
       runId: string,
       context: BrowserContinuationRunContext,
     ) => Promise<{ kind: 'authenticated' } | { kind: 'tool_error'; code: AppErrorCode }>
+    waitForManualIntervention?: (
+      runId: string,
+      context: BrowserContinuationRunContext,
+    ) => Promise<{ kind: 'resumed' } | { kind: 'tool_error'; code: AppErrorCode }>
   } = {},
 ) {
   const bindings = options.bindings ?? [continuationBinding()]
@@ -309,6 +313,9 @@ function attachBrowserContinuation(
     takeOver: vi.fn(async () => undefined),
     waitForAuthentication: vi.fn(options.waitForAuthentication ?? (async () => ({
       kind: 'authenticated' as const,
+    }))),
+    waitForManualIntervention: vi.fn(options.waitForManualIntervention ?? (async () => ({
+      kind: 'resumed' as const,
     }))),
   }
   const create = vi.spyOn(catalog, 'create')
@@ -588,6 +595,13 @@ function attachCombinedBrowserContinuation(
     loginWait: {
       wait: vi.fn(async (input) => {
         if (await input.probe() !== 'authenticated') throw { code: 'AUTH_REQUIRED' }
+      }),
+      cancel: vi.fn(),
+    },
+    manualWait: {
+      wait: vi.fn(async (input) => {
+        state = { ...state, activityRevision: state.activityRevision + 1 }
+        await input.promote()
       }),
       cancel: vi.fn(),
     },
@@ -3503,6 +3517,273 @@ describe('AgentOrchestrator', () => {
     expect(browser.executor.takeOver).toHaveBeenCalledOnce()
   })
 
+  it.each([
+    {
+      code: 'MANUAL_ACTION_REQUIRED',
+      actionSummary: '该操作需要你在网页中手动完成。停止操作 5 秒后将自动继续。',
+    },
+    {
+      code: 'UNSUPPORTED_CONTROL',
+      actionSummary: '自动操作暂时无法继续，请在网页中手动操作。停止操作 5 秒后将自动继续。',
+    },
+    {
+      code: 'MANUAL_INTERVENTION_REQUIRED',
+      actionSummary: '自动操作暂时无法继续，请在网页中手动操作。停止操作 5 秒后将自动继续。',
+    },
+  ] as const)(
+    'keeps manual intervention $code in the same turn and replaces stale evidence',
+    async ({ code, actionSummary }) => {
+      let waitingStarted!: () => void
+      let resume!: () => void
+      const started = new Promise<void>((resolve) => { waitingStarted = resolve })
+      const resumed = new Promise<void>((resolve) => { resume = resolve })
+      const dependencies = harness([[
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'manual_initial_inspect',
+          name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期' },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ], [
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'manual_handoff',
+          name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ], [
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ], [
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'manual_field_match',
+          name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ]])
+      dependencies.workflows.list = async () => []
+      let inspection = 0
+      const browser = attachBrowserContinuation(dependencies, {
+        execute: async (tool) => {
+          if (tool === 'browser_session_handoff') return { kind: 'handoff', code }
+          inspection += 1
+          return inspection === 1
+            ? inspectedPrivateFields([{
+                ref: 'ref_old', label: 'OLD_PRIVATE_EVIDENCE_LABEL', value: '1999-01-01',
+              }])
+            : inspectedPrivateFields([{
+                ref: 'ref_expiry', label: '工作居住证有效期', value: '2031-06-30',
+              }])
+        },
+        waitForManualIntervention: async () => {
+          waitingStarted()
+          await resumed
+          return { kind: 'resumed' }
+        },
+      })
+      const running = new AgentOrchestrator(dependencies).run(textRunInput({
+        conversationId: 'browser_conversation', content: '请填写申请信息，并告诉我工作居住证有效期',
+        provider: 'openrouter', model: 'model', requestId: `manual_resume_${code}`,
+      }))
+
+      const observed = await Promise.race([
+        started.then(() => 'waiting' as const),
+        running.then(() => 'terminal' as const),
+      ])
+      expect(observed).toBe('waiting')
+      expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+      expect(dependencies.records.terminal).toHaveLength(0)
+      expect(browser.executor.execute.mock.calls.map(([tool]) => tool)).toEqual([
+        'browser_session_inspect',
+        'browser_session_handoff',
+      ])
+      expect(dependencies.records.events).toContainEqual(expect.objectContaining({
+        type: 'block', block: expect.objectContaining({
+          type: 'browser_status', state: 'awaiting_user', errorCode: code, actionSummary,
+        }),
+      }))
+
+      await Promise.resolve()
+      expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+      resume()
+      await expect(running).resolves.toMatchObject({ status: 'completed' })
+
+      expect(browser.executor.execute.mock.calls.map(([tool]) => tool)).toEqual([
+        'browser_session_inspect',
+        'browser_session_handoff',
+        'browser_session_inspect',
+      ])
+      expect(browser.executor.waitForManualIntervention).toHaveBeenCalledOnce()
+      expect(browser.executor.waitForAuthentication).not.toHaveBeenCalled()
+      const finalRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
+      const finalContext = JSON.stringify(finalRequest.messages)
+      expect(finalContext).toContain('superseded_browser_snapshot')
+      expect(finalContext).not.toContain('OLD_PRIVATE_EVIDENCE_LABEL')
+      const semanticRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[3]![0]
+      const semanticContext = JSON.stringify(semanticRequest.messages)
+      expect(semanticContext).toContain('工作居住证有效期')
+      expect(semanticContext).not.toContain('OLD_PRIVATE_EVIDENCE_LABEL')
+      const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
+      expect(JSON.stringify(terminal.blocks)).toContain('工作居住证有效期：2031-06-30')
+    },
+  )
+
+  it('keeps manual intervention waiting available for Stop', async () => {
+    let waitingStarted!: () => void
+    const started = new Promise<void>((resolve) => { waitingStarted = resolve })
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'manual_stop_handoff',
+        name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }),
+      waitForManualIntervention: async (_runId, context) => {
+        waitingStarted()
+        return new Promise((resolve) => {
+          context.signal?.addEventListener('abort', () => {
+            resolve({ kind: 'tool_error', code: 'CANCELLED' })
+          }, { once: true })
+        })
+      },
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'browser_conversation', content: '继续读取证件',
+      provider: 'openrouter', model: 'model', requestId: 'manual_stop_request',
+    }))
+
+    const observed = await Promise.race([
+      started.then(() => 'waiting' as const),
+      running.then(() => 'terminal' as const),
+    ])
+    expect(observed).toBe('waiting')
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+
+    await orchestrator.cancel('manual_stop_request')
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } })
+    expect(browser.executor.cancel).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { code: 'PAGE_CLOSED', status: 'failed', state: 'failed' },
+    { code: 'DOMAIN_BLOCKED', status: 'failed', state: 'failed' },
+    { code: 'WORKFLOW_CHANGED', status: 'failed', state: 'failed' },
+    { code: 'CANCELLED', status: 'cancelled', state: 'cancelled' },
+    { code: 'INTERNAL_ERROR', status: 'failed', state: 'failed' },
+  ] as const)(
+    'keeps manual intervention terminal failure $code precise',
+    async ({ code, status, state }) => {
+      const dependencies = harness([[
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: `manual_terminal_${code}`,
+          name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ]])
+      dependencies.workflows.list = async () => []
+      attachBrowserContinuation(dependencies, {
+        execute: async () => ({ kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }),
+        waitForManualIntervention: async () => ({ kind: 'tool_error', code }),
+      })
+
+      const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+        conversationId: 'browser_conversation', content: '继续读取证件', provider: 'openrouter',
+        model: 'model', requestId: `manual_terminal_request_${code}`,
+      }))
+
+      expect(result).toMatchObject({ status, error: { code } })
+      const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
+      expect(terminal.blocks).toContainEqual(expect.objectContaining({
+        type: 'browser_status', state, errorCode: code,
+      }))
+    },
+  )
+
+  it('requires a new manual intervention wait when fresh inspection blocks again', async () => {
+    let firstWaitingStarted!: () => void
+    let secondWaitingStarted!: () => void
+    let resumeFirst!: () => void
+    let resumeSecond!: () => void
+    const firstStarted = new Promise<void>((resolve) => { firstWaitingStarted = resolve })
+    const secondStarted = new Promise<void>((resolve) => { secondWaitingStarted = resolve })
+    const firstResumed = new Promise<void>((resolve) => { resumeFirst = resolve })
+    const secondResumed = new Promise<void>((resolve) => { resumeSecond = resolve })
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeated_manual_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeated_manual_handoff',
+        name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'manual_action' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeated_manual_field_match',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let inspection = 0
+    let wait = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => {
+        if (tool === 'browser_session_handoff') {
+          return { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }
+        }
+        inspection += 1
+        if (inspection === 1) return inspectedSnapshot([])
+        if (inspection === 2) return { kind: 'handoff', code: 'MANUAL_INTERVENTION_REQUIRED' }
+        return inspectedPrivateFields([{
+          ref: 'ref_expiry', label: '工作居住证有效期', value: '2032-08-24',
+        }])
+      },
+      waitForManualIntervention: async () => {
+        wait += 1
+        if (wait === 1) {
+          firstWaitingStarted()
+          await firstResumed
+        } else {
+          secondWaitingStarted()
+          await secondResumed
+        }
+        return { kind: 'resumed' }
+      },
+    })
+    const running = new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的工作居住证有效期是？',
+      provider: 'openrouter', model: 'model', requestId: 'repeated_manual_request',
+    }))
+
+    expect(await Promise.race([
+      firstStarted.then(() => 'waiting' as const),
+      running.then(() => 'terminal' as const),
+    ])).toBe('waiting')
+    resumeFirst()
+    expect(await Promise.race([
+      secondStarted.then(() => 'waiting' as const),
+      running.then(() => 'terminal' as const),
+    ])).toBe('waiting')
+    expect(browser.executor.waitForManualIntervention).toHaveBeenCalledTimes(2)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+
+    resumeSecond()
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+    expect(browser.executor.execute.mock.calls.map(([tool]) => tool)).toEqual([
+      'browser_session_inspect',
+      'browser_session_handoff',
+      'browser_session_inspect',
+      'browser_session_inspect',
+    ])
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
+    expect(JSON.stringify(terminal.blocks)).toContain('工作居住证有效期：2032-08-24')
+  })
+
   it('makes a binding created by a workflow available in the same user turn', async () => {
     const dependencies = harness([
       toolTurn,
@@ -5013,7 +5294,7 @@ describe('AgentOrchestrator', () => {
       model: 'model', requestId: `combined_injected_${url.split('/').at(-1)}`,
     }))).resolves.toMatchObject({ status: 'completed' })
 
-    expect(execute).toHaveBeenCalledTimes(2)
+    expect(execute).toHaveBeenCalledTimes(3)
     expect(combined.inspector.resolveRef).toHaveBeenCalledOnce()
     expect(combined.workspace.performContinuationAction).not.toHaveBeenCalled()
     expect(combined.workspace.focusContinuation).toHaveBeenCalledOnce()
@@ -5023,10 +5304,13 @@ describe('AgentOrchestrator', () => {
       role: 'tool', tool_call_id: 'combined_injected_act_call',
       content: expect.stringContaining('MANUAL_ACTION_REQUIRED'),
     }))
-    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
-      expect.objectContaining({
+    expect(dependencies.records.events).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({
         type: 'browser_status', state: 'awaiting_user', errorCode: 'MANUAL_ACTION_REQUIRED',
       }),
+    }))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'browser_status', state: 'completed' }),
     )
   })
 
@@ -5074,10 +5358,13 @@ describe('AgentOrchestrator', () => {
     expect(combined.workspace.performContinuationAction).not.toHaveBeenCalled()
     expect(combined.workspace.focusContinuation).toHaveBeenCalledOnce()
     expect(combined.release).toHaveBeenCalledOnce()
-    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
-      expect.objectContaining({
+    expect(dependencies.records.events).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({
         type: 'browser_status', state: 'awaiting_user', errorCode: 'MANUAL_ACTION_REQUIRED',
       }),
+    }))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks).toContainEqual(
+      expect.objectContaining({ type: 'browser_status', state: 'completed' }),
     )
   })
 
