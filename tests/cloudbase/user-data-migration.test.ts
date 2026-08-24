@@ -121,10 +121,31 @@ describe('CloudBase user data migration', () => {
     expect(canonical).not.toMatch(/jsonb_extract_path_text\([^)]*,\s*'owner(?:UserId|_user_id)'/i)
     expect(canonical).not.toMatch(/(?:cursor|nextCursor|previousCursor)'\s*,\s*(?:mutation\.)?server_sequence/i)
     expect(syncPush).toMatch(/LOOP\s+BEGIN\s/)
-    expect(syncPush).toContain('EXCEPTION WHEN OTHERS THEN')
     expect(syncPush).toContain("'status', 'rejected'")
     expect(syncPush).toContain("'errorCode', 'INVALID_INPUT'")
-    expect(syncPush).not.toMatch(/SQLERRM|SQLSTATE|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL/)
+    expect(syncPush).not.toMatch(/SQLERRM|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL|GET STACKED DIAGNOSTICS/)
+  })
+
+  it('rejects null protocol versions and separates expected data failures from internal failures', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const syncPull = extractFunction(canonical, 'autoforge_sync_pull')
+    const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
+
+    for (const rpc of [syncPush, syncPull, legacyImport]) {
+      expect(rpc).toContain('IF p_protocol_version IS DISTINCT FROM 1 THEN')
+      expect(rpc).toContain("MESSAGE = 'UPGRADE_REQUIRED'")
+    }
+    expect(syncPush).toContain(
+      "WHEN SQLSTATE 'P0001' OR data_exception OR integrity_constraint_violation THEN",
+    )
+    expect(syncPush).toMatch(
+      /WHEN OTHERS THEN\s+RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001'/,
+    )
+    expect(syncPush).not.toMatch(
+      /WHEN OTHERS THEN[\s\S]{0,500}status, error_code[\s\S]{0,200}'rejected', 'INVALID_INPUT'/,
+    )
+    expect(syncPush).not.toMatch(/WHEN OTHERS THEN\s+NULL/)
   })
 
   it('uses rerunnable named indexes and the correct conversation cursor tie break', async () => {
@@ -167,6 +188,40 @@ describe('CloudBase user data migration', () => {
     expect(legacyImport).not.toContain(
       "md5(p_batch_id || ':' || jsonb_array_length(p_conversations)::text",
     )
+  })
+
+  it('contains nullable legacy and preference inputs behind sanitized stable errors', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
+    const updatePreferences = extractFunction(
+      canonical,
+      'autoforge_update_user_data_preferences',
+    )
+
+    expect(legacyImport).toContain(
+      "jsonb_typeof(p_conversations) IS DISTINCT FROM 'array'",
+    )
+    expect(legacyImport).toContain(
+      "jsonb_typeof(p_messages) IS DISTINCT FROM 'array'",
+    )
+    expect(legacyImport).toContain("jsonb_typeof(item) IS DISTINCT FROM 'object'")
+    expect(legacyImport).toContain("'status', 'rejected', 'errorCode', 'INVALID_INPUT'")
+    expect(legacyImport).toMatch(
+      /WHEN OTHERS THEN\s+RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001'/,
+    )
+    expect(legacyImport).not.toMatch(/SQLERRM|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL|GET STACKED DIAGNOSTICS/)
+
+    expect(updatePreferences).toContain('p_timezone IS NULL')
+    expect(updatePreferences).toContain('p_display_currency IS NULL')
+    expect(updatePreferences).toContain("p_display_currency NOT IN ('CNY', 'USD')")
+    expect(updatePreferences).toContain(
+      'EXCEPTION WHEN data_exception OR integrity_constraint_violation THEN',
+    )
+    expect(updatePreferences).toContain("MESSAGE = 'INVALID_INPUT'")
+    expect(updatePreferences).toMatch(
+      /WHEN OTHERS THEN\s+RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001'/,
+    )
+    expect(updatePreferences).not.toMatch(/SQLERRM|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL|GET STACKED DIAGNOSTICS/)
   })
 
   it('exposes only service-role RPC execution and no direct table access', async () => {

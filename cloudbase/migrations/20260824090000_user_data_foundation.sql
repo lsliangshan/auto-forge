@@ -286,12 +286,13 @@ DECLARE
 BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
   PERFORM autoforge_require_identifier(p_device_id, 128);
-  IF p_protocol_version <> 1 THEN
+  IF p_protocol_version IS DISTINCT FROM 1 THEN
     RAISE EXCEPTION USING MESSAGE = 'UPGRADE_REQUIRED', ERRCODE = 'P0001';
   END IF;
-  IF p_mutations IS NULL
-    OR jsonb_typeof(p_mutations) <> 'array'
-    OR jsonb_array_length(p_mutations) > 100
+  IF p_mutations IS NULL OR jsonb_typeof(p_mutations) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF jsonb_array_length(p_mutations) > 100
     OR pg_column_size(p_mutations) > 1048576 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
@@ -520,6 +521,7 @@ BEGIN
     ELSIF mutation_kind = 'preferences.update' THEN
       IF payload->>'timezone' IS NULL
         OR length(payload->>'timezone') NOT BETWEEN 1 AND 128
+        OR payload->>'displayCurrency' IS NULL
         OR payload->>'displayCurrency' NOT IN ('CNY', 'USD') THEN
         mutation_status := 'rejected';
         mutation_error := 'INVALID_INPUT';
@@ -620,28 +622,27 @@ BEGIN
       'revision', result_revision_value,
       'errorCode', mutation_error
     )));
-    EXCEPTION WHEN OTHERS THEN
+    EXCEPTION
+      WHEN SQLSTATE 'P0001' OR data_exception OR integrity_constraint_violation THEN
       IF receipt_ready THEN
-        BEGIN
-          PERFORM pg_advisory_xact_lock(
-            hashtextextended(auth_user_id::text || ':mutation:' || mutation_id, 0)
-          );
-          INSERT INTO app_sync_mutations(
-            owner_user_id, mutation_id, device_id, kind, entity_id, base_revision,
-            status, error_code, mutation_payload, request_hash
-          ) VALUES (
-            auth_user_id, mutation_id, p_device_id, mutation_kind, entity_id,
-            base_revision_value, 'rejected', 'INVALID_INPUT', mutation, request_hash_value
-          )
-          ON CONFLICT (owner_user_id, mutation_id) DO NOTHING
-          RETURNING cursor_token::text INTO latest_cursor;
-        EXCEPTION WHEN OTHERS THEN
-          NULL;
-        END;
+        PERFORM pg_advisory_xact_lock(
+          hashtextextended(auth_user_id::text || ':mutation:' || mutation_id, 0)
+        );
+        INSERT INTO app_sync_mutations(
+          owner_user_id, mutation_id, device_id, kind, entity_id, base_revision,
+          status, error_code, mutation_payload, request_hash
+        ) VALUES (
+          auth_user_id, mutation_id, p_device_id, mutation_kind, entity_id,
+          base_revision_value, 'rejected', 'INVALID_INPUT', mutation, request_hash_value
+        )
+        ON CONFLICT (owner_user_id, mutation_id) DO NOTHING
+        RETURNING cursor_token::text INTO latest_cursor;
       END IF;
       results := results || jsonb_build_array(jsonb_build_object(
         'id', result_id, 'status', 'rejected', 'errorCode', 'INVALID_INPUT'
       ));
+      WHEN OTHERS THEN
+        RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
     END;
   END LOOP;
 
@@ -655,6 +656,11 @@ BEGIN
   LIMIT 1;
 
   RETURN jsonb_strip_nulls(jsonb_build_object('results', results, 'cursor', latest_cursor));
+EXCEPTION
+  WHEN SQLSTATE 'P0001' THEN
+    RAISE;
+  WHEN OTHERS THEN
+    RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
 END;
 $$;
 
@@ -678,7 +684,7 @@ DECLARE
 BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
   PERFORM autoforge_require_identifier(p_device_id, 128);
-  IF p_protocol_version <> 1 THEN
+  IF p_protocol_version IS DISTINCT FROM 1 THEN
     RAISE EXCEPTION USING MESSAGE = 'UPGRADE_REQUIRED', ERRCODE = 'P0001';
   END IF;
   IF p_limit IS NULL OR p_limit < 1 OR p_limit > 100 THEN
@@ -921,14 +927,18 @@ BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
   PERFORM autoforge_require_identifier(p_device_id, 128);
   PERFORM autoforge_require_identifier(p_batch_id, 128);
-  IF p_protocol_version <> 1 THEN
+  IF p_protocol_version IS DISTINCT FROM 1 THEN
     RAISE EXCEPTION USING MESSAGE = 'UPGRADE_REQUIRED', ERRCODE = 'P0001';
   END IF;
-  IF jsonb_typeof(p_conversations) <> 'array'
-    OR jsonb_typeof(p_messages) <> 'array'
-    OR jsonb_array_length(p_conversations) + jsonb_array_length(p_messages) > 100
+  IF jsonb_typeof(p_conversations) IS DISTINCT FROM 'array'
+    OR jsonb_typeof(p_messages) IS DISTINCT FROM 'array'
+    OR p_include_unowned IS NULL THEN
+    RETURN jsonb_build_object(
+      'batchId', p_batch_id, 'status', 'rejected', 'errorCode', 'INVALID_INPUT'
+    );
+  END IF;
+  IF jsonb_array_length(p_conversations) + jsonb_array_length(p_messages) > 100
     OR pg_column_size(p_conversations) + pg_column_size(p_messages) > 1048576
-    OR p_include_unowned IS NULL
     OR COALESCE(p_cloud_sync_consent->>'purpose', '') <> 'cloud_sync'
     OR (p_include_unowned AND COALESCE(p_unowned_import_consent->>'purpose', '') <> 'legacy_unowned_import')
     OR (NOT p_include_unowned AND p_unowned_import_consent IS NOT NULL) THEN
@@ -976,6 +986,7 @@ BEGIN
     );
   END IF;
 
+  BEGIN
   PERFORM autoforge_record_consent(auth_user_id, p_cloud_sync_consent);
   IF p_include_unowned THEN
     PERFORM autoforge_record_consent(auth_user_id, p_unowned_import_consent);
@@ -983,10 +994,18 @@ BEGIN
 
   FOR item IN SELECT value FROM jsonb_array_elements(p_conversations)
   LOOP
-    IF item ? 'ownerUserId' OR item ? 'owner_user_id'
+    IF jsonb_typeof(item) IS DISTINCT FROM 'object'
+      OR item ? 'ownerUserId' OR item ? 'owner_user_id'
+      OR jsonb_typeof(item->'id') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(item->'title') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(item->'titleState') IS DISTINCT FROM 'string'
+      OR item->>'titleState' NOT IN ('pending', 'generating', 'ai_named', 'user_named', 'failed')
+      OR jsonb_typeof(item->'createdAt') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(item->'lastActivityAt') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(item->'metadataUpdatedAt') IS DISTINCT FROM 'string'
       OR (item ? 'sourceUnowned' AND jsonb_typeof(item->'sourceUnowned') <> 'boolean')
       OR (item->'sourceUnowned' = 'true'::jsonb AND NOT p_include_unowned) THEN
-      RAISE EXCEPTION USING MESSAGE = 'IMPORT_CONFIRMATION_REQUIRED', ERRCODE = 'P0001';
+      RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
     END IF;
     PERFORM autoforge_require_identifier(item->>'id', 128);
     INSERT INTO app_conversations(
@@ -1003,10 +1022,18 @@ BEGIN
 
   FOR item IN SELECT value FROM jsonb_array_elements(p_messages)
   LOOP
-    IF item ? 'ownerUserId' OR item ? 'owner_user_id'
+    IF jsonb_typeof(item) IS DISTINCT FROM 'object'
+      OR item ? 'ownerUserId' OR item ? 'owner_user_id'
+      OR jsonb_typeof(item->'id') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(item->'conversationId') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(item->'role') IS DISTINCT FROM 'string'
+      OR item->>'role' NOT IN ('user', 'assistant')
+      OR jsonb_typeof(item->'blocks') IS DISTINCT FROM 'array'
+      OR (item ? 'executionId' AND jsonb_typeof(item->'executionId') <> 'string')
+      OR jsonb_typeof(item->'createdAt') IS DISTINCT FROM 'string'
       OR (item ? 'sourceUnowned' AND jsonb_typeof(item->'sourceUnowned') <> 'boolean')
       OR (item->'sourceUnowned' = 'true'::jsonb AND NOT p_include_unowned) THEN
-      RAISE EXCEPTION USING MESSAGE = 'IMPORT_CONFIRMATION_REQUIRED', ERRCODE = 'P0001';
+      RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
     END IF;
     PERFORM autoforge_require_identifier(item->>'id', 128);
     PERFORM autoforge_require_identifier(item->>'conversationId', 128);
@@ -1053,6 +1080,19 @@ BEGIN
     'importedConversations', imported_conversations,
     'importedMessages', imported_messages
   );
+  EXCEPTION
+    WHEN SQLSTATE 'P0001' OR data_exception OR integrity_constraint_violation THEN
+      RETURN jsonb_build_object(
+        'batchId', p_batch_id, 'status', 'rejected', 'errorCode', 'INVALID_INPUT'
+      );
+    WHEN OTHERS THEN
+      RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
+  END;
+EXCEPTION
+  WHEN SQLSTATE 'P0001' THEN
+    RAISE;
+  WHEN OTHERS THEN
+    RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
 END;
 $$;
 
@@ -1136,6 +1176,7 @@ BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
   IF p_timezone IS NULL OR length(p_timezone) NOT BETWEEN 1 AND 128
     OR p_timezone <> btrim(p_timezone)
+    OR p_display_currency IS NULL
     OR p_display_currency NOT IN ('CNY', 'USD')
     OR p_expected_revision IS NULL OR p_expected_revision < 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
@@ -1150,6 +1191,7 @@ BEGIN
     RAISE EXCEPTION USING MESSAGE = 'SYNC_CONFLICT', ERRCODE = 'P0001';
   END IF;
   next_revision := COALESCE(preferences.revision, 0) + 1;
+  BEGIN
   INSERT INTO app_user_data_preferences(
     owner_user_id, timezone, display_currency, revision
   ) VALUES (
@@ -1160,11 +1202,21 @@ BEGIN
     display_currency = EXCLUDED.display_currency,
     revision = EXCLUDED.revision,
     updated_at = clock_timestamp();
+  EXCEPTION WHEN data_exception OR integrity_constraint_violation THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  WHEN OTHERS THEN
+    RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
+  END;
   RETURN jsonb_build_object(
     'timezone', p_timezone,
     'displayCurrency', p_display_currency,
     'revision', next_revision
   );
+EXCEPTION
+  WHEN SQLSTATE 'P0001' THEN
+    RAISE;
+  WHEN OTHERS THEN
+    RAISE EXCEPTION USING MESSAGE = 'INTERNAL_ERROR', ERRCODE = 'P0001';
 END;
 $$;
 
