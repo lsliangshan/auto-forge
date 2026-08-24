@@ -382,7 +382,7 @@ export interface AgentRunInput extends UsageAttribution {
   contextLength?: number
   currentMedia: CurrentMediaMetadata[]
   allowTools: boolean
-  supportsImageInput: boolean
+  readonly supportsImageInput: boolean
   provider: ModelProviderId
   model: string
   requestId?: string
@@ -425,7 +425,7 @@ interface ActiveAgentRun {
   userId: string
   model: string
   contextLength?: number
-  supportsImageInput: boolean
+  readonly supportsImageInput: boolean
   blocks: ChatBlock[]
   messages: ModelMessage[]
   tools: ModelTool[]

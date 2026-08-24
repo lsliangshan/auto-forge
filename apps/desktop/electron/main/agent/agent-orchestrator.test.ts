@@ -1318,6 +1318,7 @@ describe('AgentOrchestrator', () => {
       assetIds: ['asset_image'],
       currentMedia: [{ kind: 'image' }],
       allowTools: false,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
     })
@@ -1452,6 +1453,7 @@ describe('AgentOrchestrator', () => {
       assetIds: [],
       currentMedia: [],
       allowTools: false,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
     })
@@ -1937,6 +1939,7 @@ describe('AgentOrchestrator', () => {
       assetIds: [],
       currentMedia: [{ kind: 'image' }],
       allowTools: true,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
     })
@@ -2340,6 +2343,7 @@ describe('AgentOrchestrator', () => {
       assetIds: [],
       currentMedia: [{ kind: 'image' }],
       allowTools: false,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
       requestId: 'media_request',

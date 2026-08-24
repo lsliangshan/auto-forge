@@ -47,6 +47,7 @@ const route: ResolvedChatRoute & { outputType: 'video' } = {
   provider: 'openrouter',
   model: 'video-model',
   supportsTools: false,
+  supportsImageInput: false,
   outputType: 'video',
   assets: [],
   generation,
