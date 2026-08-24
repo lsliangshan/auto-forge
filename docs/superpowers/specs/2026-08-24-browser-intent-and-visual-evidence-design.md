@@ -123,11 +123,12 @@ bounds using the same fail-closed principles as the semantic resolver.
 ### BrowserContinuationToolExecutor
 
 The executor exposes one internal, read-only visual-evidence operation to the
-orchestrator. It accepts the exact binding ID and snapshot ID plus the existing
-run context, verifies the active run, lease, current page identity, and stored
-snapshot, and then delegates capture to `BrowserPageInspector`. It returns either
-the bounded visual bundle or the existing safe tool-error shape. This operation
-is not added to the model tool catalog and cannot perform browser mutations.
+orchestrator. It accepts the exact binding ID, snapshot ID, bounded Main-owned
+cursor pages, and existing run context; verifies the active run, lease, current
+page identity, stored latest snapshot, and supplied page identity; and then
+delegates capture to `BrowserPageInspector`. It returns either the bounded visual
+bundle or the existing safe tool-error shape. This operation is not added to the
+model tool catalog and cannot perform browser mutations.
 
 ### Existing Semantic Resolver
 
