@@ -30,6 +30,13 @@ export interface CloudBaseAuthPort {
   signOut(): Promise<unknown>
 }
 
+export interface CloudBaseFunctionPort {
+  callFunction(options: {
+    name: string
+    data: Record<string, unknown>
+  }): Promise<unknown>
+}
+
 interface CloudBaseFactory {
   init(config: {
     env: string
@@ -38,8 +45,7 @@ interface CloudBaseFactory {
     auth: { detectSessionInUrl: false }
   }): {
     auth: CloudBaseAuthPort
-    callFunction(options: { name: string; data: Record<string, unknown> }): Promise<unknown>
-  }
+  } & CloudBaseFunctionPort
 }
 
 const cloudBaseFactory: CloudBaseFactory = {
