@@ -190,6 +190,58 @@ describe('CloudBase user data migration', () => {
     )
   })
 
+  it('projects accepted legacy rows through ordered deterministic sync receipts', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
+    const conversationReceipt = legacyImport.indexOf(
+      "conversation_mutation_id := 'legacy-conversation:' || md5(",
+    )
+    const messageLoop = legacyImport.indexOf(
+      'FOR item IN SELECT value FROM jsonb_array_elements(p_messages)',
+    )
+    const messageReceipt = legacyImport.indexOf(
+      "message_mutation_id := 'legacy-message:' || md5(",
+    )
+    const reducedReceipt = legacyImport.lastIndexOf(
+      "auth_user_id, p_batch_id, p_device_id, 'legacy.import'",
+    )
+
+    expect(conversationReceipt).toBeGreaterThan(-1)
+    expect(messageLoop).toBeGreaterThan(conversationReceipt)
+    expect(messageReceipt).toBeGreaterThan(messageLoop)
+    expect(reducedReceipt).toBeGreaterThan(messageReceipt)
+    expect(legacyImport).toContain("p_batch_id || ':conversation:' || item->>'id'")
+    expect(legacyImport).toContain("p_batch_id || ':message:' || item->>'id'")
+    expect(legacyImport).toContain(
+      "'title', item->>'title', 'titleState', item->>'titleState'",
+    )
+    expect(legacyImport).toContain(
+      "'createdAt', item->>'createdAt', 'lastActivityAt', item->>'lastActivityAt'",
+    )
+    expect(legacyImport).toContain(
+      "'id', item->>'id', 'conversationId', item->>'conversationId'",
+    )
+    expect(legacyImport).toContain(
+      "'role', item->>'role', 'blocks', item->'blocks'",
+    )
+    expect(legacyImport).toContain(
+      "'executionId', NULLIF(item->>'executionId', '')",
+    )
+    expect(legacyImport).toContain('message_base_revision := conversation_row.revision')
+    expect(legacyImport).toContain('revision = message_base_revision + 1')
+    expect(legacyImport).toContain(
+      "'message.append', item->>'id', message_base_revision, message_base_revision + 1",
+    )
+    expect(legacyImport).toMatch(
+      /IF inserted_count = 1 THEN[\s\S]+?conversation_mutation_id[\s\S]+?END IF;[\s\S]+?FOR item IN SELECT value FROM jsonb_array_elements\(p_messages\)/,
+    )
+    expect(legacyImport).toMatch(
+      /IF inserted_count = 1 THEN[\s\S]+?message_base_revision := conversation_row\.revision[\s\S]+?UPDATE app_conversations[\s\S]+?message_mutation_id[\s\S]+?END IF;[\s\S]+?INSERT INTO app_sync_mutations\(/,
+    )
+    expect(legacyImport.indexOf("receipt.kind = 'legacy.import'"))
+      .toBeLessThan(legacyImport.indexOf('BEGIN\n  PERFORM autoforge_record_consent'))
+  })
+
   it('contains nullable legacy and preference inputs behind sanitized stable errors', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')

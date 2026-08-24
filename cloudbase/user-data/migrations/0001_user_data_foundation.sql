@@ -922,6 +922,10 @@ DECLARE
   imported_messages integer := 0;
   inserted_count integer;
   next_ordinal bigint;
+  message_base_revision bigint;
+  conversation_mutation_id text;
+  message_mutation_id text;
+  row_mutation_payload jsonb;
   legacy_request_hash text;
 BEGIN
   auth_user_id := autoforge_resolve_user_id(p_caller_user_id);
@@ -1018,6 +1022,30 @@ BEGIN
     ) ON CONFLICT (owner_user_id, id) DO NOTHING;
     GET DIAGNOSTICS inserted_count = ROW_COUNT;
     imported_conversations := imported_conversations + inserted_count;
+    IF inserted_count = 1 THEN
+      conversation_mutation_id := 'legacy-conversation:' || md5(
+        p_batch_id || ':conversation:' || item->>'id'
+      );
+      row_mutation_payload := jsonb_build_object(
+        'id', conversation_mutation_id,
+        'entityId', item->>'id',
+        'baseRevision', 0,
+        'kind', 'conversation.create',
+        'payload', jsonb_build_object(
+          'title', item->>'title', 'titleState', item->>'titleState',
+          'createdAt', item->>'createdAt', 'lastActivityAt', item->>'lastActivityAt',
+          'metadataUpdatedAt', item->>'metadataUpdatedAt'
+        )
+      );
+      INSERT INTO app_sync_mutations(
+        owner_user_id, mutation_id, device_id, kind, entity_id, base_revision,
+        result_revision, status, mutation_payload, request_hash
+      ) VALUES (
+        auth_user_id, conversation_mutation_id, p_device_id, 'conversation.create',
+        item->>'id', 0, 1, 'applied', row_mutation_payload,
+        md5(row_mutation_payload::text)
+      );
+    END IF;
   END LOOP;
 
   FOR item IN SELECT value FROM jsonb_array_elements(p_messages)
@@ -1058,6 +1086,37 @@ BEGIN
     ) ON CONFLICT (owner_user_id, id) DO NOTHING;
     GET DIAGNOSTICS inserted_count = ROW_COUNT;
     imported_messages := imported_messages + inserted_count;
+    IF inserted_count = 1 THEN
+      message_base_revision := conversation_row.revision;
+      UPDATE app_conversations SET
+        revision = message_base_revision + 1,
+        last_activity_at = GREATEST(last_activity_at, (item->>'createdAt')::timestamptz)
+      WHERE owner_user_id = auth_user_id
+        AND id = item->>'conversationId';
+      message_mutation_id := 'legacy-message:' || md5(
+        p_batch_id || ':message:' || item->>'id'
+      );
+      row_mutation_payload := jsonb_build_object(
+        'id', message_mutation_id,
+        'entityId', item->>'id',
+        'baseRevision', message_base_revision,
+        'kind', 'message.append',
+        'payload', jsonb_strip_nulls(jsonb_build_object(
+          'id', item->>'id', 'conversationId', item->>'conversationId',
+          'role', item->>'role', 'blocks', item->'blocks',
+          'executionId', NULLIF(item->>'executionId', ''),
+          'createdAt', item->>'createdAt'
+        ))
+      );
+      INSERT INTO app_sync_mutations(
+        owner_user_id, mutation_id, device_id, kind, entity_id, base_revision,
+        result_revision, status, mutation_payload, request_hash
+      ) VALUES (
+        auth_user_id, message_mutation_id, p_device_id,
+        'message.append', item->>'id', message_base_revision, message_base_revision + 1,
+        'applied', row_mutation_payload, md5(row_mutation_payload::text)
+      );
+    END IF;
   END LOOP;
 
   INSERT INTO app_sync_mutations(

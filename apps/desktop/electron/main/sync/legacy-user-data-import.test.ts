@@ -179,6 +179,36 @@ describe('LegacyUserDataImporter', () => {
     expect(test.importLegacyBatch).toHaveBeenCalledTimes(1)
   })
 
+  it('omits a legacy null execution id on the strict wire and preserves a string id', async () => {
+    const legacy = harness([conversation('owned', 'alice', 'Owned', 1_000)], [
+      { ...message('without_execution', 'owned', 1_100), executionId: null } as unknown as Message,
+      { ...message('with_execution', 'owned', 1_200), executionId: 'execution_1' },
+    ]).legacy
+    const wireCalls: Extract<CloudBaseUserDataCall, { action: 'importLegacyBatch' }>[] = []
+    const port = new CloudBaseUserDataPort({
+      callFunction: vi.fn(async ({ data }) => {
+        const batch = data as Extract<CloudBaseUserDataCall, { action: 'importLegacyBatch' }>
+        wireCalls.push(structuredClone(batch))
+        return { result: { ok: true, data: { batchId: batch.batchId, status: 'applied' } } }
+      }),
+    })
+    const root = mkdtempSync(join(tmpdir(), 'autoforge-legacy-execution-id-'))
+    roots.push(root)
+    const stores = new UserDataStoreManager(root)
+    const engine = new UserDataSyncEngine(port, stores)
+    await engine.start('alice', 'device-a')
+    const importer = new LegacyUserDataImporter(legacy, engine)
+
+    await expect(importer.import('alice', confirmation(false))).resolves.toHaveLength(1)
+    expect(wireCalls).toHaveLength(1)
+    expect(wireCalls[0]!.messages).toEqual([
+      expect.not.objectContaining({ executionId: expect.anything() }),
+      expect.objectContaining({ executionId: 'execution_1' }),
+    ])
+    await engine.pause()
+    stores.close()
+  })
+
   it('splits at the exact final wire-call threshold through the real engine and strict port', async () => {
     const calibration = harness([
       conversation('owned', 'alice', 'Small', 1_000),

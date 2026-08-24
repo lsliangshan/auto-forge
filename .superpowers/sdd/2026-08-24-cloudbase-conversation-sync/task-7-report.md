@@ -19,6 +19,9 @@
 - CloudBase usage responses canonicalize SQL numeric strings such as `0.010000000000` to `0.01` before the strict public decimal schema. Monthly bounds use the saved IANA timezone, including east/west UTC month-boundary coverage.
 - Imported conversation activity is the maximum of its conversation timestamps and latest selected message timestamp.
 - Review round 2 centralizes the one-MiB wire limit in the strict CloudBase port. The Task 5 engine constructs and measures the exact final `importLegacyBatch` call, including action, protocol version, and the active device binding; the importer uses that same measurement before accepting a record into a batch. Near-limit batches therefore split before transport, without UUID-specific byte reservations, while an individually oversized record still fails safely.
+- Import-projection follow-up: the SQL import RPC now appends deterministic `conversation.create` receipts before imported message receipts, advances each conversation through sequential `message.append` revisions, and keeps the reduced `legacy.import` receipt last. A duplicate batch still exits before row work, while the existing inner exception block keeps rejected batches transactional.
+- Main now awaits ordinary paged pull after all accepted import batches, so the current per-UID cache is hydrated before success returns and another profile hydrates through the same pull path. A stopped/retrying pull surfaces its safe status instead of reporting import success. There are no direct local snapshot writes.
+- Legacy SQLite `execution_id = NULL` is omitted from the strict import wire, while a present string execution ID is preserved.
 
 ## TDD evidence
 
@@ -32,6 +35,7 @@ RED was observed before implementation:
 - Video completion: no remote-safe BYOK event was emitted for terminal video cost.
 - Review round 1: seven focused failures reproduced non-canonical SQL cost, stale imported activity, rejected import continuation, missing binding-generation verification, and non-sequential preference projections/receipt overwrite. Additional RED tests reproduced the renderer-controlled import identity, missing persisted root, and confirmed-cost BYOK labels.
 - Review round 2: the real importer -> engine -> strict-port threshold test failed with `INVALID_INPUT` because the importer admitted a request whose final authenticated call was one byte above 1,048,576 bytes.
+- Import-projection follow-up: the SQL static test first failed because no deterministic normal row receipts existed; the real Main/in-memory-port test then returned an empty current-profile cache because import success did not await pull, and a lost projection pull incorrectly returned a duplicate import success. A strict importer -> engine -> CloudBase-port test also failed with `INVALID_INPUT` because a normal absent SQLite execution ID was serialized as `null`.
 
 GREEN verification is listed below.
 
@@ -86,6 +90,7 @@ Review follow-up verification:
 - All workspace typechecks: passed.
 - ESLint over all review-changed TypeScript/Vue files: 0 errors; the same four pre-existing compact-markup warnings remain in `SettingsView.vue`.
 - Review round 2 focused importer/engine/port suite: 60/60 passed; Desktop typecheck, focused lint, and `git diff --check` passed.
+- Import-projection follow-up: migration tests passed 11/11; focused application/importer/engine/cache/strict-port tests passed 262/262; shared contracts passed 81/81; Desktop typecheck and focused ESLint passed. The two SQL migration copies remained byte-identical and `git diff --check` passed.
 
 ## Remaining staging-only gaps
 

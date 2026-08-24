@@ -19,6 +19,7 @@ import {
   type ChatSendInput,
   type ExecutionEvent,
   type ModelInfo,
+  type PulledMutation,
   type ProxySettings,
   type SyncMutation,
   type WorkflowDetail,
@@ -913,6 +914,208 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.close()).resolves.toBeUndefined()
   })
 
+  it('hydrates imported rows through paged ordinary pull for the current and a second profile', async () => {
+    const firstRoot = await mkdtemp(join(tmpdir(), 'autoforge-application-import-projection-a-'))
+    const secondRoot = await mkdtemp(join(tmpdir(), 'autoforge-application-import-projection-b-'))
+    directories.push(firstRoot, secondRoot)
+    openAppDatabase(join(firstRoot, 'autoforge.sqlite')).close()
+    const seeded = new Database(join(firstRoot, 'autoforge.sqlite'))
+    seeded.transaction(() => {
+      for (let index = 0; index < 50; index += 1) {
+        const createdAt = 1_700_000_000_000 + index * 10
+        seeded.prepare(`
+          INSERT INTO conversations(id, title, title_state, user_id, created_at, updated_at)
+          VALUES (?, ?, 'user_named', NULL, ?, ?)
+        `).run(`legacy_projection_${index}`, `Projected ${index}`, createdAt, createdAt)
+        seeded.prepare(`
+          INSERT INTO messages(id, conversation_id, role, blocks_json, ordinal, created_at)
+          VALUES (?, ?, 'user', ?, 1, ?)
+        `).run(
+          `legacy_projection_message_${index}`,
+          `legacy_projection_${index}`,
+          JSON.stringify([{ type: 'text', text: `Projected message ${index}` }]),
+          createdAt + 1,
+        )
+      }
+    })()
+    seeded.close()
+
+    const events: PulledMutation[] = []
+    const revisions = new Map<string, number>()
+    const importedBatches: Extract<CloudBaseUserDataCall, { action: 'importLegacyBatch' }>[] = []
+    const acceptedBatches = new Set<string>()
+    let rejectNextPull = false
+    const cursorFor = (position: number) => `cursor_projection_${position.toString().padStart(8, '0')}`
+    const cursorPosition = (cursor: string | undefined) => (
+      cursor === undefined ? 0 : Number(cursor.slice('cursor_projection_'.length))
+    )
+    const receivedAt = '2026-08-25T00:00:00.000Z'
+    const append = (mutation: PulledMutation) => { events.push(mutation) }
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall) => {
+        if (input.action === 'syncPush') {
+          const results = input.mutations.map((mutation) => {
+            const resultRevision = mutation.kind === 'privacy.consent'
+              || mutation.kind === 'usage.record'
+              || mutation.kind === 'legacy.import'
+              ? 0
+              : mutation.baseRevision + 1
+            append({
+              id: mutation.id, kind: mutation.kind, entityId: mutation.entityId,
+              baseRevision: mutation.baseRevision, payload: mutation.payload,
+              resultRevision, receivedAt,
+            } as PulledMutation)
+            return { id: mutation.id, status: 'applied' as const, revision: resultRevision }
+          })
+          return {
+            ok: true as const,
+            data: { results, cursor: cursorFor(events.length) },
+          }
+        }
+        if (input.action === 'syncPull') {
+          if (rejectNextPull) {
+            rejectNextPull = false
+            return { ok: false as const, error: { code: 'SERVICE_UNAVAILABLE' as const } }
+          }
+          const start = cursorPosition(input.cursor)
+          const page = events.slice(start, start + (input.limit ?? 100))
+          return {
+            ok: true as const,
+            data: {
+              mutations: structuredClone(page),
+              cursor: page.length > 0 ? cursorFor(start + page.length) : input.cursor ?? null,
+            },
+          }
+        }
+        if (input.action === 'importLegacyBatch') {
+          importedBatches.push(structuredClone(input))
+          if (acceptedBatches.has(input.batchId)) {
+            return {
+              ok: true as const,
+              data: { batchId: input.batchId, status: 'duplicate' as const },
+            }
+          }
+          acceptedBatches.add(input.batchId)
+          for (const conversation of input.conversations) {
+            revisions.set(conversation.id, 1)
+            append({
+              id: `legacy-conversation:${createHash('md5')
+                .update(`${input.batchId}:conversation:${conversation.id}`).digest('hex')}`,
+              kind: 'conversation.create', entityId: conversation.id,
+              baseRevision: 0, resultRevision: 1, receivedAt,
+              payload: {
+                title: conversation.title, titleState: conversation.titleState,
+                createdAt: conversation.createdAt, lastActivityAt: conversation.lastActivityAt,
+                metadataUpdatedAt: conversation.metadataUpdatedAt,
+              },
+            })
+          }
+          for (const message of input.messages) {
+            const baseRevision = revisions.get(message.conversationId)
+            if (baseRevision === undefined) throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+            revisions.set(message.conversationId, baseRevision + 1)
+            append({
+              id: `legacy-message:${createHash('md5')
+                .update(`${input.batchId}:message:${message.id}`).digest('hex')}`,
+              kind: 'message.append', entityId: message.id,
+              baseRevision, resultRevision: baseRevision + 1, receivedAt,
+              payload: {
+                id: message.id, conversationId: message.conversationId,
+                role: message.role, blocks: message.blocks, createdAt: message.createdAt,
+                ...(typeof message.executionId === 'string'
+                  ? { executionId: message.executionId }
+                  : {}),
+              },
+            })
+          }
+          append({
+            id: input.batchId, kind: 'legacy.import', entityId: input.batchId,
+            baseRevision: 0, resultRevision: 0, receivedAt,
+            payload: { batchId: input.batchId, includeUnowned: input.includeUnowned },
+          })
+          return {
+            ok: true as const,
+            data: {
+              batchId: input.batchId, status: 'applied' as const,
+              importedConversations: input.conversations.length,
+              importedMessages: input.messages.length,
+            },
+          }
+        }
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }),
+    }
+    const first = createApplicationRuntime(options(firstRoot, { userDataSyncPort }))
+    const second = createApplicationRuntime(options(secondRoot, { userDataSyncPort }))
+    const importInput = {
+      includeUnowned: true,
+      cloudSyncConsent: {
+        purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+        consentedAt: receivedAt, clientVersion: '0.1.0',
+      },
+      unownedImportConsent: {
+        purpose: 'legacy_unowned_import' as const,
+        documentVersion: 'legacy-unowned-import-2026-08',
+        consentedAt: receivedAt, clientVersion: '0.1.0',
+      },
+    }
+    try {
+      await authenticate(first, 'ProjectionAlice')
+      await expect(first.services.settings.importLegacyData(importInput)).resolves.toEqual([
+        expect.objectContaining({
+          status: 'applied', importedConversations: 50, importedMessages: 50,
+        }),
+      ])
+      expect(importedBatches).toHaveLength(1)
+      expect(events.slice(-101).map(({ kind }) => kind)).toEqual([
+        ...Array.from({ length: 50 }, () => 'conversation.create'),
+        ...Array.from({ length: 50 }, () => 'message.append'),
+        'legacy.import',
+      ])
+      expect(JSON.stringify(events.slice(-101))).not.toMatch(/sourceUnowned|ownerUserId|owner_user_id/)
+      expect(userDataSyncPort.call.mock.calls
+        .map(([call]) => call)
+        .filter((call) => call.action === 'syncPull'))
+        .toEqual(expect.arrayContaining([
+          expect.objectContaining({ cursor: cursorFor(2), limit: 100 }),
+        ]))
+      expect(withUserData(firstRoot, 'test_user_projectionalice', (store) => (
+        store.sync.getCheckpoint()?.remoteCursor
+      ))).toBe(cursorFor(events.length))
+      const importedConversation = importedBatches[0]!.conversations[0]!
+      const firstConversations = await listConversations(first)
+      expect(firstConversations).toHaveLength(50)
+      expect(firstConversations).toContainEqual(expect.objectContaining({
+        id: importedConversation.id, syncState: 'synced', revision: 2,
+      }))
+      const importedMessage = importedBatches[0]!.messages.find(
+        ({ conversationId }) => conversationId === importedConversation.id,
+      )!
+      await expect(listMessages(first, importedConversation.id)).resolves.toEqual([
+        expect.objectContaining({
+          conversationId: importedConversation.id,
+          blocks: importedMessage.blocks,
+        }),
+      ])
+
+      await authenticate(second, 'ProjectionAlice')
+      const secondConversations = await listConversations(second)
+      expect(secondConversations).toHaveLength(50)
+      expect(secondConversations).toContainEqual(expect.objectContaining({
+        id: importedConversation.id, syncState: 'synced', revision: 2,
+      }))
+      await expect(listMessages(second, importedConversation.id)).resolves.toHaveLength(1)
+      expect(userDataSyncPort.call.mock.calls.filter(([call]) => call.action === 'syncPull').length)
+        .toBeGreaterThanOrEqual(6)
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      rejectNextPull = true
+      await expect(first.services.settings.importLegacyData(importInput))
+        .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+    } finally {
+      await Promise.all([first.close(), second.close()])
+    }
+  })
+
   it('uses saved IANA timezone month bounds and consecutive public preference revisions', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-timezone-'))
@@ -1090,7 +1293,8 @@ describe('createApplicationRuntime', () => {
             ok: true as const,
             data: {
               results: input.mutations.map((mutation) => ({
-                id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+                id: mutation.id, status: 'applied' as const,
+                revision: mutation.kind === 'privacy.consent' ? 0 : mutation.baseRevision + 1,
               })),
               cursor: 'cursor_import_race_push',
             },

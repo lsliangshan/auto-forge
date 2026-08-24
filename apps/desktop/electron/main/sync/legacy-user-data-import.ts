@@ -127,7 +127,7 @@ export class LegacyUserDataImporter {
             conversationId: conversationIds.get(row.conversationId)!,
             role: row.role === 'user' ? 'user' : 'assistant',
             blocks: chatBlockSchema.array().parse(row.blocks),
-            ...(row.executionId === undefined ? {} : { executionId: row.executionId }),
+            ...(typeof row.executionId === 'string' ? { executionId: row.executionId } : {}),
             createdAt: iso(row.createdAt), ...(sourceUnowned ? { sourceUnowned: true } : {}),
           },
         })

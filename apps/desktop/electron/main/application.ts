@@ -2150,10 +2150,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           } : {}),
           candidateBatchId: `legacy-${randomUUID()}`,
         })
-        return legacyUserDataImporter.import(session.user.id, {
+        const results = await legacyUserDataImporter.import(session.user.id, {
           ...confirmation.data,
           batchId,
         })
+        await userDataSync.pull()
+        const pullStatus = userDataSync.status()
+        if (pullStatus.state !== 'idle') {
+          throw failure('errorCode' in pullStatus ? pullStatus.errorCode ?? 'INTERNAL_ERROR' : 'INTERNAL_ERROR')
+        }
+        return results
       },
       getAccountDataPreferences: async (): Promise<AccountDataPreferences> => {
         await requireAuthenticatedSession()
