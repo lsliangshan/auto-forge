@@ -1,4 +1,5 @@
 import {
+  matchesHttpsUrlPattern,
   toSafeAppError,
   type AppError,
   type AppErrorCode,
@@ -120,10 +121,14 @@ export class BrowserCapabilityService implements CapabilityPort {
     return this.executions.size > 0
   }
 
-  async request(context: BrowserCapabilityContext, request: WorkerCapabilityRequest): Promise<unknown> {
+  async request(
+    context: BrowserCapabilityContext,
+    request: WorkerCapabilityRequest,
+    declaredScope?: CapabilityScope,
+  ): Promise<unknown> {
     switch (request.capability) {
       case 'browser.open':
-        return this.open(context, request.arguments.url, request.scope)
+        return this.open(context, request.arguments.url, request.scope, declaredScope)
       case 'browser.fill':
         return this.fill(context, request.arguments.locator, request.arguments.value, request.scope)
       case 'browser.click':
@@ -138,16 +143,30 @@ export class BrowserCapabilityService implements CapabilityPort {
   async open(
     context: BrowserCapabilityContext,
     url: string,
+    requestedScope?: CapabilityScope,
     declaredScope?: CapabilityScope,
   ): Promise<void> {
     const state = await this.stateForCurrentUser(context, true)
     const origin = originOf(url)
-    const authorizedScope = await this.authorize(context, 'browser.open', declaredScope, origin)
+    const authorizedScope = await this.authorize(context, 'browser.open', requestedScope, origin)
+    const declaredPatterns = declaredScope && 'origins' in declaredScope
+      ? declaredScope.origins
+      : undefined
     this.assertActive(state)
     const tab = await this.ensureTab(state)
     this.assertActive(state)
-    await tab.open(url, authorizedScope.origins)
-    await this.authorizeCurrent(state, 'browser.open', declaredScope)
+    if (declaredPatterns) {
+      await tab.open(url, authorizedScope.origins, declaredPatterns)
+    } else {
+      await tab.open(url, authorizedScope.origins)
+    }
+    const currentUrl = await tab.url()
+    const currentOrigin = originOf(currentUrl)
+    if (authorizedScope.origins.includes(currentOrigin)) {
+      await this.authorizeCurrent(state, 'browser.open', requestedScope)
+    } else if (!declaredPatterns?.some((pattern) => matchesHttpsUrlPattern(pattern, currentUrl))) {
+      throw failure('CAPABILITY_SCOPE_DENIED')
+    }
     const binding = this.bindingInput(state.context, tab.id)
     if (binding && this.options.continuationRegistry) {
       this.options.continuationRegistry.bind(binding)

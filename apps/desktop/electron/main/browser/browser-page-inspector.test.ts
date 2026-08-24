@@ -1188,6 +1188,32 @@ describe('BrowserPageInspector', () => {
     })
   })
 
+  it('allows only declared cross-origin login URLs during authentication probing', async () => {
+    const loginOrigin = 'https://sso.example.gov.cn'
+    const exactBinding = binding({
+      auth: { loginUrls: [`${loginOrigin}/login/*`] },
+      readableRegions: ['role=main'],
+    })
+    const port = new FakeCdpPort([
+      node(10, 'main', '统一身份认证', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'textbox', '用户名'),
+      node(12, 'textbox', '密码', { dom: { tagName: 'input', inputType: 'password' } }),
+    ], {
+      origin: loginOrigin,
+      url: `${loginOrigin}/login/oauth`,
+      locatorMatches: [{ locator: 'role=main', backendNodeIds: [10] }],
+    })
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+    const authority = input(exactBinding, { origin: loginOrigin })
+
+    await expect(inspector.currentPageContext(authority))
+      .rejects.toMatchObject({ code: 'DOMAIN_BLOCKED' })
+    await expect(inspector.currentPageContext(input(exactBinding, {
+      origin: loginOrigin,
+      allowAuthLoginUrls: true,
+    }))).resolves.toMatchObject({ auth: 'required' })
+  })
+
   it('captures only a current safe bounded node for a vision-capable model', async () => {
     const port = new FakeCdpPort([
       node(10, 'main', '详情', { axNodeId: 'ax_main', parentAxNodeId: undefined }),

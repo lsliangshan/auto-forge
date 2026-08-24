@@ -41,6 +41,7 @@ import type {
   ModelStreamRequest,
 } from '../main/chat/model-provider.js'
 import { BrowserContinuationRegistry } from '../main/browser/browser-continuation-registry.js'
+import { BrowserLoginWaitCoordinator } from '../main/browser/browser-login-wait-coordinator.js'
 import type {
   BrowserContinuationBinding,
   BrowserContinuationBindingInput,
@@ -692,9 +693,12 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
     startedAt: Date.now(),
   })
   const inspector = new BrowserPageInspector(workspace)
+  const loginWait = new BrowserLoginWaitCoordinator({
+    onPageInvalidated: (listener) => workspace.onPageInvalidated(listener),
+  })
   let runActive = true
   const executor = new BrowserContinuationToolExecutor({
-    registry: registry(), inspector, workspace, audits: database.browserActionAudits,
+    registry: registry(), inspector, workspace, loginWait, audits: database.browserActionAudits,
     isRunActive: (runId) => runActive && runId === current.runId,
   })
   const inspect = () => executor.execute('browser_session_inspect', {
@@ -790,6 +794,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
   } finally {
     runActive = false
     await executor.endRun(current.runId)
+    loginWait.dispose()
     inspector.dispose()
     database.close()
   }
@@ -974,7 +979,7 @@ async function installFixtureWorkflow(): Promise<string> {
     ],
     browserContinuation: {
       auth: {
-        loginUrls: [`${fixtureOrigin}/login`],
+        loginUrls: [`${fixtureOrigin}/login*`],
         loggedIn: ['role=button[name="退出"]'],
         loggedOut: ['css=#manual-login'],
       },

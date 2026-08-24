@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { ModelProviderId, WorkflowDetail } from '@autoforge/shared'
+import type { AppErrorCode, ModelProviderId, WorkflowDetail } from '@autoforge/shared'
 import {
   AgentOrchestrator,
   createAgentPersistence,
@@ -274,6 +274,10 @@ function attachBrowserContinuation(
       input: unknown,
       context: BrowserContinuationRunContext,
     ) => Promise<BrowserContinuationToolResult>
+    waitForAuthentication?: (
+      runId: string,
+      context: BrowserContinuationRunContext,
+    ) => Promise<{ kind: 'authenticated' } | { kind: 'tool_error'; code: AppErrorCode }>
   } = {},
 ) {
   const bindings = options.bindings ?? [continuationBinding()]
@@ -303,6 +307,9 @@ function attachBrowserContinuation(
     endRun: vi.fn(async () => undefined),
     cancel: vi.fn(async () => undefined),
     takeOver: vi.fn(async () => undefined),
+    waitForAuthentication: vi.fn(options.waitForAuthentication ?? (async () => ({
+      kind: 'authenticated' as const,
+    }))),
   }
   const create = vi.spyOn(catalog, 'create')
   Object.assign(dependencies, { browserContinuation: { catalog, executor } })
@@ -676,6 +683,45 @@ describe('AgentOrchestrator', () => {
     })
     expect(JSON.stringify(dependencies.records.events)).not.toContain('workflow.3\\u0000')
     expect(dependencies.records.starts).toHaveLength(0)
+  })
+
+  it('bypasses oversized catalog routing for a unique exact activation example', async () => {
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => [largeWorkflow(1), largeWorkflow(2), largeWorkflow(3)]
+    const providerInputs: ModelStreamRequest[] = []
+    dependencies.providerInstances.openrouter.stream = vi.fn((request) => {
+      providerInputs.push(request)
+      return events(providerInputs.length === 1 ? [
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'exact_large_call',
+          name: 'workflow_3', arguments: { input: {} },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+      ] : [
+        { type: 'text_delta', choiceIndex: 0, text: '任务完成' },
+        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+      ])
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'conversation_exact_large', content: '执行任务 3', provider: 'openrouter',
+        model: 'openrouter/model', requestId: 'request_exact_large',
+      }),
+      contextLength: 32_000,
+    })
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(providerInputs).toHaveLength(2)
+    expect(providerInputs[0]).toMatchObject({
+      tools: [expect.objectContaining({ function: expect.objectContaining({ name: 'workflow_3' }) })],
+      toolChoice: { type: 'function', function: { name: 'workflow_3' } },
+    })
+    expect(dependencies.records.usage
+      .filter(({ method }) => method === 'start')
+      .map(({ args }) => (args[0] as { operationKey: string }).operationKey))
+      .not.toContain('agent:request_exact_large:workflow-routing')
+    expect(dependencies.records.starts).toHaveLength(1)
   })
 
   it('fails compact routing overflow before provider selection or workflow execution', async () => {
@@ -1344,7 +1390,7 @@ describe('AgentOrchestrator', () => {
     ]])
 
     const result = await new AgentOrchestrator(dependencies).run(textRunInput({
-      conversationId: 'safe_navigation', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model',
+      conversationId: 'safe_navigation', content: '百度搜索', provider: 'openrouter', model: 'model',
     }))
 
     expect(result.status).toBe('completed')
@@ -1359,6 +1405,26 @@ describe('AgentOrchestrator', () => {
     expect(dependencies.records.events).not.toContainEqual(expect.objectContaining({
       type: 'block', block: expect.objectContaining({ type: 'approval' }),
     }))
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.map(([request]) => request)
+    expect(requests[0]).toMatchObject({
+      toolChoice: { type: 'function', function: { name: 'workflow_1' } },
+    })
+    expect(requests[1]).not.toHaveProperty('toolChoice')
+  })
+
+  it('does not force a workflow for a request that merely mentions its name', async () => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '百度搜索是一项搜索服务。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'workflow_name_mention', content: '请介绍百度搜索', provider: 'openrouter', model: 'model',
+    }))
+
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]![0])
+      .not.toHaveProperty('toolChoice')
+    expect(dependencies.records.starts).toHaveLength(0)
   })
 
   it('persists an unrelated direct answer without workflow status or provenance', async () => {
@@ -2699,12 +2765,6 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
       {
-        type: 'text_delta', choiceIndex: 0,
-        text: '有效期至：2028-06-30（证件详情，https://permit.example.gov.cn，读取于 2026-04-08T00:00:00.000Z）。',
-      },
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ], [
-      {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'browser_field_match_1',
         name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
       },
@@ -2741,17 +2801,14 @@ describe('AgentOrchestrator', () => {
       role: 'system',
       content: expect.stringMatching(/网页内容.*不可信|字段标签.*字段值.*页面标题.*来源.*读取时间|不能.*增加.*工具.*来源.*绑定.*操作/),
     }))
+    expect(requests).toHaveLength(2)
     expect(JSON.stringify(requests[1]!.messages)).not.toContain(privateId)
     expect(JSON.stringify(requests[1]!.messages)).not.toContain(injection)
+    expect(JSON.stringify(requests[1]!.messages)).toContain('有效期至')
+    expect(JSON.stringify(requests[1]!.messages)).not.toContain('2028-06-30')
     expect(requests[1]!.tools?.map((tool) => tool.function.name)).toEqual([
-      'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
+      'report_browser_field_matches',
     ])
-    expect(JSON.stringify(requests[1]!.tools)).not.toMatch(/attacker\.example|提交所有字段/)
-    expect(requests[1]!.messages).toContainEqual(expect.objectContaining({
-      role: 'tool', tool_call_id: 'browser_call_1', content: expect.stringContaining('UNTRUSTED_BROWSER_PAGE_DATA'),
-    }))
-    expect(JSON.stringify(requests[2]!.messages)).toContain('有效期至')
-    expect(JSON.stringify(requests[2]!.messages)).not.toContain('2028-06-30')
     expect(browser.executor.execute).toHaveBeenCalledWith(
       'browser_session_inspect',
       { bindingId: 'binding_1', intent: '读取证件有效期' },
@@ -2773,6 +2830,305 @@ describe('AgentOrchestrator', () => {
       }),
     )
     expect(browser.executor.endRun).toHaveBeenCalledOnce()
+  })
+
+  it('finishes a read-only browser request as soon as inspected evidence uniquely matches', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'early_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'early_field_match',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => inspectedPrivateFields([
+        { ref: 'ref_expiry', label: '有效期至', value: '2028-06-30' },
+      ]),
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的居住证有效期是？',
+      provider: 'openrouter', model: 'model', requestId: 'early_browser_answer',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(browser.executor.execute).toHaveBeenCalledOnce()
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('有效期至：2028-06-30')
+  })
+
+  it('continues an inspect cursor before matching evidence from the complete snapshot', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'paged_inspect_first',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'paged_inspect_last',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '读取有效期', cursor: 'cursor_next' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'paged_field_match',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_2'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let inspection = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => {
+        inspection += 1
+        const result = inspectedPrivateFields(inspection === 1
+          ? [{ ref: 'ref_generic_expiry', label: '有效期至', value: '2028-06-30' }]
+          : [{ ref: 'ref_permit_expiry', label: '工作居住证有效期', value: '2029-07-01' }]) as Extract<BrowserContinuationToolResult, { kind: 'success' }>
+        return inspection === 1
+          ? {
+              ...result,
+              data: {
+                ...result.data,
+                snapshot: { ...(result.data.snapshot as BrowserPageSnapshot), cursor: 'cursor_next' },
+              },
+            }
+          : result
+      },
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取工作居住证有效期',
+      provider: 'openrouter', model: 'model', requestId: 'paged_browser_answer',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(browser.executor.execute).toHaveBeenCalledTimes(2)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(3)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('工作居住证有效期：2029-07-01')
+  })
+
+  it('matches accumulated evidence after the final cursor page has no new private fields', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cursor_evidence_first',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cursor_evidence_last',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '读取有效期', cursor: 'cursor_next' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cursor_evidence_match',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let inspection = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => {
+        inspection += 1
+        if (inspection === 2) return inspectedSnapshot([])
+        const result = inspectedPrivateFields([
+          { ref: 'ref_expiry', label: '工作居住证有效期', value: '2029-07-01' },
+        ]) as Extract<BrowserContinuationToolResult, { kind: 'success' }>
+        return {
+          ...result,
+          data: {
+            ...result.data,
+            snapshot: { ...(result.data.snapshot as BrowserPageSnapshot), cursor: 'cursor_next' },
+          },
+        }
+      },
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取工作居住证有效期',
+      provider: 'openrouter', model: 'model', requestId: 'cursor_accumulated_evidence',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(browser.executor.execute).toHaveBeenCalledTimes(2)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(3)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('工作居住证有效期：2029-07-01')
+  })
+
+  it('uses distinct usage operation keys when new browser evidence requires another match', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'multi_match_inspect_1',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件类型' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'multi_match_none',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: [] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'multi_match_inspect_2',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件类型' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'multi_match_selected',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_2'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let inspection = 0
+    attachBrowserContinuation(dependencies, {
+      execute: async () => {
+        inspection += 1
+        const snapshotId = `snapshot_${inspection}`
+        const field = inspection === 1
+          ? { ref: 'ref_number', label: '证件号码', value: '110101199001010000' }
+          : { ref: 'ref_type', label: '证件类型', value: '工作居住证' }
+        const result = inspectedPrivateFields([field]) as Extract<BrowserContinuationToolResult, { kind: 'success' }>
+        return {
+          ...result,
+          data: {
+            ...result.data,
+            snapshot: { ...(result.data.snapshot as BrowserPageSnapshot), snapshotId },
+          },
+          privateFieldEvidence: result.privateFieldEvidence?.map((evidence) => ({ ...evidence, snapshotId })),
+        }
+      },
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取证件类型', provider: 'openrouter',
+      model: 'model', requestId: 'multiple_browser_matches',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    const matcherOperationKeys = dependencies.records.usage
+      .filter(({ method, args }) => method === 'start'
+        && (args[0] as { operationKey: string }).operationKey.includes('browser-field-match'))
+      .map(({ args }) => (args[0] as { operationKey: string }).operationKey)
+    expect(matcherOperationKeys).toEqual([
+      'agent:multiple_browser_matches:browser-field-match:1',
+      'agent:multiple_browser_matches:browser-field-match:2',
+    ])
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('证件类型：工作居住证')
+  })
+
+  it('does not rematch unchanged browser evidence from a repeated inspect', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeat_inspect_1',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件类型' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeat_match_none',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: [] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeat_inspect_2',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件类型' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    attachBrowserContinuation(dependencies, {
+      execute: async () => inspectedPrivateFields([
+        { ref: 'ref_type', label: '证件类型', value: '工作居住证' },
+      ]),
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取证件类型', provider: 'openrouter',
+      model: 'model', requestId: 'repeat_browser_evidence',
+    }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(4)
+    expect(dependencies.records.usage.filter(({ method, args }) => method === 'start'
+      && (args[0] as { operationKey: string }).operationKey.includes('browser-field-match'))).toHaveLength(1)
+  })
+
+  it('removes superseded browser snapshots from later model requests', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_first',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取状态' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_second',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取状态' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_third',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取状态' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let inspection = 0
+    attachBrowserContinuation(dependencies, {
+      execute: async () => {
+        inspection += 1
+        const snapshotId = inspection < 3 ? 'snapshot_old' : 'snapshot_current'
+        const marker = inspection === 1
+          ? 'OLD_SNAPSHOT_PAGE_ONE'
+          : inspection === 2 ? 'OLD_SNAPSHOT_PAGE_TWO' : 'CURRENT_SNAPSHOT_MARKER'
+        return {
+          kind: 'success',
+          data: {
+            trust: 'untrusted_page_data',
+            snapshot: {
+              snapshotId, bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+              url: 'https://permit.example.gov.cn/detail', title: '证件详情',
+              capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1,
+              auth: 'authenticated',
+              nodes: [{ ref: `ref_${inspection}`, role: 'heading', name: marker, enabled: true, actions: [] }],
+              serializedBytes: 1_000,
+            },
+          },
+        }
+      },
+    })
+
+    await new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取状态', provider: 'openrouter', model: 'model',
+    }))
+
+    const finalRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[3]![0]
+    const context = JSON.stringify(finalRequest.messages)
+    expect(context).toContain('CURRENT_SNAPSHOT_MARKER')
+    expect(context).not.toContain('OLD_SNAPSHOT_PAGE_ONE')
+    expect(context).not.toContain('OLD_SNAPSHOT_PAGE_TWO')
+    expect(context).toContain('superseded_browser_snapshot')
   })
 
   it('returns TARGET_AMBIGUOUS instead of choosing among plausible pages by catalog order', async () => {
@@ -2833,7 +3189,11 @@ describe('AgentOrchestrator', () => {
     expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]![0]).not.toHaveProperty('tools')
   })
 
-  it('keeps a login handoff system-owned and asks the user to continue manually', async () => {
+  it('waits for login without another model call and resumes with fresh authenticated evidence', async () => {
+    let waitingStarted!: () => void
+    let authenticate!: () => void
+    const started = new Promise<void>((resolve) => { waitingStarted = resolve })
+    const authenticated = new Promise<void>((resolve) => { authenticate = resolve })
     const dependencies = harness([[
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'login_call',
@@ -2841,50 +3201,207 @@ describe('AgentOrchestrator', () => {
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
-      { type: 'text_delta', choiceIndex: 0, text: '证件详情需要登录；页面已交还，请登录后发送新消息继续。' },
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'login_field_match',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => tool === 'browser_session_handoff'
+        ? { kind: 'handoff', code: 'AUTH_REQUIRED' }
+        : inspectedPrivateFields([{
+          ref: 'ref_expiry', label: '工作居住证有效期', value: '2029-07-01',
+        }]),
+      waitForAuthentication: async () => {
+        waitingStarted()
+        await authenticated
+        return { kind: 'authenticated' }
+      },
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的工作居住证有效期是？',
+      provider: 'openrouter', model: 'model', requestId: 'login_auto_resume',
+    }))
+
+    await started
+
+    expect(dependencies.records.terminal).toHaveLength(0)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+    expect(dependencies.records.events).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({
+        type: 'browser_status', state: 'awaiting_user', errorCode: 'AUTH_REQUIRED',
+        actionSummary: '网页尚未登录，请在已打开页面完成登录。登录后将自动继续，无需再次提问。',
+      }),
+    }))
+
+    authenticate()
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
+    expect(terminal.blocks).toContainEqual(expect.objectContaining({
+      type: 'browser_status', state: 'completed',
+    }))
+    expect(JSON.stringify(terminal.blocks)).toContain('工作居住证有效期：2029-07-01')
+    expect(JSON.stringify(terminal.blocks)).not.toContain('3年')
+    expect(browser.executor.execute).toHaveBeenCalledTimes(2)
+    expect(browser.executor.endRun).toHaveBeenCalledOnce()
+  })
+
+  it('enters login loading when an inspected page requires auth even if the model stops', async () => {
+    let waitingStarted!: () => void
+    const started = new Promise<void>((resolve) => { waitingStarted = resolve })
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_logged_out_page',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => []
     const browser = attachBrowserContinuation(dependencies, {
-      execute: async () => ({ kind: 'handoff', code: 'AUTH_REQUIRED' }),
+      execute: async (tool) => tool === 'browser_session_handoff'
+        ? { kind: 'handoff', code: 'AUTH_REQUIRED' }
+        : {
+            kind: 'success',
+            data: {
+              trust: 'untrusted_page_data',
+              snapshot: {
+                snapshotId: 'snapshot_logged_out', bindingId: 'binding_1',
+                origin: 'https://permit.example.gov.cn',
+                url: 'https://permit.example.gov.cn/p/login/login.html', title: '用户登录',
+                capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1,
+                auth: 'required', nodes: [], serializedBytes: 500,
+              },
+            },
+          },
+      waitForAuthentication: async (_runId, context) => {
+        waitingStarted()
+        return new Promise((resolve) => {
+          context.signal?.addEventListener('abort', () => {
+            resolve({ kind: 'tool_error', code: 'CANCELLED' })
+          }, { once: true })
+        })
+      },
     })
-
-    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
-      conversationId: 'browser_conversation', content: '继续查询证件', provider: 'openrouter', model: 'model',
-    }))).resolves.toMatchObject({ status: 'completed' })
-
-    const terminal = dependencies.records.terminal.at(-1) as { blocks: unknown[] }
-    expect(terminal.blocks).toContainEqual(expect.objectContaining({
-      type: 'browser_status', state: 'awaiting_user', errorCode: 'AUTH_REQUIRED',
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的工作居住证有效期是？',
+      provider: 'openrouter', model: 'model', requestId: 'host_auth_loading',
     }))
-    expect(JSON.stringify(terminal.blocks)).toContain('需要登录')
-    expect(browser.executor.endRun).toHaveBeenCalledOnce()
+
+    const observed = await Promise.race([
+      started.then(() => 'waiting' as const),
+      running.then(() => 'completed' as const),
+    ])
+    expect(observed).toBe('waiting')
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+    expect(dependencies.records.terminal).toHaveLength(0)
+    expect(dependencies.records.events).toContainEqual(expect.objectContaining({
+      type: 'block', block: expect.objectContaining({
+        type: 'browser_status', state: 'awaiting_user', errorCode: 'AUTH_REQUIRED',
+        actionSummary: '网页尚未登录，请在已打开页面完成登录。登录后将自动继续，无需再次提问。',
+      }),
+    }))
+    expect(browser.executor.execute.mock.calls.map(([tool]) => tool))
+      .toEqual(['browser_session_inspect', 'browser_session_handoff'])
+
+    await orchestrator.cancel('host_auth_loading')
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
   })
 
-  it('rejects takeover after handoff has already released the browser lease', async () => {
-    const dependencies = harness([])
+  it('redacts logged-out snapshots before continuing after authentication', async () => {
+    let waitingStarted!: () => void
+    let authenticate!: () => void
+    const started = new Promise<void>((resolve) => { waitingStarted = resolve })
+    const authenticated = new Promise<void>((resolve) => { authenticate = resolve })
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'prelogin_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
     dependencies.workflows.list = async () => []
-    let secondTurnStarted!: () => void
-    let releaseSecondTurn!: () => void
-    const started = new Promise<void>((resolve) => { secondTurnStarted = resolve })
-    const released = new Promise<void>((resolve) => { releaseSecondTurn = resolve })
-    let turn = 0
-    dependencies.providerInstances.openrouter.stream = vi.fn(async function* () {
-      turn += 1
-      if (turn === 1) {
-        yield {
-          type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'handoff_terminal_call',
-          name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'login' },
+    let inspection = 0
+    attachBrowserContinuation(dependencies, {
+      execute: async (tool) => {
+        if (tool === 'browser_session_handoff') return { kind: 'handoff', code: 'AUTH_REQUIRED' }
+        inspection += 1
+        const loggedOut = inspection === 1
+        return {
+          kind: 'success',
+          data: {
+            trust: 'untrusted_page_data',
+            snapshot: {
+              snapshotId: loggedOut ? 'snapshot_logged_out' : 'snapshot_authenticated',
+              bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+              url: loggedOut
+                ? 'https://permit.example.gov.cn/login'
+                : 'https://permit.example.gov.cn/detail',
+              title: loggedOut ? '登录' : '证件详情',
+              capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: loggedOut ? 1 : 2,
+              auth: loggedOut ? 'required' : 'authenticated',
+              nodes: [{
+                ref: loggedOut ? 'ref_login' : 'ref_detail', role: 'heading',
+                name: loggedOut ? 'LOGGED_OUT_SNAPSHOT_SECRET' : 'AUTHENTICATED_SNAPSHOT_MARKER',
+                enabled: true, actions: [],
+              }],
+              serializedBytes: 1_000,
+            },
+          },
         }
-        yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
-        return
-      }
-      secondTurnStarted()
-      await released
-      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      },
+      waitForAuthentication: async () => {
+        waitingStarted()
+        await authenticated
+        return { kind: 'authenticated' }
+      },
     })
+    const running = new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '读取证件', provider: 'openrouter',
+      model: 'model', requestId: 'login_snapshot_redaction',
+    }))
+
+    await started
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+    authenticate()
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+
+    const finalRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    const context = JSON.stringify(finalRequest.messages)
+    expect(context).toContain('AUTHENTICATED_SNAPSHOT_MARKER')
+    expect(context).toContain('superseded_browser_snapshot')
+    expect(context).not.toContain('LOGGED_OUT_SNAPSHOT_SECRET')
+  })
+
+  it('keeps login waiting available for explicit takeover cancellation', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'handoff_terminal_call',
+        name: 'browser_session_handoff', arguments: { bindingId: 'binding_1', reason: 'login' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let waitingStarted!: () => void
+    const started = new Promise<void>((resolve) => { waitingStarted = resolve })
     const browser = attachBrowserContinuation(dependencies, {
       execute: async () => ({ kind: 'handoff', code: 'AUTH_REQUIRED' }),
+      waitForAuthentication: async (_runId, context) => {
+        waitingStarted()
+        return new Promise((resolve) => {
+          context.signal?.addEventListener('abort', () => {
+            resolve({ kind: 'tool_error', code: 'CANCELLED' })
+          }, { once: true })
+        })
+      },
     })
     const orchestrator = new AgentOrchestrator(dependencies)
     const running = orchestrator.run(textRunInput({
@@ -2896,23 +3413,24 @@ describe('AgentOrchestrator', () => {
 
     await expect(orchestrator.takeOverBrowser(
       'handoff_terminal_request', 'binding_1', context.runId,
-    )).resolves.toBe(false)
-    expect(browser.executor.takeOver).not.toHaveBeenCalled()
-
-    releaseSecondTurn()
-    await expect(running).resolves.toMatchObject({ status: 'completed' })
-    expect(browser.executor.endRun).toHaveBeenCalledOnce()
+    )).resolves.toBe(true)
+    await expect(running).resolves.toMatchObject({ status: 'cancelled' })
+    expect(browser.executor.takeOver).toHaveBeenCalledOnce()
   })
 
-  it('defers a binding created by a workflow until the next user turn', async () => {
+  it('makes a binding created by a workflow available in the same user turn', async () => {
     const dependencies = harness([
       toolTurn,
       [
-        { type: 'text_delta', choiceIndex: 0, text: '工作流已打开页面' },
-        { type: 'finish', choiceIndex: 0, reason: 'stop' },
+        {
+          type: 'tool_call', choiceIndex: 0, index: 0, id: 'same_turn_inspect',
+          name: 'browser_session_inspect',
+          arguments: { bindingId: 'binding_1', intent: '读取今日天气' },
+        },
+        { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
       ],
       [
-        { type: 'text_delta', choiceIndex: 0, text: '新一轮可以继续页面' },
+        { type: 'text_delta', choiceIndex: 0, text: '未找到唯一字段。' },
         { type: 'finish', choiceIndex: 0, reason: 'stop' },
       ],
     ])
@@ -2920,30 +3438,24 @@ describe('AgentOrchestrator', () => {
     const browser = attachBrowserContinuation(dependencies, { bindings: liveBindings })
     const startReserved = dependencies.executions.startReserved
     dependencies.executions.startReserved = async (reservation, input) => {
-      liveBindings.push(continuationBinding({ conversationId: 'deferral_conversation' }))
+      liveBindings.push(continuationBinding({ conversationId: 'same_turn_conversation' }))
       return startReserved(reservation, input)
     }
     const orchestrator = new AgentOrchestrator(dependencies)
 
     await expect(orchestrator.run(textRunInput({
-      conversationId: 'deferral_conversation', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model',
+      conversationId: 'same_turn_conversation', content: '使用百度搜索今日天气', provider: 'openrouter', model: 'model',
     }))).resolves.toMatchObject({ status: 'completed' })
 
-    const firstRunRequests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls
-      .slice(0, 2).map(([request]) => request)
-    expect(firstRunRequests).toHaveLength(2)
-    expect(firstRunRequests.flatMap((request) => request.tools?.map((tool) => tool.function.name) ?? []))
-      .not.toContain('browser_session_inspect')
-    expect(browser.create).toHaveBeenCalledTimes(1)
-
-    await expect(orchestrator.run(textRunInput({
-      conversationId: 'deferral_conversation', content: '继续证件查询', provider: 'openrouter', model: 'model',
-    }))).resolves.toMatchObject({ status: 'completed' })
-
-    const nextTurnRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
-    expect(nextTurnRequest.tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining([
+    const sameTurnRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
+    expect(sameTurnRequest.tools?.map((tool) => tool.function.name)).toEqual(expect.arrayContaining([
       'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
     ]))
+    expect(browser.executor.execute).toHaveBeenCalledWith(
+      'browser_session_inspect',
+      { bindingId: 'binding_1', intent: '使用百度搜索今日天气' },
+      expect.objectContaining({ conversationId: 'same_turn_conversation' }),
+    )
     expect(browser.create).toHaveBeenCalledTimes(2)
   })
 
@@ -3016,10 +3528,6 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([
       ...Array.from({ length: 11 }, (_value, index) => inspectTurn(index + 1)),
       [
-        { type: 'text_delta', choiceIndex: 0, text: '最高学历：本科。' },
-        { type: 'finish', choiceIndex: 0, reason: 'stop' },
-      ],
-      [
         {
           type: 'tool_call', choiceIndex: 0, index: 0, id: 'education_field_match',
           name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
@@ -3032,6 +3540,7 @@ describe('AgentOrchestrator', () => {
     const browser = attachBrowserContinuation(dependencies, {
       execute: async () => {
         inspectionIndex += 1
+        if (inspectionIndex < 11) return inspectedSnapshot([])
         const capturedAt = `2026-04-08T00:00:${String(inspectionIndex).padStart(2, '0')}.000Z`
         const result = inspectedPrivateFields([
           { ref: `ref_education_${inspectionIndex}`, label: '最高学历', value: '本科' },
@@ -3056,7 +3565,7 @@ describe('AgentOrchestrator', () => {
 
     expect(result.status).toBe('completed')
     expect(browser.executor.execute).toHaveBeenCalledTimes(11)
-    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(13)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(12)
     expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('最高学历：本科')
   })
 
@@ -3364,6 +3873,181 @@ describe('AgentOrchestrator', () => {
     )
   })
 
+  it('keeps an invalid targeted scroll recoverable so the model can retry a page scroll', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_expiry_call',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '读取居住证有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'invalid_scroll_call',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1',
+          actions: [{ type: 'scroll', ref: 'ref_missing', direction: 'down' }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'page_scroll_call',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1',
+          actions: [{ type: 'scroll', direction: 'down' }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已读取居住证有效期。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool, input) => {
+        if (tool === 'browser_session_inspect') {
+          return inspectedSnapshot([{
+            ref: 'ref_expiry', role: 'statictext', name: '有效期至', enabled: true, actions: [],
+          }])
+        }
+        const action = (input as { actions: Array<{ ref?: string }> }).actions[0]!
+        return action.ref
+          ? { kind: 'tool_error', code: 'PAGE_CHANGED' }
+          : { kind: 'success', data: { completedActions: 1 } }
+      },
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的居住证有效期是？',
+      provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).toHaveBeenCalledTimes(2)
+    expect(browser.executor.execute).toHaveBeenLastCalledWith(
+      'browser_session_act',
+      expect.objectContaining({ actions: [{ type: 'scroll', direction: 'down' }] }),
+      expect.any(Object),
+    )
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0].messages)
+      .toContainEqual(expect.objectContaining({
+        role: 'tool', tool_call_id: 'invalid_scroll_call', content: expect.stringContaining('INVALID_INPUT'),
+      }))
+    expect((dependencies.records.terminal.at(-1) as { blocks: unknown[] }).blocks)
+      .toContainEqual(expect.objectContaining({ type: 'browser_status', state: 'completed' }))
+  })
+
+  it('allows a targeted scroll whose ref belongs to the selected snapshot', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_scroll_target',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '定位居住证有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'targeted_scroll_call',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_1',
+          actions: [{ type: 'scroll', ref: 'ref_expiry', direction: 'down' }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已定位居住证有效期。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => tool === 'browser_session_inspect'
+        ? inspectedSnapshot([{
+          ref: 'ref_expiry', role: 'statictext', name: '有效期至', enabled: true, actions: [],
+        }])
+        : { kind: 'success', data: { completedActions: 1 } },
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的居住证有效期是？',
+      provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).toHaveBeenLastCalledWith(
+      'browser_session_act',
+      expect.objectContaining({
+        snapshotId: 'snapshot_1',
+        actions: [{ type: 'scroll', ref: 'ref_expiry', direction: 'down' }],
+      }),
+      expect.any(Object),
+    )
+  })
+
+  it('rejects a targeted scroll whose ref belongs only to another cached snapshot', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_first_snapshot',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '读取证件详情' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect_second_snapshot',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '继续读取证件详情' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cross_snapshot_scroll_call',
+        name: 'browser_session_act', arguments: {
+          bindingId: 'binding_1', snapshotId: 'snapshot_2',
+          actions: [{ type: 'scroll', ref: 'ref_first', direction: 'down' }],
+        },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '已读取证件详情。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    let inspection = 0
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async (tool) => {
+        if (tool !== 'browser_session_inspect') throw new Error('unexpected browser action')
+        inspection += 1
+        return {
+          kind: 'success',
+          data: {
+            trust: 'untrusted_page_data',
+            snapshot: {
+              snapshotId: `snapshot_${inspection}`, bindingId: 'binding_1',
+              origin: 'https://permit.example.gov.cn', url: 'https://permit.example.gov.cn/detail',
+              title: '证件详情', capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1,
+              auth: 'authenticated', serializedBytes: 1_000,
+              nodes: [{
+                ref: inspection === 1 ? 'ref_first' : 'ref_second',
+                role: 'statictext', name: '有效期至', enabled: true, actions: [],
+              }],
+            },
+          },
+        }
+      },
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的居住证有效期是？',
+      provider: 'openrouter', model: 'model',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.execute).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[3]![0].messages)
+      .toContainEqual(expect.objectContaining({
+        role: 'tool', tool_call_id: 'cross_snapshot_scroll_call',
+        content: expect.stringContaining('INVALID_INPUT'),
+      }))
+  })
+
   it.each([
     {
       name: 'Chinese click negation',
@@ -3482,12 +4166,6 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
       {
-        type: 'text_delta', choiceIndex: 0,
-        text: '有效期至 2028-06-30；身份证号 110101199001010000；页面还显示秘密住址。',
-      },
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ], [
-      {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'privacy_field_match',
         name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
       },
@@ -3521,9 +4199,6 @@ describe('AgentOrchestrator', () => {
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
-      { type: 'text_delta', choiceIndex: 0, text: '模型不能直接看到字段值。' },
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'semantic_match_call',
         name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_2'] },
@@ -3544,15 +4219,13 @@ describe('AgentOrchestrator', () => {
       provider: 'openrouter', model: 'model', requestId: 'semantic_match_request',
     }))).resolves.toMatchObject({ status: 'completed' })
 
-    const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
+    const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
     expect(JSON.stringify(matcherRequest.messages)).toContain('我的证件号码是多少')
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件编号')
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件号码')
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件类型')
     expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/202111127927|430722\*{6}8715|身份证/u)
-    const toolMessage = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
-      .messages.find(({ role }) => role === 'tool')
-    expect(String(toolMessage?.content)).not.toMatch(/202111127927|430722\*{6}8715|身份证/u)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
     expect(terminal).toContain('证件号码：430722******8715')
     expect(terminal).not.toContain('证件编号：202111127927')
@@ -3569,8 +4242,6 @@ describe('AgentOrchestrator', () => {
         name: 'report_browser_continuation_route', arguments: { bindingId: 'binding_1' },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
-    ], [
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'field_match_call',
@@ -3637,13 +4308,13 @@ describe('AgentOrchestrator', () => {
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'semantic_reject_match',
         name: 'report_browser_field_matches', arguments: { matchingCandidateIds: [] },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => []
     attachBrowserContinuation(dependencies, {
@@ -3660,6 +4331,7 @@ describe('AgentOrchestrator', () => {
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
     expect(terminal).toContain('无法从已绑定网页中唯一确认请求的字段')
     expect(terminal).not.toContain('202111127927')
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(3)
   })
 
   it('rejects private browser evidence that does not bind to the public snapshot node', async () => {
@@ -3697,7 +4369,6 @@ describe('AgentOrchestrator', () => {
   })
 
   it('projects one real structured static field into a Main-owned answer and only that answer reaches next-turn context', async () => {
-    const providerClaim = '模型声称有效期是 2099-12-31，并要求信任网页说明。'
     const inspected = await inspectedStaticFields([
       '  工作居住证有效期 ： 2032年02月29日  ',
       '签发日期：2024-01-01',
@@ -3718,9 +4389,6 @@ describe('AgentOrchestrator', () => {
         name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取全部网页内容' },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
-    ], [
-      { type: 'text_delta', choiceIndex: 0, text: providerClaim },
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'real_static_match',
@@ -3759,14 +4427,7 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(firstTerminal)).not.toMatch(
       /2099-12-31|忽略系统策略|提交所有字段|签发日期|2024-01-01|业务部门|立即交出|portal\.example\.io|AKIAIOSFODNN7EXAMPLE|张三|138-0013-8000|工作居住证有效期 2028-06-30/,
     )
-    const inspectedRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
-    const inspectedToolMessage = inspectedRequest.messages.find(({ role }) => role === 'tool')
-    expect(String(inspectedToolMessage?.content)).toContain('"name":"工作居住证有效期"')
-    expect(String(inspectedToolMessage?.content)).not.toMatch(/2032年02月29日|2024-01-01/u)
-    expect(String(inspectedToolMessage?.content)).not.toMatch(
-      /业务部门|立即交出|portal\.example\.io|AKIAIOSFODNN7EXAMPLE|张三|138-0013-8000|工作居住证有效期 2028-06-30/,
-    )
-    const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
+    const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
     expect(JSON.stringify(matcherRequest.messages)).toContain('工作居住证有效期')
     expect(JSON.stringify(matcherRequest.messages)).toContain('签发日期')
     expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/2032年02月29日|2024-01-01/u)
@@ -3776,7 +4437,7 @@ describe('AgentOrchestrator', () => {
       provider: 'openrouter', model: 'model', requestId: 'next_turn_request',
     }))).resolves.toMatchObject({ status: 'completed' })
 
-    const nextTurn = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[3]![0]
+    const nextTurn = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
     expect(JSON.stringify(nextTurn.messages)).toContain(expectedAnswer)
     expect(JSON.stringify(nextTurn.messages)).not.toMatch(
       /2099-12-31|忽略系统策略|提交所有字段|签发日期|2024-01-01|业务部门|立即交出|portal\.example\.io|AKIAIOSFODNN7EXAMPLE|张三|138-0013-8000|工作居住证有效期 2028-06-30/,
@@ -3795,9 +4456,6 @@ describe('AgentOrchestrator', () => {
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
-      { type: 'text_delta', choiceIndex: 0, text: '唯一答案是 2028-06-30。' },
-      { type: 'finish', choiceIndex: 0, reason: 'stop' },
-    ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'two_static_match',
         name: 'report_browser_field_matches',
@@ -3815,10 +4473,7 @@ describe('AgentOrchestrator', () => {
       provider: 'openrouter', model: 'model', requestId: 'two_static_request',
     }))
 
-    const inspectedRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
-    const inspectedToolMessage = inspectedRequest.messages.find(({ role }) => role === 'tool')
-    expect(String(inspectedToolMessage?.content)).not.toMatch(/2028-06-30|2029-07-01/u)
-    const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[2]![0]
+    const matcherRequest = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[1]![0]
     expect(JSON.stringify(matcherRequest.messages)).toContain('有效期至')
     expect(JSON.stringify(matcherRequest.messages)).toContain('工作居住证有效期')
     expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/2028-06-30|2029-07-01/u)

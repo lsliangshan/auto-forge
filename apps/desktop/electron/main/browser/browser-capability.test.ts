@@ -192,6 +192,45 @@ describe('BrowserCapabilityService', () => {
     })
   })
 
+  it('allows browser.open to finish on a redirect covered by its declared URL patterns', async () => {
+    const { service, tab, setUrl } = createHarness()
+    const declaredScope = { origins: ['https://*.bjt.beijing.gov.cn'] }
+    const exactScope = { origins: ['https://fw.bjrcgz.gov.cn'] }
+    const redirectContext: BrowserCapabilityContext = {
+      ...context,
+      permissionMatrix: { 'browser.open': declaredScope.origins },
+    }
+    vi.mocked(tab.open).mockImplementationOnce(async () => {
+      setUrl('https://portal.bjt.beijing.gov.cn/p/login/login.html')
+    })
+
+    await expect(service.request(redirectContext, {
+      capability: 'browser.open',
+      scope: exactScope,
+      arguments: { url: 'https://fw.bjrcgz.gov.cn/person-platform/' },
+    }, declaredScope)).resolves.toBeUndefined()
+
+    expect(tab.open).toHaveBeenCalledWith(
+      'https://fw.bjrcgz.gov.cn/person-platform/',
+      exactScope.origins,
+      declaredScope.origins,
+    )
+  })
+
+  it('rejects a browser.open redirect outside its declared URL patterns', async () => {
+    const { service, tab, setUrl } = createHarness()
+    const declaredScope = { origins: ['https://*.bjt.beijing.gov.cn/login/*'] }
+    vi.mocked(tab.open).mockImplementationOnce(async () => {
+      setUrl('https://portal.bjt.beijing.gov.cn/admin/')
+    })
+
+    await expect(service.request(context, {
+      capability: 'browser.open',
+      scope: { origins: ['https://fw.bjrcgz.gov.cn'] },
+      arguments: { url: 'https://fw.bjrcgz.gov.cn/person-platform/' },
+    }, declaredScope)).rejects.toMatchObject({ code: 'CAPABILITY_SCOPE_DENIED' })
+  })
+
   it('releases execution ownership without closing the retained tab', async () => {
     const { service, tab, workspace } = createHarness()
     await service.open(context, 'https://www.baidu.com', baiduScope)

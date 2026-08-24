@@ -78,7 +78,7 @@ export function requiredCapability(
 
 function actionSupported(action: BrowserAction, target: BrowserSemanticNode | undefined): boolean {
   if (action.type === 'navigate' || action.type === 'wait' || action.type === 'focus') return true
-  if (action.type === 'scroll' && action.ref === undefined) return true
+  if (action.type === 'scroll') return action.ref === undefined || target?.ref === action.ref
   if (!target || ('ref' in action && action.ref !== target.ref)) return false
   return target.actions.includes(action.type as BrowserSemanticNode['actions'][number])
 }

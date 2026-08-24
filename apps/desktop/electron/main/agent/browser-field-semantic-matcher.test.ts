@@ -46,6 +46,7 @@ function harness(events: readonly ModelStreamEvent[], streamError?: unknown) {
     model: 'deepseek/deepseek-v4',
     userId: 'user_1',
     requestId: 'request_1',
+    evidenceRevision: 1,
     chatRunId: 'run_1',
     signal,
     id: () => 'usage_1',
@@ -84,6 +85,9 @@ describe('matchBrowserFieldSemantics', () => {
         }),
       }),
     })])
+    expect(test.providerUsage.start).toHaveBeenCalledWith(expect.objectContaining({
+      operationKey: 'agent:request_1:browser-field-match:1',
+    }))
   })
 
   it('lets the model reject a related but semantically different attribute', async () => {

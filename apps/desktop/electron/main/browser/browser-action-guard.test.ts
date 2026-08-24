@@ -149,6 +149,35 @@ describe('BrowserActionGuard', () => {
     }))).toEqual({ kind: 'blocked', code: 'UNSUPPORTED_CONTROL' })
   })
 
+  it('allows scrolling an exact static text target without a declared scroll action', () => {
+    const target = node('statictext', '居住证有效期', {
+      ref: 'ref_expiry',
+      actions: [],
+    })
+    expect(guard.decide(context({
+      action: { type: 'scroll', ref: target.ref, direction: 'down' },
+      target,
+    }))).toEqual({ kind: 'allowed' })
+  })
+
+  it('allows page scrolling without a target ref', () => {
+    expect(guard.decide(context({
+      action: { type: 'scroll', direction: 'down' },
+      target: undefined,
+    }))).toEqual({ kind: 'allowed' })
+  })
+
+  it.each([
+    ['a missing target', undefined, 'PAGE_CHANGED'],
+    ['a mismatched ref', node('statictext', '居住证有效期', { ref: 'ref_other', actions: [] }), 'UNSUPPORTED_CONTROL'],
+    ['a disabled target', node('statictext', '居住证有效期', { ref: 'ref_expiry', enabled: false, actions: [] }), 'UNSUPPORTED_CONTROL'],
+  ] as const)('blocks targeted scrolling for %s', (_case, target, code) => {
+    expect(guard.decide(context({
+      action: { type: 'scroll', ref: 'ref_expiry', direction: 'down' },
+      target,
+    }))).toEqual({ kind: 'blocked', code })
+  })
+
   it.each([
     [node('button', '登录'), { formOwned: true, inputType: 'password' }, 'AUTH_REQUIRED'],
     [node('textbox', '图形验证码', { actions: ['fill'] }), { inputType: 'text' }, 'UNSUPPORTED_CONTROL'],

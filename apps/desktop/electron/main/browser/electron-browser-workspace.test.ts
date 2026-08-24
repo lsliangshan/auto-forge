@@ -874,6 +874,24 @@ describe('ElectronBrowserWorkspace', () => {
     expect(completed).toBe(true)
   })
 
+  it('shuts down cleanly when Electron clears the view webContents before destroyed handlers run', async () => {
+    const harness = createHarness()
+    await harness.workspace.acquire(executionInput())
+    const view = harness.views[1]!
+    const contents = view.webContents
+    expect(contents.debugger.listenerCount('message')).toBe(1)
+    contents.prependOnceListener('destroyed', () => {
+      Object.defineProperty(view, 'webContents', {
+        configurable: true,
+        get: () => undefined,
+      })
+    })
+
+    await expect(harness.workspace.shutdown()).resolves.toBeUndefined()
+
+    expect(contents.debugger.listenerCount('message')).toBe(0)
+  })
+
   it('creates one BaseWindow and secure switchable target tabs sharing only the same user session', async () => {
     const { workspace, views, windows, backgroundColor } = createHarness()
     const first = await workspace.acquire(executionInput({ executionId: 'exec_1' }))
@@ -2478,6 +2496,61 @@ describe('ElectronBrowserWorkspace', () => {
     expect(approved.preventDefault).not.toHaveBeenCalled()
     const denied = { preventDefault: vi.fn() }
     target.emit('will-navigate', denied, 'https://evil.example/')
+    expect(denied.preventDefault).toHaveBeenCalledOnce()
+  })
+
+  it('allows a cross-origin redirect covered by the browser.open URL patterns', async () => {
+    const { workspace, views } = createHarness()
+    const tab = await acquire(workspace, 'exec_1')
+    const target = views[1]!.webContents
+    const initialUrl = 'https://fw.bjrcgz.gov.cn/person-platform/'
+    const loginUrl = 'https://portal.bjt.beijing.gov.cn/p/login/login.html'
+    vi.spyOn(target, 'loadURL').mockImplementationOnce(async (url) => {
+      target.loaded.push(url)
+      target.currentUrl = url
+      target.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+      target.currentUrl = loginUrl
+      target.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+      target.emit('did-fail-load', {}, -3, 'ERR_ABORTED', initialUrl, true)
+      setTimeout(() => target.emit('did-stop-loading'), 5)
+      throw Object.assign(new Error('navigation replaced'), { code: 'ERR_ABORTED', errno: -3, url: loginUrl })
+    })
+
+    await expect(tab.open(
+      initialUrl,
+      ['https://fw.bjrcgz.gov.cn'],
+      ['https://*.bjt.beijing.gov.cn'],
+    )).resolves.toBeUndefined()
+
+    expect(await tab.url()).toBe(loginUrl)
+    const returnToInitial = { preventDefault: vi.fn() }
+    target.emit('will-navigate', returnToInitial, initialUrl)
+    expect(returnToInitial.preventDefault).toHaveBeenCalledOnce()
+  })
+
+  it('blocks a cross-origin redirect outside the browser.open URL patterns', async () => {
+    const { workspace, views } = createHarness()
+    const tab = await acquire(workspace, 'exec_1')
+    const target = views[1]!.webContents
+    const initialUrl = 'https://fw.bjrcgz.gov.cn/person-platform/'
+    const denied = { preventDefault: vi.fn() }
+    vi.spyOn(target, 'loadURL').mockImplementationOnce(async (url) => {
+      target.loaded.push(url)
+      target.currentUrl = url
+      target.emit(
+        'will-redirect',
+        denied,
+        'https://portal.bjt.beijing.gov.cn/admin/',
+      )
+      throw Object.assign(new Error('navigation replaced'), { code: 'ERR_ABORTED', errno: -3 })
+    })
+
+    await expect(tab.open(
+      initialUrl,
+      ['https://fw.bjrcgz.gov.cn'],
+      ['https://*.bjt.beijing.gov.cn/login/*'],
+    )).rejects.toMatchObject({ code: 'CAPABILITY_SCOPE_DENIED' })
+
     expect(denied.preventDefault).toHaveBeenCalledOnce()
   })
 

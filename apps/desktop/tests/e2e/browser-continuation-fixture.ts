@@ -88,14 +88,26 @@ function sendJson(response: import('node:http').ServerResponse, value: unknown):
 function pageDocument(input: {
   authenticated: boolean
   dynamic?: boolean
+  spa?: boolean
   disallowedOrigin: string
   employer: string
 }): string {
-  if (!input.authenticated) return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>人工登录</title></head>
+  if (!input.authenticated) {
+    const loginControl = input.spa
+      ? `<button id="manual-login" type="button">人工登录并继续</button>
+<script>document.querySelector('#manual-login').addEventListener('click', async () => {
+  await fetch('/authenticate-spa', { method: 'POST' });
+  history.pushState({}, '', '/details');
+  document.title = '工作居住证详情';
+  document.body.innerHTML = '<main id="permit-details"><h1>工作居住证详情</h1><button id="logout-marker">退出</button><section aria-label="证件有效期"><div id="expiry-date">工作居住证有效期：2028-06-30</div></section></main>';
+})</script>`
+      : '<a id="manual-login" role="button" href="/authenticate">人工登录并继续</a>'
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>人工登录</title></head>
 <body><main><h1>人工登录</h1><label>账号<input autocomplete="username"></label>
 <label>密码<input type="password" autocomplete="current-password"></label>
 <label>图形验证码<input aria-label="图形验证码"></label><img alt="图形验证码">
-<a id="manual-login" role="button" href="/authenticate">人工登录并继续</a></main></body></html>`
+${loginControl}</main></body></html>`
+  }
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>工作居住证详情</title></head>
 <body><main id="permit-details"><h1>工作居住证详情</h1><button id="logout-marker">退出</button>
 <section aria-label="证件有效期"><div id="expiry-date">工作居住证有效期：2028-06-30</div></section>
@@ -195,6 +207,13 @@ export async function startBrowserContinuationFixture(): Promise<BrowserContinua
       })
       return response.end()
     }
+    if (url.pathname === '/authenticate-spa' && request.method === 'POST') {
+      state.authenticated = true
+      response.writeHead(204, {
+        'set-cookie': 'fixture_session=authenticated; Path=/; Secure; HttpOnly; SameSite=Strict',
+      })
+      return response.end()
+    }
     const hasSession = (request.headers.cookie ?? '').split(';')
       .some((cookie) => cookie.trim() === 'fixture_session=authenticated')
     if (url.pathname === '/details' || url.pathname === '/dynamic') {
@@ -215,7 +234,12 @@ export async function startBrowserContinuationFixture(): Promise<BrowserContinua
       return response.end('<!doctype html><html lang="zh-CN"><title>许可详情弹窗</title><main><h1>许可详情弹窗</h1></main></html>')
     }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-    response.end(pageDocument({ authenticated: false, disallowedOrigin, employer: state.employer }))
+    response.end(pageDocument({
+      authenticated: false,
+      spa: url.pathname === '/login-spa',
+      disallowedOrigin,
+      employer: state.employer,
+    }))
   })
   const allowedPort = await listen(allowed)
   const proxy = createHttpServer((_request, response) => {

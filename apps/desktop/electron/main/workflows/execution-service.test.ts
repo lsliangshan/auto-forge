@@ -1088,6 +1088,9 @@ describe('ExecutionService', () => {
           '*.example.com',
           'https://path.example.com/login/*',
         ] },
+      }, {
+        capability: 'browser.open',
+        scope: { origins: ['https://other.example/*'] },
       }],
     }
     const harness = createHarness({
@@ -1128,9 +1131,11 @@ describe('ExecutionService', () => {
       decision: 'once',
     })
     await turn()
-    expect(requestCapability).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({
-      capability: 'browser.open', scope: effectiveScope,
-    }))
+    expect(requestCapability).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ capability: 'browser.open', scope: effectiveScope }),
+      { origins: ['*.example.com', 'https://path.example.com/login/*'] },
+    )
     await harness.service.cancel(execution.id)
   })
 

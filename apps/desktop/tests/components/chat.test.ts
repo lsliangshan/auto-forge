@@ -816,6 +816,27 @@ describe('chat interactions', () => {
       .toBe(true)
   })
 
+  it('keeps Stop available while login waiting already gives the user page control', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: browserStatusBlock('awaiting_user', {
+        errorCode: 'AUTH_REQUIRED',
+        actionSummary: '网页尚未登录，请在已打开页面完成登录。登录后将自动继续，无需再次提问。',
+      }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="browser-status"]').text()).toContain('等待你登录')
+    expect(wrapper.find('[data-testid="take-over-browser"]').exists()).toBe(false)
+    const stop = wrapper.get('[data-testid="stop-browser"]')
+    expect((stop.element as HTMLButtonElement).disabled).toBe(false)
+
+    await stop.trigger('click')
+    await flushPromises()
+    expect(api.chat.cancel).toHaveBeenCalledWith('request_1')
+  })
+
   it.each([
     ['awaiting_user', '需要你在浏览器中操作', true],
     ['completed', '浏览器自动操作已完成', true],

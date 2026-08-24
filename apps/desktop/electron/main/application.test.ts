@@ -3419,7 +3419,7 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
-  it('keeps injected page data in the current provider run and carries only the final answer plus safe browser status forward', async () => {
+  it('keeps injected page data out of provider context and carries only the final answer plus safe browser status forward', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-browser-context-'))
     directories.push(root)
     const workspace = createBrowserWorkspace()
@@ -3516,26 +3516,25 @@ describe('createApplicationRuntime', () => {
     })
 
     await runtime.services.chat.send(chatInput(conversation.id, '读取证件有效期'))
-    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(3))
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(2))
     await vi.waitFor(async () => expect(JSON.stringify(await runtime.services.chat.listMessages(conversation.id)))
       .toContain('2028-06-30'))
-    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).toContain(ephemeralPageData)
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(injection)
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(privateValue)
     expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain('2028-06-30')
-    expect(JSON.stringify(agentRequests(captured)[2]!.messages)).toContain('有效期至')
-    expect(JSON.stringify(agentRequests(captured)[2]!.messages)).not.toContain('2028-06-30')
+    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).not.toContain(ephemeralPageData)
+    expect(JSON.stringify(agentRequests(captured)[1]!.messages)).toContain('有效期至')
 
     await runtime.services.chat.send(chatInput(conversation.id, '只总结上次安全结果'))
-    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(5))
-    const followUpContext = JSON.stringify(agentRequests(captured)[3]!.messages)
+    await vi.waitFor(() => expect(agentRequests(captured)).toHaveLength(4))
+    const followUpContext = JSON.stringify(agentRequests(captured)[2]!.messages)
     expect(followUpContext).toContain('有效期至：2028-06-30')
     expect(followUpContext).toContain('[浏览器页面: permit.example.gov.cn; 来源: https://permit.example.gov.cn;')
     expect(followUpContext).not.toContain(injection)
     expect(followUpContext).not.toContain(privateValue)
     expect(followUpContext).not.toContain(ephemeralPageData)
     expect(followUpContext).not.toMatch(/UNTRUSTED_BROWSER_PAGE_DATA|snapshotId|backendNodeId|identity=private/)
-    const followUpRoute = JSON.stringify(agentRequests(captured)[4]!.messages)
+    const followUpRoute = JSON.stringify(agentRequests(captured)[3]!.messages)
     expect(followUpRoute).toContain('只总结上次安全结果')
     expect(followUpRoute).not.toMatch(/2028-06-30|110101199001010000|本次运行临时页面说明/)
 
@@ -5710,7 +5709,7 @@ describe('createApplicationRuntime', () => {
     ])
     expect(registry.list(session.user.id, conversation.id)).toEqual([live])
     expect(workspace.setContinuationRegistry).toHaveBeenCalledTimes(1)
-    expect(workspace.onPageInvalidated).toHaveBeenCalledTimes(1)
+    expect(workspace.onPageInvalidated).toHaveBeenCalledTimes(2)
     await runtime.close()
   })
 

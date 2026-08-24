@@ -20,7 +20,7 @@
 
 `@autoforge/shared` 提供唯一的纯计算模式模块，负责校验和匹配。Workflow Manifest 校验复用该模块；共享 Zod 契约区分声明范围与 Worker 精确范围。
 
-执行服务以“声明覆盖请求”替代 Manifest 权限与 Worker 请求的 scope 哈希相等判断。`browser.open` 使用请求中的完整 URL；后续 `fill/click/url/close` 只比较主机与端口并继续沿用现有精确 origin 会话约束。同一 origin 内的路径导航不因初始路径模式而拒绝，跨 origin 导航仍拒绝。
+执行服务以“声明覆盖请求”替代 Manifest 权限与 Worker 请求的 scope 哈希相等判断。`browser.open` 使用请求中的完整 URL；首次打开期间的主框架跨 origin 重定向继续使用本次命中的声明模式校验完整目标 URL，打开结束后只保留最终精确 origin。后续 `fill/click/url/close` 只比较主机与端口并继续沿用现有精确 origin 会话约束。同一 origin 内的路径导航不因初始路径模式而拒绝，未命中本次声明模式的跨 origin 导航仍拒绝。
 
 审批事件、一次性授权和持久化授权保存 Worker 提交的精确 origin。通配符只存在于工作流声明，不进入运行时授权记录。
 
@@ -36,4 +36,3 @@
 - Manifest 测试覆盖通配模式接受与危险模式拒绝。
 - Worker 协议测试证明 Worker 仍不能提交通配符 scope。
 - 执行服务测试覆盖首次 URL 匹配、错误路径/主机拒绝、后续同 origin 操作允许及审批 scope 保持精确。
-

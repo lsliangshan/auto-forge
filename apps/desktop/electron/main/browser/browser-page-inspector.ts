@@ -129,6 +129,7 @@ export interface BrowserPageContextInput {
   readonly tabId: string
   readonly navigationEpoch: number
   readonly origin: string
+  readonly allowAuthLoginUrls?: boolean
   readonly signal?: AbortSignal
 }
 
@@ -1087,7 +1088,10 @@ export class BrowserPageInspector {
     this.liveBinding(input.lease)
     this.assertPage({ ...input, intent: 'live action validation' }, page)
     this.assertRawBudget(page)
-    const patterns = Object.values(binding.permissionMatrix).flat()
+    const patterns = [
+      ...Object.values(binding.permissionMatrix).flat(),
+      ...(input.allowAuthLoginUrls ? binding.browserContinuation?.auth?.loginUrls ?? [] : []),
+    ]
     if (!patterns.some((pattern) => matchesHttpsUrlPattern(pattern, page.url))) throw failure('DOMAIN_BLOCKED')
     const visibleNodes = page.nodes.filter((node) => (
       (node.frameId === undefined || node.frameId === page.frameId) && !node.ignored && !node.dom.hidden

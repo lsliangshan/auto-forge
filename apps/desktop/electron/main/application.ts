@@ -39,6 +39,7 @@ import { CloudBaseAuthService } from './auth/cloudbase-auth-service.js'
 import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserCapabilityService, PolicyEngineBrowserAuthorization } from './browser/browser-capability.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
+import { BrowserLoginWaitCoordinator } from './browser/browser-login-wait-coordinator.js'
 import { BrowserPageInspector } from './browser/browser-page-inspector.js'
 import { EncryptedBrowserSessionStorageStore } from './browser/browser-session-storage-store.js'
 import type { ApplicationBrowserWorkspacePort } from './browser/electron-browser-workspace.js'
@@ -768,11 +769,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     continuationRegistry: browserContinuations,
   })
   const browserInspector = new BrowserPageInspector(options.browserWorkspace)
+  const browserLoginWait = new BrowserLoginWaitCoordinator({
+    onPageInvalidated: (listener) => options.browserWorkspace.onPageInvalidated(listener),
+  })
   let isBrowserRunActive: (runId: string) => boolean = () => false
   const browserContinuationExecutor = new BrowserContinuationToolExecutor({
     registry: browserContinuations,
     inspector: browserInspector,
     workspace: options.browserWorkspace,
+    loginWait: browserLoginWait,
     audits: database.browserActionAudits,
     isRunActive: (runId) => isBrowserRunActive(runId),
   })
@@ -1803,7 +1808,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         })
         await capture('execution-shutdown', () => executions.shutdown())
         await capture('continuation-shutdown', async () => {
-          try { await browserContinuations.shutdown() } finally { browserInspector.dispose() }
+          try { await browserContinuations.shutdown() } finally {
+            browserLoginWait.dispose()
+            browserInspector.dispose()
+          }
         })
         await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped

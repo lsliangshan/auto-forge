@@ -349,7 +349,8 @@ export interface AgentOrchestratorDependencies {
   providerUsage: Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
   browserContinuation?: {
     catalog: Pick<BrowserContinuationCatalog, 'create' | 'refresh'>
-    executor: Pick<BrowserContinuationToolExecutor, 'execute' | 'endRun' | 'cancel' | 'takeOver'>
+    executor: Pick<BrowserContinuationToolExecutor,
+      'execute' | 'waitForAuthentication' | 'endRun' | 'cancel' | 'takeOver'>
   }
   emit: (event: ChatEvent) => void
   id?: () => string
@@ -418,8 +419,11 @@ interface ActiveAgentRun {
   messages: ModelMessage[]
   tools: ModelTool[]
   workflowCatalogTools: ModelTool[]
+  initialWorkflowToolChoice?: ModelStreamRequest['toolChoice']
   workflows: Map<string, WorkflowCandidate>
   browserCatalog: BrowserContinuationCatalogSnapshot
+  browserToolsAllowed: boolean
+  browserPolicyAdded: boolean
   browserCandidate?: BrowserContinuationCandidate
   browserExplicitBindingId?: string
   browserBindingId?: string
@@ -430,7 +434,11 @@ interface ActiveAgentRun {
   browserRead: boolean
   browserAuthorization: BrowserAuthorizationEnvelope
   browserSnapshots: Map<string, BrowserPageSnapshot>
+  browserSnapshotToolMessages: Map<string, Array<Extract<ModelMessage, { role: 'tool' }>>>
   browserEvidence: BrowserFieldEvidence[]
+  browserEvidenceRevision: number
+  browserEvidenceMatchRevision?: number
+  browserEvidenceMatchedCandidateId?: string
   browserHandoffCode?: 'AUTH_REQUIRED' | 'MANUAL_ACTION_REQUIRED' | 'UNSUPPORTED_CONTROL'
   browserCleanup?: Promise<void>
   currentUser: BrowserContinuationRunContext['currentUser']
@@ -485,6 +493,24 @@ function explicitBrowserBinding(
     ))
   })
   return matches.length === 1 ? matches[0]!.bindingId : undefined
+}
+
+function exactWorkflowCandidate(
+  content: string,
+  candidates: readonly WorkflowCandidate[],
+): WorkflowCandidate | undefined {
+  const request = content.normalize('NFKC').trim()
+  if (!request) return undefined
+  const matches = candidates.filter(({ workflow }) => {
+    const negative = workflow.activationNegativeExamples.some((example) => (
+      example.normalize('NFKC').trim() === request
+    ))
+    if (negative) return false
+    return [workflow.name, ...workflow.activationExamples].some((example) => (
+      example.normalize('NFKC').trim() === request
+    ))
+  })
+  return matches.length === 1 ? matches[0] : undefined
 }
 
 function explicitHttpsUrls(content: string): ReadonlySet<string> {
@@ -568,7 +594,11 @@ function browserActionAuthorized(
   snapshotId: string,
   action: BrowserAction,
 ): boolean {
-  if (action.type === 'focus' || action.type === 'wait' || action.type === 'scroll') return true
+  if (action.type === 'focus' || action.type === 'wait') return true
+  if (action.type === 'scroll') {
+    return action.ref === undefined
+      || snapshots.get(snapshotId)?.nodes.some((node) => node.ref === action.ref) === true
+  }
   if (!envelope.mutationTypes.includes(action.type)) return false
   if (action.type === 'navigate') {
     try {
@@ -727,13 +757,17 @@ export class AgentOrchestrator {
         workflowCatalogTools: [],
         workflows: new Map(),
         browserCatalog: EMPTY_BROWSER_CATALOG,
+        browserToolsAllowed: false,
+        browserPolicyAdded: false,
         browserStarted: false,
         browserCleaned: false,
         browserTerminal: false,
         browserRead: false,
         browserAuthorization: browserAuthorization(input.content),
         browserSnapshots: new Map(),
+        browserSnapshotToolMessages: new Map(),
         browserEvidence: [],
+        browserEvidenceRevision: 0,
         currentUser: { messageId: userMessageId, text: input.content },
         controller: new AbortController(),
         loop: new WorkflowToolLoop({ now: this.now }),
@@ -746,26 +780,34 @@ export class AgentOrchestrator {
       this.activeByRun.set(runId, active)
       const workflowToolsAllowed = input.allowTools && !EXPLICIT_WORKFLOW_OPTOUT.test(input.content)
       const browserToolsAllowed = input.allowTools && !EXPLICIT_BROWSER_OPTOUT.test(input.content)
+      active.browserToolsAllowed = browserToolsAllowed
       if (browserToolsAllowed && this.dependencies.browserContinuation) {
         active.browserCatalog = await this.dependencies.browserContinuation.catalog.create({
           userId: input.userId,
           conversationId: input.conversationId,
         })
         active.browserExplicitBindingId = explicitBrowserBinding(input.content, active.browserCatalog)
+        active.browserPolicyAdded = active.browserCatalog.tools.length > 0
       }
       if (workflowToolsAllowed) {
         const catalog = await createWorkflowCatalog({
           workflows: this.dependencies.workflows,
           selectorFor: this.dependencies.createSourceSelector,
         }).create({ developerMode: this.dependencies.developerMode?.() ?? false })
-        const candidates = await new WorkflowRouter().route({
-          query: input.content,
-          candidates: catalog,
-          ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
-          select: (request) => this.selectWorkflowRouting(active!, request),
-          signal: active.controller.signal,
-        })
+        const exactCandidate = exactWorkflowCandidate(input.content, catalog)
+        const candidates = exactCandidate === undefined
+          ? await new WorkflowRouter().route({
+              query: input.content,
+              candidates: catalog,
+              ...(input.contextLength === undefined ? {} : { contextLength: input.contextLength }),
+              select: (request) => this.selectWorkflowRouting(active!, request),
+              signal: active.controller.signal,
+            })
+          : [exactCandidate]
         active.workflowCatalogTools = candidates.map(({ tool }) => tool)
+        active.initialWorkflowToolChoice = exactCandidate === undefined
+          ? undefined
+          : { type: 'function', function: { name: exactCandidate.toolName } }
         active.workflows = new Map(candidates.map((candidate) => [candidate.toolName, candidate]))
       }
       active.tools = [...active.workflowCatalogTools, ...active.browserCatalog.tools]
@@ -1008,6 +1050,9 @@ export class AgentOrchestrator {
           model: active.model,
           messages: active.messages,
           ...(offeredTools.length ? { tools: offeredTools } : {}),
+          ...(decision.decisionIndex === 1 && active.initialWorkflowToolChoice
+            ? { toolChoice: active.initialWorkflowToolChoice }
+            : {}),
           signal: active.controller.signal,
           endUserId: active.userId,
         },
@@ -1334,6 +1379,8 @@ export class AgentOrchestrator {
     const privateFieldEvidence = call.name === 'browser_session_inspect'
       ? strictBrowserPrivateFieldEvidence(rawResult)
       : Object.freeze([])
+    let earlyBrowserAnswer: string | undefined
+    let pageAuthenticationRequired = false
     let result = strictBrowserToolResult(call.name, rawResult)
     if (result?.kind === 'success' && call.name === 'browser_session_inspect') {
       const data = result.data as {
@@ -1348,7 +1395,27 @@ export class AgentOrchestrator {
         || inspectedOrigin !== candidate.origin) result = undefined
       else if (data.snapshot) {
         this.rememberBrowserEvidence(active, candidate, data.snapshot, privateFieldEvidence)
+        pageAuthenticationRequired = data.snapshot.auth === 'required'
+        if (!pageAuthenticationRequired
+          && active.browserEvidence.length > 0
+          && data.snapshot.cursor === undefined
+          && active.browserAuthorization.mutationTypes.length === 0
+          && active.browserAuthorization.navigationUrls.size === 0) {
+          earlyBrowserAnswer = await this.matchedBrowserEvidenceAnswer(active)
+        }
       }
+    }
+    if (pageAuthenticationRequired && result?.kind === 'success') {
+      this.updateBrowserStatus(active, candidate, 'inspecting', '已识别登录页面，正在等待你登录')
+      this.appendBrowserToolExchange(active, call, assistantContent, result)
+      return this.executeBrowserTool(active, {
+        type: 'tool_call',
+        choiceIndex: 0,
+        index: 0,
+        id: this.id(),
+        name: 'browser_session_handoff',
+        arguments: { bindingId: candidate.bindingId, reason: 'login' },
+      }, '')
     }
     if (result?.kind === 'success' && call.name === 'browser_session_act'
       && result.data.completedActions !== browserSessionActInputSchema.parse(executorInput).actions.length) {
@@ -1358,7 +1425,9 @@ export class AgentOrchestrator {
       const actions = browserSessionActInputSchema.parse(executorInput).actions
       if (actions.some((action) => action.type === 'navigate')) {
         active.browserSnapshots.clear()
+        const hadBrowserEvidence = active.browserEvidence.length > 0
         active.browserEvidence.length = 0
+        if (hadBrowserEvidence) active.browserEvidenceRevision += 1
         const refreshed = await browser.catalog.refresh({
           userId: active.userId,
           conversationId: active.conversationId,
@@ -1384,13 +1453,15 @@ export class AgentOrchestrator {
           : '已完成本步网页操作，等待下一步',
       )
     } else if (result.kind === 'handoff') {
-      active.browserTerminal = true
       active.browserHandoffCode = result.code
+      active.browserTerminal = result.code !== 'AUTH_REQUIRED'
       this.updateBrowserStatus(
         active,
         candidate,
         'awaiting_user',
-        result.code === 'AUTH_REQUIRED' ? '需要用户登录后继续' : '需要用户完成受保护操作',
+        result.code === 'AUTH_REQUIRED'
+          ? '网页尚未登录，请在已打开页面完成登录。登录后将自动继续，无需再次提问。'
+          : '需要用户完成受保护操作',
         result.code,
       )
     } else {
@@ -1401,6 +1472,67 @@ export class AgentOrchestrator {
       this.updateBrowserStatus(active, candidate, 'failed', '网页操作已安全停止', result.code)
     }
     this.appendBrowserToolExchange(active, call, assistantContent, result)
+    if (result.kind === 'handoff' && result.code === 'AUTH_REQUIRED') {
+      const resumed = await browser.executor.waitForAuthentication(active.runId, {
+        userId: active.userId,
+        conversationId: active.conversationId,
+        runId: active.runId,
+        currentUser: active.currentUser,
+        signal: active.controller.signal,
+      })
+      const inactiveAfterWait = await this.inactiveBrowserResult(active)
+      if (inactiveAfterWait) return inactiveAfterWait
+      if (resumed.kind === 'tool_error') {
+        active.browserTerminal = true
+        const error = appFailure(resumed.code)
+        this.updateBrowserStatus(
+          active,
+          candidate,
+          resumed.code === 'CANCELLED' ? 'cancelled' : 'failed',
+          resumed.code === 'PAGE_CLOSED' ? '目标网页已关闭' : '等待登录已结束',
+          resumed.code,
+        )
+        return this.terminalize(
+          active,
+          resumed.code === 'CANCELLED' ? 'cancelled' : 'failed',
+          error,
+          resumed.code === 'CANCELLED' ? 'cancel' : 'endRun',
+        )
+      }
+      active.browserHandoffCode = undefined
+      active.browserTerminal = false
+      active.browserSnapshots.clear()
+      this.supersedeBrowserSnapshots(active)
+      if (active.browserEvidence.length > 0) active.browserEvidenceRevision += 1
+      active.browserEvidence.length = 0
+      active.browserEvidenceMatchRevision = undefined
+      active.browserEvidenceMatchedCandidateId = undefined
+      await this.refreshBrowserCatalog(active)
+      const refreshed = active.browserCatalog.bindings.get(candidate.bindingId)
+      if (!refreshed || refreshed.workflowVersion !== candidate.workflowVersion) {
+        return this.terminalize(active, 'failed', appFailure('WORKFLOW_CHANGED'))
+      }
+      active.browserCandidate = refreshed
+      active.browserBindingId = refreshed.bindingId
+      active.browserExplicitBindingId = refreshed.bindingId
+      this.updateBrowserStatus(active, refreshed, 'inspecting', '已检测到登录，正在继续读取网页')
+      return this.executeBrowserTool(active, {
+        type: 'tool_call',
+        choiceIndex: 0,
+        index: 0,
+        id: this.id(),
+        name: 'browser_session_inspect',
+        arguments: {
+          bindingId: refreshed.bindingId,
+          intent: active.browserAuthorization.inspectIntent,
+        },
+      }, '')
+    }
+    if (earlyBrowserAnswer !== undefined) {
+      this.appendText(active, earlyBrowserAnswer)
+      this.appendWorkflowProvenance(active)
+      return this.terminalize(active, 'completed')
+    }
     return this.drive(active)
   }
 
@@ -1515,7 +1647,23 @@ export class AgentOrchestrator {
     this.updateWorkflowStatus(active, pending, terminalStatus, statusError)
     this.appendToolExchange(active, pending, modelResult)
     this.clearPending(active)
+    if (terminalStatus === 'completed') await this.refreshBrowserCatalog(active)
     return this.drive(active)
+  }
+
+  private async refreshBrowserCatalog(active: ActiveAgentRun): Promise<void> {
+    const browser = this.dependencies.browserContinuation
+    if (!browser || !active.browserToolsAllowed || active.browserTerminal) return
+    active.browserCatalog = await browser.catalog.create({
+      userId: active.userId,
+      conversationId: active.conversationId,
+    })
+    active.browserExplicitBindingId = explicitBrowserBinding(active.currentUser.text, active.browserCatalog)
+    active.tools = [...active.workflowCatalogTools, ...active.browserCatalog.tools]
+    if (active.browserCatalog.tools.length > 0 && !active.browserPolicyAdded) {
+      active.messages.push({ role: 'system', content: BROWSER_CONTINUATION_POLICY })
+      active.browserPolicyAdded = true
+    }
   }
 
   private appendToolExchange(
@@ -1556,6 +1704,10 @@ export class AgentOrchestrator {
     assistantContent: string,
     result: BrowserContinuationToolResult,
   ): void {
+    const snapshotId = call.name === 'browser_session_inspect' && result.kind === 'success'
+      ? (result.data as { snapshot: BrowserPageSnapshot }).snapshot.snapshotId
+      : undefined
+    if (snapshotId !== undefined) this.supersedeBrowserSnapshots(active, snapshotId)
     let serializedArguments = '{}'
     let serializedResult = JSON.stringify({ kind: 'tool_error', code: 'INTERNAL_ERROR' })
     try { serializedArguments = JSON.stringify(call.arguments) ?? '{}' } catch { /* Provider arguments originated as JSON. */ }
@@ -1569,7 +1721,7 @@ export class AgentOrchestrator {
         function: { name: call.name, arguments: serializedArguments },
       }],
     })
-    active.messages.push({
+    const toolMessage: Extract<ModelMessage, { role: 'tool' }> = {
       role: 'tool',
       tool_call_id: call.id,
       content: [
@@ -1578,7 +1730,27 @@ export class AgentOrchestrator {
         serializedResult,
         'END_UNTRUSTED_BROWSER_PAGE_DATA',
       ].join('\n'),
-    })
+    }
+    active.messages.push(toolMessage)
+    if (snapshotId !== undefined) {
+      const messages = active.browserSnapshotToolMessages.get(snapshotId) ?? []
+      messages.push(toolMessage)
+      active.browserSnapshotToolMessages.set(snapshotId, messages)
+    }
+  }
+
+  private supersedeBrowserSnapshots(active: ActiveAgentRun, keepSnapshotId?: string): void {
+    for (const [snapshotId, messages] of active.browserSnapshotToolMessages) {
+      if (snapshotId === keepSnapshotId) continue
+      for (const message of messages) {
+        message.content = [
+          'UNTRUSTED_BROWSER_PAGE_DATA',
+          JSON.stringify({ kind: 'superseded_browser_snapshot', snapshotId }),
+          'END_UNTRUSTED_BROWSER_PAGE_DATA',
+        ].join('\n')
+      }
+      active.browserSnapshotToolMessages.delete(snapshotId)
+    }
   }
 
   private rememberBrowserEvidence(
@@ -1587,11 +1759,13 @@ export class AgentOrchestrator {
     snapshot: BrowserPageSnapshot,
     privateFieldEvidence: readonly z.infer<typeof browserPrivateFieldEvidenceSchema>[],
   ): void {
+    let evidenceChanged = false
     const previousSnapshot = [...active.browserSnapshots.values()].at(-1)
     if (previousSnapshot
       && (previousSnapshot.origin !== snapshot.origin
         || previousSnapshot.navigationEpoch !== snapshot.navigationEpoch)) {
       active.browserSnapshots.clear()
+      evidenceChanged = active.browserEvidence.length > 0
       active.browserEvidence.length = 0
     }
     active.browserSnapshots.set(snapshot.snapshotId, snapshot)
@@ -1603,7 +1777,7 @@ export class AgentOrchestrator {
         || node.actions.length !== 0
         || node.name !== evidence.label
         || node.value !== undefined) continue
-      active.browserEvidence.push({
+      const remembered: BrowserFieldEvidence = {
         snapshotId: snapshot.snapshotId,
         ref: evidence.ref,
         label: evidence.label,
@@ -1611,14 +1785,26 @@ export class AgentOrchestrator {
         pageLabel: candidate.pageLabel,
         origin: candidate.origin,
         capturedAt: snapshot.capturedAt,
-      })
+      }
+      const existingIndex = active.browserEvidence.findIndex((existing) => (
+        existing.label === remembered.label
+        && existing.pageLabel === remembered.pageLabel
+        && existing.origin === remembered.origin
+      ))
+      if (existingIndex === -1) {
+        active.browserEvidence.push(remembered)
+        evidenceChanged = true
+      } else {
+        active.browserEvidence[existingIndex] = remembered
+      }
     }
+    if (evidenceChanged) active.browserEvidenceRevision += 1
   }
 
-  private async browserAnswer(active: ActiveAgentRun): Promise<string> {
+  private async matchedBrowserEvidenceAnswer(active: ActiveAgentRun): Promise<string | undefined> {
     const unique = new Map<string, BrowserFieldEvidence>()
     for (const evidence of active.browserEvidence) {
-      const key = [evidence.label, evidence.value, evidence.pageLabel, evidence.origin].join('\u0000')
+      const key = [evidence.label, evidence.pageLabel, evidence.origin].join('\u0000')
       const previous = unique.get(key)
       if (!previous || evidence.capturedAt > previous.capturedAt) unique.set(key, evidence)
     }
@@ -1627,6 +1813,16 @@ export class AgentOrchestrator {
       label: evidence.label,
       evidence,
     }))
+    const answerFor = (candidateId: string | undefined): string | undefined => {
+      const evidence = candidateEvidence.find(({ id }) => id === candidateId)?.evidence
+      return evidence === undefined
+        ? undefined
+        : `${safeAnswerText(evidence.label)}：${safeAnswerText(evidence.value)}`
+          + `（来源：${safeAnswerText(evidence.pageLabel)} / ${evidence.origin}；读取时间：${evidence.capturedAt}）。`
+    }
+    if (active.browserEvidenceMatchRevision === active.browserEvidenceRevision) {
+      return answerFor(active.browserEvidenceMatchedCandidateId)
+    }
     const semanticMatch: BrowserFieldSemanticMatchResult = candidateEvidence.length === 0
       ? { matchingCandidateIds: [] as readonly string[] }
       : await matchBrowserFieldSemantics({
@@ -1637,6 +1833,7 @@ export class AgentOrchestrator {
         model: active.model,
         userId: active.userId,
         requestId: active.requestId,
+        evidenceRevision: active.browserEvidenceRevision,
         chatRunId: active.runId,
         signal: active.controller.signal,
         id: this.id,
@@ -1644,12 +1841,17 @@ export class AgentOrchestrator {
       })
     if (semanticMatch.usage) this.addUsage(active, semanticMatch.usage)
     if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
-    if (semanticMatch.matchingCandidateIds.length === 1) {
-      const evidence = candidateEvidence.find(({ id }) => id === semanticMatch.matchingCandidateIds[0])?.evidence
-      if (!evidence) return '无法从已绑定网页中唯一确认请求的字段；请在可见页面核对后再继续。'
-      return `${safeAnswerText(evidence.label)}：${safeAnswerText(evidence.value)}`
-        + `（来源：${safeAnswerText(evidence.pageLabel)} / ${evidence.origin}；读取时间：${evidence.capturedAt}）。`
-    }
+    const matchedCandidateId = semanticMatch.matchingCandidateIds.length === 1
+      ? semanticMatch.matchingCandidateIds[0]
+      : undefined
+    active.browserEvidenceMatchRevision = active.browserEvidenceRevision
+    active.browserEvidenceMatchedCandidateId = matchedCandidateId
+    return answerFor(matchedCandidateId)
+  }
+
+  private async browserAnswer(active: ActiveAgentRun): Promise<string> {
+    const matched = await this.matchedBrowserEvidenceAnswer(active)
+    if (matched !== undefined) return matched
     if (active.browserHandoffCode === 'AUTH_REQUIRED') {
       return '网页需要你先完成登录；目前无法唯一确认请求的字段。'
     }
@@ -1894,7 +2096,9 @@ export class AgentOrchestrator {
       : active.blocks.find((block): block is BrowserStatusBlock => (
         block.type === 'browser_status' && block.blockId === active.browserStatusBlockId
       ))?.state
-    if (candidate && !['awaiting_user', 'failed', 'cancelled'].includes(currentBrowserState ?? '')) {
+    if (candidate
+      && !['failed', 'cancelled'].includes(currentBrowserState ?? '')
+      && !(currentBrowserState === 'awaiting_user' && status === 'completed')) {
       if (status === 'completed') {
         this.updateBrowserStatus(active, candidate, 'completed', '浏览器自动操作已完成')
       } else if (status === 'failed') {

@@ -88,7 +88,11 @@ export interface CapabilityContext {
 }
 
 export interface CapabilityPort {
-  request(context: CapabilityContext, request: WorkerCapabilityRequest): Promise<unknown>
+  request(
+    context: CapabilityContext,
+    request: WorkerCapabilityRequest,
+    declaredScope?: CapabilityScope,
+  ): Promise<unknown>
   closeExecution(executionId: string): Promise<void> | void
 }
 
@@ -382,6 +386,14 @@ function effectiveCapabilityRequest(
     if (origin && !origins.includes(origin)) origins.push(origin)
   }
   return { ...request, scope: { origins } }
+}
+
+function browserOpenRedirectScope(
+  declared: { capability: Capability; scope: CapabilityScope },
+): CapabilityScope | undefined {
+  if (declared.capability !== 'browser.open' || !('origins' in declared.scope)) return undefined
+  const origins = declared.scope.origins.filter((pattern) => exactHostOrigin(pattern) === undefined)
+  return origins.length > 0 ? { origins } : undefined
 }
 
 export class ExecutionService {
@@ -976,9 +988,15 @@ export class ExecutionService {
 
   private async dispatchCapability(active: ActiveExecution, pending: PendingCapability): Promise<void> {
     try {
-      const result = await this.dependencies.capability.request({
+      const context = {
         ...active.capabilityContext,
-      }, pending.request)
+      }
+      const redirectScope = browserOpenRedirectScope(
+        active.workflow.permissions[pending.permissionIndex]!,
+      )
+      const result = redirectScope
+        ? await this.dependencies.capability.request(context, pending.request, redirectScope)
+        : await this.dependencies.capability.request(context, pending.request)
       if (active.terminal) return
       this.write(active, { type: 'capability_result', requestId: pending.requestId, result: result ?? null })
     } catch (error) {

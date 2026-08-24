@@ -223,23 +223,31 @@ test.describe.serial('conversation-bound browser continuation', () => {
     await expect(page.getByText('2028-06-30')).toHaveCount(0)
   })
 
-  test('hands login to the user and continues only from a new message', async () => {
-    const conversationId = await createConversation(page, electronApp)
-    await seed(electronApp, conversationId, '/login')
-    await sendChat(page, electronApp, conversationId, '读取证件“有效期至”')
-    await expect(page.getByText('需要你在浏览器中操作')).toBeVisible()
-    await expect(page.getByText('网页需要你先完成登录')).toBeVisible()
+  for (const login of [
+    { mode: 'navigation', path: '/login' },
+    { mode: 'same-document SPA', path: '/login-spa' },
+  ]) {
+    test(`waits for ${login.mode} login and resumes the same chat turn automatically`, async () => {
+      const conversationId = await createConversation(page, electronApp)
+      await seed(electronApp, conversationId, login.path, '1.0.0', false)
+      await submitChat(page, '读取证件“有效期至”')
+      await expect(page.getByText('等待你登录')).toBeVisible()
+      await expect(page.getByText(
+        '网页尚未登录，请在已打开页面完成登录。登录后将自动继续，无需再次提问。',
+      )).toBeVisible()
 
-    const beforeLoginClick = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
-    await command(electronApp, 'userClick', { selector: '#manual-login' })
-    await expect.poll(async () => (await fixture.snapshot()).authenticated).toBe(true)
-    await page.waitForTimeout(500)
-    expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests).toHaveLength(beforeLoginClick)
-    await expect(page.getByText('工作居住证有效期：2028-06-30')).toHaveCount(0)
-    await sendChat(page, electronApp, conversationId, '我已登录，请继续读取证件“有效期至”')
-    await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
-    expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
-  })
+      const beforeLoginClick = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
+      await page.waitForTimeout(750)
+      expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests)
+        .toHaveLength(beforeLoginClick)
+      await command(electronApp, 'userClick', { selector: '#manual-login' })
+      await expect.poll(async () => (await fixture.snapshot()).authenticated).toBe(true)
+      await command(electronApp, 'waitForIdle', { conversationId })
+
+      await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
+      expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
+    })
+  }
 
   test('edits and autosaves a draft but requires an explicit user click for final submit', async () => {
     const conversationId = await createConversation(page, electronApp)

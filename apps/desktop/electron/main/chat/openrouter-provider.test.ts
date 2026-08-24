@@ -1776,6 +1776,41 @@ describe('OpenRouterProvider', () => {
     expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).not.toHaveProperty('max_tokens')
   })
 
+  it('serializes an explicit function tool choice only when requested', async () => {
+    const fetch = vi.fn(async (...request: Parameters<typeof globalThis.fetch>) => {
+      void request
+      return sseResponse([
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      ])
+    })
+    const provider = new OpenRouterProvider({ credential, fetch })
+    const tool = {
+      type: 'function' as const,
+      function: {
+        name: 'workflow_1',
+        description: '运行唯一匹配的工作流',
+        parameters: { type: 'object', additionalProperties: false },
+      },
+    }
+
+    await collect(provider.stream({
+      model: 'tool-model',
+      messages: [{ role: 'user', content: '运行工作流' }],
+      tools: [tool],
+      toolChoice: { type: 'function', function: { name: 'workflow_1' } },
+    }))
+    await collect(provider.stream({
+      model: 'chat-model',
+      messages: [{ role: 'user', content: '直接回答' }],
+      tools: [tool],
+    }))
+
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toMatchObject({
+      tool_choice: { type: 'function', function: { name: 'workflow_1' } },
+    })
+    expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).not.toHaveProperty('tool_choice')
+  })
+
   it('parses arbitrary SSE boundaries, CRLF comments, usage, choices, and indexed tool fragments', async () => {
     const payload = [
       ': keep-alive\r\n\r\n',

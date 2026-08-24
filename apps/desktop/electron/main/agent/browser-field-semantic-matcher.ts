@@ -69,6 +69,7 @@ export interface BrowserFieldSemanticMatchInput {
   readonly model: string
   readonly userId: string
   readonly requestId: string
+  readonly evidenceRevision: number
   readonly chatRunId?: string
   readonly signal?: AbortSignal
   readonly id: () => string
@@ -98,7 +99,7 @@ export async function matchBrowserFieldSemantics(
   let usage: Extract<ModelStreamEvent, { type: 'usage' }> | undefined
   try {
     for await (const event of trackProviderStream({
-      operationKey: `agent:${input.requestId}:browser-field-match`,
+      operationKey: `agent:${input.requestId}:browser-field-match:${input.evidenceRevision}`,
       attribution: {
         userId: input.userId,
         requestId: input.requestId,
