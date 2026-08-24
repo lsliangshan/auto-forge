@@ -4,7 +4,7 @@
 
 **Goal:** Let the active AI model use the complete sanitized page hierarchy to select one or many authoritative browser evidence nodes, including attachment names filtered by same-row upload status.
 
-**Architecture:** `BrowserPageInspector` emits an ordered semantic graph with retained parent refs and render eligibility. A new `BrowserPageEvidenceResolver` sends all current-page graph pages to the frozen text model and accepts only a strict opaque-ID selection. `AgentOrchestrator` validates those IDs against the current snapshots and deterministically renders exact Main-owned node values, falling back to the existing private scalar matcher when full-page evidence yields no answer.
+**Architecture:** `BrowserPageInspector` emits an ordered semantic graph with retained parent refs and render eligibility. A new `BrowserPageEvidenceResolver` sends all current-page graph pages to the frozen text model and accepts only a strict opaque-ID selection. `AgentOrchestrator` preserves the existing private scalar matcher as the first resolver when approved private values exist, then uses full-page evidence selection for contextual questions and deterministically renders exact Main-owned node values.
 
 **Tech Stack:** TypeScript 6, Electron 43, Chrome DevTools Protocol accessibility tree, Zod 4, Vitest 4, existing model-provider and usage-accounting ports.
 
@@ -269,7 +269,7 @@ git commit -m "feat(browser): resolve evidence from full page context"
 
 **Interfaces:**
 - Consumes: Task 1 snapshot metadata and Task 2 `resolveBrowserPageEvidence`.
-- Produces: one deterministic Main-owned browser answer string; full-page selection runs before existing `matchedBrowserEvidenceAnswer`, which remains the private scalar fallback.
+- Produces: one deterministic Main-owned browser answer string; existing private scalar evidence resolves first when present, and full-page selection handles requests it cannot answer.
 
 - [ ] **Step 1: Add a failing multi-row attachment regression test**
 
@@ -343,10 +343,10 @@ Update `browserAnswer`:
 
 ```ts
 private async browserAnswer(active: ActiveAgentRun): Promise<string> {
-  const pageAnswer = await this.matchedBrowserPageAnswer(active)
-  if (pageAnswer !== undefined) return pageAnswer
   const privateScalarAnswer = await this.matchedBrowserEvidenceAnswer(active)
   if (privateScalarAnswer !== undefined) return privateScalarAnswer
+  const pageAnswer = await this.matchedBrowserPageAnswer(active)
+  if (pageAnswer !== undefined) return pageAnswer
   // existing handoff/unable-to-confirm messages
 }
 ```

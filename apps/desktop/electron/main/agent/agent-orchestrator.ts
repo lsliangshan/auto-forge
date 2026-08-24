@@ -1414,8 +1414,8 @@ export class AgentOrchestrator {
           && data.snapshot.cursor === undefined
           && active.browserAuthorization.mutationTypes.length === 0
           && active.browserAuthorization.navigationUrls.size === 0) {
-          earlyBrowserAnswer = await this.matchedBrowserPageAnswer(active)
-            ?? await this.matchedBrowserEvidenceAnswer(active)
+          earlyBrowserAnswer = await this.matchedBrowserEvidenceAnswer(active)
+            ?? await this.matchedBrowserPageAnswer(active)
         }
       }
     }
@@ -1953,10 +1953,10 @@ export class AgentOrchestrator {
   }
 
   private async browserAnswer(active: ActiveAgentRun): Promise<string> {
-    const pageMatched = await this.matchedBrowserPageAnswer(active)
-    if (pageMatched !== undefined) return pageMatched
     const matched = await this.matchedBrowserEvidenceAnswer(active)
     if (matched !== undefined) return matched
+    const pageMatched = await this.matchedBrowserPageAnswer(active)
+    if (pageMatched !== undefined) return pageMatched
     if (active.browserHandoffCode === 'AUTH_REQUIRED') {
       return '网页需要你先完成登录；目前无法唯一确认请求的字段。'
     }

@@ -75,9 +75,11 @@ For `shape: "list"`, Main renders selected values in page order. For
 `shape: "scalar"`, exactly one selected value is allowed. Zero valid selections
 use the existing unable-to-confirm response.
 
-The existing private scalar-field matcher remains as a fallback for approved
-values deliberately withheld from the model-visible graph. This preserves the
-current certificate, education, and date trust policy without weakening it.
+The existing private scalar-field matcher remains the first resolver when
+approved values deliberately withheld from the model-visible graph exist. If it
+finds no relevant scalar answer, full-page evidence selection runs next. This
+preserves the current certificate, education, and date trust policy without
+weakening it while still allowing contextual answers that do not fit one field.
 
 ## Interface contract
 
@@ -160,8 +162,9 @@ and billing-consistency errors retain their existing explicit error behavior.
    against the exact snapshots and current evidence revision.
 7. Main renders exact selected node text/value with page label, origin, and
    capture time. The model selection and unused page text are not persisted.
-8. If full-page selection yields no valid evidence, the existing private scalar
-   matcher runs. If neither path yields evidence, Main returns the existing
+8. When approved private scalar evidence exists, its matcher runs first. If it
+   yields no valid evidence, or no private evidence exists, full-page selection
+   runs. If neither path yields evidence, Main returns the existing
    unable-to-confirm message.
 
 ## Whole-page bounds and pagination
@@ -221,7 +224,8 @@ invented. The selected values and provenance are exact Main-owned data.
 
 - No workflow manifest, renderer, database, or external public contract changes.
 - Existing `BrowserPageSnapshot` consumers tolerate optional node metadata.
-- Existing single-field private evidence and matcher remain intact as fallback.
+- Existing single-field private evidence and matcher remain intact as the first
+  resolver when approved private values exist.
 - Existing browser action authorization continues to use the same refs and does
   not trust `parentRef` or `answerable` for mutation authorization.
 
