@@ -84,6 +84,49 @@ const userId = 'e2e_browser_user'
 const account = 'E2EBrowser'
 const password = 'password-e2e'
 
+const nativeSetTimeout = globalThis.setTimeout
+const nativeClearTimeout = globalThis.clearTimeout
+let manualQuietClockEnabled = false
+let manualQuietNow = 0
+let manualQuietTimerSequence = 0
+const manualQuietTimers = new Map<ReturnType<typeof setTimeout>, {
+  deadline: number
+  callback: () => void
+}>()
+
+globalThis.setTimeout = ((...parameters: Parameters<typeof setTimeout>) => {
+  const [callback, delay = 0, ...args] = parameters
+  const stack = new Error().stack ?? ''
+  if (manualQuietClockEnabled && delay <= 5_000 && stack.includes('scheduleQuietWindow')) {
+    const handle = Object.freeze({ manualQuietTimer: ++manualQuietTimerSequence }) as unknown as ReturnType<typeof setTimeout>
+    manualQuietTimers.set(handle, {
+      deadline: manualQuietNow + delay,
+      callback: () => callback(...args),
+    })
+    return handle
+  }
+  return nativeSetTimeout(...parameters)
+}) as typeof setTimeout
+
+globalThis.clearTimeout = ((handle: Parameters<typeof clearTimeout>[0]) => {
+  if (handle && manualQuietTimers.delete(handle as ReturnType<typeof setTimeout>)) return
+  nativeClearTimeout(handle)
+}) as typeof clearTimeout
+
+async function advanceManualQuietWindow(milliseconds: number): Promise<void> {
+  if (!Number.isInteger(milliseconds) || milliseconds < 0) throw new Error('A non-negative integer duration is required')
+  manualQuietNow += milliseconds
+  while (true) {
+    const due = [...manualQuietTimers.entries()]
+      .filter(([, timer]) => timer.deadline <= manualQuietNow)
+      .sort((left, right) => left[1].deadline - right[1].deadline)[0]
+    if (!due) return
+    manualQuietTimers.delete(due[0])
+    due[1].callback()
+    await Promise.resolve()
+  }
+}
+
 if (new URL(fixtureOrigin).protocol !== 'https:' || new URL(disallowedOrigin).protocol !== 'https:') {
   throw new Error('Browser continuation E2E fixtures must use HTTPS')
 }
@@ -391,6 +434,11 @@ const deterministicProvider: CredentialBoundModelProvider = {
       }
       const page = inspectedSnapshot(request)
       if (!page) throw new Error('The deterministic provider did not receive a real inspected snapshot')
+      if (page.nodes.some((node) => /请手动核验/iu.test(node.name))) {
+        yield toolCall(request, 'browser_session_handoff', { bindingId, reason: 'unsupported_control' })
+        yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }
+        return
+      }
       const finalRef = page.nodes.find((node) => /正式提交/iu.test(node.name))?.ref
       if (userText.includes('E2E_INJECT_OPEN_TAB')) {
         yield attemptedToolCall(request, conversationId, 'browser_session_open_tab', {
@@ -472,9 +520,12 @@ type TargetState = {
   loading?: boolean
   allowedOrigins?: readonly string[]
   ownerContinuationRunId?: string
+  continuationSuspended: boolean
+  activityRevision: number
   view: { webContents: {
     getURL(): string
     isDestroyed(): boolean
+    focus(): void
     once(event: string, listener: (event: { defaultPrevented?: boolean }) => void): void
     removeListener(event: string, listener: (event: { defaultPrevented?: boolean }) => void): void
     sendInputEvent(event: { type: string; x?: number; y?: number; button?: string; clickCount?: number; keyCode?: string }): void
@@ -809,6 +860,7 @@ async function directScenario(input: Record<string, unknown>): Promise<Record<st
 async function seedBinding(input: Record<string, unknown>): Promise<{ bindingId: string; tabId: string }> {
   const conversationId = String(input.conversationId)
   const path = String(input.path ?? '/login')
+  if (path.startsWith('/manual-')) manualQuietClockEnabled = true
   const workflowVersion = String(input.workflowVersion ?? '1.0.0')
   const authenticate = input.authenticate !== false
   const chatRunId = `seed_run_${randomUUID()}`
@@ -870,6 +922,99 @@ async function clickFixture(selector: string, tabId?: string): Promise<void> {
   throw new Error(`Fixture selector is unavailable: ${selector}`)
 }
 
+function latestTarget(): TargetState {
+  const target = [...targets().values()].reverse().find((candidate) => !candidate.closed)
+  if (!target || target.view.webContents.isDestroyed()) throw new Error('Fixture target is unavailable')
+  return target
+}
+
+async function typePhysicalCharacter(target: TargetState, character: string): Promise<void> {
+  if (!target.ownerContinuationRunId || !target.continuationSuspended) {
+    throw new Error('Manual typing requires a suspended continuation')
+  }
+  const before = target.activityRevision
+  target.view.webContents.focus()
+  target.view.webContents.sendInputEvent({ type: 'keyDown', keyCode: character.toUpperCase() })
+  target.view.webContents.sendInputEvent({ type: 'char', keyCode: character })
+  target.view.webContents.sendInputEvent({ type: 'keyUp', keyCode: character.toUpperCase() })
+  if (target.activityRevision <= before) throw new Error('Target before-input-event did not record physical activity')
+}
+
+async function clickPhysicalControl(target: TargetState, selector: string): Promise<void> {
+  if (!target.ownerContinuationRunId || !target.continuationSuspended) {
+    throw new Error('Manual clicking requires a suspended continuation')
+  }
+  const before = target.activityRevision
+  const encoded = JSON.stringify(selector)
+  const point = await target.view.webContents.executeJavaScript<{ x: number; y: number }>(`(() => {
+    const element = document.querySelector(${encoded});
+    if (!(element instanceof HTMLElement)) throw new Error('Manual control is unavailable');
+    const bounds = element.getBoundingClientRect();
+    return { x: Math.round(bounds.left + bounds.width / 2), y: Math.round(bounds.top + bounds.height / 2) };
+  })()`)
+  target.view.webContents.focus()
+  target.view.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y })
+  target.view.webContents.sendInputEvent({ type: 'mouseDown', x: point.x, y: point.y, button: 'left', clickCount: 1 })
+  target.view.webContents.sendInputEvent({ type: 'mouseUp', x: point.x, y: point.y, button: 'left', clickCount: 1 })
+  if (target.activityRevision <= before) throw new Error('Target before-mouse-event did not record physical activity')
+}
+
+async function waitForTargetCondition(target: TargetState, script: string, message: string): Promise<void> {
+  const deadline = Date.now() + 2_000
+  while (Date.now() < deadline) {
+    if (await target.view.webContents.executeJavaScript<boolean>(script)) return
+    await new Promise<void>((resolve) => nativeSetTimeout(resolve, 10))
+  }
+  throw new Error(message)
+}
+
+async function resolveManualIntervention(mode: string): Promise<void> {
+  const target = latestTarget()
+  if (mode === 'typing' || mode === 'repeated') {
+    const wasRepeatedSecondStep = mode === 'repeated'
+      && await target.view.webContents.executeJavaScript<boolean>(
+        `document.querySelector('#manual-marker')?.textContent?.includes('第二步') === true`,
+      )
+    const focused = await target.view.webContents.executeJavaScript<boolean>(`(() => {
+      const input = document.querySelector('#manual-value');
+      if (!(input instanceof HTMLInputElement)) return false;
+      input.focus();
+      return true;
+    })()`)
+    if (!focused) throw new Error('Manual typing control is unavailable')
+    await typePhysicalCharacter(target, mode === 'repeated' ? 'r' : 'v')
+    await waitForTargetCondition(
+      target,
+      wasRepeatedSecondStep
+        ? `document.querySelector('#expiry-date') !== null`
+        : mode === 'repeated'
+          ? `document.querySelector('#manual-marker')?.textContent?.includes('第二步') === true`
+          : `document.querySelector('#expiry-date') !== null`,
+      'Manual typing did not update the fixture page',
+    )
+    return
+  }
+  if (mode === 'navigation') {
+    await clickPhysicalControl(target, '#manual-navigation')
+    await waitForTargetCondition(
+      target,
+      `location.pathname === '/manual-resolved' && document.querySelector('#expiry-date') !== null`,
+      'Manual navigation did not reach the resolved page',
+    )
+    return
+  }
+  if (mode === 'same-document') {
+    await clickPhysicalControl(target, '#manual-spa')
+    await waitForTargetCondition(
+      target,
+      `location.hash === '#resolved' && document.querySelector('#expiry-date') !== null`,
+      'Manual same-document navigation did not resolve the page',
+    )
+    return
+  }
+  throw new Error(`Unsupported manual intervention mode: ${mode}`)
+}
+
 type WorkspaceInternals = {
   window?: BaseWindow
   toolbar?: WebContentsView
@@ -924,6 +1069,9 @@ async function resetScenario(): Promise<void> {
   providerAttempts.splice(0)
   executorCalls.splice(0)
   highlightEvents.splice(0)
+  manualQuietClockEnabled = false
+  manualQuietNow = 0
+  manualQuietTimers.clear()
   const conversations = await runtime!.services.chat.listConversations()
   for (const conversation of conversations) await runtime!.services.chat.deleteConversation(conversation.id)
 }
@@ -1024,6 +1172,11 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     throw new Error(`Conversation did not become idle: ${String(input.conversationId)}`)
   }
   if (name === 'seedBinding') return seedBinding(input)
+  if (name === 'manualResolve') return resolveManualIntervention(String(input.mode))
+  if (name === 'manualActivity') return typePhysicalCharacter(latestTarget(), 'x')
+  if (name === 'advanceManualQuietWindow') {
+    return advanceManualQuietWindow(Number(input.milliseconds))
+  }
   if (name === 'userClick') return clickFixture(String(input.selector), input.tabId ? String(input.tabId) : undefined)
   if (name === 'userPageOperation') return clickFixture(String(input.selector), input.tabId ? String(input.tabId) : undefined)
   if (name === 'tabFieldValue') {

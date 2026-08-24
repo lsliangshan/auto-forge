@@ -3,7 +3,11 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createRequire } from 'node:module'
 import { test, expect, _electron, type ElectronApplication, type Page } from '@playwright/test'
-import { startBrowserContinuationFixture, type BrowserContinuationFixture } from './browser-continuation-fixture.js'
+import {
+  manualInterventionCases,
+  startBrowserContinuationFixture,
+  type BrowserContinuationFixture,
+} from './browser-continuation-fixture.js'
 
 const desktopRoot = resolve(import.meta.dirname, '../..')
 const repositoryRoot = resolve(desktopRoot, '../..')
@@ -248,6 +252,71 @@ test.describe.serial('conversation-bound browser continuation', () => {
       expect(await fixture.snapshot()).toMatchObject({ finalSubmissions: 0 })
     })
   }
+
+  for (const intervention of manualInterventionCases) {
+    test(`resumes the same chat turn after manual ${intervention.mode} and five quiet seconds`, async () => {
+      const conversationId = await createConversation(page, electronApp)
+      await seed(electronApp, conversationId, intervention.path)
+      await submitChat(page, '读取证件“有效期至”')
+      await expect(page.getByText('等待你手动操作')).toBeVisible()
+      await expect(page.getByText(
+        '自动操作暂时无法继续，请在网页中手动操作。停止操作 5 秒后将自动继续。',
+      )).toBeVisible()
+
+      const before = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
+      await command(electronApp, 'manualResolve', { mode: intervention.mode })
+      await expect.poll(async () => (
+        await command<HarnessSnapshot>(electronApp, 'snapshot')
+      ).providerRequests.length).toBe(before)
+      await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 5_000 })
+      await command(electronApp, 'waitForIdle', { conversationId })
+
+      await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
+    })
+  }
+
+  test('new physical input at 4,999 ms delays manual recovery', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    await seed(electronApp, conversationId, '/manual-typing')
+    await submitChat(page, '读取证件“有效期至”')
+    await expect(page.getByText('等待你手动操作')).toBeVisible()
+
+    const before = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
+    await command(electronApp, 'manualResolve', { mode: 'typing' })
+    await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 4_999 })
+    await command(electronApp, 'manualActivity')
+    await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 1 })
+    expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests).toHaveLength(before)
+    await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 4_999 })
+    await command(electronApp, 'waitForIdle', { conversationId })
+
+    await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
+  })
+
+  test('a repeated manual blocker requires a new physical event', async () => {
+    const conversationId = await createConversation(page, electronApp)
+    await seed(electronApp, conversationId, '/manual-repeated')
+    await submitChat(page, '读取证件“有效期至”')
+    await expect(page.getByText('等待你手动操作')).toBeVisible()
+
+    const before = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
+    await command(electronApp, 'manualResolve', { mode: 'repeated' })
+    await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 5_000 })
+    await expect.poll(async () => (
+      await command<HarnessSnapshot>(electronApp, 'snapshot')
+    ).providerRequests.length).toBeGreaterThan(before)
+    await expect(page.getByText('等待你手动操作')).toBeVisible()
+    const repeated = (await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests.length
+    await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 5_000 })
+    expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests).toHaveLength(repeated)
+
+    await command(electronApp, 'manualResolve', { mode: 'repeated' })
+    expect((await command<HarnessSnapshot>(electronApp, 'snapshot')).providerRequests).toHaveLength(repeated)
+    await command(electronApp, 'advanceManualQuietWindow', { milliseconds: 5_000 })
+    await command(electronApp, 'waitForIdle', { conversationId })
+
+    await expect(page.getByText('工作居住证有效期：2028-06-30')).toBeVisible()
+  })
 
   test('edits and autosaves a draft but requires an explicit user click for final submit', async () => {
     const conversationId = await createConversation(page, electronApp)
