@@ -137,25 +137,38 @@ function cloneValidatedJson(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
+function opaqueKeyTokens(key) {
+  return key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((token) => token.toLowerCase())
+}
+
+const sensitiveOpaqueTokens = new Set([
+  'authorization', 'base64', 'cookie', 'cookies', 'credential', 'credentials',
+  'owner', 'password', 'passwords', 'prompt', 'prompts', 'secret', 'secrets',
+  'sql', 'token', 'tokens', 'uid',
+])
+
+function hasOpaqueTokenPair(tokens, first, second) {
+  return tokens.some((token, index) => token === first && tokens[index + 1] === second)
+}
+
 function sensitiveOpaqueKey(key) {
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '')
-  return normalized === 'authorization'
-    || normalized === 'cookie'
-    || normalized === 'uid'
-    || normalized.endsWith('uid')
-    || normalized.includes('userid')
-    || normalized === 'path'
-    || normalized.endsWith('path')
-    || normalized.includes('owner')
-    || normalized.includes('credential')
-    || normalized.includes('token')
-    || normalized.includes('password')
-    || normalized.includes('secret')
-    || normalized.includes('servicekey')
-    || normalized.includes('apikey')
-    || normalized.includes('prompt')
-    || normalized.includes('responsebody')
-    || normalized.includes('base64')
+  const tokens = opaqueKeyTokens(key)
+  if (tokens.some((token) => sensitiveOpaqueTokens.has(token))) return true
+
+  return hasOpaqueTokenPair(tokens, 'auth', 'header')
+    || hasOpaqueTokenPair(tokens, 'user', 'id')
+    || hasOpaqueTokenPair(tokens, 'api', 'key')
+    || hasOpaqueTokenPair(tokens, 'service', 'key')
+    || hasOpaqueTokenPair(tokens, 'response', 'body')
+    || ['local', 'file', 'root', 'absolute'].some((prefix) => (
+      hasOpaqueTokenPair(tokens, prefix, 'path')
+    ))
+    || (tokens.length === 1 && tokens[0] === 'path')
 }
 
 function sanitizeOpaqueJson(value) {

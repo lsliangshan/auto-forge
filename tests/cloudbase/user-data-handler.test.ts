@@ -755,10 +755,17 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
               workflowName: 'Workflow',
               args: {
                 query: 'status:open',
+                fluid: 'hydraulic',
+                liquid: 'water',
+                sql: 'select-secret-must-not-cross',
                 ServiceKey: 'service-key-must-not-cross',
                 rootPath: '/Users/private/project',
                 nested: {
                   Authorization: 'authorization-must-not-cross',
+                  authorizationHeader: 'authorization-header-must-not-cross',
+                  cookieValue: 'cookie-must-not-cross',
+                  uidValue: 'uid-must-not-cross',
+                  filePathValue: 'file-path-must-not-cross',
                   callerUserId: 'user-id-must-not-cross',
                   access_token: 'token-must-not-cross',
                   passwordValue: 'password-must-not-cross',
@@ -786,10 +793,17 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
           workflowName: 'Workflow',
           args: {
             query: 'status:open',
+            fluid: 'hydraulic',
+            liquid: 'water',
+            sql: '[REDACTED]',
             ServiceKey: '[REDACTED]',
             rootPath: '[REDACTED]',
             nested: {
               Authorization: '[REDACTED]',
+              authorizationHeader: '[REDACTED]',
+              cookieValue: '[REDACTED]',
+              uidValue: '[REDACTED]',
+              filePathValue: '[REDACTED]',
               callerUserId: '[REDACTED]',
               access_token: '[REDACTED]',
               passwordValue: '[REDACTED]',
@@ -804,7 +818,7 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
       }],
     })
     expect(JSON.stringify(result)).not.toMatch(
-      /service-key-must-not-cross|Users\/private|authorization-must-not-cross|user-id-must-not-cross|token-must-not-cross|password-must-not-cross|prompt-must-not-cross|response-must-not-cross|base64-must-not-cross|owner-must-not-cross/,
+      /select-secret-must-not-cross|service-key-must-not-cross|Users\/private|authorization-must-not-cross|authorization-header-must-not-cross|cookie-must-not-cross|uid-must-not-cross|file-path-must-not-cross|user-id-must-not-cross|token-must-not-cross|password-must-not-cross|prompt-must-not-cross|response-must-not-cross|base64-must-not-cross|owner-must-not-cross/,
     )
   })
 
