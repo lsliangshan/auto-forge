@@ -8,7 +8,7 @@ import {
   byokUsageEventSchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
-  legacyImportConfirmRequestSchema,
+  legacyImportRequestSchema,
   openExternalRequestSchema,
   privacyConsentSchema,
   remoteUsageSnapshotSchema,
@@ -489,6 +489,30 @@ class UserDataAdmissionGate {
 
 function iso(timestamp: number | undefined): string | undefined {
   return timestamp === undefined ? undefined : new Date(timestamp).toISOString()
+}
+
+function timeZoneParts(date: Date, timeZone: string): Record<string, number> {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).filter(({ type }) => type !== 'literal')
+    .map(({ type, value }) => [type, Number(value)]))
+}
+
+function startOfMonthInTimeZone(now: Date, timeZone: string): Date {
+  const current = timeZoneParts(now, timeZone)
+  const localMidnight = Date.UTC(current.year!, current.month! - 1, 1)
+  let instant = localMidnight
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const represented = timeZoneParts(new Date(instant), timeZone)
+    const offset = Date.UTC(
+      represented.year!, represented.month! - 1, represented.day!,
+      represented.hour!, represented.minute!, represented.second!,
+    ) - instant
+    instant = localMidnight - offset
+  }
+  return new Date(instant)
 }
 
 function summary(workflow: WorkflowDetail): WorkflowSummary {
@@ -2093,7 +2117,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       importLegacyData: async (input) => {
         const session = await requireAuthenticatedSession()
-        const confirmation = legacyImportConfirmRequestSchema.safeParse(input)
+        const confirmation = legacyImportRequestSchema.safeParse(input)
         const store = currentUserData()
         const storedCloudConsent = store.account.getConsent('cloud_sync')
         if (!confirmation.success
@@ -2113,7 +2137,23 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             await userDataSync.flush()
           }
         }
-        return legacyUserDataImporter.import(session.user.id, confirmation.data)
+        const selectionFingerprint = legacyUserDataImporter.selectionFingerprint(
+          session.user.id,
+          confirmation.data.includeUnowned,
+        )
+        const batchId = store.account.resolveLegacyImportBatch({
+          selectionFingerprint,
+          includeUnowned: confirmation.data.includeUnowned,
+          cloudConsentVersion: confirmation.data.cloudSyncConsent.documentVersion,
+          ...(confirmation.data.unownedImportConsent ? {
+            unownedConsentVersion: confirmation.data.unownedImportConsent.documentVersion,
+          } : {}),
+          candidateBatchId: `legacy-${randomUUID()}`,
+        })
+        return legacyUserDataImporter.import(session.user.id, {
+          ...confirmation.data,
+          batchId,
+        })
       },
       getAccountDataPreferences: async (): Promise<AccountDataPreferences> => {
         await requireAuthenticatedSession()
@@ -2172,7 +2212,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             })
           : accountDataPreferencesSchema.parse(accountDataPreferencesDefaults)
         const endedAt = new Date()
-        const startedAt = new Date(Date.UTC(endedAt.getUTCFullYear(), endedAt.getUTCMonth(), 1))
+        const startedAt = startOfMonthInTimeZone(endedAt, preferences.timezone)
         const response = await userDataSyncPort.call({
           action: 'getUsageSnapshot',
           startedAt: startedAt.toISOString(),
@@ -2265,6 +2305,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     settings: {
       ...ungatedServices.settings,
       getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),
+      recordPrivacyConsent: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.recordPrivacyConsent(input),
+      ),
+      previewLegacyImport: () => userDataAdmission.run(
+        ungatedServices.settings.previewLegacyImport,
+      ),
+      importLegacyData: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.importLegacyData(input),
+      ),
+      getAccountDataPreferences: () => userDataAdmission.run(
+        ungatedServices.settings.getAccountDataPreferences,
+      ),
+      updateAccountDataPreferences: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.updateAccountDataPreferences(input),
+      ),
+      getRemoteUsage: () => userDataAdmission.run(ungatedServices.settings.getRemoteUsage),
       clearLocalData: (scope) => userDataAdmission.run(
         () => ungatedServices.settings.clearLocalData(scope),
       ),

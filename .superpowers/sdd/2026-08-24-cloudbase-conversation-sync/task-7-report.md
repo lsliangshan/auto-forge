@@ -9,6 +9,16 @@
 - BYOK events for OpenRouter and DeepSeek use the authenticated per-user outbox, are always user-owned/non-billable, and classify known Provider cost as `estimated` and absent cost as `unavailable`. Streaming and video events never serialize API keys or fingerprints.
 - Commit message: `feat: import legacy chats and sync BYOK usage` (the final hash is recorded in the task handoff and ledger).
 
+## Review follow-up
+
+- All six cloud-data settings methods now run inside `UserDataAdmissionGate`. Dedicated legacy imports additionally capture the active UID/generation and the Task 5 engine verifies that binding before and after any pending drain; an A request cannot be adopted by B after an identity handoff.
+- A remote `rejected` import result is a safe failure. Import stops at that batch and the Renderer cannot display completion.
+- Renderer import requests no longer choose batch IDs. Main hashes the exact selected legacy set and the per-UID cache migration `0005_legacy_import_identity.sql` persists one root batch identity for that set and consent-version tuple. Ambiguous retries and restarts reuse the same root; changing the selected set or consent versions rotates it.
+- Optimistic preference projections advance to `baseRevision + 1`. Consecutive offline updates therefore enqueue FIFO bases `0`, then `1`; an earlier receipt cannot overwrite a newer optimistic projection, and a later conflict keeps that projection visible and retryable.
+- Local OpenRouter BYOK labels now say estimate/unavailable rather than confirmed/pending confirmation. Only the separately trusted platform-cost field retains “confirmed” language.
+- CloudBase usage responses canonicalize SQL numeric strings such as `0.010000000000` to `0.01` before the strict public decimal schema. Monthly bounds use the saved IANA timezone, including east/west UTC month-boundary coverage.
+- Imported conversation activity is the maximum of its conversation timestamps and latest selected message timestamp.
+
 ## TDD evidence
 
 RED was observed before implementation:
@@ -19,6 +29,7 @@ RED was observed before implementation:
 - Public path: preload methods were absent, IPC handlers were absent, first conversation creation succeeded without consent, and the settings usage/import controls were absent.
 - Renderer first-create consent: no confirmation was shown and no consent-backed retry occurred.
 - Video completion: no remote-safe BYOK event was emitted for terminal video cost.
+- Review round 1: seven focused failures reproduced non-canonical SQL cost, stale imported activity, rejected import continuation, missing binding-generation verification, and non-sequential preference projections/receipt overwrite. Additional RED tests reproduced the renderer-controlled import identity, missing persisted root, and confirmed-cost BYOK labels.
 
 GREEN verification is listed below.
 
@@ -27,13 +38,14 @@ GREEN verification is listed below.
 - Preview reads global legacy conversations with `list()` only. It never calls `claimLegacyAndListForUser()`, mutates ownership, or exposes another non-null UID's rows.
 - Import selection includes only the authenticated UID and, when separately confirmed, unowned rows. Foreign UID-owned conversations and messages are excluded.
 - Conversation/message identities are deterministic SHA-256-derived values from the import batch, entity kind, and legacy ID. Relationships and original timestamps are preserved.
-- Rows are ordered conversation-first and sent in deterministic batches capped at 100 records and one MiB. The Task 5 lifecycle queue serializes each dedicated import call with the active binding and current drain.
+- The public root identity is Main-owned and persisted per UID. Its selection fingerprint includes only the active UID/unowned-confirmed rows and their messages; other UID-owned rows cannot affect or enter the import.
+- Rows are ordered conversation-first and sent in deterministic batches capped at 100 records and one MiB. The Task 5 lifecycle queue serializes each dedicated import call with the captured active UID/generation and current drain. Rejected batches stop the sequence.
 - `privacy.consent` remains a durable FIFO outbox mutation. The additive per-UID SQLite projection recognizes consent across restart and applies pulled consent records.
 - Refused first-conversation consent and cancelled unowned import confirmation are covered as no-write paths.
 
 ## Preferences and usage
 
-- `preferences.update` remains an optimistic per-UID projection plus durable FIFO outbox mutation. Pulled or directly read preferences are projected locally with revision and update time.
+- `preferences.update` remains an optimistic per-UID projection plus durable FIFO outbox mutation. Optimistic revisions advance sequentially and earlier receipts preserve newer pending values. Pulled or directly read preferences are projected locally with revision and update time.
 - Main validates account timezones with `Intl.DateTimeFormat`; display currency remains the strict `CNY | USD` contract. Invalid timezone tests prove no outbox write.
 - `getUserDataPreferences` and `getUsageSnapshot` use the expanded strict CloudBase port and derive identity only from the authenticated function context.
 - Remote usage distinguishes platform-confirmed cost, unacknowledged BYOK records, BYOK estimates, unavailable-cost records, tokens, account timezone/currency, and last sync time. BYOK estimates are never displayed as confirmed spend.
@@ -49,7 +61,7 @@ GREEN verification is listed below.
 
 - Shared contracts/tests: `packages/shared/src/desktop-api.ts`, `packages/shared/src/contracts.test.ts`.
 - Import/sync/port: `legacy-user-data-import.ts` and test, `user-data-sync-engine.ts` and test, `cloudbase-user-data-port.ts` and test.
-- Per-UID cache: `user-data-client.ts` and test, `user-data-repositories.ts`, migration `0004_account_sync_projection.sql`.
+- Per-UID cache: `user-data-client.ts` and test, `user-data-repositories.ts`, migrations `0004_account_sync_projection.sql` and `0005_legacy_import_identity.sql`.
 - BYOK attribution: `provider-usage-stream.ts` and test, repository interface, eight stream call sites, `video-job-runner.ts` and focused test.
 - Public Main boundary: `application.ts` and test, `register-ipc.ts` and test, preload `bridge.ts` and test.
 - Renderer: chat/settings stores, `SettingsView.vue`, `BillingUsagePanel.vue`, and `workbench.test.ts`.
@@ -63,6 +75,14 @@ GREEN verification is listed below.
 - Shared typecheck and build: passed.
 - ESLint over every changed TypeScript/Vue file: exited 0 with no errors. It reports four pre-existing compact-markup warnings in unchanged portions of `SettingsView.vue`.
 - `git diff --check`: passed before commit.
+
+Review follow-up verification:
+
+- Shared contract suite: 81/81 passed.
+- Focused Main/application/cache/import/engine/port/IPC/preload suite: 304/304 passed.
+- Renderer workbench + BYOK label suites: 81/81 passed.
+- All workspace typechecks: passed.
+- ESLint over all review-changed TypeScript/Vue files: 0 errors; the same four pre-existing compact-markup warnings remain in `SettingsView.vue`.
 
 ## Remaining staging-only gaps
 

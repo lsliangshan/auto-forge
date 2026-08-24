@@ -507,6 +507,32 @@ export const legacyImportConfirmRequestSchema = z.object({
 })
 export type LegacyImportConfirmRequest = z.infer<typeof legacyImportConfirmRequestSchema>
 
+export const legacyImportRequestSchema = z.object({
+  includeUnowned: z.boolean(),
+  cloudSyncConsent: privacyConsentSchema,
+  unownedImportConsent: privacyConsentSchema.optional(),
+}).strict().superRefine((request, context) => {
+  if (request.cloudSyncConsent.purpose !== 'cloud_sync') {
+    context.addIssue({
+      code: 'custom', path: ['cloudSyncConsent', 'purpose'],
+      message: 'Cloud sync consent is required separately from legacy import consent',
+    })
+  }
+  if (request.includeUnowned && request.unownedImportConsent?.purpose !== 'legacy_unowned_import') {
+    context.addIssue({
+      code: 'custom', path: ['unownedImportConsent'],
+      message: 'Importing unowned history requires separate confirmation',
+    })
+  }
+  if (!request.includeUnowned && request.unownedImportConsent !== undefined) {
+    context.addIssue({
+      code: 'custom', path: ['unownedImportConsent'],
+      message: 'Unowned import consent must accompany an unowned import',
+    })
+  }
+})
+export type LegacyImportRequest = z.infer<typeof legacyImportRequestSchema>
+
 export const legacyImportResultSchema = z.object({
   batchId: identifierSchema,
   status: z.enum(['applied', 'duplicate', 'rejected']),
@@ -1515,7 +1541,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsRecordPrivacyConsent]: privacyConsentSchema,
   [ipcChannels.settingsPreviewLegacyImport]: z.undefined(),
-  [ipcChannels.settingsImportLegacyData]: legacyImportConfirmRequestSchema,
+  [ipcChannels.settingsImportLegacyData]: legacyImportRequestSchema,
   [ipcChannels.settingsGetAccountDataPreferences]: z.undefined(),
   [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
   [ipcChannels.settingsGetRemoteUsage]: z.undefined(),
@@ -1690,7 +1716,7 @@ export interface DesktopAPI {
     getTokenUsage(): Promise<TokenUsageSnapshot>
     recordPrivacyConsent(input: PrivacyConsent): Promise<void>
     previewLegacyImport(): Promise<LegacyImportPreview>
-    importLegacyData(input: LegacyImportConfirmRequest): Promise<LegacyImportResult[]>
+    importLegacyData(input: LegacyImportRequest): Promise<LegacyImportResult[]>
     getAccountDataPreferences(): Promise<AccountDataPreferences>
     updateAccountDataPreferences(input: AccountDataPreferences): Promise<AccountDataPreferences>
     getRemoteUsage(): Promise<RemoteUsageSnapshot>

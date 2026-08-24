@@ -1622,7 +1622,7 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
@@ -1686,7 +1686,7 @@ describe('UserDataStoreManager', () => {
     }
     alice.outbox.recordWithPreferences(preferences)
     expect(alice.account.getPreferences()).toEqual({
-      timezone: 'America/New_York', displayCurrency: 'USD', revision: 0,
+      timezone: 'America/New_York', displayCurrency: 'USD', revision: 1,
       updatedAt: '2026-08-25T00:01:00.000Z',
     })
     manager.close()
@@ -1705,6 +1705,83 @@ describe('UserDataStoreManager', () => {
     manager.open('cloud-bob')
     expect(manager.current()?.account.getConsent('cloud_sync')).toBeUndefined()
     expect(manager.current()?.account.getPreferences()).toBeUndefined()
+    manager.close()
+  })
+
+  it('assigns consecutive optimistic preference revisions and preserves the newest value across receipts', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const first: Extract<SyncMutation, { kind: 'preferences.update' }> = {
+      id: 'preferences_first', kind: 'preferences.update', entityId: 'account-preferences',
+      baseRevision: 0, occurredAt: '2026-08-25T00:01:00.000Z',
+      payload: { timezone: 'Asia/Shanghai', displayCurrency: 'CNY' },
+    }
+    const second: Extract<SyncMutation, { kind: 'preferences.update' }> = {
+      id: 'preferences_second', kind: 'preferences.update', entityId: 'account-preferences',
+      baseRevision: 1, occurredAt: '2026-08-25T00:02:00.000Z',
+      payload: { timezone: 'America/New_York', displayCurrency: 'USD' },
+    }
+    store.outbox.recordWithPreferences(first)
+    store.outbox.recordWithPreferences(second)
+
+    expect(store.outbox.list(10).map(({ baseRevision }) => baseRevision)).toEqual([0, 1])
+    expect(store.account.getPreferences()).toMatchObject({
+      timezone: 'America/New_York', revision: 2,
+    })
+    store.outbox.markSyncing([first.id])
+    store.outbox.acknowledgePushResults(
+      [first], [{ id: first.id, status: 'applied', revision: 1 }],
+    )
+    expect(store.account.getPreferences()).toMatchObject({
+      timezone: 'America/New_York', revision: 2,
+    })
+    store.outbox.markSyncing([second.id])
+    store.outbox.acknowledgePushResults(
+      [second], [{ id: second.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' }],
+    )
+    store.outbox.markFailed(second.id, 'SYNC_CONFLICT')
+    expect(store.outbox.find(second.id)).toMatchObject({
+      state: 'failed', lastErrorCode: 'SYNC_CONFLICT', baseRevision: 1,
+    })
+    expect(store.account.getPreferences()).toMatchObject({
+      timezone: 'America/New_York', revision: 2,
+    })
+    manager.close()
+  })
+
+  it('persists one legacy import root per selected set and consent versions', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const selection = {
+      selectionFingerprint: 'a'.repeat(64),
+      includeUnowned: true,
+      cloudConsentVersion: 'cloud-sync-2026-08',
+      unownedConsentVersion: 'legacy-unowned-import-2026-08',
+    }
+    expect(store.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'legacy-root-1',
+    })).toBe('legacy-root-1')
+    expect(store.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'must-not-replace',
+    })).toBe('legacy-root-1')
+    manager.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(reopened.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'still-must-not-replace',
+    })).toBe('legacy-root-1')
+    expect(reopened.account.resolveLegacyImportBatch({
+      ...selection, selectionFingerprint: 'b'.repeat(64), candidateBatchId: 'legacy-root-2',
+    })).toBe('legacy-root-2')
+    expect(reopened.account.resolveLegacyImportBatch({
+      ...selection, cloudConsentVersion: 'cloud-sync-2026-09',
+      candidateBatchId: 'legacy-root-3',
+    })).toBe('legacy-root-3')
+    manager.open('cloud-bob')
+    expect(manager.current()?.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'bob-root-1',
+    })).toBe('bob-root-1')
     manager.close()
   })
 

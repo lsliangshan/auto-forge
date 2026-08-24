@@ -72,7 +72,7 @@ describe('CloudBaseUserDataPort', () => {
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: {
         startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
-        inputTokens: 10, outputTokens: 5, estimatedCostUsd: '0.01',
+        inputTokens: 10, outputTokens: 5, estimatedCostUsd: '0.010000000000',
         estimatedCount: 1, unavailableCount: 2,
       } } })
     const port = new CloudBaseUserDataPort({ callFunction })
@@ -94,7 +94,9 @@ describe('CloudBaseUserDataPort', () => {
     await expect(port.call({
       action: 'getUsageSnapshot', startedAt: '2026-08-01T00:00:00.000Z',
       endedAt: '2026-08-25T00:00:00.000Z',
-    })).resolves.toMatchObject({ ok: true, data: { estimatedCount: 1 } })
+    })).resolves.toMatchObject({
+      ok: true, data: { estimatedCostUsd: '0.01', estimatedCount: 1 },
+    })
     expect(JSON.stringify(callFunction.mock.calls)).not.toContain('ownerUserId')
     expect(JSON.stringify(callFunction.mock.calls)).not.toContain('userId')
   })

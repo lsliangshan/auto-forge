@@ -39,7 +39,8 @@ function harness(conversations: Conversation[], messages: Message[] = []) {
   const importLegacyBatch = vi.fn().mockResolvedValue({
     batchId: 'batch_1-0', status: 'applied', importedConversations: 1, importedMessages: 1,
   })
-  const importer = new LegacyUserDataImporter(legacy, { importLegacyBatch })
+  const captureBinding = vi.fn(() => ({ userId: 'alice', generation: 1 }))
+  const importer = new LegacyUserDataImporter(legacy, { captureBinding, importLegacyBatch })
   return { importer, legacy, importLegacyBatch }
 }
 
@@ -87,7 +88,7 @@ describe('LegacyUserDataImporter', () => {
     ])
 
     await test.importer.import('alice', confirmation(true))
-    const request = test.importLegacyBatch.mock.calls[0]![0]
+    const request = test.importLegacyBatch.mock.calls[0]![1]
 
     expect(request).toMatchObject({
       batchId: 'batch_1-0', includeUnowned: true,
@@ -96,12 +97,12 @@ describe('LegacyUserDataImporter', () => {
     expect(request.conversations).toEqual([
       {
         id: 'legacy_caea47fe6c05ff0e1442f734acdac795', title: 'Owned', titleState: 'user_named',
-        createdAt: '1970-01-01T00:00:01.000Z', lastActivityAt: '1970-01-01T00:00:01.010Z',
+        createdAt: '1970-01-01T00:00:01.000Z', lastActivityAt: '1970-01-01T00:00:01.100Z',
         metadataUpdatedAt: '1970-01-01T00:00:01.010Z',
       },
       {
         id: 'legacy_6ce38694d7062dc9f9bf65633e515f89', title: 'Unowned', titleState: 'user_named',
-        createdAt: '1970-01-01T00:00:02.000Z', lastActivityAt: '1970-01-01T00:00:02.010Z',
+        createdAt: '1970-01-01T00:00:02.000Z', lastActivityAt: '1970-01-01T00:00:02.100Z',
         metadataUpdatedAt: '1970-01-01T00:00:02.010Z', sourceUnowned: true,
       },
     ])
@@ -133,10 +134,10 @@ describe('LegacyUserDataImporter', () => {
     test.importLegacyBatch.mockResolvedValue({ batchId: 'ignored', status: 'duplicate' })
 
     await test.importer.import('alice', confirmation(false))
-    const firstRun = test.importLegacyBatch.mock.calls.map(([request]) => request)
+    const firstRun = test.importLegacyBatch.mock.calls.map(([, request]) => request)
     test.importLegacyBatch.mockClear()
     await test.importer.import('alice', confirmation(false))
-    const secondRun = test.importLegacyBatch.mock.calls.map(([request]) => request)
+    const secondRun = test.importLegacyBatch.mock.calls.map(([, request]) => request)
 
     expect(secondRun).toEqual(firstRun)
     expect(firstRun.length).toBeGreaterThan(1)
@@ -144,5 +145,19 @@ describe('LegacyUserDataImporter', () => {
       expect(request.conversations.length + request.messages.length).toBeLessThanOrEqual(100)
       expect(Buffer.byteLength(JSON.stringify(request), 'utf8')).toBeLessThanOrEqual(1_048_576)
     }
+  })
+
+  it('stops after a rejected remote batch and surfaces only a safe failure', async () => {
+    const rows = Array.from({ length: 101 }, (_, index) => (
+      conversation(`owned_${index}`, 'alice', `Owned ${index}`, index + 1)
+    ))
+    const test = harness(rows)
+    test.importLegacyBatch.mockResolvedValueOnce({
+      batchId: 'batch_1-0', status: 'rejected', errorCode: 'SYNC_CONFLICT',
+    })
+
+    await expect(test.importer.import('alice', confirmation(false)))
+      .rejects.toMatchObject({ code: 'SYNC_CONFLICT' })
+    expect(test.importLegacyBatch).toHaveBeenCalledTimes(1)
   })
 })

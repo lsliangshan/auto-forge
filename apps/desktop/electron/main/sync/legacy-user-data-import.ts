@@ -9,6 +9,7 @@ import {
 } from '@autoforge/shared'
 import { createHash } from 'node:crypto'
 import type { AppRepositories, Conversation } from '../database/repositories.js'
+import type { UserDataBindingToken } from './user-data-sync-engine.js'
 
 const MAX_BATCH_RECORDS = 100
 const MAX_BATCH_BYTES = 1_048_576
@@ -37,7 +38,11 @@ export interface LegacyImportBatchRequest extends LegacyImportConfirmRequest {
 export type LegacyImportBatchResult = LegacyImportResult
 
 interface LegacyImportCoordinator {
-  importLegacyBatch(input: LegacyImportBatchRequest): Promise<LegacyImportBatchResult>
+  captureBinding(userId: string): UserDataBindingToken
+  importLegacyBatch(
+    expected: UserDataBindingToken,
+    input: LegacyImportBatchRequest,
+  ): Promise<LegacyImportBatchResult>
 }
 
 type LegacyRepositories = Pick<AppRepositories, 'conversations' | 'messages'>
@@ -70,9 +75,22 @@ export class LegacyUserDataImporter {
     })
   }
 
+  selectionFingerprint(userId: string, includeUnowned: boolean): string {
+    const conversations = selectedConversations(
+      this.legacy.conversations.list(), userId, includeUnowned,
+    ).sort((left, right) => left.id.localeCompare(right.id))
+    const selected = conversations.map((conversation) => ({
+      conversation,
+      messages: this.legacy.messages.listForConversation(conversation.id)
+        .sort((left, right) => left.id.localeCompare(right.id)),
+    }))
+    return createHash('sha256').update(JSON.stringify(selected)).digest('hex')
+  }
+
   async import(userId: string, input: LegacyImportConfirmRequest): Promise<LegacyImportBatchResult[]> {
     const confirmation = legacyImportConfirmRequestSchema.safeParse(input)
     if (!confirmation.success) throw toSafeAppError({ code: 'IMPORT_CONFIRMATION_REQUIRED' })
+    const binding = this.coordinator.captureBinding(userId)
     const conversations = selectedConversations(
       this.legacy.conversations.list(), userId, confirmation.data.includeUnowned,
     )
@@ -84,12 +102,17 @@ export class LegacyUserDataImporter {
       | { type: 'message'; value: LegacyImportBatchRequest['messages'][number] }
     > = []
     for (const row of conversations) {
+      const messages = this.legacy.messages.listForConversation(row.id)
       const sourceUnowned = row.userId === undefined
       records.push({
         type: 'conversation',
         value: {
           id: conversationIds.get(row.id)!, title: row.title, titleState: row.titleState,
-          createdAt: iso(row.createdAt), lastActivityAt: iso(row.updatedAt),
+          createdAt: iso(row.createdAt),
+          lastActivityAt: iso(messages.reduce(
+            (latest, message) => Math.max(latest, message.createdAt),
+            Math.max(row.createdAt, row.updatedAt),
+          )),
           metadataUpdatedAt: iso(row.updatedAt), ...(sourceUnowned ? { sourceUnowned: true } : {}),
         },
       })
@@ -138,7 +161,13 @@ export class LegacyUserDataImporter {
       }
     }
     const results: LegacyImportBatchResult[] = []
-    for (const batch of batches) results.push(await this.coordinator.importLegacyBatch(batch))
+    for (const batch of batches) {
+      const result = await this.coordinator.importLegacyBatch(binding, batch)
+      if (result.status === 'rejected') {
+        throw toSafeAppError({ code: result.errorCode ?? 'SYNC_CONFLICT' })
+      }
+      results.push(result)
+    }
     return results
   }
 

@@ -24,6 +24,7 @@ import {
   ipcResponseSchemas,
   ipcChannels,
   legacyImportConfirmRequestSchema,
+  legacyImportRequestSchema,
   legacyImportResultSchema,
   legacyImportPreviewSchema,
   listConversationsRequestSchema,
@@ -407,6 +408,12 @@ describe('cross-process contracts', () => {
     }).success).toBe(false)
     expect(legacyImportConfirmRequestSchema.safeParse({
       batchId: 'batch_1', includeUnowned: false, cloudSyncConsent, unownedImportConsent,
+    }).success).toBe(false)
+    expect(legacyImportRequestSchema.parse({
+      includeUnowned: false, cloudSyncConsent,
+    })).toEqual({ includeUnowned: false, cloudSyncConsent })
+    expect(legacyImportRequestSchema.safeParse({
+      batchId: 'renderer-controlled', includeUnowned: false, cloudSyncConsent,
     }).success).toBe(false)
   })
 

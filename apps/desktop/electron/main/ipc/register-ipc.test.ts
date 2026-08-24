@@ -166,8 +166,11 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.settingsRecordPrivacyConsent, consent)).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.settingsPreviewLegacyImport)).resolves.toMatchObject({ ownedCount: 1 })
     await expect(app.invoke(ipcChannels.settingsImportLegacyData, {
-      batchId: 'batch_1', includeUnowned: false, cloudSyncConsent: consent,
+      includeUnowned: false, cloudSyncConsent: consent,
     })).resolves.toEqual([{ batchId: 'batch_1-0', status: 'applied' }])
+    await expect(app.invoke(ipcChannels.settingsImportLegacyData, {
+      batchId: 'renderer-controlled', includeUnowned: false, cloudSyncConsent: consent,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     await expect(app.invoke(ipcChannels.settingsUpdateAccountDataPreferences, {
       timezone: 'UTC', displayCurrency: 'USD', ownerUserId: 'forged',
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })

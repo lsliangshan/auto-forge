@@ -818,6 +818,334 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('reuses a persisted public import identity after a lost response and stops on a rejected later batch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-legacy-import-retry-'))
+    directories.push(root)
+    openAppDatabase(join(root, 'autoforge.sqlite')).close()
+    const seeded = new Database(join(root, 'autoforge.sqlite'))
+    expect(() => seeded.transaction(() => {
+      for (let index = 0; index < 2; index += 1) {
+        seeded.prepare(`
+          INSERT INTO conversations(id, title, title_state, user_id, created_at, updated_at)
+          VALUES (?, ?, 'user_named', NULL, ?, ?)
+        `).run(`legacy_owned_${index}`, `Legacy ${index}`, index + 1, index + 1)
+      }
+      for (let index = 0; index < 200; index += 1) {
+        seeded.prepare(`
+          INSERT INTO messages(id, conversation_id, role, blocks_json, ordinal, created_at)
+          VALUES (?, ?, 'user', ?, ?, ?)
+        `).run(
+          `legacy_message_${index}`,
+          `legacy_owned_${index % 2}`,
+          JSON.stringify([{ type: 'text', text: `Message ${index}` }]),
+          Math.floor(index / 2) + 1,
+          index + 2,
+        )
+      }
+    })()).not.toThrow()
+    expect(() => seeded.close()).not.toThrow()
+    const importCalls: Extract<CloudBaseUserDataCall, { action: 'importLegacyBatch' }>[] = []
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall) => {
+        if (input.action === 'syncPush') return {
+          ok: true as const,
+          data: {
+            results: input.mutations.map((mutation) => ({
+              id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+            })),
+            cursor: 'cursor_import_retry_push',
+          },
+        }
+        if (input.action === 'syncPull') return {
+          ok: true as const, data: { mutations: [], cursor: 'cursor_import_retry_pull' },
+        }
+        if (input.action === 'importLegacyBatch') {
+          importCalls.push(structuredClone(input))
+          if (importCalls.length === 1) throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
+          if (importCalls.length === 2) return {
+            ok: true as const, data: { batchId: input.batchId, status: 'duplicate' as const },
+          }
+          return {
+            ok: true as const,
+            data: {
+              batchId: input.batchId, status: 'rejected' as const,
+              errorCode: 'SYNC_CONFLICT' as const,
+            },
+          }
+        }
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }),
+    }
+    let runtime!: ReturnType<typeof createApplicationRuntime>
+    expect(() => { runtime = createApplicationRuntime(options(root, { userDataSyncPort })) })
+      .not.toThrow()
+    await expect(authenticate(runtime, 'ImportRetry')).resolves.toBeDefined()
+    await expect(runtime.services.settings.previewLegacyImport()).resolves.toEqual({
+      ownedCount: 0, unownedCount: 2, requiresUnownedConfirmation: true,
+    })
+    const input = {
+      includeUnowned: true,
+      cloudSyncConsent: {
+        purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+      unownedImportConsent: {
+        purpose: 'legacy_unowned_import' as const,
+        documentVersion: 'legacy-unowned-import-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    }
+
+    await expect(runtime.services.settings.importLegacyData(input))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+    await expect(runtime.services.settings.importLegacyData(input))
+      .rejects.toMatchObject({ code: 'SYNC_CONFLICT' })
+
+    expect(importCalls).toHaveLength(3)
+    expect(importCalls[1]!.batchId).toBe(importCalls[0]!.batchId)
+    expect(importCalls[1]!.conversations).toEqual(importCalls[0]!.conversations)
+    expect(importCalls.map(({ batchId }) => batchId)).toEqual([
+      expect.stringMatching(/^legacy-[0-9a-f-]+-0$/),
+      importCalls[0]!.batchId,
+      expect.stringMatching(/^legacy-[0-9a-f-]+-1$/),
+    ])
+    expect(JSON.stringify(importCalls)).not.toContain('test_user_importretry')
+    await expect(runtime.close()).resolves.toBeUndefined()
+  })
+
+  it('uses saved IANA timezone month bounds and consecutive public preference revisions', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-timezone-'))
+    directories.push(root)
+    const calls: CloudBaseUserDataCall[] = []
+    const runtime = createApplicationRuntime(options(root, {
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall) => {
+          calls.push(structuredClone(input))
+          if (input.action === 'syncPush') return {
+            ok: true as const,
+            data: {
+              results: input.mutations.map((mutation) => ({
+                id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+              })),
+              cursor: 'cursor_timezone_push',
+            },
+          }
+          if (input.action === 'syncPull') return {
+            ok: true as const, data: { mutations: [], cursor: 'cursor_timezone_pull' },
+          }
+          if (input.action === 'getUserDataPreferences') return {
+            ok: true as const,
+            data: {
+              timezone: 'Asia/Shanghai', displayCurrency: 'CNY' as const, revision: 0,
+              updatedAt: '2026-08-25T00:00:00.000Z',
+            },
+          }
+          if (input.action === 'getUsageSnapshot') return {
+            ok: true as const,
+            data: {
+              startedAt: input.startedAt, endedAt: input.endedAt,
+              inputTokens: 1, outputTokens: 2, estimatedCostUsd: '0.01',
+              estimatedCount: 1, unavailableCount: 0,
+            },
+          }
+          throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+        }),
+      },
+    }))
+    try {
+      vi.setSystemTime(new Date('2026-08-31T16:30:00.000Z'))
+      const session = await authenticate(runtime, 'UsageTimezone')
+      await expect(runtime.services.settings.getRemoteUsage()).resolves.toMatchObject({
+        startedAt: '2026-08-31T16:00:00.000Z', timezone: 'Asia/Shanghai',
+      })
+      await runtime.services.settings.updateAccountDataPreferences({
+        timezone: 'UTC', displayCurrency: 'USD',
+      })
+      await runtime.services.settings.updateAccountDataPreferences({
+        timezone: 'America/New_York', displayCurrency: 'USD',
+      })
+      expect(await runtime.services.settings.getAccountDataPreferences()).toEqual({
+        timezone: 'America/New_York', displayCurrency: 'USD',
+      })
+      const preferences = withUserData(root, session.user.id, (store) => (
+        store.outbox.list(100).filter((mutation) => mutation.kind === 'preferences.update')
+      ))
+      expect(preferences.map(({ baseRevision }) => baseRevision)).toEqual([0, 1])
+
+      vi.setSystemTime(new Date('2026-09-01T03:30:00.000Z'))
+      await expect(runtime.services.settings.getRemoteUsage()).resolves.toMatchObject({
+        startedAt: '2026-08-01T04:00:00.000Z', timezone: 'America/New_York',
+      })
+      const usageCalls = calls.filter((call) => call.action === 'getUsageSnapshot')
+      expect(usageCalls).toEqual([
+        expect.objectContaining({
+          startedAt: '2026-08-31T16:00:00.000Z', endedAt: '2026-08-31T16:30:00.000Z',
+        }),
+        expect.objectContaining({
+          startedAt: '2026-08-01T04:00:00.000Z', endedAt: '2026-09-01T03:30:00.000Z',
+        }),
+      ])
+    } finally {
+      await runtime.close()
+      vi.useRealTimers()
+    }
+  })
+
+  it('gates all public cloud-data settings methods while an A read drains before switching to B', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cloud-data-read-race-'))
+    directories.push(root)
+    const usageStarted = deferred<void>()
+    const releaseUsage = deferred<void>()
+    const runtime = createApplicationRuntime(options(root, {
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall) => {
+          if (input.action === 'syncPush') return {
+            ok: true as const,
+            data: {
+              results: input.mutations.map((mutation) => ({
+                id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+              })),
+              cursor: 'cursor_read_race_push',
+            },
+          }
+          if (input.action === 'syncPull') return {
+            ok: true as const, data: { mutations: [], cursor: 'cursor_read_race_pull' },
+          }
+          if (input.action === 'getUserDataPreferences') return {
+            ok: true as const,
+            data: {
+              timezone: 'UTC', displayCurrency: 'USD' as const, revision: 0,
+              updatedAt: '2026-08-25T00:00:00.000Z',
+            },
+          }
+          if (input.action === 'getUsageSnapshot') {
+            usageStarted.resolve()
+            await releaseUsage.promise
+            return {
+              ok: true as const,
+              data: {
+                startedAt: input.startedAt, endedAt: input.endedAt,
+                inputTokens: 1, outputTokens: 2, estimatedCostUsd: '0',
+                estimatedCount: 0, unavailableCount: 1,
+              },
+            }
+          }
+          throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+        }),
+      },
+    }))
+    const alice = await authenticate(runtime, 'CloudReadAlice')
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'CloudReadBobby')
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'CloudReadAlice', password: 'password' })
+    const pendingBefore = withUserData(root, alice.user.id, (store) => store.outbox.countPending())
+
+    const reading = runtime.services.settings.getRemoteUsage()
+    await usageStarted.promise
+    let switched = false
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'CloudReadBobby', password: 'password',
+    }).then((session) => { switched = true; return session })
+    const consent = {
+      purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    }
+    await expect(Promise.allSettled([
+      runtime.services.settings.recordPrivacyConsent(consent),
+      runtime.services.settings.previewLegacyImport(),
+      runtime.services.settings.importLegacyData({ includeUnowned: false, cloudSyncConsent: consent }),
+      runtime.services.settings.getAccountDataPreferences(),
+      runtime.services.settings.updateAccountDataPreferences({ timezone: 'UTC', displayCurrency: 'USD' }),
+    ])).resolves.toEqual(Array.from({ length: 5 }, () => expect.objectContaining({
+      status: 'rejected', reason: expect.objectContaining({ code: 'CONFLICT' }),
+    })))
+    expect(switched).toBe(false)
+    expect(withUserData(root, alice.user.id, (store) => store.outbox.countPending()))
+      .toBe(pendingBefore)
+
+    releaseUsage.resolve()
+    await expect(reading).resolves.toMatchObject({ timezone: 'UTC', totalTokens: 3 })
+    await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_cloudreadbobby' } })
+    await runtime.close()
+  })
+
+  it('drains an A legacy import before an authenticated A-to-B switch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cloud-data-import-race-'))
+    directories.push(root)
+    openAppDatabase(join(root, 'autoforge.sqlite')).close()
+    const seed = new Database(join(root, 'autoforge.sqlite'))
+    seed.prepare(`
+      INSERT INTO conversations(id, title, title_state, user_id, created_at, updated_at)
+      VALUES ('legacy_import_race', 'Legacy race', 'user_named', NULL, 1, 1)
+    `).run()
+    seed.close()
+    const importStarted = deferred<void>()
+    const releaseImport = deferred<void>()
+    const runtime = createApplicationRuntime(options(root, {
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall) => {
+          if (input.action === 'syncPush') return {
+            ok: true as const,
+            data: {
+              results: input.mutations.map((mutation) => ({
+                id: mutation.id, status: 'applied' as const, revision: mutation.baseRevision + 1,
+              })),
+              cursor: 'cursor_import_race_push',
+            },
+          }
+          if (input.action === 'syncPull') return {
+            ok: true as const, data: { mutations: [], cursor: 'cursor_import_race_pull' },
+          }
+          if (input.action === 'importLegacyBatch') {
+            importStarted.resolve()
+            await releaseImport.promise
+            return {
+              ok: true as const,
+              data: {
+                batchId: input.batchId, status: 'applied' as const,
+                importedConversations: input.conversations.length,
+                importedMessages: input.messages.length,
+              },
+            }
+          }
+          throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+        }),
+      },
+    }))
+    await authenticate(runtime, 'CloudImportAlice')
+    await runtime.services.auth.logout()
+    await authenticate(runtime, 'CloudImportBobby')
+    await runtime.services.auth.logout()
+    await runtime.services.auth.loginWithPassword({ account: 'CloudImportAlice', password: 'password' })
+    const importing = runtime.services.settings.importLegacyData({
+      includeUnowned: true,
+      cloudSyncConsent: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+      unownedImportConsent: {
+        purpose: 'legacy_unowned_import', documentVersion: 'legacy-unowned-import-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    })
+    await importStarted.promise
+    let switched = false
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'CloudImportBobby', password: 'password',
+    }).then((session) => { switched = true; return session })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(switched).toBe(false)
+
+    releaseImport.resolve()
+    await expect(importing).resolves.toEqual([
+      expect.objectContaining({ status: 'applied', importedConversations: 1 }),
+    ])
+    await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_cloudimportbobby' } })
+    await runtime.close()
+  })
+
   it('rejects selector-less resolution instead of using an id and version fallback', async () => {
     const vault = createWorkflowSourceSelectorVault()
     const installed = {
@@ -7007,7 +7335,14 @@ describe('createApplicationRuntime', () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-cache-message-'))
     directories.push(root)
     const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
-    const userDataSyncCall = vi.fn(async () => {
+    const retryStarted = deferred<void>()
+    const releaseRetry = deferred<void>()
+    let holdRetry = false
+    const userDataSyncCall = vi.fn(async (input: CloudBaseUserDataCall) => {
+      if (holdRetry && input.action === 'syncPush') {
+        retryStarted.resolve()
+        await releaseRetry.promise
+      }
       throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' })
     })
     const runtime = createApplicationRuntime(options(root, {
@@ -7040,15 +7375,22 @@ describe('createApplicationRuntime', () => {
     const failedMutation = userDataStores.current()?.outbox.list(100)
       .find((mutation) => mutation.entityId === second.id)
     expect(failedMutation).toBeDefined()
+    await new Promise<void>((resolve) => setImmediate(resolve))
     userDataStores.current()?.outbox.markFailed(failedMutation!.id, 'SYNC_CONFLICT')
     expect(userDataStores.current()?.outbox.find(failedMutation!.id)).toMatchObject({
       state: 'failed', lastErrorCode: 'SYNC_CONFLICT',
     })
-    expect(userDataStores.current()?.conversations.getSummary(second.id))
-      .toMatchObject({ syncState: 'failed' })
-    await runtime.services.chat.retrySync(second.id)
-    expect(userDataStores.current()?.conversations.getSummary(second.id))
-      .toMatchObject({ syncState: 'pending' })
+    expect((await runtime.services.chat.listConversations({ limit: 50 })).items)
+      .toContainEqual(expect.objectContaining({ id: second.id, syncState: 'failed' }))
+    holdRetry = true
+    const retrying = runtime.services.chat.retrySync(second.id)
+    await retryStarted.promise
+    expect((await runtime.services.chat.listConversations({ limit: 50 })).items)
+      .toContainEqual(expect.objectContaining({ id: second.id, syncState: 'syncing' }))
+    releaseRetry.resolve()
+    await retrying
+    expect((await runtime.services.chat.listConversations({ limit: 50 })).items)
+      .toContainEqual(expect.objectContaining({ id: second.id, syncState: 'pending' }))
     await runtime.close()
   })
 })

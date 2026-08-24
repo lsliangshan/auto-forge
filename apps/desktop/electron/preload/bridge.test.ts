@@ -124,7 +124,7 @@ describe('preload desktop bridge', () => {
       purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
       consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
     }
-    const importRequest = { batchId: 'batch_1', includeUnowned: false, cloudSyncConsent }
+    const importRequest = { includeUnowned: false, cloudSyncConsent }
 
     await app.api.settings.recordPrivacyConsent(cloudSyncConsent)
     await app.api.settings.previewLegacyImport()

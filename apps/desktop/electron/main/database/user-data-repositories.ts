@@ -119,6 +119,13 @@ export interface UserDataRepositories {
     getConsent(purpose: PrivacyConsentPurpose): PrivacyConsent | undefined
     getPreferences(): AccountDataPreferencesRecord | undefined
     projectPreferences(preferences: AccountDataPreferencesRecord): void
+    resolveLegacyImportBatch(input: {
+      selectionFingerprint: string
+      includeUnowned: boolean
+      cloudConsentVersion: string
+      unownedConsentVersion?: string
+      candidateBatchId: string
+    }): string
   }
   sync: {
     getCheckpoint(): SyncCheckpoint | undefined
@@ -652,7 +659,9 @@ function acknowledgeLocalMutation(
       projectConsent(database, local.payload)
       break
     case 'preferences.update':
-      projectPreferences(database, local.payload, resultRevision, remote.receivedAt)
+      if ((storedPreferences(database)?.revision ?? 0) <= resultRevision) {
+        projectPreferences(database, local.payload, resultRevision, remote.receivedAt)
+      }
       break
     default:
       break
@@ -1702,6 +1711,54 @@ export function createUserDataRepositories(
         const value = accountDataPreferencesRecordSchema.parse(preferences)
         projectPreferences(database, value, value.revision, value.updatedAt)
       },
+      resolveLegacyImportBatch(input) {
+        const value = parsePersisted(() => z.object({
+          selectionFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+          includeUnowned: z.boolean(),
+          cloudConsentVersion: z.string().trim().min(1).max(128),
+          unownedConsentVersion: z.string().trim().min(1).max(128).optional(),
+          candidateBatchId: z.string().trim().min(1).max(128),
+        }).strict().parse(input))
+        return transaction(database, () => {
+          const stored = database.prepare(`
+            SELECT selection_fingerprint AS selectionFingerprint,
+                   include_unowned AS includeUnowned,
+                   cloud_consent_version AS cloudConsentVersion,
+                   unowned_consent_version AS unownedConsentVersion,
+                   batch_id AS batchId
+            FROM legacy_import_identity WHERE id = 1
+          `).get() as Query | undefined
+          if (stored
+            && stored.selectionFingerprint === value.selectionFingerprint
+            && stored.includeUnowned === Number(value.includeUnowned)
+            && stored.cloudConsentVersion === value.cloudConsentVersion
+            && (stored.unownedConsentVersion ?? undefined) === value.unownedConsentVersion) {
+            return z.string().trim().min(1).max(128).parse(stored.batchId)
+          }
+          database.prepare(`
+            INSERT INTO legacy_import_identity(
+              id, selection_fingerprint, include_unowned, cloud_consent_version,
+              unowned_consent_version, batch_id, updated_at
+            ) VALUES (
+              1, @selectionFingerprint, @includeUnowned, @cloudConsentVersion,
+              @unownedConsentVersion, @candidateBatchId, @updatedAt
+            )
+            ON CONFLICT(id) DO UPDATE SET
+              selection_fingerprint = excluded.selection_fingerprint,
+              include_unowned = excluded.include_unowned,
+              cloud_consent_version = excluded.cloud_consent_version,
+              unowned_consent_version = excluded.unowned_consent_version,
+              batch_id = excluded.batch_id,
+              updated_at = excluded.updated_at
+          `).run({
+            ...value,
+            includeUnowned: Number(value.includeUnowned),
+            unownedConsentVersion: value.unownedConsentVersion ?? null,
+            updatedAt: Date.now(),
+          })
+          return value.candidateBatchId
+        })
+      },
     },
     sync: {
       getCheckpoint: () => readCheckpoint(database),
@@ -1770,7 +1827,12 @@ export function createUserDataRepositories(
         mutation,
         (validated) => {
           if (validated.kind !== 'preferences.update') throw new UserDataConsistencyError()
-          projectPreferences(database, validated.payload, validated.baseRevision, validated.occurredAt)
+          projectPreferences(
+            database,
+            validated.payload,
+            validated.baseRevision + 1,
+            validated.occurredAt,
+          )
         },
       ),
       listReady(now, limit) {

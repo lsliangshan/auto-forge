@@ -1198,11 +1198,11 @@ describe('workbench', () => {
     })).toEqual(['Token 趋势', '模型用量'])
 
     const table = wrapper.get('.billing-table')
-    expect(table.attributes('aria-label')).toBe('模型用量与 OpenRouter 消费')
+    expect(table.attributes('aria-label')).toBe('模型用量与 OpenRouter BYOK 估算')
     const headers = table.findAll('th')
     expect(headers).toHaveLength(8)
     expect(headers.map((cell) => cell.text()))
-      .toEqual(['Provider', '模型', '输入 Token', '输出 Token', '总 Token', 'OpenRouter 消费', '已确认', '待确认'])
+      .toEqual(['Provider', '模型', '输入 Token', '输出 Token', '总 Token', 'OpenRouter BYOK 估算', '已估算', '费用不可用'])
     expect(headers.map((cell) => cell.attributes('scope'))).toEqual(Array(8).fill('col'))
     expect(table.get('tbody tr').findAll('td').map((cell) => cell.text()))
       .toEqual(['OpenRouter', 'precise/model', '1,200', '34', '1,234', '$0', '0', '0'])
@@ -1283,14 +1283,14 @@ describe('workbench', () => {
       .toContain('$0.0000001'))
 
     expect(wrapper.get('[data-testid="billing-panel"] h2').text()).toBe('用量与消费')
-    expect(wrapper.get('[data-testid="billing-summary-known"]').text()).toContain('已确认 1 笔')
+    expect(wrapper.get('[data-testid="billing-summary-known"]').text()).toContain('已取得费用估算 1 笔')
     const warning = wrapper.get('[data-testid="billing-cost-warning"]')
-    expect(warning.text()).toBe('有 2 笔费用待确认')
+    expect(warning.text()).toBe('有 2 笔费用不可用')
     const help = warning.get('[data-testid="billing-cost-help"]')
     expect(help.attributes('tabindex')).toBe('0')
     expect(help.attributes('role')).toBe('img')
-    expect(help.attributes('aria-label')).toBe('查看待确认费用说明')
-    const explanation = '这表示部分 OpenRouter 调用暂未取得准确费用。当前显示的消费金额不包含这些费用，无需手动确认，系统会自动尝试查询。'
+    expect(help.attributes('aria-label')).toBe('查看费用不可用说明')
+    const explanation = '这表示部分 OpenRouter BYOK 调用暂未取得费用估算。当前显示的估算金额不包含这些调用，系统会自动尝试查询。'
     const tooltip = wrapper.findAllComponents({ name: 'ElTooltip' })
       .find((component) => component.props('content') === explanation)
     expect(tooltip?.props('content')).toBe(explanation)

@@ -121,7 +121,11 @@ const remoteUsageDataSchema = z.object({
   endedAt: z.iso.datetime({ offset: true }),
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
-  estimatedCostUsd: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/),
+  estimatedCostUsd: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/).transform((value) => {
+    const [whole, fractional] = value.split('.')
+    const canonicalFraction = fractional?.replace(/0+$/, '')
+    return canonicalFraction ? `${whole}.${canonicalFraction}` : whole!
+  }),
   estimatedCount: z.number().int().nonnegative(),
   unavailableCount: z.number().int().nonnegative(),
 }).strict()

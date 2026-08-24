@@ -623,7 +623,6 @@ async function confirmLegacyImport() {
     }
     await window.autoForge.settings.recordPrivacyConsent(cloudSyncConsent)
     await window.autoForge.settings.importLegacyData({
-      batchId: `legacy-${Date.now()}`,
       includeUnowned: preview.requiresUnownedConfirmation,
       cloudSyncConsent,
       ...(preview.requiresUnownedConfirmation ? {

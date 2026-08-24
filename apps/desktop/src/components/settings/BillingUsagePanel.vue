@@ -112,17 +112,17 @@
           <div
             data-testid="billing-summary-cost"
           >
-            <dt>OpenRouter 消费</dt>
+            <dt>OpenRouter BYOK 估算</dt>
             <dd>{{ formatUsd(activeUsage.openRouterCostUsd) }}</dd>
             <p data-testid="billing-summary-known">
-              已确认 {{ formatTokens(activeUsage.openRouterKnownCostCount) }} 笔
+              已取得费用估算 {{ formatTokens(activeUsage.openRouterKnownCostCount) }} 笔
             </p>
             <p
               v-if="activeUsage.openRouterUnknownCostCount > 0"
               data-testid="billing-cost-warning"
               class="billing-cost-warning"
             >
-              有 {{ formatTokens(activeUsage.openRouterUnknownCostCount) }} 笔费用待确认
+              有 {{ formatTokens(activeUsage.openRouterUnknownCostCount) }} 笔费用不可用
               <el-tooltip
                 :content="pendingCostExplanation"
                 :trigger="['hover', 'focus']"
@@ -133,7 +133,7 @@
                   data-testid="billing-cost-help"
                   tabindex="0"
                   role="img"
-                  aria-label="查看待确认费用说明"
+                  aria-label="查看费用不可用说明"
                 >
                   <QuestionFilled />
                 </el-icon>
@@ -166,7 +166,7 @@
           <div class="billing-table-wrap">
             <table
               class="billing-table"
-              aria-label="模型用量与 OpenRouter 消费"
+              aria-label="模型用量与 OpenRouter BYOK 估算"
             >
               <thead>
                 <tr>
@@ -186,13 +186,13 @@
                     总 Token
                   </th>
                   <th scope="col">
-                    OpenRouter 消费
+                    OpenRouter BYOK 估算
                   </th>
                   <th scope="col">
-                    已确认
+                    已估算
                   </th>
                   <th scope="col">
-                    待确认
+                    费用不可用
                   </th>
                 </tr>
               </thead>
@@ -267,7 +267,7 @@ const providerLabels = {
   openrouter: 'OpenRouter',
   deepseek: 'DeepSeek',
 } as const
-const pendingCostExplanation = '这表示部分 OpenRouter 调用暂未取得准确费用。当前显示的消费金额不包含这些费用，无需手动确认，系统会自动尝试查询。'
+const pendingCostExplanation = '这表示部分 OpenRouter BYOK 调用暂未取得费用估算。当前显示的估算金额不包含这些调用，系统会自动尝试查询。'
 const tokenFormatter = new Intl.NumberFormat('zh-CN')
 const rangeFormatter = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',

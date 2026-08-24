@@ -39,8 +39,14 @@ interface SyncEngineDependencies {
 
 interface ActiveBinding {
   generation: number
+  userId: string
   deviceId: string
   store: UserDataStore
+}
+
+export interface UserDataBindingToken {
+  userId: string
+  generation: number
 }
 
 const defaultDependencies: SyncEngineDependencies = {
@@ -120,7 +126,7 @@ export class UserDataSyncEngine {
     return this.#queueLifecycle(async () => {
       await this.#handoff()
       const generation = ++this.#generation
-      this.#binding = { generation, deviceId, store: this.stores.open(userId) }
+      this.#binding = { generation, userId, deviceId, store: this.stores.open(userId) }
       this.#pullFailureAttempt = 0
       this.#status = { state: 'idle' }
     })
@@ -147,13 +153,30 @@ export class UserDataSyncEngine {
     return this.#ensureDrain(binding)
   }
 
-  async importLegacyBatch(input: LegacyImportBatchRequest): Promise<LegacyImportBatchResult> {
+  captureBinding(userId: string): UserDataBindingToken {
+    const binding = this.#binding
+    if (!binding || binding.userId !== userId) throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+    return { userId: binding.userId, generation: binding.generation }
+  }
+
+  async importLegacyBatch(
+    expected: UserDataBindingToken,
+    input: LegacyImportBatchRequest,
+  ): Promise<LegacyImportBatchResult> {
     let result: LegacyImportBatchResult | undefined
     await this.#queueLifecycle(async () => {
       const binding = this.#binding
-      if (!binding) throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+      if (!binding
+        || binding.userId !== expected.userId
+        || binding.generation !== expected.generation) {
+        throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+      }
       await this.#drainPromise
-      if (!this.#isCurrent(binding)) throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+      if (!this.#isCurrent(binding)
+        || binding.userId !== expected.userId
+        || binding.generation !== expected.generation) {
+        throw toSafeAppError({ code: 'AUTH_REQUIRED' })
+      }
       const response = await this.port.call({
         action: 'importLegacyBatch',
         protocolVersion: PROTOCOL_VERSION,

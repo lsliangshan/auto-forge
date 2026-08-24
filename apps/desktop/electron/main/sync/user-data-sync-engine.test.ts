@@ -192,6 +192,7 @@ describe('UserDataSyncEngine', () => {
       return success({ mutations: [], cursor: null })
     })
     await engine.start('alice', 'device-a')
+    const binding = engine.captureBinding('alice')
     const request = {
       includeUnowned: false,
       cloudSyncConsent: {
@@ -201,8 +202,8 @@ describe('UserDataSyncEngine', () => {
       conversations: [], messages: [],
     }
 
-    const importingFirst = engine.importLegacyBatch({ ...request, batchId: 'batch_1-0' })
-    const importingSecond = engine.importLegacyBatch({ ...request, batchId: 'batch_1-1' })
+    const importingFirst = engine.importLegacyBatch(binding, { ...request, batchId: 'batch_1-0' })
+    const importingSecond = engine.importLegacyBatch(binding, { ...request, batchId: 'batch_1-1' })
     await vi.waitFor(() => expect(calls).toHaveLength(1))
     expect(calls[0]).toMatchObject({
       action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'device-a', batchId: 'batch_1-0',
@@ -215,6 +216,28 @@ describe('UserDataSyncEngine', () => {
       expect.objectContaining({ batchId: 'batch_1-1', status: 'applied' }),
     ])
     expect(calls.map((call) => call.action)).toEqual(['importLegacyBatch', 'importLegacyBatch'])
+  })
+
+  it('rejects a captured UID generation after an identity handoff instead of importing as the new UID', async () => {
+    const manager = createManager()
+    const calls: CloudBaseUserDataCall[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      calls.push(input)
+      return { ok: true, data: { batchId: 'batch_1-0', status: 'applied' } }
+    })
+    await engine.start('alice', 'device-a')
+    const alice = engine.captureBinding('alice')
+    await engine.start('bob', 'device-b')
+
+    await expect(engine.importLegacyBatch(alice, {
+      batchId: 'batch_1-0', includeUnowned: false,
+      cloudSyncConsent: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+      conversations: [], messages: [],
+    })).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(calls).toEqual([])
   })
 
   it('notifies exact conversation projections through failure, retry, and success', async () => {

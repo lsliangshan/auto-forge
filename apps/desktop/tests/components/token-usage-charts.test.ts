@@ -2,6 +2,7 @@ import { mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TokenUsageBarChart from '../../src/components/settings/TokenUsageBarChart.vue'
 import TokenUsageLineChart from '../../src/components/settings/TokenUsageLineChart.vue'
+import BillingUsagePanel from '../../src/components/settings/BillingUsagePanel.vue'
 import { barChartOption, lineChartOption } from '../../src/components/settings/token-usage-chart-options'
 
 const chart = vi.hoisted(() => ({
@@ -87,6 +88,27 @@ const period = {
 }
 
 describe('token usage chart options', () => {
+  it('labels every local OpenRouter cost as estimated or unavailable, never confirmed', () => {
+    const usage = {
+      generatedAt: period.endedAt,
+      today: period, yesterday: period, week: period, month: period, allTime: period,
+    }
+    const wrapper = mount(BillingUsagePanel, {
+      props: { usage, loading: false, error: '' },
+      global: {
+        stubs: {
+          'el-button': true, 'el-tabs': true, 'el-tab-pane': true,
+          'el-tooltip': true, 'el-icon': true,
+          TokenUsageLineChart: true, TokenUsageBarChart: true,
+        },
+      },
+    })
+
+    expect(wrapper.text()).toContain('OpenRouter BYOK 估算')
+    expect(wrapper.text()).toContain('费用不可用')
+    expect(wrapper.text()).not.toContain('已确认')
+  })
+
   it('builds three token trend series', () => {
     const option = lineChartOption(period, 'today')
     expect(option.series).toMatchObject([
