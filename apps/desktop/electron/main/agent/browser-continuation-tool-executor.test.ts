@@ -646,6 +646,36 @@ describe('BrowserContinuationToolExecutor', () => {
     },
   )
 
+  it.each(['PAGE_CLOSED', 'WORKFLOW_CHANGED'] as const)(
+    'revalidates %s after a pending continuation-state read',
+    async (code) => {
+      const test = harness()
+      await test.executor.execute('browser_session_inspect', {
+        bindingId: 'binding_1', intent: '读取工作居住证有效期',
+      }, run())
+      let stateReadStarted!: () => void
+      let finishStateRead!: () => void
+      const started = new Promise<void>((resolve) => { stateReadStarted = resolve })
+      const stateRead = new Promise<void>((resolve) => { finishStateRead = resolve })
+      test.workspace.getContinuationState.mockImplementationOnce(async () => {
+        stateReadStarted()
+        await stateRead
+        return { ...test.state }
+      })
+      test.assertEligible.mockClear()
+      test.assertEligible
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce({ code })
+
+      const validating = test.executor.validateContinuation('agent_run_1', run())
+      await started
+      finishStateRead()
+
+      await expect(validating).resolves.toEqual({ kind: 'tool_error', code })
+      expect(test.assertEligible).toHaveBeenCalledTimes(2)
+    },
+  )
+
   it('terminates manual suspension when the user navigates outside binding policy', async () => {
     const test = harness()
     await test.executor.execute('browser_session_handoff', {

@@ -457,6 +457,8 @@ export class BrowserContinuationToolExecutor {
         lease.binding.tabId,
         context.runId,
       )
+      await lease.assertEligible()
+      this.assertActive(state, context)
       if (!this.currentPageAllowed(lease, page)) throw failure('DOMAIN_BLOCKED')
       return { kind: 'valid' }
     } catch (error) {

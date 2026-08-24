@@ -234,6 +234,25 @@ describe('BrowserContinuationRegistry', () => {
     }
   })
 
+  it('does not let a taken-over lease release erase the next owner terminal reason', async () => {
+    const test = createHarness()
+    const binding = test.registry.bind(bindingInput())
+    const oldLease = await test.registry.acquire(binding.bindingId, {
+      userId: binding.userId, conversationId: binding.conversationId, runId: 'run_old',
+    })
+    test.owners.delete(binding.tabId)
+    await test.registry.markTakenOver(binding.tabId, 'run_old')
+    const newLease = await test.registry.acquire(binding.bindingId, {
+      userId: binding.userId, conversationId: binding.conversationId, runId: 'run_new',
+    })
+
+    await test.registry.revokeBinding(binding.bindingId, 'WORKFLOW_CHANGED')
+    await oldLease.release()
+
+    await expect(newLease.assertEligible()).rejects.toMatchObject({ code: 'WORKFLOW_CHANGED' })
+    await expect(newLease.release()).resolves.toBeUndefined()
+  })
+
   it('persists close and revoke transitions while removing live authority and releasing leases', async () => {
     const test = createHarness()
     const closedBinding = test.registry.bind(bindingInput())

@@ -61,7 +61,10 @@ export class BrowserContinuationRegistry {
   private readonly bindings = new Map<string, BrowserContinuationBinding>()
   private readonly bindingsByTab = new Map<string, BrowserContinuationBinding>()
   private readonly leaseOwners = new Map<string, string>()
-  private readonly leaseTerminalReasons = new Map<string, AppErrorCode>()
+  private readonly leaseTerminalReasons = new Map<string, {
+    ownerRunId: string
+    reason: AppErrorCode
+  }>()
   private readonly id: () => string
   private readonly now: () => number
   private stopped = false
@@ -185,7 +188,7 @@ export class BrowserContinuationRegistry {
       throw failure('PAGE_CLOSED')
     }
     this.leaseOwners.set(bindingId, input.runId)
-    this.leaseTerminalReasons.delete(bindingId)
+    this.clearTerminalReasonForLease(bindingId, input.runId)
     let released = false
     let releasePending: Promise<void> | undefined
     return Object.freeze({
@@ -199,10 +202,10 @@ export class BrowserContinuationRegistry {
         if (released
           || this.bindings.get(bindingId) !== binding
           || this.leaseOwners.get(bindingId) !== input.runId) {
-          throw failure(this.leaseTerminalReasons.get(bindingId) ?? 'PAGE_CLOSED')
+          throw failure(this.terminalReasonForLease(bindingId, input.runId) ?? 'PAGE_CLOSED')
         }
         if (await this.bindingEligible(binding)) return
-        const terminalReason = this.leaseTerminalReasons.get(bindingId)
+        const terminalReason = this.terminalReasonForLease(bindingId, input.runId)
         if (terminalReason) throw failure(terminalReason)
         await this.revokeBinding(bindingId, 'WORKFLOW_CHANGED').catch(() => undefined)
         throw failure('WORKFLOW_CHANGED')
@@ -212,13 +215,13 @@ export class BrowserContinuationRegistry {
         if (!releasePending) {
           releasePending = (async () => {
             if (this.leaseOwners.get(bindingId) !== input.runId) {
-              this.leaseTerminalReasons.delete(bindingId)
+              this.clearTerminalReasonForLease(bindingId, input.runId)
               released = true
               return
             }
             await this.options.workspace.releaseContinuation(binding.tabId, input.runId)
             if (this.leaseOwners.get(bindingId) === input.runId) this.leaseOwners.delete(bindingId)
-            this.leaseTerminalReasons.delete(bindingId)
+            this.clearTerminalReasonForLease(bindingId, input.runId)
             released = true
           })()
         }
@@ -235,7 +238,7 @@ export class BrowserContinuationRegistry {
     const binding = this.bindingsByTab.get(tabId)
     if (!binding) return
     const ownerRunId = this.leaseOwners.get(binding.bindingId)
-    if (ownerRunId) this.leaseTerminalReasons.set(binding.bindingId, reason)
+    if (ownerRunId) this.leaseTerminalReasons.set(binding.bindingId, { ownerRunId, reason })
     this.removeLive(binding)
     if (ownerRunId) {
       void this.options.workspace.releaseContinuation(binding.tabId, ownerRunId).catch(() => undefined)
@@ -280,7 +283,7 @@ export class BrowserContinuationRegistry {
     const binding = this.bindings.get(bindingId)
     if (!binding) return
     const ownerRunId = this.leaseOwners.get(bindingId)
-    if (ownerRunId) this.leaseTerminalReasons.set(bindingId, reason)
+    if (ownerRunId) this.leaseTerminalReasons.set(bindingId, { ownerRunId, reason })
     this.removeLive(binding)
     const failures: unknown[] = []
     try {
@@ -311,6 +314,17 @@ export class BrowserContinuationRegistry {
     this.bindings.delete(binding.bindingId)
     this.bindingsByTab.delete(binding.tabId)
     this.leaseOwners.delete(binding.bindingId)
+  }
+
+  private terminalReasonForLease(bindingId: string, ownerRunId: string): AppErrorCode | undefined {
+    const terminal = this.leaseTerminalReasons.get(bindingId)
+    return terminal?.ownerRunId === ownerRunId ? terminal.reason : undefined
+  }
+
+  private clearTerminalReasonForLease(bindingId: string, ownerRunId: string): void {
+    if (this.leaseTerminalReasons.get(bindingId)?.ownerRunId === ownerRunId) {
+      this.leaseTerminalReasons.delete(bindingId)
+    }
   }
 
   private async bindingEligible(binding: BrowserContinuationBinding): Promise<boolean> {

@@ -1722,10 +1722,13 @@ export class AgentOrchestrator {
   private async refreshBrowserCatalog(active: ActiveAgentRun): Promise<void> {
     const browser = this.dependencies.browserContinuation
     if (!browser || !active.browserToolsAllowed || active.browserTerminal) return
-    active.browserCatalog = await browser.catalog.create({
+    const catalog = await browser.catalog.create({
       userId: active.userId,
       conversationId: active.conversationId,
     })
+    const inactive = await this.inactiveBrowserResult(active)
+    if (inactive || active.browserTerminal) return
+    active.browserCatalog = catalog
     active.browserExplicitBindingId = explicitBrowserBinding(active.currentUser.text, active.browserCatalog)
     active.tools = [...active.workflowCatalogTools, ...active.browserCatalog.tools]
     if (active.browserCatalog.tools.length > 0 && !active.browserPolicyAdded) {

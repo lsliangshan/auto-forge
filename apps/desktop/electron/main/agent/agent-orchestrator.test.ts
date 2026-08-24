@@ -3963,6 +3963,64 @@ describe('AgentOrchestrator', () => {
     expect(browser.create).toHaveBeenCalledTimes(2)
   })
 
+  it('does not commit refreshed catalog state when Stop wins catalog creation', async () => {
+    let refreshStarted!: () => void
+    let finishRefresh!: () => void
+    const started = new Promise<void>((resolve) => { refreshStarted = resolve })
+    const refresh = new Promise<void>((resolve) => { finishRefresh = resolve })
+    const dependencies = harness([toolTurn])
+    const liveBindings: BrowserContinuationBinding[] = []
+    const browser = attachBrowserContinuation(dependencies, { bindings: liveBindings })
+    const create = BrowserContinuationCatalog.prototype.create.bind(browser.catalog)
+    browser.create.mockImplementation(async (input) => {
+      if (browser.create.mock.calls.length === 2) {
+        refreshStarted()
+        await refresh
+      }
+      return create(input)
+    })
+    const startReserved = dependencies.executions.startReserved
+    dependencies.executions.startReserved = async (reservation, input) => {
+      liveBindings.push(continuationBinding({ conversationId: 'cancelled_catalog_conversation' }))
+      return startReserved(reservation, input)
+    }
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const requestId = 'cancelled_catalog_refresh'
+    const running = orchestrator.run(textRunInput({
+      conversationId: 'cancelled_catalog_conversation', content: '使用百度搜索今日天气',
+      provider: 'openrouter', model: 'model', requestId,
+    }))
+
+    await started
+    const active = (Reflect.get(orchestrator, 'activeByRequest') as Map<string, {
+      browserCatalog: unknown
+      browserExplicitBindingId?: string
+      browserPolicyAdded: boolean
+      tools: unknown[]
+      messages: unknown[]
+    }>).get(requestId)!
+    const before = {
+      browserCatalog: active.browserCatalog,
+      browserExplicitBindingId: active.browserExplicitBindingId,
+      browserPolicyAdded: active.browserPolicyAdded,
+      tools: active.tools,
+      messages: active.messages,
+      messageValues: structuredClone(active.messages),
+    }
+
+    await orchestrator.cancel(requestId)
+    finishRefresh()
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', error: { code: 'CANCELLED' } })
+
+    expect(active.browserCatalog).toBe(before.browserCatalog)
+    expect(active.browserExplicitBindingId).toBe(before.browserExplicitBindingId)
+    expect(active.browserPolicyAdded).toBe(before.browserPolicyAdded)
+    expect(active.tools).toBe(before.tools)
+    expect(active.messages).toBe(before.messages)
+    expect(active.messages).toEqual(before.messageValues)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledOnce()
+  })
+
   it('keeps malformed pre-lease browser calls recoverable inside the ten-decision cap', async () => {
     const invalidCall: ProviderStreamEvent[] = [{
       type: 'tool_call', choiceIndex: 0, index: 0, id: 'invalid_browser_call',
