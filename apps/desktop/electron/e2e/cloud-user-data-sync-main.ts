@@ -166,6 +166,8 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspacePort {
   }
 }
 
+let providerRequestCount = 0
+
 const networkProxy: NetworkProxyPort = {
   async initialize() { /* local-only */ },
   async transition() { /* local-only */ },
@@ -175,6 +177,7 @@ const networkProxy: NetworkProxyPort = {
     return operation({ settings: { enabled: false, bypassDomains: [] } })
   },
   async fetch() {
+    providerRequestCount += 1
     throw toSafeAppError({ code: 'MODEL_PROVIDER_UNAVAILABLE' })
   },
 }
@@ -240,11 +243,6 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
   if (name === 'selectedConversation') {
     return (await runtime.services.chat.listConversations({ limit: 50 })).items[0]?.id ?? ''
   }
-  if (name === 'selectedMessageCount') {
-    const conversationId = (await runtime.services.chat.listConversations({ limit: 50 })).items[0]?.id
-    if (!conversationId) return 0
-    return (await runtime.services.chat.listMessages({ conversationId, limit: 100 })).items.length
-  }
   if (name === 'switchUser') {
     const user = fixtureUser(String(input.user))
     await runtime.services.auth.logout()
@@ -255,6 +253,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     return true
   }
   if (name === 'pendingOutbox') return userDataStores?.current()?.outbox.countPending() ?? 0
+  if (name === 'providerRequestCount') return providerRequestCount
   throw new Error(`Unknown cloud user-data E2E command: ${name}`)
 }
 

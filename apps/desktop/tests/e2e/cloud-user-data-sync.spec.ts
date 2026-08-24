@@ -100,6 +100,21 @@ async function switchUser(profile: LaunchedProfile, user: 'alice' | 'bob'): Prom
   await expect(profile.page.getByLabel('主导航')).toBeVisible()
 }
 
+async function assertImportedTranscriptVisible(profile: LaunchedProfile): Promise<void> {
+  await profile.page.goto(`file://${join(desktopRoot, 'out/renderer/index.html')}#/chat`)
+  await profile.page.reload()
+  const conversation = profile.page.getByRole('button', { name: /^本机未归属历史 /u })
+  await expect(conversation).toBeVisible()
+  await conversation.click()
+
+  const messages = profile.page.locator('article.message')
+  await expect(messages).toHaveCount(99)
+  await expect(profile.page.getByText('历史消息 1', { exact: true })).toBeVisible()
+  await expect(profile.page.getByText('历史消息 50', { exact: true })).toBeVisible()
+  await expect(profile.page.getByText('历史消息 99', { exact: true })).toBeVisible()
+  await expect(profile.page.getByRole('button', { name: '加载更早消息' })).toHaveCount(0)
+}
+
 test.describe.serial('CloudBase conversation sync milestone', () => {
   test.setTimeout(60_000)
 
@@ -250,16 +265,11 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     expect(currentProfileSnapshot.pullPageSizes.some((size, index, pages) => (
       size === 100 && pages[index + 1] === 1
     ))).toBe(true)
-    expect(await command<number>(profile.app, 'selectedMessageCount')).toBe(99)
-
-    await profile.page.goto(`file://${join(desktopRoot, 'out/renderer/index.html')}#/chat`)
-    await profile.page.reload()
-    await expect(profile.page.getByText('本机未归属历史')).toBeVisible()
+    await assertImportedTranscriptVisible(profile)
 
     const second = await launchProfile(fixture)
     profiles.push(second)
-    await expect(second.page.getByText('本机未归属历史')).toBeVisible()
-    expect(await command<number>(second.app, 'selectedMessageCount')).toBe(99)
+    await assertImportedTranscriptVisible(second)
   })
 
   test('shows BYOK estimates and unavailable costs without confirmed platform spend', async () => {
@@ -274,6 +284,6 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     await expect(summary).toContainText('BYOK 费用不可用1 笔')
     await expect(summary).toContainText('平台已确认消费—')
     await expect(summary).not.toContainText('BYOK 已确认')
-    expect((await fixture.snapshot('alice')).paidProviderRequests).toBe(0)
+    expect(await command<number>(profile.app, 'providerRequestCount')).toBe(0)
   })
 })

@@ -30,17 +30,22 @@ interface StoredMessage {
   conversationId: string
 }
 
+interface StoredReceipt {
+  requestHash: string
+  result: SyncMutationResult
+}
+
 interface UserState {
   online: boolean
   failAfterApply: boolean
   events: PulledMutation[]
-  receipts: Map<string, SyncMutationResult>
+  receipts: Map<string, StoredReceipt>
   conversations: Map<string, StoredConversation>
   messages: Map<string, StoredMessage>
   consents: Set<string>
   usage: Map<string, ByokUsageEvent>
   preferences: StoredPreferences
-  importedBatches: Set<string>
+  importedBatches: Map<string, string>
   duplicateMutationCount: number
   pullPageSizes: number[]
 }
@@ -50,7 +55,6 @@ export interface CloudUserDataFixtureSnapshot {
   consentCount: number
   importedBatchCount: number
   duplicateMutationCount: number
-  paidProviderRequests: number
   pullPageSizes: number[]
 }
 
@@ -81,7 +85,7 @@ function initialUserState(): UserState {
       revision: 0,
       updatedAt: '2026-08-25T00:00:00.000Z',
     },
-    importedBatches: new Set(),
+    importedBatches: new Map(),
     duplicateMutationCount: 0,
     pullPageSizes: [],
   }
@@ -121,6 +125,35 @@ function receivedAt(sequence: number): string {
   return new Date(Date.UTC(2026, 7, 25, 0, 0, 0, sequence)).toISOString()
 }
 
+function requestHash(value: unknown): string {
+  const canonicalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(canonicalize)
+    if (item && typeof item === 'object') {
+      return Object.fromEntries(
+        Object.entries(item)
+          .filter(([, child]) => child !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, child]) => [key, canonicalize(child)]),
+      )
+    }
+    return item
+  }
+  return createHash('md5').update(JSON.stringify(canonicalize(value))).digest('hex')
+}
+
+function importRequestHash(input: Record<string, unknown>): string {
+  return requestHash({
+    protocolVersion: input.protocolVersion,
+    deviceId: input.deviceId,
+    batchId: input.batchId,
+    includeUnowned: input.includeUnowned,
+    conversations: input.conversations,
+    messages: input.messages,
+    cloudSyncConsent: input.cloudSyncConsent,
+    unownedImportConsent: input.unownedImportConsent ?? null,
+  })
+}
+
 function importMutationId(
   batchId: string,
   kind: 'conversation' | 'message',
@@ -151,15 +184,18 @@ function appendEvent(state: UserState, mutation: SyncMutation, resultRevision: n
 function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationResult {
   const existingReceipt = state.receipts.get(mutation.id)
   if (existingReceipt) {
-    state.duplicateMutationCount += 1
-    return { ...existingReceipt, status: 'duplicate' }
+    if (existingReceipt.requestHash === requestHash(mutation)) {
+      state.duplicateMutationCount += 1
+      return { ...existingReceipt.result, status: 'duplicate' }
+    }
+    return { id: mutation.id, status: 'rejected', errorCode: 'INVALID_INPUT' }
   }
 
   let revision: number
   if (mutation.kind === 'conversation.create') {
     if (mutation.baseRevision !== 0 || state.conversations.has(mutation.entityId)) {
       const result = { id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' } as const
-      state.receipts.set(mutation.id, result)
+      state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
       return result
     }
     revision = 1
@@ -177,7 +213,7 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
     const conversation = state.conversations.get(mutation.entityId)
     if (!conversation || conversation.revision !== mutation.baseRevision) {
       const result = { id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' } as const
-      state.receipts.set(mutation.id, result)
+      state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
       return result
     }
     revision = conversation.revision + 1
@@ -189,7 +225,7 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
     const conversation = state.conversations.get(mutation.payload.conversationId)
     if (!conversation || conversation.revision !== mutation.baseRevision) {
       const result = { id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' } as const
-      state.receipts.set(mutation.id, result)
+      state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
       return result
     }
     revision = conversation.revision + 1
@@ -200,7 +236,7 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
   } else if (mutation.kind === 'preferences.update') {
     if (state.preferences.revision !== mutation.baseRevision) {
       const result = { id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' } as const
-      state.receipts.set(mutation.id, result)
+      state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
       return result
     }
     revision = state.preferences.revision + 1
@@ -217,7 +253,7 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
   }
 
   const result = { id: mutation.id, status: 'applied', revision } as const
-  state.receipts.set(mutation.id, result)
+  state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
   appendEvent(state, mutation, revision)
   return result
 }
@@ -249,13 +285,13 @@ function importLegacyBatch(state: UserState, input: Record<string, unknown>) {
   const batchId = String(input.batchId)
   const conversations = Array.isArray(input.conversations) ? input.conversations : []
   const messages = Array.isArray(input.messages) ? input.messages : []
-  if (state.importedBatches.has(batchId)) {
-    return {
-      batchId,
-      status: 'duplicate' as const,
-    }
+  const hash = importRequestHash(input)
+  const existingHash = state.importedBatches.get(batchId)
+  if (existingHash) {
+    return existingHash === hash
+      ? { batchId, status: 'duplicate' as const }
+      : { batchId, status: 'rejected' as const, errorCode: 'SYNC_CONFLICT' as const }
   }
-  state.importedBatches.add(batchId)
   let importedConversations = 0
   let importedMessages = 0
   for (const raw of conversations) {
@@ -327,6 +363,7 @@ function importLegacyBatch(state: UserState, input: Record<string, unknown>) {
     },
     receivedAt: receivedAt(state.events.length + 1),
   })
+  state.importedBatches.set(batchId, hash)
   return {
     batchId,
     status: 'applied' as const,
@@ -505,7 +542,6 @@ export async function startCloudUserDataFixture(): Promise<CloudUserDataFixture>
         consentCount: state.consents.size,
         importedBatchCount: state.importedBatches.size,
         duplicateMutationCount: state.duplicateMutationCount,
-        paidProviderRequests: 0,
         pullPageSizes: [...state.pullPageSizes],
       }
     },
