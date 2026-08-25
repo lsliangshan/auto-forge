@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
-import { access, mkdtemp, rm } from 'node:fs/promises'
+import { access, mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, relative } from 'node:path'
 import process from 'node:process'
 
 async function terminateTree(child, signal) {
@@ -30,12 +30,21 @@ export async function runKnowledgeSmoke({
   runAsNode = false,
   onWorkspaceCreated = () => undefined,
 }) {
-  const workspace = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-ui-smoke-'))
+  const temporaryRoot = await realpath(tmpdir())
+  const workspace = await realpath(await mkdtemp(join(temporaryRoot, 'autoforge-knowledge-ui-smoke-')))
+  const workspaceRelative = relative(temporaryRoot, workspace)
+  if (!workspaceRelative || workspaceRelative.startsWith('..') || isAbsolute(workspaceRelative)) {
+    await rm(workspace, { recursive: true, force: true })
+    throw new Error('Knowledge smoke workspace escaped the parent temporary root')
+  }
   onWorkspaceCreated(workspace)
   const childEnvironment = {
     ...process.env,
     ...environment,
     AUTOFORGE_KNOWLEDGE_SMOKE_ROOT: workspace,
+    TMPDIR: workspace,
+    TMP: workspace,
+    TEMP: workspace,
   }
   if (runAsNode) childEnvironment.ELECTRON_RUN_AS_NODE = '1'
   else delete childEnvironment.ELECTRON_RUN_AS_NODE
