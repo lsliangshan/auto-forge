@@ -13,7 +13,7 @@
         <el-button
           data-testid="knowledge-import"
           type="primary"
-          :disabled="!knowledge.canWrite || knowledge.operationPending"
+          :disabled="!knowledge.canImport || knowledge.operationPending"
           @click="knowledge.importDocument"
         >导入文件</el-button>
         <el-button
@@ -37,11 +37,13 @@
       <p>还没有文件</p>
       <small>支持文本型 PDF、DOCX、UTF-8 TXT、Markdown 和 HTML。</small>
     </div>
-    <div v-else class="document-list af-scrollbar">
+    <div v-else class="document-list af-scrollbar" role="listbox" aria-label="文件列表">
       <button
         v-for="document in knowledge.documents"
         :key="document.id"
         type="button"
+        role="option"
+        :aria-selected="knowledge.selectedDocumentId === document.id"
         :data-testid="`knowledge-document-${document.id}`"
         :class="['document-row', { selected: knowledge.selectedDocumentId === document.id }]"
         @click="knowledge.selectDocument(document.id)"
@@ -66,7 +68,7 @@
       <div>
         <el-button
           data-testid="knowledge-replace"
-          :disabled="!knowledge.canWrite || knowledge.operationPending"
+          :disabled="!knowledge.canReplace || knowledge.operationPending"
           @click="knowledge.replaceSelectedDocument"
         >替换文件</el-button>
         <el-button
@@ -89,6 +91,7 @@ import { onBeforeUnmount, onMounted } from 'vue'
 import { useKnowledgeStore } from '../stores/knowledge'
 
 const knowledge = useKnowledgeStore()
+let mounted = true
 const statusLabels: Record<KnowledgeDocument['status'], string> = {
   queued: '排队中', copying: '复制中', uploading: '上传中', parsing: '解析中',
   indexing: '索引中', ready: '已就绪', failed: '处理失败', paused: '已暂停', deleted: '已删除',
@@ -110,9 +113,12 @@ async function recycleDocument() {
 
 onMounted(async () => {
   await knowledge.load()
-  knowledge.startProcessingPolling()
+  if (mounted) knowledge.startProcessingPolling()
 })
-onBeforeUnmount(() => knowledge.stopProcessingPolling())
+onBeforeUnmount(() => {
+  mounted = false
+  knowledge.stopProcessingPolling()
+})
 </script>
 
 <style scoped>

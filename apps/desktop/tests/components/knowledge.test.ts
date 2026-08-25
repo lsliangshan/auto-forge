@@ -20,7 +20,8 @@ import { useKnowledgeStore } from '../../src/stores/knowledge'
 
 const at = '2026-08-26T00:00:00.000Z'
 const localBase: KnowledgeBase = {
-  id: 'kb_local', name: '我的知识库', kind: 'local', status: 'ready', documentCount: 1, updatedAt: at,
+  id: 'kb_local', name: '我的知识库', kind: 'local', status: 'ready', searchable: true,
+  documentCount: 1, updatedAt: at,
 }
 const readyDocument: KnowledgeDocument = {
   id: 'document_1', knowledgeBaseId: localBase.id, name: '政策.md', mimeType: 'text/markdown',
@@ -300,6 +301,81 @@ describe('knowledge Store boundary', () => {
     expect(knowledge.documentsByBase).toEqual({})
   })
 
+  it('invalidates in-flight catalog, document, and version publications when polling stops', async () => {
+    const api = createApi()
+    const catalog = deferred<KnowledgeBase[]>()
+    const documents = deferred<KnowledgeDocument[]>()
+    const versions = deferred<Awaited<ReturnType<DesktopAPI['knowledge']['listVersions']>>>()
+    vi.mocked(api.knowledge.listBases).mockReturnValue(catalog.promise)
+    vi.mocked(api.knowledge.listDocuments).mockReturnValue(documents.promise)
+    vi.mocked(api.knowledge.listVersions).mockReturnValue(versions.promise)
+    installApi(api)
+    const knowledge = useKnowledgeStore()
+    knowledge.bases = [localBase]
+    knowledge.selectedBaseId = localBase.id
+    knowledge.selectedDocumentId = readyDocument.id
+
+    const loadingCatalog = knowledge.refreshCatalog()
+    const loadingDocuments = knowledge.loadDocuments(localBase.id)
+    const loadingVersions = knowledge.loadVersions(readyDocument.id)
+    knowledge.stopProcessingPolling()
+    catalog.resolve([{ ...localBase, id: 'stopped_catalog' }])
+    documents.resolve([{ ...readyDocument, id: 'stopped_document' }])
+    versions.resolve([{ id: 'stopped_version', documentId: readyDocument.id, number: 1, status: 'ready', createdAt: at }])
+    await Promise.all([loadingCatalog, loadingDocuments, loadingVersions])
+
+    expect(knowledge.bases).toEqual([localBase])
+    expect(knowledge.documentsByBase).toEqual({})
+    expect(knowledge.versionsByDocument).toEqual({})
+    expect(knowledge.documentsLoading).toBe(false)
+    expect(knowledge.versionsLoading).toBe(false)
+  })
+
+  it('does not restart polling or publish a stale workspace refresh after route unmount', async () => {
+    vi.useFakeTimers()
+    const staleDocuments = deferred<KnowledgeDocument[]>()
+    const staleBase = { ...localBase, id: 'kb_workspace' }
+    const chatBase = { ...localBase, id: 'kb_chat', name: '会话目录' }
+    const api = createApi({ bases: [staleBase], documents: [] })
+    vi.mocked(api.knowledge.listBases)
+      .mockResolvedValueOnce([staleBase])
+      .mockResolvedValueOnce([chatBase])
+      .mockResolvedValue([staleBase])
+    vi.mocked(api.knowledge.listDocuments)
+      .mockReturnValueOnce(staleDocuments.promise)
+      .mockResolvedValue([{ ...readyDocument, knowledgeBaseId: staleBase.id, status: 'ready' }])
+    const mounted = await mountKnowledge(api)
+    const chat = useChatStore(mounted.pinia)
+    chat.selectedConversationId = 'conversation_1'
+
+    await mounted.router.push('/chat')
+    await flushPromises()
+    expect(useKnowledgeStore(mounted.pinia).bases).toEqual([chatBase])
+
+    staleDocuments.resolve([{ ...readyDocument, knowledgeBaseId: staleBase.id, status: 'parsing' }])
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    const knowledge = useKnowledgeStore(mounted.pinia)
+    expect(api.knowledge.listDocuments).toHaveBeenCalledTimes(1)
+    expect(knowledge.bases).toEqual([chatBase])
+    expect(knowledge.documentsByBase[staleBase.id]).toBeUndefined()
+  })
+
+  it('clears a paused polling error on reload and when no processing remains', async () => {
+    const api = createApi({ documents: [] })
+    installApi(api)
+    const knowledge = useKnowledgeStore()
+    knowledge.pollingError = '处理状态自动刷新已暂停'
+
+    await knowledge.load()
+    expect(knowledge.pollingError).toBe('')
+
+    knowledge.pollingError = '处理状态自动刷新已暂停'
+    knowledge.startProcessingPolling()
+    expect(knowledge.pollingError).toBe('')
+  })
+
   it('keeps the current base loading state and error isolated from an older base request', async () => {
     const secondBase = { ...localBase, id: 'kb_second', name: '第二知识库' }
     const first = deferred<KnowledgeDocument[]>()
@@ -365,6 +441,21 @@ describe('knowledge Store boundary', () => {
     expect(wrapper.get('[data-testid="knowledge-replace"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="knowledge-export"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('[data-testid="knowledge-recycle-document"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="inspector-panel"]').text()).toContain('不可检索（会员已过期）')
+  })
+
+  it('enforces the free one-library and one-active-file quota before invoking Main', async () => {
+    const { api, wrapper } = await mountKnowledge(createApi({ entitlement: free }))
+
+    await wrapper.get('[aria-label="新知识库名称"]').setValue('不应创建')
+    expect(wrapper.get('[data-testid="knowledge-create"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-import"]').attributes('disabled')).toBeDefined()
+
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="knowledge-replace"]').attributes('disabled')).toBeUndefined()
+    expect(api.knowledge.createBase).not.toHaveBeenCalled()
+    expect(api.knowledge.importDocument).not.toHaveBeenCalled()
   })
 })
 
@@ -381,7 +472,10 @@ describe('knowledge three-pane workspace', () => {
   })
 
   it('creates a named base through the path-free DesktopAPI contract', async () => {
-    const { api, wrapper } = await mountKnowledge()
+    const api = createApi({
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false },
+    })
+    const { wrapper } = await mountKnowledge(api)
     await wrapper.get('[aria-label="新知识库名称"]').setValue('项目资料')
     await wrapper.get('[data-testid="knowledge-create"]').trigger('click')
     await flushPromises()
@@ -411,6 +505,70 @@ describe('knowledge three-pane workspace', () => {
     expect(wrapper.get('[aria-label="知识库列表"]').attributes('role')).toBe('listbox')
     expect(wrapper.get('[data-testid="knowledge-base-kb_local"]').attributes('aria-selected')).toBe('true')
     expect(wrapper.get('[aria-label="知识库文件"]').attributes('aria-busy')).toBe('false')
+    expect(wrapper.get('[data-testid="knowledge-document-document_1"]').attributes('role')).toBe('option')
+    expect(wrapper.get('[data-testid="knowledge-document-document_1"]').attributes('aria-selected')).toBe('false')
+  })
+
+  it('describes local processing without calling it cloud sync and reflects ready-version retrieval', async () => {
+    const processingBase = Object.assign(
+      { ...localBase, status: 'processing' as const },
+      { searchable: true },
+    )
+    const api = createApi({
+      bases: [processingBase],
+      documents: [{ ...readyDocument, status: 'parsing' }],
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    const inspector = wrapper.get('[data-testid="inspector-panel"]')
+    expect(inspector.text()).toContain('本地处理中，仅已发布版本可检索')
+    expect(inspector.text()).not.toContain('同步中，仅已发布版本可用')
+  })
+
+  it('marks read-only retained data and failed files without a ready version as unsearchable', async () => {
+    const readOnlyBase = Object.assign(
+      { ...localBase, status: 'read_only' as const },
+      { searchable: false },
+    )
+    const api = createApi({ bases: [readOnlyBase] })
+    const mounted = await mountKnowledge(api)
+    await mounted.wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+    expect(mounted.wrapper.get('[data-testid="inspector-panel"]').text()).toContain('不可检索（只读保留）')
+
+    const failedBase = Object.assign(
+      { ...localBase, status: 'failed' as const },
+      { searchable: false },
+    )
+    const failedApi = createApi({
+      bases: [failedBase],
+      documents: [{ ...readyDocument, status: 'failed' }],
+    })
+    vi.mocked(failedApi.knowledge.listVersions).mockResolvedValue([
+      { id: 'version_failed', documentId: readyDocument.id, number: 1, status: 'failed', createdAt: at },
+    ])
+    const failed = await mountKnowledge(failedApi)
+    await failed.wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+    expect(failed.wrapper.get('[data-testid="inspector-panel"]').text()).toContain('不可检索（没有已就绪版本）')
+  })
+
+  it('keeps only the prior ready version retrievable when the latest processing attempt failed', async () => {
+    const failedBase = Object.assign(
+      { ...localBase, status: 'failed' as const },
+      { searchable: true },
+    )
+    const api = createApi({
+      bases: [failedBase],
+      documents: [{ ...readyDocument, status: 'failed' }],
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="inspector-panel"]').text()).toContain('仅原有已就绪版本可检索')
   })
 })
 
@@ -460,12 +618,14 @@ describe('conversation knowledge preferences', () => {
     expect(wrapper.get('[data-testid="knowledge-base-kb_deleted"]').attributes('disabled')).toBeDefined()
   })
 
-  it('keeps syncing, paused, failed-ready-version, and read-only libraries selectable when their scope is usable', async () => {
+  it('uses Main searchable state for processing and failed choices while keeping read-only retention unsearchable', async () => {
     const bases: KnowledgeBase[] = [
-      { ...localBase, id: 'kb_processing', name: '本地处理中', status: 'processing' },
-      { ...localBase, id: 'kb_failed', name: '部分失败', status: 'failed' },
-      { ...localBase, id: 'kb_paused', name: '同步暂停', kind: 'cloud', status: 'paused' },
-      { ...localBase, id: 'kb_readonly', name: '只读资料', status: 'read_only' },
+      Object.assign({ ...localBase, id: 'kb_processing', name: '本地处理中', status: 'processing' }, { searchable: true }),
+      Object.assign({ ...localBase, id: 'kb_processing_empty', name: '首次处理中', status: 'processing' }, { searchable: false }),
+      Object.assign({ ...localBase, id: 'kb_failed', name: '部分失败', status: 'failed' }, { searchable: true }),
+      Object.assign({ ...localBase, id: 'kb_failed_empty', name: '首次失败', status: 'failed' }, { searchable: false }),
+      Object.assign({ ...localBase, id: 'kb_paused', name: '同步暂停', kind: 'cloud', status: 'paused' }, { searchable: true }),
+      Object.assign({ ...localBase, id: 'kb_readonly', name: '只读资料', status: 'read_only' }, { searchable: false }),
     ]
     const api = createApi({
       bases,
@@ -474,11 +634,14 @@ describe('conversation knowledge preferences', () => {
     })
     const { wrapper } = await mountComposer(api)
 
-    for (const id of ['kb_processing', 'kb_failed', 'kb_paused', 'kb_readonly']) {
+    for (const id of ['kb_processing', 'kb_failed', 'kb_paused']) {
       expect(wrapper.get(`[data-testid="knowledge-base-${id}"]`).attributes('disabled')).toBeUndefined()
     }
+    for (const id of ['kb_processing_empty', 'kb_failed_empty', 'kb_readonly']) {
+      expect(wrapper.get(`[data-testid="knowledge-base-${id}"]`).attributes('disabled')).toBeDefined()
+    }
     expect(wrapper.text()).toContain('已就绪版本可用')
-    expect(wrapper.text()).toContain('只读 · 可检索')
+    expect(wrapper.text()).toContain('只读 · 不可检索')
   })
 
   it('reloads authoritative Main selection after a failed save', async () => {
@@ -510,6 +673,23 @@ describe('conversation knowledge preferences', () => {
 
     expect(chat.knowledgeSelection).toEqual(emptySelection)
     expect(chat.knowledgeSelectionError).toBe('')
+  })
+
+  it('falls back to the last Main-confirmed selection when queued saves and authoritative reload all fail', async () => {
+    const confirmed = { knowledgeBaseIds: ['kb_local'], knowledgeMode: 'strict' } as const
+    const api = createApi({ selection: confirmed })
+    vi.mocked(api.knowledge.getConversationSelection)
+      .mockResolvedValueOnce(confirmed)
+      .mockRejectedValue(new Error('reload unavailable'))
+    vi.mocked(api.knowledge.updateConversationSelection).mockRejectedValue(new Error('write failed'))
+    const { chat, wrapper } = await mountComposer(api)
+
+    await wrapper.get('[data-testid="knowledge-mode-mixed"]').trigger('click')
+    await wrapper.get('[data-testid="knowledge-base-kb_local"]').trigger('click')
+    await flushPromises()
+
+    expect(chat.knowledgeSelection).toEqual(confirmed)
+    expect(chat.knowledgeSelectionError).toBe('知识库选择保存失败')
   })
 
   it('reconciles a failed save for a conversation that is no longer selected without leaking its error', async () => {

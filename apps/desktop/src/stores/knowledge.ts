@@ -82,13 +82,28 @@ export const useKnowledgeStore = defineStore('knowledge', {
         documents.some(({ status }) => processingDocumentStatuses.has(status)))
     },
     canCreateBase(state): boolean {
-      return Boolean(state.availability?.local.available && entitlementAllowsWrite(state.entitlement))
+      if (!state.availability?.local.available || !entitlementAllowsWrite(state.entitlement)) return false
+      return state.entitlement?.tier === 'member'
+        || state.bases.every(({ status }) => status === 'recycled')
     },
     canWrite(state): boolean {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
       if (!base || base.status === 'read_only' || base.status === 'recycled') return false
       return scopeAvailable(base, state.availability, state.entitlement)
         && entitlementAllowsWrite(state.entitlement)
+    },
+    canImport(state): boolean {
+      const base = state.bases.find(({ id }) => id === state.selectedBaseId)
+      if (!base || !this.canWrite) return false
+      if (state.entitlement?.tier === 'member') return true
+      const documents = state.documentsByBase[base.id]
+      return documents !== undefined && documents.every(({ status }) => status === 'deleted')
+    },
+    canReplace(state): boolean {
+      const document = Object.values(state.documentsByBase)
+        .flat()
+        .find(({ id }) => id === state.selectedDocumentId)
+      return Boolean(this.canWrite && document && document.status !== 'deleted')
     },
     canRecycle(state): boolean {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
@@ -131,6 +146,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
       const version = ++this._catalogVersion
       this.loading = true
       this.error = ''
+      this.pollingError = ''
       try {
         const api = getDesktopApi().knowledge
         const availability = await api.getFeatureAvailability()
@@ -304,7 +320,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
       this.selectedDocumentId = document.id
     },
     async importDocument() {
-      if (!this.selectedBaseId || this.operationPending || !this.canWrite) return
+      if (!this.selectedBaseId || this.operationPending || !this.canImport) return
       const knowledgeBaseId = this.selectedBaseId
       await this.runOperation('导入文件失败', async (isCurrent) => {
         const acknowledgement = await getDesktopApi().knowledge.importDocument(knowledgeBaseId)
@@ -316,7 +332,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     async replaceSelectedDocument() {
       const documentId = this.selectedDocumentId
-      if (!documentId || this.operationPending || !this.canWrite) return
+      if (!documentId || this.operationPending || !this.canReplace) return
       await this.runOperation('替换文件失败', async (isCurrent) => {
         const acknowledgement = await getDesktopApi().knowledge.replaceDocument(documentId)
         if (acknowledgement && isCurrent()) {
@@ -375,6 +391,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     startProcessingPolling() {
       this.stopProcessingPolling()
+      this.pollingError = ''
       if (!this.hasProcessing) return
       const controller: PollController = { failures: 0, ownerEpoch: this._ownerEpoch }
       pollingControllers.set(this, controller)
@@ -412,6 +429,15 @@ export const useKnowledgeStore = defineStore('knowledge', {
       const controller = pollingControllers.get(this)
       if (controller?.timer !== undefined) globalThis.clearTimeout(controller.timer)
       pollingControllers.delete(this)
+      this._catalogVersion += 1
+      this._refreshVersion += 1
+      this._documentLoadVersions = {}
+      this._versionLoadVersions = {}
+      this._documentsLoadingVersion += 1
+      this._versionsLoadingVersion += 1
+      this.loading = false
+      this.documentsLoading = false
+      this.versionsLoading = false
     },
     async runOperation(message: string, operation: (isCurrent: () => boolean) => Promise<void>) {
       const ownerEpoch = this._ownerEpoch

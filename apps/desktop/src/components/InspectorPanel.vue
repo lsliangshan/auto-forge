@@ -226,10 +226,32 @@ const knowledgeDocumentStatus = computed(() => ({
 const hasReadyVersion = computed(() => knowledge.versions.some(({ status }) => status === 'ready'))
 const knowledgeRetrievalStatus = computed(() => {
   const base = knowledge.selectedBase
-  if (!base) return '不可用'
+  const document = knowledge.selectedDocument
+  if (!base || !document) return '不可用'
+  if (base.status === 'read_only') return '不可检索（只读保留）'
+  if (!knowledge.entitlement
+    || !['active', 'offline_grace'].includes(knowledge.entitlement.status)) {
+    return knowledge.entitlement?.status === 'expired'
+      ? '不可检索（会员已过期）'
+      : '不可检索（权益不可用）'
+  }
+  const scopeAvailable = base.kind === 'local'
+    ? knowledge.availability?.local.available
+    : knowledge.availability?.cloud.available && knowledge.entitlement.cloudEnabled
+  if (!scopeAvailable) return '不可检索（当前范围不可用）'
+  if (!base.searchable || !hasReadyVersion.value) return '不可检索（没有已就绪版本）'
+  if (document.status === 'failed') return '仅原有已就绪版本可检索'
+  if (base.status === 'processing') {
+    return base.kind === 'cloud'
+      ? '同步中，仅已发布版本可检索'
+      : '本地处理中，仅已发布版本可检索'
+  }
+  if (base.status === 'paused') {
+    return base.kind === 'cloud'
+      ? '同步已暂停，仅已发布版本可检索'
+      : '本地处理已暂停，仅已发布版本可检索'
+  }
   if (base.kind === 'local') return '仅本地关键词检索'
-  if (base.status === 'processing') return '同步中，仅已发布版本可用'
-  if (base.status === 'paused') return '同步已暂停，仅已发布版本可用'
   return knowledge.consent?.status === 'granted' ? '已同步' : '关键词检索'
 })
 const versionStatusLabel = (status: string) => ({ staging: '处理中', ready: '已就绪', failed: '失败', retired: '已退役' })[status] ?? status

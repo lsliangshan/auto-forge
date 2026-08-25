@@ -62,6 +62,13 @@ function copyGenerationPreferences(
   }
 }
 
+function copyKnowledgeSelection(selection: KnowledgeSelection): KnowledgeSelection {
+  return {
+    knowledgeBaseIds: [...selection.knowledgeBaseIds],
+    knowledgeMode: selection.knowledgeMode,
+  }
+}
+
 function acquireChatEvents(api: DesktopAPI, listener: (event: ChatEvent) => void): () => void {
   const existing = hubs.get(api)
   const hub: ChatHub = existing ?? { listeners: new Set(), unsubscribe: () => undefined }
@@ -197,6 +204,7 @@ export const useChatStore = defineStore('chat', {
     draftsByConversation: {} as Record<string, MediaAsset[]>,
     preferencesByConversation: {} as Record<string, ConversationGenerationPreferences>,
     knowledgeSelectionsByConversation: {} as Record<string, KnowledgeSelection>,
+    _confirmedKnowledgeSelections: {} as Record<string, KnowledgeSelection>,
     pendingRequestByConversation: {} as Record<string, true>,
     activeRequestByConversation: {} as Record<string, string>,
     awaitingResponseByConversation: {} as Record<string, true>,
@@ -252,6 +260,7 @@ export const useChatStore = defineStore('chat', {
       this.draftsByConversation = {}
       this.preferencesByConversation = {}
       this.knowledgeSelectionsByConversation = {}
+      this._confirmedKnowledgeSelections = {}
       this.pendingRequestByConversation = {}
       this.activeRequestByConversation = {}
       this.awaitingResponseByConversation = {}
@@ -325,6 +334,9 @@ export const useChatStore = defineStore('chat', {
         this.knowledgeSelectionsByConversation[conversation.id] = {
           knowledgeBaseIds: [], knowledgeMode: 'mixed',
         }
+        this._confirmedKnowledgeSelections[conversation.id] = {
+          knowledgeBaseIds: [], knowledgeMode: 'mixed',
+        }
         await this.loadGenerationPreferences(conversation.id)
       } catch (error) { this.error = displayError(error, '创建会话失败') }
     },
@@ -353,6 +365,7 @@ export const useChatStore = defineStore('chat', {
           delete this.draftsByConversation[id]
           delete this.preferencesByConversation[id]
           delete this.knowledgeSelectionsByConversation[id]
+          delete this._confirmedKnowledgeSelections[id]
           delete this.pendingRequestByConversation[id]
           delete this.activeRequestByConversation[id]
           delete this.awaitingResponseByConversation[id]
@@ -440,10 +453,9 @@ export const useChatStore = defineStore('chat', {
       try {
         const selection = await getDesktopApi().knowledge.getConversationSelection(conversationId)
         if (epoch !== this._stateEpoch || version !== this._knowledgePreferenceVersions[conversationId]) return
-        this.knowledgeSelectionsByConversation[conversationId] = {
-          knowledgeBaseIds: [...selection.knowledgeBaseIds],
-          knowledgeMode: selection.knowledgeMode,
-        }
+        const confirmed = copyKnowledgeSelection(selection)
+        this.knowledgeSelectionsByConversation[conversationId] = confirmed
+        this._confirmedKnowledgeSelections[conversationId] = copyKnowledgeSelection(confirmed)
         if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = ''
       } catch (error) {
         if (epoch === this._stateEpoch
@@ -458,16 +470,7 @@ export const useChatStore = defineStore('chat', {
       const epoch = this._stateEpoch
       const version = (this._knowledgePreferenceVersions[conversationId] ?? 0) + 1
       this._knowledgePreferenceVersions[conversationId] = version
-      const snapshot: KnowledgeSelection = {
-        knowledgeBaseIds: [...selection.knowledgeBaseIds],
-        knowledgeMode: selection.knowledgeMode,
-      }
-      const previousSelection = this.knowledgeSelectionsByConversation[conversationId]
-        ? {
-            knowledgeBaseIds: [...this.knowledgeSelectionsByConversation[conversationId]!.knowledgeBaseIds],
-            knowledgeMode: this.knowledgeSelectionsByConversation[conversationId]!.knowledgeMode,
-          }
-        : { knowledgeBaseIds: [], knowledgeMode: 'mixed' as const }
+      const snapshot = copyKnowledgeSelection(selection)
       this.knowledgeSelectionsByConversation[conversationId] = snapshot
       if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = ''
       let queues = knowledgePreferenceQueues.get(this)
@@ -484,12 +487,12 @@ export const useChatStore = defineStore('chat', {
       queues.set(conversationId, settled)
       try {
         await operation
+        if (saved && epoch === this._stateEpoch) {
+          this._confirmedKnowledgeSelections[conversationId] = copyKnowledgeSelection(saved)
+        }
         if (saved && epoch === this._stateEpoch
           && version === this._knowledgePreferenceVersions[conversationId]) {
-          this.knowledgeSelectionsByConversation[conversationId] = {
-            knowledgeBaseIds: [...saved.knowledgeBaseIds],
-            knowledgeMode: saved.knowledgeMode,
-          }
+          this.knowledgeSelectionsByConversation[conversationId] = copyKnowledgeSelection(saved)
           if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = ''
         }
       } catch (error) {
@@ -500,14 +503,16 @@ export const useChatStore = defineStore('chat', {
           const authoritative = await getDesktopApi().knowledge.getConversationSelection(conversationId)
           if (epoch !== this._stateEpoch
             || version !== this._knowledgePreferenceVersions[conversationId]) return
-          this.knowledgeSelectionsByConversation[conversationId] = {
-            knowledgeBaseIds: [...authoritative.knowledgeBaseIds],
-            knowledgeMode: authoritative.knowledgeMode,
-          }
+          const confirmed = copyKnowledgeSelection(authoritative)
+          this._confirmedKnowledgeSelections[conversationId] = confirmed
+          this.knowledgeSelectionsByConversation[conversationId] = copyKnowledgeSelection(confirmed)
         } catch {
           if (epoch !== this._stateEpoch
             || version !== this._knowledgePreferenceVersions[conversationId]) return
-          this.knowledgeSelectionsByConversation[conversationId] = previousSelection
+          this.knowledgeSelectionsByConversation[conversationId] = copyKnowledgeSelection(
+            this._confirmedKnowledgeSelections[conversationId]
+              ?? { knowledgeBaseIds: [], knowledgeMode: 'mixed' },
+          )
         }
         if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = message
       } finally {

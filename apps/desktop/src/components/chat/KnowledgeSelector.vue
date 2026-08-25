@@ -85,11 +85,21 @@ function choiceFor(base: KnowledgeBase, missing = false): Choice {
             : base.kind === 'cloud' ? '已同步 · ' : ''
     return { base, label: `${state}${reason}`, disabled: true }
   }
-  if (base.status === 'read_only') return { base, label: '只读 · 可检索', disabled: false }
-  if (base.status === 'failed') return { base, label: '处理失败 · 仅已就绪版本可用', disabled: false }
-  if (base.status === 'paused') return { base, label: '同步已暂停 · 仅已就绪版本可用', disabled: false }
+  if (base.status === 'read_only') return { base, label: '只读 · 不可检索（可导出或删除）', disabled: true }
+  if (!base.searchable) {
+    const state = base.status === 'processing'
+      ? (base.kind === 'cloud' ? '同步中' : '本地处理中')
+      : base.status === 'failed'
+        ? '处理失败'
+        : base.status === 'paused'
+          ? '同步已暂停'
+          : '尚无内容'
+    return { base, label: `${state} · 暂无已就绪版本`, disabled: true }
+  }
+  if (base.status === 'failed') return { base, label: '处理失败 · 已就绪版本可用', disabled: false }
+  if (base.status === 'paused') return { base, label: '同步已暂停 · 已就绪版本可用', disabled: false }
   if (base.status === 'processing') {
-    return { base, label: `${base.kind === 'cloud' ? '同步中' : '本地处理中'} · 仅已就绪版本可用`, disabled: false }
+    return { base, label: `${base.kind === 'cloud' ? '同步中' : '本地处理中'} · 已就绪版本可用`, disabled: false }
   }
   if (base.kind === 'local') return { base, label: '仅本地 · 关键词检索', disabled: false }
   return {
@@ -105,7 +115,7 @@ const choices = computed<Choice[]>(() => {
   for (const id of selection.value.knowledgeBaseIds) {
     if (known.has(id)) continue
     current.push(choiceFor({
-      id, name: id, kind: 'local', status: 'recycled', documentCount: 0,
+      id, name: id, kind: 'local', status: 'recycled', searchable: false, documentCount: 0,
       updatedAt: new Date(0).toISOString(),
     }, true))
   }

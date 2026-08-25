@@ -118,7 +118,7 @@ function services(): DesktopIpcServices {
     knowledge: {
       listBases: vi.fn().mockResolvedValue([]),
       createBase: vi.fn().mockResolvedValue({
-        id: 'kb_1', name: 'Policies', kind: 'local', status: 'ready', documentCount: 0,
+        id: 'kb_1', name: 'Policies', kind: 'local', status: 'ready', searchable: false, documentCount: 0,
         updatedAt: '2026-08-26T00:00:00.000Z',
       }),
       listDocuments: vi.fn().mockResolvedValue([]),

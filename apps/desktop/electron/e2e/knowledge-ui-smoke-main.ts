@@ -1,6 +1,4 @@
-import { mkdtempSync } from 'node:fs'
-import { rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -24,7 +22,9 @@ const rendererFile = fileURLToPath(new URL('../../out/renderer/index.html', impo
 const preloadFile = fileURLToPath(new URL('../../out/preload/index.cjs', import.meta.url))
 const parserWorkerFile = fileURLToPath(new URL('../../out/renderer/electron/main/knowledge/parser-worker.html', import.meta.url))
 const parserPreloadFile = fileURLToPath(new URL('../../out/preload/parser.cjs', import.meta.url))
-const userData = mkdtempSync(join(tmpdir(), 'autoforge-knowledge-ui-smoke-'))
+const smokeRoot = process.env.AUTOFORGE_KNOWLEDGE_SMOKE_ROOT
+if (!smokeRoot) throw new Error('Parent-owned knowledge smoke workspace is required')
+const userData: string = smokeRoot
 const sourceFile = join(userData, 'smoke-source.txt')
 app.setPath('userData', userData)
 protocol.registerSchemesAsPrivileged([{
@@ -123,7 +123,11 @@ function createServices(service: KnowledgeService): DesktopIpcServices {
 async function waitFor(check: () => Promise<boolean>, description: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (await check()) return
+    const matched = await Promise.race([
+      check(),
+      new Promise<false>((resolve) => globalThis.setTimeout(() => resolve(false), 2_000)),
+    ])
+    if (matched) return
     await new Promise((resolve) => globalThis.setTimeout(resolve, 50))
   }
   throw new Error(`Timed out waiting for ${description}`)
@@ -144,6 +148,7 @@ async function navigate(hash: string): Promise<void> {
 }
 
 async function run(): Promise<void> {
+  let exitCode = 0
   try {
     process.stderr.write('knowledge-ui-smoke: app-ready\n')
     await writeFile(sourceFile, 'AutoForge real Electron knowledge import acknowledgement smoke.')
@@ -215,8 +220,8 @@ async function run(): Promise<void> {
     process.stderr.write('knowledge-ui-smoke: document-ready\n')
     await mainWindow.loadFile(rendererFile, { hash: '/chat' })
     await waitFor(
-      () => rendererMatches(`document.querySelector('[data-testid="knowledge-base-${knowledgeBaseId}"]') !== null`),
-      'conversation knowledge selector',
+      () => rendererMatches(`document.querySelector('[data-testid="knowledge-base-${knowledgeBaseId}"]')?.disabled === false`),
+      'enabled conversation knowledge selector from refreshed Main catalog',
       10_000,
     )
     process.stderr.write('knowledge-ui-smoke: selector-visible\n')
@@ -252,13 +257,16 @@ async function run(): Promise<void> {
       calls,
       visible,
     })}\n`)
+    await writeFile(join(userData, '.knowledge-smoke-complete'), 'ok')
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`)
+    exitCode = 1
   } finally {
     disposeIpc?.()
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy()
     await knowledge?.close().catch(() => undefined)
     await session.defaultSession.clearStorageData().catch(() => undefined)
-    await rm(userData, { recursive: true, force: true })
-    app.quit()
+    app.exit(exitCode)
   }
 }
 

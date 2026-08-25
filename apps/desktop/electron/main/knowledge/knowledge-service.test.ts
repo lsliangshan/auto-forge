@@ -266,7 +266,7 @@ describe('KnowledgeService lifecycle', () => {
     const owner = { userId: 'alice' }
 
     const [defaultBase] = await app.service.listBases(owner)
-    expect(defaultBase).toMatchObject({ name: '我的知识库', kind: 'local', status: 'ready' })
+    expect(defaultBase).toMatchObject({ name: '我的知识库', kind: 'local', status: 'ready', searchable: false })
     await expect(app.service.createBase(owner, 'Second')).rejects.toMatchObject({ code: 'CONFLICT' })
 
     app.picks.push(await writeSource(app.rootDirectory, 'first.txt', '北京政务服务指南'))
@@ -274,8 +274,69 @@ describe('KnowledgeService lifecycle', () => {
       name: 'first.txt', status: 'parsing', versionCount: 1,
     })
     await expect.poll(async () => (await app.service.listDocuments(owner, defaultBase!.id))[0]?.status).toBe('ready')
+    await expect(app.service.listBases(owner)).resolves.toEqual([
+      expect.objectContaining({ id: defaultBase!.id, searchable: true }),
+    ])
     app.picks.push(await writeSource(app.rootDirectory, 'second.txt', '第二份文件'))
     await expect(app.service.importDocument(owner, defaultBase!.id)).rejects.toMatchObject({ code: 'CONFLICT' })
+    await app.service.close()
+  })
+
+  it('removes read-only retained libraries from authoritative conversation scope and search', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'retained.txt', '不可检索的只读保留资料'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    const opened = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    opened.database.prepare("UPDATE knowledge_bases SET status = 'read_only' WHERE id = ?").run(base!.id)
+    opened.close()
+
+    await expect(app.service.listBases(owner)).resolves.toEqual([
+      expect.objectContaining({ id: base!.id, status: 'read_only', searchable: false }),
+    ])
+    await expect(app.service.getConversationSelection(owner, 'conversation_1')).resolves.toEqual({
+      knowledgeBaseIds: [], knowledgeMode: 'strict',
+    })
+    await expect(app.service.search(owner, 'conversation_1', '只读保留资料')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    await expect(app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'mixed',
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await app.service.close()
+  })
+
+  it('removes expired entitlement from authoritative conversation scope', async () => {
+    const entitlement: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+    }
+    const app = await fixture({ entitlement })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'expires.txt', '会员到期后停止检索'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    entitlement.status = 'expired'
+
+    await expect(app.service.getConversationSelection(owner, 'conversation_1')).resolves.toEqual({
+      knowledgeBaseIds: [], knowledgeMode: 'strict',
+    })
+    await expect(app.service.search(owner, 'conversation_1', '停止检索')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    await expect(app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'mixed',
+    })).rejects.toMatchObject({ code: 'FORBIDDEN' })
     await app.service.close()
   })
 

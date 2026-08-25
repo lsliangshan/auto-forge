@@ -470,7 +470,7 @@ describe('authentication store', () => {
     chat.messagesByConversation.conversation_alice = []
     knowledge.bases = [{
       id: 'alice_base', name: 'Alice private', kind: 'local', status: 'ready',
-      documentCount: 1, updatedAt: '2026-08-21T00:00:00.000Z',
+      searchable: true, documentCount: 1, updatedAt: '2026-08-21T00:00:00.000Z',
     }]
     knowledge.documentsByBase.alice_base = []
     knowledge.versionsByDocument.alice_document = []
@@ -503,7 +503,7 @@ describe('authentication store', () => {
     auth.session = { ...authSession, user: { id: 'old_user', account: 'Old' } }
     knowledge.bases = [{
       id: 'old_base', name: 'Old private', kind: 'local', status: 'ready',
-      documentCount: 0, updatedAt: '2026-08-21T00:00:00.000Z',
+      searchable: false, documentCount: 0, updatedAt: '2026-08-21T00:00:00.000Z',
     }]
     knowledge.selectedBaseId = 'old_base'
 

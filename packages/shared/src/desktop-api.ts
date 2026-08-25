@@ -30,6 +30,7 @@ export const knowledgeBaseSchema = z.object({
   name: nonEmptyStringSchema.max(200),
   kind: z.enum(['local', 'cloud']),
   status: z.enum(['ready', 'processing', 'paused', 'failed', 'read_only', 'recycled']),
+  searchable: z.boolean(),
   documentCount: z.number().int().nonnegative(),
   updatedAt: timestampSchema,
 }).strict()

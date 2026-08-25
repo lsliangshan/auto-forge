@@ -223,14 +223,20 @@ export class KnowledgeService implements KnowledgePersistence {
         knowledge_bases.updated_at AS updatedAt,
         count(documents.id) AS documentCount,
         coalesce(sum(CASE WHEN documents.status IN ('pending', 'processing') THEN 1 ELSE 0 END), 0) AS processingCount,
-        coalesce(sum(CASE WHEN documents.status = 'failed' THEN 1 ELSE 0 END), 0) AS failedCount
+        coalesce(sum(CASE WHEN documents.status = 'failed' THEN 1 ELSE 0 END), 0) AS failedCount,
+        coalesce(sum(CASE WHEN documents.status <> 'recycled'
+          AND EXISTS (
+            SELECT 1 FROM document_versions
+            WHERE document_versions.id = documents.active_version_id
+              AND document_versions.status = 'ready'
+          ) THEN 1 ELSE 0 END), 0) AS searchableDocumentCount
       FROM knowledge_bases
       LEFT JOIN documents ON documents.knowledge_base_id = knowledge_bases.id
       GROUP BY knowledge_bases.id
       ORDER BY knowledge_bases.created_at, knowledge_bases.id
     `).all() as Array<{
       id: string; name: string; status: 'active' | 'read_only' | 'recycled'; updatedAt: number
-      documentCount: number; processingCount: number; failedCount: number
+      documentCount: number; processingCount: number; failedCount: number; searchableDocumentCount: number
     }>
     return rows.map(row => ({
       id: row.id,
@@ -245,6 +251,7 @@ export class KnowledgeService implements KnowledgePersistence {
             : row.failedCount > 0
               ? 'failed'
               : 'ready',
+      searchable: row.status === 'active' && row.searchableDocumentCount > 0,
       documentCount: row.documentCount,
       updatedAt: iso(row.updatedAt),
     }))
@@ -269,7 +276,7 @@ export class KnowledgeService implements KnowledgePersistence {
         INSERT INTO knowledge_bases (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
       `).run(id, name, now, now)
     })()
-    return { id, name, kind: 'local', status: 'ready', documentCount: 0, updatedAt: iso(now) }
+    return { id, name, kind: 'local', status: 'ready', searchable: false, documentCount: 0, updatedAt: iso(now) }
   }
 
   async listDocuments(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument[]> {
@@ -401,9 +408,17 @@ export class KnowledgeService implements KnowledgePersistence {
       SELECT knowledge_mode AS knowledgeMode FROM conversation_selections WHERE conversation_id = ?
     `).get(conversationId) as { knowledgeMode: 'mixed' | 'strict' } | undefined
     if (!selection) return { knowledgeBaseIds: [], knowledgeMode: 'mixed' }
+    const entitlement = await this.getEntitlement(owner)
+    if (!['active', 'offline_grace'].includes(entitlement.status)) {
+      return { knowledgeBaseIds: [], knowledgeMode: selection.knowledgeMode }
+    }
     const bases = session.opened.database.prepare(`
-      SELECT knowledge_base_id AS knowledgeBaseId FROM conversation_selection_bases
-      WHERE conversation_id = ? ORDER BY ordinal
+      SELECT conversation_selection_bases.knowledge_base_id AS knowledgeBaseId
+      FROM conversation_selection_bases
+      JOIN knowledge_bases ON knowledge_bases.id = conversation_selection_bases.knowledge_base_id
+      WHERE conversation_selection_bases.conversation_id = ?
+        AND knowledge_bases.status = 'active'
+      ORDER BY conversation_selection_bases.ordinal
     `).all(conversationId) as Array<{ knowledgeBaseId: string }>
     return { knowledgeBaseIds: bases.map(row => row.knowledgeBaseId), knowledgeMode: selection.knowledgeMode }
   }
@@ -420,6 +435,8 @@ export class KnowledgeService implements KnowledgePersistence {
       failure('INVALID_INPUT')
     }
     if (selection.knowledgeBaseIds.length > 0) {
+      const entitlement = await this.getEntitlement(owner)
+      if (!['active', 'offline_grace'].includes(entitlement.status)) failure('FORBIDDEN')
       const placeholders = selection.knowledgeBaseIds.map(() => '?').join(', ')
       const count = session.opened.database.prepare(`
         SELECT count(*) AS count FROM knowledge_bases

@@ -53,8 +53,8 @@ describe('cross-process contracts', () => {
   it('keeps personal knowledge DTOs strict and free of private storage details', () => {
     expect(knowledgeBaseSchema.parse({
       id: 'kb_1', name: 'Research notes', kind: 'local', status: 'ready',
-      documentCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
-    })).toMatchObject({ id: 'kb_1', status: 'ready' })
+      searchable: true, documentCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+    })).toMatchObject({ id: 'kb_1', status: 'ready', searchable: true })
     expect(knowledgeDocumentSchema.parse({
       id: 'document_1', knowledgeBaseId: 'kb_1', name: 'outline.md', mimeType: 'text/markdown',
       status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
@@ -65,7 +65,7 @@ describe('cross-process contracts', () => {
     })).toMatchObject({ documentId: 'document_1', number: 1 })
 
     for (const value of [
-      { id: 'kb_1', name: 'Research notes', kind: 'local', status: 'ready', documentCount: 1, updatedAt: '2026-08-26T00:00:00.000Z', path: '/private/kb' },
+      { id: 'kb_1', name: 'Research notes', kind: 'local', status: 'ready', searchable: true, documentCount: 1, updatedAt: '2026-08-26T00:00:00.000Z', path: '/private/kb' },
       { id: 'document_1', knowledgeBaseId: 'kb_1', name: 'outline.md', mimeType: 'text/markdown', status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z', userId: 'other_user' },
     ]) {
       expect(knowledgeBaseSchema.safeParse(value).success || knowledgeDocumentSchema.safeParse(value).success).toBe(false)

@@ -284,7 +284,7 @@ const execution = useExecutionStore()
 const knowledge = useKnowledgeStore()
 const knowledgeBaseName = ref('')
 const baseStatusLabel = (base: KnowledgeBase) => {
-  if (base.status === 'processing') return '同步中'
+  if (base.status === 'processing') return base.kind === 'cloud' ? '同步中' : '本地处理中'
   if (base.status === 'read_only') return '只读'
   if (base.status === 'failed') return '失败'
   if (base.status === 'paused') return '已暂停'
