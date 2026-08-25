@@ -1,5 +1,9 @@
 <template>
-  <section class="knowledge-view" aria-label="知识库文件">
+  <section
+    class="knowledge-view"
+    aria-label="知识库文件"
+    :aria-busy="knowledge.loading || knowledge.documentsLoading"
+  >
     <header class="knowledge-toolbar">
       <div>
         <span class="af-panel-heading">文件</span>
@@ -13,7 +17,8 @@
           @click="knowledge.importDocument"
         >导入文件</el-button>
         <el-button
-          :disabled="!knowledge.selectedBaseId || knowledge.operationPending"
+          data-testid="knowledge-export"
+          :disabled="!knowledge.canExport || knowledge.operationPending"
           @click="knowledge.exportSelectedBase"
         >导出</el-button>
       </div>
@@ -22,7 +27,7 @@
     <div v-if="knowledge.error" class="knowledge-state error" role="alert">
       {{ knowledge.error }}
     </div>
-    <div v-else-if="knowledge.loading || knowledge.documentsLoading" class="knowledge-state">
+    <div v-else-if="knowledge.loading || knowledge.documentsLoading" class="knowledge-state" aria-live="polite">
       正在加载知识库…
     </div>
     <div v-else-if="!knowledge.selectedBaseId" class="knowledge-state">
@@ -51,9 +56,9 @@
       </button>
     </div>
 
-    <div v-if="knowledge.operationError" class="operation-error" role="alert">
-      <span>{{ knowledge.operationError }}</span>
-      <el-button size="small" @click="knowledge.operationError = ''">关闭</el-button>
+    <div v-if="knowledge.operationError || knowledge.pollingError" class="operation-error" role="alert">
+      <span>{{ knowledge.operationError || knowledge.pollingError }}</span>
+      <el-button size="small" @click="knowledge.operationError = ''; knowledge.pollingError = ''">关闭</el-button>
     </div>
 
     <footer v-if="knowledge.selectedDocument" class="document-actions">
@@ -65,10 +70,11 @@
           @click="knowledge.replaceSelectedDocument"
         >替换文件</el-button>
         <el-button
+          data-testid="knowledge-recycle-document"
           type="danger"
           plain
-          :disabled="knowledge.operationPending"
-          @click="knowledge.recycleSelectedDocument"
+          :disabled="!knowledge.canRecycle || knowledge.operationPending"
+          @click="recycleDocument"
         >移入回收站</el-button>
       </div>
     </footer>
@@ -76,8 +82,9 @@
 </template>
 
 <script setup lang="ts">
-import { Document } from '@element-plus/icons-vue'
 import type { KnowledgeDocument } from '@autoforge/shared'
+import { Document } from '@element-plus/icons-vue'
+import { ElMessageBox } from 'element-plus'
 import { onBeforeUnmount, onMounted } from 'vue'
 import { useKnowledgeStore } from '../stores/knowledge'
 
@@ -90,14 +97,22 @@ const statusLabel = (status: KnowledgeDocument['status']) => statusLabels[status
 const statusTone = (status: KnowledgeDocument['status']) =>
   status === 'ready' ? 'success' : status === 'failed' || status === 'deleted' ? 'danger' : 'warning'
 
-let polling: ReturnType<typeof globalThis.setInterval> | undefined
-onMounted(() => {
-  void knowledge.load()
-  polling = globalThis.setInterval(() => { void knowledge.refreshProcessing() }, 1_500)
+async function recycleDocument() {
+  const document = knowledge.selectedDocument
+  if (!document) return
+  try {
+    await ElMessageBox.confirm(`确认将“${document.name}”移入回收站？`, '回收文件', {
+      type: 'warning', confirmButtonText: '确认回收', cancelButtonText: '取消',
+    })
+    await knowledge.recycleSelectedDocument()
+  } catch { /* Cancellation does not mutate knowledge state. */ }
+}
+
+onMounted(async () => {
+  await knowledge.load()
+  knowledge.startProcessingPolling()
 })
-onBeforeUnmount(() => {
-  if (polling !== undefined) globalThis.clearInterval(polling)
-})
+onBeforeUnmount(() => knowledge.stopProcessingPolling())
 </script>
 
 <style scoped>

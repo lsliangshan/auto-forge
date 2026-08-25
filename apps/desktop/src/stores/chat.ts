@@ -261,6 +261,7 @@ export const useChatStore = defineStore('chat', {
       this._messageLoadVersions = {}
       this._preferenceVersions = {}
       this._knowledgePreferenceVersions = {}
+      knowledgePreferenceQueues.delete(this)
       closedMediaAdmissions.delete(this)
       this.loading = false
       this.error = ''
@@ -433,7 +434,6 @@ export const useChatStore = defineStore('chat', {
     },
     async loadKnowledgeSelection(conversationId: string) {
       if (!conversationId) return
-      this.knowledgeSelectionError = ''
       const epoch = this._stateEpoch
       const version = (this._knowledgePreferenceVersions[conversationId] ?? 0) + 1
       this._knowledgePreferenceVersions[conversationId] = version
@@ -444,6 +444,7 @@ export const useChatStore = defineStore('chat', {
           knowledgeBaseIds: [...selection.knowledgeBaseIds],
           knowledgeMode: selection.knowledgeMode,
         }
+        if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = ''
       } catch (error) {
         if (epoch === this._stateEpoch
           && version === this._knowledgePreferenceVersions[conversationId]
@@ -461,8 +462,14 @@ export const useChatStore = defineStore('chat', {
         knowledgeBaseIds: [...selection.knowledgeBaseIds],
         knowledgeMode: selection.knowledgeMode,
       }
+      const previousSelection = this.knowledgeSelectionsByConversation[conversationId]
+        ? {
+            knowledgeBaseIds: [...this.knowledgeSelectionsByConversation[conversationId]!.knowledgeBaseIds],
+            knowledgeMode: this.knowledgeSelectionsByConversation[conversationId]!.knowledgeMode,
+          }
+        : { knowledgeBaseIds: [], knowledgeMode: 'mixed' as const }
       this.knowledgeSelectionsByConversation[conversationId] = snapshot
-      this.knowledgeSelectionError = ''
+      if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = ''
       let queues = knowledgePreferenceQueues.get(this)
       if (!queues) {
         queues = new Map()
@@ -483,11 +490,26 @@ export const useChatStore = defineStore('chat', {
             knowledgeBaseIds: [...saved.knowledgeBaseIds],
             knowledgeMode: saved.knowledgeMode,
           }
+          if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = ''
         }
       } catch (error) {
-        if (epoch === this._stateEpoch && this.selectedConversationId === conversationId) {
-          this.knowledgeSelectionError = displayError(error, '知识库选择保存失败')
+        if (epoch !== this._stateEpoch
+          || version !== this._knowledgePreferenceVersions[conversationId]) return
+        const message = displayError(error, '知识库选择保存失败')
+        try {
+          const authoritative = await getDesktopApi().knowledge.getConversationSelection(conversationId)
+          if (epoch !== this._stateEpoch
+            || version !== this._knowledgePreferenceVersions[conversationId]) return
+          this.knowledgeSelectionsByConversation[conversationId] = {
+            knowledgeBaseIds: [...authoritative.knowledgeBaseIds],
+            knowledgeMode: authoritative.knowledgeMode,
+          }
+        } catch {
+          if (epoch !== this._stateEpoch
+            || version !== this._knowledgePreferenceVersions[conversationId]) return
+          this.knowledgeSelectionsByConversation[conversationId] = previousSelection
         }
+        if (this.selectedConversationId === conversationId) this.knowledgeSelectionError = message
       } finally {
         if (queues.get(conversationId) === settled) queues.delete(conversationId)
       }

@@ -27,7 +27,7 @@
             <span class="af-panel-heading">处理与索引</span>
             <p>{{ knowledgeDocumentStatus }}</p>
             <p class="muted">处理位置：{{ knowledge.selectedBase?.kind === 'cloud' ? 'CloudBase' : '本机' }}</p>
-            <p class="muted">检索：{{ knowledge.selectedBase?.kind === 'cloud' && knowledge.consent?.status === 'granted' ? '已同步' : '关键词检索' }}</p>
+            <p class="muted">检索：{{ knowledgeRetrievalStatus }}</p>
           </section>
           <section>
             <span class="af-panel-heading">不可变版本</span>
@@ -41,7 +41,8 @@
           </section>
           <section v-if="knowledge.selectedDocument.status === 'failed'" class="knowledge-error-detail">
             <span class="af-panel-heading">可操作错误</span>
-            <p>处理失败。原有已就绪版本仍可用；可替换文件重试，或移入回收站。</p>
+            <p v-if="hasReadyVersion">新版本处理失败，原有已就绪版本仍可用；可替换文件重试，或移入回收站。</p>
+            <p v-else>处理失败，当前没有可检索的已就绪版本；可替换文件重试，或移入回收站。</p>
           </section>
           <section v-if="knowledge.operationError" class="knowledge-error-detail" role="alert">
             <span class="af-panel-heading">操作失败</span><p>{{ knowledge.operationError }}</p>
@@ -222,6 +223,15 @@ const knowledgeDocumentStatus = computed(() => ({
   queued: '排队中', copying: '复制中', uploading: '上传中', parsing: '解析中', indexing: '索引中',
   ready: '已就绪', failed: '处理失败', paused: '已暂停', deleted: '已删除',
 })[knowledge.selectedDocument?.status ?? 'ready'])
+const hasReadyVersion = computed(() => knowledge.versions.some(({ status }) => status === 'ready'))
+const knowledgeRetrievalStatus = computed(() => {
+  const base = knowledge.selectedBase
+  if (!base) return '不可用'
+  if (base.kind === 'local') return '仅本地关键词检索'
+  if (base.status === 'processing') return '同步中，仅已发布版本可用'
+  if (base.status === 'paused') return '同步已暂停，仅已发布版本可用'
+  return knowledge.consent?.status === 'granted' ? '已同步' : '关键词检索'
+})
 const versionStatusLabel = (status: string) => ({ staging: '处理中', ready: '已就绪', failed: '失败', retired: '已退役' })[status] ?? status
 const isCancellable = computed(() => execution.selectedDetail && ['queued', 'awaiting_approval', 'running'].includes(execution.selectedDetail.status))
 const statusLabel = (status: string) => ({ queued: '排队中', awaiting_approval: '等待授权', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[status] ?? status

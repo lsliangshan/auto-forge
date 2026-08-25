@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, type AuthOtpRequest, type AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
+import { useKnowledgeStore } from './knowledge'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -53,6 +54,12 @@ function finishRestoring(store: { restoring: boolean }): void {
   store.restoring = count > 0
 }
 
+function resetOwnerScopedStores(previous: AuthSession | null, next: AuthSession | null, force = false): void {
+  if (!force && previous?.user.id === next?.user.id) return
+  useChatStore().resetLocalData()
+  useKnowledgeStore().reset()
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     session: null as AuthSession | null,
@@ -79,10 +86,12 @@ export const useAuthStore = defineStore('auth', {
         try {
           const session = await getDesktopApi().auth.getSession()
           if (generation !== sessionGeneration(this)) return
+          resetOwnerScopedStores(this.session, session)
           this.session = session
           this.initialized = true
         } catch (error) {
           if (generation !== sessionGeneration(this)) return
+          resetOwnerScopedStores(this.session, null, true)
           this.session = null
           this.initialized = true
           this.error = displayError(error, '登录状态恢复失败')
@@ -151,6 +160,7 @@ export const useAuthStore = defineStore('auth', {
             await getDesktopApi().auth.logout()
           } catch {
             if (cleanupOwner === sessionGeneration(this)) {
+              resetOwnerScopedStores(this.session, session)
               this.session = session
               this.initialized = true
               this.error = '退出登录失败'
@@ -158,11 +168,13 @@ export const useAuthStore = defineStore('auth', {
             return undefined
           }
           nextSessionGeneration(this)
+          resetOwnerScopedStores(this.session, null, true)
           this.session = null
           this.initialized = true
           this.error = ''
           return undefined
         }
+        resetOwnerScopedStores(this.session, session)
         this.session = session
         this.initialized = true
         return session
@@ -202,6 +214,7 @@ export const useAuthStore = defineStore('auth', {
       try {
         const session = await getDesktopApi().auth.loginWithPassword(credentials)
         if (sessionOwner !== sessionGeneration(this)) return undefined
+        resetOwnerScopedStores(this.session, session)
         this.session = session
         this.initialized = true
         return session
@@ -222,10 +235,10 @@ export const useAuthStore = defineStore('auth', {
       try {
         await getDesktopApi().auth.logout()
         nextSessionGeneration(this)
+        resetOwnerScopedStores(this.session, null, true)
         this.session = null
         this.initialized = true
         this.error = ''
-        useChatStore().resetLocalData()
         return true
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {

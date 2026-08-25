@@ -279,13 +279,34 @@ describe('KnowledgeService lifecycle', () => {
     await app.service.close()
   })
 
-  it('treats an expired member entitlement as non-member for local write limits', async () => {
+  it('rejects local creation when the current member entitlement is expired', async () => {
     const app = await fixture({
       entitlement: { tier: 'member', status: 'expired', betaEnabled: true, cloudEnabled: false },
     })
     const owner = { userId: 'alice' }
     await app.service.listBases(owner)
-    await expect(app.service.createBase(owner, 'Second')).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(app.service.createBase(owner, 'Second')).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await app.service.close()
+  })
+
+  it('enforces current entitlement on create, import, and replace while retaining expired-user export and recycle', async () => {
+    const entitlement: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+    }
+    const app = await fixture({ entitlement })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'retained.txt', '仍可导出的已就绪内容'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    entitlement.status = 'expired'
+
+    await expect(app.service.createBase(owner, 'Forbidden')).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(app.service.importDocument(owner, base!.id)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(app.service.replaceDocument(owner, imported!.id)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    app.exports.push(join(app.rootDirectory, 'retained.zip'))
+    await expect(app.service.exportBase(owner, base!.id)).resolves.toBeUndefined()
+    await expect(app.service.recycleDocument(owner, imported!.id)).resolves.toBeUndefined()
     await app.service.close()
   })
 

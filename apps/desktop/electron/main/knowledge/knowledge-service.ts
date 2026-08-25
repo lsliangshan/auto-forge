@@ -251,6 +251,7 @@ export class KnowledgeService implements KnowledgePersistence {
   }
 
   async createBase(owner: KnowledgeOwner, rawName: string): Promise<KnowledgeBase> {
+    await this.requireLocalWriteAccess(owner)
     const session = await this.ensureSession(owner)
     const name = rawName.trim()
     if (!name || name.length > 200) failure('INVALID_INPUT')
@@ -306,12 +307,14 @@ export class KnowledgeService implements KnowledgePersistence {
   }
 
   async importDocument(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument | undefined> {
+    await this.requireLocalWriteAccess(owner)
     const session = await this.ensureSession(owner)
     this.requireBase(session, knowledgeBaseId, true)
     return this.track(this.performImport(session, owner, { knowledgeBaseId }))
   }
 
   async replaceDocument(owner: KnowledgeOwner, documentId: string): Promise<KnowledgeDocument | undefined> {
+    await this.requireLocalWriteAccess(owner)
     const session = await this.ensureSession(owner)
     const document = this.requireDocument(session, documentId, true)
     return this.track(this.performImport(session, owner, {
@@ -321,6 +324,7 @@ export class KnowledgeService implements KnowledgePersistence {
   }
 
   async recycleDocument(owner: KnowledgeOwner, documentId: string): Promise<void> {
+    await this.requireLocalScopeAvailable()
     const session = await this.ensureSession(owner)
     await this.mutate(session, () => {
       const document = this.requireDocument(session, documentId)
@@ -346,6 +350,7 @@ export class KnowledgeService implements KnowledgePersistence {
   }
 
   async recycleBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void> {
+    await this.requireLocalScopeAvailable()
     const session = await this.ensureSession(owner)
     await this.mutate(session, () => {
       this.requireBase(session, knowledgeBaseId)
@@ -588,6 +593,16 @@ export class KnowledgeService implements KnowledgePersistence {
       || (this.options.arch ?? process.arch) !== 'arm64') reasons.push('packaging_unverified')
     if (!await this.options.safeStorage.isAvailable()) reasons.push('safe_storage_unavailable')
     return reasons
+  }
+
+  private async requireLocalScopeAvailable(): Promise<void> {
+    if ((await this.preflightAvailability()).length > 0) failure('SERVICE_UNAVAILABLE')
+  }
+
+  private async requireLocalWriteAccess(owner: KnowledgeOwner): Promise<void> {
+    await this.requireLocalScopeAvailable()
+    const entitlement = await this.getEntitlement(owner)
+    if (!['active', 'offline_grace'].includes(entitlement.status)) failure('FORBIDDEN')
   }
 
   private ensureDefaultBase(session: OpenKnowledgeSession): void {

@@ -6,7 +6,7 @@
       <small v-else-if="knowledge.entitlement?.status === 'unavailable'">权益不可用</small>
       <small v-else>{{ selection.knowledgeBaseIds.length ? `已选 ${selection.knowledgeBaseIds.length} 个` : '未选择' }}</small>
     </div>
-    <div class="knowledge-options" aria-label="当前会话知识库">
+    <div class="knowledge-options" role="group" aria-label="当前会话知识库">
       <button
         v-for="choice in choices"
         :key="choice.base.id"
@@ -25,7 +25,7 @@
         {{ knowledge.availability && !knowledge.availability.local.available ? '不可用' : '暂无知识库' }}
       </span>
     </div>
-    <div class="knowledge-modes" aria-label="知识库回答模式">
+    <div class="knowledge-modes" role="radiogroup" aria-label="知识库回答模式">
       <button
         type="button"
         role="radio"
@@ -64,21 +64,34 @@ type Choice = { base: KnowledgeBase; label: string; disabled: boolean }
 
 function choiceFor(base: KnowledgeBase, missing = false): Choice {
   if (missing) return { base, label: '已删除或不可用', disabled: true }
-  if (base.status === 'processing') return { base, label: '同步中', disabled: true }
-  if (base.status === 'read_only') return { base, label: '只读', disabled: true }
-  if (base.status === 'failed') return { base, label: '不可用 · 处理失败', disabled: true }
-  if (base.status === 'paused') return { base, label: '不可用 · 已暂停', disabled: true }
   if (base.status === 'recycled') return { base, label: '已删除或不可用', disabled: true }
-  if (base.kind === 'local') {
-    if (!knowledge.availability?.local.available) return { base, label: '不可用', disabled: true }
-    return { base, label: '仅本地 · 关键词检索', disabled: false }
-  }
-  if (!knowledge.availability?.cloud.available || !knowledge.entitlement?.cloudEnabled) {
+  const scopeUsable = base.kind === 'local'
+    ? knowledge.availability?.local.available
+    : knowledge.availability?.cloud.available && knowledge.entitlement?.cloudEnabled
+  if (!scopeUsable) {
     return { base, label: '不可用', disabled: true }
   }
-  if (knowledge.entitlement.status === 'expired') {
-    return { base, label: '已同步 · 会员已过期', disabled: true }
+  if (!knowledge.entitlement
+    || !['active', 'offline_grace'].includes(knowledge.entitlement.status)) {
+    const reason = knowledge.entitlement?.status === 'expired' ? '会员已过期' : '权益不可用'
+    const state = base.status === 'processing'
+      ? '同步中 · '
+      : base.status === 'read_only'
+        ? '只读 · '
+        : base.status === 'failed'
+          ? '处理失败 · '
+          : base.status === 'paused'
+            ? '同步已暂停 · '
+            : base.kind === 'cloud' ? '已同步 · ' : ''
+    return { base, label: `${state}${reason}`, disabled: true }
   }
+  if (base.status === 'read_only') return { base, label: '只读 · 可检索', disabled: false }
+  if (base.status === 'failed') return { base, label: '处理失败 · 仅已就绪版本可用', disabled: false }
+  if (base.status === 'paused') return { base, label: '同步已暂停 · 仅已就绪版本可用', disabled: false }
+  if (base.status === 'processing') {
+    return { base, label: `${base.kind === 'cloud' ? '同步中' : '本地处理中'} · 仅已就绪版本可用`, disabled: false }
+  }
+  if (base.kind === 'local') return { base, label: '仅本地 · 关键词检索', disabled: false }
   return {
     base,
     label: knowledge.consent?.status === 'granted' ? '已同步' : '已同步 · 关键词检索',

@@ -90,7 +90,7 @@
         <el-button
           data-testid="knowledge-create"
           :icon="Plus"
-          :disabled="!knowledgeBaseName.trim() || knowledge.operationPending"
+          :disabled="!knowledgeBaseName.trim() || !knowledge.canCreateBase || knowledge.operationPending"
           @click="createKnowledgeBase"
         >创建</el-button>
       </div>
@@ -99,10 +99,13 @@
       <div v-else-if="!knowledge.bases.length" class="sidebar-state">
         尚无可用知识库
       </div>
-      <ul v-else class="context-list af-scrollbar" aria-label="知识库列表">
+      <ul v-else class="context-list af-scrollbar" aria-label="知识库列表" role="listbox">
         <li v-for="base in knowledge.bases" :key="base.id">
           <button
+            :data-testid="`knowledge-base-${base.id}`"
             type="button"
+            role="option"
+            :aria-selected="knowledge.selectedBaseId === base.id"
             :class="['knowledge-base-row', { active: knowledge.selectedBaseId === base.id }]"
             @click="knowledge.selectBase(base.id)"
           >
@@ -112,8 +115,15 @@
         </li>
       </ul>
       <div v-if="knowledge.selectedBase" class="knowledge-base-actions">
-        <el-button size="small" @click="knowledge.exportSelectedBase">导出</el-button>
-        <el-button size="small" type="danger" plain @click="knowledge.recycleSelectedBase">回收</el-button>
+        <el-button size="small" :disabled="!knowledge.canExport || knowledge.operationPending" @click="knowledge.exportSelectedBase">导出</el-button>
+        <el-button
+          data-testid="knowledge-recycle-base"
+          size="small"
+          type="danger"
+          plain
+          :disabled="!knowledge.canRecycle || knowledge.operationPending"
+          @click="recycleKnowledgeBase"
+        >回收</el-button>
       </div>
     </template>
 
@@ -286,6 +296,16 @@ async function createKnowledgeBase() {
   if (!name) return
   await knowledge.createBase(name)
   if (!knowledge.operationError) knowledgeBaseName.value = ''
+}
+async function recycleKnowledgeBase() {
+  const base = knowledge.selectedBase
+  if (!base) return
+  try {
+    await ElMessageBox.confirm(`确认将知识库“${base.name}”及其文件移入回收站？`, '回收知识库', {
+      type: 'warning', confirmButtonText: '确认回收', cancelButtonText: '取消',
+    })
+    await knowledge.recycleSelectedBase()
+  } catch { /* Cancellation does not mutate knowledge state. */ }
 }
 const conversationSearch = ref('')
 const conversationGroups = computed(() => {

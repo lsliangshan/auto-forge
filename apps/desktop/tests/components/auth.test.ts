@@ -9,6 +9,7 @@ import AppRail from '../../src/components/AppRail.vue'
 import { createAuthGuard, routes, safeRedirect } from '../../src/router'
 import { useAuthStore } from '../../src/stores/auth'
 import { useChatStore } from '../../src/stores/chat'
+import { useKnowledgeStore } from '../../src/stores/knowledge'
 
 const authSession: AuthSession = {
   user: { id: 'user_1', account: 'Alice' },
@@ -452,11 +453,12 @@ describe('authentication store', () => {
     expect(auth.error).toBe('操作失败，请稍后重试')
   })
 
-  it('clears the previous user chat state after logout succeeds', async () => {
+  it('clears every previous-owner chat and knowledge field after logout succeeds', async () => {
     const api = createApi()
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const auth = useAuthStore()
     const chat = useChatStore()
+    const knowledge = useKnowledgeStore()
     auth.session = authSession
     chat.conversations = [{
       id: 'conversation_alice',
@@ -466,12 +468,50 @@ describe('authentication store', () => {
     }]
     chat.selectedConversationId = 'conversation_alice'
     chat.messagesByConversation.conversation_alice = []
+    knowledge.bases = [{
+      id: 'alice_base', name: 'Alice private', kind: 'local', status: 'ready',
+      documentCount: 1, updatedAt: '2026-08-21T00:00:00.000Z',
+    }]
+    knowledge.documentsByBase.alice_base = []
+    knowledge.versionsByDocument.alice_document = []
+    knowledge.selectedBaseId = 'alice_base'
+    knowledge.selectedDocumentId = 'alice_document'
+    knowledge.availability = {
+      local: { available: true, reasons: [] },
+      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+    }
+    knowledge.loading = true
+    knowledge.operationError = 'old owner error'
 
     await expect(auth.logout()).resolves.toBe(true)
 
     expect(chat.conversations).toEqual([])
     expect(chat.selectedConversationId).toBe('')
     expect(chat.messagesByConversation).toEqual({})
+    expect(knowledge.$state).toMatchObject({
+      bases: [], documentsByBase: {}, versionsByDocument: {},
+      selectedBaseId: '', selectedDocumentId: '', availability: undefined,
+      loading: false, operationError: '',
+    })
+  })
+
+  it('invalidates prior-owner knowledge state when a different account login succeeds', async () => {
+    const api = createApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const knowledge = useKnowledgeStore()
+    auth.session = { ...authSession, user: { id: 'old_user', account: 'Old' } }
+    knowledge.bases = [{
+      id: 'old_base', name: 'Old private', kind: 'local', status: 'ready',
+      documentCount: 0, updatedAt: '2026-08-21T00:00:00.000Z',
+    }]
+    knowledge.selectedBaseId = 'old_base'
+
+    await auth.loginWithPassword({ account: 'Alice', password: 'password' })
+
+    expect(auth.session).toEqual(authSession)
+    expect(knowledge.bases).toEqual([])
+    expect(knowledge.selectedBaseId).toBe('')
   })
 
   it('clears the session after a pending logout succeeds despite a later OTP cancellation', async () => {

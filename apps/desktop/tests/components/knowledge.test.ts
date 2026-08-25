@@ -1,6 +1,7 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import ElementPlus from 'element-plus'
+import { ElMessageBox } from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import type {
@@ -33,6 +34,16 @@ const free: KnowledgeEntitlementState = {
   tier: 'free', status: 'active', betaEnabled: true, cloudEnabled: false,
 }
 const emptySelection: KnowledgeSelection = { knowledgeBaseIds: [], knowledgeMode: 'mixed' }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
 
 function createApi(input: {
   bases?: KnowledgeBase[]
@@ -140,6 +151,47 @@ afterEach(() => {
 })
 
 describe('knowledge Store boundary', () => {
+  it('clears every owner-scoped field and rejects stale catalog, document, version, and import responses', async () => {
+    const api = createApi()
+    const catalog = deferred<KnowledgeBase[]>()
+    const documents = deferred<KnowledgeDocument[]>()
+    const versions = deferred<Awaited<ReturnType<DesktopAPI['knowledge']['listVersions']>>>()
+    const acknowledgement = deferred<KnowledgeDocument | undefined>()
+    vi.mocked(api.knowledge.listBases).mockReturnValue(catalog.promise)
+    vi.mocked(api.knowledge.listDocuments).mockReturnValue(documents.promise)
+    vi.mocked(api.knowledge.listVersions).mockReturnValue(versions.promise)
+    vi.mocked(api.knowledge.importDocument).mockReturnValue(acknowledgement.promise)
+    installApi(api)
+    const knowledge = useKnowledgeStore()
+    knowledge.bases = [localBase]
+    knowledge.selectedBaseId = localBase.id
+    knowledge.selectedDocumentId = readyDocument.id
+    knowledge.documentsByBase = { [localBase.id]: [readyDocument] }
+    knowledge.versionsByDocument = { [readyDocument.id]: [] }
+    knowledge.availability = available
+    knowledge.entitlement = free
+    knowledge.consent = { provider: 'openrouter', status: 'denied' }
+
+    const loadingCatalog = knowledge.refreshCatalog()
+    const loadingDocuments = knowledge.loadDocuments(localBase.id)
+    const loadingVersions = knowledge.loadVersions(readyDocument.id)
+    const importing = knowledge.importDocument()
+    knowledge.reset()
+    catalog.resolve([{ ...localBase, id: 'old_owner_base' }])
+    documents.resolve([{ ...readyDocument, id: 'old_owner_document' }])
+    versions.resolve([{ id: 'old_owner_version', documentId: readyDocument.id, number: 1, status: 'ready', createdAt: at }])
+    acknowledgement.resolve({ ...readyDocument, id: 'old_owner_ack' })
+    await Promise.all([loadingCatalog, loadingDocuments, loadingVersions, importing])
+
+    expect(knowledge.$state).toMatchObject({
+      bases: [], documentsByBase: {}, versionsByDocument: {},
+      selectedBaseId: '', selectedDocumentId: '',
+      availability: undefined, entitlement: undefined, consent: undefined,
+      loading: false, documentsLoading: false, versionsLoading: false,
+      operationPending: false, error: '', operationError: '',
+    })
+  })
+
   it('fails closed before listing private bases when local storage is unavailable', async () => {
     const api = createApi({
       featureAvailability: {
@@ -202,6 +254,78 @@ describe('knowledge Store boundary', () => {
     expect(knowledge.documentsByBase[secondBase.id]?.[0]?.status).toBe('ready')
   })
 
+  it('polls processing state single-flight and stops after bounded exponential-backoff failures', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    vi.mocked(api.knowledge.listDocuments).mockRejectedValue(new Error('offline'))
+    installApi(api)
+    const knowledge = useKnowledgeStore()
+    knowledge.bases = [localBase]
+    knowledge.selectedBaseId = localBase.id
+    knowledge.documentsByBase = {
+      [localBase.id]: [{ ...readyDocument, status: 'parsing' }],
+    }
+
+    knowledge.startProcessingPolling()
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    expect(api.knowledge.listDocuments).toHaveBeenCalledTimes(3)
+    expect(knowledge.pollingError).toContain('自动刷新已暂停')
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(api.knowledge.listDocuments).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not overlap a slow processing refresh and cancels it on owner reset', async () => {
+    vi.useFakeTimers()
+    const api = createApi()
+    const documents = deferred<KnowledgeDocument[]>()
+    vi.mocked(api.knowledge.listDocuments).mockReturnValue(documents.promise)
+    installApi(api)
+    const knowledge = useKnowledgeStore()
+    knowledge.bases = [localBase]
+    knowledge.selectedBaseId = localBase.id
+    knowledge.documentsByBase = {
+      [localBase.id]: [{ ...readyDocument, status: 'parsing' }],
+    }
+
+    knowledge.startProcessingPolling()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(api.knowledge.listDocuments).toHaveBeenCalledOnce()
+
+    knowledge.reset()
+    documents.resolve([{ ...readyDocument, status: 'ready' }])
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(api.knowledge.listDocuments).toHaveBeenCalledOnce()
+    expect(knowledge.documentsByBase).toEqual({})
+  })
+
+  it('keeps the current base loading state and error isolated from an older base request', async () => {
+    const secondBase = { ...localBase, id: 'kb_second', name: '第二知识库' }
+    const first = deferred<KnowledgeDocument[]>()
+    const second = deferred<KnowledgeDocument[]>()
+    const api = createApi({ bases: [localBase, secondBase] })
+    vi.mocked(api.knowledge.listDocuments).mockImplementation((baseId) => (
+      baseId === localBase.id ? first.promise : second.promise
+    ))
+    installApi(api)
+    const knowledge = useKnowledgeStore()
+    knowledge.bases = [localBase, secondBase]
+    knowledge.selectedBaseId = localBase.id
+    const firstLoad = knowledge.loadDocuments(localBase.id)
+    knowledge.selectedBaseId = secondBase.id
+    const secondLoad = knowledge.loadDocuments(secondBase.id)
+
+    first.reject(new Error('old base failed'))
+    await firstLoad
+
+    expect(knowledge.documentsLoading).toBe(true)
+    expect(knowledge.operationError).toBe('')
+    second.resolve([])
+    await secondLoad
+    expect(knowledge.documentsLoading).toBe(false)
+  })
+
   it('keeps replacement errors actionable without replacing the ready document locally', async () => {
     const api = createApi()
     vi.mocked(api.knowledge.replaceDocument).mockRejectedValue(new Error('parser details'))
@@ -227,6 +351,21 @@ describe('knowledge Store boundary', () => {
     expect(wrapper.get('[data-testid="knowledge-import"]').attributes('disabled')).toBeDefined()
     expect(api.knowledge.importDocument).not.toHaveBeenCalled()
   })
+
+  it('disables local create/import/replace after entitlement expiry while retaining export and recycle', async () => {
+    const api = createApi({
+      entitlement: { tier: 'member', status: 'expired', betaEnabled: true, cloudEnabled: false },
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-create"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-import"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-replace"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-export"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="knowledge-recycle-document"]').attributes('disabled')).toBeUndefined()
+  })
 })
 
 describe('knowledge three-pane workspace', () => {
@@ -249,6 +388,29 @@ describe('knowledge three-pane workspace', () => {
 
     expect(api.knowledge.createBase).toHaveBeenCalledWith('项目资料')
     expect(wrapper.get('[aria-label="知识库列表"]').text()).toContain('项目资料')
+  })
+
+  it('requires explicit confirmation before recycling a document or library', async () => {
+    const { api, wrapper } = await mountKnowledge()
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    vi.spyOn(ElMessageBox, 'confirm').mockRejectedValueOnce(new Error('cancelled'))
+
+    await wrapper.get('[data-testid="knowledge-recycle-document"]').trigger('click')
+    await flushPromises()
+    expect(api.knowledge.recycleDocument).not.toHaveBeenCalled()
+
+    vi.mocked(ElMessageBox.confirm).mockResolvedValueOnce('confirm')
+    await wrapper.get('[data-testid="knowledge-recycle-document"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="knowledge-document-document_1"]').exists()).toBe(false)
+  })
+
+  it('exposes labeled listbox selection and non-blocking background refresh state', async () => {
+    const { wrapper } = await mountKnowledge()
+
+    expect(wrapper.get('[aria-label="知识库列表"]').attributes('role')).toBe('listbox')
+    expect(wrapper.get('[data-testid="knowledge-base-kb_local"]').attributes('aria-selected')).toBe('true')
+    expect(wrapper.get('[aria-label="知识库文件"]').attributes('aria-busy')).toBe('false')
   })
 })
 
@@ -296,6 +458,104 @@ describe('conversation knowledge preferences', () => {
     expect(wrapper.get('[data-testid="knowledge-base-kb_syncing"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="knowledge-base-kb_readonly"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="knowledge-base-kb_deleted"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('keeps syncing, paused, failed-ready-version, and read-only libraries selectable when their scope is usable', async () => {
+    const bases: KnowledgeBase[] = [
+      { ...localBase, id: 'kb_processing', name: '本地处理中', status: 'processing' },
+      { ...localBase, id: 'kb_failed', name: '部分失败', status: 'failed' },
+      { ...localBase, id: 'kb_paused', name: '同步暂停', kind: 'cloud', status: 'paused' },
+      { ...localBase, id: 'kb_readonly', name: '只读资料', status: 'read_only' },
+    ]
+    const api = createApi({
+      bases,
+      featureAvailability: { local: { available: true, reasons: [] }, cloud: { available: true, reasons: [] } },
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true },
+    })
+    const { wrapper } = await mountComposer(api)
+
+    for (const id of ['kb_processing', 'kb_failed', 'kb_paused', 'kb_readonly']) {
+      expect(wrapper.get(`[data-testid="knowledge-base-${id}"]`).attributes('disabled')).toBeUndefined()
+    }
+    expect(wrapper.text()).toContain('已就绪版本可用')
+    expect(wrapper.text()).toContain('只读 · 可检索')
+  })
+
+  it('reloads authoritative Main selection after a failed save', async () => {
+    const authoritative = { knowledgeBaseIds: ['kb_local'], knowledgeMode: 'strict' } as const
+    const api = createApi({ selection: authoritative })
+    vi.mocked(api.knowledge.updateConversationSelection).mockRejectedValue(new Error('write failed'))
+    vi.mocked(api.knowledge.getConversationSelection).mockResolvedValue(authoritative)
+    const { chat, wrapper } = await mountComposer(api)
+
+    await wrapper.get('[data-testid="knowledge-mode-mixed"]').trigger('click')
+    await flushPromises()
+
+    expect(chat.knowledgeSelection).toEqual(authoritative)
+    expect(chat.knowledgeSelectionError).toBe('知识库选择保存失败')
+  })
+
+  it('does not let an older failed save overwrite the latest successful preference or its cleared error', async () => {
+    const firstSave = deferred<KnowledgeSelection>()
+    const api = createApi({ selection: emptySelection })
+    vi.mocked(api.knowledge.updateConversationSelection)
+      .mockReturnValueOnce(firstSave.promise)
+      .mockImplementationOnce(async (_conversationId, selection) => selection)
+    const { chat, wrapper } = await mountComposer(api)
+
+    await wrapper.get('[data-testid="knowledge-mode-strict"]').trigger('click')
+    await wrapper.get('[data-testid="knowledge-mode-mixed"]').trigger('click')
+    firstSave.reject(new Error('old failure'))
+    await flushPromises()
+
+    expect(chat.knowledgeSelection).toEqual(emptySelection)
+    expect(chat.knowledgeSelectionError).toBe('')
+  })
+
+  it('reconciles a failed save for a conversation that is no longer selected without leaking its error', async () => {
+    const failedSave = deferred<KnowledgeSelection>()
+    const authoritative = { knowledgeBaseIds: ['kb_local'], knowledgeMode: 'strict' } as const
+    const api = createApi({ selection: authoritative })
+    vi.mocked(api.knowledge.updateConversationSelection).mockReturnValue(failedSave.promise)
+    vi.mocked(api.knowledge.getConversationSelection).mockResolvedValue(authoritative)
+    installApi(api)
+    const chat = useChatStore()
+    chat.selectedConversationId = 'conversation_1'
+    chat.knowledgeSelectionsByConversation.conversation_1 = authoritative
+    const saving = chat.updateKnowledgeSelection('conversation_1', {
+      knowledgeBaseIds: ['kb_local'], knowledgeMode: 'mixed',
+    })
+    chat.selectedConversationId = 'conversation_2'
+
+    failedSave.reject(new Error('write failed'))
+    await saving
+
+    expect(chat.knowledgeSelectionsByConversation.conversation_1).toEqual(authoritative)
+    expect(chat.knowledgeSelectionError).toBe('')
+  })
+
+  it('does not serialize a new owner preference save behind the previous owner queue', async () => {
+    const oldSave = deferred<KnowledgeSelection>()
+    const api = createApi()
+    vi.mocked(api.knowledge.updateConversationSelection)
+      .mockReturnValueOnce(oldSave.promise)
+      .mockImplementationOnce(async (_conversationId, selection) => selection)
+    installApi(api)
+    const chat = useChatStore()
+    chat.selectedConversationId = 'same_conversation_id'
+    const stale = chat.updateKnowledgeSelection('same_conversation_id', {
+      knowledgeBaseIds: ['kb_local'], knowledgeMode: 'strict',
+    })
+
+    chat.resetLocalData()
+    chat.selectedConversationId = 'same_conversation_id'
+    const current = chat.updateKnowledgeSelection('same_conversation_id', emptySelection)
+    await flushPromises()
+
+    expect(api.knowledge.updateConversationSelection).toHaveBeenCalledTimes(2)
+    oldSave.resolve({ knowledgeBaseIds: ['kb_local'], knowledgeMode: 'strict' })
+    await Promise.all([stale, current])
+    expect(chat.knowledgeSelection).toEqual(emptySelection)
   })
 
   it('initializes a new conversation with no inherited knowledge bases and mixed mode', async () => {

@@ -12,6 +12,30 @@ import { displayError, getDesktopApi } from '../services/desktop-api'
 const processingDocumentStatuses = new Set<KnowledgeDocument['status']>([
   'queued', 'copying', 'uploading', 'parsing', 'indexing',
 ])
+const POLL_INTERVAL_MS = 1_500
+const MAX_POLL_FAILURES = 3
+
+interface PollController {
+  failures: number
+  ownerEpoch: number
+  timer?: ReturnType<typeof globalThis.setTimeout>
+}
+
+const pollingControllers = new WeakMap<object, PollController>()
+
+function entitlementAllowsWrite(entitlement: KnowledgeEntitlementState | undefined): boolean {
+  return Boolean(entitlement && ['active', 'offline_grace'].includes(entitlement.status))
+}
+
+function scopeAvailable(
+  base: KnowledgeBase | undefined,
+  availability: KnowledgeFeatureAvailability | undefined,
+  entitlement: KnowledgeEntitlementState | undefined,
+): boolean {
+  if (!base || base.status === 'recycled') return false
+  if (base.kind === 'local') return Boolean(availability?.local.available)
+  return Boolean(availability?.cloud.available && entitlement?.cloudEnabled)
+}
 
 export const useKnowledgeStore = defineStore('knowledge', {
   state: () => ({
@@ -29,9 +53,15 @@ export const useKnowledgeStore = defineStore('knowledge', {
     operationPending: false,
     error: '',
     operationError: '',
-    _loadVersion: 0,
+    pollingError: '',
+    _ownerEpoch: 0,
+    _catalogVersion: 0,
     _documentLoadVersions: {} as Record<string, number>,
-    _versionLoadVersion: 0,
+    _versionLoadVersions: {} as Record<string, number>,
+    _documentsLoadingVersion: 0,
+    _versionsLoadingVersion: 0,
+    _operationVersion: 0,
+    _refreshVersion: 0,
   }),
   getters: {
     selectedBase(state): KnowledgeBase | undefined {
@@ -51,22 +81,35 @@ export const useKnowledgeStore = defineStore('knowledge', {
       return Object.values(state.documentsByBase).some((documents) =>
         documents.some(({ status }) => processingDocumentStatuses.has(status)))
     },
+    canCreateBase(state): boolean {
+      return Boolean(state.availability?.local.available && entitlementAllowsWrite(state.entitlement))
+    },
     canWrite(state): boolean {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
       if (!base || base.status === 'read_only' || base.status === 'recycled') return false
-      if (base.kind === 'local') return Boolean(state.availability?.local.available)
-      return Boolean(
-        state.availability?.cloud.available
-        && state.entitlement?.cloudEnabled
-        && ['active', 'offline_grace'].includes(state.entitlement.status),
-      )
+      return scopeAvailable(base, state.availability, state.entitlement)
+        && entitlementAllowsWrite(state.entitlement)
+    },
+    canRecycle(state): boolean {
+      const base = state.bases.find(({ id }) => id === state.selectedBaseId)
+      return scopeAvailable(base, state.availability, state.entitlement)
+    },
+    canExport(state): boolean {
+      const base = state.bases.find(({ id }) => id === state.selectedBaseId)
+      return scopeAvailable(base, state.availability, state.entitlement)
     },
   },
   actions: {
     reset() {
-      this._loadVersion += 1
+      this.stopProcessingPolling()
+      this._ownerEpoch += 1
+      this._catalogVersion += 1
       this._documentLoadVersions = {}
-      this._versionLoadVersion += 1
+      this._versionLoadVersions = {}
+      this._documentsLoadingVersion += 1
+      this._versionsLoadingVersion += 1
+      this._operationVersion += 1
+      this._refreshVersion += 1
       this.bases = []
       this.documentsByBase = {}
       this.versionsByDocument = {}
@@ -81,21 +124,23 @@ export const useKnowledgeStore = defineStore('knowledge', {
       this.operationPending = false
       this.error = ''
       this.operationError = ''
+      this.pollingError = ''
     },
     async load() {
-      const version = ++this._loadVersion
+      const ownerEpoch = this._ownerEpoch
+      const version = ++this._catalogVersion
       this.loading = true
       this.error = ''
       try {
         const api = getDesktopApi().knowledge
         const availability = await api.getFeatureAvailability()
-        if (version !== this._loadVersion) return
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.availability = availability
         const [entitlement, consent] = await Promise.all([
           api.getEntitlement(),
           api.getConsent(),
         ])
-        if (version !== this._loadVersion) return
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.entitlement = entitlement
         this.consent = consent
         if (!availability.local.available && !availability.cloud.available) {
@@ -106,7 +151,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
           return
         }
         const bases = await api.listBases()
-        if (version !== this._loadVersion) return
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.bases = bases
         if (!bases.some(({ id }) => id === this.selectedBaseId)) {
           this.selectedBaseId = bases[0]?.id ?? ''
@@ -114,34 +159,48 @@ export const useKnowledgeStore = defineStore('knowledge', {
         }
         if (this.selectedBaseId) await this.loadDocuments(this.selectedBaseId)
       } catch (error) {
-        if (version === this._loadVersion) this.error = displayError(error, '知识库加载失败')
+        if (ownerEpoch === this._ownerEpoch && version === this._catalogVersion) {
+          this.error = displayError(error, '知识库加载失败')
+        }
       } finally {
-        if (version === this._loadVersion) this.loading = false
+        if (ownerEpoch === this._ownerEpoch && version === this._catalogVersion) this.loading = false
       }
     },
     async loadSelectorCatalog() {
+      const ownerEpoch = this._ownerEpoch
+      const version = ++this._catalogVersion
       try {
         const api = getDesktopApi().knowledge
         const availability = await api.getFeatureAvailability()
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.availability = availability
         const [entitlement, consent] = await Promise.all([
           api.getEntitlement(),
           api.getConsent(),
         ])
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.entitlement = entitlement
         this.consent = consent
         if (!availability.local.available && !availability.cloud.available) {
           this.bases = []
           return
         }
-        this.bases = await api.listBases()
+        const bases = await api.listBases()
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
+        this.bases = bases
+        this.operationError = ''
       } catch (error) {
-        this.operationError = displayError(error, '知识库选项加载失败')
-        this.bases = []
+        if (ownerEpoch === this._ownerEpoch && version === this._catalogVersion) {
+          this.operationError = displayError(error, '知识库选项加载失败')
+          this.bases = []
+        }
       }
     },
     async refreshCatalog() {
+      const ownerEpoch = this._ownerEpoch
+      const version = ++this._catalogVersion
       const bases = await getDesktopApi().knowledge.listBases()
+      if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
       this.bases = bases
       if (!bases.some(({ id }) => id === this.selectedBaseId)) {
         this.selectedBaseId = bases[0]?.id ?? ''
@@ -155,55 +214,80 @@ export const useKnowledgeStore = defineStore('knowledge', {
       this.selectedDocumentId = ''
       await this.loadDocuments(id)
     },
-    async loadDocuments(requestedKnowledgeBaseId?: string) {
+    async loadDocuments(requestedKnowledgeBaseId?: string, background = false) {
       const knowledgeBaseId = requestedKnowledgeBaseId ?? this.selectedBaseId
       if (!knowledgeBaseId) return
+      const ownerEpoch = this._ownerEpoch
       const version = (this._documentLoadVersions[knowledgeBaseId] ?? 0) + 1
       this._documentLoadVersions[knowledgeBaseId] = version
-      this.documentsLoading = true
+      const visible = !background && this.selectedBaseId === knowledgeBaseId
+      const loadingVersion = visible ? ++this._documentsLoadingVersion : 0
+      if (visible) this.documentsLoading = true
       try {
         const documents = await getDesktopApi().knowledge.listDocuments(knowledgeBaseId)
-        if (version !== this._documentLoadVersions[knowledgeBaseId]) return
+        if (ownerEpoch !== this._ownerEpoch
+          || version !== this._documentLoadVersions[knowledgeBaseId]) return
         this.documentsByBase[knowledgeBaseId] = documents
         if (this.selectedBaseId === knowledgeBaseId
           && !documents.some(({ id }) => id === this.selectedDocumentId)) {
           this.selectedDocumentId = ''
         }
+        if (!background && visible) this.operationError = ''
+        return true
       } catch (error) {
-        if (version === this._documentLoadVersions[knowledgeBaseId]) {
+        if (!background && this.selectedBaseId === knowledgeBaseId
+          && ownerEpoch === this._ownerEpoch
+          && version === this._documentLoadVersions[knowledgeBaseId]) {
           this.operationError = displayError(error, '文件列表加载失败')
         }
+        return false
       } finally {
-        if (version === this._documentLoadVersions[knowledgeBaseId]) this.documentsLoading = false
+        if (visible && loadingVersion === this._documentsLoadingVersion
+          && ownerEpoch === this._ownerEpoch
+          && version === this._documentLoadVersions[knowledgeBaseId]) this.documentsLoading = false
       }
     },
     async selectDocument(id: string) {
       this.selectedDocumentId = id
       await this.loadVersions(id)
     },
-    async loadVersions(requestedDocumentId?: string) {
+    async loadVersions(requestedDocumentId?: string, background = false) {
       const documentId = requestedDocumentId ?? this.selectedDocumentId
       if (!documentId) return
-      const version = ++this._versionLoadVersion
-      this.versionsLoading = true
+      const ownerEpoch = this._ownerEpoch
+      const version = (this._versionLoadVersions[documentId] ?? 0) + 1
+      this._versionLoadVersions[documentId] = version
+      const visible = !background && this.selectedDocumentId === documentId
+      const loadingVersion = visible ? ++this._versionsLoadingVersion : 0
+      if (visible) this.versionsLoading = true
       try {
         const versions = await getDesktopApi().knowledge.listVersions(documentId)
-        if (version === this._versionLoadVersion && this.selectedDocumentId === documentId) {
+        if (ownerEpoch === this._ownerEpoch
+          && version === this._versionLoadVersions[documentId]
+          && this.selectedDocumentId === documentId) {
           this.versionsByDocument[documentId] = versions
+          if (!background) this.operationError = ''
         }
+        return true
       } catch (error) {
-        if (version === this._versionLoadVersion) {
+        if (!background && this.selectedDocumentId === documentId
+          && ownerEpoch === this._ownerEpoch
+          && version === this._versionLoadVersions[documentId]) {
           this.operationError = displayError(error, '版本列表加载失败')
         }
+        return false
       } finally {
-        if (version === this._versionLoadVersion) this.versionsLoading = false
+        if (visible && loadingVersion === this._versionsLoadingVersion
+          && ownerEpoch === this._ownerEpoch
+          && version === this._versionLoadVersions[documentId]) this.versionsLoading = false
       }
     },
     async createBase(rawName: string) {
       const name = rawName.trim()
-      if (!name || this.operationPending) return
-      await this.runOperation('创建知识库失败', async () => {
+      if (!name || this.operationPending || !this.canCreateBase) return
+      await this.runOperation('创建知识库失败', async (isCurrent) => {
         const created = await getDesktopApi().knowledge.createBase(name)
+        if (!isCurrent()) return
         this.bases = [created, ...this.bases.filter(({ id }) => id !== created.id)]
         this.selectedBaseId = created.id
         this.selectedDocumentId = ''
@@ -221,39 +305,48 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     async importDocument() {
       if (!this.selectedBaseId || this.operationPending || !this.canWrite) return
-      await this.runOperation('导入文件失败', async () => {
-        const acknowledgement = await getDesktopApi().knowledge.importDocument(this.selectedBaseId)
-        if (acknowledgement) this.upsertDocument(acknowledgement)
+      const knowledgeBaseId = this.selectedBaseId
+      await this.runOperation('导入文件失败', async (isCurrent) => {
+        const acknowledgement = await getDesktopApi().knowledge.importDocument(knowledgeBaseId)
+        if (acknowledgement && isCurrent()) {
+          this.upsertDocument(acknowledgement)
+          this.startProcessingPolling()
+        }
       })
     },
     async replaceSelectedDocument() {
       const documentId = this.selectedDocumentId
       if (!documentId || this.operationPending || !this.canWrite) return
-      await this.runOperation('替换文件失败', async () => {
+      await this.runOperation('替换文件失败', async (isCurrent) => {
         const acknowledgement = await getDesktopApi().knowledge.replaceDocument(documentId)
-        if (acknowledgement) this.upsertDocument(acknowledgement)
+        if (acknowledgement && isCurrent()) {
+          this.upsertDocument(acknowledgement)
+          this.startProcessingPolling()
+        }
       })
     },
     async recycleSelectedDocument() {
       const document = this.selectedDocument
-      if (!document || this.operationPending) return
-      await this.runOperation('移入回收站失败', async () => {
+      if (!document || this.operationPending || !this.canRecycle) return
+      await this.runOperation('移入回收站失败', async (isCurrent) => {
         await getDesktopApi().knowledge.recycleDocument(document.id)
+        if (!isCurrent()) return
         this.documentsByBase[document.knowledgeBaseId] = this.documents
           .filter(({ id }) => id !== document.id)
         this.selectedDocumentId = ''
       })
     },
     async exportSelectedBase() {
-      if (!this.selectedBaseId || this.operationPending) return
-      await this.runOperation('导出知识库失败', () =>
+      if (!this.selectedBaseId || this.operationPending || !this.canExport) return
+      await this.runOperation('导出知识库失败', async () =>
         getDesktopApi().knowledge.exportBase(this.selectedBaseId))
     },
     async recycleSelectedBase() {
       const baseId = this.selectedBaseId
-      if (!baseId || this.operationPending) return
-      await this.runOperation('移入回收站失败', async () => {
+      if (!baseId || this.operationPending || !this.canRecycle) return
+      await this.runOperation('移入回收站失败', async (isCurrent) => {
         await getDesktopApi().knowledge.recycleBase(baseId)
+        if (!isCurrent()) return
         this.bases = this.bases.filter(({ id }) => id !== baseId)
         delete this.documentsByBase[baseId]
         this.selectedBaseId = this.bases[0]?.id ?? ''
@@ -262,26 +355,77 @@ export const useKnowledgeStore = defineStore('knowledge', {
       })
     },
     async refreshProcessing() {
-      if (!this.hasProcessing) return
+      if (!this.hasProcessing) return true
+      const ownerEpoch = this._ownerEpoch
+      const refreshVersion = ++this._refreshVersion
       const selectedDocumentId = this.selectedDocumentId
-      await Promise.all(Object.entries(this.documentsByBase)
+      const refreshed = await Promise.all(Object.entries(this.documentsByBase)
         .filter(([, documents]) => documents.some(({ status }) => processingDocumentStatuses.has(status)))
-        .map(([baseId]) => this.loadDocuments(baseId)))
+        .map(([baseId]) => this.loadDocuments(baseId, true)))
+      if (ownerEpoch !== this._ownerEpoch || refreshVersion !== this._refreshVersion) return false
+      if (refreshed.some((success) => success === false)) return false
       if (selectedDocumentId && this.selectedDocumentId === selectedDocumentId) {
-        await this.loadVersions(selectedDocumentId)
+        const versionsLoaded = await this.loadVersions(selectedDocumentId, true)
+        if (versionsLoaded === false) return false
       }
       const bases = await getDesktopApi().knowledge.listBases()
+      if (ownerEpoch !== this._ownerEpoch || refreshVersion !== this._refreshVersion) return false
       this.bases = bases
+      return true
     },
-    async runOperation(message: string, operation: () => Promise<void>) {
+    startProcessingPolling() {
+      this.stopProcessingPolling()
+      if (!this.hasProcessing) return
+      const controller: PollController = { failures: 0, ownerEpoch: this._ownerEpoch }
+      pollingControllers.set(this, controller)
+      const schedule = (delay: number) => {
+        controller.timer = globalThis.setTimeout(async () => {
+          if (pollingControllers.get(this) !== controller
+            || controller.ownerEpoch !== this._ownerEpoch) return
+          let succeeded: boolean
+          try {
+            succeeded = await this.refreshProcessing()
+          } catch {
+            succeeded = false
+          }
+          if (pollingControllers.get(this) !== controller
+            || controller.ownerEpoch !== this._ownerEpoch) return
+          if (succeeded) {
+            controller.failures = 0
+            this.pollingError = ''
+            if (this.hasProcessing) schedule(POLL_INTERVAL_MS)
+            else pollingControllers.delete(this)
+            return
+          }
+          controller.failures += 1
+          if (controller.failures >= MAX_POLL_FAILURES) {
+            this.pollingError = '处理状态自动刷新已暂停，请重新进入知识库后重试。'
+            pollingControllers.delete(this)
+            return
+          }
+          schedule(POLL_INTERVAL_MS * (2 ** controller.failures))
+        }, delay)
+      }
+      schedule(POLL_INTERVAL_MS)
+    },
+    stopProcessingPolling() {
+      const controller = pollingControllers.get(this)
+      if (controller?.timer !== undefined) globalThis.clearTimeout(controller.timer)
+      pollingControllers.delete(this)
+    },
+    async runOperation(message: string, operation: (isCurrent: () => boolean) => Promise<void>) {
+      const ownerEpoch = this._ownerEpoch
+      const version = ++this._operationVersion
+      const isCurrent = () => ownerEpoch === this._ownerEpoch && version === this._operationVersion
       this.operationPending = true
       this.operationError = ''
       try {
-        await operation()
+        await operation(isCurrent)
+        if (isCurrent()) this.operationError = ''
       } catch (error) {
-        this.operationError = displayError(error, message)
+        if (isCurrent()) this.operationError = displayError(error, message)
       } finally {
-        this.operationPending = false
+        if (isCurrent()) this.operationPending = false
       }
     },
   },
