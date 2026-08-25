@@ -10,6 +10,7 @@ import {
   type ChatEvent,
   type ExecutionEvent,
   type ExecutionStatus,
+  knowledgeSearchResultsSchema,
 } from './events.js'
 import {
   capabilitySchema,
@@ -23,6 +24,84 @@ import {
 const identifierSchema = z.string().trim().min(1)
 const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
+
+export const knowledgeBaseSchema = z.object({
+  id: identifierSchema,
+  name: nonEmptyStringSchema.max(200),
+  kind: z.enum(['local', 'cloud']),
+  status: z.enum(['ready', 'processing', 'paused', 'failed', 'read_only']),
+  documentCount: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+}).strict()
+export type KnowledgeBase = z.infer<typeof knowledgeBaseSchema>
+
+export const knowledgeDocumentSchema = z.object({
+  id: identifierSchema,
+  knowledgeBaseId: identifierSchema,
+  name: nonEmptyStringSchema.max(500),
+  mimeType: nonEmptyStringSchema.max(200),
+  status: z.enum(['queued', 'copying', 'uploading', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted']),
+  versionCount: z.number().int().positive(),
+  updatedAt: timestampSchema,
+}).strict()
+export type KnowledgeDocument = z.infer<typeof knowledgeDocumentSchema>
+
+export const knowledgeVersionSchema = z.object({
+  id: identifierSchema,
+  documentId: identifierSchema,
+  number: z.number().int().positive(),
+  status: z.enum(['staging', 'ready', 'failed', 'retired']),
+  createdAt: timestampSchema,
+}).strict()
+export type KnowledgeVersion = z.infer<typeof knowledgeVersionSchema>
+
+export const knowledgeSelectionSchema = z.object({
+  knowledgeBaseIds: z.array(identifierSchema).max(32).refine(
+    (ids) => new Set(ids).size === ids.length,
+    { message: 'Knowledge base IDs must be unique' },
+  ),
+  knowledgeMode: z.enum(['mixed', 'strict']),
+}).strict()
+export type KnowledgeSelection = z.infer<typeof knowledgeSelectionSchema>
+
+export const localKnowledgeSearchRequestSchema = z.object({
+  query: nonEmptyStringSchema.max(1_000),
+}).strict()
+export type LocalKnowledgeSearchRequest = z.infer<typeof localKnowledgeSearchRequestSchema>
+export { knowledgeSearchResultsSchema }
+export type { KnowledgeCitationReference, KnowledgeSearchResult } from './events.js'
+
+export const knowledgeEntitlementStateSchema = z.object({
+  tier: z.enum(['free', 'member']),
+  status: z.enum(['active', 'offline_grace', 'expired', 'unavailable']),
+  betaEnabled: z.boolean(),
+  cloudEnabled: z.boolean(),
+}).strict()
+export type KnowledgeEntitlementState = z.infer<typeof knowledgeEntitlementStateSchema>
+
+export const knowledgeConsentStateSchema = z.object({
+  provider: z.enum(['openrouter', 'deepseek']),
+  status: z.enum(['unknown', 'granted', 'denied']),
+  updatedAt: timestampSchema.optional(),
+}).strict()
+export type KnowledgeConsentState = z.infer<typeof knowledgeConsentStateSchema>
+
+export const knowledgeFeatureAvailabilitySchema = z.object({
+  available: z.boolean(),
+  reasons: z.array(z.enum([
+    'native_dependency_unavailable',
+    'encrypted_storage_unavailable',
+    'safe_storage_unavailable',
+    'fts_unavailable',
+    'packaging_unverified',
+    'kill_switch_enabled',
+  ])).max(6),
+}).strict().superRefine(({ available, reasons }, context) => {
+  if ((available && reasons.length > 0) || (!available && reasons.length === 0)) {
+    context.addIssue({ code: 'custom', message: 'Knowledge availability must fail closed with explicit reasons' })
+  }
+})
+export type KnowledgeFeatureAvailability = z.infer<typeof knowledgeFeatureAvailabilitySchema>
 
 const browserAuditOriginSchema = z.string().superRefine((value, context) => {
   try {
@@ -953,6 +1032,13 @@ export const ipcChannels = {
   settingsGetTokenUsage: 'settings:get-token-usage',
   settingsClearLocalData: 'settings:clear-local-data',
   settingsClearBrowserData: 'settings:clear-browser-data',
+  knowledgeListBases: 'knowledge:list-bases',
+  knowledgeListDocuments: 'knowledge:list-documents',
+  knowledgeGetConversationSelection: 'knowledge:get-conversation-selection',
+  knowledgeUpdateConversationSelection: 'knowledge:update-conversation-selection',
+  knowledgeGetFeatureAvailability: 'knowledge:get-feature-availability',
+  knowledgeGetEntitlement: 'knowledge:get-entitlement',
+  knowledgeGetConsent: 'knowledge:get-consent',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
 } as const
@@ -1025,6 +1111,11 @@ export const listProviderModelsRequestSchema = providerRequestSchema.extend({
 }).strict()
 export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
+}).strict()
+export const knowledgeBaseRequestSchema = z.object({ knowledgeBaseId: identifierSchema }).strict()
+export const knowledgeConversationSelectionRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const updateKnowledgeConversationSelectionRequestSchema = knowledgeConversationSelectionRequestSchema.extend({
+  selection: knowledgeSelectionSchema,
 }).strict()
 export const openExternalRequestSchema = z.object({
   url: z.string().superRefine((value, context) => {
@@ -1106,6 +1197,13 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.settingsClearBrowserData]: z.undefined(),
+  [ipcChannels.knowledgeListBases]: z.undefined(),
+  [ipcChannels.knowledgeListDocuments]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeGetConversationSelection]: knowledgeConversationSelectionRequestSchema,
+  [ipcChannels.knowledgeUpdateConversationSelection]: updateKnowledgeConversationSelectionRequestSchema,
+  [ipcChannels.knowledgeGetFeatureAvailability]: z.undefined(),
+  [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
+  [ipcChannels.knowledgeGetConsent]: z.undefined(),
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
@@ -1176,6 +1274,13 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
+  [ipcChannels.knowledgeListBases]: z.array(knowledgeBaseSchema),
+  [ipcChannels.knowledgeListDocuments]: z.array(knowledgeDocumentSchema),
+  [ipcChannels.knowledgeGetConversationSelection]: knowledgeSelectionSchema,
+  [ipcChannels.knowledgeUpdateConversationSelection]: knowledgeSelectionSchema,
+  [ipcChannels.knowledgeGetFeatureAvailability]: knowledgeFeatureAvailabilitySchema,
+  [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
+  [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
@@ -1267,6 +1372,15 @@ export interface DesktopAPI {
     getTokenUsage(): Promise<TokenUsageSnapshot>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
     clearBrowserData(): Promise<void>
+  }
+  knowledge: {
+    listBases(): Promise<KnowledgeBase[]>
+    listDocuments(knowledgeBaseId: string): Promise<KnowledgeDocument[]>
+    getConversationSelection(conversationId: string): Promise<KnowledgeSelection>
+    updateConversationSelection(conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
+    getFeatureAvailability(): Promise<KnowledgeFeatureAvailability>
+    getEntitlement(): Promise<KnowledgeEntitlementState>
+    getConsent(): Promise<KnowledgeConsentState>
   }
   system: {
     openExternal(url: string): Promise<void>

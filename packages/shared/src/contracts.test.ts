@@ -19,6 +19,15 @@ import {
   ipcResponseSchemas,
   ipcChannels,
   listProviderModelsRequestSchema,
+  localKnowledgeSearchRequestSchema,
+  knowledgeBaseSchema,
+  knowledgeCitationReferenceSchema,
+  knowledgeDocumentSchema,
+  knowledgeEntitlementStateSchema,
+  knowledgeFeatureAvailabilitySchema,
+  knowledgeSearchResultsSchema,
+  knowledgeSelectionSchema,
+  knowledgeVersionSchema,
   mediaAssetSchema,
   mediaBlockSchema,
   modelInfoSchema,
@@ -40,6 +49,66 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('keeps personal knowledge DTOs strict and free of private storage details', () => {
+    expect(knowledgeBaseSchema.parse({
+      id: 'kb_1', name: 'Research notes', kind: 'local', status: 'ready',
+      documentCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+    })).toMatchObject({ id: 'kb_1', status: 'ready' })
+    expect(knowledgeDocumentSchema.parse({
+      id: 'document_1', knowledgeBaseId: 'kb_1', name: 'outline.md', mimeType: 'text/markdown',
+      status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+    })).toMatchObject({ knowledgeBaseId: 'kb_1', name: 'outline.md' })
+    expect(knowledgeVersionSchema.parse({
+      id: 'version_1', documentId: 'document_1', number: 1, status: 'ready',
+      createdAt: '2026-08-26T00:00:00.000Z',
+    })).toMatchObject({ documentId: 'document_1', number: 1 })
+
+    for (const value of [
+      { id: 'kb_1', name: 'Research notes', kind: 'local', status: 'ready', documentCount: 1, updatedAt: '2026-08-26T00:00:00.000Z', path: '/private/kb' },
+      { id: 'document_1', knowledgeBaseId: 'kb_1', name: 'outline.md', mimeType: 'text/markdown', status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z', userId: 'other_user' },
+    ]) {
+      expect(knowledgeBaseSchema.safeParse(value).success || knowledgeDocumentSchema.safeParse(value).success).toBe(false)
+    }
+  })
+
+  it('limits trusted knowledge selection and search contracts without caller scope', () => {
+    expect(knowledgeSelectionSchema.parse({ knowledgeBaseIds: ['kb_1'], knowledgeMode: 'strict' }))
+      .toEqual({ knowledgeBaseIds: ['kb_1'], knowledgeMode: 'strict' })
+    expect(knowledgeSelectionSchema.safeParse({ knowledgeBaseIds: ['kb_1', 'kb_1'], knowledgeMode: 'mixed' }).success).toBe(false)
+    expect(knowledgeSelectionSchema.safeParse({ knowledgeBaseIds: Array.from({ length: 33 }, (_, index) => `kb_${index}`), knowledgeMode: 'mixed' }).success).toBe(false)
+    expect(localKnowledgeSearchRequestSchema.safeParse({ query: 'retrieval query', topK: 99 }).success).toBe(false)
+    expect(localKnowledgeSearchRequestSchema.safeParse({ query: 'retrieval query', knowledgeBaseIds: ['foreign_kb'] }).success).toBe(false)
+    expect(localKnowledgeSearchRequestSchema.safeParse({ query: 'retrieval query', sql: 'select * from kb_chunks' }).success).toBe(false)
+  })
+
+  it('limits local knowledge evidence and validates source-specific citations', () => {
+    const result = {
+      evidenceId: 'evidence_1', knowledgeBaseId: 'kb_1', documentId: 'document_1', versionId: 'version_1',
+      snippet: 'A supported excerpt.', score: 0.75,
+      citation: { evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1', kind: 'pdf', page: 2, startOffset: 0, endOffset: 21 },
+    }
+    expect(knowledgeSearchResultsSchema.parse([result])).toEqual([result])
+    expect(knowledgeSearchResultsSchema.safeParse(Array.from({ length: 9 }, (_, index) => ({
+      ...result, evidenceId: `evidence_${index}`,
+      citation: { ...result.citation, evidenceId: `evidence_${index}` },
+    }))).success).toBe(false)
+    expect(knowledgeCitationReferenceSchema.safeParse({
+      ...result.citation, page: 0,
+    }).success).toBe(false)
+    expect(knowledgeCitationReferenceSchema.safeParse({
+      ...result.citation, indexId: 'stale-index',
+    }).success).toBe(false)
+  })
+
+  it('reports fail-closed feature availability and public entitlement state', () => {
+    expect(knowledgeFeatureAvailabilitySchema.parse({ available: false, reasons: ['encrypted_storage_unavailable'] }))
+      .toEqual({ available: false, reasons: ['encrypted_storage_unavailable'] })
+    expect(knowledgeFeatureAvailabilitySchema.safeParse({ available: true, reasons: ['fts_unavailable'] }).success).toBe(false)
+    expect(knowledgeEntitlementStateSchema.parse({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+    })).toMatchObject({ tier: 'free', status: 'active' })
+  })
+
   it('validates CloudBase username, password, phone, email, and OTP inputs', () => {
     expect(authCredentialsSchema.parse({ account: '  Alice_1  ', password: '密码密码密码密码' }))
       .toEqual({ account: 'Alice_1', password: '密码密码密码密码' })

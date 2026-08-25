@@ -13,6 +13,55 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 const workflowSourceSchema = z.enum(['installed', 'development'])
 const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 
+const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('pdf'), page: z.number().int().positive(),
+    startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
+  }).strict().refine(({ startOffset, endOffset }) => endOffset > startOffset, {
+    message: 'PDF citation end offset must follow its start offset', path: ['endOffset'],
+  }),
+  z.object({
+    kind: z.literal('docx'), headingPath: z.array(nonEmptyStringSchema.max(200)).max(20), paragraphId: identifierSchema,
+  }).strict(),
+  z.object({ kind: z.enum(['markdown', 'html']), nodeId: identifierSchema }).strict(),
+  z.object({
+    kind: z.literal('txt'), startLine: z.number().int().positive(), endLine: z.number().int().positive(),
+    startColumn: z.number().int().nonnegative(), endColumn: z.number().int().nonnegative(),
+  }).strict().superRefine(({ startLine, endLine, startColumn, endColumn }, context) => {
+    if (endLine < startLine || (endLine === startLine && endColumn <= startColumn)) {
+      context.addIssue({ code: 'custom', message: 'TXT citation end must follow its start' })
+    }
+  }),
+])
+
+export const knowledgeCitationReferenceSchema = z.object({
+  evidenceId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+}).strict().and(knowledgeCoordinateSchema)
+export type KnowledgeCitationReference = z.infer<typeof knowledgeCitationReferenceSchema>
+
+export const knowledgeSearchResultSchema = z.object({
+  evidenceId: identifierSchema,
+  knowledgeBaseId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  snippet: z.string().trim().min(1).max(4_000),
+  score: z.number().finite().min(0).max(1),
+  citation: knowledgeCitationReferenceSchema,
+}).strict().superRefine(({ evidenceId, documentId, versionId, citation }, context) => {
+  if (citation.evidenceId !== evidenceId || citation.documentId !== documentId || citation.versionId !== versionId) {
+    context.addIssue({ code: 'custom', path: ['citation'], message: 'Citation must reference this evidence item' })
+  }
+})
+export type KnowledgeSearchResult = z.infer<typeof knowledgeSearchResultSchema>
+
+export const knowledgeSearchResultsSchema = z.array(knowledgeSearchResultSchema).max(8).superRefine((results, context) => {
+  if (new Set(results.map(({ evidenceId }) => evidenceId)).size !== results.length) {
+    context.addIssue({ code: 'custom', message: 'Knowledge evidence IDs must be unique' })
+  }
+})
+
 function declaredScopeMatchesCapability(capability: string, scope: Record<string, unknown>): boolean {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')

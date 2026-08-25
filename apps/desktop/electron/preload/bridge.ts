@@ -145,6 +145,23 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       clearLocalData: (scope) => invoke(ipcRenderer, ipcChannels.settingsClearLocalData, { scope }),
       clearBrowserData: () => invoke(ipcRenderer, ipcChannels.settingsClearBrowserData),
     },
+    knowledge: {
+      listBases: () => invoke(ipcRenderer, ipcChannels.knowledgeListBases),
+      listDocuments: (knowledgeBaseId) => invoke(ipcRenderer, ipcChannels.knowledgeListDocuments, { knowledgeBaseId }),
+      getConversationSelection: (conversationId) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeGetConversationSelection,
+        { conversationId },
+      ),
+      updateConversationSelection: (conversationId, selection) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeUpdateConversationSelection,
+        { conversationId, selection },
+      ),
+      getFeatureAvailability: () => invoke(ipcRenderer, ipcChannels.knowledgeGetFeatureAvailability),
+      getEntitlement: () => invoke(ipcRenderer, ipcChannels.knowledgeGetEntitlement),
+      getConsent: () => invoke(ipcRenderer, ipcChannels.knowledgeGetConsent),
+    },
     system: {
       openExternal: (url) => invoke(ipcRenderer, ipcChannels.systemOpenExternal, { url }),
       getAppInfo: () => invoke(ipcRenderer, ipcChannels.systemGetAppInfo),

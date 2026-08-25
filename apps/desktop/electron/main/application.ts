@@ -1743,6 +1743,15 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
     },
+    knowledge: {
+      listBases: () => { throw failure('SERVICE_UNAVAILABLE') },
+      listDocuments: () => { throw failure('SERVICE_UNAVAILABLE') },
+      getConversationSelection: () => { throw failure('SERVICE_UNAVAILABLE') },
+      updateConversationSelection: () => { throw failure('SERVICE_UNAVAILABLE') },
+      getFeatureAvailability: async () => ({ available: false, reasons: ['native_dependency_unavailable'] }),
+      getEntitlement: async () => ({ tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false }),
+      getConsent: async () => ({ provider: (await settings.get()).activeProvider, status: 'unknown' }),
+    },
     system: {
       openExternal: async (url) => {
         const parsed = openExternalRequestSchema.safeParse({ url })

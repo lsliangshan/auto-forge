@@ -106,6 +106,15 @@ function services(): DesktopIpcServices {
       clearLocalData: vi.fn(),
       clearBrowserData: vi.fn(),
     },
+    knowledge: {
+      listBases: vi.fn().mockResolvedValue([]),
+      listDocuments: vi.fn().mockResolvedValue([]),
+      getConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
+      updateConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
+      getFeatureAvailability: vi.fn().mockResolvedValue({ available: false, reasons: ['encrypted_storage_unavailable'] }),
+      getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false }),
+      getConsent: vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'unknown' }),
+    },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
 }
@@ -325,6 +334,35 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.chat.send).not.toHaveBeenCalled()
+  })
+
+  it('guards fixed knowledge contracts without renderer-provided scope or retrieval limits', async () => {
+    const app = harness()
+    const selection = { knowledgeBaseIds: ['kb_1'], knowledgeMode: 'strict' as const }
+
+    await app.invoke(ipcChannels.knowledgeListBases)
+    await app.invoke(ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1' })
+    await app.invoke(ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_1' })
+    await app.invoke(ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection })
+    await app.invoke(ipcChannels.knowledgeGetFeatureAvailability)
+    await app.invoke(ipcChannels.knowledgeGetEntitlement)
+    await app.invoke(ipcChannels.knowledgeGetConsent)
+
+    expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith()
+    expect(app.dependencies.knowledge.listDocuments).toHaveBeenCalledWith('kb_1')
+    expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith('conversation_1')
+    expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith('conversation_1', selection)
+    expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith()
+
+    for (const [channel, input] of [
+      [ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1', userId: 'other_user' }],
+      [ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection, topK: 99 }],
+      [ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection: { ...selection, indexId: 'foreign-index' } }],
+      [ipcChannels.knowledgeGetFeatureAvailability, { path: '/private/knowledge.sqlite' }],
+    ] as const) {
+      await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledTimes(1)
   })
 
   it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {

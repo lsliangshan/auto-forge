@@ -6,6 +6,12 @@ import {
   type AppError,
   type AuthSession,
   type DesktopAPI,
+  type KnowledgeBase,
+  type KnowledgeConsentState,
+  type KnowledgeDocument,
+  type KnowledgeEntitlementState,
+  type KnowledgeFeatureAvailability,
+  type KnowledgeSelection,
   type MediaAsset,
   type MediaImportContext,
   type MediaRemoveDraftRequest,
@@ -56,6 +62,15 @@ export interface DesktopIpcServices {
   executions: Omit<DesktopAPI['executions'], 'onEvent'>
   permissions: DesktopAPI['permissions']
   settings: DesktopAPI['settings']
+  knowledge: {
+    listBases(): Promise<KnowledgeBase[]>
+    listDocuments(knowledgeBaseId: string): Promise<KnowledgeDocument[]>
+    getConversationSelection(conversationId: string): Promise<KnowledgeSelection>
+    updateConversationSelection(conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
+    getFeatureAvailability(): Promise<KnowledgeFeatureAvailability>
+    getEntitlement(): Promise<KnowledgeEntitlementState>
+    getConsent(): Promise<KnowledgeConsentState>
+  }
   system: DesktopAPI['system']
 }
 
@@ -201,6 +216,16 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsGetTokenUsage, () => options.services.settings.getTokenUsage())
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
   register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
+  register(ipcChannels.knowledgeListBases, () => options.services.knowledge.listBases())
+  register(ipcChannels.knowledgeListDocuments, (input) => options.services.knowledge.listDocuments(input.knowledgeBaseId))
+  register(ipcChannels.knowledgeGetConversationSelection, (input) => options.services.knowledge.getConversationSelection(input.conversationId))
+  register(ipcChannels.knowledgeUpdateConversationSelection, (input) => options.services.knowledge.updateConversationSelection(
+    input.conversationId,
+    input.selection,
+  ))
+  register(ipcChannels.knowledgeGetFeatureAvailability, () => options.services.knowledge.getFeatureAvailability())
+  register(ipcChannels.knowledgeGetEntitlement, () => options.services.knowledge.getEntitlement())
+  register(ipcChannels.knowledgeGetConsent, () => options.services.knowledge.getConsent())
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 

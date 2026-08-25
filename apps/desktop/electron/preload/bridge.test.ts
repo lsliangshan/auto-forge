@@ -82,6 +82,33 @@ describe('preload desktop bridge', () => {
     expect(app.api.profile).not.toHaveProperty('invoke')
   })
 
+  it('exposes only fixed knowledge operations without a generic search transport', async () => {
+    const app = harness()
+    const selection = { knowledgeBaseIds: ['kb_1'], knowledgeMode: 'mixed' as const }
+
+    await app.api.knowledge.listBases()
+    await app.api.knowledge.listDocuments('kb_1')
+    await app.api.knowledge.getConversationSelection('conversation_1')
+    await app.api.knowledge.updateConversationSelection('conversation_1', selection)
+    await app.api.knowledge.getFeatureAvailability()
+    await app.api.knowledge.getEntitlement()
+    await app.api.knowledge.getConsent()
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgeListBases, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.knowledgeGetFeatureAvailability, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(6, ipcChannels.knowledgeGetEntitlement, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(7, ipcChannels.knowledgeGetConsent, undefined)
+    expect(Object.keys(app.api.knowledge)).toEqual([
+      'listBases', 'listDocuments', 'getConversationSelection', 'updateConversationSelection',
+      'getFeatureAvailability', 'getEntitlement', 'getConsent',
+    ])
+    expect(app.api.knowledge).not.toHaveProperty('search')
+    expect(app.api.knowledge).not.toHaveProperty('invoke')
+  })
+
   it('uses literal fixed channels without exposing a generic transport', async () => {
     const app = harness()
     await app.api.chat.renameConversation('c1', 'Renamed')
