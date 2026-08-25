@@ -49,7 +49,7 @@ function runVerifier(fixture: ReturnType<typeof packagingFixture>, path?: string
 function fakePackagedApp(
   fixture: ReturnType<typeof packagingFixture>,
   outputDirectory = 'mac-arm64',
-  options: { nativeModule?: boolean; executable?: string } = {},
+  options: { nativeModule?: boolean; encryptedNativeModule?: boolean; executable?: string } = {},
 ) {
   const app = join(fixture.desktop, 'dist', outputDirectory, 'AutoForge.app')
   const resources = join(app, 'Contents', 'Resources')
@@ -69,6 +69,18 @@ function fakePackagedApp(
     )
     mkdirSync(nativeDirectory, { recursive: true })
     writeFileSync(join(nativeDirectory, 'better_sqlite3.node'), '')
+  }
+
+  if (options.encryptedNativeModule) {
+    const nativeDirectory = join(
+      resources,
+      'app.asar.unpacked',
+      'node_modules',
+      'better-sqlite3-multiple-ciphers',
+      'prebuilds',
+    )
+    mkdirSync(nativeDirectory, { recursive: true })
+    writeFileSync(join(nativeDirectory, 'darwin-arm64.node'), '')
   }
 
   if (options.executable) {
@@ -97,10 +109,23 @@ describe('verify-packaged-native', () => {
     expect(result.stderr).toContain('Packaged better-sqlite3 native module not found')
   })
 
+  it('reports a missing packaged encrypted database native module before launching Electron', () => {
+    const fixture = packagingFixture()
+    fakePackagedApp(fixture, 'mac-arm64', {
+      nativeModule: true,
+      executable: '#!/bin/sh\nexit 0\n',
+    })
+    const result = runVerifier(fixture)
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('Packaged encrypted SQLite native module not found')
+  })
+
   it('reports a failed packaged require probe with its exit code', () => {
     const fixture = packagingFixture()
     fakePackagedApp(fixture, 'mac-arm64', {
       nativeModule: true,
+      encryptedNativeModule: true,
       executable: '#!/bin/sh\necho "simulated require failure" >&2\nexit 17\n',
     })
     const result = runVerifier(fixture)
@@ -114,10 +139,12 @@ describe('verify-packaged-native', () => {
     const fixture = packagingFixture()
     fakePackagedApp(fixture, 'mac', {
       nativeModule: true,
+      encryptedNativeModule: true,
       executable: '#!/bin/sh\nexit 0\n',
     })
     fakePackagedApp(fixture, 'mac-arm64', {
       nativeModule: true,
+      encryptedNativeModule: true,
       executable: '#!/bin/sh\necho "current target failed" >&2\nexit 23\n',
     })
 

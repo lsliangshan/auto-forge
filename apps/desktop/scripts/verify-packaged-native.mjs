@@ -67,8 +67,25 @@ if (!existsSync(nativeModule)) {
   throw new Error(`Packaged better-sqlite3 native module not found: ${nativeModule}`)
 }
 
+const encryptedNativeModule = join(
+  resourcesDirectory,
+  'app.asar.unpacked',
+  'node_modules',
+  'better-sqlite3-multiple-ciphers',
+  'prebuilds',
+  'darwin-arm64.node',
+)
+if (!existsSync(encryptedNativeModule)) {
+  throw new Error(`Packaged encrypted SQLite native module not found: ${encryptedNativeModule}`)
+}
+
 const executable = resolvePackagedExecutable(packageDirectory)
 const databasePackage = join(appArchive, 'node_modules', 'better-sqlite3')
+const encryptedDatabasePackage = join(
+  appArchive,
+  'node_modules',
+  'better-sqlite3-multiple-ciphers',
+)
 const httpsProxyAgentPackage = join(appArchive, 'node_modules', 'https-proxy-agent', 'dist', 'index.js')
 const socksProxyAgentPackage = join(appArchive, 'node_modules', 'socks-proxy-agent', 'dist', 'index.js')
 const workflowCompilerPackage = join(
@@ -91,7 +108,32 @@ const probe = [
   'const { transformSync } = require(process.argv[4])',
   'const transformed = transformSync("const answer: number = 42", { loader: "ts" })',
   'if (!transformed.code.includes("42")) throw new Error("Packaged workflow compiler output was invalid")',
-  'console.log(`Packaged proxy agents, better-sqlite3, and workflow compiler loaded under Electron ${process.versions.electron}`)',
+  'const fs = require("node:fs")',
+  'const os = require("node:os")',
+  'const path = require("node:path")',
+  'const encryptedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "autoforge-packaged-cipher-"))',
+  'const encryptedKey = Buffer.alloc(32, 1)',
+  'try {',
+  '  const EncryptedDatabase = require(process.argv[5])',
+  '  const encryptedPath = path.join(encryptedDirectory, "probe.sqlite")',
+  '  let encrypted = new EncryptedDatabase(encryptedPath)',
+  '  encrypted.rekey(encryptedKey)',
+  '  encrypted.pragma("temp_store = MEMORY")',
+  '  encrypted.exec("CREATE VIRTUAL TABLE probe USING fts5(body, tokenize=trigram)")',
+  '  encrypted.prepare("INSERT INTO probe(body) VALUES (?)").run("packaged probe content")',
+  '  encrypted.close()',
+  '  encrypted = new EncryptedDatabase(encryptedPath)',
+  '  encrypted.key(encryptedKey)',
+  '  encrypted.pragma("temp_store = MEMORY")',
+  '  const encryptedResult = encrypted.prepare("SELECT count(*) AS count FROM probe WHERE probe MATCH ?").get("packaged")',
+  '  const tempStore = encrypted.pragma("temp_store", { simple: true })',
+  '  encrypted.close()',
+  '  if (encryptedResult.count !== 1 || tempStore !== 2) throw new Error("Packaged encrypted SQLite probe failed")',
+  '} finally {',
+  '  encryptedKey.fill(0)',
+  '  fs.rmSync(encryptedDirectory, { recursive: true, force: true })',
+  '}',
+  'console.log(`Packaged proxy agents, SQLite drivers, and workflow compiler loaded under Electron ${process.versions.electron}`)',
 ].join(';')
 
 const result = spawnSync(executable, [
@@ -101,6 +143,7 @@ const result = spawnSync(executable, [
   httpsProxyAgentPackage,
   socksProxyAgentPackage,
   workflowCompilerPackage,
+  encryptedDatabasePackage,
 ], {
   env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   stdio: 'inherit',
