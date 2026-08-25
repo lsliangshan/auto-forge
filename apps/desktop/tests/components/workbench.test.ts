@@ -191,10 +191,12 @@ describe('workbench', () => {
     Reflect.deleteProperty(window, 'autoForge')
   })
 
-  it('renders exactly the five confirmed navigation items', async () => {
+  it('renders the approved navigation order with knowledge between chat and workflows', async () => {
     const { wrapper } = await mountApp()
     expect(wrapper.findAll('[data-testid="app-nav-item"]').map((item) => item.text()))
-      .toEqual(['聊天', '工作流', '开发', '执行记录', '设置'])
+      .toEqual(['聊天', '知识库', '工作流', '开发', '执行记录', '设置'])
+    expect(routes.find(({ path }) => path === '/')?.children?.find(({ name }) => name === 'knowledge'))
+      .toMatchObject({ path: 'knowledge', meta: { title: '知识库', inspector: true } })
   })
 
   it('keeps the responsive inspector reachable through an accessible toggle', async () => {

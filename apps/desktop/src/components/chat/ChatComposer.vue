@@ -6,6 +6,7 @@
     @drop.prevent="onDrop"
     @submit.prevent="submit"
   >
+    <KnowledgeSelector :disabled="disabled || running" />
     <div class="composer-tools">
       <button
         type="button"
@@ -336,6 +337,7 @@ import type {
   OutputType,
 } from '@autoforge/shared'
 import { useChatStore, type ChatSendAcknowledgement } from '../../stores/chat'
+import KnowledgeSelector from './KnowledgeSelector.vue'
 
 type ConcreteOutput = Exclude<OutputType, 'auto'>
 

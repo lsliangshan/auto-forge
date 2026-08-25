@@ -75,6 +75,48 @@
       </ul>
     </template>
 
+    <template v-else-if="route.name === 'knowledge'">
+      <div class="sidebar-toolbar">
+        <span class="af-panel-heading">知识库</span>
+      </div>
+      <div class="knowledge-create">
+        <el-input
+          v-model="knowledgeBaseName"
+          aria-label="新知识库名称"
+          maxlength="200"
+          placeholder="新知识库名称"
+          @keyup.enter="createKnowledgeBase"
+        />
+        <el-button
+          data-testid="knowledge-create"
+          :icon="Plus"
+          :disabled="!knowledgeBaseName.trim() || knowledge.operationPending"
+          @click="createKnowledgeBase"
+        >创建</el-button>
+      </div>
+      <div v-if="knowledge.loading" class="sidebar-state">正在加载…</div>
+      <div v-else-if="knowledge.error" class="sidebar-error" role="alert">{{ knowledge.error }}</div>
+      <div v-else-if="!knowledge.bases.length" class="sidebar-state">
+        尚无可用知识库
+      </div>
+      <ul v-else class="context-list af-scrollbar" aria-label="知识库列表">
+        <li v-for="base in knowledge.bases" :key="base.id">
+          <button
+            type="button"
+            :class="['knowledge-base-row', { active: knowledge.selectedBaseId === base.id }]"
+            @click="knowledge.selectBase(base.id)"
+          >
+            <span class="af-truncate">{{ base.name }}</span>
+            <small>{{ base.documentCount }} 个文件 · {{ baseStatusLabel(base) }}</small>
+          </button>
+        </li>
+      </ul>
+      <div v-if="knowledge.selectedBase" class="knowledge-base-actions">
+        <el-button size="small" @click="knowledge.exportSelectedBase">导出</el-button>
+        <el-button size="small" type="danger" plain @click="knowledge.recycleSelectedBase">回收</el-button>
+      </div>
+    </template>
+
     <template v-else-if="route.name === 'workflows'">
       <div class="sidebar-toolbar">
         <span class="af-panel-heading">筛选工作流</span>
@@ -215,12 +257,13 @@
 
 <script setup lang="ts">
 import { ChatDotRound, Delete, Edit, Plus, Search } from '@element-plus/icons-vue'
-import type { ExecutionStatus } from '@autoforge/shared'
+import type { ExecutionStatus, KnowledgeBase } from '@autoforge/shared'
 import { ElMessageBox } from 'element-plus'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
+import { useKnowledgeStore } from '../stores/knowledge'
 import { useWorkflowStore } from '../stores/workflow'
 import FileTree from './developer/FileTree.vue'
 
@@ -228,6 +271,22 @@ const route = useRoute()
 const chat = useChatStore()
 const workflow = useWorkflowStore()
 const execution = useExecutionStore()
+const knowledge = useKnowledgeStore()
+const knowledgeBaseName = ref('')
+const baseStatusLabel = (base: KnowledgeBase) => {
+  if (base.status === 'processing') return '同步中'
+  if (base.status === 'read_only') return '只读'
+  if (base.status === 'failed') return '失败'
+  if (base.status === 'paused') return '已暂停'
+  if (base.status === 'recycled') return '已回收'
+  return base.kind === 'cloud' ? '已同步' : '仅本地'
+}
+async function createKnowledgeBase() {
+  const name = knowledgeBaseName.value.trim()
+  if (!name) return
+  await knowledge.createBase(name)
+  if (!knowledge.operationError) knowledgeBaseName.value = ''
+}
 const conversationSearch = ref('')
 const conversationGroups = computed(() => {
   const search = conversationSearch.value.trim().toLocaleLowerCase()
@@ -267,11 +326,11 @@ const settingsSections = [
 ] as const
 type SettingsSectionId = typeof settingsSections[number]['id']
 const activeSettingsSection = ref<SettingsSectionId>(settingsSections[0].id)
-let settingsScrollContainer: HTMLElement | null = null
+let settingsScrollContainer: globalThis.HTMLElement | null = null
 
 function scrollToSettingsSection(id: SettingsSectionId) {
   activeSettingsSection.value = id
-  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  globalThis.document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 function syncActiveSettingsSection() {
@@ -284,7 +343,7 @@ function syncActiveSettingsSection() {
   const decisionLine = settingsScrollContainer.getBoundingClientRect().top + 24
   let activeId: SettingsSectionId = settingsSections[0].id
   for (const section of settingsSections) {
-    const element = document.getElementById(section.id)
+    const element = globalThis.document.getElementById(section.id)
     if (!element) continue
     if (element.getBoundingClientRect().top > decisionLine) break
     activeId = section.id
@@ -303,7 +362,7 @@ function setupSettingsScrollSync() {
   if (route.name !== 'settings') return
   void nextTick(() => {
     if (route.name !== 'settings') return
-    settingsScrollContainer = document.querySelector<HTMLElement>('.workspace-content')
+    settingsScrollContainer = globalThis.document.querySelector<globalThis.HTMLElement>('.workspace-content')
     settingsScrollContainer?.addEventListener('scroll', syncActiveSettingsSection, { passive: true })
     syncActiveSettingsSection()
   })
@@ -370,4 +429,8 @@ onBeforeUnmount(detachSettingsScrollSync)
 .settings-section-link { width: 100%; border: 0; border-radius: 5px; padding: 8px 9px; color: var(--af-text); background: transparent; font: inherit; font-size: 13px; cursor: pointer; text-align: left; }
 .settings-section-link:hover, .settings-section-link.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }
 .settings-section-link.active { font-weight: 650; }
+.knowledge-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+.knowledge-base-row { display: grid; width: 100%; gap: 3px; border: 0; border-radius: 6px; padding: 9px 8px; color: var(--af-text); background: transparent; cursor: pointer; text-align: left; }
+.knowledge-base-row:hover { background: var(--af-hover); }.knowledge-base-row.active { color: var(--af-cobalt); background: var(--af-cobalt-soft); }.knowledge-base-row small { color: var(--af-text-muted); font-size: 10px; }
+.knowledge-base-actions { display: flex; gap: 6px; border-top: 1px solid var(--af-border); padding-top: 10px; }
 </style>

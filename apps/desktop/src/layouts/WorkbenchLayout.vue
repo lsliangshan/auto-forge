@@ -23,7 +23,7 @@
           {{ inspectorOpen ? '隐藏检查器' : '查看检查器' }}
         </el-button>
       </header>
-      <div class="workspace-content af-scrollbar">
+      <div :class="['workspace-content', 'af-scrollbar', { 'knowledge-workspace': route.name === 'knowledge' }]">
         <RouterView />
       </div>
     </main>
@@ -62,4 +62,5 @@ watch(() => route.name, () => {
 .workspace-eyebrow { display: block; margin-bottom: 1px; color: var(--af-text-muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
 .inspector-toggle { -webkit-app-region: no-drag; }
 .workspace-content { min-height: 0; flex: 1; overflow: auto; }
+.workspace-content.knowledge-workspace { overflow: hidden; }
 </style>

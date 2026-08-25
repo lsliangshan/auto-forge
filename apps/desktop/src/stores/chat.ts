@@ -8,6 +8,7 @@ import type {
   ConversationSummary,
   DesktopAPI,
   GenerationOptions,
+  KnowledgeSelection,
   MediaAsset,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
@@ -26,6 +27,7 @@ const hubs = new WeakMap<DesktopAPI, ChatHub>()
 const storeReleases = new WeakMap<object, () => void>()
 const disposeWrapped = new WeakSet<object>()
 const preferenceQueues = new WeakMap<object, Map<string, Promise<void>>>()
+const knowledgePreferenceQueues = new WeakMap<object, Map<string, Promise<void>>>()
 const mediaQueues = new WeakMap<object, Map<string, Promise<void>>>()
 const closedMediaAdmissions = new WeakMap<object, Set<string>>()
 let localMessageSequence = 0
@@ -194,6 +196,7 @@ export const useChatStore = defineStore('chat', {
     messagesByConversation: {} as Record<string, UiChatMessage[]>,
     draftsByConversation: {} as Record<string, MediaAsset[]>,
     preferencesByConversation: {} as Record<string, ConversationGenerationPreferences>,
+    knowledgeSelectionsByConversation: {} as Record<string, KnowledgeSelection>,
     pendingRequestByConversation: {} as Record<string, true>,
     activeRequestByConversation: {} as Record<string, string>,
     awaitingResponseByConversation: {} as Record<string, true>,
@@ -201,11 +204,13 @@ export const useChatStore = defineStore('chat', {
     _terminalRequests: {} as Record<string, true>,
     loading: false,
     error: '' as string,
+    knowledgeSelectionError: '' as string,
     _loadVersion: 0,
     _selectionVersion: 0,
     _messageVersions: {} as Record<string, number>,
     _messageLoadVersions: {} as Record<string, number>,
     _preferenceVersions: {} as Record<string, number>,
+    _knowledgePreferenceVersions: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
   }),
@@ -217,6 +222,10 @@ export const useChatStore = defineStore('chat', {
     drafts(state): MediaAsset[] { return state.draftsByConversation[state.selectedConversationId] ?? [] },
     preferences(state): ConversationGenerationPreferences {
       return state.preferencesByConversation[state.selectedConversationId] ?? defaultGenerationPreferences()
+    },
+    knowledgeSelection(state): KnowledgeSelection {
+      return state.knowledgeSelectionsByConversation[state.selectedConversationId]
+        ?? { knowledgeBaseIds: [], knowledgeMode: 'mixed' }
     },
     isRunning(state): boolean {
       const conversationId = state.selectedConversationId
@@ -242,6 +251,7 @@ export const useChatStore = defineStore('chat', {
       this.messagesByConversation = {}
       this.draftsByConversation = {}
       this.preferencesByConversation = {}
+      this.knowledgeSelectionsByConversation = {}
       this.pendingRequestByConversation = {}
       this.activeRequestByConversation = {}
       this.awaitingResponseByConversation = {}
@@ -250,9 +260,11 @@ export const useChatStore = defineStore('chat', {
       this._messageVersions = {}
       this._messageLoadVersions = {}
       this._preferenceVersions = {}
+      this._knowledgePreferenceVersions = {}
       closedMediaAdmissions.delete(this)
       this.loading = false
       this.error = ''
+      this.knowledgeSelectionError = ''
     },
     ensureSubscriptions() {
       if (this._subscribed) return
@@ -309,6 +321,9 @@ export const useChatStore = defineStore('chat', {
         closedAdmissions(this).delete(conversation.id)
         this.selectedConversationId = conversation.id
         this._selectionVersion += 1
+        this.knowledgeSelectionsByConversation[conversation.id] = {
+          knowledgeBaseIds: [], knowledgeMode: 'mixed',
+        }
         await this.loadGenerationPreferences(conversation.id)
       } catch (error) { this.error = displayError(error, '创建会话失败') }
     },
@@ -336,6 +351,7 @@ export const useChatStore = defineStore('chat', {
           delete this.messagesByConversation[id]
           delete this.draftsByConversation[id]
           delete this.preferencesByConversation[id]
+          delete this.knowledgeSelectionsByConversation[id]
           delete this.pendingRequestByConversation[id]
           delete this.activeRequestByConversation[id]
           delete this.awaitingResponseByConversation[id]
@@ -343,6 +359,7 @@ export const useChatStore = defineStore('chat', {
           delete this._messageVersions[id]
           delete this._messageLoadVersions[id]
           this._preferenceVersions[id] = (this._preferenceVersions[id] ?? 0) + 1
+          this._knowledgePreferenceVersions[id] = (this._knowledgePreferenceVersions[id] ?? 0) + 1
           if (this.selectedConversationId === id) {
             this.selectedConversationId = this.conversations[0]?.id ?? ''
             this._selectionVersion += 1
@@ -412,6 +429,67 @@ export const useChatStore = defineStore('chat', {
           && this.selectedConversationId === conversationId) {
           this.error = displayError(error, '生成设置加载失败')
         }
+      }
+    },
+    async loadKnowledgeSelection(conversationId: string) {
+      if (!conversationId) return
+      this.knowledgeSelectionError = ''
+      const epoch = this._stateEpoch
+      const version = (this._knowledgePreferenceVersions[conversationId] ?? 0) + 1
+      this._knowledgePreferenceVersions[conversationId] = version
+      try {
+        const selection = await getDesktopApi().knowledge.getConversationSelection(conversationId)
+        if (epoch !== this._stateEpoch || version !== this._knowledgePreferenceVersions[conversationId]) return
+        this.knowledgeSelectionsByConversation[conversationId] = {
+          knowledgeBaseIds: [...selection.knowledgeBaseIds],
+          knowledgeMode: selection.knowledgeMode,
+        }
+      } catch (error) {
+        if (epoch === this._stateEpoch
+          && version === this._knowledgePreferenceVersions[conversationId]
+          && this.selectedConversationId === conversationId) {
+          this.knowledgeSelectionError = displayError(error, '知识库选择加载失败')
+        }
+      }
+    },
+    async updateKnowledgeSelection(conversationId: string, selection: KnowledgeSelection) {
+      if (!conversationId) return
+      const epoch = this._stateEpoch
+      const version = (this._knowledgePreferenceVersions[conversationId] ?? 0) + 1
+      this._knowledgePreferenceVersions[conversationId] = version
+      const snapshot: KnowledgeSelection = {
+        knowledgeBaseIds: [...selection.knowledgeBaseIds],
+        knowledgeMode: selection.knowledgeMode,
+      }
+      this.knowledgeSelectionsByConversation[conversationId] = snapshot
+      this.knowledgeSelectionError = ''
+      let queues = knowledgePreferenceQueues.get(this)
+      if (!queues) {
+        queues = new Map()
+        knowledgePreferenceQueues.set(this, queues)
+      }
+      const previous = queues.get(conversationId) ?? Promise.resolve()
+      let saved: KnowledgeSelection | undefined
+      const operation = previous.catch(() => undefined).then(async () => {
+        saved = await getDesktopApi().knowledge.updateConversationSelection(conversationId, snapshot)
+      })
+      const settled = operation.catch(() => undefined)
+      queues.set(conversationId, settled)
+      try {
+        await operation
+        if (saved && epoch === this._stateEpoch
+          && version === this._knowledgePreferenceVersions[conversationId]) {
+          this.knowledgeSelectionsByConversation[conversationId] = {
+            knowledgeBaseIds: [...saved.knowledgeBaseIds],
+            knowledgeMode: saved.knowledgeMode,
+          }
+        }
+      } catch (error) {
+        if (epoch === this._stateEpoch && this.selectedConversationId === conversationId) {
+          this.knowledgeSelectionError = displayError(error, '知识库选择保存失败')
+        }
+      } finally {
+        if (queues.get(conversationId) === settled) queues.delete(conversationId)
       }
     },
     async updateGenerationPreferences(

@@ -1209,6 +1209,9 @@ describe('workbench authentication entry', () => {
     auth.session = adminSession
     await flushPromises()
     expect(wrapper.find('[aria-label="用户管理"]').exists()).toBe(true)
+    expect(wrapper.findAll('[data-testid="app-nav-item"]').map((item) => item.text())).toEqual([
+      '聊天', '知识库', '工作流', '开发', '执行记录', '用户管理', '设置',
+    ])
     auth.session = {
       ...adminSession,
       authorization: { ...adminSession.authorization!, confirmed: false },

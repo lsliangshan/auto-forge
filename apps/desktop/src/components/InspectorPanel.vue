@@ -15,7 +15,41 @@
       </button>
     </header>
     <div class="inspector-content af-scrollbar">
-      <template v-if="route.name === 'executions' || execution.selectedId">
+      <template v-if="route.name === 'knowledge'">
+        <div v-if="knowledge.versionsLoading" class="inspector-state">正在加载版本…</div>
+        <template v-else-if="knowledge.selectedDocument">
+          <section>
+            <span class="af-panel-heading">文件</span>
+            <p class="breakable">{{ knowledge.selectedDocument.name }}</p>
+            <p class="muted">{{ knowledge.selectedDocument.mimeType }}</p>
+          </section>
+          <section>
+            <span class="af-panel-heading">处理与索引</span>
+            <p>{{ knowledgeDocumentStatus }}</p>
+            <p class="muted">处理位置：{{ knowledge.selectedBase?.kind === 'cloud' ? 'CloudBase' : '本机' }}</p>
+            <p class="muted">检索：{{ knowledge.selectedBase?.kind === 'cloud' && knowledge.consent?.status === 'granted' ? '已同步' : '关键词检索' }}</p>
+          </section>
+          <section>
+            <span class="af-panel-heading">不可变版本</span>
+            <ol v-if="knowledge.versions.length" class="version-list">
+              <li v-for="version in knowledge.versions" :key="version.id">
+                <span>版本 {{ version.number }}</span>
+                <small>{{ versionStatusLabel(version.status) }} · {{ new Date(version.createdAt).toLocaleString('zh-CN') }}</small>
+              </li>
+            </ol>
+            <p v-else class="muted">暂无可见版本</p>
+          </section>
+          <section v-if="knowledge.selectedDocument.status === 'failed'" class="knowledge-error-detail">
+            <span class="af-panel-heading">可操作错误</span>
+            <p>处理失败。原有已就绪版本仍可用；可替换文件重试，或移入回收站。</p>
+          </section>
+          <section v-if="knowledge.operationError" class="knowledge-error-detail" role="alert">
+            <span class="af-panel-heading">操作失败</span><p>{{ knowledge.operationError }}</p>
+          </section>
+        </template>
+        <div v-else class="inspector-state">选择文件后查看元数据、版本、同步和错误状态。</div>
+      </template>
+      <template v-else-if="route.name === 'executions' || execution.selectedId">
         <div
           v-if="execution.selectedDetailLoading"
           class="inspector-state"
@@ -172,6 +206,7 @@ import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useExecutionStore } from '../stores/execution'
+import { useKnowledgeStore } from '../stores/knowledge'
 import { useWorkflowStore } from '../stores/workflow'
 import DebugPanel from './developer/DebugPanel.vue'
 
@@ -180,8 +215,14 @@ defineEmits<{ close: [] }>()
 const route = useRoute()
 const chat = useChatStore()
 const execution = useExecutionStore()
+const knowledge = useKnowledgeStore()
 const workflow = useWorkflowStore()
-const inspectorTitle = computed(() => route.name === 'executions' ? '执行详情' : route.name === 'workflows' ? '工作流信息' : route.name === 'developer' ? '开发输出' : '任务详情')
+const inspectorTitle = computed(() => route.name === 'knowledge' ? '文件详情' : route.name === 'executions' ? '执行详情' : route.name === 'workflows' ? '工作流信息' : route.name === 'developer' ? '开发输出' : '任务详情')
+const knowledgeDocumentStatus = computed(() => ({
+  queued: '排队中', copying: '复制中', uploading: '上传中', parsing: '解析中', indexing: '索引中',
+  ready: '已就绪', failed: '处理失败', paused: '已暂停', deleted: '已删除',
+})[knowledge.selectedDocument?.status ?? 'ready'])
+const versionStatusLabel = (status: string) => ({ staging: '处理中', ready: '已就绪', failed: '失败', retired: '已退役' })[status] ?? status
 const isCancellable = computed(() => execution.selectedDetail && ['queued', 'awaiting_approval', 'running'].includes(execution.selectedDetail.status))
 const statusLabel = (status: string) => ({ queued: '排队中', awaiting_approval: '等待授权', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' })[status] ?? status
 const formatScope = (scope: { origins?: string[]; paths?: string[] }) => scope.origins?.join('、') ?? scope.paths?.join('、') ?? '无附加范围'
@@ -207,6 +248,7 @@ const formatData = (value: unknown) => {
 .permission-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.permission-list li { font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }.permission-list small { display: block; margin-top: 2px; color: var(--af-text-muted); font-family: inherit; }
 .hash { font-family: ui-monospace, monospace; font-size: 10px !important; }.recent-list { display: grid; gap: 7px; margin: 9px 0 0; padding: 0; list-style: none; }.recent-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }.recent-list small { color: var(--af-text-muted); }
 .inspector-state { padding: 36px 10px; color: var(--af-text-muted); font-size: 13px; line-height: 1.6; text-align: center; }
+.version-list { display: grid; gap: 8px; margin: 9px 0 0; padding: 0; list-style: none; }.version-list li { display: grid; gap: 2px; font-size: 12px; }.version-list small { color: var(--af-text-muted); font-size: 10px; }.knowledge-error-detail p { color: var(--af-danger); }
 @media (max-width: 1179px) {
   .inspector { position: fixed; z-index: 25; top: 0; right: 0; box-shadow: -12px 0 28px rgb(25 32 44 / 16%); }
   .inspector.open { display: block; }
