@@ -92,6 +92,7 @@ function responseMatchesContext(response: ParserResponse, context: ParserRespons
   if (response.chunks.reduce((total, chunk) => total + chunk.text.length, 0) > limits.maxTextChars) return false
   const ids = new Set<string>()
   let idCharacters = 0
+  let coordinateCharacters = 0
   for (const block of response.blocks) {
     if (ids.has(block.id)) return false
     ids.add(block.id)
@@ -102,10 +103,18 @@ function responseMatchesContext(response: ParserResponse, context: ParserRespons
     if (coordinate.kind === 'pdf' && (coordinate.page > limits.maxPages || coordinate.itemStart > coordinate.itemEnd || coordinate.itemEnd > limits.maxTextChars)) return false
     if (coordinate.kind === 'txt' && (coordinate.lineStart > coordinate.lineEnd || coordinate.lineEnd > limits.maxTextChars + 1 || coordinate.charStart > coordinate.charEnd || coordinate.charEnd > limits.maxTextChars)) return false
     if ((coordinate.kind === 'markdown' || coordinate.kind === 'html') && coordinate.blockIndex >= limits.maxBlocks) return false
+    if (coordinate.kind === 'docx') coordinateCharacters += coordinate.paragraphId.length + coordinate.headingPath.reduce((total, part) => total + part.length, 0)
+    if (coordinate.kind === 'markdown' || coordinate.kind === 'html') coordinateCharacters += coordinate.path.reduce((total, part) => total + part.length, 0)
+    if (coordinateCharacters > limits.maxTextChars + response.blocks.length * 128) return false
   }
+  let referenceCount = 0
+  let referenceCharacters = 0
   for (const [index, chunk] of response.chunks.entries()) {
     if (chunk.index !== index || chunk.text.length > limits.maxChunkChars || chunk.blockIds.length > Math.min(256, limits.maxBlocks)) return false
     if (chunk.blockIds.some(id => !ids.has(id))) return false
+    referenceCount += chunk.blockIds.length
+    referenceCharacters += chunk.blockIds.reduce((total, id) => total + id.length, 0)
+    if (referenceCount > response.chunks.length || referenceCharacters > response.chunks.length * 128) return false
   }
   return true
 }

@@ -31,22 +31,55 @@ function enforce(document: ParsedDocument, limits: ParserLimits): ParsedDocument
 
 const DROPPED_MARKDOWN_HTML = new Set(['script', 'style', 'noscript', 'template', 'iframe', 'object', 'embed', 'svg', 'math'])
 
-function textOf(node: MarkdownNode, depths = new Map<string, number>()): string {
-  if (node.type === 'html') return ''
-  if (typeof node.value === 'string') return node.value
+interface MarkdownHtmlState {
+  readonly depths: Map<string, number>
+  pendingTag: string
+}
+
+function consumeMarkdownHtml(value: string, state: MarkdownHtmlState): void {
+  const source = state.pendingTag + value
+  state.pendingTag = ''
+  for (let start = source.indexOf('<'); start >= 0; start = source.indexOf('<', start + 1)) {
+    let quote = ''
+    let end = start + 1
+    for (; end < source.length; end += 1) {
+      const character = source[end]!
+      if (quote) {
+        if (character === quote) quote = ''
+      } else if (character === '"' || character === "'") {
+        quote = character
+      } else if (character === '>') {
+        break
+      }
+    }
+    if (end >= source.length) {
+      state.pendingTag = source.slice(start)
+      return
+    }
+    const boundary = source.slice(start + 1, end).trim()
+    start = end
+    const closing = boundary.startsWith('/')
+    const match = boundary.match(/^\/?\s*([a-z0-9-]+)\b/i)
+    const tag = match?.[1]?.toLowerCase()
+    if (!tag || !DROPPED_MARKDOWN_HTML.has(tag)) continue
+    if (closing) state.depths.set(tag, Math.max(0, (state.depths.get(tag) ?? 0) - 1))
+    else if (!boundary.endsWith('/')) state.depths.set(tag, (state.depths.get(tag) ?? 0) + 1)
+  }
+}
+
+function markdownHtmlActive(state: MarkdownHtmlState): boolean {
+  return [...state.depths.values()].some(depth => depth > 0)
+}
+
+function textOf(node: MarkdownNode, state: MarkdownHtmlState): string {
+  if (node.type === 'html') {
+    consumeMarkdownHtml(node.value ?? '', state)
+    return ''
+  }
+  if (typeof node.value === 'string') return markdownHtmlActive(state) ? '' : node.value
   let output = ''
   for (const child of node.children ?? []) {
-    if (child.type === 'html') {
-      for (const match of child.value?.matchAll(/<\s*(\/?)\s*([a-z0-9-]+)\b([^>]*)>/gi) ?? []) {
-        const tag = match[2]?.toLowerCase()
-        if (!tag || !DROPPED_MARKDOWN_HTML.has(tag)) continue
-        if (match[1]) depths.set(tag, Math.max(0, (depths.get(tag) ?? 0) - 1))
-        else if (!match[3]?.trimEnd().endsWith('/')) depths.set(tag, (depths.get(tag) ?? 0) + 1)
-      }
-      continue
-    }
-    if ([...depths.values()].some(depth => depth > 0)) continue
-    output += textOf(child, depths)
+    output += textOf(child, state)
   }
   return output
 }
@@ -70,9 +103,9 @@ function parseMarkdown(bytes: Uint8Array): ParsedDocument {
   try { root = unified().use(remarkParse).parse(source) as MarkdownNode } catch { throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT') }
   const blocks: ParserBlock[] = []
   const headings: string[] = []
+  const htmlState: MarkdownHtmlState = { depths: new Map(), pendingTag: '' }
   for (const node of root.children ?? []) {
-    if (node.type === 'html') continue
-    const text = normalized(textOf(node))
+    const text = normalized(textOf(node, htmlState))
     if (!text) continue
     if (node.type === 'heading') {
       const depth = node.depth ?? 1
@@ -247,6 +280,7 @@ async function parsePdf(bytes: Uint8Array, limits: ParserLimits): Promise<Parsed
       verbosity: 0,
     })
     const document = await task.promise
+    if (await document.getPermissions() !== null) throw new DocumentParserError('PARSER_ENCRYPTED_DOCUMENT')
     if (document.numPages > limits.maxPages) throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
     const blocks: ParserBlock[] = []
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {

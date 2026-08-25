@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { deflateSync } from 'node:zlib'
+import { brotliCompressSync, deflateSync } from 'node:zlib'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -56,10 +56,8 @@ function minimalPdf(text?: string): Uint8Array {
   return new TextEncoder().encode(body)
 }
 
-function compressedPdf(text: string): Uint8Array {
-  const decoded = Buffer.from(`BT /F1 12 Tf 72 720 Td (${text}) Tj ET`)
-  const compressed = deflateSync(decoded)
-  const beforeStream = Buffer.from('<< /Filter /FlateDecode /Length ' + compressed.length + ' >>\nstream\n')
+function filteredPdf(filter: 'FlateDecode' | 'BrotliDecode', compressed: Uint8Array): Uint8Array {
+  const beforeStream = Buffer.from(`<< /Filter /${filter} /Length ${compressed.length} >>\nstream\n`)
   const streamObject = Buffer.concat([beforeStream, compressed, Buffer.from('\nendstream')])
   const objects = [
     Buffer.from('<< /Type /Catalog /Pages 2 0 R >>'),
@@ -80,6 +78,10 @@ function compressedPdf(text: string): Uint8Array {
   const xref = length
   const trailer = Buffer.from(`xref\n0 6\n0000000000 65535 f \n${offsets.map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`)
   return Buffer.concat([...parts, trailer])
+}
+
+function compressedPdf(text: string): Uint8Array {
+  return filteredPdf('FlateDecode', deflateSync(Buffer.from(`BT /F1 12 Tf 72 720 Td (${text}) Tj ET`)))
 }
 
 const PDF_PASSWORD_PADDING = Buffer.from([
@@ -106,10 +108,10 @@ function rc4(key: Uint8Array, input: Uint8Array): Buffer {
   return output
 }
 
-function passwordProtectedPdf(): Uint8Array {
+function passwordProtectedPdf(password = 'test'): Uint8Array {
   const pad = (password: string) => Buffer.concat([Buffer.from(password, 'ascii'), PDF_PASSWORD_PADDING]).subarray(0, 32)
   const digest = (...parts: Uint8Array[]) => createHash('md5').update(Buffer.concat(parts)).digest()
-  const userPassword = pad('test')
+  const userPassword = pad(password)
   const ownerKey = digest(pad('owner')).subarray(0, 5)
   const ownerEntry = rc4(ownerKey, userPassword)
   const permissions = Buffer.alloc(4)
@@ -192,6 +194,20 @@ describe('sandbox parser core', () => {
     expect(JSON.stringify(html)).not.toContain('bad')
   })
 
+  it('keeps dangerous Markdown HTML state quote-aware across the whole document', async () => {
+    const quoted = await parseEncryptedDocument(await encryptedRequest('markdown', new TextEncoder().encode(
+      'Before <script title="/>">evil()</script> after',
+    )))
+    expect(quoted).toMatchObject({ type: 'result', text: 'Before after' })
+    expect(JSON.stringify(quoted)).not.toContain('evil')
+
+    const split = await parseEncryptedDocument(await encryptedRequest('markdown', new TextEncoder().encode(
+      'Before <script>\n\nevil across paragraphs\n\n</script> after',
+    )))
+    expect(split).toMatchObject({ type: 'result', text: 'Before\nafter' })
+    expect(JSON.stringify(split)).not.toContain('evil')
+  })
+
   it('parses a DOCX paragraph without exposing images or external files', async () => {
     const mammothEntry = require.resolve('mammoth')
     const fixture = await readFile(join(dirname(mammothEntry), '../test/test-data/single-paragraph.docx'))
@@ -216,6 +232,7 @@ describe('sandbox parser core', () => {
     expect(scanned).toMatchObject({ type: 'error', code: 'PARSER_SCANNED_DOCUMENT' })
     const encrypted = passwordProtectedPdf()
     expect(await parseEncryptedDocument(await encryptedRequest('pdf', encrypted))).toMatchObject({ type: 'error', code: 'PARSER_ENCRYPTED_DOCUMENT' })
+    expect(await parseEncryptedDocument(await encryptedRequest('pdf', passwordProtectedPdf('')))).toMatchObject({ type: 'error', code: 'PARSER_ENCRYPTED_DOCUMENT' })
     expect(await parseEncryptedDocument(await encryptedRequest('pdf', minimalPdf('/Encrypt is ordinary text')))).toMatchObject({ type: 'result', text: '/Encrypt is ordinary text' })
   })
 
@@ -225,6 +242,34 @@ describe('sandbox parser core', () => {
     expect(await parseEncryptedDocument(await encryptedRequest('pdf', expanding, limits))).toMatchObject({
       type: 'error', code: 'PARSER_LIMIT_EXCEEDED',
     })
+  })
+
+  it('fails closed before invoking the synchronous Brotli fallback under a hard budget', async () => {
+    const native = Object.getOwnPropertyDescriptor(globalThis, 'DecompressionStream')
+    class NoNativeBrotli extends DecompressionStream {
+      constructor(format: CompressionFormat) {
+        if (String(format) === 'brotli') throw new TypeError('forced native Brotli failure')
+        super(format)
+      }
+    }
+    Object.defineProperty(globalThis, 'DecompressionStream', { configurable: true, value: NoNativeBrotli })
+    try {
+      const limits = { ...DEFAULT_PARSER_LIMITS, maxDecompressedBytes: 256 }
+      const expandingBrotli = filteredPdf('BrotliDecode', brotliCompressSync(Buffer.from('A'.repeat(2_048))))
+      expect(await parseEncryptedDocument(await encryptedRequest('pdf', expandingBrotli, limits))).toMatchObject({
+        type: 'error', code: 'PARSER_LIMIT_EXCEEDED',
+      })
+      const invalidBrotli = filteredPdf('BrotliDecode', Uint8Array.of(0xff, 0xff, 0xff, 0xff))
+      expect(await parseEncryptedDocument(await encryptedRequest('pdf', invalidBrotli, limits))).toMatchObject({
+        type: 'error', code: 'PARSER_LIMIT_EXCEEDED',
+      })
+      const workerSource = await readFile(require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs'), 'utf8')
+      const brotliMethod = workerSource.slice(workerSource.indexOf('class BrotliStream'), workerSource.indexOf(';// ./external/jbig2'))
+      expect(brotliMethod.indexOf('if (maxDecodedStreamBytes > 0)')).toBeGreaterThan(0)
+      expect(brotliMethod.indexOf('if (maxDecodedStreamBytes > 0)')).toBeLessThan(brotliMethod.indexOf('this.#isAsync = false'))
+    } finally {
+      if (native) Object.defineProperty(globalThis, 'DecompressionStream', native)
+    }
   })
 
   it('rejects malformed, oversized, and unsupported content with stable errors', async () => {

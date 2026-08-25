@@ -19,7 +19,7 @@ index 1529140e3b8a97c852c73a69802b331969447959..04fbabe874503b64a3585cd86a0d7246
      rangeChunkSize,
      docBaseUrl,
 diff --git a/legacy/build/pdf.worker.mjs b/legacy/build/pdf.worker.mjs
-index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..0da355cc077f504c4368ec4dcc93df2fbb106293 100644
+index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..6dcf222c8cdff261b808b46fc29b71675ec8757e 100644
 --- a/legacy/build/pdf.worker.mjs
 +++ b/legacy/build/pdf.worker.mjs
 @@ -9373,4 +9373,16 @@ class ImageResizer {
@@ -64,7 +64,17 @@ index ff381bb9b154685f8ed641b6c1adabb4c732e1f3..0da355cc077f504c4368ec4dcc93df2f
      this.buffer = new Uint8Array(decodedData.buffer, decodedData.byteOffset, decodedData.length);
      this.bufferLength = this.buffer.length;
      this.eof = true;
-@@ -70364,6 +70380,7 @@ class WorkerMessageHandler {
+@@ -15023,6 +15039,9 @@ class BrotliStream extends DecodeStream {
+     if (decompressed) {
+       return decompressed;
+     }
++    if (maxDecodedStreamBytes > 0) {
++      throw new FormatError("PDF decoded stream limit exceeded");
++    }
+     this.#isAsync = false;
+     this.stream = new Stream(compressed, 0, compressed.length, this.stream.dict);
+     this.reset();
+@@ -70364,6 +70383,7 @@ class WorkerMessageHandler {
      handler.on("GetDocRequest", data => this.createDocumentHandler(data, port));
    }
    static createDocumentHandler(docParams, port) {

@@ -52,4 +52,23 @@ describe('knowledge parser protocol', () => {
       chunks: [{ index: 0, text: '123', blockIds: ['line-1'] }],
     }, { jobId: 'job-1', format: 'txt', limits: DEFAULT_PARSER_LIMITS })).toThrow(/protocol/i)
   })
+
+  it('rejects aggregate coordinate metadata and repeated block-id amplification', () => {
+    const limits = { ...DEFAULT_PARSER_LIMITS, maxTextChars: 2, maxBlocks: 2, maxChunks: 2 }
+    const longPath = Array.from({ length: 32 }, () => 'x'.repeat(512))
+    const blocks = [
+      { id: 'a', text: 'a', coordinate: { kind: 'markdown', path: longPath, blockIndex: 0 } },
+      { id: 'b', text: 'b', coordinate: { kind: 'markdown', path: longPath, blockIndex: 1 } },
+    ]
+    expect(() => parseParserResponse({
+      version: 1, type: 'result', jobId: 'job-1', text: 'ab', blocks,
+      chunks: [{ index: 0, text: 'a', blockIds: ['a'] }, { index: 1, text: 'b', blockIds: ['b'] }],
+    }, { jobId: 'job-1', format: 'markdown', limits })).toThrow(/protocol/i)
+
+    expect(() => parseParserResponse({
+      version: 1, type: 'result', jobId: 'job-1', text: 'ab',
+      blocks: blocks.map(block => ({ ...block, coordinate: { ...block.coordinate, path: [] } })),
+      chunks: [{ index: 0, text: 'a', blockIds: ['a', 'a'] }, { index: 1, text: 'b', blockIds: ['b', 'b'] }],
+    }, { jobId: 'job-1', format: 'markdown', limits })).toThrow(/protocol/i)
+  })
 })
