@@ -245,7 +245,6 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
   }
   if (name === 'switchUser') {
     const user = fixtureUser(String(input.user))
-    await runtime.services.auth.logout()
     return runtime.services.auth.loginWithPassword({ account: user, password })
   }
   if (name === 'refreshConversations') {

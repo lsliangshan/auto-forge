@@ -23,6 +23,21 @@
         aria-label="搜索会话"
       />
       <div
+        v-if="stalledConversation"
+        class="durable-sync-warning"
+        data-testid="durable-sync-warning"
+        role="alert"
+      >
+        <span>同步已停滞超过 24 小时</span>
+        <button
+          type="button"
+          data-testid="retry-durable-sync"
+          @click="chat.retrySync(stalledConversation.id)"
+        >
+          立即重试
+        </button>
+      </div>
+      <div
         v-if="chat.loading"
         class="sidebar-state"
       >
@@ -275,6 +290,9 @@ const conversationGroups = computed(() => {
   }
   return [...groups].map(([label, items]) => ({ label, items }))
 })
+const stalledConversation = computed(() => chat.conversations
+  .filter((conversation) => conversation.syncWarningSince !== undefined)
+  .sort((left, right) => left.syncWarningSince!.localeCompare(right.syncWarningSince!))[0])
 const syncStateLabel: Record<SyncState, string> = {
   synced: '同步完成', pending: '等待同步', syncing: '正在同步', failed: '同步失败',
 }
@@ -401,6 +419,8 @@ onBeforeUnmount(detachSettingsScrollSync)
 .conversation-select { display: flex; min-width: 0; align-items: center; gap: 8px; border: 0; padding: 9px 8px; color: inherit; background: transparent; cursor: pointer; text-align: left; }
 .conversation-sync-status { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--af-text-muted); }
 .conversation-sync-status.is-synced { background: var(--af-success); }.conversation-sync-status.is-pending { background: var(--af-warning); }.conversation-sync-status.is-syncing { background: var(--af-cobalt); box-shadow: 0 0 0 2px var(--af-cobalt-soft); }.conversation-sync-status.is-failed { background: var(--af-danger); }
+.durable-sync-warning { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; color: var(--af-warning-strong); background: var(--af-warning-soft); border-radius: 8px; font-size: 12px; }
+.durable-sync-warning button { color: inherit; background: none; border: 0; padding: 0; font: inherit; text-decoration: underline; cursor: pointer; }
 .conversation-action { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 4px; color: var(--af-text-muted); background: transparent; cursor: pointer; opacity: 0; }
 .conversation-row:hover .conversation-action, .conversation-action:focus-visible, .conversation-action.sync-retry { opacity: 1; }.conversation-action:hover { color: var(--af-cobalt); background: var(--af-surface); }.conversation-action.danger:hover { color: var(--af-danger); }.conversation-action.sync-retry { color: var(--af-danger); }
 .conversation-more { padding: 8px 4px; text-align: center; }.conversation-more button { border: 0; color: var(--af-cobalt); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }

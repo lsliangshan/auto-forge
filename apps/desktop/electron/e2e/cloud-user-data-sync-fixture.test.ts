@@ -75,6 +75,40 @@ function legacyImport(title: string) {
 }
 
 describe('cloud user-data local double receipt identity', () => {
+  it('duplicates only byte-identical immutable message content under a reused message id', async () => {
+    fixture = await startCloudUserDataFixture()
+    const create = createMutation('Message parent')
+    const message = {
+      id: 'message_mutation_original', kind: 'message.append', entityId: 'reused_message_id',
+      baseRevision: 1, occurredAt: '2026-08-25T00:01:00.000Z',
+      payload: {
+        id: 'reused_message_id', conversationId: create.entityId, role: 'user',
+        blocks: [{ type: 'text', text: 'Original body' }],
+        executionId: 'execution_original', createdAt: '2026-08-25T00:01:00.000Z',
+      },
+    }
+    await call({ action: 'syncPush', mutations: [create] })
+    expect((await call({ action: 'syncPush', mutations: [message] })).data.results).toEqual([
+      { id: message.id, status: 'applied', revision: 2 },
+    ])
+    expect((await call({ action: 'syncPush', mutations: [{
+      ...message, id: 'message_mutation_identical', baseRevision: 2,
+    }] })).data.results).toEqual([
+      { id: 'message_mutation_identical', status: 'duplicate', revision: 2 },
+    ])
+    expect((await call({ action: 'syncPush', mutations: [{
+      ...message, id: 'message_mutation_mismatch', baseRevision: 99,
+      payload: {
+        ...message.payload,
+        conversationId: 'missing_conversation',
+        blocks: [{ type: 'text', text: 'Changed body' }],
+      },
+    }] })).data.results).toEqual([
+      { id: 'message_mutation_mismatch', status: 'rejected', errorCode: 'INVALID_INPUT' },
+    ])
+    expect((await call({ action: 'syncPull', limit: 100 })).data.mutations).toHaveLength(2)
+  })
+
   it('duplicates an identical mutation but rejects changed content under the same ID', async () => {
     fixture = await startCloudUserDataFixture()
     const original = createMutation('原始标题')

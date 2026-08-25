@@ -387,8 +387,8 @@ describe('openAppDatabase', () => {
     `).run()
     seed.prepare(`
       INSERT INTO executions (
-        id, workflow_id, workflow_version, status, input_json, created_at
-      ) VALUES ('legacy_execution', 'workflow', '1.0.0', 'completed', '{}', 1)
+        id, owner_user_id, workflow_id, workflow_version, status, input_json, created_at
+      ) VALUES ('legacy_execution', 'legacy-user', 'workflow', '1.0.0', 'completed', '{}', 1)
     `).run()
     seed.close()
     const database = openProductionAppDatabase(path)
@@ -576,12 +576,13 @@ describe('openAppDatabase', () => {
 
     database.executions.insert({
       id: 'exec_1',
+      ownerUserId: 'test-user',
       status: 'running',
       workflowId: 'w',
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     const inspection = new Database(path, { readonly: true })
     expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
       .map(({ table, on_delete }) => ({ table, on_delete })))
@@ -622,6 +623,7 @@ describe('openAppDatabase', () => {
     const database = openProductionAppDatabase(path)
     expect(() => database.executions.insert({
       id: 'user_cache_execution',
+      ownerUserId: 'execution_boundary_user',
       workflowId: 'workflow.boundary',
       workflowVersion: '1.0.0',
       chatRunId: 'user_cache_run_not_in_global_chat_runs',
@@ -646,14 +648,15 @@ describe('openAppDatabase', () => {
     })
     expect(database.chatRuns.get('user_cache_run_not_in_global_chat_runs')).toBeUndefined()
     expect(database.chatRuns.get('updated_user_cache_run_not_in_global_chat_runs')).toBeUndefined()
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     database.close()
 
     const inspection = new Database(path)
     inspection.pragma('foreign_keys = ON')
     const after = tableSnapshot(inspection)
     expect(after.executions).toEqual([
-      ...(before.executions as unknown[]),
+      ...(before.executions as Array<Record<string, unknown>>)
+        .map((execution) => ({ ...execution, owner_user_id: null })),
       expect.objectContaining({
         id: 'user_cache_execution',
         chat_run_id: 'updated_user_cache_run_not_in_global_chat_runs',
@@ -692,6 +695,47 @@ describe('openAppDatabase', () => {
     inspection.close()
   })
 
+  it('migrates legacy executions as unowned and requires trusted ownership for new rows', () => {
+    const path = createV12ExecutionBoundaryDatabase()
+    const database = openProductionAppDatabase(path)
+
+    expect(database.executions.getForUser('legacy_execution', 'execution_boundary_user'))
+      .toBeUndefined()
+    expect(database.executions.listForUser('execution_boundary_user')).toEqual([])
+    expect(() => database.executions.insert({
+      id: 'missing_owner_execution',
+      workflowId: 'workflow.boundary',
+      workflowVersion: '1.0.0',
+      status: 'completed',
+    } as never)).toThrow()
+    expect(database.executions.insert({
+      id: 'owned_execution',
+      ownerUserId: 'execution_boundary_user',
+      workflowId: 'workflow.boundary',
+      workflowVersion: '1.0.0',
+      status: 'completed',
+    })).toMatchObject({ id: 'owned_execution', ownerUserId: 'execution_boundary_user' })
+    expect(database.executions.getForUser('owned_execution', 'other_user')).toBeUndefined()
+    expect(database.executions.updateForUser(
+      'owned_execution', 'other_user', { status: 'cancelled' },
+    )).toBeUndefined()
+    expect(database.executions.getForUser('owned_execution', 'execution_boundary_user'))
+      .toMatchObject({ status: 'completed' })
+    expect(database.executionSteps.listForUser('owned_execution', 'other_user')).toEqual([])
+    expect(database.executionLogs.listForUser('owned_execution', 'other_user')).toEqual([])
+    expect(database.schemaVersion()).toBe(14)
+    database.close()
+
+    const inspection = new Database(path, { readonly: true })
+    expect(inspection.prepare(
+      "SELECT owner_user_id FROM executions WHERE id = 'legacy_execution'",
+    ).get()).toEqual({ owner_user_id: null })
+    expect(inspection.prepare(
+      "SELECT owner_user_id FROM executions WHERE id = 'owned_execution'",
+    ).get()).toEqual({ owner_user_id: 'execution_boundary_user' })
+    inspection.close()
+  })
+
   it('persists redacted browser continuation audits and expires active bindings on recovery', () => {
     const database = openTestDatabase()
     insertLocalUser(database, 'browser_user', 'BrowserUser')
@@ -703,7 +747,7 @@ describe('openAppDatabase', () => {
       model: 'model', status: 'completed', startedAt: 1,
     })
     const execution = database.executions.insert({
-      id: 'browser_execution', status: 'completed', workflowId: 'gov.permit', workflowVersion: '1.0.0',
+      id: 'browser_execution', ownerUserId: 'browser_user', status: 'completed', workflowId: 'gov.permit', workflowVersion: '1.0.0',
     })
 
     const binding = database.browserTabBindings.insert({
@@ -804,7 +848,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.conversations.get('conversation_v1')).toMatchObject({
       title: 'Persisted v1',
       titleState: 'user_named',
@@ -818,7 +862,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -829,7 +873,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -849,7 +893,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -1371,6 +1415,7 @@ describe('openAppDatabase', () => {
     database.conversations.delete('conversation_usage_delete')
     database.executions.insert({
       id: 'execution_clear_all',
+      ownerUserId: 'user_retention',
       workflowId: 'workflow_clear_all',
       workflowVersion: '1.0.0',
       status: 'completed',
@@ -1438,7 +1483,7 @@ describe('openAppDatabase', () => {
     database.conversations.insert({ id: 'recovery_conversation', title: 'Recovery' })
     for (const status of ['queued', 'awaiting_approval', 'running']) {
       database.executions.insert({
-        id: `execution_${status}`, status, workflowId: 'workflow', workflowVersion: '1.0.0',
+        id: `execution_${status}`, ownerUserId: 'recovery_user', status, workflowId: 'workflow', workflowVersion: '1.0.0',
       })
       database.chatRuns.insert({
         id: `run_${status}`, conversationId: 'recovery_conversation', requestId: `request_${status}`,
@@ -1559,6 +1604,7 @@ describe('openAppDatabase', () => {
     })
     database.executions.insert({
       id: 'execution_approval_recovery', status: 'awaiting_approval',
+      ownerUserId: 'approval_recovery_user',
       workflowId: 'workflow.recovery', workflowVersion: '1.0.0',
     })
     database.chatRuns.insert({
@@ -1826,7 +1872,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(13)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)
@@ -2315,6 +2361,7 @@ describe('openAppDatabase', () => {
     insertVideo('request_valid_paused', 'paused')
     database.executions.insert({
       id: 'execution_parameters_recovery',
+      ownerUserId: 'parameters_recovery_user',
       status: 'running',
       workflowId: 'workflow',
       workflowVersion: '1.0.0',
@@ -3157,6 +3204,7 @@ describe('openAppDatabase', () => {
     const database = openTestDatabase()
     database.executions.insert({
       id: 'execution_1',
+      ownerUserId: 'execution_log_user',
       status: 'running',
       workflowId: 'workflow_1',
       workflowVersion: '1.0.0',
@@ -3181,7 +3229,7 @@ describe('openAppDatabase', () => {
 
   it('redacts complete plain-text secret values before persistence and return', () => {
     const database = openTestDatabase()
-    database.executions.insert({ id: 'execution_2', status: 'running', workflowId: 'workflow_1', workflowVersion: '1.0.0' })
+    database.executions.insert({ id: 'execution_2', ownerUserId: 'execution_log_user', status: 'running', workflowId: 'workflow_1', workflowVersion: '1.0.0' })
     const message = 'Authorization: Bearer sk-secret; X-API-Key: api-secret; token=token-secret; password=password-secret'
     const returned = database.executionLogs.insert({
       id: 'log_2',

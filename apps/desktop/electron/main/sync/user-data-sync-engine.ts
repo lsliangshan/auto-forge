@@ -22,14 +22,17 @@ const PROTOCOL_VERSION = 1 as const
 const BATCH_LIMIT = 100
 const MAX_EVENT_BYTES = 1_048_576
 const MAX_RETRY_DELAY = 5 * 60 * 1_000
+const SYNC_WARNING_AGE_MS = 24 * 60 * 60 * 1_000
 
 type TimerHandle = unknown
 
-export type UserDataSyncStatus =
+type UserDataSyncState =
   | { state: 'idle' | 'running' }
   | { state: 'paused'; errorCode?: 'AUTH_REQUIRED' }
   | { state: 'retrying'; errorCode: 'SERVICE_UNAVAILABLE'; nextRetryAt: number }
   | { state: 'quarantined'; errorCode: AppErrorCode }
+
+export type UserDataSyncStatus = UserDataSyncState & { warningSince?: number }
 
 interface SyncEngineDependencies {
   now: () => number
@@ -234,8 +237,23 @@ export class UserDataSyncEngine {
     })
   }
 
+  discard(): void {
+    const binding = this.#binding
+    ++this.#generation
+    this.#binding = undefined
+    this.#flushRequested = false
+    this.#pullRequested = false
+    this.#clearTimer()
+    if (binding) this.#syncingIds.delete(binding.generation)
+    this.#drainPromise = undefined
+    this.#status = { state: 'paused' }
+  }
+
   status(): UserDataSyncStatus {
-    return { ...this.#status }
+    const oldest = this.#binding?.store.outbox.oldestPendingOrFailedAt()
+    return oldest !== undefined && this.#dependencies.now() - oldest >= SYNC_WARNING_AGE_MS
+      ? { ...this.#status, warningSince: oldest }
+      : { ...this.#status }
   }
 
   #expectedBinding(expected: UserDataBindingToken): ActiveBinding {

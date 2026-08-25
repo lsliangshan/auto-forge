@@ -485,6 +485,7 @@ export class ExecutionService {
     const id = record.executionId
     const inserted = this.dependencies.repositories.executions.insert({
       id,
+      ownerUserId: input.userId,
       workflowId: input.workflowId,
       workflowVersion: input.workflowVersion,
       status: 'queued',

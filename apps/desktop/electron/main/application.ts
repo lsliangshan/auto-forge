@@ -226,6 +226,8 @@ export interface ApplicationRuntimeOptions {
   projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
+  /** @internal Allows deterministic bounded-logout tests. */
+  logoutSyncTimeoutMs?: number
 }
 
 interface ObservedAuthService extends AuthService {
@@ -749,6 +751,17 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     userDataLifecycleTail = operation.catch(() => undefined)
     return operation
   }
+  const prepareUserDataDiscard = (): Promise<void> => {
+    const operation = userDataLifecycleTail.then(async () => {
+      await pauseVideoJobs()
+      await pauseUserReconciliation()
+      userDataSync.discard()
+      userDataStores.close()
+      boundUserId = undefined
+    })
+    userDataLifecycleTail = operation.catch(() => undefined)
+    return operation
+  }
   const currentUserData = (): UserDataStore => {
     const current = userDataStores.current()
     if (!current) throw failure('AUTH_REQUIRED')
@@ -1163,7 +1176,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (['queued', 'awaiting_approval', 'running'].includes(event.status)) activeExecutions.add(event.executionId)
       else activeExecutions.delete(event.executionId)
     }
-    if (auth.isAuthenticated()) {
+    const ownerUserId = database.executions.get(event.executionId)?.ownerUserId
+    if (auth.isAuthenticated() && ownerUserId !== undefined && ownerUserId === auth.currentUserId()) {
       try { options.emitExecution(event) } catch { /* Renderer events are observational. */ }
     }
   }
@@ -1433,7 +1447,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
   }
-  const beforeAuthIdentityChange = async (waitForActive: () => Promise<void>): Promise<void> => {
+  const beforeAuthIdentityChange = async (
+    waitForActive: () => Promise<void>,
+    pause = true,
+  ): Promise<void> => {
     const current = await auth.getSession()
     if (current) {
       await resetBrowserIdentity(current.user.id)
@@ -1448,7 +1465,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       for (const work of titleWork) work.controller.abort()
       await Promise.all(titleWork.map(({ promise }) => promise))
       await waitForActive()
-      await pauseUserData()
+      if (pause) await pauseUserData()
       return
     }
     await waitForActive()
@@ -1466,6 +1483,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
     })
   )
+  const flushForLogout = async (): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        userDataSync.flush(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, options.logoutSyncTimeoutMs ?? 5_000)
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
 
   let settingsUpdateTail = Promise.resolve()
   const ungatedServices: DesktopIpcServices = {
@@ -1500,7 +1530,26 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await bindUserData(session)
         return session
       }),
-      logout: () => transitionIdentity(() => auth.logout()),
+      logout: (input) => userDataAdmission.transition(async (waitForActive) => {
+        const session = await auth.requireSession()
+        await beforeAuthIdentityChange(waitForActive, false)
+        if (!input?.discardPending) {
+          await flushForLogout()
+          const pendingCount = currentUserData().outbox.countPending()
+          if (pendingCount > 0) return { status: 'pending_sync' as const, pendingCount }
+          await pauseUserData()
+        } else {
+          await prepareUserDataDiscard()
+        }
+        try {
+          await auth.logout()
+        } catch (error) {
+          await bindUserData(session)
+          throw error
+        }
+        userDataStores.closeAndDelete(session.user.id)
+        return { status: 'logged_out' as const }
+      }),
       requireSession: () => userDataAdmission.run(requireAuthenticatedSession),
     },
     userAdmin: {
@@ -1966,7 +2015,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     executions: {
       list: async (query?: ExecutionQuery) => {
-        let records = database.executions.list()
+        const session = await auth.requireSession()
+        let records = database.executions.listForUser(session.user.id)
         if (query?.status) records = records.filter((execution) => execution.status === query.status)
         if (query?.workflowId) records = records.filter((execution) => execution.workflowId === query.workflowId)
         if (query?.search) records = records.filter((execution) => `${execution.id}\n${execution.workflowId}`.toLocaleLowerCase().includes(query.search!.toLocaleLowerCase()))
@@ -1975,21 +2025,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return records.map(executionSummary)
       },
       get: async (executionId) => {
-        const execution = database.executions.get(executionId)
+        const session = await auth.requireSession()
+        const execution = database.executions.getForUser(executionId, session.user.id)
         if (!execution) throw failure('NOT_FOUND')
         const result: ExecutionDetail = {
           ...executionSummary(execution),
           input: execution.input,
           ...(execution.result === undefined ? {} : { output: execution.result }),
           ...(execution.errorCode ? { error: { code: execution.errorCode, message: toSafeAppError({ code: execution.errorCode }).message } } : {}),
-          steps: database.executionSteps.list(executionId).map((step) => ({
+          steps: database.executionSteps.listForUser(executionId, session.user.id).map((step) => ({
             id: step.id,
             label: step.name,
             status: step.status as 'running' | 'completed' | 'failed',
             ...(iso(step.startedAt) ? { startedAt: iso(step.startedAt) } : {}),
             ...(iso(step.endedAt) ? { finishedAt: iso(step.endedAt) } : {}),
           })),
-          logs: database.executionLogs.list(executionId).map((log) => ({
+          logs: database.executionLogs.listForUser(executionId, session.user.id).map((log) => ({
             id: log.id,
             level: log.level as 'debug' | 'info' | 'warn' | 'error',
             message: log.message,
@@ -1999,8 +2050,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return result
       },
       decide: async (decision) => {
+        const session = await auth.requireSession()
         const agentOwned = agent.recognizesExecution(decision.executionId)
           || chatDatabase.messages.hasWorkflowApproval(decision.executionId)
+        if (!agentOwned && !database.executions.getForUser(decision.executionId, session.user.id)) {
+          throw failure('NOT_FOUND')
+        }
         let result
         try {
           result = await agent.resumeApproval(decision)
@@ -2012,6 +2067,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (result.error?.code === 'CONFLICT') await executions.decide(decision)
       },
       cancel: async (executionId) => {
+        const session = await auth.requireSession()
+        if (!database.executions.getForUser(executionId, session.user.id)) {
+          throw failure('NOT_FOUND')
+        }
         const cancelledAgent = await agent.cancelExecution(executionId)
         if (!cancelledAgent) await executions.cancel(executionId)
         await browser.closeExecution(executionId)

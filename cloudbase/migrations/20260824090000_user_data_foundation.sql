@@ -267,6 +267,7 @@ DECLARE
   payload jsonb;
   device_row app_sync_devices%ROWTYPE;
   existing_receipt app_sync_mutations%ROWTYPE;
+  existing_message app_messages%ROWTYPE;
   conversation_row app_conversations%ROWTYPE;
   preferences_row app_user_data_preferences%ROWTYPE;
   mutation_id text;
@@ -475,37 +476,54 @@ BEGIN
         mutation_status := 'rejected';
         mutation_error := 'INVALID_INPUT';
       ELSE
-        PERFORM pg_advisory_xact_lock(hashtextextended(auth_user_id::text || ':' || conversation_id, 0));
-        SELECT * INTO conversation_row
-        FROM app_conversations conversation
-        WHERE conversation.owner_user_id = auth_user_id AND conversation.id = conversation_id
-        FOR UPDATE;
-        IF NOT FOUND OR conversation_row.deleted_at IS NOT NULL
-          OR conversation_row.revision <> base_revision_value THEN
-          mutation_status := 'conflict';
-          mutation_error := 'SYNC_CONFLICT';
-        ELSIF EXISTS (
-          SELECT 1 FROM app_messages message
-          WHERE message.owner_user_id = auth_user_id AND message.id = entity_id
-        ) THEN
-          mutation_status := 'duplicate';
-          result_revision_value := conversation_row.revision;
+        PERFORM pg_advisory_xact_lock(hashtextextended(
+          auth_user_id::text || ':message:' || entity_id, 0
+        ));
+        SELECT * INTO existing_message
+        FROM app_messages message
+        WHERE message.owner_user_id = auth_user_id AND message.id = entity_id;
+        IF FOUND THEN
+          IF existing_message.conversation_id IS DISTINCT FROM conversation_id
+            OR existing_message.role IS DISTINCT FROM payload->>'role'
+            OR existing_message.blocks IS DISTINCT FROM payload->'blocks'
+            OR existing_message.execution_id IS DISTINCT FROM NULLIF(payload->>'executionId', '')
+            OR existing_message.created_at IS DISTINCT FROM (payload->>'createdAt')::timestamptz THEN
+            mutation_status := 'rejected';
+            mutation_error := 'INVALID_INPUT';
+          ELSE
+            SELECT revision INTO result_revision_value
+            FROM app_conversations conversation
+            WHERE conversation.owner_user_id = auth_user_id
+              AND conversation.id = existing_message.conversation_id;
+            mutation_status := 'duplicate';
+          END IF;
         ELSE
-          SELECT COALESCE(max(message.ordinal), 0) + 1 INTO assigned_ordinal
-          FROM app_messages message
-          WHERE message.owner_user_id = auth_user_id
-            AND message.conversation_id = conversation_id;
-          INSERT INTO app_messages(
-            id, owner_user_id, conversation_id, ordinal, role, blocks, execution_id, created_at
-          ) VALUES (
-            entity_id, auth_user_id, conversation_id, assigned_ordinal, payload->>'role',
-            payload->'blocks', NULLIF(payload->>'executionId', ''), (payload->>'createdAt')::timestamptz
-          );
-          result_revision_value := conversation_row.revision + 1;
-          UPDATE app_conversations SET
-            revision = result_revision_value,
-            last_activity_at = GREATEST(last_activity_at, (payload->>'createdAt')::timestamptz)
-          WHERE owner_user_id = auth_user_id AND id = conversation_id;
+          PERFORM pg_advisory_xact_lock(hashtextextended(auth_user_id::text || ':' || conversation_id, 0));
+          SELECT * INTO conversation_row
+          FROM app_conversations conversation
+          WHERE conversation.owner_user_id = auth_user_id AND conversation.id = conversation_id
+          FOR UPDATE;
+          IF NOT FOUND OR conversation_row.deleted_at IS NOT NULL
+            OR conversation_row.revision <> base_revision_value THEN
+            mutation_status := 'conflict';
+            mutation_error := 'SYNC_CONFLICT';
+          ELSE
+            SELECT COALESCE(max(message.ordinal), 0) + 1 INTO assigned_ordinal
+            FROM app_messages message
+            WHERE message.owner_user_id = auth_user_id
+              AND message.conversation_id = conversation_id;
+            INSERT INTO app_messages(
+              id, owner_user_id, conversation_id, ordinal, role, blocks, execution_id, created_at
+            ) VALUES (
+              entity_id, auth_user_id, conversation_id, assigned_ordinal, payload->>'role',
+              payload->'blocks', NULLIF(payload->>'executionId', ''), (payload->>'createdAt')::timestamptz
+            );
+            result_revision_value := conversation_row.revision + 1;
+            UPDATE app_conversations SET
+              revision = result_revision_value,
+              last_activity_at = GREATEST(last_activity_at, (payload->>'createdAt')::timestamptz)
+            WHERE owner_user_id = auth_user_id AND id = conversation_id;
+          END IF;
         END IF;
       END IF;
 
@@ -1279,6 +1297,48 @@ EXCEPTION
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION autoforge_purge_expired_conversation_tombstones()
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  purged_count bigint;
+BEGIN
+  UPDATE app_usage_events usage
+  SET conversation_id = NULL
+  WHERE EXISTS (
+    SELECT 1
+    FROM app_conversations conversation
+    WHERE conversation.owner_user_id = usage.owner_user_id
+      AND conversation.id = usage.conversation_id
+      AND conversation.deleted_at < clock_timestamp() - interval '30 days'
+  );
+
+  DELETE FROM app_sync_mutations mutation
+  WHERE EXISTS (
+    SELECT 1
+    FROM app_conversations conversation
+    WHERE conversation.owner_user_id = mutation.owner_user_id
+      AND conversation.deleted_at < clock_timestamp() - interval '30 days'
+      AND (
+        mutation.kind IN (
+          'conversation.create', 'conversation.rename', 'conversation.delete',
+          'conversation.restore'
+        ) AND mutation.entity_id = conversation.id
+        OR mutation.kind = 'message.append'
+          AND mutation.mutation_payload->'payload'->>'conversationId' = conversation.id
+      )
+  );
+
+  DELETE FROM app_conversations conversation
+  WHERE conversation.deleted_at < clock_timestamp() - interval '30 days';
+  GET DIAGNOSTICS purged_count = ROW_COUNT;
+  RETURN purged_count;
+END;
+$$;
+
 REVOKE ALL ON TABLE app_conversations FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON TABLE app_messages FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON TABLE app_model_runs FROM PUBLIC, anon, authenticated, service_role;
@@ -1302,6 +1362,7 @@ REVOKE ALL ON FUNCTION autoforge_import_legacy_batch(varchar, integer, varchar, 
 REVOKE ALL ON FUNCTION autoforge_get_usage_snapshot(varchar, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION autoforge_get_user_data_preferences(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION autoforge_update_user_data_preferences(varchar, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION autoforge_purge_expired_conversation_tombstones() FROM PUBLIC, anon, authenticated, service_role;
 
 GRANT EXECUTE ON FUNCTION autoforge_sync_push(varchar, integer, varchar, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION autoforge_sync_pull(varchar, integer, varchar, varchar, integer) TO service_role;
@@ -1312,5 +1373,6 @@ GRANT EXECUTE ON FUNCTION autoforge_import_legacy_batch(varchar, integer, varcha
 GRANT EXECUTE ON FUNCTION autoforge_get_usage_snapshot(varchar, timestamptz, timestamptz) TO service_role;
 GRANT EXECUTE ON FUNCTION autoforge_get_user_data_preferences(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION autoforge_update_user_data_preferences(varchar, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION autoforge_purge_expired_conversation_tombstones() TO service_role;
 
 COMMIT;

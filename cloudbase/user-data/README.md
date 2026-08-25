@@ -48,6 +48,16 @@ The fixture uses disposable app profiles and fake Alice/Bob identities. It block
 
 This local suite validates application boundaries and the checked-in wire semantics. It is not evidence that PostgreSQL accepted the migration, that CloudBase authentication or service-role forwarding is configured correctly, or that a deployed environment enforces owner isolation.
 
+## Tombstone retention job
+
+Conversation tombstones are eligible for permanent removal only after they are older than 30 days. An authorized operator must configure the approved database scheduler to invoke the following service-role-only function once per day:
+
+```sql
+SELECT autoforge_purge_expired_conversation_tombstones();
+```
+
+The function is not exposed to `PUBLIC`, `anon`, or `authenticated`, and it must never be called from Electron or the user-data function's client request surface. Record the returned row count and job outcome in deployment monitoring without recording owner IDs or conversation content. Scheduling is an explicit environment operation; this repository neither assumes a PostgreSQL scheduling extension nor installs a job automatically.
+
 ## Staging-only validation
 
 Before any production rollout, operators must execute the runbook against staging. The staging evidence must cover the actual supported PostgreSQL runtime, the deployed CloudBase function, unauthenticated and cross-owner denial, deterministic count/hash comparison, rollback controls, and a dual-device Electron run using staging accounts. Do not place live keys, tokens, UIDs, message bodies, or local paths in the evidence record.

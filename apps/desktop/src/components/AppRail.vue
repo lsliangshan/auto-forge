@@ -75,6 +75,7 @@ import {
 } from "@element-plus/icons-vue";
 import { computed, onMounted, watch } from "vue";
 import { useRouter } from "vue-router";
+import { ElMessageBox } from "element-plus";
 import { useAuthStore } from "../stores/auth";
 import { useProfileStore } from "../stores/profile";
 import logoUrl from "../../resources/branding/autoforge-logo.png";
@@ -101,7 +102,20 @@ const items = computed(() => [
 ]);
 
 async function logout() {
-  if (await auth.logout()) {
+  let loggedOut = await auth.logout();
+  if (!loggedOut && auth.pendingLogoutCount > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `仍有 ${auth.pendingLogoutCount} 条本地修改未同步。放弃这些修改并退出登录？`,
+        "未同步修改",
+        { type: "warning", confirmButtonText: "放弃并退出", cancelButtonText: "继续等待" },
+      );
+      loggedOut = await auth.logout(true);
+    } catch {
+      return;
+    }
+  }
+  if (loggedOut) {
     profile.reset();
     await router.replace("/login");
   }

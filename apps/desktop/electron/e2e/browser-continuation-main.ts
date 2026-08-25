@@ -886,7 +886,7 @@ async function seedBinding(input: Record<string, unknown>): Promise<{ bindingId:
       status: 'completed', startedAt: Date.now(), endedAt: Date.now(),
     })
     database.executions.insert({
-      id: executionId, workflowId: provenance.workflowId, workflowVersion,
+      id: executionId, ownerUserId: userId, workflowId: provenance.workflowId, workflowVersion,
       chatRunId, status: 'completed', createdAt: Date.now(),
     })
   } finally {

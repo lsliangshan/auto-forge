@@ -9,6 +9,7 @@ import outboxEnqueueSequenceMigration from '../../../resources/user-cache-migrat
 import syncReceiptEvidenceMigration from '../../../resources/user-cache-migrations/0003_sync_receipt_evidence.sql?raw'
 import accountSyncProjectionMigration from '../../../resources/user-cache-migrations/0004_account_sync_projection.sql?raw'
 import legacyImportIdentityMigration from '../../../resources/user-cache-migrations/0005_legacy_import_identity.sql?raw'
+import legacyImportIdentityHistoryMigration from '../../../resources/user-cache-migrations/0006_legacy_import_identity_history.sql?raw'
 import {
   createUserDataRepositories,
   type UserDataRepositories,
@@ -22,6 +23,7 @@ const USER_CACHE_MIGRATIONS = [
   { version: 3, source: syncReceiptEvidenceMigration },
   { version: 4, source: accountSyncProjectionMigration },
   { version: 5, source: legacyImportIdentityMigration },
+  { version: 6, source: legacyImportIdentityHistoryMigration },
 ] as const
 
 export type UserDataStore = UserDataRepositories

@@ -174,6 +174,28 @@ afterEach(() => {
 })
 
 describe('UserDataSyncEngine', () => {
+  it('reports a 24-hour warning from durable outbox age and clears after recovery', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const manager = createManager()
+    try {
+      const store = manager.open('alice')
+      const mutation = createMutation(1)
+      store.outbox.recordWithConversation(mutation)
+      const { engine, clock } = createEngine(manager, async () => (
+        failure('SERVICE_UNAVAILABLE')
+      ))
+      await engine.start('alice', 'device-a')
+      clock.nowValue = 1_000 + (24 * 60 * 60 * 1_000)
+
+      expect(engine.status()).toMatchObject({ state: 'idle', warningSince: 1_000 })
+      store.outbox.delete(mutation.id)
+      expect(engine.status()).toEqual({ state: 'idle' })
+    } finally {
+      manager.close()
+      now.mockRestore()
+    }
+  })
+
   it('serializes dedicated legacy imports on the active UID and supplies only its device binding', async () => {
     const manager = createManager()
     let releaseFirst!: () => void
@@ -408,6 +430,48 @@ describe('UserDataSyncEngine', () => {
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
       expect.objectContaining({ id: create.entityId, revision: 2, syncState: 'synced' }),
     )
+  })
+
+  it('replays a dependent offline create rename and message chain without conflict', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const create = createMutation(43)
+    const rename = renameMutation('dependent_rename', create.entityId, 1, 'Offline title')
+    const first = messageMutation('dependent_message_first', create.entityId, 2)
+    const second = messageMutation('dependent_message_second', create.entityId, 3)
+    store.outbox.recordWithConversation(create)
+    store.outbox.recordWithConversation(rename)
+    store.outbox.recordWithMessage(first)
+    store.outbox.recordWithMessage(second)
+    let revision = 0
+    let pushed: SyncMutation[] = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        pushed = [...input.mutations]
+        const results = input.mutations.map((mutation) => {
+          if (mutation.baseRevision !== revision) {
+            return { id: mutation.id, status: 'conflict' as const, errorCode: 'SYNC_CONFLICT' as const }
+          }
+          revision += 1
+          return { id: mutation.id, status: 'applied' as const, revision }
+        })
+        return success({ results, cursor: 'cursor_dependent_push' })
+      }
+      return success({
+        mutations: pushed.map((mutation, index) => remoteReceipt(mutation, index + 1)),
+        cursor: 'cursor_dependent_pull',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(engine.status()).toEqual({ state: 'idle' })
+    expect(store.outbox.countPending()).toBe(0)
+    expect(store.messages.listForConversation(create.entityId)).toHaveLength(2)
+    expect(store.conversations.getSummary(create.entityId)).toMatchObject({
+      title: 'Offline title', revision: 4, syncState: 'synced',
+    })
   })
 
   it('builds the largest FIFO push prefix within the exact one-mebibyte event limit', async () => {

@@ -57,7 +57,7 @@ function services(): DesktopIpcServices {
       verifyOtp: vi.fn().mockResolvedValue(authSession),
       cancelOtp: vi.fn().mockResolvedValue(undefined),
       loginWithPassword: vi.fn().mockResolvedValue(authSession),
-      logout: vi.fn().mockResolvedValue(undefined),
+      logout: vi.fn().mockResolvedValue({ status: 'logged_out' }),
       requireSession: vi.fn().mockResolvedValue(authSession),
     },
     userAdmin: {
@@ -194,7 +194,12 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.authLoginWithPassword, {
       account: 'Alice_1', password: 'password',
     })).resolves.toEqual(authSession)
-    await expect(app.invoke(ipcChannels.authLogout)).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.authLogout)).resolves.toEqual({ status: 'logged_out' })
+    await expect(app.invoke(ipcChannels.authLogout, { discardPending: true }))
+      .resolves.toEqual({ status: 'logged_out' })
+    expect(app.dependencies.auth.logout).toHaveBeenLastCalledWith({ discardPending: true })
+    await expect(app.invoke(ipcChannels.authLogout, { discardPending: false }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.auth.requireSession).not.toHaveBeenCalled()
   })
 

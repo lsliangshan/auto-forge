@@ -136,6 +136,14 @@ export const authOtpVerificationSchema = z.object({
 }).strict()
 export type AuthOtpVerification = z.infer<typeof authOtpVerificationSchema>
 
+export const logoutRequestSchema = z.object({ discardPending: z.literal(true) }).strict().optional()
+export type LogoutRequest = z.infer<typeof logoutRequestSchema>
+export const logoutResultSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('logged_out') }).strict(),
+  z.object({ status: z.literal('pending_sync'), pendingCount: z.number().int().positive().max(10_000) }).strict(),
+])
+export type LogoutResult = z.infer<typeof logoutResultSchema>
+
 export const profileGenderSchema = z.enum(['male', 'female', 'other', 'prefer_not_to_say'])
 export type ProfileGender = z.infer<typeof profileGenderSchema>
 
@@ -372,6 +380,7 @@ export const conversationSummarySchema = z.object({
   titleState: conversationTitleStateSchema,
   revision: z.number().int().nonnegative(),
   syncState: syncStateSchema,
+  syncWarningSince: timestampSchema.optional(),
   createdAt: timestampSchema,
   lastActivityAt: timestampSchema,
   metadataUpdatedAt: timestampSchema,
@@ -1484,7 +1493,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.authVerifyOtp]: authOtpVerificationSchema,
   [ipcChannels.authCancelOtp]: z.object({ challengeId: identifierSchema }).strict(),
   [ipcChannels.authLoginWithPassword]: authCredentialsSchema,
-  [ipcChannels.authLogout]: z.undefined(),
+  [ipcChannels.authLogout]: logoutRequestSchema,
   [ipcChannels.userAdminList]: userAdminListRequestSchema,
   [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleRequestSchema,
   [ipcChannels.profileGet]: z.undefined(),
@@ -1561,7 +1570,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.authVerifyOtp]: authSessionSchema,
   [ipcChannels.authCancelOtp]: voidResponseSchema,
   [ipcChannels.authLoginWithPassword]: authSessionSchema,
-  [ipcChannels.authLogout]: voidResponseSchema,
+  [ipcChannels.authLogout]: logoutResultSchema,
   [ipcChannels.userAdminList]: userAdminListResponseSchema,
   [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleResponseSchema,
   [ipcChannels.profileGet]: userProfileSchema,
@@ -1636,7 +1645,7 @@ export interface DesktopAPI {
     verifyOtp(input: AuthOtpVerification): Promise<AuthSession>
     cancelOtp(challengeId: string): Promise<void>
     loginWithPassword(input: AuthCredentials): Promise<AuthSession>
-    logout(): Promise<void>
+    logout(input?: LogoutRequest): Promise<LogoutResult>
   }
   profile: {
     get(): Promise<UserProfile>

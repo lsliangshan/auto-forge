@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -187,6 +187,32 @@ afterEach(() => {
 })
 
 describe('UserDataStoreManager', () => {
+  it('advances optimistic conversation revisions for dependent offline mutations', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const conversationId = 'dependent_offline_conversation'
+
+    store.outbox.recordWithConversation(
+      createConversationMutation('dependent_create', conversationId),
+    )
+    expect(projectedConversation(store, conversationId)?.revision).toBe(1)
+
+    store.outbox.recordWithConversation(
+      renameConversationMutation('dependent_rename', conversationId, 1, 'Offline title'),
+    )
+    expect(projectedConversation(store, conversationId)?.revision).toBe(2)
+
+    const first = appendMessageMutation('dependent_message_1', conversationId, 'offline_message_1')
+    store.outbox.recordWithMessage({ ...first, baseRevision: 2 })
+    expect(projectedConversation(store, conversationId)?.revision).toBe(3)
+
+    const second = appendMessageMutation('dependent_message_2', conversationId, 'offline_message_2')
+    store.outbox.recordWithMessage({ ...second, baseRevision: 3 })
+    expect(projectedConversation(store, conversationId)?.revision).toBe(4)
+    expect(store.outbox.list(10).map(({ baseRevision }) => baseRevision)).toEqual([0, 1, 2, 3])
+    manager.close()
+  })
+
   it('preserves enqueue FIFO when timestamps are frozen and IDs sort in reverse', () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_777_000_000_000)
     const manager = new UserDataStoreManager(temporaryRoot())
@@ -205,6 +231,29 @@ describe('UserDataStoreManager', () => {
       const expected = ['z_create_first', 'y_message_second', 'x_rename_third']
       expect(store.outbox.list(10).map(({ id }) => id)).toEqual(expected)
       expect(store.outbox.listReady(Date.now(), 10).map(({ id }) => id)).toEqual(expected)
+    } finally {
+      manager.close()
+      now.mockRestore()
+    }
+  })
+
+  it('derives and clears a 24-hour warning from durable pending outbox age', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const manager = new UserDataStoreManager(temporaryRoot())
+    try {
+      const store = manager.open('cloud-alice')
+      const mutation = createConversationMutation('stalled_mutation', 'stalled_conversation')
+      store.outbox.recordWithConversation(mutation)
+      expect(store.conversations.getSummary(mutation.entityId)?.syncWarningSince).toBeUndefined()
+
+      now.mockReturnValue(1_000 + (24 * 60 * 60 * 1_000))
+      expect(store.conversations.getSummary(mutation.entityId)?.syncWarningSince)
+        .toBe('1970-01-01T00:00:01.000Z')
+      expect(store.conversations.listPage({ limit: 50 }).items[0]?.syncWarningSince)
+        .toBe('1970-01-01T00:00:01.000Z')
+
+      store.outbox.delete(mutation.id)
+      expect(store.conversations.getSummary(mutation.entityId)?.syncWarningSince).toBeUndefined()
     } finally {
       manager.close()
       now.mockRestore()
@@ -616,7 +665,7 @@ describe('UserDataStoreManager', () => {
     expect(store.outbox.find(first.id)).toBeUndefined()
     expect(store.outbox.find(second.id)).toMatchObject({ state: 'failed' })
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
-      expect.objectContaining({ id: create.entityId, revision: 2, syncState: 'failed' }),
+      expect.objectContaining({ id: create.entityId, revision: 3, syncState: 'failed' }),
     )
     manager.close()
   })
@@ -659,7 +708,7 @@ describe('UserDataStoreManager', () => {
     expect(store.outbox.find(first.id)).toMatchObject({ state: 'syncing' })
     expect(store.outbox.find(second.id)).toBeUndefined()
     expect(store.conversations.listPage({ limit: 50 }).items).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: first.entityId, revision: 0, syncState: 'syncing' }),
+      expect.objectContaining({ id: first.entityId, revision: 1, syncState: 'syncing' }),
       expect.objectContaining({ id: second.entityId, revision: 1, syncState: 'synced' }),
     ]))
     manager.close()
@@ -694,7 +743,7 @@ describe('UserDataStoreManager', () => {
     expect(store.outbox.countPending()).toBe(1)
     expect(store.outbox.listReady(Date.now(), 10).map(({ id }) => id)).toEqual([later.id])
     expect(projectedConversation(store, create.entityId)).toMatchObject({
-      title: 'Later local title', revision: 2, syncState: 'pending',
+      title: 'Later local title', revision: 3, syncState: 'pending',
     })
     const inspection = new Database(cachePath(root, 'cloud-alice'))
     expect(inspection.prepare('SELECT mutation_id AS mutationId FROM sync_receipt_evidence').all())
@@ -733,7 +782,7 @@ describe('UserDataStoreManager', () => {
       mutations: [pulledMutation(first, 2)],
     }, 4)
     expect(projectedConversation(reopened, create.entityId)).toMatchObject({
-      title: 'Later local title', revision: 2, syncState: 'pending',
+      title: 'Later local title', revision: 3, syncState: 'pending',
     })
     expect(reopened.outbox.find(later.id)).toBeDefined()
     manager.close()
@@ -1359,7 +1408,7 @@ describe('UserDataStoreManager', () => {
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
       expect.objectContaining({
         id: 'conversation_before_message',
-        revision: 1,
+        revision: 2,
         syncState: 'pending',
         lastActivityAt: laterMessage.payload.createdAt,
       }),
@@ -1390,7 +1439,7 @@ describe('UserDataStoreManager', () => {
       expect.objectContaining({
         id: 'conversation_before_rename',
         title: 'Later optimistic title',
-        revision: 1,
+        revision: 2,
         syncState: 'pending',
       }),
     )
@@ -1427,7 +1476,7 @@ describe('UserDataStoreManager', () => {
       expect.objectContaining({
         id: 'rename_chain_conversation',
         title: 'Second title',
-        revision: 2,
+        revision: 3,
         syncState: 'pending',
       }),
     )
@@ -1622,7 +1671,7 @@ describe('UserDataStoreManager', () => {
     manager.close()
     const inspection = new Database(path, { readonly: true })
     expect(inspection.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }])
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'outbox_mutations'").get())
       .toBeDefined()
     expect(inspection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_receipt_evidence'").get())
@@ -1778,10 +1827,59 @@ describe('UserDataStoreManager', () => {
       ...selection, cloudConsentVersion: 'cloud-sync-2026-09',
       candidateBatchId: 'legacy-root-3',
     })).toBe('legacy-root-3')
+    expect(reopened.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'must-return-first-root-after-a-b-a',
+    })).toBe('legacy-root-1')
     manager.open('cloud-bob')
     expect(manager.current()?.account.resolveLegacyImportBatch({
       ...selection, candidateBatchId: 'bob-root-1',
     })).toBe('bob-root-1')
+    manager.close()
+  })
+
+  it('migrates the singleton legacy import identity into durable identity history', () => {
+    const root = temporaryRoot()
+    const path = cachePath(root, 'cloud-alice')
+    const sqlite = new Database(path)
+    for (let version = 1; version <= 5; version += 1) {
+      sqlite.exec(readFileSync(new URL(
+        `../../../resources/user-cache-migrations/${String(version).padStart(4, '0')}_${[
+          'user_cache',
+          'outbox_enqueue_sequence',
+          'sync_receipt_evidence',
+          'account_sync_projection',
+          'legacy_import_identity',
+        ][version - 1]}.sql`,
+        import.meta.url,
+      ), 'utf8'))
+      sqlite.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(version, version)
+    }
+    sqlite.prepare(`
+      INSERT INTO legacy_import_identity(
+        id, selection_fingerprint, include_unowned, cloud_consent_version,
+        unowned_consent_version, batch_id, updated_at
+      ) VALUES (1, ?, 1, ?, ?, ?, 1)
+    `).run('a'.repeat(64), 'cloud-sync-2026-08', 'legacy-unowned-import-2026-08', 'legacy-root-1')
+    sqlite.close()
+
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const selection = {
+      selectionFingerprint: 'a'.repeat(64),
+      includeUnowned: true,
+      cloudConsentVersion: 'cloud-sync-2026-08',
+      unownedConsentVersion: 'legacy-unowned-import-2026-08',
+    }
+    expect(store.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'must-not-replace-migrated-root',
+    })).toBe('legacy-root-1')
+    expect(store.account.resolveLegacyImportBatch({
+      ...selection, selectionFingerprint: 'b'.repeat(64), candidateBatchId: 'legacy-root-2',
+    })).toBe('legacy-root-2')
+    expect(store.account.resolveLegacyImportBatch({
+      ...selection, candidateBatchId: 'must-still-return-migrated-root',
+    })).toBe('legacy-root-1')
     manager.close()
   })
 

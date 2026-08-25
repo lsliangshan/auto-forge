@@ -148,6 +148,7 @@ export const workflowFiles = sqliteTable('workflow_files', {
 
 export const executions = sqliteTable('executions', {
   id: text('id').primaryKey(),
+  ownerUserId: text('owner_user_id'),
   workflowId: text('workflow_id').notNull(),
   workflowVersion: text('workflow_version').notNull(),
   chatRunId: text('chat_run_id'),
@@ -161,6 +162,7 @@ export const executions = sqliteTable('executions', {
 }, (table) => [
   index('executions_status_created_at_idx').on(table.status, table.createdAt),
   index('executions_created_at_idx').on(table.createdAt),
+  index('executions_owner_created_at_idx').on(table.ownerUserId, table.createdAt, table.id),
 ])
 
 export const executionSteps = sqliteTable('execution_steps', {

@@ -251,6 +251,7 @@ const conversationEventSummarySchema = z.object({
   titleState: z.enum(['pending', 'generating', 'ai_named', 'user_named', 'failed']),
   revision: z.number().int().nonnegative(),
   syncState: z.enum(['synced', 'pending', 'syncing', 'failed']),
+  syncWarningSince: timestampSchema.optional(),
   createdAt: timestampSchema,
   lastActivityAt: timestampSchema,
   metadataUpdatedAt: timestampSchema,

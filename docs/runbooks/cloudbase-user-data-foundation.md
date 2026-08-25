@@ -24,6 +24,14 @@ Go criteria:
 
 Stop if the migration reports an unexpected object, permission, or runtime error.
 
+Configure the approved environment scheduler to call
+`SELECT autoforge_purge_expired_conversation_tombstones();` once per day using
+`service_role`. Verify `PUBLIC`, `anon`, and `authenticated` cannot execute it.
+The function permanently removes only conversation tombstones older than 30
+days and returns the number removed. Record only that count and the job outcome.
+Do not expose the call through Electron or a client action, and do not assume or
+install a particular PostgreSQL scheduling extension as part of this migration.
+
 ### 2. Deploy function
 
 Have an authorized CloudBase operator deploy the reviewed `autoforge-user-data` function artifact. Supply the PostgreSQL RPC endpoint and service credential only through the environment secret facility. Confirm logs redact arguments and native database diagnostics.

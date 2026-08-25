@@ -119,7 +119,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
     auth: {
       getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
       cancelOtp: vi.fn().mockResolvedValue(undefined), loginWithPassword: vi.fn(),
-      logout: vi.fn().mockResolvedValue(undefined),
+      logout: vi.fn().mockResolvedValue({ status: 'logged_out' }),
     },
     profile: {
       get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
@@ -571,6 +571,28 @@ describe('workbench', () => {
     await retry.trigger('click')
     await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('failed-conversation'))
     expect(wrapper.html()).not.toContain('userId')
+  })
+
+  it('shows an actionable durable sync warning and clears it after recovery', async () => {
+    const api = createApi()
+    const stalled = {
+      ...conversationSummary('stalled-conversation', '2026-07-20T00:00:00.000Z', 'pending'),
+      syncWarningSince: '2026-07-19T00:00:00.000Z',
+    }
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [stalled] })
+    const { wrapper } = await mountApp('/chat', api)
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="durable-sync-warning"]').text())
+      .toContain('24 小时'))
+    await wrapper.get('[data-testid="retry-durable-sync"]').trigger('click')
+    await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('stalled-conversation'))
+
+    useChatStore().applyChatEvent({
+      type: 'conversation_updated',
+      conversationId: stalled.id,
+      conversation: { ...stalled, syncState: 'synced', syncWarningSince: undefined },
+    })
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="durable-sync-warning"]').exists()).toBe(false))
   })
 
   it('serializes settings patches so older full responses cannot roll back newer fields', async () => {

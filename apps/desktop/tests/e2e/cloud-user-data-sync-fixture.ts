@@ -28,6 +28,10 @@ interface StoredPreferences {
 interface StoredMessage {
   id: string
   conversationId: string
+  role: 'user' | 'assistant'
+  blocks: ChatBlock[]
+  executionId?: string
+  createdAt: string
 }
 
 interface StoredReceipt {
@@ -222,14 +226,31 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
     if (mutation.kind === 'conversation.delete') conversation.deleted = true
     if (mutation.kind === 'conversation.restore') conversation.deleted = false
   } else if (mutation.kind === 'message.append') {
+    const existingMessage = state.messages.get(mutation.entityId)
+    if (existingMessage) {
+      const isIdentical = requestHash(existingMessage) === requestHash(mutation.payload)
+      const conversation = state.conversations.get(existingMessage.conversationId)
+      const result = isIdentical
+        ? { id: mutation.id, status: 'duplicate', revision: conversation!.revision } as const
+        : { id: mutation.id, status: 'rejected', errorCode: 'INVALID_INPUT' } as const
+      state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
+      if (isIdentical) state.duplicateMutationCount += 1
+      return result
+    }
     const conversation = state.conversations.get(mutation.payload.conversationId)
-    if (!conversation || conversation.revision !== mutation.baseRevision) {
+    if (!conversation) {
+      const result = { id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' } as const
+      state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
+      return result
+    }
+    if (conversation.revision !== mutation.baseRevision) {
       const result = { id: mutation.id, status: 'conflict', errorCode: 'SYNC_CONFLICT' } as const
       state.receipts.set(mutation.id, { requestHash: requestHash(mutation), result })
       return result
     }
     revision = conversation.revision + 1
     conversation.revision = revision
+    state.messages.set(mutation.entityId, { ...mutation.payload })
   } else if (mutation.kind === 'privacy.consent') {
     revision = 0
     state.consents.add(`${mutation.payload.purpose}\0${mutation.payload.documentVersion}`)
@@ -348,7 +369,6 @@ function importLegacyBatch(state: UserState, input: Record<string, unknown>) {
       },
     } as SyncMutation
     applyMutation(state, mutation)
-    state.messages.set(message.id, { id: message.id, conversationId: message.conversationId })
     importedMessages += 1
   }
   state.events.push({

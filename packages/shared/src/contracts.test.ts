@@ -29,6 +29,8 @@ import {
   legacyImportPreviewSchema,
   listConversationsRequestSchema,
   listMessagesRequestSchema,
+  logoutRequestSchema,
+  logoutResultSchema,
   retryConversationSyncRequestSchema,
   listProviderModelsRequestSchema,
   messagePageSchema,
@@ -60,6 +62,16 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('requires an explicit typed discard confirmation for logout', () => {
+    expect(logoutRequestSchema.parse(undefined)).toBeUndefined()
+    expect(logoutRequestSchema.parse({ discardPending: true })).toEqual({ discardPending: true })
+    expect(logoutRequestSchema.safeParse({ discardPending: false }).success).toBe(false)
+    expect(logoutRequestSchema.safeParse({ discardPending: true, userId: 'forged' }).success).toBe(false)
+    expect(logoutResultSchema.parse({ status: 'logged_out' })).toEqual({ status: 'logged_out' })
+    expect(logoutResultSchema.parse({ status: 'pending_sync', pendingCount: 3 }))
+      .toEqual({ status: 'pending_sync', pendingCount: 3 })
+  })
+
   it('requires strict opaque cursor requests and paged chat responses', () => {
     const cursor = 'opaque-cursor-0001'
     expect(listConversationsRequestSchema.parse({ limit: 50 })).toEqual({ limit: 50 })
@@ -92,6 +104,9 @@ describe('cross-process contracts', () => {
       metadataUpdatedAt: '2026-08-24T00:02:00.000Z',
     }
     expect(conversationSummarySchema.parse(summary)).toEqual(summary)
+    expect(conversationSummarySchema.parse({
+      ...summary, syncWarningSince: '2026-08-23T00:00:00.000Z',
+    })).toMatchObject({ syncWarningSince: '2026-08-23T00:00:00.000Z' })
     expect(conversationPageSchema.parse({ items: [summary], nextCursor: cursor }))
       .toEqual({ items: [summary], nextCursor: cursor })
     expect.soft(conversationPageSchema.safeParse({

@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, type AuthOtpRequest, type AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
+import { useExecutionStore } from './execution'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -58,6 +59,7 @@ function replaceSession(store: { session: AuthSession | null }, session: AuthSes
   const nextUserId = session?.user.id
   if (previousUserId !== undefined && previousUserId !== nextUserId) {
     useChatStore().resetLocalData()
+    useExecutionStore().resetLocalData()
   }
   store.session = session
 }
@@ -70,6 +72,7 @@ export const useAuthStore = defineStore('auth', {
     submitting: false,
     challenge: null as AuthOtpChallenge | null,
     sendingOtp: false,
+    pendingLogoutCount: 0,
     error: '',
   }),
   getters: {
@@ -157,7 +160,7 @@ export const useAuthStore = defineStore('auth', {
         if (generation !== otpGeneration(this) || sessionOwner !== sessionGeneration(this)) {
           const cleanupOwner = sessionGeneration(this)
           try {
-            await getDesktopApi().auth.logout()
+            await getDesktopApi().auth.logout({ discardPending: true })
           } catch {
             if (cleanupOwner === sessionGeneration(this)) {
               replaceSession(this, session)
@@ -223,18 +226,24 @@ export const useAuthStore = defineStore('auth', {
         finishSubmitting(this)
       }
     },
-    async logout(): Promise<boolean> {
+    async logout(discardPending = false): Promise<boolean> {
       startSubmitting(this)
       this.error = ''
       await this.cancelOtp()
       const sessionOwner = nextSessionGeneration(this)
       try {
-        await getDesktopApi().auth.logout()
+        const result = await getDesktopApi().auth.logout(
+          discardPending ? { discardPending: true } : undefined,
+        )
+        if (result.status === 'pending_sync') {
+          this.pendingLogoutCount = result.pendingCount
+          return false
+        }
         nextSessionGeneration(this)
-        this.session = null
+        replaceSession(this, null)
         this.initialized = true
+        this.pendingLogoutCount = 0
         this.error = ''
-        useChatStore().resetLocalData()
         return true
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {

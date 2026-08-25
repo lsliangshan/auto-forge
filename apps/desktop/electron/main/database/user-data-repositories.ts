@@ -142,6 +142,7 @@ export interface UserDataRepositories {
     find(id: string): OutboxMutationRecord | undefined
     list(limit: number): OutboxMutationRecord[]
     countPending(kind?: SyncMutationKind): number
+    oldestPendingOrFailedAt(): number | undefined
     markSyncing(ids: readonly string[]): void
     markPending(id: string, nextAttemptAt?: number): void
     markFailed(id: string, errorCode: AppErrorCode, nextAttemptAt?: number): void
@@ -338,7 +339,7 @@ function optimisticConversationMutation(
           id, title, title_state, user_id, revision, sync_state, created_at, updated_at,
           last_activity_at, metadata_updated_at
         ) VALUES (
-          @id, @title, @titleState, @ownerUserId, 0, 'pending', @createdAt, @metadataUpdatedAt,
+          @id, @title, @titleState, @ownerUserId, 1, 'pending', @createdAt, @metadataUpdatedAt,
           @lastActivityAt, @metadataUpdatedAt
         )
       `).run({
@@ -358,12 +359,14 @@ function optimisticConversationMutation(
         UPDATE conversations
         SET title = @title,
             title_state = @titleState,
+            revision = @revision,
             sync_state = 'pending',
             metadata_updated_at = @metadataUpdatedAt,
             updated_at = @metadataUpdatedAt
         WHERE id = @id
       `).run({
         id: mutation.entityId,
+        revision: mutation.baseRevision + 1,
         title: mutation.payload.title,
         titleState: mutation.payload.titleState,
         metadataUpdatedAt: timestamp(mutation.payload.metadataUpdatedAt),
@@ -373,17 +376,27 @@ function optimisticConversationMutation(
       requireOwnedConversation(database, ownerUserId, mutation.entityId)
       database.prepare(`
         UPDATE conversations
-        SET deleted_at = @occurredAt, sync_state = 'pending', updated_at = @occurredAt
+        SET deleted_at = @occurredAt, revision = @revision,
+            sync_state = 'pending', updated_at = @occurredAt
         WHERE id = @id
-      `).run({ id: mutation.entityId, occurredAt: timestamp(mutation.occurredAt) })
+      `).run({
+        id: mutation.entityId,
+        revision: mutation.baseRevision + 1,
+        occurredAt: timestamp(mutation.occurredAt),
+      })
       return
     case 'conversation.restore':
       requireOwnedConversation(database, ownerUserId, mutation.entityId)
       database.prepare(`
         UPDATE conversations
-        SET deleted_at = NULL, sync_state = 'pending', updated_at = @occurredAt
+        SET deleted_at = NULL, revision = @revision,
+            sync_state = 'pending', updated_at = @occurredAt
         WHERE id = @id
-      `).run({ id: mutation.entityId, occurredAt: timestamp(mutation.occurredAt) })
+      `).run({
+        id: mutation.entityId,
+        revision: mutation.baseRevision + 1,
+        occurredAt: timestamp(mutation.occurredAt),
+      })
       return
     default:
       throw new Error('Conversation mutation required')
@@ -416,11 +429,16 @@ function optimisticMessageMutation(
   })
   database.prepare(`
     UPDATE conversations
-    SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+    SET revision = @revision,
+        last_activity_at = MAX(last_activity_at + 1, @createdAt),
         updated_at = MAX(updated_at, last_activity_at + 1, @createdAt),
         sync_state = 'pending'
     WHERE id = @conversationId
-  `).run({ conversationId: payload.conversationId, createdAt: timestamp(payload.createdAt) })
+  `).run({
+    conversationId: payload.conversationId,
+    revision: mutation.baseRevision + 1,
+    createdAt: timestamp(payload.createdAt),
+  })
 }
 
 interface MutationReceipt {
@@ -958,6 +976,7 @@ function conversationPage(
     createdAt: isoTimestamp(row.createdAt),
     lastActivityAt: isoTimestamp(row.lastActivityAt),
     metadataUpdatedAt: isoTimestamp(row.metadataUpdatedAt),
+    ...conversationSyncWarning(database, z.string().parse(row.id)),
   })))
   const last = pageRows.at(-1)
   return {
@@ -966,6 +985,23 @@ function conversationPage(
       ? { nextCursor: encodeCursor({ lastActivityAt: last.lastActivityAt, id: last.id }) }
       : {}),
   }
+}
+
+const SYNC_WARNING_AGE_MS = 24 * 60 * 60 * 1_000
+
+function conversationSyncWarning(database: SqliteDatabase, conversationId: string) {
+  const result = database.prepare(`
+    SELECT MIN(created_at) AS oldest
+    FROM outbox_mutations
+    WHERE state IN ('pending', 'failed')
+      AND (
+        (kind LIKE 'conversation.%' AND entity_id = @conversationId)
+        OR (kind = 'message.append' AND json_extract(payload_json, '$.conversationId') = @conversationId)
+      )
+  `).get({ conversationId }) as { oldest: number | null }
+  return result.oldest !== null && Date.now() - result.oldest >= SYNC_WARNING_AGE_MS
+    ? { syncWarningSince: isoTimestamp(result.oldest) }
+    : {}
 }
 
 function messagePage(database: SqliteDatabase, input: {
@@ -1214,6 +1250,7 @@ export function createUserDataRepositories(
       createdAt: isoTimestamp(z.number().parse(row.createdAt)),
       lastActivityAt: isoTimestamp(z.number().parse(row.lastActivityAt)),
       metadataUpdatedAt: isoTimestamp(z.number().parse(row.metadataUpdatedAt)),
+      ...conversationSyncWarning(database, id),
     }))
   }
   const messageMutation = (
@@ -1720,43 +1757,38 @@ export function createUserDataRepositories(
           candidateBatchId: z.string().trim().min(1).max(128),
         }).strict().parse(input))
         return transaction(database, () => {
-          const stored = database.prepare(`
-            SELECT selection_fingerprint AS selectionFingerprint,
-                   include_unowned AS includeUnowned,
-                   cloud_consent_version AS cloudConsentVersion,
-                   unowned_consent_version AS unownedConsentVersion,
-                   batch_id AS batchId
-            FROM legacy_import_identity WHERE id = 1
-          `).get() as Query | undefined
-          if (stored
-            && stored.selectionFingerprint === value.selectionFingerprint
-            && stored.includeUnowned === Number(value.includeUnowned)
-            && stored.cloudConsentVersion === value.cloudConsentVersion
-            && (stored.unownedConsentVersion ?? undefined) === value.unownedConsentVersion) {
-            return z.string().trim().min(1).max(128).parse(stored.batchId)
-          }
           database.prepare(`
             INSERT INTO legacy_import_identity(
-              id, selection_fingerprint, include_unowned, cloud_consent_version,
+              selection_fingerprint, include_unowned, cloud_consent_version,
               unowned_consent_version, batch_id, updated_at
             ) VALUES (
-              1, @selectionFingerprint, @includeUnowned, @cloudConsentVersion,
+              @selectionFingerprint, @includeUnowned, @cloudConsentVersion,
               @unownedConsentVersion, @candidateBatchId, @updatedAt
             )
-            ON CONFLICT(id) DO UPDATE SET
-              selection_fingerprint = excluded.selection_fingerprint,
-              include_unowned = excluded.include_unowned,
-              cloud_consent_version = excluded.cloud_consent_version,
-              unowned_consent_version = excluded.unowned_consent_version,
-              batch_id = excluded.batch_id,
-              updated_at = excluded.updated_at
+            ON CONFLICT(
+              selection_fingerprint, include_unowned, cloud_consent_version,
+              unowned_consent_version
+            ) DO NOTHING
           `).run({
             ...value,
             includeUnowned: Number(value.includeUnowned),
-            unownedConsentVersion: value.unownedConsentVersion ?? null,
+            unownedConsentVersion: value.unownedConsentVersion ?? '',
             updatedAt: Date.now(),
           })
-          return value.candidateBatchId
+          const stored = database.prepare(`
+            SELECT batch_id AS batchId
+            FROM legacy_import_identity
+            WHERE selection_fingerprint = @selectionFingerprint
+              AND include_unowned = @includeUnowned
+              AND cloud_consent_version = @cloudConsentVersion
+              AND unowned_consent_version = @unownedConsentVersion
+          `).get({
+            selectionFingerprint: value.selectionFingerprint,
+            includeUnowned: Number(value.includeUnowned),
+            cloudConsentVersion: value.cloudConsentVersion,
+            unownedConsentVersion: value.unownedConsentVersion ?? '',
+          }) as Query
+          return z.string().trim().min(1).max(128).parse(stored.batchId)
         })
       },
     },
@@ -1806,12 +1838,14 @@ export function createUserDataRepositories(
           }, [...assetIds])
           database.prepare(`
             UPDATE conversations
-            SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+            SET revision = @revision,
+                last_activity_at = MAX(last_activity_at + 1, @createdAt),
                 updated_at = MAX(updated_at, last_activity_at + 1, @createdAt), sync_state = 'pending'
             WHERE id = @conversationId AND user_id = @ownerUserId
           `).run({
             conversationId: payload.conversationId,
             ownerUserId,
+            revision: validated.baseRevision + 1,
             createdAt: timestamp(payload.createdAt),
           })
         },
@@ -1874,6 +1908,14 @@ export function createUserDataRepositories(
           : database.prepare('SELECT COUNT(*) AS count FROM outbox_mutations WHERE kind = @kind')
             .get({ kind })
       ) as { count: number }).count,
+      oldestPendingOrFailedAt() {
+        const result = database.prepare(`
+          SELECT MIN(created_at) AS oldest
+          FROM outbox_mutations
+          WHERE state IN ('pending', 'failed')
+        `).get() as { oldest: number | null }
+        return result.oldest ?? undefined
+      },
       markSyncing(ids) {
         transaction(database, () => {
           const mutations = ids.map((id) => findOutboxMutation(database, id))

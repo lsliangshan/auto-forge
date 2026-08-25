@@ -189,7 +189,7 @@ function createEventApi() {
     auth: {
       getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
       cancelOtp: vi.fn().mockResolvedValue(undefined), loginWithPassword: vi.fn(),
-      logout: vi.fn().mockResolvedValue(undefined),
+      logout: vi.fn().mockResolvedValue({ status: 'logged_out' }),
     },
     profile: {
       get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),

@@ -2,13 +2,14 @@ import { createPinia, setActivePinia } from 'pinia'
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessageBox } from 'element-plus'
 import { toSafeAppError, type AuthSession, type DesktopAPI } from '@autoforge/shared'
 import App from '../../src/App.vue'
 import AppRail from '../../src/components/AppRail.vue'
 import { createAuthGuard, routes, safeRedirect } from '../../src/router'
 import { useAuthStore } from '../../src/stores/auth'
 import { useChatStore } from '../../src/stores/chat'
+import { useExecutionStore } from '../../src/stores/execution'
 
 const authSession: AuthSession = {
   user: { id: 'user_1', account: 'Alice' },
@@ -49,7 +50,7 @@ function createApi(): DesktopAPI {
       verifyOtp: vi.fn(),
       cancelOtp: vi.fn().mockResolvedValue(undefined),
       loginWithPassword: vi.fn().mockResolvedValue(authSession),
-      logout: vi.fn().mockResolvedValue(undefined),
+      logout: vi.fn().mockResolvedValue({ status: 'logged_out' }),
     },
     userAdmin: {
       list: vi.fn().mockResolvedValue({ items: [], page: 1, pageSize: 20, total: 0 }),
@@ -150,6 +151,29 @@ describe('authentication store', () => {
       expect(chat.selectedConversationId).toBe('')
     },
   )
+
+  it('clears execution state when the authenticated UID changes', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.loginWithPassword).mockResolvedValue(bobSession)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    const execution = useExecutionStore()
+    auth.session = authSession
+    execution.items = [{
+      id: 'alice_execution', workflowId: 'workflow.alice', workflowVersion: '1.0.0',
+      status: 'completed', createdAt: '2026-08-25T00:00:00.000Z',
+    }]
+    execution.selectedId = 'alice_execution'
+    execution.details.alice_execution = {
+      ...execution.items[0]!, input: {}, steps: [], logs: [],
+    }
+
+    await auth.loginWithPassword({ account: 'Bob', password: 'password' })
+
+    expect(execution.items).toEqual([])
+    expect(execution.selectedId).toBe('')
+    expect(execution.details).toEqual({})
+  })
 
   it('deduplicates concurrent session restoration', async () => {
     const api = createApi()
@@ -423,7 +447,7 @@ describe('authentication store', () => {
     const api = createApi()
     const pendingVerification = deferred<AuthSession>()
     const compensationStarted = deferred<void>()
-    const pendingLogout = deferred<void>()
+    const pendingLogout = deferred<Awaited<ReturnType<DesktopAPI['auth']['logout']>>>()
     vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
     vi.mocked(api.auth.logout).mockImplementation(() => {
       compensationStarted.resolve()
@@ -440,7 +464,7 @@ describe('authentication store', () => {
 
     const restoring = auth.restore()
     await restoring
-    pendingLogout.resolve()
+    pendingLogout.resolve({ status: 'logged_out' })
     await verifying
 
     expect(auth.session).toBeNull()
@@ -453,7 +477,7 @@ describe('authentication store', () => {
     const api = createApi()
     const pendingVerification = deferred<AuthSession>()
     const compensationStarted = deferred<void>()
-    const pendingLogout = deferred<void>()
+    const pendingLogout = deferred<Awaited<ReturnType<DesktopAPI['auth']['logout']>>>()
     const pendingRestore = deferred<AuthSession | null>()
     vi.mocked(api.auth.verifyOtp).mockReturnValue(pendingVerification.promise)
     vi.mocked(api.auth.logout).mockImplementation(() => {
@@ -475,7 +499,7 @@ describe('authentication store', () => {
     await restoring
     expect(auth.session).toEqual(authSession)
 
-    pendingLogout.resolve()
+    pendingLogout.resolve({ status: 'logged_out' })
     await verifying
 
     expect(auth.session).toBeNull()
@@ -495,6 +519,26 @@ describe('authentication store', () => {
 
     expect(auth.session).toEqual(authSession)
     expect(auth.error).toBe('操作失败，请稍后重试')
+  })
+
+  it('keeps the session until pending changes are explicitly discarded', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.logout)
+      .mockResolvedValueOnce({ status: 'pending_sync', pendingCount: 3 })
+      .mockResolvedValueOnce({ status: 'logged_out' })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.session = authSession
+
+    await expect(auth.logout()).resolves.toBe(false)
+    expect(auth.session).toEqual(authSession)
+    expect(auth.pendingLogoutCount).toBe(3)
+    expect(api.auth.logout).toHaveBeenLastCalledWith(undefined)
+
+    await expect(auth.logout(true)).resolves.toBe(true)
+    expect(api.auth.logout).toHaveBeenLastCalledWith({ discardPending: true })
+    expect(auth.session).toBeNull()
+    expect(auth.pendingLogoutCount).toBe(0)
   })
 
   it('clears the previous user chat state after logout succeeds', async () => {
@@ -522,7 +566,7 @@ describe('authentication store', () => {
   it('clears the session after a pending logout succeeds despite a later OTP cancellation', async () => {
     const api = createApi()
     const logoutStarted = deferred<void>()
-    const pendingLogout = deferred<void>()
+    const pendingLogout = deferred<Awaited<ReturnType<DesktopAPI['auth']['logout']>>>()
     vi.mocked(api.auth.logout).mockImplementation(() => {
       logoutStarted.resolve()
       return pendingLogout.promise
@@ -534,7 +578,7 @@ describe('authentication store', () => {
     const loggingOut = auth.logout()
     await logoutStarted.promise
     await auth.cancelOtp()
-    pendingLogout.resolve()
+    pendingLogout.resolve({ status: 'logged_out' })
     await expect(loggingOut).resolves.toBe(true)
 
     expect(auth.session).toBeNull()
@@ -546,7 +590,7 @@ describe('authentication store', () => {
   it('makes logout terminal when a restore starts before remote logout succeeds', async () => {
     const api = createApi()
     const logoutStarted = deferred<void>()
-    const pendingLogout = deferred<void>()
+    const pendingLogout = deferred<Awaited<ReturnType<DesktopAPI['auth']['logout']>>>()
     const pendingRestore = deferred<AuthSession | null>()
     vi.mocked(api.auth.logout).mockImplementation(() => {
       logoutStarted.resolve()
@@ -562,7 +606,7 @@ describe('authentication store', () => {
     const restoring = auth.restore()
     expect(auth.restoring).toBe(true)
 
-    pendingLogout.resolve()
+    pendingLogout.resolve({ status: 'logged_out' })
     await expect(loggingOut).resolves.toBe(true)
     expect(auth.session).toBeNull()
     expect(auth.initialized).toBe(true)
@@ -1384,6 +1428,41 @@ describe('workbench authentication entry', () => {
     expect(auth.session).toEqual(authSession)
 
     await wrapper.get('[aria-label="退出登录"]').trigger('click')
+    await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/login'))
+    expect(auth.session).toBeNull()
+  })
+
+  it('requires visible confirmation before explicitly discarding pending sync on logout', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.logout)
+      .mockResolvedValueOnce({ status: 'pending_sync', pendingCount: 2 })
+      .mockResolvedValueOnce({ status: 'logged_out' })
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const auth = useAuthStore(pinia)
+    auth.session = authSession
+    auth.initialized = true
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/chat', component: { template: '<div />' } },
+        { path: '/login', component: { template: '<div />' } },
+      ],
+    })
+    await router.push('/chat')
+    const wrapper = mount(AppRail, { global: { plugins: [pinia, router, ElementPlus] } })
+
+    await wrapper.get('[aria-label="退出登录"]').trigger('click')
+    await vi.waitFor(() => expect(api.auth.logout).toHaveBeenCalledTimes(2))
+    expect(api.auth.logout).toHaveBeenNthCalledWith(1, undefined)
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining('2 条本地修改未同步'),
+      '未同步修改',
+      expect.any(Object),
+    )
+    expect(api.auth.logout).toHaveBeenNthCalledWith(2, { discardPending: true })
     await vi.waitFor(() => expect(router.currentRoute.value.fullPath).toBe('/login'))
     expect(auth.session).toBeNull()
   })

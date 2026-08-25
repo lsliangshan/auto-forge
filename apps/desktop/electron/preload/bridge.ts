@@ -61,7 +61,7 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       verifyOtp: (input) => invoke(ipcRenderer, ipcChannels.authVerifyOtp, input),
       cancelOtp: (challengeId) => invoke(ipcRenderer, ipcChannels.authCancelOtp, { challengeId }),
       loginWithPassword: (input) => invoke(ipcRenderer, ipcChannels.authLoginWithPassword, input),
-      logout: () => invoke(ipcRenderer, ipcChannels.authLogout),
+      logout: (input) => invoke(ipcRenderer, ipcChannels.authLogout, input),
     },
     userAdmin: {
       list: (input) => invoke(ipcRenderer, ipcChannels.userAdminList, input),

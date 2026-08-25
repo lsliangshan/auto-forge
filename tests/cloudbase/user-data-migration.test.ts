@@ -35,6 +35,7 @@ const rpcNames = [
   'autoforge_get_usage_snapshot',
   'autoforge_get_user_data_preferences',
   'autoforge_update_user_data_preferences',
+  'autoforge_purge_expired_conversation_tombstones',
 ] as const
 
 function extractTable(sql: string, tableName: string): string {
@@ -124,6 +125,28 @@ describe('CloudBase user data migration', () => {
     expect(syncPush).toContain("'status', 'rejected'")
     expect(syncPush).toContain("'errorCode', 'INVALID_INPUT'")
     expect(syncPush).not.toMatch(/SQLERRM|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL|GET STACKED DIAGNOSTICS/)
+  })
+
+  it('rejects a duplicate message id unless every immutable field matches', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const duplicateBranch = syncPush.slice(
+      syncPush.indexOf("ELSIF mutation_kind = 'message.append'"),
+      syncPush.indexOf("ELSIF mutation_kind = 'privacy.consent'"),
+    )
+
+    expect(duplicateBranch).toContain('existing_message.conversation_id IS DISTINCT FROM conversation_id')
+    expect(duplicateBranch).toContain("existing_message.role IS DISTINCT FROM payload->>'role'")
+    expect(duplicateBranch).toContain("existing_message.blocks IS DISTINCT FROM payload->'blocks'")
+    expect(duplicateBranch).toContain("existing_message.execution_id IS DISTINCT FROM NULLIF(payload->>'executionId', '')")
+    expect(duplicateBranch).toContain("existing_message.created_at IS DISTINCT FROM (payload->>'createdAt')::timestamptz")
+    expect(duplicateBranch).toContain("mutation_status := 'rejected'")
+    expect(duplicateBranch).toContain("mutation_error := 'INVALID_INPUT'")
+    expect(duplicateBranch).toContain("auth_user_id::text || ':message:' || entity_id")
+    expect(duplicateBranch.indexOf("auth_user_id::text || ':message:' || entity_id"))
+      .toBeLessThan(duplicateBranch.indexOf('SELECT * INTO existing_message'))
+    expect(duplicateBranch.indexOf('SELECT * INTO existing_message'))
+      .toBeLessThan(duplicateBranch.indexOf('SELECT * INTO conversation_row'))
   })
 
   it('rejects null protocol versions and separates expected data failures from internal failures', async () => {
@@ -290,6 +313,28 @@ describe('CloudBase user data migration', () => {
     expect(canonical).not.toMatch(/GRANT .* TO authenticated/i)
     expect(canonical).not.toMatch(/GRANT .* TO anon/i)
     expect(canonical).not.toMatch(/GRANT .* TO PUBLIC/i)
+  })
+
+  it('purges only conversation tombstones older than 30 days through service role', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const purge = extractFunction(canonical, 'autoforge_purge_expired_conversation_tombstones')
+
+    expect(purge).toContain('SECURITY DEFINER')
+    expect(purge).toContain('SET search_path = pg_catalog, public')
+    expect(purge).toContain("deleted_at < clock_timestamp() - interval '30 days'")
+    expect(purge).toContain('UPDATE app_usage_events')
+    expect(purge).toContain('conversation_id = NULL')
+    expect(purge).toContain('DELETE FROM app_sync_mutations')
+    expect(purge).toContain('DELETE FROM app_conversations')
+    expect(canonical).toContain(
+      'REVOKE ALL ON FUNCTION autoforge_purge_expired_conversation_tombstones() FROM PUBLIC, anon, authenticated, service_role',
+    )
+    expect(canonical).toContain(
+      'GRANT EXECUTE ON FUNCTION autoforge_purge_expired_conversation_tombstones() TO service_role',
+    )
+    expect(canonical).not.toContain(
+      'GRANT EXECUTE ON FUNCTION autoforge_purge_expired_conversation_tombstones() TO authenticated',
+    )
   })
 
   it('keeps accepted data tables intact during rollback', async () => {
