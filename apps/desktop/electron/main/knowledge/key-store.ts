@@ -104,8 +104,7 @@ export async function removeFileDurably(
   try {
     await fileSystem.unlink(path)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-    throw error
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
   await syncDirectory(dirname(path), fileSystem)
 }

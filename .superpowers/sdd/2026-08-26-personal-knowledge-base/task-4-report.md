@@ -304,3 +304,75 @@ Tests  1 failed | 2868 passed (2869)
 ```
 
 The sole repository-suite failure remains the same unrelated pre-existing Application context-summary billing case at `application.test.ts:3865`: it receives `CONTEXT_LIMIT_EXCEEDED` instead of the expected completed stream. All round-two knowledge, IPC, and auth-admission boundaries pass.
+
+## Fix round 3: durable rejected-snapshot orphan cleanup
+
+### Implementation and self-review
+
+- Added encrypted-only `orphan_object_cleanups`, keyed by the validated opaque managed relative name and containing only its opaque import job/document scope. It intentionally has no foreign keys so destructive graph deletion cannot erase unfinished cleanup authority.
+- A newly orphaned or CAS-rejected snapshot now commits its cleanup journal before touching the object file. Durable unlink and parent-directory sync run next; the row is deleted only after both succeed. A retry that sees `ENOENT` still syncs the parent directory, covering the prior unlink-succeeded/directory-sync-failed state.
+- Snapshot tasks can now reject with cleanup failures, and scoped lifecycle drain rethrows the first tracked rejection after draining all tasks. Recycle/purge therefore cannot report success while an unjournaled or non-durably-removed object remains.
+- Recycle and purge retries reconcile scoped orphan rows before completion. Session open reconciles all orphan rows before purge-journal recovery, import recovery, or session admission. The existing validated directory scan remains only defense-in-depth for a crash before journal creation.
+- The journal owns no original path, filename, content hash, key material, or user identity; it remains only in the per-user encrypted database. Managed names are revalidated before every filesystem resolution.
+
+### RED commands and captured output
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'journals and retries a CAS-rejected snapshot'
+Test Files  1 failed (1)
+Tests  4 failed | 25 skipped (29)
+recycle/unlink: expected injected EIO cleanup failure; received CANCELLED
+purge/unlink: expected injected EIO cleanup failure; received CANCELLED
+recycle/directory-fsync: expected injected EIO cleanup failure; received CANCELLED
+purge/directory-fsync: expected injected EIO cleanup failure; received CANCELLED
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/key-store.test.ts -t 'already-unlinked file'
+Test Files  1 failed (1)
+Tests  1 failed | 3 skipped (4)
+AssertionError: expected ['unlink'] to equal
+['unlink', 'open:r:none', 'sync:directory', 'close:directory']
+```
+
+### GREEN commands and output
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'journals and retries a CAS-rejected snapshot'
+Test Files  1 passed (1)
+Tests  4 passed | 25 skipped (29)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/key-store.test.ts -t 'already-unlinked file'
+Test Files  1 passed (1)
+Tests  1 passed | 3 skipped (4)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge electron/main/ipc/register-ipc.test.ts
+Test Files  9 passed (9)
+Tests  114 passed (114)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/application.test.ts -t 'owns path-free knowledge|holds knowledge owner derivation|reopens admission safely'
+Test Files  1 passed (1)
+Tests  3 passed | 147 skipped (150)
+```
+
+```text
+$ pnpm typecheck
+Scope: 4 of 5 workspace projects
+packages/shared typecheck: Done
+packages/workflow-sdk typecheck: Done
+packages/workflow-schema typecheck: Done
+apps/desktop typecheck: Done
+```
+
+```text
+$ pnpm exec eslint <all 8 changed round-three source/test files>
+(no output; exit 0)
+$ git diff --check
+(no output; exit 0)
+```

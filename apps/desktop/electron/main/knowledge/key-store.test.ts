@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  removeFileDurably,
   writeFileDurably,
   type DurableFileHandlePort,
   type DurableFileSystemPort,
@@ -84,5 +85,22 @@ describe('durable knowledge key records', () => {
       .rejects.toBe(failure)
     expect(calls).toContain('rename')
     expect(calls.indexOf('rename')).toBeLessThan(calls.indexOf('sync:directory'))
+  })
+
+  it('syncs the parent directory when retry observes an already-unlinked file', async () => {
+    const { calls, fileSystem } = fakeFileSystem()
+    fileSystem.unlink = async () => {
+      calls.push('unlink')
+      throw Object.assign(new Error('already removed'), { code: 'ENOENT' })
+    }
+
+    await removeFileDurably('/records/orphan.afobj', fileSystem)
+
+    expect(calls).toEqual([
+      'unlink',
+      'open:r:none',
+      'sync:directory',
+      'close:directory',
+    ])
   })
 })

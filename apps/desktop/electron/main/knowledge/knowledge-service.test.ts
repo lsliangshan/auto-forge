@@ -8,7 +8,7 @@ import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
 import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
-import { KnowledgeKeyStore } from './key-store.js'
+import { KnowledgeKeyStore, removeFileDurably } from './key-store.js'
 import { KnowledgeService, type KnowledgeParserPort, type KnowledgeServiceOptions } from './knowledge-service.js'
 import { DEFAULT_PARSER_LIMITS, type ParserResponse } from './parser-protocol.js'
 import { parseEncryptedDocument } from './parser-worker.js'
@@ -82,6 +82,7 @@ async function fixture(options: {
   vacuumKnowledgeDatabase?: (database: OpenedUserKnowledgeDatabase['database']) => void
   rotateKnowledgeDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
   createObjectSnapshot?: typeof createEncryptedObjectSnapshot
+  removeKnowledgeObjectDurably?: (path: string) => Promise<void>
 } = {}) {
   const rootDirectory = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-service-'))
   directories.push(rootDirectory)
@@ -114,6 +115,7 @@ async function fixture(options: {
       vacuumKnowledgeDatabase: options.vacuumKnowledgeDatabase,
       rotateKnowledgeDatabaseKey: options.rotateKnowledgeDatabaseKey,
       createObjectSnapshot: options.createObjectSnapshot,
+      removeKnowledgeObjectDurably: options.removeKnowledgeObjectDurably,
     }
     return new KnowledgeService(serviceOptions)
   }
@@ -497,6 +499,106 @@ describe('KnowledgeService lifecycle', () => {
     inspected.close()
     expect(() => findFileEnding(app.rootDirectory, '.afobj')).toThrow('.afobj not found')
   })
+
+  it.each([
+    { lifecycle: 'recycle', failureStep: 'unlink', recovery: 'retry' },
+    { lifecycle: 'purge', failureStep: 'unlink', recovery: 'retry' },
+    { lifecycle: 'recycle', failureStep: 'directory-fsync', recovery: 'reopen' },
+    { lifecycle: 'purge', failureStep: 'directory-fsync', recovery: 'reopen' },
+  ] as const)(
+    'journals and retries a CAS-rejected snapshot after $failureStep failure during $lifecycle',
+    async ({ lifecycle, failureStep, recovery }) => {
+      const snapshotStarted = deferred<void>()
+      const releaseSnapshot = deferred<void>()
+      const cleanupFailure = Object.assign(new Error(`injected ${failureStep} failure`), { code: 'EIO' })
+      let cleanupAttempts = 0
+      const app = await fixture({
+        createObjectSnapshot: async input => {
+          snapshotStarted.resolve()
+          await releaseSnapshot.promise
+          return createEncryptedObjectSnapshot(input)
+        },
+        removeKnowledgeObjectDurably: async path => {
+          cleanupAttempts += 1
+          if (cleanupAttempts === 1) {
+            if (failureStep === 'directory-fsync') await unlink(path)
+            throw cleanupFailure
+          }
+          await removeFileDurably(path)
+        },
+      })
+      const owner = { userId: 'alice' }
+      const [base] = await app.service.listBases(owner)
+      app.picks.push(await writeSource(
+        app.rootDirectory,
+        `journal-${lifecycle}-${failureStep}.txt`,
+        `journal ${lifecycle} ${failureStep}`,
+      ))
+      const importing = app.service.importDocument(owner, base!.id)
+      await snapshotStarted.promise
+      const [pending] = await app.service.listDocuments(owner, base!.id)
+      const firstLifecycle = (lifecycle === 'recycle'
+        ? app.service.recycleDocument(owner, pending!.id)
+        : app.service.purgeDocument(owner, pending!.id)
+      )
+      releaseSnapshot.resolve()
+
+      const [importOutcome, lifecycleOutcome] = await Promise.all([
+        importing.then(value => ({ value }), error => ({ error })),
+        firstLifecycle.then(value => ({ value }), error => ({ error })),
+      ])
+      expect(importOutcome).toMatchObject({ error: cleanupFailure })
+      expect(lifecycleOutcome).toMatchObject({ error: cleanupFailure })
+      expect(cleanupAttempts).toBe(1)
+
+      const journaled = await openUserKnowledgeDatabase({
+        rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+      })
+      const localJob = journaled.database.prepare(`
+        SELECT job_id AS jobId, document_id AS documentId FROM local_import_jobs
+      `).get() as { jobId: string; documentId: string }
+      const orphan = journaled.database.prepare(`
+        SELECT relative_name AS relativeName, job_id AS jobId, document_id AS documentId
+        FROM orphan_object_cleanups
+      `).get()
+      expect(orphan).toEqual({
+        relativeName: expect.stringMatching(/^[0-9a-f-]+\.afobj$/),
+        jobId: localJob.jobId,
+        documentId: pending!.id,
+      })
+      expect(journaled.database.prepare('SELECT count(*) AS count FROM source_objects').get())
+        .toEqual({ count: 0 })
+      expect(journaled.database.prepare("SELECT count(*) AS count FROM jobs WHERE status = 'pending'").get())
+        .toEqual({ count: 0 })
+      const objectPath = join(dirname(journaled.databasePath), 'objects', (orphan as { relativeName: string }).relativeName)
+      if (failureStep === 'unlink') await expect(readFile(objectPath)).resolves.toBeInstanceOf(Buffer)
+      else await expect(readFile(objectPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      journaled.close()
+
+      let recovered = app.service
+      if (recovery === 'retry') {
+        await (lifecycle === 'recycle'
+          ? recovered.recycleDocument(owner, pending!.id)
+          : recovered.purgeDocument(owner, pending!.id))
+      } else {
+        await app.service.close()
+        recovered = app.createService()
+        await recovered.listBases(owner)
+      }
+      await recovered.close()
+
+      const inspected = await openUserKnowledgeDatabase({
+        rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+      })
+      expect(inspected.database.prepare('SELECT count(*) AS count FROM orphan_object_cleanups').get())
+        .toEqual({ count: 0 })
+      expect(inspected.database.prepare('SELECT count(*) AS count FROM source_objects').get()).toEqual({ count: 0 })
+      expect(inspected.database.prepare("SELECT count(*) AS count FROM jobs WHERE status = 'pending'").get())
+        .toEqual({ count: 0 })
+      inspected.close()
+      await expect(readFile(objectPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    },
+  )
 
   it('does not acknowledge a post-rename snapshot sync failure and removes its unmanaged object', async () => {
     const syncFailure = Object.assign(new Error('injected object directory sync failure'), { code: 'EIO' })

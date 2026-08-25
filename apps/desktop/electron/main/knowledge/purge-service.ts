@@ -35,6 +35,7 @@ export interface KnowledgePurgeServiceOptions {
   readonly requireTarget: (kind: PurgeEntityKind, id: string) => void
   readonly cancelImportJobs: (kind: PurgeEntityKind, id: string, now: number) => void
   readonly abortAndDrain: (kind: PurgeEntityKind, id: string) => Promise<void>
+  readonly reconcileOrphans: (kind: PurgeEntityKind, id: string) => Promise<void>
   readonly unlinkObject?: (path: string) => Promise<void>
   readonly vacuumDatabase?: (database: Database.Database) => void
   readonly rotateDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
@@ -79,6 +80,7 @@ export class KnowledgePurgeService {
       return journal
     })())
     await this.options.abortAndDrain(kind, id)
+    await this.options.reconcileOrphans(kind, id)
 
     let journal = prepared
     if (journal.state === 'prepared') {

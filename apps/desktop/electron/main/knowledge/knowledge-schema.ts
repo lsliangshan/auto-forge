@@ -270,6 +270,14 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS local_import_jobs_document
       ON local_import_jobs(document_id, generation DESC);
 
+    CREATE TABLE IF NOT EXISTS orphan_object_cleanups (
+      relative_name TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      document_id TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS orphan_object_cleanups_document
+      ON orphan_object_cleanups(document_id);
+
     CREATE TABLE IF NOT EXISTS document_import_heads (
       document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
       generation INTEGER NOT NULL CHECK (generation > 0),

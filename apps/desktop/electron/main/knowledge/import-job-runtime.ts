@@ -43,7 +43,7 @@ interface ActiveImport {
 }
 
 export interface KnowledgeSnapshotTask {
-  complete(): void
+  complete(error?: unknown): void
 }
 
 export async function serializeKnowledgeMutation<T>(
@@ -78,7 +78,11 @@ export class KnowledgeImportRuntime {
   ): KnowledgeSnapshotTask {
     if (this.active.has(scope.jobId)) throw new Error('Knowledge import task is already active')
     let resolve!: () => void
-    const operation = new Promise<void>(release => { resolve = release })
+    let reject!: (error: unknown) => void
+    const operation = new Promise<void>((release, fail) => {
+      resolve = release
+      reject = fail
+    })
     const active: ActiveImport = {
       session,
       documentId: scope.documentId,
@@ -89,11 +93,12 @@ export class KnowledgeImportRuntime {
     this.options.track(operation)
     let completed = false
     return {
-      complete: () => {
+      complete: (error?: unknown) => {
         if (completed) return
         completed = true
         if (this.active.get(scope.jobId) === active) this.active.delete(scope.jobId)
-        resolve()
+        if (error === undefined) resolve()
+        else reject(error)
       },
     }
   }
@@ -141,7 +146,9 @@ export class KnowledgeImportRuntime {
     for (const active of activeTasks) {
       active.controller?.abort()
     }
-    await Promise.allSettled(activeTasks.map(active => active.operation))
+    const outcomes = await Promise.allSettled(activeTasks.map(active => active.operation))
+    const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
+    if (failure) throw failure.reason
   }
 
   cancelJobs(

@@ -23,8 +23,9 @@ import {
 } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeExportService } from './export-service.js'
-import { KnowledgeKeyStore, removeFileDurably } from './key-store.js'
+import { KnowledgeKeyStore } from './key-store.js'
 import { LocalKnowledgeRetriever, type LocalKnowledgeSearchOutcome } from './local-retriever.js'
+import { KnowledgeOrphanCleanupService } from './orphan-cleanup-service.js'
 import type { KnowledgeOwner, KnowledgePersistence } from './knowledge-types.js'
 import type { ParserFormat } from './parser-protocol.js'
 import { KnowledgePurgeService } from './purge-service.js'
@@ -69,6 +70,7 @@ export interface KnowledgeServiceOptions {
   readonly rotateKnowledgeDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
   readonly openKnowledgeDatabase?: typeof openUserKnowledgeDatabase
   readonly createObjectSnapshot?: typeof createEncryptedObjectSnapshot
+  readonly removeKnowledgeObjectDurably?: (path: string) => Promise<void>
 }
 
 interface DocumentRow {
@@ -335,6 +337,7 @@ export class KnowledgeService implements KnowledgePersistence {
       })()
     })
     await this.imports.abortAndDrainScope(session, 'document', documentId)
+    await this.orphanCleanup(session).resumeScope('document', documentId)
   }
 
   async purgeDocument(owner: KnowledgeOwner, documentId: string): Promise<void> {
@@ -365,6 +368,7 @@ export class KnowledgeService implements KnowledgePersistence {
       })()
     })
     await this.imports.abortAndDrainScope(session, 'knowledge_base', knowledgeBaseId)
+    await this.orphanCleanup(session).resumeScope('knowledge_base', knowledgeBaseId)
   }
 
   async purgeBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void> {
@@ -563,6 +567,7 @@ export class KnowledgeService implements KnowledgePersistence {
         objectsDirectory: join(directory, 'objects'),
         mutationTail: Promise.resolve(),
       }
+      await this.orphanCleanup(session).resumeAll()
       await this.purgeService(session).resumeAll()
       await this.imports.reconcile(session)
       this.session = session
@@ -666,7 +671,8 @@ export class KnowledgeService implements KnowledgePersistence {
     let versionNumber = 1
     let generation = 1
     let priorJobId: string | undefined
-    let finishSnapshotTask: (() => void) | undefined
+    let finishSnapshotTask: ((error?: unknown) => void) | undefined
+    let snapshotTaskFailure: unknown
     try {
       await this.mutate(session, () => session.opened.database.transaction(() => {
         this.requireBase(session, target.knowledgeBaseId, true)
@@ -742,7 +748,7 @@ export class KnowledgeService implements KnowledgePersistence {
         const snapshotTask = this.imports.beginSnapshot(session, {
           jobId, documentId, knowledgeBaseId: target.knowledgeBaseId,
         })
-        finishSnapshotTask = () => snapshotTask.complete()
+        finishSnapshotTask = error => snapshotTask.complete(error)
       })())
     } catch (error) {
       finishSnapshotTask?.()
@@ -839,13 +845,20 @@ export class KnowledgeService implements KnowledgePersistence {
       } catch {
         // Preserve the import failure; close/logout may already be tearing the database down.
       }
+      let cleanupFailure: unknown
       if (!sourceObjectStored) {
-        try { await removeFileDurably(objectPath) } catch { /* Preserve the import failure. */ }
+        try {
+          await this.orphanCleanup(session).journalAndRemove({ relativeName, jobId, documentId })
+        } catch (cleanupError) {
+          cleanupFailure = cleanupError
+          snapshotTaskFailure = cleanupError
+        }
       }
+      if (cleanupFailure !== undefined) throw cleanupFailure
       if (typeof error === 'object' && error !== null && 'code' in error) throw error
       failure('INTERNAL_ERROR')
     } finally {
-      finishSnapshotTask?.()
+      finishSnapshotTask?.(snapshotTaskFailure)
     }
   }
 
@@ -888,9 +901,19 @@ export class KnowledgeService implements KnowledgePersistence {
         this.imports.cancelJobs(session, entityKind, targetId, now)
       ),
       abortAndDrain: (kind, id) => this.imports.abortAndDrainScope(session, kind, id),
+      reconcileOrphans: (kind, id) => this.orphanCleanup(session).resumeScope(kind, id),
       unlinkObject: this.options.unlinkKnowledgeObject,
       vacuumDatabase: this.options.vacuumKnowledgeDatabase,
       rotateDatabaseKey: this.options.rotateKnowledgeDatabaseKey,
+    })
+  }
+
+  private orphanCleanup(session: OpenKnowledgeSession): KnowledgeOrphanCleanupService {
+    return new KnowledgeOrphanCleanupService({
+      database: session.opened.database,
+      objectsDirectory: session.objectsDirectory,
+      mutate: operation => this.mutate(session, operation),
+      removeObjectDurably: this.options.removeKnowledgeObjectDurably,
     })
   }
 
