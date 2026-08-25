@@ -26,6 +26,7 @@ import {
   knowledgeEntitlementStateSchema,
   knowledgeFeatureAvailabilitySchema,
   knowledgeSearchResultsSchema,
+  knowledgeSearchOutcomeSchema,
   knowledgeSelectionSchema,
   knowledgeVersionSchema,
   mediaAssetSchema,
@@ -79,6 +80,30 @@ describe('cross-process contracts', () => {
     expect(localKnowledgeSearchRequestSchema.safeParse({ query: 'retrieval query', topK: 99 }).success).toBe(false)
     expect(localKnowledgeSearchRequestSchema.safeParse({ query: 'retrieval query', knowledgeBaseIds: ['foreign_kb'] }).success).toBe(false)
     expect(localKnowledgeSearchRequestSchema.safeParse({ query: 'retrieval query', sql: 'select * from kb_chunks' }).success).toBe(false)
+  })
+
+  it('keeps lifecycle requests path-free and search scope Main-owned', () => {
+    expect(ipcRequestSchemas[ipcChannels.knowledgeCreateBase].parse({ name: 'Policies' }))
+      .toEqual({ name: 'Policies' })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeImportDocument].parse({ knowledgeBaseId: 'kb_1' }))
+      .toEqual({ knowledgeBaseId: 'kb_1' })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeSearch].parse({
+      conversationId: 'conversation_1', query: '北京政务',
+    })).toEqual({ conversationId: 'conversation_1', query: '北京政务' })
+    expect(knowledgeSearchOutcomeSchema.parse({ kind: 'ask_for_detail', results: [] }))
+      .toEqual({ kind: 'ask_for_detail', results: [] })
+
+    for (const input of [
+      { knowledgeBaseId: 'kb_1', path: '/private/source.txt' },
+      { knowledgeBaseId: 'kb_1', userId: 'other_user' },
+      { knowledgeBaseId: 'kb_1', entitlement: 'member' },
+    ]) expect(ipcRequestSchemas[ipcChannels.knowledgeImportDocument].safeParse(input).success).toBe(false)
+    for (const input of [
+      { conversationId: 'conversation_1', query: '北京', topK: 99 },
+      { conversationId: 'conversation_1', query: '北京', knowledgeBaseIds: ['kb_other'] },
+      { conversationId: 'conversation_1', query: '北京', indexId: 'index_other' },
+      { conversationId: 'conversation_1', query: '北京', sql: 'select 1' },
+    ]) expect(ipcRequestSchemas[ipcChannels.knowledgeSearch].safeParse(input).success).toBe(false)
   })
 
   it('limits local knowledge evidence and validates source-specific citations', () => {

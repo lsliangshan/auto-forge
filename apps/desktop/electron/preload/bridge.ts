@@ -147,7 +147,16 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
     },
     knowledge: {
       listBases: () => invoke(ipcRenderer, ipcChannels.knowledgeListBases),
+      createBase: (name) => invoke(ipcRenderer, ipcChannels.knowledgeCreateBase, { name }),
       listDocuments: (knowledgeBaseId) => invoke(ipcRenderer, ipcChannels.knowledgeListDocuments, { knowledgeBaseId }),
+      listVersions: (documentId) => invoke(ipcRenderer, ipcChannels.knowledgeListVersions, { documentId }),
+      importDocument: (knowledgeBaseId) => invoke(ipcRenderer, ipcChannels.knowledgeImportDocument, { knowledgeBaseId }),
+      replaceDocument: (documentId) => invoke(ipcRenderer, ipcChannels.knowledgeReplaceDocument, { documentId }),
+      recycleDocument: (documentId) => invoke(ipcRenderer, ipcChannels.knowledgeRecycleDocument, { documentId }),
+      purgeDocument: (documentId) => invoke(ipcRenderer, ipcChannels.knowledgePurgeDocument, { documentId }),
+      recycleBase: (knowledgeBaseId) => invoke(ipcRenderer, ipcChannels.knowledgeRecycleBase, { knowledgeBaseId }),
+      purgeBase: (knowledgeBaseId) => invoke(ipcRenderer, ipcChannels.knowledgePurgeBase, { knowledgeBaseId }),
+      exportBase: (knowledgeBaseId) => invoke(ipcRenderer, ipcChannels.knowledgeExportBase, { knowledgeBaseId }),
       getConversationSelection: (conversationId) => invoke(
         ipcRenderer,
         ipcChannels.knowledgeGetConversationSelection,
@@ -157,6 +166,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
         ipcRenderer,
         ipcChannels.knowledgeUpdateConversationSelection,
         { conversationId, selection },
+      ),
+      search: (conversationId, query) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeSearch,
+        { conversationId, query },
       ),
       getFeatureAvailability: () => invoke(ipcRenderer, ipcChannels.knowledgeGetFeatureAvailability),
       getEntitlement: () => invoke(ipcRenderer, ipcChannels.knowledgeGetEntitlement),

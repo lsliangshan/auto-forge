@@ -30,6 +30,7 @@ import { createMediaProtocolHandler } from './media/media-protocol.js'
 import { NetworkProxyService } from './network/network-proxy-service.js'
 import { ElectronBrowserWorkspace } from './browser/electron-browser-workspace.js'
 import { createSecureWindow } from './window.js'
+import { createElectronParserSupervisor } from './knowledge/parser-supervisor.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
 
@@ -141,6 +142,32 @@ async function initialize(): Promise<ApplicationRuntime> {
         : await dialog.showOpenDialog(dialogOptions)
       return result.canceled ? undefined : result.filePaths[0]
     },
+    createKnowledgeParser: () => createElectronParserSupervisor(
+      fileURLToPath(new URL('../renderer/electron/main/knowledge/parser-worker.html', import.meta.url)),
+      fileURLToPath(new URL('../preload/parser.cjs', import.meta.url)),
+    ),
+    chooseKnowledgeFile: async () => {
+      const dialogOptions: OpenDialogOptions = {
+        title: '导入知识库文件',
+        properties: ['openFile'],
+        filters: [{
+          name: 'Documents',
+          extensions: ['pdf', 'docx', 'txt', 'md', 'markdown', 'html', 'htm'],
+        }],
+      }
+      const result = mainWindow
+        ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+        : await dialog.showOpenDialog(dialogOptions)
+      return result.canceled ? undefined : result.filePaths[0]
+    },
+    chooseKnowledgeExportPath: async (defaultName) => {
+      const result = mainWindow
+        ? await dialog.showSaveDialog(mainWindow, { defaultPath: defaultName, filters: [{ name: 'ZIP', extensions: ['zip'] }] })
+        : await dialog.showSaveDialog({ defaultPath: defaultName, filters: [{ name: 'ZIP', extensions: ['zip'] }] })
+      return result.canceled ? undefined : result.filePath
+    },
+    knowledgePlatform: process.platform,
+    knowledgeArch: process.arch,
     qiniuEnv: process.env,
     cloudbaseEnv: process.env,
     readClipboardImage: () => {

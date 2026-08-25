@@ -59,6 +59,10 @@ import {
   type NetworkTransportSnapshot,
 } from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
+import { readEncryptedObjectSnapshot } from './knowledge/encrypted-object-store.js'
+import type { KnowledgeParserPort } from './knowledge/knowledge-service.js'
+import { DEFAULT_PARSER_LIMITS } from './knowledge/parser-protocol.js'
+import { parseEncryptedDocument } from './knowledge/parser-worker.js'
 import { SettingsService } from './settings/settings-service.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
@@ -749,6 +753,87 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('owns path-free knowledge import/search/export and closes parser scope before logout identity change', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-'))
+    directories.push(root)
+    const sourcePath = join(root, 'private-source.txt')
+    const exportPath = join(root, 'knowledge-export.zip')
+    const privateText = '北京政务应用边界私有标记'
+    await writeFile(sourcePath, privateText)
+    const order: string[] = []
+    const authDelegate = createTestAuthService()
+    const authService: AuthService = {
+      ...authDelegate,
+      logout: async () => {
+        order.push('auth-logout')
+        await authDelegate.logout()
+      },
+    }
+    const picks = [sourcePath]
+    const exports = [exportPath]
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      chooseKnowledgeFile: async () => picks.shift(),
+      chooseKnowledgeExportPath: async () => exports.shift(),
+      createKnowledgeParser: async (): Promise<KnowledgeParserPort> => ({
+        async parse(input) {
+          const encrypted = await readEncryptedObjectSnapshot(input.objectPath)
+          const fileKey = Uint8Array.from(input.fileKey).buffer
+          input.fileKey.fill(0)
+          return parseEncryptedDocument({
+            version: 1,
+            type: 'parse',
+            jobId: input.jobId,
+            format: input.format,
+            encryptedBytes: Uint8Array.from(encrypted).buffer,
+            fileKey,
+            limits: DEFAULT_PARSER_LIMITS,
+          })
+        },
+        async terminateAll() { order.push('parser-terminate') },
+      }),
+      knowledgePlatform: 'darwin',
+      knowledgeArch: 'arm64',
+    }))
+    const alice = await authenticate(runtime, 'KnowledgeAlice')
+    const [base] = await runtime.services.knowledge.listBases({ userId: alice.user.id })
+    const imported = await runtime.services.knowledge.importDocument({ userId: alice.user.id }, base!.id)
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.knowledge.updateConversationSelection(
+      { userId: alice.user.id },
+      conversation.id,
+      { knowledgeBaseIds: [base!.id], knowledgeMode: 'strict' },
+    )
+    await expect(runtime.services.knowledge.search(
+      { userId: alice.user.id }, conversation.id, '北京政务',
+    )).resolves.toMatchObject({ kind: 'results', results: [{ documentId: imported!.id }] })
+    await runtime.services.knowledge.exportBase({ userId: alice.user.id }, base!.id)
+    expect((await readFile(exportPath)).subarray(0, 2).toString()).toBe('PK')
+
+    await runtime.services.auth.logout()
+    expect(order.slice(0, 2)).toEqual(['parser-terminate', 'auth-logout'])
+
+    const bob = await authenticate(runtime, 'KnowledgeBob')
+    await expect(runtime.services.knowledge.getConversationSelection(
+      { userId: bob.user.id }, conversation.id,
+    )).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    const [bobBase] = await runtime.services.knowledge.listBases({ userId: bob.user.id })
+    await expect(runtime.services.knowledge.listDocuments({ userId: bob.user.id }, bobBase!.id))
+      .resolves.toEqual([])
+    await runtime.close()
+
+    for (const file of ['autoforge.sqlite', 'autoforge.sqlite-wal', 'autoforge.sqlite-journal']) {
+      try {
+        const bytes = await readFile(join(root, file))
+        expect(bytes.includes(Buffer.from('private-source.txt'))).toBe(false)
+        expect(bytes.includes(Buffer.from(privateText))).toBe(false)
+        expect(bytes.includes(Buffer.from('北京政务'))).toBe(false)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+  })
+
   it('rejects selector-less resolution instead of using an id and version fallback', async () => {
     const vault = createWorkflowSourceSelectorVault()
     const installed = {

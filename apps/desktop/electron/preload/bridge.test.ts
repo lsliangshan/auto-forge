@@ -82,30 +82,50 @@ describe('preload desktop bridge', () => {
     expect(app.api.profile).not.toHaveProperty('invoke')
   })
 
-  it('exposes only fixed knowledge operations without a generic search transport', async () => {
+  it('exposes fixed path-free knowledge lifecycle and scoped-search operations', async () => {
     const app = harness()
     const selection = { knowledgeBaseIds: ['kb_1'], knowledgeMode: 'mixed' as const }
 
     await app.api.knowledge.listBases()
+    await app.api.knowledge.createBase('Policies')
     await app.api.knowledge.listDocuments('kb_1')
+    await app.api.knowledge.listVersions('document_1')
+    await app.api.knowledge.importDocument('kb_1')
+    await app.api.knowledge.replaceDocument('document_1')
+    await app.api.knowledge.recycleDocument('document_1')
+    await app.api.knowledge.purgeDocument('document_1')
+    await app.api.knowledge.recycleBase('kb_1')
+    await app.api.knowledge.purgeBase('kb_1')
+    await app.api.knowledge.exportBase('kb_1')
     await app.api.knowledge.getConversationSelection('conversation_1')
     await app.api.knowledge.updateConversationSelection('conversation_1', selection)
+    await app.api.knowledge.search('conversation_1', '北京政务')
     await app.api.knowledge.getFeatureAvailability()
     await app.api.knowledge.getEntitlement()
     await app.api.knowledge.getConsent()
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgeListBases, undefined)
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1' })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_1' })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection })
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.knowledgeGetFeatureAvailability, undefined)
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(6, ipcChannels.knowledgeGetEntitlement, undefined)
-    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(7, ipcChannels.knowledgeGetConsent, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeCreateBase, { name: 'Policies' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.knowledgeListVersions, { documentId: 'document_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(5, ipcChannels.knowledgeImportDocument, { knowledgeBaseId: 'kb_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(6, ipcChannels.knowledgeReplaceDocument, { documentId: 'document_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(7, ipcChannels.knowledgeRecycleDocument, { documentId: 'document_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(8, ipcChannels.knowledgePurgeDocument, { documentId: 'document_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(9, ipcChannels.knowledgeRecycleBase, { knowledgeBaseId: 'kb_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(10, ipcChannels.knowledgePurgeBase, { knowledgeBaseId: 'kb_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(11, ipcChannels.knowledgeExportBase, { knowledgeBaseId: 'kb_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(12, ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_1' })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(13, ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(14, ipcChannels.knowledgeSearch, {
+      conversationId: 'conversation_1', query: '北京政务',
+    })
     expect(Object.keys(app.api.knowledge)).toEqual([
-      'listBases', 'listDocuments', 'getConversationSelection', 'updateConversationSelection',
+      'listBases', 'createBase', 'listDocuments', 'listVersions', 'importDocument',
+      'replaceDocument', 'recycleDocument', 'purgeDocument', 'recycleBase', 'purgeBase',
+      'exportBase', 'getConversationSelection', 'updateConversationSelection', 'search',
       'getFeatureAvailability', 'getEntitlement', 'getConsent',
     ])
-    expect(app.api.knowledge).not.toHaveProperty('search')
     expect(app.api.knowledge).not.toHaveProperty('invoke')
   })
 

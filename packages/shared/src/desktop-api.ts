@@ -29,7 +29,7 @@ export const knowledgeBaseSchema = z.object({
   id: identifierSchema,
   name: nonEmptyStringSchema.max(200),
   kind: z.enum(['local', 'cloud']),
-  status: z.enum(['ready', 'processing', 'paused', 'failed', 'read_only']),
+  status: z.enum(['ready', 'processing', 'paused', 'failed', 'read_only', 'recycled']),
   documentCount: z.number().int().nonnegative(),
   updatedAt: timestampSchema,
 }).strict()
@@ -70,6 +70,11 @@ export const localKnowledgeSearchRequestSchema = z.object({
 export type LocalKnowledgeSearchRequest = z.infer<typeof localKnowledgeSearchRequestSchema>
 export { knowledgeSearchResultsSchema }
 export type { KnowledgeCitationReference, KnowledgeSearchResult } from './events.js'
+export const knowledgeSearchOutcomeSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('results'), results: knowledgeSearchResultsSchema }).strict(),
+  z.object({ kind: z.literal('ask_for_detail'), results: z.tuple([]) }).strict(),
+])
+export type KnowledgeSearchOutcome = z.infer<typeof knowledgeSearchOutcomeSchema>
 
 export const knowledgeEntitlementStateSchema = z.object({
   tier: z.enum(['free', 'member']),
@@ -1053,9 +1058,19 @@ export const ipcChannels = {
   settingsClearLocalData: 'settings:clear-local-data',
   settingsClearBrowserData: 'settings:clear-browser-data',
   knowledgeListBases: 'knowledge:list-bases',
+  knowledgeCreateBase: 'knowledge:create-base',
   knowledgeListDocuments: 'knowledge:list-documents',
+  knowledgeListVersions: 'knowledge:list-versions',
+  knowledgeImportDocument: 'knowledge:import-document',
+  knowledgeReplaceDocument: 'knowledge:replace-document',
+  knowledgeRecycleDocument: 'knowledge:recycle-document',
+  knowledgePurgeDocument: 'knowledge:purge-document',
+  knowledgeRecycleBase: 'knowledge:recycle-base',
+  knowledgePurgeBase: 'knowledge:purge-base',
+  knowledgeExportBase: 'knowledge:export-base',
   knowledgeGetConversationSelection: 'knowledge:get-conversation-selection',
   knowledgeUpdateConversationSelection: 'knowledge:update-conversation-selection',
+  knowledgeSearch: 'knowledge:search',
   knowledgeGetFeatureAvailability: 'knowledge:get-feature-availability',
   knowledgeGetEntitlement: 'knowledge:get-entitlement',
   knowledgeGetConsent: 'knowledge:get-consent',
@@ -1133,9 +1148,14 @@ export const clearLocalDataRequestSchema = z.object({
   scope: z.enum(['conversations', 'executions', 'all']),
 }).strict()
 export const knowledgeBaseRequestSchema = z.object({ knowledgeBaseId: identifierSchema }).strict()
+export const knowledgeDocumentRequestSchema = z.object({ documentId: identifierSchema }).strict()
+export const createKnowledgeBaseRequestSchema = z.object({ name: nonEmptyStringSchema.max(200) }).strict()
 export const knowledgeConversationSelectionRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const updateKnowledgeConversationSelectionRequestSchema = knowledgeConversationSelectionRequestSchema.extend({
   selection: knowledgeSelectionSchema,
+}).strict()
+export const knowledgeSearchRequestSchema = knowledgeConversationSelectionRequestSchema.extend({
+  query: localKnowledgeSearchRequestSchema.shape.query,
 }).strict()
 export const openExternalRequestSchema = z.object({
   url: z.string().superRefine((value, context) => {
@@ -1218,9 +1238,19 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.settingsClearBrowserData]: z.undefined(),
   [ipcChannels.knowledgeListBases]: z.undefined(),
+  [ipcChannels.knowledgeCreateBase]: createKnowledgeBaseRequestSchema,
   [ipcChannels.knowledgeListDocuments]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeListVersions]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgeImportDocument]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeReplaceDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgeRecycleDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgePurgeDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgeRecycleBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgePurgeBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeExportBase]: knowledgeBaseRequestSchema,
   [ipcChannels.knowledgeGetConversationSelection]: knowledgeConversationSelectionRequestSchema,
   [ipcChannels.knowledgeUpdateConversationSelection]: updateKnowledgeConversationSelectionRequestSchema,
+  [ipcChannels.knowledgeSearch]: knowledgeSearchRequestSchema,
   [ipcChannels.knowledgeGetFeatureAvailability]: z.undefined(),
   [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
   [ipcChannels.knowledgeGetConsent]: z.undefined(),
@@ -1295,9 +1325,19 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
   [ipcChannels.knowledgeListBases]: z.array(knowledgeBaseSchema),
+  [ipcChannels.knowledgeCreateBase]: knowledgeBaseSchema,
   [ipcChannels.knowledgeListDocuments]: z.array(knowledgeDocumentSchema),
+  [ipcChannels.knowledgeListVersions]: z.array(knowledgeVersionSchema),
+  [ipcChannels.knowledgeImportDocument]: knowledgeDocumentSchema.optional(),
+  [ipcChannels.knowledgeReplaceDocument]: knowledgeDocumentSchema.optional(),
+  [ipcChannels.knowledgeRecycleDocument]: voidResponseSchema,
+  [ipcChannels.knowledgePurgeDocument]: voidResponseSchema,
+  [ipcChannels.knowledgeRecycleBase]: voidResponseSchema,
+  [ipcChannels.knowledgePurgeBase]: voidResponseSchema,
+  [ipcChannels.knowledgeExportBase]: voidResponseSchema,
   [ipcChannels.knowledgeGetConversationSelection]: knowledgeSelectionSchema,
   [ipcChannels.knowledgeUpdateConversationSelection]: knowledgeSelectionSchema,
+  [ipcChannels.knowledgeSearch]: knowledgeSearchOutcomeSchema,
   [ipcChannels.knowledgeGetFeatureAvailability]: knowledgeFeatureAvailabilitySchema,
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
@@ -1395,9 +1435,19 @@ export interface DesktopAPI {
   }
   knowledge: {
     listBases(): Promise<KnowledgeBase[]>
+    createBase(name: string): Promise<KnowledgeBase>
     listDocuments(knowledgeBaseId: string): Promise<KnowledgeDocument[]>
+    listVersions(documentId: string): Promise<KnowledgeVersion[]>
+    importDocument(knowledgeBaseId: string): Promise<KnowledgeDocument | undefined>
+    replaceDocument(documentId: string): Promise<KnowledgeDocument | undefined>
+    recycleDocument(documentId: string): Promise<void>
+    purgeDocument(documentId: string): Promise<void>
+    recycleBase(knowledgeBaseId: string): Promise<void>
+    purgeBase(knowledgeBaseId: string): Promise<void>
+    exportBase(knowledgeBaseId: string): Promise<void>
     getConversationSelection(conversationId: string): Promise<KnowledgeSelection>
     updateConversationSelection(conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
+    search(conversationId: string, query: string): Promise<KnowledgeSearchOutcome>
     getFeatureAvailability(): Promise<KnowledgeFeatureAvailability>
     getEntitlement(): Promise<KnowledgeEntitlementState>
     getConsent(): Promise<KnowledgeConsentState>

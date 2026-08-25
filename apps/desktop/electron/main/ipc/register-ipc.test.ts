@@ -108,9 +108,22 @@ function services(): DesktopIpcServices {
     },
     knowledge: {
       listBases: vi.fn().mockResolvedValue([]),
+      createBase: vi.fn().mockResolvedValue({
+        id: 'kb_1', name: 'Policies', kind: 'local', status: 'ready', documentCount: 0,
+        updatedAt: '2026-08-26T00:00:00.000Z',
+      }),
       listDocuments: vi.fn().mockResolvedValue([]),
+      listVersions: vi.fn().mockResolvedValue([]),
+      importDocument: vi.fn().mockResolvedValue(undefined),
+      replaceDocument: vi.fn().mockResolvedValue(undefined),
+      recycleDocument: vi.fn().mockResolvedValue(undefined),
+      purgeDocument: vi.fn().mockResolvedValue(undefined),
+      recycleBase: vi.fn().mockResolvedValue(undefined),
+      purgeBase: vi.fn().mockResolvedValue(undefined),
+      exportBase: vi.fn().mockResolvedValue(undefined),
       getConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
       updateConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
+      search: vi.fn().mockResolvedValue({ kind: 'ask_for_detail', results: [] }),
       getFeatureAvailability: vi.fn().mockResolvedValue({
         local: { available: false, reasons: ['encrypted_storage_unavailable'] },
         cloud: { available: false, reasons: ['encrypted_storage_unavailable'] },
@@ -339,29 +352,51 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.chat.send).not.toHaveBeenCalled()
   })
 
-  it('guards fixed knowledge contracts without renderer-provided scope or retrieval limits', async () => {
+  it('guards fixed knowledge lifecycle and search contracts without renderer-provided paths or scope', async () => {
     const app = harness()
     const selection = { knowledgeBaseIds: ['kb_1'], knowledgeMode: 'strict' as const }
 
     await app.invoke(ipcChannels.knowledgeListBases)
+    await app.invoke(ipcChannels.knowledgeCreateBase, { name: 'Policies' })
     await app.invoke(ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1' })
+    await app.invoke(ipcChannels.knowledgeListVersions, { documentId: 'document_1' })
+    await app.invoke(ipcChannels.knowledgeImportDocument, { knowledgeBaseId: 'kb_1' })
+    await app.invoke(ipcChannels.knowledgeReplaceDocument, { documentId: 'document_1' })
+    await app.invoke(ipcChannels.knowledgeRecycleDocument, { documentId: 'document_1' })
+    await app.invoke(ipcChannels.knowledgePurgeDocument, { documentId: 'document_1' })
+    await app.invoke(ipcChannels.knowledgeRecycleBase, { knowledgeBaseId: 'kb_1' })
+    await app.invoke(ipcChannels.knowledgePurgeBase, { knowledgeBaseId: 'kb_1' })
+    await app.invoke(ipcChannels.knowledgeExportBase, { knowledgeBaseId: 'kb_1' })
     await app.invoke(ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_1' })
     await app.invoke(ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection })
+    await app.invoke(ipcChannels.knowledgeSearch, { conversationId: 'conversation_1', query: '北京政务' })
     await app.invoke(ipcChannels.knowledgeGetFeatureAvailability)
     await app.invoke(ipcChannels.knowledgeGetEntitlement)
     await app.invoke(ipcChannels.knowledgeGetConsent)
 
     const owner = { userId: 'user_1' }
     expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.createBase).toHaveBeenCalledWith(owner, 'Policies')
     expect(app.dependencies.knowledge.listDocuments).toHaveBeenCalledWith(owner, 'kb_1')
+    expect(app.dependencies.knowledge.listVersions).toHaveBeenCalledWith(owner, 'document_1')
+    expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'kb_1')
+    expect(app.dependencies.knowledge.replaceDocument).toHaveBeenCalledWith(owner, 'document_1')
+    expect(app.dependencies.knowledge.recycleDocument).toHaveBeenCalledWith(owner, 'document_1')
+    expect(app.dependencies.knowledge.purgeDocument).toHaveBeenCalledWith(owner, 'document_1')
+    expect(app.dependencies.knowledge.exportBase).toHaveBeenCalledWith(owner, 'kb_1')
     expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith(owner, 'conversation_1')
     expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith(owner, 'conversation_1', selection)
+    expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, 'conversation_1', '北京政务')
     expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
 
     for (const [channel, input] of [
       [ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1', userId: 'other_user' }],
+      [ipcChannels.knowledgeImportDocument, { knowledgeBaseId: 'kb_1', path: '/private/source.txt' }],
+      [ipcChannels.knowledgeReplaceDocument, { documentId: 'document_1', path: '/private/source.txt' }],
       [ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection, topK: 99 }],
       [ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_1', selection: { ...selection, indexId: 'foreign-index' } }],
+      [ipcChannels.knowledgeSearch, { conversationId: 'conversation_1', query: '北京', topK: 99 }],
+      [ipcChannels.knowledgeSearch, { conversationId: 'conversation_1', query: '北京', knowledgeBaseIds: ['kb_other'] }],
       [ipcChannels.knowledgeGetFeatureAvailability, { path: '/private/knowledge.sqlite' }],
     ] as const) {
       await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
@@ -377,17 +412,27 @@ describe('registerDesktopIpc', () => {
     vi.mocked(app.dependencies.auth.requireSession).mockResolvedValue(ownerSession)
 
     await app.invoke(ipcChannels.knowledgeListBases)
+    await app.invoke(ipcChannels.knowledgeCreateBase, { name: 'Bob Base' })
     await app.invoke(ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_bob' })
+    await app.invoke(ipcChannels.knowledgeListVersions, { documentId: 'document_bob' })
+    await app.invoke(ipcChannels.knowledgeImportDocument, { knowledgeBaseId: 'kb_bob' })
+    await app.invoke(ipcChannels.knowledgeReplaceDocument, { documentId: 'document_bob' })
     await app.invoke(ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_bob' })
     await app.invoke(ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_bob', selection })
+    await app.invoke(ipcChannels.knowledgeSearch, { conversationId: 'conversation_bob', query: '北京' })
     await app.invoke(ipcChannels.knowledgeGetFeatureAvailability)
     await app.invoke(ipcChannels.knowledgeGetEntitlement)
     await app.invoke(ipcChannels.knowledgeGetConsent)
 
     expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.createBase).toHaveBeenCalledWith(owner, 'Bob Base')
     expect(app.dependencies.knowledge.listDocuments).toHaveBeenCalledWith(owner, 'kb_bob')
+    expect(app.dependencies.knowledge.listVersions).toHaveBeenCalledWith(owner, 'document_bob')
+    expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'kb_bob')
+    expect(app.dependencies.knowledge.replaceDocument).toHaveBeenCalledWith(owner, 'document_bob')
     expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith(owner, 'conversation_bob')
     expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith(owner, 'conversation_bob', selection)
+    expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, 'conversation_bob', '北京')
     expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.getEntitlement).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.getConsent).toHaveBeenCalledWith(owner)

@@ -87,6 +87,33 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
     BEGIN
       SELECT RAISE(ABORT, 'document version payload is immutable');
     END;
+
+    CREATE TABLE IF NOT EXISTS source_objects (
+      id TEXT PRIMARY KEY,
+      relative_name TEXT NOT NULL UNIQUE,
+      wrapped_file_key BLOB NOT NULL,
+      byte_size INTEGER NOT NULL CHECK (byte_size > 0),
+      content_hash TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS knowledge_metadata (
+      key TEXT PRIMARY KEY,
+      value BLOB NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS conversation_selections (
+      conversation_id TEXT PRIMARY KEY,
+      knowledge_mode TEXT NOT NULL CHECK (knowledge_mode IN ('mixed', 'strict')),
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS conversation_selection_bases (
+      conversation_id TEXT NOT NULL REFERENCES conversation_selections(conversation_id) ON DELETE CASCADE,
+      knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      PRIMARY KEY (conversation_id, knowledge_base_id),
+      UNIQUE (conversation_id, ordinal)
+    ) STRICT;
     CREATE TRIGGER document_versions_lifecycle
     BEFORE UPDATE OF status ON document_versions
     WHEN NOT (

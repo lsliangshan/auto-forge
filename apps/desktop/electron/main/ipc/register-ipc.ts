@@ -11,7 +11,9 @@ import {
   type KnowledgeDocument,
   type KnowledgeEntitlementState,
   type KnowledgeFeatureAvailability,
+  type KnowledgeSearchOutcome,
   type KnowledgeSelection,
+  type KnowledgeVersion,
   type MediaAsset,
   type MediaImportContext,
   type MediaRemoveDraftRequest,
@@ -65,9 +67,19 @@ export interface DesktopIpcServices {
   settings: DesktopAPI['settings']
   knowledge: {
     listBases(owner: KnowledgeOwner): Promise<KnowledgeBase[]>
+    createBase(owner: KnowledgeOwner, name: string): Promise<KnowledgeBase>
     listDocuments(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument[]>
+    listVersions(owner: KnowledgeOwner, documentId: string): Promise<KnowledgeVersion[]>
+    importDocument(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument | undefined>
+    replaceDocument(owner: KnowledgeOwner, documentId: string): Promise<KnowledgeDocument | undefined>
+    recycleDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
+    purgeDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
+    recycleBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void>
+    purgeBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void>
+    exportBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void>
     getConversationSelection(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSelection>
     updateConversationSelection(owner: KnowledgeOwner, conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
+    search(owner: KnowledgeOwner, conversationId: string, query: string): Promise<KnowledgeSearchOutcome>
     getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability>
     getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
     getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>
@@ -230,12 +242,26 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
   register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
   registerKnowledge(ipcChannels.knowledgeListBases, (owner) => options.services.knowledge.listBases(owner))
+  registerKnowledge(ipcChannels.knowledgeCreateBase, (owner, input) => options.services.knowledge.createBase(owner, input.name))
   registerKnowledge(ipcChannels.knowledgeListDocuments, (owner, input) => options.services.knowledge.listDocuments(owner, input.knowledgeBaseId))
+  registerKnowledge(ipcChannels.knowledgeListVersions, (owner, input) => options.services.knowledge.listVersions(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgeImportDocument, (owner, input) => options.services.knowledge.importDocument(owner, input.knowledgeBaseId))
+  registerKnowledge(ipcChannels.knowledgeReplaceDocument, (owner, input) => options.services.knowledge.replaceDocument(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgeRecycleDocument, (owner, input) => options.services.knowledge.recycleDocument(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgePurgeDocument, (owner, input) => options.services.knowledge.purgeDocument(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgeRecycleBase, (owner, input) => options.services.knowledge.recycleBase(owner, input.knowledgeBaseId))
+  registerKnowledge(ipcChannels.knowledgePurgeBase, (owner, input) => options.services.knowledge.purgeBase(owner, input.knowledgeBaseId))
+  registerKnowledge(ipcChannels.knowledgeExportBase, (owner, input) => options.services.knowledge.exportBase(owner, input.knowledgeBaseId))
   registerKnowledge(ipcChannels.knowledgeGetConversationSelection, (owner, input) => options.services.knowledge.getConversationSelection(owner, input.conversationId))
   registerKnowledge(ipcChannels.knowledgeUpdateConversationSelection, (owner, input) => options.services.knowledge.updateConversationSelection(
     owner,
     input.conversationId,
     input.selection,
+  ))
+  registerKnowledge(ipcChannels.knowledgeSearch, (owner, input) => options.services.knowledge.search(
+    owner,
+    input.conversationId,
+    input.query,
   ))
   registerKnowledge(ipcChannels.knowledgeGetFeatureAvailability, (owner) => options.services.knowledge.getFeatureAvailability(owner))
   registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))

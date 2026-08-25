@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, rename } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -14,6 +14,7 @@ export interface EncryptedObjectSnapshot {
   readonly objectPath: string
   readonly wrappedFileKey: Buffer
   readonly encryptedBytes: number
+  readonly contentHash: string
 }
 
 function requireKey(key: Buffer, name: string): void {
@@ -77,6 +78,18 @@ async function readStableRegularFile(path: string, maxBytes: number): Promise<Bu
   }
 }
 
+export async function hashStableKnowledgeSource(
+  path: string,
+  maxBytes = MAX_KNOWLEDGE_OBJECT_BYTES,
+): Promise<string> {
+  const plaintext = await readStableRegularFile(path, maxBytes)
+  try {
+    return createHash('sha256').update(plaintext).digest('hex')
+  } finally {
+    plaintext.fill(0)
+  }
+}
+
 export async function createEncryptedObjectSnapshot(input: {
   sourcePath: string
   objectPath: string
@@ -89,6 +102,7 @@ export async function createEncryptedObjectSnapshot(input: {
   try {
     const encrypted = seal(OBJECT_MAGIC, plaintext, fileKey)
     const wrappedFileKey = seal(WRAP_MAGIC, fileKey, wrapKey)
+    const contentHash = createHash('sha256').update(plaintext).digest('hex')
     await mkdir(dirname(input.objectPath), { recursive: true, mode: 0o700 })
     const temporaryPath = `${input.objectPath}.${randomBytes(12).toString('hex')}.tmp`
     const handle = await open(temporaryPath, 'wx', 0o600)
@@ -99,7 +113,7 @@ export async function createEncryptedObjectSnapshot(input: {
       await handle.close()
     }
     await rename(temporaryPath, input.objectPath)
-    return { objectPath: input.objectPath, wrappedFileKey, encryptedBytes: encrypted.length }
+    return { objectPath: input.objectPath, wrappedFileKey, encryptedBytes: encrypted.length, contentHash }
   } finally {
     plaintext.fill(0)
     fileKey.fill(0)
@@ -120,6 +134,16 @@ export function unwrapSnapshotFileKey(wrappedFileKey: Buffer, userKey: Buffer): 
 
 export async function readEncryptedObjectSnapshot(path: string): Promise<Buffer> {
   return readStableRegularFile(path, MAX_KNOWLEDGE_OBJECT_BYTES + OBJECT_MAGIC.length + IV_BYTES + TAG_BYTES)
+}
+
+export async function readDecryptedObjectSnapshot(path: string, fileKey: Buffer): Promise<Buffer> {
+  requireKey(fileKey, 'Knowledge file key')
+  const encrypted = await readEncryptedObjectSnapshot(path)
+  try {
+    return openEnvelope(encrypted, OBJECT_MAGIC, fileKey)
+  } finally {
+    encrypted.fill(0)
+  }
 }
 
 export const encryptedObjectEnvelope = Object.freeze({ magic: OBJECT_MAGIC.toString('ascii'), ivBytes: IV_BYTES, tagBytes: TAG_BYTES })

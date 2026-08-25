@@ -103,6 +103,11 @@ import {
   type WorkflowSourceSelectorVault,
 } from './workflows/workflow-source-selector.js'
 import type { DesktopIpcServices } from './ipc/register-ipc.js'
+import {
+  KnowledgeService,
+  type KnowledgeEntitlementPort,
+  type KnowledgeParserPort,
+} from './knowledge/knowledge-service.js'
 
 export interface ApplicationPaths {
   database: string
@@ -128,6 +133,7 @@ type ApplicationFailureSource =
   | 'media-cancel'
   | 'chat-drain'
   | 'execution-shutdown'
+  | 'knowledge-shutdown'
   | 'continuation-shutdown'
   | 'browser-shutdown'
   | 'database-close'
@@ -150,6 +156,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'media-cancel': 50,
   'chat-drain': 60,
   'execution-shutdown': 70,
+  'knowledge-shutdown': 75,
   'continuation-shutdown': 80,
   'browser-shutdown': 90,
   'database-close': 100,
@@ -205,6 +212,12 @@ export interface ApplicationRuntimeOptions {
   projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
+  createKnowledgeParser?: () => Promise<KnowledgeParserPort>
+  chooseKnowledgeFile?: () => Promise<string | undefined>
+  chooseKnowledgeExportPath?: (defaultName: string) => Promise<string | undefined>
+  knowledgeEntitlement?: KnowledgeEntitlementPort
+  knowledgePlatform?: NodeJS.Platform
+  knowledgeArch?: string
 }
 
 interface ObservedAuthService extends AuthService {
@@ -1111,7 +1124,25 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
   }
+  const knowledge = new KnowledgeService({
+    rootDirectory: options.paths.data,
+    safeStorage: options.safeStorage,
+    createParser: options.createKnowledgeParser ?? (async () => {
+      throw new Error('Knowledge parser runtime is unavailable')
+    }),
+    chooseImportFile: options.chooseKnowledgeFile ?? (async () => undefined),
+    chooseExportPath: options.chooseKnowledgeExportPath ?? (async () => undefined),
+    ownsConversation: async (owner, conversationId) => (
+      database.conversations.get(conversationId)?.userId === owner.userId
+    ),
+    entitlement: options.knowledgeEntitlement,
+    getConsent: async () => ({ provider: (await settings.get()).activeProvider, status: 'unknown' }),
+    platform: options.knowledgePlatform,
+    arch: options.knowledgeArch,
+    runtimeAvailable: options.createKnowledgeParser !== undefined,
+  })
   const beforeAuthIdentityChange = async (): Promise<void> => {
+    await knowledge.close()
     const current = await auth.getSession()
     if (current) await resetBrowserIdentity(current.user.id)
   }
@@ -1119,7 +1150,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
     auth: {
-      getSession: () => auth.getSession(),
+      getSession: async () => {
+        const session = await auth.getSession()
+        if (!session) await knowledge.close()
+        return session
+      },
       refreshAuthorization: () => auth.refreshAuthorization(),
       sendOtp: (input) => auth.sendOtp(input),
       verifyOtp: async (input) => { await beforeAuthIdentityChange(); return auth.verifyOtp(input) },
@@ -1743,18 +1778,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
     },
-    knowledge: {
-      listBases: () => { throw failure('SERVICE_UNAVAILABLE') },
-      listDocuments: () => { throw failure('SERVICE_UNAVAILABLE') },
-      getConversationSelection: () => { throw failure('SERVICE_UNAVAILABLE') },
-      updateConversationSelection: () => { throw failure('SERVICE_UNAVAILABLE') },
-      getFeatureAvailability: async () => ({
-        local: { available: false, reasons: ['native_dependency_unavailable'] },
-        cloud: { available: false, reasons: ['native_dependency_unavailable'] },
-      }),
-      getEntitlement: async () => ({ tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false }),
-      getConsent: async () => ({ provider: (await settings.get()).activeProvider, status: 'unknown' }),
-    },
+    knowledge,
     system: {
       openExternal: async (url) => {
         const parsed = openExternalRequestSchema.safeParse({ url })
@@ -1825,6 +1849,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           conversationTitleContexts.clear()
         })
         await capture('execution-shutdown', () => executions.shutdown())
+        await capture('knowledge-shutdown', () => knowledge.close())
         await capture('continuation-shutdown', async () => {
           try { await browserContinuations.shutdown() } finally {
             browserLoginWait.dispose()
