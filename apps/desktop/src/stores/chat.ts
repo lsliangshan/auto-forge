@@ -248,6 +248,7 @@ export const useChatStore = defineStore('chat', {
   state: () => ({
     conversations: [] as ConversationSummary[],
     nextConversationCursor: undefined as string | undefined,
+    syncWarningSince: undefined as string | undefined,
     selectedConversationId: '' as string,
     messagesByConversation: {} as Record<string, UiChatMessage[]>,
     previousMessageCursorByConversation: {} as Record<string, string | undefined>,
@@ -304,6 +305,7 @@ export const useChatStore = defineStore('chat', {
       this._subscribed = false
       this.conversations = []
       this.nextConversationCursor = undefined
+      this.syncWarningSince = undefined
       this.selectedConversationId = ''
       this.messagesByConversation = {}
       this.previousMessageCursorByConversation = {}
@@ -341,10 +343,10 @@ export const useChatStore = defineStore('chat', {
         }
       }
     },
-    async loadConversations(hydrateSelected = true) {
+    async loadConversations(hydrateSelected = true, force = false) {
       this.ensureSubscriptions()
       const requestKey = 'initial'
-      if (this._conversationPageRequests[requestKey]) return
+      if (this._conversationPageRequests[requestKey] && !force) return
       const version = ++this._loadVersion
       const requestToken = ++this._pageRequestSequence
       const dataGeneration = this._dataGeneration
@@ -359,6 +361,7 @@ export const useChatStore = defineStore('chat', {
         const selected = this.conversations.find(({ id }) => id === this.selectedConversationId)
         this.conversations = mergeConversationPages(selected ? [selected] : [], page.items)
         this.nextConversationCursor = page.nextCursor
+        this.syncWarningSince = page.syncWarningSince
         if (!this.selectedConversationId) {
           this.selectedConversationId = this.conversations[0]?.id ?? ''
           this._selectionVersion += 1
@@ -399,6 +402,7 @@ export const useChatStore = defineStore('chat', {
           || this.nextConversationCursor !== cursor) return
         this.conversations = mergeConversationPages(this.conversations, page.items)
         this.nextConversationCursor = page.nextCursor
+        this.syncWarningSince = page.syncWarningSince
       } catch (error) {
         if (dataGeneration === this._dataGeneration
           && this._conversationPageRequests[cursor] === requestToken) {
@@ -584,10 +588,10 @@ export const useChatStore = defineStore('chat', {
         }
       }
     },
-    async retrySync(conversationId: string) {
+    async retrySync(conversationId?: string) {
       try {
         await getDesktopApi().chat.retrySync(conversationId)
-        await this.loadConversations()
+        await this.loadConversations(false, true)
       } catch (error) {
         this.error = displayError(error, '同步重试失败')
       }

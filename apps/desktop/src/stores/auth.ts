@@ -160,7 +160,15 @@ export const useAuthStore = defineStore('auth', {
         if (generation !== otpGeneration(this) || sessionOwner !== sessionGeneration(this)) {
           const cleanupOwner = sessionGeneration(this)
           try {
-            await getDesktopApi().auth.logout({ discardPending: true })
+            const result = await getDesktopApi().auth.logout({ preservePending: true })
+            if (result.status !== 'logged_out') {
+              if (cleanupOwner === sessionGeneration(this)) {
+                replaceSession(this, session)
+                this.initialized = true
+                this.error = '同步仍在进行，请稍后重试退出登录'
+              }
+              return undefined
+            }
           } catch {
             if (cleanupOwner === sessionGeneration(this)) {
               replaceSession(this, session)
@@ -237,6 +245,10 @@ export const useAuthStore = defineStore('auth', {
         )
         if (result.status === 'pending_sync') {
           this.pendingLogoutCount = result.pendingCount
+          return false
+        }
+        if (result.status === 'sync_timeout') {
+          this.error = '同步仍在进行，请稍后重试退出登录'
           return false
         }
         nextSessionGeneration(this)

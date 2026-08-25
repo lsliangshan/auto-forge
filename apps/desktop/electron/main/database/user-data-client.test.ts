@@ -213,6 +213,107 @@ describe('UserDataStoreManager', () => {
     manager.close()
   })
 
+  it('advances revision through real assistant finalization before the next offline user turn', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const conversationId = 'offline_text_conversation'
+    store.outbox.recordWithConversation(createConversationMutation('offline_text_create', conversationId))
+    const firstUser = appendMessageMutation(
+      'offline_text_user_mutation_1', conversationId, 'offline_text_user_1',
+    )
+    store.outbox.recordWithMessage(firstUser)
+    store.messages.insert({
+      id: 'offline_text_assistant_1', conversationId, role: 'assistant', blocks: [], createdAt: 2_000,
+    })
+    store.chatRuns.insert({
+      id: 'offline_text_run_1', conversationId, requestId: 'offline_text_request_1',
+      userId: 'cloud-alice', provider: 'openrouter', model: 'text-model',
+      status: 'running', startedAt: 2_000,
+    })
+
+    store.chatRuns.finalizeWithMessage(
+      'offline_text_run_1',
+      'offline_text_assistant_1',
+      'offline_text_request_1',
+      { blocks: [{ type: 'text', text: 'assistant reply' }], status: 'completed', endedAt: 2_100 },
+    )
+    const secondUser = {
+      ...appendMessageMutation(
+        'offline_text_user_mutation_2', conversationId, 'offline_text_user_2',
+      ),
+      baseRevision: projectedConversation(store, conversationId)!.revision,
+    }
+    store.outbox.recordWithMessage(secondUser)
+
+    expect(store.outbox.list(10).map(({ entityId, baseRevision }) => ({ entityId, baseRevision })))
+      .toEqual([
+        { entityId: conversationId, baseRevision: 0 },
+        { entityId: 'offline_text_user_1', baseRevision: 1 },
+        { entityId: 'offline_text_assistant_1', baseRevision: 2 },
+        { entityId: 'offline_text_user_2', baseRevision: 3 },
+      ])
+    expect(projectedConversation(store, conversationId)?.revision).toBe(4)
+    manager.close()
+  })
+
+  it.each(['failed', 'completed'] as const)(
+    'advances revision through the real %s media terminal path',
+    (outcome) => {
+      const manager = new UserDataStoreManager(temporaryRoot())
+      const store = manager.open('cloud-alice')
+      const video = startVideoIntent(store, `revision_${outcome}`)
+      expect(projectedConversation(store, video.conversationId)?.revision).toBe(1)
+      if (outcome === 'failed') {
+        store.mediaGenerationJobs.fail(
+          video.requestId,
+          ['pending'],
+          'MEDIA_GENERATION_FAILED',
+          2_000,
+        )
+      } else {
+        store.mediaGenerationJobs.bindSubmitted(video.requestId, {
+          providerJobId: `provider_${outcome}`,
+          status: 'in_progress',
+          parameters: { version: 1, options: {} },
+          nextPollAt: 1_500,
+          updatedAt: 1_100,
+        })
+        store.mediaGenerationJobs.transition(video.requestId, ['in_progress'], {
+          status: 'downloading', nextPollAt: null, updatedAt: 1_500,
+        })
+        store.mediaAssets.insert({
+          id: `asset_${outcome}`,
+          conversationId: video.conversationId,
+          source: 'generated',
+          kind: 'video',
+          mimeType: 'video/mp4',
+          originalName: `${outcome}.mp4`,
+          relativePath: `${video.conversationId}/${outcome}.mp4`,
+          byteSize: 24,
+          sha256: 'a'.repeat(64),
+          provider: 'openrouter',
+          model: 'video-model',
+          status: 'ready',
+          createdAt: 1_500,
+          updatedAt: 1_500,
+        })
+        store.mediaGenerationJobs.complete(video.requestId, ['downloading'], {
+          assetId: `asset_${outcome}`,
+          block: {
+            type: 'media', blockId: `video_block_revision_${outcome}`,
+            assetId: `asset_${outcome}`, kind: 'video', purpose: 'output',
+            name: `${outcome}.mp4`, mimeType: 'video/mp4', byteSize: 24,
+          },
+          endedAt: 2_000,
+        })
+      }
+
+      expect(store.outbox.list(10).map(({ baseRevision }) => baseRevision)).toEqual([0, 1])
+      expect(projectedConversation(store, video.conversationId)?.revision).toBe(2)
+      manager.close()
+    },
+  )
+
   it('preserves enqueue FIFO when timestamps are frozen and IDs sort in reverse', () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_777_000_000_000)
     const manager = new UserDataStoreManager(temporaryRoot())
@@ -688,6 +789,33 @@ describe('UserDataStoreManager', () => {
     expect(store.conversations.listPage({ limit: 50 }).items).toContainEqual(
       expect.objectContaining({ id: create.entityId, syncState: 'pending' }),
     )
+    manager.close()
+  })
+
+  it('makes pending backoff and failed non-conversation work immediately retryable', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const pending = createConversationMutation('retry_pending_backoff', 'retry_pending_conversation')
+    const failed: SyncMutation = {
+      id: 'retry_failed_usage',
+      kind: 'usage.record',
+      entityId: 'retry_failed_usage',
+      baseRevision: 0,
+      occurredAt: '2026-08-24T00:00:00.000Z',
+      payload: {
+        id: 'retry_failed_usage', operationId: 'retry_failed_operation',
+        purpose: 'assistant_reply', credentialOwner: 'user', billable: false,
+        provider: 'openrouter', model: 'test-model', modality: 'text',
+        costStatus: 'unavailable', occurredAt: '2026-08-24T00:00:00.000Z',
+      },
+    }
+    store.outbox.recordWithConversation(pending)
+    store.outbox.markPending(pending.id, 9_999_999)
+    store.outbox.record(failed)
+    store.outbox.markFailed(failed.id, 'SERVICE_UNAVAILABLE', 9_999_999)
+
+    expect(store.outbox.retryFailed()).toEqual([pending.id, failed.id])
+    expect(store.outbox.listReady(1, 10).map(({ id }) => id)).toEqual([pending.id, failed.id])
     manager.close()
   })
 
@@ -1594,6 +1722,66 @@ describe('UserDataStoreManager', () => {
     inspection.close()
     manager.close()
   })
+
+  it.each(['before', 'at', 'after'] as const)(
+    'accepts compacted purge history from a checkpoint %s the retained cursor rows',
+    (checkpoint) => {
+      const manager = new UserDataStoreManager(temporaryRoot())
+      const store = manager.open(`purge-${checkpoint}`)
+      const conversationId = `purged_conversation_${checkpoint}`
+      const create: SyncMutation = {
+        id: `purged_create_${checkpoint}`, kind: 'conversation.create', entityId: conversationId,
+        baseRevision: 0, occurredAt: '2026-06-01T00:00:00.000Z',
+        payload: {
+          title: '[deleted conversation]', titleState: 'user_named',
+          createdAt: '2026-06-01T00:00:00.000Z',
+          lastActivityAt: '2026-06-01T00:01:00.000Z',
+          metadataUpdatedAt: '2026-06-01T00:00:00.000Z',
+        },
+      }
+      const message: SyncMutation = {
+        id: `purged_message_mutation_${checkpoint}`, kind: 'message.append',
+        entityId: `purged_message_${checkpoint}`, baseRevision: 1,
+        occurredAt: '2026-06-01T00:01:00.000Z',
+        payload: {
+          id: `purged_message_${checkpoint}`, conversationId, role: 'user', blocks: [],
+          createdAt: '2026-06-01T00:01:00.000Z',
+        },
+      }
+      const deletion: SyncMutation = {
+        id: `purged_delete_${checkpoint}`, kind: 'conversation.delete', entityId: conversationId,
+        baseRevision: 2, occurredAt: '2026-06-01T00:02:00.000Z', payload: {},
+      }
+      const prefix = [pulledMutation(create, 1), pulledMutation(message, 2)]
+      const tombstone = pulledMutation(deletion, 3)
+
+      if (checkpoint === 'at') {
+        store.sync.applyRemotePage({
+          protocolVersion: 1, cursor: 'cursor_purge_at_anchor', mutations: prefix,
+        }, 1)
+        store.sync.applyRemotePage({
+          protocolVersion: 1, cursor: 'cursor_purge_tombstone', mutations: [tombstone],
+        }, 2)
+      } else {
+        store.sync.applyRemotePage({
+          protocolVersion: 1, cursor: 'cursor_purge_tombstone',
+          mutations: [...prefix, tombstone],
+        }, 1)
+        if (checkpoint === 'after') {
+          store.sync.applyRemotePage({
+            protocolVersion: 1, cursor: 'cursor_after_purge', mutations: [],
+          }, 2)
+        }
+      }
+
+      expect(store.conversations.listPage({ limit: 50 }).items).toEqual([])
+      expect(store.messages.get(`purged_message_${checkpoint}`)?.blocks).toEqual([])
+      expect(store.sync.getCheckpoint()?.remoteCursor).toBe(
+        checkpoint === 'after' ? 'cursor_after_purge' : 'cursor_purge_tombstone',
+      )
+      manager.close()
+    },
+  )
 
   it('validates persisted and newly assigned outbox error codes', () => {
     const root = temporaryRoot()

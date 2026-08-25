@@ -65,11 +65,14 @@ describe('cross-process contracts', () => {
   it('requires an explicit typed discard confirmation for logout', () => {
     expect(logoutRequestSchema.parse(undefined)).toBeUndefined()
     expect(logoutRequestSchema.parse({ discardPending: true })).toEqual({ discardPending: true })
+    expect(logoutRequestSchema.parse({ preservePending: true })).toEqual({ preservePending: true })
     expect(logoutRequestSchema.safeParse({ discardPending: false }).success).toBe(false)
     expect(logoutRequestSchema.safeParse({ discardPending: true, userId: 'forged' }).success).toBe(false)
     expect(logoutResultSchema.parse({ status: 'logged_out' })).toEqual({ status: 'logged_out' })
     expect(logoutResultSchema.parse({ status: 'pending_sync', pendingCount: 3 }))
       .toEqual({ status: 'pending_sync', pendingCount: 3 })
+    expect(logoutResultSchema.parse({ status: 'sync_timeout' }))
+      .toEqual({ status: 'sync_timeout' })
   })
 
   it('requires strict opaque cursor requests and paged chat responses', () => {
@@ -109,6 +112,9 @@ describe('cross-process contracts', () => {
     })).toMatchObject({ syncWarningSince: '2026-08-23T00:00:00.000Z' })
     expect(conversationPageSchema.parse({ items: [summary], nextCursor: cursor }))
       .toEqual({ items: [summary], nextCursor: cursor })
+    expect(conversationPageSchema.parse({
+      items: [summary], syncWarningSince: '2026-08-23T00:00:00.000Z',
+    })).toMatchObject({ syncWarningSince: '2026-08-23T00:00:00.000Z' })
     expect.soft(conversationPageSchema.safeParse({
       items: Array.from({ length: 51 }, (_, index) => ({ ...summary, id: `conv_${index}` })),
     }).success).toBe(false)
@@ -132,6 +138,7 @@ describe('cross-process contracts', () => {
       .toEqual({ items: [message] })
     expect(ipcRequestSchemas[ipcChannels.chatRetrySync].parse({ conversationId: 'conv_1' }))
       .toEqual({ conversationId: 'conv_1' })
+    expect(ipcRequestSchemas[ipcChannels.chatRetrySync].parse({})).toEqual({})
     expect(ipcResponseSchemas[ipcChannels.chatRetrySync].parse(undefined)).toBeUndefined()
   })
 

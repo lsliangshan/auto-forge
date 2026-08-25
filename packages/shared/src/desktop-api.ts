@@ -136,11 +136,15 @@ export const authOtpVerificationSchema = z.object({
 }).strict()
 export type AuthOtpVerification = z.infer<typeof authOtpVerificationSchema>
 
-export const logoutRequestSchema = z.object({ discardPending: z.literal(true) }).strict().optional()
+export const logoutRequestSchema = z.union([
+  z.object({ discardPending: z.literal(true) }).strict(),
+  z.object({ preservePending: z.literal(true) }).strict(),
+]).optional()
 export type LogoutRequest = z.infer<typeof logoutRequestSchema>
 export const logoutResultSchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('logged_out') }).strict(),
   z.object({ status: z.literal('pending_sync'), pendingCount: z.number().int().positive().max(10_000) }).strict(),
+  z.object({ status: z.literal('sync_timeout') }).strict(),
 ])
 export type LogoutResult = z.infer<typeof logoutResultSchema>
 
@@ -391,6 +395,7 @@ export type ConversationSummary = z.infer<typeof conversationSummarySchema>
 export const conversationPageSchema = z.object({
   items: z.array(conversationSummarySchema).max(50),
   nextCursor: opaqueCursorSchema.optional(),
+  syncWarningSince: timestampSchema.optional(),
 }).strict()
 export type ConversationPage = z.infer<typeof conversationPageSchema>
 
@@ -1407,7 +1412,7 @@ export const renameConversationRequestSchema = z.object({
 }).strict()
 export const deleteConversationRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const retryConversationSyncRequestSchema = z.object({
-  conversationId: identifierSchema,
+  conversationId: identifierSchema.optional(),
 }).strict()
 export const cancelChatRequestSchema = z.object({ requestId: identifierSchema }).strict()
 export const generationPreferencesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
@@ -1662,7 +1667,7 @@ export interface DesktopAPI {
     createConversation(): Promise<ConversationSummary>
     renameConversation(conversationId: string, title: string): Promise<ConversationSummary>
     deleteConversation(conversationId: string): Promise<void>
-    retrySync(conversationId: string): Promise<void>
+    retrySync(conversationId?: string): Promise<void>
     send(input: ChatSendInput): Promise<{ requestId: string }>
     cancel(requestId: string): Promise<void>
     takeOverBrowser(input: TakeOverBrowserRequest): Promise<void>

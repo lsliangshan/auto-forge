@@ -40,7 +40,10 @@ import type {
   BrowserContinuationActivity,
   BrowserContinuationBindingInput,
 } from './browser/browser-continuation-types.js'
-import type { CloudBaseUserDataCall } from './cloud/cloudbase-user-data-port.js'
+import type {
+  CloudBaseUserDataCall,
+  UserDataFunctionResponse,
+} from './cloud/cloudbase-user-data-port.js'
 import type { BrowserPageCdpPort } from './browser/browser-page-inspector.js'
 import {
   browserSessionStorageSecretKey,
@@ -405,6 +408,13 @@ function chatInput(conversationId: string, content: string): ChatSendInput {
       video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
     },
   }
+}
+
+function userMediaScope(userId: string): string {
+  return createHash('sha256')
+    .update('autoforge-user-media-v1\0')
+    .update(userId)
+    .digest('hex')
 }
 
 async function authenticate(
@@ -1892,6 +1902,81 @@ describe('createApplicationRuntime', () => {
     ]) {
       await expect(operation()).rejects.toMatchObject({ code: 'NOT_FOUND' })
     }
+    await runtime.close()
+  })
+
+  it('stores new media under hashed per-UID roots and switches services without stale references', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-media-roots-'))
+    directories.push(root)
+    const source = join(root, 'private.png')
+    const bytes = Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'),
+      Buffer.from('per-user-media'),
+    ])
+    await writeFile(source, bytes)
+    const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores,
+      chooseMediaFiles: async () => [source],
+    }))
+    const alice = await authenticate(runtime, 'MediaRootAlice', false)
+    userDataStores.current()!.conversations.insert({
+      id: 'alice_media_conversation', title: 'Alice media', userId: alice.user.id,
+    })
+    const [aliceAsset] = await runtime.services.media.pickFiles({
+      conversationId: 'alice_media_conversation', existingAssetIds: [],
+    })
+    const aliceRoot = join(root, 'user-media', userMediaScope(alice.user.id))
+    const aliceRelativePath = join('alice_media_conversation', `${aliceAsset!.id}.png`)
+    await expect(readFile(join(aliceRoot, aliceRelativePath))).resolves.toEqual(bytes)
+    await expect(access(join(root, 'media', aliceRelativePath))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(aliceRoot).not.toContain(alice.user.id)
+
+    const bob = await authenticate(runtime, 'MediaRootBobby', false)
+    userDataStores.current()!.conversations.insert({
+      id: 'bob_media_conversation', title: 'Bob media', userId: bob.user.id,
+    })
+    const [bobAsset] = await runtime.services.media.pickFiles({
+      conversationId: 'bob_media_conversation', existingAssetIds: [],
+    })
+    const bobRoot = join(root, 'user-media', userMediaScope(bob.user.id))
+    const bobRelativePath = join('bob_media_conversation', `${bobAsset!.id}.png`)
+    expect(bobRoot).not.toBe(aliceRoot)
+    await expect(readFile(join(bobRoot, bobRelativePath))).resolves.toEqual(bytes)
+    await expect(runtime.mediaAssets.resolveReadyAsset(aliceAsset!.id))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(readFile(join(aliceRoot, aliceRelativePath))).resolves.toEqual(bytes)
+    await runtime.close()
+  })
+
+  it('deletes only the authenticated UID media root on successful normal logout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-user-media-logout-'))
+    directories.push(root)
+    const source = join(root, 'logout.png')
+    const bytes = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('logout-media')])
+    await writeFile(source, bytes)
+    const legacyRoot = join(root, 'media', 'legacy-conversation')
+    await mkdir(legacyRoot, { recursive: true })
+    await writeFile(join(legacyRoot, 'legacy.png'), 'legacy-media')
+    const userDataStores = new UserDataStoreManager(join(root, 'user-caches'))
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores,
+      chooseMediaFiles: async () => [source],
+    }))
+    const session = await authenticate(runtime, 'MediaLogoutAlice', false)
+    userDataStores.current()!.conversations.insert({
+      id: 'media_logout_conversation', title: 'Logout media', userId: session.user.id,
+    })
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: 'media_logout_conversation', existingAssetIds: [],
+    })
+    const mediaRoot = join(root, 'user-media', userMediaScope(session.user.id))
+    await expect(readFile(join(mediaRoot, 'media_logout_conversation', `${asset!.id}.png`)))
+      .resolves.toEqual(bytes)
+
+    await expect(runtime.services.auth.logout()).resolves.toEqual({ status: 'logged_out' })
+    await expect(access(mediaRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(join(legacyRoot, 'legacy.png'), 'utf8')).resolves.toBe('legacy-media')
     await runtime.close()
   })
 
@@ -5001,13 +5086,14 @@ describe('createApplicationRuntime', () => {
       browserWorkspace: createBrowserWorkspace(),
     })
 
-    await authenticate(runtime)
+    const session = await authenticate(runtime)
+    const mediaRoot = join(root, 'user-media', userMediaScope(session.user.id))
     const deleted = await runtime.services.chat.createConversation()
     await runtime.services.media.pickFiles({
       conversationId: deleted.id,
       existingAssetIds: [],
     })
-    const deletedDirectory = join(root, 'media', deleted.id)
+    const deletedDirectory = join(mediaRoot, deleted.id)
     await expect(access(deletedDirectory)).resolves.toBeUndefined()
     await runtime.services.chat.deleteConversation(deleted.id)
     await expect(access(deletedDirectory)).rejects.toMatchObject({ code: 'ENOENT' })
@@ -5017,7 +5103,7 @@ describe('createApplicationRuntime', () => {
       conversationId: preserved.id,
       existingAssetIds: [],
     })
-    const preservedDirectory = join(root, 'media', preserved.id)
+    const preservedDirectory = join(mediaRoot, preserved.id)
     await runtime.services.settings.clearLocalData('executions')
     await expect(access(preservedDirectory)).resolves.toBeUndefined()
     expect(await listConversations(runtime)).toHaveLength(1)
@@ -7318,6 +7404,10 @@ describe('createApplicationRuntime', () => {
   it('refuses ordinary logout with pending sync and deletes the cache only after explicit discard', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-logout-pending-'))
     directories.push(root)
+    const source = join(root, 'pending.png')
+    await writeFile(source, Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('pending-media'),
+    ]))
     const userDataRoot = join(root, 'user-caches')
     const userDataStores = new UserDataStoreManager(userDataRoot)
     const runtime = createApplicationRuntime(options(root, {
@@ -7325,9 +7415,16 @@ describe('createApplicationRuntime', () => {
       userDataSyncPort: {
         call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
       },
+      chooseMediaFiles: async () => [source],
     }))
-    await authenticate(runtime, 'LogoutPendingAlice')
-    await runtime.services.chat.createConversation()
+    const session = await authenticate(runtime, 'LogoutPendingAlice')
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+    const mediaRoot = join(root, 'user-media', userMediaScope(session.user.id))
+    const mediaPath = join(mediaRoot, conversation.id, `${asset!.id}.png`)
+    await expect(access(mediaPath)).resolves.toBeUndefined()
 
     await expect(runtime.services.auth.logout()).resolves.toEqual({
       status: 'pending_sync', pendingCount: 2,
@@ -7336,10 +7433,12 @@ describe('createApplicationRuntime', () => {
       user: { account: 'LogoutPendingAlice' },
     })
     expect((await readdir(userDataRoot)).some((name) => name.endsWith('.sqlite'))).toBe(true)
+    await expect(access(mediaPath)).resolves.toBeUndefined()
 
     await expect(runtime.services.auth.logout({ discardPending: true }))
       .resolves.toEqual({ status: 'logged_out' })
     expect((await readdir(userDataRoot)).some((name) => name.endsWith('.sqlite'))).toBe(false)
+    await expect(access(mediaRoot)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(runtime.services.auth.requireSession()).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await runtime.close()
   })
@@ -7406,6 +7505,98 @@ describe('createApplicationRuntime', () => {
     await expect(loggingOut).resolves.toEqual({ status: 'logged_out' })
     expect(underlyingLogout).toHaveBeenCalledOnce()
     expect((await readdir(userDataRoot)).some((name) => name.endsWith('.sqlite'))).toBe(false)
+    await runtime.close()
+  })
+
+  it('bounds logout while a pull is hung with no pending outbox and preserves the live cache', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-logout-hung-pull-'))
+    directories.push(root)
+    const pullStarted = deferred<void>()
+    const releasePull = deferred<void>()
+    let hangPull = false
+    const userDataRoot = join(root, 'user-caches')
+    const userDataStores = new UserDataStoreManager(userDataRoot)
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores,
+      userDataSyncPort: {
+        call: vi.fn(async (input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> => {
+          if (input.action === 'syncPull') {
+            if (hangPull) {
+              pullStarted.resolve()
+              await releasePull.promise
+            }
+            return { ok: true as const, data: { mutations: [], cursor: null } }
+          }
+          if (input.action !== 'syncPush') throw new Error(`Unexpected ${input.action}`)
+          return {
+            ok: true as const,
+            data: {
+              results: input.mutations.map((mutation: SyncMutation) => ({
+                id: mutation.id,
+                status: 'applied' as const,
+                revision: mutation.kind === 'conversation.create' ? 1 : 0,
+              })),
+            },
+          }
+        }),
+      },
+      logoutSyncTimeoutMs: 20,
+    }))
+    await authenticate(runtime, 'LogoutHungPullAlice', false)
+    await vi.waitFor(() => expect(userDataStores.current()?.outbox.countPending()).toBe(0))
+    hangPull = true
+    await runtime.services.chat.listConversations({ limit: 50 })
+    await pullStarted.promise
+
+    await expect(Promise.race([
+      runtime.services.auth.logout(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('logout remained hung')), 250)),
+    ])).resolves.toEqual({ status: 'sync_timeout' })
+    await expect(runtime.services.auth.requireSession()).resolves.toMatchObject({
+      user: { account: 'LogoutHungPullAlice' },
+    })
+    expect(userDataStores.current()).toBeDefined()
+    expect((await readdir(userDataRoot)).some((name) => name.endsWith('.sqlite'))).toBe(true)
+
+    releasePull.resolve()
+    await runtime.close()
+  })
+
+  it('logs out a stale OTP session while preserving its durable pending cache', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-logout-preserve-'))
+    directories.push(root)
+    const source = join(root, 'preserved.png')
+    await writeFile(source, Buffer.concat([
+      Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('preserved-media'),
+    ]))
+    const userDataRoot = join(root, 'user-caches')
+    const userDataStores = new UserDataStoreManager(userDataRoot)
+    const runtime = createApplicationRuntime(options(root, {
+      userDataStores,
+      userDataSyncPort: {
+        call: vi.fn(async () => { throw toSafeAppError({ code: 'SERVICE_UNAVAILABLE' }) }),
+      },
+      chooseMediaFiles: async () => [source],
+    }))
+    const session = await authenticate(runtime, 'PreservePendingAlice')
+    const conversation = await runtime.services.chat.createConversation()
+    const [asset] = await runtime.services.media.pickFiles({
+      conversationId: conversation.id, existingAssetIds: [],
+    })
+    const mediaRoot = join(root, 'user-media', userMediaScope(session.user.id))
+    const mediaPath = join(mediaRoot, conversation.id, `${asset!.id}.png`)
+    expect(userDataStores.current()?.outbox.countPending()).toBe(2)
+
+    await expect(runtime.services.auth.logout({ preservePending: true }))
+      .resolves.toEqual({ status: 'logged_out' })
+    expect((await readdir(userDataRoot)).some((name) => name.endsWith('.sqlite'))).toBe(true)
+    await expect(access(mediaPath)).resolves.toBeUndefined()
+    await expect(runtime.services.auth.requireSession()).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+
+    await runtime.services.auth.loginWithPassword({
+      account: 'PreservePendingAlice', password: 'password',
+    })
+    expect(userDataStores.current()?.outbox.countPending()).toBe(2)
     await runtime.close()
   })
 

@@ -1316,21 +1316,54 @@ BEGIN
       AND conversation.deleted_at < clock_timestamp() - interval '30 days'
   );
 
-  DELETE FROM app_sync_mutations mutation
-  WHERE EXISTS (
-    SELECT 1
-    FROM app_conversations conversation
-    WHERE conversation.owner_user_id = mutation.owner_user_id
-      AND conversation.deleted_at < clock_timestamp() - interval '30 days'
-      AND (
-        mutation.kind IN (
-          'conversation.create', 'conversation.rename', 'conversation.delete',
-          'conversation.restore'
-        ) AND mutation.entity_id = conversation.id
-        OR mutation.kind = 'message.append'
-          AND mutation.mutation_payload->'payload'->>'conversationId' = conversation.id
-      )
-  );
+  WITH compacted AS (
+    SELECT mutation.server_sequence,
+           jsonb_build_object(
+             'id', mutation.mutation_id,
+             'kind', mutation.kind,
+             'entityId', mutation.entity_id,
+             'baseRevision', mutation.base_revision,
+             'payload', CASE
+               WHEN mutation.kind = 'conversation.create' THEN jsonb_build_object(
+                 'title', '[deleted conversation]',
+                 'titleState', 'user_named',
+                 'createdAt', mutation.mutation_payload->'payload'->'createdAt',
+                 'lastActivityAt', mutation.mutation_payload->'payload'->'lastActivityAt',
+                 'metadataUpdatedAt', mutation.mutation_payload->'payload'->'metadataUpdatedAt'
+               )
+               WHEN mutation.kind = 'conversation.rename' THEN jsonb_build_object(
+                 'title', '[deleted conversation]',
+                 'titleState', 'user_named',
+                 'metadataUpdatedAt', mutation.mutation_payload->'payload'->'metadataUpdatedAt'
+               )
+               WHEN mutation.kind = 'message.append' THEN jsonb_build_object(
+                 'id', mutation.mutation_payload->'payload'->'id',
+                 'conversationId', mutation.mutation_payload->'payload'->'conversationId',
+                 'role', mutation.mutation_payload->'payload'->'role',
+                 'blocks', '[]'::jsonb,
+                 'createdAt', mutation.mutation_payload->'payload'->'createdAt'
+               )
+               ELSE '{}'::jsonb
+             END,
+             'occurredAt', mutation.mutation_payload->'occurredAt'
+           ) AS mutation_payload
+    FROM app_sync_mutations mutation
+    JOIN app_conversations conversation
+      ON conversation.owner_user_id = mutation.owner_user_id
+     AND conversation.deleted_at < clock_timestamp() - interval '30 days'
+     AND (
+       mutation.kind IN (
+         'conversation.create', 'conversation.rename', 'conversation.delete',
+         'conversation.restore'
+       ) AND mutation.entity_id = conversation.id
+       OR mutation.kind = 'message.append'
+         AND mutation.mutation_payload->'payload'->>'conversationId' = conversation.id
+     )
+  )
+  UPDATE app_sync_mutations mutation
+  SET mutation_payload = compacted.mutation_payload
+  FROM compacted
+  WHERE mutation.server_sequence = compacted.server_sequence;
 
   DELETE FROM app_conversations conversation
   WHERE conversation.deleted_at < clock_timestamp() - interval '30 days';

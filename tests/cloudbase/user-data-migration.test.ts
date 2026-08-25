@@ -324,7 +324,13 @@ describe('CloudBase user data migration', () => {
     expect(purge).toContain("deleted_at < clock_timestamp() - interval '30 days'")
     expect(purge).toContain('UPDATE app_usage_events')
     expect(purge).toContain('conversation_id = NULL')
-    expect(purge).toContain('DELETE FROM app_sync_mutations')
+    expect(purge).toContain('UPDATE app_sync_mutations')
+    expect(purge).not.toContain('DELETE FROM app_sync_mutations')
+    expect(purge).toContain("'title', '[deleted conversation]'")
+    expect(purge).toContain("'blocks', '[]'::jsonb")
+    expect(purge).toContain("mutation.kind = 'message.append'")
+    expect(purge).toContain("mutation_payload->'payload'->'createdAt'")
+    expect(purge).not.toContain('request_hash =')
     expect(purge).toContain('DELETE FROM app_conversations')
     expect(canonical).toContain(
       'REVOKE ALL ON FUNCTION autoforge_purge_expired_conversation_tombstones() FROM PUBLIC, anon, authenticated, service_role',

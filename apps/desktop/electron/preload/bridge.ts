@@ -78,7 +78,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       createConversation: () => invoke(ipcRenderer, ipcChannels.chatCreateConversation),
       renameConversation: (conversationId, title) => invoke(ipcRenderer, ipcChannels.chatRenameConversation, { conversationId, title }),
       deleteConversation: (conversationId) => invoke(ipcRenderer, ipcChannels.chatDeleteConversation, { conversationId }),
-      retrySync: (conversationId) => invoke(ipcRenderer, ipcChannels.chatRetrySync, { conversationId }),
+      retrySync: (conversationId) => invoke(
+        ipcRenderer,
+        ipcChannels.chatRetrySync,
+        conversationId === undefined ? {} : { conversationId },
+      ),
       send: (input) => invoke(ipcRenderer, ipcChannels.chatSend, input),
       cancel: (requestId) => invoke(ipcRenderer, ipcChannels.chatCancel, { requestId }),
       takeOverBrowser: (input) => invoke(ipcRenderer, ipcChannels.chatTakeOverBrowser, input),

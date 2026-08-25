@@ -1504,7 +1504,11 @@ export function createUserDataRepositories(
           ...value,
           run: { ...value.run, userId: ownerUserId },
         })
-        bumpConversationActivity(value.job.conversationId, value.userMessage.createdAt)
+        bumpConversationActivity(
+          value.job.conversationId,
+          mutation.baseRevision + 1,
+          value.userMessage.createdAt,
+        )
       })
       if (!started) throw new UserDataConsistencyError()
       return started
@@ -1556,7 +1560,11 @@ export function createUserDataRepositories(
         assertOutboxCapacity(database)
         const mutation = syncMutationSchema.parse(messageMutation(completed.message))
         insertOutbox(database, mutation)
-        bumpConversationActivity(completed.job.conversationId, input.endedAt)
+        bumpConversationActivity(
+          completed.job.conversationId,
+          mutation.baseRevision + 1,
+          input.endedAt,
+        )
         recomputeAffectedConversations(database, ownerUserId, [mutation])
       })
       return completed
@@ -1570,7 +1578,11 @@ export function createUserDataRepositories(
         assertOutboxCapacity(database)
         const mutation = syncMutationSchema.parse(messageMutation(failed.message))
         insertOutbox(database, mutation)
-        bumpConversationActivity(failed.job.conversationId, endedAt)
+        bumpConversationActivity(
+          failed.job.conversationId,
+          mutation.baseRevision + 1,
+          endedAt,
+        )
         recomputeAffectedConversations(database, ownerUserId, [mutation])
       })
       return failed
@@ -1594,13 +1606,15 @@ export function createUserDataRepositories(
         })
         database.prepare(`
           UPDATE conversations
-          SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+          SET revision = @revision,
+              last_activity_at = MAX(last_activity_at + 1, @createdAt),
               updated_at = MAX(updated_at, last_activity_at + 1, @createdAt),
               sync_state = 'pending'
           WHERE id = @conversationId AND user_id = @ownerUserId
         `).run({
           conversationId: value.userMessage.conversationId,
           ownerUserId,
+          revision: mutation.baseRevision + 1,
           createdAt: value.userMessage.createdAt,
         })
       })
@@ -1641,10 +1655,16 @@ export function createUserDataRepositories(
         finalized = repositories.chatRuns.finalizeWithMessage(id, messageId, requestId, value)
         database.prepare(`
           UPDATE conversations
-          SET last_activity_at = MAX(last_activity_at + 1, @createdAt),
+          SET revision = @revision,
+              last_activity_at = MAX(last_activity_at + 1, @createdAt),
               updated_at = MAX(updated_at, last_activity_at + 1, @createdAt), sync_state = 'pending'
           WHERE id = @conversationId AND user_id = @ownerUserId
-        `).run({ conversationId: existing.conversationId, ownerUserId, createdAt: existing.createdAt })
+        `).run({
+          conversationId: existing.conversationId,
+          ownerUserId,
+          revision: mutation.baseRevision + 1,
+          createdAt: existing.createdAt,
+        })
       })
       if (!finalized) throw new UserDataConsistencyError()
       return finalized
@@ -1724,14 +1744,19 @@ export function createUserDataRepositories(
       recomputeAffectedConversations(database, ownerUserId, [mutation])
     })
   }
-  function bumpConversationActivity(conversationId: string, occurredAt: number): void {
+  function bumpConversationActivity(
+    conversationId: string,
+    revision: number,
+    occurredAt: number,
+  ): void {
     database.prepare(`
       UPDATE conversations
-      SET last_activity_at = MAX(last_activity_at + 1, @occurredAt),
+      SET revision = @revision,
+          last_activity_at = MAX(last_activity_at + 1, @occurredAt),
           updated_at = MAX(updated_at, last_activity_at + 1, @occurredAt),
           sync_state = 'pending'
       WHERE id = @conversationId AND user_id = @ownerUserId
-    `).run({ conversationId, ownerUserId, occurredAt })
+    `).run({ conversationId, ownerUserId, revision, occurredAt })
   }
   return {
     conversations,
@@ -1960,13 +1985,13 @@ export function createUserDataRepositories(
           ? undefined
           : parsePersisted(() => z.string().trim().min(1).parse(entityId))
         return transaction(database, () => {
-          const failed = (database.prepare(`
+          const retryable = (database.prepare(`
             SELECT id, kind, entity_id AS entityId, base_revision AS baseRevision,
                    payload_json AS payloadJson, state, attempts,
                    next_attempt_at AS nextAttemptAt, last_error_code AS lastErrorCode,
                    occurred_at AS occurredAt, created_at AS createdAt
             FROM outbox_mutations
-            WHERE state = 'failed'
+            WHERE state IN ('pending', 'failed')
             ORDER BY enqueue_sequence
           `).all() as Query[]).map(outboxFromRow).filter((mutation) => (
             validatedEntityId === undefined
@@ -1976,13 +2001,13 @@ export function createUserDataRepositories(
           const update = database.prepare(`
             UPDATE outbox_mutations
             SET state = 'pending', next_attempt_at = NULL, last_error_code = NULL
-            WHERE id = @id AND state = 'failed'
+            WHERE id = @id AND state IN ('pending', 'failed')
           `)
-          for (const mutation of failed) {
+          for (const mutation of retryable) {
             update.run({ id: mutation.id })
           }
-          recomputeAffectedConversations(database, ownerUserId, failed)
-          return failed.map(({ id }) => id)
+          recomputeAffectedConversations(database, ownerUserId, retryable)
+          return retryable.map(({ id }) => id)
         })
       },
       delete(id) {

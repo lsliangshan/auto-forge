@@ -23,7 +23,7 @@
         aria-label="搜索会话"
       />
       <div
-        v-if="stalledConversation"
+        v-if="chat.syncWarningSince"
         class="durable-sync-warning"
         data-testid="durable-sync-warning"
         role="alert"
@@ -32,7 +32,7 @@
         <button
           type="button"
           data-testid="retry-durable-sync"
-          @click="chat.retrySync(stalledConversation.id)"
+          @click="chat.retrySync()"
         >
           立即重试
         </button>
@@ -290,9 +290,6 @@ const conversationGroups = computed(() => {
   }
   return [...groups].map(([label, items]) => ({ label, items }))
 })
-const stalledConversation = computed(() => chat.conversations
-  .filter((conversation) => conversation.syncWarningSince !== undefined)
-  .sort((left, right) => left.syncWarningSince!.localeCompare(right.syncWarningSince!))[0])
 const syncStateLabel: Record<SyncState, string> = {
   synced: '同步完成', pending: '等待同步', syncing: '正在同步', failed: '同步失败',
 }

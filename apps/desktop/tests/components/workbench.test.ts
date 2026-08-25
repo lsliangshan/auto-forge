@@ -575,23 +575,19 @@ describe('workbench', () => {
 
   it('shows an actionable durable sync warning and clears it after recovery', async () => {
     const api = createApi()
-    const stalled = {
-      ...conversationSummary('stalled-conversation', '2026-07-20T00:00:00.000Z', 'pending'),
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('visible-conversation', '2026-07-20T00:00:00.000Z')],
       syncWarningSince: '2026-07-19T00:00:00.000Z',
-    }
-    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [stalled] })
+    })
     const { wrapper } = await mountApp('/chat', api)
 
     await vi.waitFor(() => expect(wrapper.get('[data-testid="durable-sync-warning"]').text())
       .toContain('24 小时'))
-    await wrapper.get('[data-testid="retry-durable-sync"]').trigger('click')
-    await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('stalled-conversation'))
-
-    useChatStore().applyChatEvent({
-      type: 'conversation_updated',
-      conversationId: stalled.id,
-      conversation: { ...stalled, syncState: 'synced', syncWarningSince: undefined },
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('visible-conversation', '2026-07-20T00:00:00.000Z')],
     })
+    await wrapper.get('[data-testid="retry-durable-sync"]').trigger('click')
+    await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith(undefined))
     await vi.waitFor(() => expect(wrapper.find('[data-testid="durable-sync-warning"]').exists()).toBe(false))
   })
 

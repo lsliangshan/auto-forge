@@ -338,6 +338,61 @@ describe('UserDataSyncEngine', () => {
     expect(engine.status()).toEqual({ state: 'idle' })
   })
 
+  it('global retry clears the timer and immediately pushes pending backoff plus failed usage', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const pending = createMutation(45)
+    const failed: SyncMutation = {
+      id: 'retry_global_usage', kind: 'usage.record', entityId: 'retry_global_usage',
+      baseRevision: 0, occurredAt: '2026-08-25T00:00:00.000Z',
+      payload: {
+        id: 'retry_global_usage', operationId: 'retry_global_operation',
+        purpose: 'assistant_reply', credentialOwner: 'user', billable: false,
+        provider: 'openrouter', model: 'text-model', modality: 'text',
+        costStatus: 'unavailable', occurredAt: '2026-08-25T00:00:00.000Z',
+      },
+    }
+    store.outbox.recordWithConversation(pending)
+    const pushed: SyncMutation[][] = []
+    let rejectFirstPush = true
+    const { engine, clock } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        if (rejectFirstPush) {
+          rejectFirstPush = false
+          return failure('SERVICE_UNAVAILABLE')
+        }
+        pushed.push([...input.mutations])
+        return success({
+          results: input.mutations.map((mutation) => ({
+            id: mutation.id, status: 'applied' as const,
+            revision: mutation.kind === 'conversation.create' ? 1 : 0,
+          })),
+          cursor: 'cursor_global_retry_push',
+        })
+      }
+      return success({
+        mutations: pushed.flatMap((batch) => batch.map((mutation) => remoteReceipt(
+          mutation, mutation.kind === 'conversation.create' ? 1 : 0,
+        ))),
+        cursor: 'cursor_global_retry_pull',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+    expect(clock.timerCount()).toBe(1)
+    expect(pushed).toEqual([])
+    store.outbox.record(failed)
+    store.outbox.markFailed(failed.id, 'SERVICE_UNAVAILABLE', 20_000)
+
+    await engine.retry()
+
+    expect(clock.timerCount()).toBe(0)
+    expect(pushed.flat().map(({ id }) => id)).toEqual([pending.id, failed.id])
+    expect(store.outbox.countPending()).toBe(0)
+    expect(engine.status()).toEqual({ state: 'idle' })
+  })
+
   it('pushes pending outbox rows in FIFO batches of at most 100', async () => {
     const manager = createManager()
     const store = manager.open('alice')
@@ -471,6 +526,101 @@ describe('UserDataSyncEngine', () => {
     expect(store.messages.listForConversation(create.entityId)).toHaveLength(2)
     expect(store.conversations.getSummary(create.entityId)).toMatchObject({
       title: 'Offline title', revision: 4, syncState: 'synced',
+    })
+  })
+
+  it('replays real offline assistant-finalization and media-terminal paths without quarantine', async () => {
+    const manager = createManager()
+    const store = manager.open('alice')
+    const textConversationId = 'real_offline_text'
+    const create = { ...createMutation(44), entityId: textConversationId }
+    store.outbox.recordWithConversation(create)
+    store.outbox.recordWithMessage(messageMutation('real_text_user_1', textConversationId, 1))
+    store.messages.insert({
+      id: 'real_text_assistant', conversationId: textConversationId,
+      role: 'assistant', blocks: [], createdAt: 2_000,
+    })
+    store.chatRuns.insert({
+      id: 'real_text_run', conversationId: textConversationId, requestId: 'real_text_request',
+      userId: 'alice', provider: 'openrouter', model: 'text-model', status: 'running', startedAt: 2_000,
+    })
+    store.chatRuns.finalizeWithMessage('real_text_run', 'real_text_assistant', 'real_text_request', {
+      blocks: [{ type: 'text', text: 'Offline assistant reply' }],
+      status: 'completed', endedAt: 2_100,
+    })
+    store.outbox.recordWithMessage(messageMutation('real_text_user_2', textConversationId, 3))
+
+    const mediaConversationId = 'real_offline_media'
+    store.conversations.insert({
+      id: mediaConversationId, title: 'Offline media', userId: 'alice', createdAt: 3_000, updatedAt: 3_000,
+    })
+    store.mediaGenerationJobs.startSubmissionIntent({
+      userMessage: {
+        id: 'real_media_user', conversationId: mediaConversationId, role: 'user',
+        blocks: [{ type: 'text', text: 'Generate offline media' }], createdAt: 3_000,
+      },
+      userAssetIds: [],
+      assistantMessage: {
+        id: 'real_media_assistant', conversationId: mediaConversationId, role: 'assistant',
+        blocks: [{
+          type: 'media_generation', blockId: 'real_media_block', jobId: 'real_media_request',
+          kind: 'video', status: 'pending',
+        }],
+        createdAt: 3_000,
+      },
+      run: {
+        id: 'real_media_run', conversationId: mediaConversationId, requestId: 'real_media_request',
+        userId: 'alice', provider: 'openrouter', model: 'video-model', status: 'running', startedAt: 3_000,
+      },
+      job: {
+        id: 'real_media_request', conversationId: mediaConversationId,
+        assistantMessageId: 'real_media_assistant', provider: 'openrouter', model: 'video-model',
+        kind: 'video', status: 'pending',
+        parameters: { version: 1, options: {}, submission: { phase: 'intent' } },
+        createdAt: 3_000, updatedAt: 3_000,
+      },
+    })
+    store.mediaGenerationJobs.fail(
+      'real_media_request', ['pending'], 'MEDIA_GENERATION_FAILED', 3_100,
+    )
+
+    const revisions = new Map<string, number>()
+    const accepted: Array<{ mutation: SyncMutation; revision: number }> = []
+    const { engine } = createEngine(manager, async (input) => {
+      if (input.action === 'syncPush') {
+        return success({
+          results: input.mutations.map((mutation) => {
+            const conversationId = mutation.kind === 'message.append'
+              ? mutation.payload.conversationId
+              : mutation.entityId
+            const revision = revisions.get(conversationId) ?? 0
+            if (mutation.baseRevision !== revision) {
+              return { id: mutation.id, status: 'conflict' as const, errorCode: 'SYNC_CONFLICT' as const }
+            }
+            const nextRevision = revision + 1
+            revisions.set(conversationId, nextRevision)
+            accepted.push({ mutation, revision: nextRevision })
+            return { id: mutation.id, status: 'applied' as const, revision: nextRevision }
+          }),
+          cursor: 'cursor_real_paths_push',
+        })
+      }
+      return success({
+        mutations: accepted.map(({ mutation, revision }) => remoteReceipt(mutation, revision)),
+        cursor: 'cursor_real_paths_pull',
+      })
+    })
+
+    await engine.start('alice', 'device-a')
+    await engine.flush()
+
+    expect(engine.status()).toEqual({ state: 'idle' })
+    expect(store.outbox.countPending()).toBe(0)
+    expect(store.conversations.getSummary(textConversationId)).toMatchObject({
+      revision: 4, syncState: 'synced',
+    })
+    expect(store.conversations.getSummary(mediaConversationId)).toMatchObject({
+      revision: 2, syncState: 'synced',
     })
   })
 

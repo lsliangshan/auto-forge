@@ -50,7 +50,7 @@ This local suite validates application boundaries and the checked-in wire semant
 
 ## Tombstone retention job
 
-Conversation tombstones are eligible for permanent removal only after they are older than 30 days. An authorized operator must configure the approved database scheduler to invoke the following service-role-only function once per day:
+Conversation content rows are eligible for permanent removal only after their tombstone is older than 30 days. The purge retains opaque sync cursor rows and the redacted revision chain through the deletion event so long-offline devices can still resume and learn the tombstone. It also retains each original request hash as minimal idempotency evidence while replacing historical titles and message blocks with fixed redacted values. An authorized operator must configure the approved database scheduler to invoke the following service-role-only function once per day:
 
 ```sql
 SELECT autoforge_purge_expired_conversation_tombstones();

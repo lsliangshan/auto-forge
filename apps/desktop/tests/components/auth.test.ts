@@ -461,6 +461,7 @@ describe('authentication store', () => {
     await auth.cancelOtp()
     pendingVerification.resolve(authSession)
     await compensationStarted.promise
+    expect(api.auth.logout).toHaveBeenCalledWith({ preservePending: true })
 
     const restoring = auth.restore()
     await restoring
@@ -493,6 +494,7 @@ describe('authentication store', () => {
     await auth.cancelOtp()
     pendingVerification.resolve(authSession)
     await compensationStarted.promise
+    expect(api.auth.logout).toHaveBeenCalledWith({ preservePending: true })
 
     const restoring = auth.restore()
     pendingRestore.resolve(authSession)
@@ -539,6 +541,19 @@ describe('authentication store', () => {
     expect(api.auth.logout).toHaveBeenLastCalledWith({ discardPending: true })
     expect(auth.session).toBeNull()
     expect(auth.pendingLogoutCount).toBe(0)
+  })
+
+  it('keeps the session and reports an actionable sync-timeout logout result', async () => {
+    const api = createApi()
+    vi.mocked(api.auth.logout).mockResolvedValue({ status: 'sync_timeout' })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const auth = useAuthStore()
+    auth.session = authSession
+
+    await expect(auth.logout()).resolves.toBe(false)
+
+    expect(auth.session).toEqual(authSession)
+    expect(auth.error).toBe('同步仍在进行，请稍后重试退出登录')
   })
 
   it('clears the previous user chat state after logout succeeds', async () => {

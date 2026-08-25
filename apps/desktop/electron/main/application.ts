@@ -83,10 +83,11 @@ import type { CloudBaseIdentityRepository } from './database/cloudbase-identity-
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
-import { createMediaAssetService } from './media/media-asset-service.js'
+import { createMediaAssetService, type MediaAssetService } from './media/media-asset-service.js'
 import { ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { createProviderUsageReconciliationLoop } from './billing/provider-usage-reconciliation-loop.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
+import { resolveUserMediaRoot } from './media/user-media-root.js'
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
@@ -724,14 +725,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let pauseUserReconciliation = async (): Promise<void> => undefined
   let activateVideoJobs: (recoverInterrupted: boolean) => Promise<void> = async () => undefined
   let pauseVideoJobs = async (): Promise<void> => undefined
+  let bindUserMedia: (session: AuthSession) => Promise<void> = async () => undefined
+  let pauseUserMedia = (): void => undefined
+  let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
+        await bindUserMedia(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
         return
       }
       await userDataSync.start(session.user.id, deviceId)
+      await bindUserMedia(session)
       boundUserId = session.user.id
       await userDataSync.pull()
       activateUserReconciliation(runtimeRecovered)
@@ -745,6 +751,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await pauseVideoJobs()
       await pauseUserReconciliation()
       await userDataSync.pause()
+      pauseUserMedia()
       userDataStores.close()
       boundUserId = undefined
     })
@@ -756,6 +763,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await pauseVideoJobs()
       await pauseUserReconciliation()
       userDataSync.discard()
+      pauseUserMedia()
       userDataStores.close()
       boundUserId = undefined
     })
@@ -918,7 +926,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const projects = new WorkflowProjectService(database, options.paths.installations, options.projectServiceOptions)
   const registry = new WorkflowRegistry(database, projects)
-  const media = createMediaAssetService({ database: chatDatabase, mediaRoot: join(options.paths.data, 'media') })
   const enqueueConversationDelete = (conversationId: string): void => {
     const store = currentUserData()
     const summary = store.conversations.getSummary(conversationId)
@@ -929,24 +936,57 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     })
     queueUserDataFlush()
   }
-  const mediaLifecycle = new MediaLifecycle({
-    database: {
-      ...chatDatabase,
-      conversations: {
-        get: (id) => chatDatabase.conversations.get(id),
-        list: () => chatDatabase.conversations.list(),
-        delete: enqueueConversationDelete,
-      },
-      clearConversations: () => {
-        for (const conversation of currentUserData().conversations.list()) {
-          if (currentUserData().conversations.getSummary(conversation.id)) {
-            enqueueConversationDelete(conversation.id)
-          }
-        }
-      },
+  const mediaLifecycleDatabase = {
+    ...chatDatabase,
+    conversations: {
+      get: (id: string) => chatDatabase.conversations.get(id),
+      list: () => chatDatabase.conversations.list(),
+      delete: enqueueConversationDelete,
     },
-    mediaRoot: join(options.paths.data, 'media'),
+    clearConversations: () => {
+      for (const conversation of currentUserData().conversations.list()) {
+        if (currentUserData().conversations.getSummary(conversation.id)) {
+          enqueueConversationDelete(conversation.id)
+        }
+      }
+    },
+  }
+  let boundMediaUserId: string | undefined
+  let boundMediaService: MediaAssetService | undefined
+  let boundMediaLifecycle: MediaLifecycle | undefined
+  const currentMediaService = (): MediaAssetService => {
+    if (!boundMediaService) throw failure('AUTH_REQUIRED')
+    return boundMediaService
+  }
+  const currentMediaLifecycle = (): MediaLifecycle => {
+    if (!boundMediaLifecycle) throw failure('AUTH_REQUIRED')
+    return boundMediaLifecycle
+  }
+  const media = new Proxy({} as MediaAssetService, {
+    get: (_target, property) => {
+      const service = currentMediaService()
+      const value = Reflect.get(service, property)
+      return typeof value === 'function' ? value.bind(service) : value
+    },
   })
+  bindUserMedia = async (session) => {
+    if (boundMediaUserId === session.user.id && boundMediaService && boundMediaLifecycle) return
+    const mediaRoot = resolveUserMediaRoot(options.paths.data, session.user.id)
+    const service = createMediaAssetService({ database: chatDatabase, mediaRoot })
+    const lifecycle = new MediaLifecycle({ database: mediaLifecycleDatabase, mediaRoot })
+    await lifecycle.recover()
+    boundMediaUserId = session.user.id
+    boundMediaService = service
+    boundMediaLifecycle = lifecycle
+  }
+  pauseUserMedia = () => {
+    boundMediaUserId = undefined
+    boundMediaService = undefined
+    boundMediaLifecycle = undefined
+  }
+  deleteUserMedia = async (userId) => {
+    await rm(resolveUserMediaRoot(options.paths.data, userId), { recursive: true, force: true })
+  }
   const providerCredentialEpoch = new Map<ModelProviderId, number>()
   const modelCatalog = new Map<ModelProviderId, {
     credentialEpoch: number
@@ -1483,13 +1523,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
     })
   )
-  const flushForLogout = async (): Promise<void> => {
+  const flushForLogout = async (timeoutMs: number): Promise<boolean> => {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      await Promise.race([
-        userDataSync.flush(),
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, options.logoutSyncTimeoutMs ?? 5_000)
+      return await Promise.race([
+        userDataSync.flush().then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs)
         }),
       ])
     } finally {
@@ -1532,14 +1572,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }),
       logout: (input) => userDataAdmission.transition(async (waitForActive) => {
         const session = await auth.requireSession()
+        const deadline = Date.now() + (options.logoutSyncTimeoutMs ?? 5_000)
         await beforeAuthIdentityChange(waitForActive, false)
-        if (!input?.discardPending) {
-          await flushForLogout()
-          const pendingCount = currentUserData().outbox.countPending()
-          if (pendingCount > 0) return { status: 'pending_sync' as const, pendingCount }
-          await pauseUserData()
-        } else {
+        const flushed = await flushForLogout(Math.max(0, deadline - Date.now()))
+        if (!flushed) return { status: 'sync_timeout' as const }
+        if (input && 'discardPending' in input) {
           await prepareUserDataDiscard()
+        } else {
+          const pendingCount = currentUserData().outbox.countPending()
+          if (!input && pendingCount > 0) {
+            return { status: 'pending_sync' as const, pendingCount }
+          }
+          await pauseUserData()
         }
         try {
           await auth.logout()
@@ -1547,7 +1591,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           await bindUserData(session)
           throw error
         }
-        userDataStores.closeAndDelete(session.user.id)
+        if (!input || 'discardPending' in input) {
+          await deleteUserMedia(session.user.id)
+          userDataStores.closeAndDelete(session.user.id)
+        }
         return { status: 'logged_out' as const }
       }),
       requireSession: () => userDataAdmission.run(requireAuthenticatedSession),
@@ -1568,8 +1615,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       listConversations: async (input) => {
         await requireAuthenticatedSession()
         const page = currentUserData().conversations.listPage(input)
+        const warningSince = userDataSync.status().warningSince
         void userDataSync.pull().catch(() => undefined)
-        return page
+        return {
+          ...page,
+          ...(warningSince === undefined ? {} : {
+            syncWarningSince: new Date(warningSince).toISOString(),
+          }),
+        }
       },
       listMessages: async (input) => {
         const session = await requireAuthenticatedSession()
@@ -1640,13 +1693,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             for (const work of titleRequests) work.controller.abort()
             await Promise.all(titleRequests.map((work) => work.promise))
             await browserContinuations.revokeConversation(conversationId, 'CANCELLED')
-            await mediaLifecycle.deleteConversation(conversationId)
+            await currentMediaLifecycle().deleteConversation(conversationId)
           },
         )
       },
       retrySync: async (conversationId) => {
         const session = await requireAuthenticatedSession()
-        requireOwnedConversation(conversationId, session.user.id)
+        if (conversationId !== undefined) requireOwnedConversation(conversationId, session.user.id)
         await userDataSync.retry(conversationId)
       },
       send: async (input) => {
@@ -2315,7 +2368,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || browser.hasActiveContexts(),
           async () => {
             if (scope === 'conversations' || scope === 'all') {
-              await mediaLifecycle.clearConversations()
+              await currentMediaLifecycle().clearConversations()
             }
             if (scope === 'executions' || scope === 'all') {
               database.clearLocalData('executions')
@@ -2418,7 +2471,6 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         chatDatabase.messages.invalidatePendingAgentApprovals()
         chatDatabase.messages.failInterruptedMediaGenerations()
         chatDatabase.providerUsage.recoverPending(Date.now())
-        await mediaLifecycle.recover()
         await videoJobs.recover()
       }
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
