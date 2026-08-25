@@ -503,6 +503,31 @@ function validateStoredLegacyReceipt(value) {
     && typeof value.includeUnowned === 'boolean'
 }
 
+function validateGenerationPreferences(value) {
+  if (!hasStrictShape(value, ['outputType', 'models', 'generation'])
+    || !['auto', 'text', 'image', 'audio', 'video'].includes(value.outputType)
+    || !hasStrictShape(value.models, [], ['text', 'image', 'audio', 'video'])
+    || !Object.values(value.models).every((model) => nonEmptyString(model))
+    || !hasStrictShape(value.generation, ['image', 'audio', 'video'])) return false
+  const { image, audio, video } = value.generation
+  return hasStrictShape(image, ['count', 'resolution', 'aspectRatio', 'format'])
+    && image.count === 1
+    && typeof image.resolution === 'string'
+    && typeof image.aspectRatio === 'string'
+    && typeof image.format === 'string'
+    && hasStrictShape(audio, ['format'], ['voice'])
+    && typeof audio.format === 'string'
+    && (audio.voice === undefined || nonEmptyString(audio.voice))
+    && hasStrictShape(
+      video,
+      ['durationSeconds', 'resolution', 'aspectRatio', 'generateAudio'],
+    )
+    && positiveInteger(video.durationSeconds)
+    && typeof video.resolution === 'string'
+    && typeof video.aspectRatio === 'string'
+    && typeof video.generateAudio === 'boolean'
+}
+
 function validateUsage(value) {
   const commonRequired = [
     'id', 'operationId', 'purpose', 'credentialOwner', 'billable', 'provider', 'model',
@@ -547,6 +572,10 @@ function validateMutationPayload(kind, payload) {
       return hasStrictShape(payload, ['title', 'titleState', 'metadataUpdatedAt'])
         && nonEmptyString(payload.title)
         && titleStates.has(payload.titleState)
+        && timestamp(payload.metadataUpdatedAt)
+    case 'conversation.preferences':
+      return hasStrictShape(payload, ['preferences', 'metadataUpdatedAt'])
+        && validateGenerationPreferences(payload.preferences)
         && timestamp(payload.metadataUpdatedAt)
     case 'conversation.delete':
     case 'conversation.restore':
@@ -606,6 +635,10 @@ function parseMutationResult(value) {
     || !['applied', 'duplicate', 'conflict', 'rejected'].includes(value.status)
     || (value.revision !== undefined && !nonnegativeInteger(value.revision))
     || (value.errorCode !== undefined && !appErrorCodes.has(value.errorCode))) return undefined
+  const successful = value.status === 'applied' || value.status === 'duplicate'
+  if (successful
+    ? value.revision === undefined || value.errorCode !== undefined
+    : value.revision !== undefined || value.errorCode === undefined) return undefined
   return {
     id: value.id,
     status: value.status,
@@ -632,7 +665,7 @@ function parsePulledMutation(value) {
     const isMessage = value.kind === 'message.append'
     const allowedKind = [
       'conversation.create', 'conversation.rename', 'conversation.delete',
-      'conversation.restore', 'message.append',
+      'conversation.restore', 'conversation.preferences', 'message.append',
     ].includes(value.kind)
     const requiredKeys = [
       'id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'compacted', 'receivedAt',

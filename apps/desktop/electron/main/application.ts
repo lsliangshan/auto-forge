@@ -848,7 +848,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const chatConversations = new Proxy(cachedConversations, {
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver)
-      if (property !== 'completeTitleGeneration') return value
+      if (property !== 'completeTitleGeneration' && property !== 'updateGenerationPreferences') {
+        return value
+      }
       return (...args: unknown[]) => {
         const result = (value as (...parameters: unknown[]) => unknown)(...args)
         if (result !== undefined) queueUserDataFlush()

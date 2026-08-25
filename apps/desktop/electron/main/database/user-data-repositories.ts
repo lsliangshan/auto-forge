@@ -7,6 +7,7 @@ import {
   appErrorCodeSchema,
   chatBlockSchema,
   chatMessageSchema,
+  conversationGenerationPreferencesSchema,
   conversationSummarySchema,
   conversationTitleStateSchema,
   opaqueCursorSchema,
@@ -17,6 +18,7 @@ import {
   syncMutationSchema,
   privacyConsentSchema,
   type ConversationPage,
+  type ConversationGenerationPreferences,
   type AppErrorCode,
   type MessagePage,
   type PulledMutation,
@@ -66,6 +68,7 @@ const conversationRowSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   lastActivityAt: z.number().int().nonnegative(),
   metadataUpdatedAt: z.number().int().nonnegative(),
+  generationPreferencesJson: z.string().nullable().optional(),
   deletedAt: z.number().int().nonnegative().nullable().optional(),
   userId: z.string().nullable(),
 }).strict()
@@ -372,6 +375,23 @@ function optimisticConversationMutation(
         metadataUpdatedAt: timestamp(mutation.payload.metadataUpdatedAt),
       })
       return
+    case 'conversation.preferences':
+      requireOwnedConversation(database, ownerUserId, mutation.entityId)
+      database.prepare(`
+        UPDATE conversations
+        SET generation_preferences_json = @generationPreferencesJson,
+            revision = @revision,
+            sync_state = 'pending',
+            metadata_updated_at = @metadataUpdatedAt,
+            updated_at = @metadataUpdatedAt
+        WHERE id = @id
+      `).run({
+        id: mutation.entityId,
+        generationPreferencesJson: JSON.stringify(mutation.payload.preferences),
+        revision: mutation.baseRevision + 1,
+        metadataUpdatedAt: timestamp(mutation.payload.metadataUpdatedAt),
+      })
+      return
     case 'conversation.delete':
       requireOwnedConversation(database, ownerUserId, mutation.entityId)
       database.prepare(`
@@ -506,6 +526,7 @@ function requireValidRemoteResult(mutation: MutationReceipt): number {
       case 'conversation.create':
         return mutation.baseRevision === 0 && result === 1
       case 'conversation.rename':
+      case 'conversation.preferences':
       case 'conversation.delete':
       case 'conversation.restore':
       case 'preferences.update':
@@ -606,7 +627,7 @@ function remoteConversation(
     SELECT id, title, title_state AS titleState, revision, sync_state AS syncState,
            created_at AS createdAt, last_activity_at AS lastActivityAt,
            metadata_updated_at AS metadataUpdatedAt, deleted_at AS deletedAt,
-           user_id AS userId
+           generation_preferences_json AS generationPreferencesJson, user_id AS userId
     FROM conversations
     WHERE id = @conversationId
   `).get({ conversationId }) as Query | undefined
@@ -614,6 +635,16 @@ function remoteConversation(
   const conversation = parsePersisted(() => conversationRowSchema.parse(raw))
   assertStoredOwner(conversation.userId ?? undefined, ownerUserId)
   return conversation
+}
+
+function parseConversationGenerationPreferences(
+  conversation: z.infer<typeof conversationRowSchema>,
+): ConversationGenerationPreferences | undefined {
+  const serialized = conversation.generationPreferencesJson
+  if (serialized == null) return undefined
+  return parsePersisted(() => conversationGenerationPreferencesSchema.parse(
+    JSON.parse(serialized),
+  ))
 }
 
 function recomputeConversationSyncState(
@@ -664,6 +695,7 @@ function acknowledgeLocalMutation(
   switch (local.kind) {
     case 'conversation.create':
     case 'conversation.rename':
+    case 'conversation.preferences':
     case 'conversation.delete':
     case 'conversation.restore':
       conversationId = local.entityId
@@ -775,7 +807,8 @@ function applyRemoteMutation(
       const existingRaw = database.prepare(`
         SELECT id, title, title_state AS titleState, revision, sync_state AS syncState,
                created_at AS createdAt, last_activity_at AS lastActivityAt,
-               metadata_updated_at AS metadataUpdatedAt, user_id AS userId
+               metadata_updated_at AS metadataUpdatedAt,
+               generation_preferences_json AS generationPreferencesJson, user_id AS userId
         FROM conversations
         WHERE id = @id
       `).get({ id: mutation.entityId }) as Query | undefined
@@ -832,6 +865,35 @@ function applyRemoteMutation(
         id: mutation.entityId,
         title: mutation.payload.title,
         titleState: mutation.payload.titleState,
+        revision,
+        metadataUpdatedAt: timestamp(mutation.payload.metadataUpdatedAt),
+      })
+      if (result.changes !== 1) throw new UserDataConsistencyError()
+      break
+    }
+    case 'conversation.preferences': {
+      const current = remoteConversation(database, ownerUserId, mutation.entityId)
+      if (current === undefined) throw new UserDataConsistencyError()
+      const storedPreferences = parseConversationGenerationPreferences(current)
+      if (current.revision === revision) {
+        if (
+          !isDeepStrictEqual(storedPreferences, mutation.payload.preferences)
+          || current.metadataUpdatedAt !== timestamp(mutation.payload.metadataUpdatedAt)
+        ) throw new UserDataConsistencyError()
+        break
+      }
+      if (current.revision !== mutation.baseRevision) throw new UserDataConsistencyError()
+      const result = database.prepare(`
+        UPDATE conversations
+        SET generation_preferences_json = @generationPreferencesJson,
+            revision = @revision,
+            sync_state = 'synced',
+            metadata_updated_at = @metadataUpdatedAt,
+            updated_at = @metadataUpdatedAt
+        WHERE id = @id
+      `).run({
+        id: mutation.entityId,
+        generationPreferencesJson: JSON.stringify(mutation.payload.preferences),
         revision,
         metadataUpdatedAt: timestamp(mutation.payload.metadataUpdatedAt),
       })
@@ -1135,6 +1197,7 @@ function affectedConversationId(mutation: SyncMutation | RemoteMutation): string
   switch (mutation.kind) {
     case 'conversation.create':
     case 'conversation.rename':
+    case 'conversation.preferences':
     case 'conversation.delete':
     case 'conversation.restore':
       return mutation.entityId
@@ -1211,12 +1274,15 @@ function acknowledgePushResults(
     for (const [id, mutation] of sentById) {
       const result = resultById.get(id)
       if (!result) throw new UserDataConsistencyError()
+      const resultRevision = result.status === 'applied' || result.status === 'duplicate'
+        ? result.revision
+        : null
       const receipt = {
         id: mutation.id,
         kind: mutation.kind,
         entityId: mutation.entityId,
         baseRevision: mutation.baseRevision,
-        resultRevision: result.revision ?? null,
+        resultRevision,
         payload: mutation.payload,
         receivedAt: mutation.occurredAt,
       } as OrdinaryRemoteMutation
@@ -1408,7 +1474,21 @@ export function createUserDataRepositories(
       preferences: Parameters<AppRepositories['conversations']['updateGenerationPreferences']>[1],
     ) {
       if (!conversations.get(id)) return undefined
-      return repositories.conversations.updateGenerationPreferences(id, preferences)
+      const summary = conversationSummary(id)
+      if (!summary) return undefined
+      const occurredAt = isoTimestamp(Date.now())
+      recordMutation({
+        id: randomUUID(),
+        kind: 'conversation.preferences',
+        entityId: id,
+        baseRevision: summary.revision,
+        occurredAt,
+        payload: {
+          preferences: conversationGenerationPreferencesSchema.parse(preferences),
+          metadataUpdatedAt: occurredAt,
+        },
+      }, (mutation) => optimisticConversationMutation(database, ownerUserId, mutation))
+      return repositories.conversations.get(id)
     },
     delete(id: string) {
       if (!conversations.get(id)) return

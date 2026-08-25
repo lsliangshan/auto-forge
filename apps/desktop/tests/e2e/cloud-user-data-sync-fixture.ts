@@ -4,6 +4,7 @@ import { once } from 'node:events'
 import type {
   ByokUsageEvent,
   ChatBlock,
+  ConversationGenerationPreferences,
   PulledMutation,
   SyncMutation,
   SyncMutationResult,
@@ -16,6 +17,7 @@ interface StoredConversation {
   title: string
   revision: number
   deleted: boolean
+  generationPreferences?: ConversationGenerationPreferences
 }
 
 interface StoredPreferences {
@@ -248,7 +250,9 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
   if (existingReceipt) {
     if (existingReceipt.requestHash === requestHash(mutation)) {
       state.duplicateMutationCount += 1
-      return { ...existingReceipt.result, status: 'duplicate' }
+      return existingReceipt.result.status === 'applied'
+        ? { ...existingReceipt.result, status: 'duplicate' }
+        : existingReceipt.result
     }
     return { id: mutation.id, status: 'rejected', errorCode: 'INVALID_INPUT' }
   }
@@ -269,6 +273,7 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
     })
   } else if (
     mutation.kind === 'conversation.rename'
+    || mutation.kind === 'conversation.preferences'
     || mutation.kind === 'conversation.delete'
     || mutation.kind === 'conversation.restore'
   ) {
@@ -281,6 +286,9 @@ function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationRe
     revision = conversation.revision + 1
     conversation.revision = revision
     if (mutation.kind === 'conversation.rename') conversation.title = mutation.payload.title
+    if (mutation.kind === 'conversation.preferences') {
+      conversation.generationPreferences = mutation.payload.preferences
+    }
     if (mutation.kind === 'conversation.delete') conversation.deleted = true
     if (mutation.kind === 'conversation.restore') conversation.deleted = false
   } else if (mutation.kind === 'message.append') {

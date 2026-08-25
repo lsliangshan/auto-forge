@@ -362,7 +362,7 @@ describe('CloudBase user data migration', () => {
     )
 
     expect(renameBranch).toMatch(
-      /IF NOT FOUND THEN[\s\S]+?mutation_kind = 'conversation\.rename'[\s\S]+?'compacted', true/,
+      /IF NOT FOUND THEN[\s\S]+?mutation_kind IN \('conversation\.rename', 'conversation\.preferences'\)[\s\S]+?'compacted', true/,
     )
     expect(messageBranch).toMatch(
       /IF NOT FOUND[\s\S]+?mutation := jsonb_build_object\([\s\S]+?'compacted', true,[\s\S]+?'conversationId', conversation_id/,
@@ -374,6 +374,44 @@ describe('CloudBase user data migration', () => {
     expect(syncPush.indexOf('request_hash_value := md5(mutation::text)'))
       .toBeLessThan(syncPush.indexOf("'compacted', true"))
     expect(syncPush).toContain('mutation, request_hash_value')
+  })
+
+  it('versions conversation generation preferences and compacts their purged receipts', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const purge = extractFunction(canonical, 'autoforge_purge_expired_conversation_tombstones')
+    const preferenceBranch = syncPush.slice(
+      syncPush.indexOf("ELSIF mutation_kind IN ('conversation.rename'"),
+      syncPush.indexOf("ELSIF mutation_kind = 'message.append'"),
+    )
+
+    expect(canonical).toContain("'conversation.preferences'")
+    expect(preferenceBranch).toContain("mutation_kind = 'conversation.preferences'")
+    expect(preferenceBranch).toContain('generation_preferences = payload->\'preferences\'')
+    expect(preferenceBranch).toContain('metadata_updated_at = (payload->>\'metadataUpdatedAt\')::timestamptz')
+    expect(preferenceBranch).toContain('result_revision_value := conversation_row.revision + 1')
+    expect(preferenceBranch).toMatch(
+      /IF NOT FOUND THEN[\s\S]+?mutation_kind IN \('conversation\.rename', 'conversation\.preferences'\)[\s\S]+?'compacted', true/,
+    )
+    expect(purge).toMatch(
+      /mutation\.kind IN \([\s\S]+?'conversation\.preferences'[\s\S]+?\) AND mutation\.entity_id/,
+    )
+  })
+
+  it('replays a post-purge stale conflict verbatim after a lost response', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const receiptReplay = syncPush.slice(
+      syncPush.indexOf('IF FOUND THEN'),
+      syncPush.indexOf("IF mutation_kind = 'conversation.create'"),
+    )
+
+    expect(receiptReplay).toMatch(
+      /'status', CASE\s+WHEN existing_receipt\.status = 'applied' THEN 'duplicate'\s+ELSE existing_receipt\.status\s+END/,
+    )
+    expect(receiptReplay).toContain("'revision', existing_receipt.result_revision")
+    expect(receiptReplay).toContain("'errorCode', existing_receipt.error_code")
+    expect(receiptReplay).not.toContain("'status', 'duplicate'")
   })
 
   it('keeps accepted data tables intact during rollback', async () => {

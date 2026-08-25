@@ -16,6 +16,9 @@ import { ElMessageBox } from 'element-plus'
 export type UiChatBlock = ChatBlock & { id: string }
 export interface UiChatMessage { id: string; role: 'user' | 'assistant'; blocks: UiChatBlock[] }
 export type ChatSendAcknowledgement = (accepted: boolean) => void
+type ConversationEventOverlay =
+  | { version: number; type: 'updated'; conversation: ConversationSummary }
+  | { version: number; type: 'removed' }
 
 interface ChatHub { listeners: Set<(event: ChatEvent) => void>; unsubscribe: () => void }
 const hubs = new WeakMap<DesktopAPI, ChatHub>()
@@ -188,6 +191,20 @@ function mergeConversationPages(
   return sortConversations([...byId.values()])
 }
 
+function applyConversationEventOverlays(
+  conversations: ConversationSummary[],
+  requestEventVersion: number,
+  overlays: Readonly<Record<string, ConversationEventOverlay>>,
+): ConversationSummary[] {
+  const byId = new Map(conversations.map((conversation) => [conversation.id, conversation]))
+  for (const [conversationId, overlay] of Object.entries(overlays)) {
+    if (overlay.version <= requestEventVersion) continue
+    if (overlay.type === 'removed') byId.delete(conversationId)
+    else byId.set(conversationId, overlay.conversation)
+  }
+  return sortConversations([...byId.values()])
+}
+
 function advanceActivity(current: string, candidate: string, latest: string): string {
   const currentAt = Date.parse(current)
   const candidateAt = Date.parse(candidate)
@@ -266,6 +283,8 @@ export const useChatStore = defineStore('chat', {
     _messageVersions: {} as Record<string, number>,
     _messageLoadVersions: {} as Record<string, number>,
     _conversationPageRequests: {} as Record<string, number>,
+    _conversationEventVersion: 0,
+    _conversationEventOverlays: {} as Record<string, ConversationEventOverlay>,
     _messagePageRequests: {} as Record<string, number>,
     _preferenceLoadRequests: {} as Record<string, number>,
     _pageRequestSequence: 0,
@@ -322,6 +341,8 @@ export const useChatStore = defineStore('chat', {
       this._messageLoadVersions = {}
       this._pageRequestSequence += 1
       this._conversationPageRequests = {}
+      this._conversationEventVersion = 0
+      this._conversationEventOverlays = {}
       this._messagePageRequests = {}
       this._preferenceLoadRequests = {}
       this._preferenceVersions = {}
@@ -353,6 +374,7 @@ export const useChatStore = defineStore('chat', {
       const requestToken = ++this._pageRequestSequence
       const dataGeneration = this._dataGeneration
       const syncWarningVersion = this._syncWarningVersion
+      const conversationEventVersion = this._conversationEventVersion
       this._conversationPageRequests[requestKey] = requestToken
       this.loading = true
       this.error = ''
@@ -362,7 +384,11 @@ export const useChatStore = defineStore('chat', {
           || dataGeneration !== this._dataGeneration
           || this._conversationPageRequests[requestKey] !== requestToken) return
         const selected = this.conversations.find(({ id }) => id === this.selectedConversationId)
-        this.conversations = mergeConversationPages(selected ? [selected] : [], page.items)
+        this.conversations = applyConversationEventOverlays(
+          mergeConversationPages(selected ? [selected] : [], page.items),
+          conversationEventVersion,
+          this._conversationEventOverlays,
+        )
         this.nextConversationCursor = page.nextCursor
         if (syncWarningVersion === this._syncWarningVersion) {
           this.syncWarningSince = page.syncWarningSince
@@ -400,13 +426,18 @@ export const useChatStore = defineStore('chat', {
       const requestToken = ++this._pageRequestSequence
       const dataGeneration = this._dataGeneration
       const syncWarningVersion = this._syncWarningVersion
+      const conversationEventVersion = this._conversationEventVersion
       this._conversationPageRequests[cursor] = requestToken
       try {
         const page = await getDesktopApi().chat.listConversations({ limit: 50, cursor })
         if (dataGeneration !== this._dataGeneration
           || this._conversationPageRequests[cursor] !== requestToken
           || this.nextConversationCursor !== cursor) return
-        this.conversations = mergeConversationPages(this.conversations, page.items)
+        this.conversations = applyConversationEventOverlays(
+          mergeConversationPages(this.conversations, page.items),
+          conversationEventVersion,
+          this._conversationEventOverlays,
+        )
         this.nextConversationCursor = page.nextCursor
         if (syncWarningVersion === this._syncWarningVersion) {
           this.syncWarningSince = page.syncWarningSince
@@ -961,13 +992,32 @@ export const useChatStore = defineStore('chat', {
         return
       }
       if (event.type === 'conversation_updated') {
+        const current = this.conversations.find(({ id }) => id === event.conversationId)
+        const refreshPreferences = this.selectedConversationId === event.conversationId
+          && current?.metadataUpdatedAt !== event.conversation.metadataUpdatedAt
+          && (this.preferencesByConversation[event.conversationId] !== undefined
+            || this._preferenceLoadRequests[event.conversationId] !== undefined)
+        const version = ++this._conversationEventVersion
+        this._conversationEventOverlays[event.conversationId] = {
+          version,
+          type: 'updated',
+          conversation: event.conversation,
+        }
         this.conversations = mergeConversationPages(
           this.conversations.filter(({ id }) => id !== event.conversationId),
           [event.conversation],
         )
+        if (refreshPreferences) {
+          this._preferenceVersions[event.conversationId]
+            = (this._preferenceVersions[event.conversationId] ?? 0) + 1
+          delete this._preferenceLoadRequests[event.conversationId]
+          void this.loadGenerationPreferences(event.conversationId)
+        }
         return
       }
       if (event.type === 'conversation_removed') {
+        const version = ++this._conversationEventVersion
+        this._conversationEventOverlays[event.conversationId] = { version, type: 'removed' }
         const selectedBeforeRemoval = this.selectedConversationId
         const selectedMessageRequestPrefix = `${selectedBeforeRemoval}:`
         const selectedLatestRequestKey = `${selectedBeforeRemoval}:latest`

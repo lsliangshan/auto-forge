@@ -381,6 +381,122 @@ describe('chat history pagination', () => {
     expect(store.syncWarningSince).toBe('2026-07-21T00:00:00.000Z')
   })
 
+  it('preserves a newer off-page conversation event across an older initial page', async () => {
+    const { api, emitChat } = createEventApi()
+    const stalePage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations).mockReturnValue(stalePage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const loading = store.loadConversations(false)
+    const liveConversation = {
+      ...conversationSummary('live-off-page', '2026-07-21T00:00:00.000Z'),
+      title: 'Live off-page update',
+      revision: 2,
+    }
+
+    emitChat({
+      type: 'conversation_updated',
+      conversationId: liveConversation.id,
+      conversation: liveConversation,
+    })
+    stalePage.resolve({
+      items: [conversationSummary('stale-page-row', '2026-07-20T00:00:00.000Z')],
+    })
+    await loading
+
+    expect(store.conversations).toEqual([
+      liveConversation,
+      conversationSummary('stale-page-row', '2026-07-20T00:00:00.000Z'),
+    ])
+  })
+
+  it('does not let a stale paginated row overwrite a newer live conversation event', async () => {
+    const { api, emitChat } = createEventApi()
+    const stalePage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations).mockReturnValue(stalePage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const staleConversation = conversationSummary('page-row', '2026-07-19T00:00:00.000Z')
+    const liveConversation = {
+      ...staleConversation,
+      title: 'Live title',
+      revision: 3,
+      lastActivityAt: '2026-07-22T00:00:00.000Z',
+      metadataUpdatedAt: '2026-07-22T00:00:00.000Z',
+    }
+    store.conversations = [conversationSummary('current-row', '2026-07-20T00:00:00.000Z')]
+    store.nextConversationCursor = 'stale-page-cursor'
+    store.ensureSubscriptions()
+
+    const loading = store.loadMoreConversations()
+    emitChat({
+      type: 'conversation_updated',
+      conversationId: liveConversation.id,
+      conversation: liveConversation,
+    })
+    stalePage.resolve({ items: [staleConversation] })
+    await loading
+
+    expect(store.conversations.find(({ id }) => id === liveConversation.id)).toEqual(liveConversation)
+  })
+
+  it('does not resurrect a removed conversation from an in-flight page', async () => {
+    const { api, emitChat } = createEventApi()
+    const stalePage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations)
+      .mockReturnValueOnce(stalePage.promise)
+      .mockResolvedValueOnce({ items: [] })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const removed = conversationSummary('removed-row', '2026-07-20T00:00:00.000Z')
+    store.conversations = [removed]
+    store.nextConversationCursor = 'removed-page-cursor'
+    store.ensureSubscriptions()
+
+    const loading = store.loadMoreConversations()
+    emitChat({ type: 'conversation_removed', conversationId: removed.id })
+    await vi.waitFor(() => expect(api.chat.listConversations).toHaveBeenCalledTimes(2))
+    stalePage.resolve({ items: [removed] })
+    await loading
+    await flushPromises()
+
+    expect(store.conversations.some(({ id }) => id === removed.id)).toBe(false)
+  })
+
+  it('does not carry conversation event overlays across an identity reset', async () => {
+    const { api, emitChat } = createEventApi()
+    const oldPage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    const newPage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations)
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(newPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const oldLoading = store.loadConversations(false)
+    emitChat({
+      type: 'conversation_updated',
+      conversationId: 'shared-row',
+      conversation: {
+        ...conversationSummary('shared-row', '2026-07-22T00:00:00.000Z'),
+        title: 'Old identity live title',
+        revision: 4,
+      },
+    })
+
+    store.resetLocalData()
+    const newLoading = store.loadConversations(false)
+    const newIdentityRow = {
+      ...conversationSummary('shared-row', '2026-07-20T00:00:00.000Z'),
+      title: 'New identity snapshot',
+    }
+    newPage.resolve({ items: [newIdentityRow] })
+    await newLoading
+    oldPage.resolve({ items: [] })
+    await oldLoading
+
+    expect(store.conversations).toEqual([newIdentityRow])
+  })
+
   it('does not merge an old identity conversation page that uses the new identity cursor', async () => {
     const { api } = createEventApi()
     const oldPage = deferred<{ items: ConversationSummary[]; nextCursor?: string }>()
@@ -1923,6 +2039,40 @@ describe('chat interactions', () => {
     expect(store.selectedConversationId).toBe('conv_1')
     expect(store.messagesByConversation.conv_1).toEqual([{ id: 'local_1', role: 'user', blocks: [] }])
     expect(api.chat.listConversations).not.toHaveBeenCalled()
+  })
+
+  it('rehydrates selected generation preferences after a converged metadata event', async () => {
+    const { api, emitChat } = createEventApi()
+    const stalePreferences = deferred<ConversationGenerationPreferences>()
+    const remotePreferences = generationPreferences({ outputType: 'video' })
+    vi.mocked(api.chat.getGenerationPreferences)
+      .mockReturnValueOnce(stalePreferences.promise)
+      .mockResolvedValueOnce(remotePreferences)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const conversation = conversationSummary('conv_preferences', '2026-08-25T00:00:00.000Z')
+    store.conversations = [conversation]
+    store.selectedConversationId = conversation.id
+    store.preferencesByConversation[conversation.id] = generationPreferences({ outputType: 'text' })
+    store.ensureSubscriptions()
+
+    const staleLoad = store.loadGenerationPreferences(conversation.id)
+    await vi.waitFor(() => expect(api.chat.getGenerationPreferences).toHaveBeenCalledOnce())
+    emitChat({
+      type: 'conversation_updated',
+      conversationId: conversation.id,
+      conversation: {
+        ...conversation,
+        revision: 2,
+        metadataUpdatedAt: '2026-08-25T00:01:00.000Z',
+      },
+    })
+    await vi.waitFor(() => expect(api.chat.getGenerationPreferences).toHaveBeenCalledTimes(2))
+    stalePreferences.resolve(generationPreferences({ outputType: 'audio' }))
+    await staleLoad
+    await flushPromises()
+
+    expect(store.preferencesByConversation[conversation.id]).toEqual(remotePreferences)
   })
 
   it('refreshes after a selected tombstone and hydrates the deterministic next visible row', async () => {

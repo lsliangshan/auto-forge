@@ -77,6 +77,16 @@ function renameConversationMutation(
   }
 }
 
+const generationPreferences = {
+  outputType: 'image' as const,
+  models: { image: 'openrouter/image-model' },
+  generation: {
+    image: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+    audio: { format: 'mp3' },
+    video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+  },
+}
+
 function cachePath(root: string, userId: string): string {
   const scope = createHash('sha256')
     .update('autoforge-user-cache-v1\0')
@@ -205,6 +215,66 @@ afterEach(() => {
 })
 
 describe('UserDataStoreManager', () => {
+  it('atomically replays offline generation preferences and converges a second device', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const conversationId = 'preferences_conversation'
+    const create = createConversationMutation('preferences_create', conversationId)
+    store.outbox.recordWithConversation(create)
+
+    expect(store.conversations.updateGenerationPreferences(conversationId, generationPreferences))
+      .toMatchObject({ generationPreferences })
+    expect(projectedConversation(store, conversationId)).toMatchObject({ revision: 2, syncState: 'pending' })
+    const preferenceMutation = store.outbox.list(10).find(
+      (mutation) => mutation.kind === 'conversation.preferences',
+    )
+    expect(preferenceMutation).toMatchObject({
+      entityId: conversationId,
+      baseRevision: 1,
+      payload: { preferences: generationPreferences },
+    })
+    manager.close()
+
+    const reopened = manager.open('cloud-alice')
+    expect(reopened.conversations.get(conversationId)).toMatchObject({ generationPreferences })
+    expect(reopened.outbox.list(10).map(({ kind }) => kind))
+      .toEqual(['conversation.create', 'conversation.preferences'])
+    if (preferenceMutation?.kind !== 'conversation.preferences') {
+      throw new Error('Missing conversation preference mutation')
+    }
+    const preferenceReceipt = {
+      id: preferenceMutation.id,
+      kind: preferenceMutation.kind,
+      entityId: preferenceMutation.entityId,
+      baseRevision: preferenceMutation.baseRevision,
+      payload: preferenceMutation.payload,
+      resultRevision: 2,
+      receivedAt: '2026-08-24T01:00:00.000Z',
+    }
+    reopened.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_preferences_replay_1',
+      mutations: [pulledMutation(create, 1), preferenceReceipt],
+    }, Date.now())
+    expect(reopened.outbox.list(10)).toEqual([])
+    expect(projectedConversation(reopened, conversationId))
+      .toMatchObject({ revision: 2, syncState: 'synced' })
+    expect(reopened.conversations.get(conversationId)).toMatchObject({ generationPreferences })
+    manager.close()
+
+    const remoteManager = new UserDataStoreManager(temporaryRoot())
+    const remote = remoteManager.open('cloud-alice')
+    remote.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_preferences_remote_1',
+      mutations: [pulledMutation(create, 1), preferenceReceipt],
+    }, Date.now())
+    expect(remote.conversations.get(conversationId)).toMatchObject({ generationPreferences })
+    expect(projectedConversation(remote, conversationId)).toMatchObject({ revision: 2, syncState: 'synced' })
+    remoteManager.close()
+  })
+
   it('advances optimistic conversation revisions for dependent offline mutations', () => {
     const manager = new UserDataStoreManager(temporaryRoot())
     const store = manager.open('cloud-alice')

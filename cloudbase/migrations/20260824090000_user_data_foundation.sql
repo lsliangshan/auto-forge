@@ -101,7 +101,8 @@ CREATE TABLE IF NOT EXISTS app_sync_mutations (
   mutation_id varchar(128) NOT NULL CHECK (length(mutation_id) BETWEEN 1 AND 128 AND mutation_id = btrim(mutation_id)),
   device_id varchar(128) NOT NULL,
   kind varchar(32) NOT NULL CHECK (kind IN (
-    'conversation.create', 'conversation.rename', 'conversation.delete', 'conversation.restore',
+    'conversation.create', 'conversation.rename', 'conversation.preferences',
+    'conversation.delete', 'conversation.restore',
     'message.append', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
   )),
   entity_id varchar(128) NOT NULL CHECK (length(entity_id) BETWEEN 1 AND 128 AND entity_id = btrim(entity_id)),
@@ -345,7 +346,8 @@ BEGIN
     result_id := mutation_id;
     PERFORM autoforge_require_identifier(entity_id, 128);
     IF mutation_kind NOT IN (
-      'conversation.create', 'conversation.rename', 'conversation.delete', 'conversation.restore',
+      'conversation.create', 'conversation.rename', 'conversation.preferences',
+      'conversation.delete', 'conversation.restore',
       'message.append', 'legacy.import', 'privacy.consent', 'preferences.update', 'usage.record'
     )
       OR mutation->>'baseRevision' !~ '^(0|[1-9][0-9]{0,18})$'
@@ -374,7 +376,10 @@ BEGIN
       IF existing_receipt.request_hash = request_hash_value THEN
         results := results || jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
           'id', mutation_id,
-          'status', 'duplicate',
+          'status', CASE
+            WHEN existing_receipt.status = 'applied' THEN 'duplicate'
+            ELSE existing_receipt.status
+          END,
           'revision', existing_receipt.result_revision,
           'errorCode', existing_receipt.error_code
         )));
@@ -416,7 +421,8 @@ BEGIN
         result_revision_value := 1;
       END IF;
 
-    ELSIF mutation_kind IN ('conversation.rename', 'conversation.delete', 'conversation.restore') THEN
+    ELSIF mutation_kind IN ('conversation.rename', 'conversation.preferences',
+      'conversation.delete', 'conversation.restore') THEN
       PERFORM pg_advisory_xact_lock(hashtextextended(auth_user_id::text || ':' || entity_id, 0));
       SELECT * INTO conversation_row
       FROM app_conversations conversation
@@ -425,7 +431,7 @@ BEGIN
       IF NOT FOUND THEN
         mutation_status := 'conflict';
         mutation_error := 'SYNC_CONFLICT';
-        IF mutation_kind = 'conversation.rename' THEN
+        IF mutation_kind IN ('conversation.rename', 'conversation.preferences') THEN
           mutation := jsonb_build_object('compacted', true);
         END IF;
       ELSIF conversation_row.revision <> base_revision_value THEN
@@ -448,6 +454,92 @@ BEGIN
           UPDATE app_conversations SET
             title = payload->>'title',
             title_state = payload->>'titleState',
+            metadata_updated_at = (payload->>'metadataUpdatedAt')::timestamptz,
+            revision = result_revision_value
+          WHERE owner_user_id = auth_user_id AND id = entity_id;
+        END IF;
+      ELSIF mutation_kind = 'conversation.preferences' THEN
+        IF jsonb_typeof(payload->'preferences') <> 'object'
+          OR jsonb_typeof(payload->'metadataUpdatedAt') <> 'string'
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(payload) AS supplied_key
+            WHERE supplied_key NOT IN ('preferences', 'metadataUpdatedAt')
+          )
+          OR NOT (payload ?& ARRAY['preferences', 'metadataUpdatedAt'])
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(payload->'preferences') AS supplied_key
+            WHERE supplied_key NOT IN ('outputType', 'models', 'generation')
+          )
+          OR NOT (payload->'preferences' ?& ARRAY['outputType', 'models', 'generation'])
+          OR jsonb_typeof(payload->'preferences'->'outputType') <> 'string'
+          OR payload->'preferences'->>'outputType' NOT IN ('auto', 'text', 'image', 'audio', 'video')
+          OR jsonb_typeof(payload->'preferences'->'models') <> 'object'
+          OR EXISTS (
+            SELECT 1 FROM jsonb_each(payload->'preferences'->'models') AS model(key, value)
+            WHERE model.key NOT IN ('text', 'image', 'audio', 'video')
+              OR jsonb_typeof(model.value) <> 'string'
+              OR length(model.value #>> '{}') < 1
+              OR model.value #>> '{}' <> btrim(model.value #>> '{}')
+          )
+          OR jsonb_typeof(payload->'preferences'->'generation') <> 'object'
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(payload->'preferences'->'generation') AS supplied_key
+            WHERE supplied_key NOT IN ('image', 'audio', 'video')
+          )
+          OR NOT (payload->'preferences'->'generation' ?& ARRAY['image', 'audio', 'video'])
+          OR jsonb_typeof(payload->'preferences'->'generation'->'image') <> 'object'
+          OR NOT (payload->'preferences'->'generation'->'image'
+            ?& ARRAY['count', 'resolution', 'aspectRatio', 'format'])
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(
+              payload->'preferences'->'generation'->'image'
+            ) AS supplied_key
+            WHERE supplied_key NOT IN ('count', 'resolution', 'aspectRatio', 'format')
+          )
+          OR payload->'preferences'->'generation'->'image'->'count' <> '1'::jsonb
+          OR jsonb_typeof(payload->'preferences'->'generation'->'image'->'resolution') <> 'string'
+          OR jsonb_typeof(payload->'preferences'->'generation'->'image'->'aspectRatio') <> 'string'
+          OR jsonb_typeof(payload->'preferences'->'generation'->'image'->'format') <> 'string'
+          OR jsonb_typeof(payload->'preferences'->'generation'->'audio') <> 'object'
+          OR NOT (payload->'preferences'->'generation'->'audio' ? 'format')
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(
+              payload->'preferences'->'generation'->'audio'
+            ) AS supplied_key
+            WHERE supplied_key NOT IN ('voice', 'format')
+          )
+          OR jsonb_typeof(payload->'preferences'->'generation'->'audio'->'format') <> 'string'
+          OR (payload->'preferences'->'generation'->'audio' ? 'voice' AND (
+            jsonb_typeof(payload->'preferences'->'generation'->'audio'->'voice') <> 'string'
+            OR length(payload->'preferences'->'generation'->'audio'->>'voice') < 1
+            OR payload->'preferences'->'generation'->'audio'->>'voice'
+              <> btrim(payload->'preferences'->'generation'->'audio'->>'voice')
+          ))
+          OR jsonb_typeof(payload->'preferences'->'generation'->'video') <> 'object'
+          OR NOT (payload->'preferences'->'generation'->'video'
+            ?& ARRAY['durationSeconds', 'resolution', 'aspectRatio', 'generateAudio'])
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(
+              payload->'preferences'->'generation'->'video'
+            ) AS supplied_key
+            WHERE supplied_key NOT IN (
+              'durationSeconds', 'resolution', 'aspectRatio', 'generateAudio'
+            )
+          )
+          OR payload->'preferences'->'generation'->'video'->>'durationSeconds'
+            !~ '^[1-9][0-9]*$'
+          OR jsonb_typeof(
+            payload->'preferences'->'generation'->'video'->'durationSeconds'
+          ) <> 'number'
+          OR jsonb_typeof(payload->'preferences'->'generation'->'video'->'resolution') <> 'string'
+          OR jsonb_typeof(payload->'preferences'->'generation'->'video'->'aspectRatio') <> 'string'
+          OR jsonb_typeof(payload->'preferences'->'generation'->'video'->'generateAudio') <> 'boolean' THEN
+          mutation_status := 'rejected';
+          mutation_error := 'INVALID_INPUT';
+        ELSE
+          result_revision_value := conversation_row.revision + 1;
+          UPDATE app_conversations SET
+            generation_preferences = payload->'preferences',
             metadata_updated_at = (payload->>'metadataUpdatedAt')::timestamptz,
             revision = result_revision_value
           WHERE owner_user_id = auth_user_id AND id = entity_id;
@@ -1379,8 +1471,8 @@ BEGIN
       ON candidate."ownerUserId" = mutation.owner_user_id
      AND (
        mutation.kind IN (
-         'conversation.create', 'conversation.rename', 'conversation.delete',
-         'conversation.restore'
+         'conversation.create', 'conversation.rename', 'conversation.preferences',
+         'conversation.delete', 'conversation.restore'
        ) AND mutation.entity_id = candidate."conversationId"
        OR mutation.kind = 'message.append'
          AND mutation.mutation_payload->'payload'->>'conversationId' = candidate."conversationId"

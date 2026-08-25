@@ -294,6 +294,67 @@ describe('CloudBase user data function', () => {
     }
   })
 
+  it('strictly accepts conversation generation preferences for push and pull', async () => {
+    const preferencesMutation = {
+      id: 'preferences_mutation_1',
+      entityId: 'conv_1',
+      baseRevision: 1,
+      occurredAt,
+      kind: 'conversation.preferences',
+      payload: {
+        preferences: {
+          outputType: 'image',
+          models: { image: 'openrouter/image-model' },
+          generation: {
+            image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+            audio: { format: 'mp3' },
+            video: {
+              durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false,
+            },
+          },
+        },
+        metadataUpdatedAt: occurredAt,
+      },
+    }
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({ results: [{ id: preferencesMutation.id, status: 'applied', revision: 2 }] })
+      .mockResolvedValueOnce({
+        mutations: [{
+          id: preferencesMutation.id,
+          kind: preferencesMutation.kind,
+          entityId: preferencesMutation.entityId,
+          baseRevision: preferencesMutation.baseRevision,
+          resultRevision: 2,
+          payload: preferencesMutation.payload,
+          receivedAt: occurredAt,
+        }],
+        cursor: opaqueCursor,
+      })
+    const handler = createUserDataHandler({ rpc })
+
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [preferencesMutation],
+    }, authenticatedContext)).resolves.toMatchObject({ ok: true })
+    await expect(handler({
+      action: 'syncPull', protocolVersion: 1, deviceId: 'dev_1', limit: 100,
+    }, authenticatedContext)).resolves.toMatchObject({
+      ok: true,
+      data: { mutations: [expect.objectContaining({ kind: 'conversation.preferences' })] },
+    })
+
+    const invalid = {
+      ...preferencesMutation,
+      payload: {
+        ...preferencesMutation.payload,
+        preferences: { ...preferencesMutation.payload.preferences, ownerUserId: 'forged' },
+      },
+    }
+    await expect(handler({
+      action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [invalid],
+    }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    expect(rpc).toHaveBeenCalledTimes(2)
+  })
+
   it('rejects extra action and nested union keys before calling RPC', async () => {
     const rpc = vi.fn()
     const handler = createUserDataHandler({ rpc })
@@ -737,6 +798,24 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
         })
         await expect(rpc(name, {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
       }
+    }
+  })
+
+  it('requires revisions for successful mutation results and error codes for failures', async () => {
+    for (const result of [
+      { id: 'mutation_1', status: 'applied' },
+      { id: 'mutation_1', status: 'duplicate' },
+      { id: 'mutation_1', status: 'conflict', errorCode: 'SYNC_CONFLICT', revision: 1 },
+      { id: 'mutation_1', status: 'conflict' },
+      { id: 'mutation_1', status: 'rejected', errorCode: 'INVALID_INPUT', revision: 1 },
+      { id: 'mutation_1', status: 'rejected' },
+    ]) {
+      const rpc = createPostgresRpcClient({
+        baseUrl: 'https://autoforge.example/v1/rdb/rest',
+        serviceKey: 'server-secret',
+        fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({ results: [result] })),
+      })
+      await expect(rpc('autoforge_sync_push', {})).rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
     }
   })
 

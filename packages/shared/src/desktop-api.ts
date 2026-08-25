@@ -415,6 +415,14 @@ export const conversationRenameMutationPayloadSchema = z.object({
 }).strict()
 export type ConversationRenameMutationPayload = z.infer<typeof conversationRenameMutationPayloadSchema>
 
+export const conversationPreferencesMutationPayloadSchema = z.object({
+  preferences: conversationGenerationPreferencesSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+export type ConversationPreferencesMutationPayload = z.infer<
+  typeof conversationPreferencesMutationPayloadSchema
+>
+
 export const conversationDeleteMutationPayloadSchema = z.object({}).strict()
 export type ConversationDeleteMutationPayload = z.infer<typeof conversationDeleteMutationPayloadSchema>
 
@@ -444,6 +452,7 @@ export type MessageAppendMutationPayload = z.infer<typeof messageAppendMutationP
 export const syncMutationKindSchema = z.enum([
   'conversation.create',
   'conversation.rename',
+  'conversation.preferences',
   'conversation.delete',
   'conversation.restore',
   'message.append',
@@ -457,12 +466,32 @@ export type SyncMutationKind = z.infer<typeof syncMutationKindSchema>
 export const syncMutationStatusSchema = z.enum(['applied', 'duplicate', 'conflict', 'rejected'])
 export type SyncMutationStatus = z.infer<typeof syncMutationStatusSchema>
 
-export const syncMutationResultSchema = z.object({
+const syncMutationResultBaseShape = {
   id: identifierSchema,
-  status: syncMutationStatusSchema,
-  revision: z.number().int().nonnegative().optional(),
-  errorCode: appErrorCodeSchema.optional(),
-}).strict()
+}
+
+export const syncMutationResultSchema = z.discriminatedUnion('status', [
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('applied'),
+    revision: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('duplicate'),
+    revision: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('conflict'),
+    errorCode: appErrorCodeSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('rejected'),
+    errorCode: appErrorCodeSchema,
+  }).strict(),
+])
 export type SyncMutationResult = z.infer<typeof syncMutationResultSchema>
 
 export const legacyImportPreviewSchema = z.object({
@@ -1020,6 +1049,11 @@ export const syncMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...syncMutationBaseShape,
+    kind: z.literal('conversation.preferences'),
+    payload: conversationPreferencesMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
     kind: z.literal('conversation.delete'),
     payload: conversationDeleteMutationPayloadSchema,
   }).strict(),
@@ -1104,6 +1138,11 @@ const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
   }).strict(),
   z.object({
     ...pulledMutationBaseShape,
+    kind: z.literal('conversation.preferences'),
+    payload: conversationPreferencesMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
     kind: z.literal('conversation.delete'),
     payload: conversationDeleteMutationPayloadSchema,
   }).strict(),
@@ -1173,6 +1212,10 @@ export const compactedPulledMutationSchema = z.discriminatedUnion('kind', [
   z.object({
     ...compactedPulledMutationBaseShape,
     kind: z.literal('conversation.rename'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.preferences'),
   }).strict(),
   z.object({
     ...compactedPulledMutationBaseShape,

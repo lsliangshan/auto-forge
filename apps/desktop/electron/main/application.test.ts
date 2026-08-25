@@ -5141,7 +5141,7 @@ describe('createApplicationRuntime', () => {
       browserWorkspace: createBrowserWorkspace(),
     }
     const runtime = createApplicationRuntime(options)
-    await authenticate(runtime)
+    const session = await authenticate(runtime)
     const conversation = await runtime.services.chat.createConversation()
     await expect(runtime.services.chat.updateGenerationPreferences(
       conversation.id,
@@ -5177,6 +5177,19 @@ describe('createApplicationRuntime', () => {
       await runtime.services.chat.getGenerationPreferences(conversation.id),
     )).rejects.toMatchObject({ code: 'NOT_FOUND' })
     await runtime.close()
+
+    withUserData(root, session.user.id, (store) => {
+      expect(store.outbox.list(10)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'conversation.preferences',
+          entityId: conversation.id,
+          baseRevision: 1,
+          payload: expect.objectContaining({
+            preferences: expect.objectContaining({ outputType: 'image' }),
+          }),
+        }),
+      ]))
+    })
 
     const restarted = createApplicationRuntime(options)
     await restarted.recover()

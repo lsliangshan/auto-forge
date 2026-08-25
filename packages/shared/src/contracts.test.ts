@@ -211,6 +211,45 @@ describe('cross-process contracts', () => {
       }).success).toBe(false)
     }
 
+    const generationPreferences = {
+      outputType: 'image' as const,
+      models: { image: 'openrouter/image-model' },
+      generation: {
+        image: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+        audio: { format: 'mp3' },
+        video: {
+          durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false,
+        },
+      },
+    }
+    const conversationPreferences = {
+      ...mutationBase,
+      kind: 'conversation.preferences' as const,
+      payload: {
+        preferences: generationPreferences,
+        metadataUpdatedAt: '2026-08-24T00:02:00.000Z',
+      },
+    }
+    expect(syncMutationSchema.parse(conversationPreferences)).toEqual(conversationPreferences)
+    expect(syncMutationSchema.safeParse({
+      ...conversationPreferences,
+      payload: {
+        ...conversationPreferences.payload,
+        preferences: { ...generationPreferences, ownerUserId: 'forged' },
+      },
+    }).success).toBe(false)
+    const pulledConversationPreferences = {
+      id: conversationPreferences.id,
+      kind: conversationPreferences.kind,
+      entityId: conversationPreferences.entityId,
+      baseRevision: conversationPreferences.baseRevision,
+      resultRevision: 1,
+      payload: conversationPreferences.payload,
+      receivedAt: conversationPreferences.occurredAt,
+    }
+    expect(pulledMutationSchema.parse(pulledConversationPreferences))
+      .toEqual(pulledConversationPreferences)
+
     const cloudSyncConsent = {
       purpose: 'cloud_sync' as const,
       documentVersion: 'privacy-2026-08',
@@ -310,6 +349,22 @@ describe('cross-process contracts', () => {
       .toEqual({ id: 'mut_1', status: 'applied', revision: 1 })
     expect(syncMutationResultSchema.parse({ id: 'mut_1', status: 'duplicate', revision: 1 }))
       .toEqual({ id: 'mut_1', status: 'duplicate', revision: 1 })
+    expect(syncMutationResultSchema.parse({
+      id: 'mut_1', status: 'conflict', errorCode: 'SYNC_CONFLICT',
+    })).toEqual({ id: 'mut_1', status: 'conflict', errorCode: 'SYNC_CONFLICT' })
+    expect(syncMutationResultSchema.parse({
+      id: 'mut_1', status: 'rejected', errorCode: 'INVALID_INPUT',
+    })).toEqual({ id: 'mut_1', status: 'rejected', errorCode: 'INVALID_INPUT' })
+    for (const invalidResult of [
+      { id: 'mut_1', status: 'applied' },
+      { id: 'mut_1', status: 'duplicate' },
+      { id: 'mut_1', status: 'conflict', errorCode: 'SYNC_CONFLICT', revision: 1 },
+      { id: 'mut_1', status: 'conflict' },
+      { id: 'mut_1', status: 'rejected', errorCode: 'INVALID_INPUT', revision: 1 },
+      { id: 'mut_1', status: 'rejected' },
+    ]) {
+      expect(syncMutationResultSchema.safeParse(invalidResult).success).toBe(false)
+    }
     expect(syncMutationResultSchema.safeParse({ id: 'mut_1', status: 'unknown' }).success).toBe(false)
   })
 
@@ -363,15 +418,22 @@ describe('cross-process contracts', () => {
       compacted: true as const,
       receivedAt: '2026-08-24T00:00:01.000Z',
     }
+    const compactedPreferences = {
+      ...compactedDelete,
+      id: 'preferences_mutation_1',
+      kind: 'conversation.preferences' as const,
+    }
 
     expect(pulledMutationSchema.parse(compactedMessage)).toEqual(compactedMessage)
     expect(pulledMutationSchema.parse(compactedDelete)).toEqual(compactedDelete)
+    expect(pulledMutationSchema.parse(compactedPreferences)).toEqual(compactedPreferences)
     expect(syncMutationSchema.safeParse(compactedMessage).success).toBe(false)
     for (const invalid of [
       { ...compactedMessage, payload: { blocks: [{ type: 'text', text: 'secret' }] } },
       { ...compactedMessage, conversationId: undefined },
       { ...compactedDelete, conversationId: 'conversation_1' },
       { ...compactedDelete, secret: 'not allowed' },
+      { ...compactedPreferences, payload: { preferences: { outputType: 'image' } } },
       { ...compactedDelete, kind: 'usage.record' },
     ]) {
       expect(pulledMutationSchema.safeParse(invalid).success).toBe(false)
