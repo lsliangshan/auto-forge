@@ -4,7 +4,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import Database from 'better-sqlite3-multiple-ciphers'
 import type { SafeStoragePort } from '../security/secret-store.js'
-import { KnowledgeKeyStore } from './key-store.js'
+import { KnowledgeKeyStore, type KnowledgeKeyStorePort } from './key-store.js'
 import {
   configureKnowledgeConnection,
   initializeKnowledgeSchema,
@@ -27,6 +27,14 @@ export interface OpenedUserKnowledgeDatabase {
   readonly capabilities: KnowledgeDatabaseCapabilities
   rotateKey(): Promise<void>
   close(): void
+}
+
+export interface KnowledgeDatabaseDependencies {
+  createKeyStore(recordPath: string, safeStorage: SafeStoragePort): KnowledgeKeyStorePort
+  openDatabase(path: string, key: Buffer): Database.Database
+  rekeyDatabase(database: Database.Database, key: Buffer): void
+  probeCapabilities(database: Database.Database): KnowledgeDatabaseCapabilities
+  initializeSchema(database: Database.Database): void
 }
 
 function validateKey(key: Buffer): void {
@@ -82,40 +90,80 @@ function ownerDirectory(rootDirectory: string, userId: string): string {
 
 async function openRecoverableDatabase(
   databasePath: string,
-  keyStore: KnowledgeKeyStore,
+  keyStore: KnowledgeKeyStorePort,
+  dependencies: KnowledgeDatabaseDependencies,
 ): Promise<Database.Database> {
   const active = await keyStore.loadActiveKey()
   const pending = await keyStore.loadPendingKey()
   try {
-    if (!pending) return openEncryptedDatabase(databasePath, active)
+    if (!pending) return dependencies.openDatabase(databasePath, active)
 
+    let activeDatabase: Database.Database | undefined
+    let activeError: unknown
     try {
-      const database = openEncryptedDatabase(databasePath, active)
-      await keyStore.discardPendingKey()
-      return database
-    } catch (activeError) {
-      try {
-        const database = openEncryptedDatabase(databasePath, pending)
-        await keyStore.promotePendingKey()
-        return database
-      } catch {
-        throw activeError
-      }
+      activeDatabase = dependencies.openDatabase(databasePath, active)
+    } catch (error) {
+      activeError = error
     }
+    if (activeDatabase) {
+      try {
+        await keyStore.discardPendingKey()
+      } catch (error) {
+        closeSilently(activeDatabase)
+        throw error
+      }
+      return activeDatabase
+    }
+
+    let pendingDatabase: Database.Database
+    try {
+      pendingDatabase = dependencies.openDatabase(databasePath, pending)
+    } catch (pendingError) {
+      throw new AggregateError(
+        [activeError, pendingError],
+        'Neither active nor pending knowledge database key could open the database',
+        { cause: pendingError },
+      )
+    }
+    try {
+      await keyStore.promotePendingKey()
+    } catch (error) {
+      closeSilently(pendingDatabase)
+      throw error
+    }
+    return pendingDatabase
   } finally {
     active.fill(0)
     pending?.fill(0)
   }
 }
 
+function closeSilently(database: Database.Database): void {
+  try {
+    database.close()
+  } catch {
+    // Preserve the initialization or recovery error that required fail-closed cleanup.
+  }
+}
+
+const defaultDependencies: KnowledgeDatabaseDependencies = {
+  createKeyStore: (recordPath, safeStorage) => new KnowledgeKeyStore(recordPath, safeStorage),
+  openDatabase: openEncryptedDatabase,
+  rekeyDatabase: rekeyEncryptedDatabase,
+  probeCapabilities: probeKnowledgeCapabilities,
+  initializeSchema: initializeKnowledgeSchema,
+}
+
 export async function openUserKnowledgeDatabase(
   options: OpenUserKnowledgeDatabaseOptions,
+  dependencyOverrides: Partial<KnowledgeDatabaseDependencies> = {},
 ): Promise<OpenedUserKnowledgeDatabase> {
+  const dependencies = { ...defaultDependencies, ...dependencyOverrides }
   const directory = ownerDirectory(options.rootDirectory, options.userId)
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const databasePath = join(directory, 'knowledge.sqlite')
   const keyRecordPath = join(directory, 'knowledge-key.json')
-  const keyStore = new KnowledgeKeyStore(keyRecordPath, options.safeStorage)
+  const keyStore = dependencies.createKeyStore(keyRecordPath, options.safeStorage)
 
   if (!keyStore.exists()) {
     if (hasDatabaseFile(databasePath)) throw new Error('Knowledge database key is unavailable')
@@ -123,14 +171,21 @@ export async function openUserKnowledgeDatabase(
     initialKey.fill(0)
   }
 
-  let database = await openRecoverableDatabase(databasePath, keyStore)
-  const capabilities = probeKnowledgeCapabilities(database)
-  initializeKnowledgeSchema(database)
+  const database = await openRecoverableDatabase(databasePath, keyStore, dependencies)
+  let capabilities: KnowledgeDatabaseCapabilities
+  try {
+    capabilities = dependencies.probeCapabilities(database)
+    dependencies.initializeSchema(database)
+  } catch (error) {
+    closeSilently(database)
+    throw error
+  }
+  let currentDatabase = database
   let closed = false
 
   return {
     get database() {
-      return database
+      return currentDatabase
     },
     databasePath,
     keyRecordPath,
@@ -140,17 +195,25 @@ export async function openUserKnowledgeDatabase(
       const pending = randomBytes(DATABASE_KEY_BYTES)
       try {
         await keyStore.stagePendingKey(pending)
-        rekeyEncryptedDatabase(database, pending)
-        database.close()
-        database = openEncryptedDatabase(databasePath, pending)
-        await keyStore.promotePendingKey()
+        dependencies.rekeyDatabase(currentDatabase, pending)
+        currentDatabase.close()
+        closed = true
+        const reopened = dependencies.openDatabase(databasePath, pending)
+        try {
+          await keyStore.promotePendingKey()
+        } catch (error) {
+          closeSilently(reopened)
+          throw error
+        }
+        currentDatabase = reopened
+        closed = false
       } finally {
         pending.fill(0)
       }
     },
     close() {
       if (closed) return
-      database.close()
+      currentDatabase.close()
       closed = true
     },
   }

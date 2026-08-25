@@ -55,6 +55,13 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS documents_knowledge_base
       ON documents(knowledge_base_id, updated_at DESC);
+    DROP TRIGGER IF EXISTS documents_scope_immutable;
+    CREATE TRIGGER documents_scope_immutable
+    BEFORE UPDATE ON documents
+    WHEN NEW.id IS NOT OLD.id OR NEW.knowledge_base_id IS NOT OLD.knowledge_base_id
+    BEGIN
+      SELECT RAISE(ABORT, 'document scope is immutable');
+    END;
 
     CREATE TABLE IF NOT EXISTS document_versions (
       id TEXT PRIMARY KEY,
@@ -66,9 +73,59 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
       created_at INTEGER NOT NULL,
       UNIQUE(document_id, version_number)
     ) STRICT;
-    CREATE TRIGGER IF NOT EXISTS document_versions_immutable
-    BEFORE UPDATE ON document_versions BEGIN
-      SELECT RAISE(ABORT, 'document versions are immutable');
+    DROP TRIGGER IF EXISTS document_versions_immutable;
+    DROP TRIGGER IF EXISTS document_versions_payload_immutable;
+    DROP TRIGGER IF EXISTS document_versions_lifecycle;
+    CREATE TRIGGER document_versions_payload_immutable
+    BEFORE UPDATE ON document_versions
+    WHEN NEW.id IS NOT OLD.id
+      OR NEW.document_id IS NOT OLD.document_id
+      OR NEW.version_number IS NOT OLD.version_number
+      OR NEW.content_hash IS NOT OLD.content_hash
+      OR NEW.source_object_id IS NOT OLD.source_object_id
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN
+      SELECT RAISE(ABORT, 'document version payload is immutable');
+    END;
+    CREATE TRIGGER document_versions_lifecycle
+    BEFORE UPDATE OF status ON document_versions
+    WHEN NOT (
+      (OLD.status = 'staging' AND NEW.status IN ('ready', 'failed'))
+      OR (OLD.status = 'ready' AND NEW.status = 'superseded')
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'invalid document version lifecycle transition');
+    END;
+
+    DROP TRIGGER IF EXISTS documents_active_version_scope_insert;
+    DROP TRIGGER IF EXISTS documents_active_version_scope_update;
+    DROP TRIGGER IF EXISTS documents_active_version_deleted;
+    CREATE TRIGGER documents_active_version_scope_insert
+    BEFORE INSERT ON documents
+    WHEN NEW.active_version_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM document_versions
+        WHERE id = NEW.active_version_id AND document_id = NEW.id
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'active version must belong to the document');
+    END;
+    CREATE TRIGGER documents_active_version_deleted
+    AFTER DELETE ON document_versions
+    BEGIN
+      UPDATE documents
+      SET active_version_id = NULL
+      WHERE id = OLD.document_id AND active_version_id = OLD.id;
+    END;
+    CREATE TRIGGER documents_active_version_scope_update
+    BEFORE UPDATE OF active_version_id ON documents
+    WHEN NEW.active_version_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM document_versions
+        WHERE id = NEW.active_version_id AND document_id = NEW.id
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'active version must belong to the document');
     END;
 
     CREATE TABLE IF NOT EXISTS knowledge_blocks (
@@ -80,6 +137,13 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
       coordinates_json TEXT NOT NULL,
       UNIQUE(version_id, ordinal)
     ) STRICT;
+    DROP TRIGGER IF EXISTS knowledge_blocks_scope_immutable;
+    CREATE TRIGGER knowledge_blocks_scope_immutable
+    BEFORE UPDATE ON knowledge_blocks
+    WHEN NEW.id IS NOT OLD.id OR NEW.version_id IS NOT OLD.version_id
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge block scope is immutable');
+    END;
 
     CREATE TABLE IF NOT EXISTS kb_chunks (
       rowid INTEGER PRIMARY KEY,
@@ -95,6 +159,39 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS kb_chunks_scope
       ON kb_chunks(knowledge_base_id, document_id, version_id);
+
+    DROP TRIGGER IF EXISTS kb_chunks_scope_insert;
+    DROP TRIGGER IF EXISTS kb_chunks_scope_update;
+    CREATE TRIGGER kb_chunks_scope_insert
+    BEFORE INSERT ON kb_chunks
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM documents
+      JOIN document_versions ON document_versions.document_id = documents.id
+      JOIN knowledge_blocks ON knowledge_blocks.version_id = document_versions.id
+      WHERE documents.id = NEW.document_id
+        AND documents.knowledge_base_id = NEW.knowledge_base_id
+        AND document_versions.id = NEW.version_id
+        AND knowledge_blocks.id = NEW.block_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge chunk scope mismatch');
+    END;
+    CREATE TRIGGER kb_chunks_scope_update
+    BEFORE UPDATE OF knowledge_base_id, document_id, version_id, block_id ON kb_chunks
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM documents
+      JOIN document_versions ON document_versions.document_id = documents.id
+      JOIN knowledge_blocks ON knowledge_blocks.version_id = document_versions.id
+      WHERE documents.id = NEW.document_id
+        AND documents.knowledge_base_id = NEW.knowledge_base_id
+        AND document_versions.id = NEW.version_id
+        AND knowledge_blocks.id = NEW.block_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge chunk scope mismatch');
+    END;
 
     CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts USING fts5(
       body,

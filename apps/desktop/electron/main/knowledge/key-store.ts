@@ -1,7 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import process from 'node:process'
 import type { SafeStoragePort } from '../security/secret-store.js'
 
 interface WrappedKeyRecord {
@@ -11,6 +12,90 @@ interface WrappedKeyRecord {
 }
 
 const DATABASE_KEY_BYTES = 32
+
+export interface DurableFileHandlePort {
+  writeFile(value: string): Promise<void>
+  sync(): Promise<void>
+  close(): Promise<void>
+}
+
+export interface DurableFileSystemPort {
+  mkdir(path: string, options: { recursive: true; mode: number }): Promise<void>
+  open(path: string, flags: 'wx' | 'r', mode?: number): Promise<DurableFileHandlePort>
+  rename(from: string, to: string): Promise<void>
+  unlink(path: string): Promise<void>
+}
+
+export type DurableRecordWriter = (recordPath: string, serialized: string) => Promise<void>
+
+export interface KnowledgeKeyStorePort {
+  exists(): boolean
+  createActiveKey(): Promise<Buffer>
+  loadActiveKey(): Promise<Buffer>
+  loadPendingKey(): Promise<Buffer | undefined>
+  stagePendingKey(key: Buffer): Promise<void>
+  promotePendingKey(): Promise<void>
+  discardPendingKey(): Promise<void>
+}
+
+const nodeFileSystem: DurableFileSystemPort = {
+  mkdir: async (path, options) => { await mkdir(path, options) },
+  open,
+  rename,
+  unlink,
+}
+
+function isUnsupportedDirectorySync(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code
+  return code === 'EINVAL'
+    || code === 'ENOSYS'
+    || code === 'ENOTSUP'
+    || (process.platform === 'win32' && (code === 'EPERM' || code === 'EISDIR'))
+}
+
+async function syncDirectory(directory: string, fileSystem: DurableFileSystemPort): Promise<void> {
+  let handle: DurableFileHandlePort | undefined
+  try {
+    handle = await fileSystem.open(directory, 'r')
+    await handle.sync()
+  } catch (error) {
+    if (!isUnsupportedDirectorySync(error)) throw error
+  } finally {
+    await handle?.close()
+  }
+}
+
+export async function writeFileDurably(
+  recordPath: string,
+  serialized: string,
+  fileSystem: DurableFileSystemPort = nodeFileSystem,
+): Promise<void> {
+  const directory = dirname(recordPath)
+  const temporaryPath = `${recordPath}.${randomUUID()}.tmp`
+  await fileSystem.mkdir(directory, { recursive: true, mode: 0o700 })
+  let renamed = false
+  try {
+    const handle = await fileSystem.open(temporaryPath, 'wx', 0o600)
+    try {
+      await handle.writeFile(serialized)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await fileSystem.rename(temporaryPath, recordPath)
+    renamed = true
+    await syncDirectory(directory, fileSystem)
+  } catch (error) {
+    if (!renamed) {
+      try {
+        await fileSystem.unlink(temporaryPath)
+      } catch {
+        // The original persistence error is authoritative.
+      }
+    }
+    throw error
+  }
+}
 
 function parseRecord(serialized: string): WrappedKeyRecord {
   const value: unknown = JSON.parse(serialized)
@@ -28,10 +113,11 @@ function parseRecord(serialized: string): WrappedKeyRecord {
   return record as unknown as WrappedKeyRecord
 }
 
-export class KnowledgeKeyStore {
+export class KnowledgeKeyStore implements KnowledgeKeyStorePort {
   constructor(
     readonly recordPath: string,
     private readonly safeStorage: SafeStoragePort,
+    private readonly persistRecord: DurableRecordWriter = writeFileDurably,
   ) {}
 
   exists(): boolean {
@@ -132,10 +218,6 @@ export class KnowledgeKeyStore {
   }
 
   private async writeRecord(record: WrappedKeyRecord): Promise<void> {
-    const directory = dirname(this.recordPath)
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-    const temporaryPath = `${this.recordPath}.${randomUUID()}.tmp`
-    await writeFile(temporaryPath, JSON.stringify(record), { mode: 0o600, flag: 'wx' })
-    await rename(temporaryPath, this.recordPath)
+    await this.persistRecord(this.recordPath, JSON.stringify(record))
   }
 }
