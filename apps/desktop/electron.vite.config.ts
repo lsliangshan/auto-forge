@@ -23,6 +23,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: new URL('./electron/preload/index.ts', import.meta.url).pathname,
+          parser: new URL('./electron/main/knowledge/parser-preload.ts', import.meta.url).pathname,
         },
         output: {
           format: 'cjs',
@@ -36,7 +37,10 @@ export default defineConfig({
     plugins: [vue(), tailwindcss()],
     build: {
       rollupOptions: {
-        input: new URL('./index.html', import.meta.url).pathname,
+        input: {
+          index: new URL('./index.html', import.meta.url).pathname,
+          parserWorker: new URL('./electron/main/knowledge/parser-worker.html', import.meta.url).pathname,
+        },
       },
     },
   },
