@@ -1982,7 +1982,7 @@ export function createUserDataRepositories(
         const result = database.prepare(`
           SELECT MIN(created_at) AS oldest
           FROM outbox_mutations
-          WHERE state IN ('pending', 'failed')
+          WHERE state IN ('pending', 'syncing', 'failed')
         `).get() as { oldest: number | null }
         return result.oldest ?? undefined
       },

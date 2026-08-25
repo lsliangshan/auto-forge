@@ -349,6 +349,33 @@ describe('CloudBase user data migration', () => {
     )
   })
 
+  it('compacts stale rename and message receipts that arrive after purge without changing the request hash', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+    const renameBranch = syncPush.slice(
+      syncPush.indexOf("ELSIF mutation_kind IN ('conversation.rename'"),
+      syncPush.indexOf("ELSIF mutation_kind = 'message.append'"),
+    )
+    const messageBranch = syncPush.slice(
+      syncPush.indexOf("ELSIF mutation_kind = 'message.append'"),
+      syncPush.indexOf("ELSIF mutation_kind = 'privacy.consent'"),
+    )
+
+    expect(renameBranch).toMatch(
+      /IF NOT FOUND THEN[\s\S]+?mutation_kind = 'conversation\.rename'[\s\S]+?'compacted', true/,
+    )
+    expect(messageBranch).toMatch(
+      /IF NOT FOUND[\s\S]+?mutation := jsonb_build_object\([\s\S]+?'compacted', true,[\s\S]+?'conversationId', conversation_id/,
+    )
+    expect(renameBranch.indexOf("auth_user_id::text || ':' || entity_id"))
+      .toBeLessThan(renameBranch.indexOf("mutation := jsonb_build_object('compacted', true)"))
+    expect(messageBranch.indexOf("auth_user_id::text || ':' || conversation_id"))
+      .toBeLessThan(messageBranch.indexOf('mutation := jsonb_build_object('))
+    expect(syncPush.indexOf('request_hash_value := md5(mutation::text)'))
+      .toBeLessThan(syncPush.indexOf("'compacted', true"))
+    expect(syncPush).toContain('mutation, request_hash_value')
+  })
+
   it('keeps accepted data tables intact during rollback', async () => {
     const rollback = await readFile(rollbackUrl, 'utf8')
 

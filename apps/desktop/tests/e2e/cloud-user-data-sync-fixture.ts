@@ -42,6 +42,7 @@ interface StoredReceipt {
 interface UserState {
   online: boolean
   failAfterApply: boolean
+  failAfterApplyAndPurge: boolean
   events: PulledMutation[]
   receipts: Map<string, StoredReceipt>
   conversations: Map<string, StoredConversation>
@@ -52,6 +53,10 @@ interface UserState {
   importedBatches: Map<string, string>
   duplicateMutationCount: number
   pullPageSizes: number[]
+  purgedCreateIdentity?: Pick<
+    Extract<SyncMutation, { kind: 'conversation.create' }>,
+    'id' | 'kind' | 'entityId' | 'baseRevision' | 'occurredAt'
+  >
 }
 
 export interface CloudUserDataFixtureSnapshot {
@@ -60,6 +65,8 @@ export interface CloudUserDataFixtureSnapshot {
   importedBatchCount: number
   duplicateMutationCount: number
   pullPageSizes: number[]
+  compactedConversationEventCount: number
+  retainedConversationPayloadCount: number
 }
 
 export interface CloudUserDataFixture {
@@ -68,6 +75,8 @@ export interface CloudUserDataFixture {
   close(): Promise<void>
   setOnline(user: FixtureUser, online: boolean): Promise<void>
   failAfterApplyOnce(user: FixtureUser): Promise<void>
+  failAfterApplyAndPurgeOnce(user: FixtureUser): Promise<void>
+  retryPurgedMutationWithChangedContent(user: FixtureUser): Promise<SyncMutationResult>
   seedConversations(user: FixtureUser, count: number, titlePrefix: string): Promise<void>
   seedByokUsage(user: FixtureUser): Promise<void>
   snapshot(user: FixtureUser): Promise<CloudUserDataFixtureSnapshot>
@@ -77,6 +86,7 @@ function initialUserState(): UserState {
   return {
     online: true,
     failAfterApply: false,
+    failAfterApplyAndPurge: false,
     events: [],
     receipts: new Map(),
     conversations: new Map(),
@@ -183,6 +193,54 @@ function pulled(
 
 function appendEvent(state: UserState, mutation: SyncMutation, resultRevision: number): void {
   state.events.push(pulled(mutation, resultRevision, state.events.length + 1))
+}
+
+function eventConversationId(event: PulledMutation): string | undefined {
+  if (event.kind.startsWith('conversation.')) return event.entityId
+  if (event.kind !== 'message.append') return undefined
+  return 'compacted' in event ? event.conversationId : event.payload.conversationId
+}
+
+function purgeConversation(state: UserState, conversationId: string): void {
+  state.events = state.events.map((event): PulledMutation => {
+    if (eventConversationId(event) !== conversationId) return event
+    return {
+      id: event.id,
+      kind: event.kind as 'conversation.create',
+      entityId: event.entityId,
+      baseRevision: event.baseRevision,
+      resultRevision: event.resultRevision,
+      compacted: true,
+      receivedAt: event.receivedAt,
+      ...(event.kind === 'message.append' ? { kind: event.kind, conversationId } : {}),
+    } as PulledMutation
+  })
+  for (const [messageId, message] of state.messages) {
+    if (message.conversationId === conversationId) state.messages.delete(messageId)
+  }
+  state.conversations.delete(conversationId)
+}
+
+function deleteAndPurgeAppliedCreate(
+  state: UserState,
+  mutation: Extract<SyncMutation, { kind: 'conversation.create' }>,
+): void {
+  const conversation = state.conversations.get(mutation.entityId)
+  if (!conversation) throw new Error('Applied conversation was unavailable for purge')
+  const deletion: SyncMutation = {
+    id: `purge_delete_${mutation.id}`,
+    kind: 'conversation.delete',
+    entityId: mutation.entityId,
+    baseRevision: conversation.revision,
+    payload: {},
+    occurredAt: '2026-10-25T00:00:00.000Z',
+  }
+  const deletionResult = applyMutation(state, deletion)
+  if (deletionResult.status !== 'applied') throw new Error('Fixture purge delete did not apply')
+  const { payload: _payload, ...identity } = mutation
+  void _payload
+  state.purgedCreateIdentity = identity
+  purgeConversation(state, mutation.entityId)
 }
 
 function applyMutation(state: UserState, mutation: SyncMutation): SyncMutationResult {
@@ -424,6 +482,16 @@ export async function startCloudUserDataFixture(): Promise<CloudUserDataFixture>
     if (input.action === 'syncPush') {
       const mutations = Array.isArray(input.mutations) ? input.mutations as SyncMutation[] : []
       const results = mutations.map((mutation) => applyMutation(state, mutation))
+      if (state.failAfterApplyAndPurge) {
+        state.failAfterApplyAndPurge = false
+        const appliedCreate = mutations.find((mutation, index): mutation is Extract<
+          SyncMutation, { kind: 'conversation.create' }
+        > => mutation.kind === 'conversation.create' && results[index]?.status === 'applied')
+        if (!appliedCreate) throw new Error('Expected an applied create before fixture purge')
+        deleteAndPurgeAppliedCreate(state, appliedCreate)
+        sendJson(response, 503, { ok: false, error: { code: 'SERVICE_UNAVAILABLE' } })
+        return
+      }
       if (state.failAfterApply) {
         state.failAfterApply = false
         sendJson(response, 503, { ok: false, error: { code: 'SERVICE_UNAVAILABLE' } })
@@ -508,6 +576,23 @@ export async function startCloudUserDataFixture(): Promise<CloudUserDataFixture>
     async failAfterApplyOnce(user) {
       users[user].failAfterApply = true
     },
+    async failAfterApplyAndPurgeOnce(user) {
+      users[user].failAfterApplyAndPurge = true
+    },
+    async retryPurgedMutationWithChangedContent(user) {
+      const identity = users[user].purgedCreateIdentity
+      if (!identity) throw new Error('No purged create mutation is available')
+      return applyMutation(users[user], {
+        ...identity,
+        payload: {
+          title: 'Changed title after purge',
+          titleState: 'user_named',
+          createdAt: identity.occurredAt,
+          lastActivityAt: identity.occurredAt,
+          metadataUpdatedAt: identity.occurredAt,
+        },
+      })
+    },
     async seedConversations(user, count, titlePrefix) {
       const state = users[user]
       for (let index = 0; index < count; index += 1) {
@@ -563,6 +648,12 @@ export async function startCloudUserDataFixture(): Promise<CloudUserDataFixture>
         importedBatchCount: state.importedBatches.size,
         duplicateMutationCount: state.duplicateMutationCount,
         pullPageSizes: [...state.pullPageSizes],
+        compactedConversationEventCount: state.events.filter((event) => (
+          eventConversationId(event) !== undefined && 'compacted' in event
+        )).length,
+        retainedConversationPayloadCount: state.events.filter((event) => (
+          eventConversationId(event) !== undefined && 'payload' in event
+        )).length,
       }
     },
   }

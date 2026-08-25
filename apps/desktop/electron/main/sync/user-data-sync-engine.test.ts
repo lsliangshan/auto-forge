@@ -239,6 +239,61 @@ describe('UserDataSyncEngine', () => {
     }
   })
 
+  it('keeps an in-flight syncing mutation warning-eligible at the 24-hour threshold', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const manager = createManager()
+    let releasePush: (() => void) | undefined
+    let flushing = Promise.resolve()
+    try {
+      const store = manager.open('alice')
+      const mutation = createMutation(21)
+      store.outbox.recordWithConversation(mutation)
+      let markPushStarted!: () => void
+      const pushStarted = new Promise<void>((resolve) => { markPushStarted = resolve })
+      const pushBlocked = new Promise<void>((resolve) => { releasePush = resolve })
+      const events: Array<{ userId: string; generation: number; warningSince?: number }> = []
+      const { engine, clock } = createEngine(
+        manager,
+        async (input) => {
+          if (input.action === 'syncPush') {
+            markPushStarted()
+            await pushBlocked
+            return success({
+              results: [{ id: mutation.id, status: 'applied', revision: 1 }],
+              cursor: 'cursor_syncing_warning_push',
+            })
+          }
+          return success({
+            mutations: [pulled(mutation)], cursor: 'cursor_syncing_warning_pull',
+          })
+        },
+        new FakeClock(),
+        undefined,
+        (binding, warningSince) => events.push({ ...binding, warningSince }),
+      )
+      clock.nowValue = 1_000
+      await engine.start('alice', 'device-a')
+      flushing = engine.flush()
+      await pushStarted
+
+      expect(store.outbox.find(mutation.id)?.state).toBe('syncing')
+      expect(clock.nextDelay()).toBe(24 * 60 * 60 * 1_000)
+      await clock.fireNext()
+      expect(events).toEqual([{ userId: 'alice', generation: 2, warningSince: 1_000 }])
+
+      releasePush?.()
+      await flushing
+      expect(store.outbox.find(mutation.id)).toBeUndefined()
+      expect(events.at(-1)).toEqual({ userId: 'alice', generation: 2, warningSince: undefined })
+      expect(engine.status()).toEqual({ state: 'idle' })
+    } finally {
+      releasePush?.()
+      await flushing.catch(() => undefined)
+      manager.close()
+      now.mockRestore()
+    }
+  })
+
   it('serializes dedicated legacy imports on the active UID and supplies only its device binding', async () => {
     const manager = createManager()
     let releaseFirst!: () => void

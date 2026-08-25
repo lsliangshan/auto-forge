@@ -306,6 +306,81 @@ describe('chat history pagination', () => {
     expect(api.chat.listConversations).toHaveBeenCalledTimes(3)
   })
 
+  it.each([
+    {
+      pageKind: 'initial' as const,
+      liveWarning: '2026-07-20T00:00:00.000Z',
+      snapshotWarning: undefined,
+    },
+    {
+      pageKind: 'initial' as const,
+      liveWarning: undefined,
+      snapshotWarning: '2026-07-19T00:00:00.000Z',
+    },
+    {
+      pageKind: 'paginated' as const,
+      liveWarning: '2026-07-20T00:00:00.000Z',
+      snapshotWarning: undefined,
+    },
+    {
+      pageKind: 'paginated' as const,
+      liveWarning: undefined,
+      snapshotWarning: '2026-07-19T00:00:00.000Z',
+    },
+  ])('does not let a stale $pageKind warning snapshot overwrite a newer live state', async ({
+    pageKind,
+    liveWarning,
+    snapshotWarning,
+  }) => {
+    const { api, emitChat } = createEventApi()
+    const page = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations).mockReturnValue(page.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    if (pageKind === 'paginated') store.nextConversationCursor = 'warning-page-cursor'
+
+    const loading = pageKind === 'initial'
+      ? store.loadConversations(false)
+      : store.loadMoreConversations()
+    emitChat({
+      type: 'sync_warning_updated',
+      ...(liveWarning === undefined ? {} : { warningSince: liveWarning }),
+    })
+    page.resolve({
+      items: [],
+      ...(snapshotWarning === undefined ? {} : { syncWarningSince: snapshotWarning }),
+    })
+    await loading
+
+    expect(store.syncWarningSince).toBe(liveWarning)
+  })
+
+  it('clears and isolates warning state when an identity reset replaces the event subscription', async () => {
+    const { api, chatUnsubscribe, emitChat } = createEventApi()
+    const oldPage = deferred<Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>>()
+    vi.mocked(api.chat.listConversations).mockReturnValue(oldPage.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    const loading = store.loadConversations(false)
+    emitChat({
+      type: 'sync_warning_updated', warningSince: '2026-07-19T00:00:00.000Z',
+    })
+
+    store.resetLocalData()
+    expect(store.syncWarningSince).toBeUndefined()
+    expect(chatUnsubscribe).toHaveBeenCalledOnce()
+    store.ensureSubscriptions()
+    emitChat({
+      type: 'sync_warning_updated', warningSince: '2026-07-21T00:00:00.000Z',
+    })
+    oldPage.resolve({ items: [], syncWarningSince: '2026-07-19T00:00:00.000Z' })
+    await loading
+
+    expect(api.chat.onEvent).toHaveBeenCalledTimes(2)
+    expect(store.syncWarningSince).toBe('2026-07-21T00:00:00.000Z')
+  })
+
   it('does not merge an old identity conversation page that uses the new identity cursor', async () => {
     const { api } = createEventApi()
     const oldPage = deferred<{ items: ConversationSummary[]; nextCursor?: string }>()

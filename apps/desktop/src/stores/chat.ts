@@ -270,6 +270,7 @@ export const useChatStore = defineStore('chat', {
     _preferenceLoadRequests: {} as Record<string, number>,
     _pageRequestSequence: 0,
     _dataGeneration: 0,
+    _syncWarningVersion: 0,
     _preferenceVersions: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
@@ -300,6 +301,7 @@ export const useChatStore = defineStore('chat', {
       this._selectionVersion += 1
       this._stateEpoch += 1
       this._dataGeneration += 1
+      this._syncWarningVersion += 1
       storeReleases.get(this)?.()
       storeReleases.delete(this)
       this._subscribed = false
@@ -350,6 +352,7 @@ export const useChatStore = defineStore('chat', {
       const version = ++this._loadVersion
       const requestToken = ++this._pageRequestSequence
       const dataGeneration = this._dataGeneration
+      const syncWarningVersion = this._syncWarningVersion
       this._conversationPageRequests[requestKey] = requestToken
       this.loading = true
       this.error = ''
@@ -361,7 +364,9 @@ export const useChatStore = defineStore('chat', {
         const selected = this.conversations.find(({ id }) => id === this.selectedConversationId)
         this.conversations = mergeConversationPages(selected ? [selected] : [], page.items)
         this.nextConversationCursor = page.nextCursor
-        this.syncWarningSince = page.syncWarningSince
+        if (syncWarningVersion === this._syncWarningVersion) {
+          this.syncWarningSince = page.syncWarningSince
+        }
         if (!this.selectedConversationId) {
           this.selectedConversationId = this.conversations[0]?.id ?? ''
           this._selectionVersion += 1
@@ -394,6 +399,7 @@ export const useChatStore = defineStore('chat', {
       if (!cursor || this._conversationPageRequests[cursor]) return
       const requestToken = ++this._pageRequestSequence
       const dataGeneration = this._dataGeneration
+      const syncWarningVersion = this._syncWarningVersion
       this._conversationPageRequests[cursor] = requestToken
       try {
         const page = await getDesktopApi().chat.listConversations({ limit: 50, cursor })
@@ -402,7 +408,9 @@ export const useChatStore = defineStore('chat', {
           || this.nextConversationCursor !== cursor) return
         this.conversations = mergeConversationPages(this.conversations, page.items)
         this.nextConversationCursor = page.nextCursor
-        this.syncWarningSince = page.syncWarningSince
+        if (syncWarningVersion === this._syncWarningVersion) {
+          this.syncWarningSince = page.syncWarningSince
+        }
       } catch (error) {
         if (dataGeneration === this._dataGeneration
           && this._conversationPageRequests[cursor] === requestToken) {
@@ -948,6 +956,7 @@ export const useChatStore = defineStore('chat', {
     },
     applyChatEvent(event: ChatEvent) {
       if (event.type === 'sync_warning_updated') {
+        this._syncWarningVersion += 1
         this.syncWarningSince = event.warningSince
         return
       }

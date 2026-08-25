@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -252,6 +253,25 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     return true
   }
   if (name === 'pendingOutbox') return userDataStores?.current()?.outbox.countPending() ?? 0
+  if (name === 'receiptEvidenceCount') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Cloud user-data E2E session is unavailable')
+    const scope = createHash('sha256')
+      .update('autoforge-user-cache-v1\0')
+      .update(session.user.id)
+      .digest('hex')
+      .slice(0, 32)
+    const database = new Database(join(userData, 'user-caches', `${scope}.sqlite`), {
+      readonly: true,
+    })
+    try {
+      return (database.prepare('SELECT COUNT(*) AS count FROM sync_receipt_evidence').get() as {
+        count: number
+      }).count
+    } finally {
+      database.close()
+    }
+  }
   if (name === 'providerRequestCount') return providerRequestCount
   throw new Error(`Unknown cloud user-data E2E command: ${name}`)
 }

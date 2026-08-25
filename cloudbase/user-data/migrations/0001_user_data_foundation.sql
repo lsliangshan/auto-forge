@@ -422,7 +422,13 @@ BEGIN
       FROM app_conversations conversation
       WHERE conversation.owner_user_id = auth_user_id AND conversation.id = entity_id
       FOR UPDATE;
-      IF NOT FOUND OR conversation_row.revision <> base_revision_value THEN
+      IF NOT FOUND THEN
+        mutation_status := 'conflict';
+        mutation_error := 'SYNC_CONFLICT';
+        IF mutation_kind = 'conversation.rename' THEN
+          mutation := jsonb_build_object('compacted', true);
+        END IF;
+      ELSIF conversation_row.revision <> base_revision_value THEN
         mutation_status := 'conflict';
         mutation_error := 'SYNC_CONFLICT';
       ELSIF mutation_kind = 'conversation.rename' THEN
@@ -503,7 +509,14 @@ BEGIN
           FROM app_conversations conversation
           WHERE conversation.owner_user_id = auth_user_id AND conversation.id = conversation_id
           FOR UPDATE;
-          IF NOT FOUND OR conversation_row.deleted_at IS NOT NULL
+          IF NOT FOUND THEN
+            mutation_status := 'conflict';
+            mutation_error := 'SYNC_CONFLICT';
+            mutation := jsonb_build_object(
+              'compacted', true,
+              'conversationId', conversation_id
+            );
+          ELSIF conversation_row.deleted_at IS NOT NULL
             OR conversation_row.revision <> base_revision_value THEN
             mutation_status := 'conflict';
             mutation_error := 'SYNC_CONFLICT';

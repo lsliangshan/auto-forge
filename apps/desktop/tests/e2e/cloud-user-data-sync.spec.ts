@@ -224,6 +224,36 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     expect((await fixture.snapshot('alice')).conversations).toHaveLength(1)
   })
 
+  test('reconciles a lost response after purge and rejects changed-content mutation reuse', async () => {
+    const profile = await launchProfile(fixture)
+    profiles.push(profile)
+    await grantCloudSync(fixture, profile)
+    await fixture.failAfterApplyAndPurgeOnce('alice')
+
+    await profile.page.getByLabel('新建会话').click()
+
+    await expect.poll(() => fixture.snapshot('alice')).toMatchObject({
+      conversations: [],
+      duplicateMutationCount: expect.any(Number),
+      compactedConversationEventCount: 2,
+      retainedConversationPayloadCount: 0,
+    })
+    await expect.poll(async () => (await fixture.snapshot('alice')).duplicateMutationCount)
+      .toBeGreaterThan(0)
+    await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
+    await expect.poll(() => command<number>(profile.app, 'receiptEvidenceCount')).toBe(0)
+    await expect(profile.page.getByText('新会话', { exact: true })).toHaveCount(0)
+
+    await expect(fixture.retryPurgedMutationWithChangedContent('alice')).resolves.toMatchObject({
+      status: 'rejected', errorCode: 'INVALID_INPUT',
+    })
+    await expect.poll(() => fixture.snapshot('alice')).toMatchObject({
+      conversations: [],
+      compactedConversationEventCount: 2,
+      retainedConversationPayloadCount: 0,
+    })
+  })
+
   test('propagates a tombstone to Alice on the second profile', async () => {
     const first = await launchProfile(fixture)
     profiles.push(first)
