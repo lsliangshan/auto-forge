@@ -1944,8 +1944,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const inputType = attributes.get('type')?.toLowerCase()
     const autocomplete = attributes.get('autocomplete')?.toLowerCase()
     const style = attributes.get('style')?.toLowerCase() ?? ''
+    const ariaHidden = attributes.get('aria-hidden')?.toLowerCase() === 'true'
     const hidden = attributes.has('hidden')
-      || attributes.get('aria-hidden')?.toLowerCase() === 'true'
+      || ariaHidden
       || inputType === 'hidden'
       || /(?:display\s*:\s*none|visibility\s*:\s*hidden)/u.test(style)
     const readOnly = axReadOnly === true || attributes.has('readonly') || attributes.get('aria-readonly') === 'true'
@@ -1956,6 +1957,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       ...(inputType === undefined ? {} : { inputType }),
       ...(autocomplete === undefined ? {} : { autocomplete }),
       ...(hidden ? { hidden: true } : {}),
+      ...(ariaHidden ? { ariaHidden: true } : {}),
       ...(readOnly ? { readOnly: true } : {}),
       ...(contentEditable ? { contentEditable: true } : {}),
       ...(href === undefined ? {} : { href }),

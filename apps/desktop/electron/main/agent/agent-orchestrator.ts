@@ -2047,10 +2047,13 @@ export class AgentOrchestrator {
     }, context)
     if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
     if (active.browserPageEvidenceRevision !== revision || validated.kind !== 'valid') return undefined
+    const answer = this.browserPageAnswerFromSelection(active, selection, captured.data.capturedAt)
     active.browserVisualEvidenceMatchRevision = revision
     active.browserVisualEvidenceSelection = selection
-    active.browserVisualEvidenceCapturedAt = captured.data.capturedAt
-    return this.browserPageAnswerFromSelection(active, selection, captured.data.capturedAt)
+    active.browserVisualEvidenceCapturedAt = answer === undefined
+      ? undefined
+      : captured.data.capturedAt
+    return answer
   }
 
   private async matchedBrowserEvidenceAnswer(active: ActiveAgentRun): Promise<string | undefined> {

@@ -22,6 +22,7 @@ export interface BrowserInspectionDomSummary {
   readonly inputType?: string
   readonly autocomplete?: string
   readonly hidden?: boolean
+  readonly ariaHidden?: boolean
   readonly readOnly?: boolean
   readonly contentEditable?: boolean
   readonly href?: string
@@ -898,7 +899,7 @@ export class BrowserPageInspector {
     }
     const protectedBoxes: BrowserInspectionNodeBox[] = []
     for (const node of mainFrameNodes.filter((candidate) => (
-      !candidate.dom.hidden && imageRestrictedNode(candidate)
+      (!candidate.dom.hidden || candidate.dom.ariaHidden === true) && imageRestrictedNode(candidate)
     ))) {
       const box = await getBox(node.backendNodeId)
       if (!validVisualBox(box)) throw failure('UNSUPPORTED_CONTROL')

@@ -5310,17 +5310,24 @@ describe('AgentOrchestrator', () => {
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
     ]])
     dependencies.workflows.list = async () => []
+    const requestId = `visual_cache_${captureError}`
+    let cachedActive: object | undefined
     const browser = attachBrowserContinuation(dependencies, {
       execute: async () => ({ kind: 'success', data: { trust: 'untrusted_page_data', snapshot } }),
       captureVisualEvidence: async () => captureError
         ? { kind: 'tool_error', code: 'INTERNAL_ERROR' }
         : { kind: 'success', data: visualBundleFor([snapshot], ['visual_value']) },
+      validateVisualEvidence: async () => {
+        cachedActive = (Reflect.get(orchestrator, 'activeByRequest') as Map<string, object>).get(requestId)
+        return { kind: 'valid' }
+      },
     })
+    const orchestrator = new AgentOrchestrator(dependencies)
 
-    await expect(new AgentOrchestrator(dependencies).run({
+    await expect(orchestrator.run({
       ...textRunInput({
         conversationId: 'browser_conversation', content: '读取页面值',
-        provider: 'openrouter', model: 'model', requestId: `visual_cache_${captureError}`,
+        provider: 'openrouter', model: 'model', requestId,
       }),
       supportsImageInput: true,
     })).resolves.toMatchObject({ status: 'completed' })
@@ -5332,6 +5339,12 @@ describe('AgentOrchestrator', () => {
     ))).toHaveLength(captureError ? 0 : 1)
     expect(dependencies.providerInstances.openrouter.stream)
       .toHaveBeenCalledTimes(captureError ? 3 : 4)
+    if (!captureError) {
+      if (!cachedActive) throw new Error('expected cached active visual evidence state')
+      expect(Reflect.get(cachedActive, 'browserVisualEvidenceCapturedAt')).toBeUndefined()
+      expect(Reflect.get(cachedActive, 'browserVisualEvidenceMatchRevision'))
+        .toBe(Reflect.get(cachedActive, 'browserPageEvidenceRevision'))
+    }
   })
 
   it.each([

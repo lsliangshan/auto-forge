@@ -396,6 +396,11 @@ describe('ElectronBrowserWorkspace', () => {
             value: { type: 'string', value: 'hidden-token' },
           },
           {
+            nodeId: 'ax_aria_hidden', parentId: 'ax_main', backendDOMNodeId: 13, frameId: 'frame_main', ignored: false,
+            role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '账户口令' },
+            value: { type: 'string', value: 'aria-hidden-secret' },
+          },
+          {
             nodeId: 'ax_other', backendDOMNodeId: 99, frameId: 'frame_other', ignored: false,
             role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '其他 frame' },
           },
@@ -421,6 +426,9 @@ describe('ElectronBrowserWorkspace', () => {
         }
         if (input?.backendNodeId === 12) {
           return { node: { backendNodeId: 12, nodeName: 'INPUT', attributes: ['type', 'hidden', 'value', 'hidden-token'] } }
+        }
+        if (input?.backendNodeId === 13) {
+          return { node: { backendNodeId: 13, nodeName: 'INPUT', attributes: ['type', 'password', 'aria-hidden', 'true', 'value', 'aria-hidden-secret'] } }
         }
         if (input?.backendNodeId === 99) {
           return { node: { backendNodeId: 99, nodeName: 'INPUT', attributes: ['type', 'password'] } }
@@ -466,15 +474,17 @@ describe('ElectronBrowserWorkspace', () => {
       expect.objectContaining({ backendNodeId: 10, role: 'main', name: '办事详情', dom: { tagName: 'main' } }),
       expect.objectContaining({ backendNodeId: 11, role: 'textbox', name: '有效期至', value: '2028-06-30', dom: { tagName: 'input', inputType: 'date', readOnly: true } }),
       expect.objectContaining({ backendNodeId: 12, dom: { tagName: 'input', inputType: 'hidden', hidden: true } }),
+      expect.objectContaining({ backendNodeId: 13, dom: { tagName: 'input', inputType: 'password', hidden: true, ariaHidden: true } }),
       expect.objectContaining({
         backendNodeId: 99, frameId: 'frame_other', role: 'textbox', name: '其他 frame',
         dom: { tagName: 'input', inputType: 'password' },
       }),
     ])
     expect(JSON.stringify(result)).not.toContain('hidden-token')
+    expect(JSON.stringify(result)).not.toContain('aria-hidden-secret')
     expect(result.locatorMatches).toEqual([
       { locator: 'role=main', backendNodeIds: [10] },
-      { locator: 'role=textbox', backendNodeIds: [11, 12] },
+      { locator: 'role=textbox', backendNodeIds: [11, 12, 13] },
       { locator: 'css=main', backendNodeIds: [10] },
       { locator: 'css=form#login', backendNodeIds: [] },
     ])

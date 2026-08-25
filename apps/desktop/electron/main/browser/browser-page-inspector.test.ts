@@ -399,6 +399,31 @@ describe('BrowserPageInspector', () => {
     expect(port.capturePageScreenshot).not.toHaveBeenCalled()
   })
 
+  it('visual evidence rejects an aria-hidden password intersecting a tile before capture', async () => {
+    const { authority, inspector, port, snapshot } = await visualFixture([
+      node(10, 'main', '办理信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'statictext', '已通过'),
+      node(12, 'textbox', '账户口令', {
+        dom: {
+          tagName: 'input', inputType: 'password', hidden: true, ariaHidden: true,
+        } as BrowserInspectionNode['dom'],
+      }),
+    ])
+    port.getNodeBox.mockImplementation(async ({ backendNodeId }) => {
+      if (backendNodeId === 11 || backendNodeId === 10) {
+        return { x: 0, y: 0, width: 1_000, height: 500, viewportWidth: 1_200, viewportHeight: 800 }
+      }
+      return { x: 100, y: 100, width: 200, height: 40, viewportWidth: 1_200, viewportHeight: 800 }
+    })
+
+    expect(snapshot.nodes.find((candidate) => candidate.name === '账户口令')).toBeUndefined()
+    await expect(inspector.captureVisualEvidence({
+      lease: authority.lease,
+      tabId: 'tab_1', navigationEpoch: 4, origin, pages: [snapshot],
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTROL' })
+    expect(port.capturePageScreenshot).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['secret token', node(12, 'statictext', '系统状态', { value: 'access_token=visible-secret' })],
     ['Chinese identity', node(12, 'statictext', '身份证号 110101199001010000')],
