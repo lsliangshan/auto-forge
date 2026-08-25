@@ -303,6 +303,39 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
       updated_at INTEGER NOT NULL
     ) STRICT;
 
+    CREATE TABLE IF NOT EXISTS cloud_sync_states (
+      knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL CHECK (mode IN ('local_only', 'syncing', 'synced', 'paused', 'converting', 'failed')),
+      published_generation_id TEXT,
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS cloud_sync_mutations (
+      id TEXT PRIMARY KEY,
+      knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('knowledge_base', 'document', 'metadata')),
+      entity_id TEXT NOT NULL,
+      operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+      base_revision TEXT,
+      payload_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'retry', 'completed', 'conflict', 'failed', 'cancelled')),
+      attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt BETWEEN 0 AND 3),
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      error_code TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS cloud_sync_mutations_ready
+      ON cloud_sync_mutations(knowledge_base_id, state, created_at);
+
+    CREATE TABLE IF NOT EXISTS cloud_sync_orphans (
+      storage_reference TEXT PRIMARY KEY,
+      knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+      request_id TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL
+    ) STRICT;
+
     CREATE TABLE IF NOT EXISTS conflicts (
       id TEXT PRIMARY KEY,
       knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,

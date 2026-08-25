@@ -1,0 +1,129 @@
+import { describe, expect, it, vi } from 'vitest'
+import { CloudBaseKnowledgeClient } from './cloudbase-knowledge-client.js'
+
+describe('CloudBaseKnowledgeClient', () => {
+  it('uses only the authenticated CloudBase function boundary and omits caller identity', async () => {
+    const callFunction = vi.fn().mockResolvedValue({
+      result: {
+        ok: true,
+        data: {
+          mutationId: 'mutation_1',
+          status: 'applied',
+          sequence: 7,
+          revision: 'revision_2',
+        },
+      },
+    })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.pushMutation({
+      mutationId: 'mutation_1',
+      knowledgeBaseId: 'kb_1',
+      entityKind: 'document',
+      entityId: 'document_1',
+      operation: 'upsert',
+      baseRevision: 'revision_1',
+      payload: { versionId: 'version_2' },
+    })).resolves.toEqual({
+      mutationId: 'mutation_1', status: 'applied', sequence: 7, revision: 'revision_2',
+    })
+    expect(callFunction).toHaveBeenCalledWith({
+      name: 'autoforge-knowledge',
+      data: {
+        action: 'pushMutation',
+        mutationId: 'mutation_1',
+        knowledgeBaseId: 'kb_1',
+        entityKind: 'document',
+        entityId: 'document_1',
+        operation: 'upsert',
+        baseRevision: 'revision_1',
+        payload: { versionId: 'version_2' },
+      },
+    })
+    expect(JSON.stringify(callFunction.mock.calls)).not.toMatch(/userId|service.?role|serviceKey|cos/i)
+  })
+
+  it('rejects malformed cloud envelopes and exposes only stable retry classifications', async () => {
+    const malformed = new CloudBaseKnowledgeClient({
+      callFunction: vi.fn().mockResolvedValue({ result: { ok: true, data: { sequence: 'seven' } } }),
+    })
+    await expect(malformed.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 0 }))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR', retryable: false })
+
+    const transient = new CloudBaseKnowledgeClient({
+      callFunction: vi.fn().mockResolvedValue({
+        result: { ok: false, error: { code: 'TRANSIENT_FAILURE' } },
+      }),
+    })
+    await expect(transient.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 0 }))
+      .rejects.toMatchObject({ code: 'TRANSIENT_FAILURE', retryable: true })
+
+    const transport = new CloudBaseKnowledgeClient({
+      callFunction: vi.fn().mockRejectedValue(new Error('token and URL details')),
+    })
+    await expect(transport.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 0 }))
+      .rejects.toMatchObject({ code: 'TRANSIENT_FAILURE', retryable: true })
+
+    const regressed = new CloudBaseKnowledgeClient({
+      callFunction: vi.fn().mockResolvedValue({ result: { ok: true, data: {
+        kind: 'incremental', nextSequence: 4, changes: [],
+      } } }),
+    })
+    await expect(regressed.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 5 }))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR', retryable: false })
+  })
+
+  it('keeps the previously published generation when publication fails', async () => {
+    const callFunction = vi.fn().mockResolvedValue({
+      result: { ok: false, error: { code: 'GENERATION_NOT_READY' } },
+    })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.publishGeneration({
+      requestId: 'publish_1',
+      knowledgeBaseId: 'kb_1',
+      generationId: 'generation_staging',
+      expectedPublishedGenerationId: 'generation_ready',
+    })).rejects.toMatchObject({ code: 'GENERATION_NOT_READY', retryable: false })
+  })
+
+  it('validates mediated upload authorization and entitlement responses', async () => {
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        uploadTicket: 'ticket_1', storageReference: 'storage/object_1', objectId: 'object_1',
+        jobId: 'job_1', expiresAt: '2026-08-26T12:15:00.000Z',
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        killSwitchEnabled: false, version: 3, validUntil: '2026-09-26T00:00:00.000Z',
+      } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+    await expect(client.authorizeUpload({
+      requestId: 'upload_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+      versionId: 'version_1', byteSize: 42, sha256: 'a'.repeat(64),
+    })).resolves.toMatchObject({ uploadTicket: 'ticket_1', storageReference: 'storage/object_1' })
+    await expect(client.getEntitlement()).resolves.toMatchObject({
+      tier: 'member', cloudEnabled: true, killSwitchEnabled: false,
+    })
+    expect(JSON.stringify(callFunction.mock.calls)).not.toMatch(/serviceKey|service.?role|cos/i)
+  })
+
+  it('stages a new cloud generation before any publication', async () => {
+    const callFunction = vi.fn().mockResolvedValue({ result: { ok: true, data: {
+      knowledgeBaseId: 'kb_1', generationId: 'generation_1', status: 'staging',
+    } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+    await expect(client.beginSync({
+      requestId: 'begin_1', knowledgeBaseId: 'kb_1', name: 'Personal',
+      revision: 'local_1', generationId: 'generation_1',
+    })).resolves.toEqual({
+      knowledgeBaseId: 'kb_1', generationId: 'generation_1', status: 'staging',
+    })
+    expect(callFunction).toHaveBeenCalledWith({
+      name: 'autoforge-knowledge', data: {
+        action: 'beginSync', requestId: 'begin_1', knowledgeBaseId: 'kb_1', name: 'Personal',
+        revision: 'local_1', generationId: 'generation_1',
+      },
+    })
+  })
+})

@@ -1,0 +1,54 @@
+BEGIN;
+
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_orphans(varchar, varchar, varchar, jsonb) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_job(varchar, varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_delete_base(varchar, varchar, varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_publish_generation(varchar, varchar, varchar, varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM service_role;
+
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_claim_job(varchar, varchar, integer);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_entitlement(varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_orphans(varchar, varchar, varchar, jsonb);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_cancel_job(varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_delete_base(varchar, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_publish_generation(varchar, varchar, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_full_resync(varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_require_cloud(bigint);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_caller(varchar);
+DROP TRIGGER IF EXISTS knowledge_changes_immutable ON public.knowledge_changes;
+DROP TRIGGER IF EXISTS knowledge_generations_lifecycle ON public.knowledge_index_generations;
+DROP TRIGGER IF EXISTS knowledge_versions_lifecycle ON public.knowledge_versions;
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_reject_mutation();
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_generation_lifecycle();
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_version_lifecycle();
+
+DROP TABLE IF EXISTS public.knowledge_requests;
+DROP TABLE IF EXISTS public.knowledge_entitlements;
+DROP TABLE IF EXISTS public.knowledge_conflicts;
+DROP TABLE IF EXISTS public.knowledge_tombstones;
+DROP TABLE IF EXISTS public.knowledge_changes;
+DROP TABLE IF EXISTS public.knowledge_entity_heads;
+DROP TABLE IF EXISTS public.knowledge_jobs;
+DROP TABLE IF EXISTS public.knowledge_index_generations;
+DROP TABLE IF EXISTS public.knowledge_chunks;
+DROP TABLE IF EXISTS public.knowledge_blocks;
+DROP TABLE IF EXISTS public.knowledge_parser_runs;
+DROP TABLE IF EXISTS public.knowledge_versions;
+DROP TABLE IF EXISTS public.knowledge_documents;
+DROP TABLE IF EXISTS public.knowledge_objects;
+DROP TABLE IF EXISTS public.knowledge_bases;
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_request_user_id();
+
+COMMIT;
