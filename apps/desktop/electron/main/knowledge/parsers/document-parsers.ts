@@ -31,43 +31,51 @@ function enforce(document: ParsedDocument, limits: ParserLimits): ParsedDocument
 
 const DROPPED_MARKDOWN_HTML = new Set(['script', 'style', 'noscript', 'template', 'iframe', 'object', 'embed', 'svg', 'math'])
 
-interface MarkdownHtmlState {
+export interface MarkdownHtmlState {
   readonly depths: Map<string, number>
   pendingTag: string
 }
 
-function consumeMarkdownHtml(value: string, state: MarkdownHtmlState): void {
+export function consumeMarkdownHtml(value: string, state: MarkdownHtmlState): void {
   const source = state.pendingTag + value
   state.pendingTag = ''
-  for (let start = source.indexOf('<'); start >= 0; start = source.indexOf('<', start + 1)) {
+  let start = source.indexOf('<')
+  while (start >= 0) {
     let quote = ''
     let end = start + 1
+    let resynchronized = false
     for (; end < source.length; end += 1) {
       const character = source[end]!
       if (quote) {
         if (character === quote) quote = ''
       } else if (character === '"' || character === "'") {
         quote = character
+      } else if (character === '<') {
+        start = end
+        resynchronized = true
+        break
       } else if (character === '>') {
         break
       }
     }
+    if (resynchronized) continue
     if (end >= source.length) {
       state.pendingTag = source.slice(start)
       return
     }
     const boundary = source.slice(start + 1, end).trim()
-    start = end
     const closing = boundary.startsWith('/')
     const match = boundary.match(/^\/?\s*([a-z0-9-]+)\b/i)
     const tag = match?.[1]?.toLowerCase()
-    if (!tag || !DROPPED_MARKDOWN_HTML.has(tag)) continue
-    if (closing) state.depths.set(tag, Math.max(0, (state.depths.get(tag) ?? 0) - 1))
-    else if (!boundary.endsWith('/')) state.depths.set(tag, (state.depths.get(tag) ?? 0) + 1)
+    if (tag && DROPPED_MARKDOWN_HTML.has(tag)) {
+      if (closing) state.depths.set(tag, Math.max(0, (state.depths.get(tag) ?? 0) - 1))
+      else if (!boundary.endsWith('/')) state.depths.set(tag, (state.depths.get(tag) ?? 0) + 1)
+    }
+    start = source.indexOf('<', end + 1)
   }
 }
 
-function markdownHtmlActive(state: MarkdownHtmlState): boolean {
+export function markdownHtmlActive(state: MarkdownHtmlState): boolean {
   return [...state.depths.values()].some(depth => depth > 0)
 }
 

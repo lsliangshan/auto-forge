@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot, unwrapSnapshotFileKey } from './encrypted-object-store.js'
 import { DEFAULT_PARSER_LIMITS, type ParserFormat, type ParserLimits, type ParserRequest } from './parser-protocol.js'
 import { parseEncryptedDocument } from './parser-worker.js'
+import { consumeMarkdownHtml, markdownHtmlActive } from './parsers/document-parsers.js'
 
 const directories: string[] = []
 const require = createRequire(import.meta.url)
@@ -206,6 +207,23 @@ describe('sandbox parser core', () => {
     )))
     expect(split).toMatchObject({ type: 'result', text: 'Before\nafter' })
     expect(JSON.stringify(split)).not.toContain('evil')
+  })
+
+  it('resynchronizes an incomplete safe Markdown tag at a dangerous opener', async () => {
+    const result = await parseEncryptedDocument(await encryptedRequest('markdown', new TextEncoder().encode(
+      '<div\n\nBefore <script>evil()</script> after',
+    )))
+    expect(result).toMatchObject({ type: 'result', text: 'Before after' })
+    expect(JSON.stringify(result)).not.toContain('evil')
+  })
+
+  it('keeps a truly split dangerous Markdown tag suppressed', () => {
+    const state = { depths: new Map<string, number>(), pendingTag: '' }
+    consumeMarkdownHtml('<scr', state)
+    consumeMarkdownHtml('ipt>', state)
+    expect(markdownHtmlActive(state) ? '' : 'evil()').toBe('')
+    consumeMarkdownHtml('</script>', state)
+    expect(markdownHtmlActive(state)).toBe(false)
   })
 
   it('parses a DOCX paragraph without exposing images or external files', async () => {
