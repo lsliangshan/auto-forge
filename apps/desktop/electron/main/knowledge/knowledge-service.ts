@@ -1,6 +1,7 @@
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { unlink } from 'node:fs/promises'
 import type Database from 'better-sqlite3-multiple-ciphers'
 import {
   toSafeAppError,
@@ -17,11 +18,12 @@ import type { SafeStoragePort } from '../security/secret-store.js'
 import {
   createEncryptedObjectSnapshot,
   hashStableKnowledgeSource,
+  unwrapSnapshotFileKey,
   type EncryptedObjectSnapshot,
 } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeExportService } from './export-service.js'
-import { KnowledgeKeyStore } from './key-store.js'
+import { KnowledgeKeyStore, removeFileDurably } from './key-store.js'
 import { LocalKnowledgeRetriever, type LocalKnowledgeSearchOutcome } from './local-retriever.js'
 import type { KnowledgeOwner, KnowledgePersistence } from './knowledge-types.js'
 import type { ParserFormat } from './parser-protocol.js'
@@ -66,6 +68,7 @@ export interface KnowledgeServiceOptions {
   readonly vacuumKnowledgeDatabase?: (database: Database.Database) => void
   readonly rotateKnowledgeDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
   readonly openKnowledgeDatabase?: typeof openUserKnowledgeDatabase
+  readonly createObjectSnapshot?: typeof createEncryptedObjectSnapshot
 }
 
 interface DocumentRow {
@@ -146,6 +149,42 @@ async function initializeObjectKey(
     }
   } finally {
     key.fill(0)
+  }
+}
+
+async function probeKnowledgeParser(parser: KnowledgeParserPort): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-probe-'))
+  const sourcePath = join(directory, 'probe.txt')
+  const objectPath = join(directory, 'probe.afobj')
+  const objectKey = randomBytes(32)
+  let wrappedFileKey: Buffer | undefined
+  let fileKey: Buffer | undefined
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 5_000)
+  timeout.unref()
+  try {
+    await writeFile(sourcePath, 'knowledge parser probe', { mode: 0o600 })
+    const snapshot = await createEncryptedObjectSnapshot({ sourcePath, objectPath, userKey: objectKey })
+    wrappedFileKey = snapshot.wrappedFileKey
+    fileKey = unwrapSnapshotFileKey(wrappedFileKey, objectKey)
+    const jobId = randomUUID()
+    const response = await parser.parse({
+      jobId,
+      format: 'txt',
+      objectPath,
+      fileKey,
+      signal: controller.signal,
+      timeoutMs: 5_000,
+    })
+    if (response.type !== 'result' || response.jobId !== jobId) {
+      throw new Error('Knowledge parser probe failed')
+    }
+  } finally {
+    clearTimeout(timeout)
+    fileKey?.fill(0)
+    wrappedFileKey?.fill(0)
+    objectKey.fill(0)
+    await rm(directory, { recursive: true, force: true })
   }
 }
 
@@ -281,11 +320,11 @@ export class KnowledgeService implements KnowledgePersistence {
 
   async recycleDocument(owner: KnowledgeOwner, documentId: string): Promise<void> {
     const session = await this.ensureSession(owner)
-    const cancelled = await this.mutate(session, () => {
+    await this.mutate(session, () => {
       const document = this.requireDocument(session, documentId)
       const now = this.now()
-      return session.opened.database.transaction(() => {
-        const jobs = this.imports.cancelJobs(session, 'document', documentId, now)
+      session.opened.database.transaction(() => {
+        this.imports.cancelJobs(session, 'document', documentId, now)
         session.opened.database.prepare(
           "UPDATE documents SET status = 'recycled', updated_at = ? WHERE id = ?",
         ).run(now, documentId)
@@ -293,10 +332,9 @@ export class KnowledgeService implements KnowledgePersistence {
           INSERT INTO tombstones (id, knowledge_base_id, entity_kind, entity_id, sequence, deleted_at, expires_at)
           VALUES (?, ?, 'document', ?, 0, ?, ?)
         `).run(this.id(), document.knowledgeBaseId, documentId, now, now + RECYCLE_PERIOD_MS)
-        return jobs
       })()
     })
-    await this.imports.abortAndDrain(cancelled)
+    await this.imports.abortAndDrainScope(session, 'document', documentId)
   }
 
   async purgeDocument(owner: KnowledgeOwner, documentId: string): Promise<void> {
@@ -306,11 +344,11 @@ export class KnowledgeService implements KnowledgePersistence {
 
   async recycleBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void> {
     const session = await this.ensureSession(owner)
-    const cancelled = await this.mutate(session, () => {
+    await this.mutate(session, () => {
       this.requireBase(session, knowledgeBaseId)
       const now = this.now()
-      return session.opened.database.transaction(() => {
-        const jobs = this.imports.cancelJobs(session, 'knowledge_base', knowledgeBaseId, now)
+      session.opened.database.transaction(() => {
+        this.imports.cancelJobs(session, 'knowledge_base', knowledgeBaseId, now)
         session.opened.database.prepare(
           "UPDATE knowledge_bases SET status = 'recycled', updated_at = ? WHERE id = ?",
         ).run(now, knowledgeBaseId)
@@ -324,10 +362,9 @@ export class KnowledgeService implements KnowledgePersistence {
           INSERT INTO tombstones (id, knowledge_base_id, entity_kind, entity_id, sequence, deleted_at, expires_at)
           VALUES (?, ?, 'knowledge_base', ?, 0, ?, ?)
         `).run(this.id(), knowledgeBaseId, knowledgeBaseId, now, now + RECYCLE_PERIOD_MS)
-        return jobs
       })()
     })
-    await this.imports.abortAndDrain(cancelled)
+    await this.imports.abortAndDrainScope(session, 'knowledge_base', knowledgeBaseId)
   }
 
   async purgeBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void> {
@@ -426,6 +463,7 @@ export class KnowledgeService implements KnowledgePersistence {
         )
         stage = 'parser'
         parser = await this.options.createParser()
+        await probeKnowledgeParser(parser)
       } catch (error) {
         if (stage === 'parser') reasons.push('native_dependency_unavailable')
         else if (String((error as Error).message).toLowerCase().match(/fts|trigram/)) reasons.push('fts_unavailable')
@@ -517,7 +555,7 @@ export class KnowledgeService implements KnowledgePersistence {
       )
       await initializeObjectKey(opened.database, objectKeyStore)
       parser = await this.options.createParser()
-      const session = {
+      const session: OpenKnowledgeSession = {
         owner: { userId: owner.userId },
         opened,
         parser,
@@ -525,6 +563,7 @@ export class KnowledgeService implements KnowledgePersistence {
         objectsDirectory: join(directory, 'objects'),
         mutationTail: Promise.resolve(),
       }
+      await this.purgeService(session).resumeAll()
       await this.imports.reconcile(session)
       this.session = session
       return session
@@ -624,94 +663,102 @@ export class KnowledgeService implements KnowledgePersistence {
     const authorityToken = this.id()
     const now = this.now()
     let sourceObjectStored = false
-    let snapshotCreated = false
     let versionNumber = 1
     let generation = 1
     let priorJobId: string | undefined
-    await this.mutate(session, () => session.opened.database.transaction(() => {
-      this.requireBase(session, target.knowledgeBaseId, true)
-      if (!target.documentId && !hasMemberAccess(entitlement)) {
-        const count = session.opened.database.prepare(`
-          SELECT count(*) AS count FROM documents
-          JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
-          WHERE documents.status <> 'recycled' AND knowledge_bases.status <> 'recycled'
-        `).get() as { count: number }
-        if (count.count >= 1) failure('CONFLICT')
-      }
-      if (target.documentId) {
-        const current = this.requireDocument(session, target.documentId, true)
-        if (current.knowledgeBaseId !== target.knowledgeBaseId) failure('NOT_FOUND')
-        versionNumber = (session.opened.database.prepare(`
-          SELECT coalesce(max(version_number), 0) + 1 AS number
-          FROM document_versions WHERE document_id = ?
-        `).get(documentId) as { number: number }).number
-      } else {
+    let finishSnapshotTask: (() => void) | undefined
+    try {
+      await this.mutate(session, () => session.opened.database.transaction(() => {
+        this.requireBase(session, target.knowledgeBaseId, true)
+        if (!target.documentId && !hasMemberAccess(entitlement)) {
+          const count = session.opened.database.prepare(`
+            SELECT count(*) AS count FROM documents
+            JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
+            WHERE documents.status <> 'recycled' AND knowledge_bases.status <> 'recycled'
+          `).get() as { count: number }
+          if (count.count >= 1) failure('CONFLICT')
+        }
+        if (target.documentId) {
+          const current = this.requireDocument(session, target.documentId, true)
+          if (current.knowledgeBaseId !== target.knowledgeBaseId) failure('NOT_FOUND')
+          versionNumber = (session.opened.database.prepare(`
+            SELECT coalesce(max(version_number), 0) + 1 AS number
+            FROM document_versions WHERE document_id = ?
+          `).get(documentId) as { number: number }).number
+        } else {
+          session.opened.database.prepare(`
+            INSERT INTO documents
+              (id, knowledge_base_id, name, mime_type, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+          `).run(documentId, target.knowledgeBaseId, source.name, source.mimeType, now, now)
+        }
+        const head = session.opened.database.prepare(`
+          SELECT generation, authoritative_job_id AS jobId
+          FROM document_import_heads WHERE document_id = ?
+        `).get(documentId) as { generation: number; jobId: string } | undefined
+        generation = (head?.generation ?? 0) + 1
+        priorJobId = head?.jobId
+        if (priorJobId) {
+          session.opened.database.prepare(`
+            UPDATE jobs SET status = 'cancelled', error_code = 'SUPERSEDED', updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'running')
+          `).run(now, priorJobId)
+          session.opened.database.prepare(`
+            UPDATE document_versions SET status = 'failed'
+            WHERE id = (SELECT version_id FROM local_import_jobs WHERE job_id = ?)
+              AND status = 'staging'
+          `).run(priorJobId)
+        }
         session.opened.database.prepare(`
-          INSERT INTO documents
-            (id, knowledge_base_id, name, mime_type, status, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'pending', ?, ?)
-        `).run(documentId, target.knowledgeBaseId, source.name, source.mimeType, now, now)
-      }
-      const head = session.opened.database.prepare(`
-        SELECT generation, authoritative_job_id AS jobId
-        FROM document_import_heads WHERE document_id = ?
-      `).get(documentId) as { generation: number; jobId: string } | undefined
-      generation = (head?.generation ?? 0) + 1
-      priorJobId = head?.jobId
-      if (priorJobId) {
+          INSERT INTO document_versions
+            (id, document_id, version_number, status, content_hash, source_object_id, created_at)
+          VALUES (?, ?, ?, 'staging', ?, ?, ?)
+        `).run(versionId, documentId, versionNumber, contentHash, objectId, now)
         session.opened.database.prepare(`
-          UPDATE jobs SET status = 'cancelled', error_code = 'SUPERSEDED', updated_at = ?
-          WHERE id = ? AND status IN ('pending', 'running')
-        `).run(now, priorJobId)
+          INSERT INTO jobs (id, kind, entity_id, status, created_at, updated_at)
+          VALUES (?, 'local_import', ?, 'pending', ?, ?)
+        `).run(jobId, versionId, now, now)
         session.opened.database.prepare(`
-          UPDATE document_versions SET status = 'failed'
-          WHERE id = (SELECT version_id FROM local_import_jobs WHERE job_id = ?)
-            AND status = 'staging'
-        `).run(priorJobId)
-      }
-      session.opened.database.prepare(`
-        INSERT INTO document_versions
-          (id, document_id, version_number, status, content_hash, source_object_id, created_at)
-        VALUES (?, ?, ?, 'staging', ?, ?, ?)
-      `).run(versionId, documentId, versionNumber, contentHash, objectId, now)
-      session.opened.database.prepare(`
-        INSERT INTO jobs (id, kind, entity_id, status, created_at, updated_at)
-        VALUES (?, 'local_import', ?, 'pending', ?, ?)
-      `).run(jobId, versionId, now, now)
-      session.opened.database.prepare(`
-        INSERT INTO local_import_jobs
-          (job_id, authority_token, knowledge_base_id, document_id, version_id, object_id,
-            generation, format, source_name, mime_type, created_at)
-        VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
-      `).run(
-        jobId, authorityToken, target.knowledgeBaseId, documentId, versionId,
-        generation, source.format, source.name, source.mimeType, now,
-      )
-      session.opened.database.prepare(`
-        INSERT INTO document_import_heads
-          (document_id, generation, authoritative_job_id, authority_token)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(document_id) DO UPDATE SET
-          generation = excluded.generation,
-          authoritative_job_id = excluded.authoritative_job_id,
-          authority_token = excluded.authority_token
-      `).run(documentId, generation, jobId, authorityToken)
-      session.opened.database.prepare(
-        "UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ?",
-      ).run(now, documentId)
-    })())
+          INSERT INTO local_import_jobs
+            (job_id, authority_token, knowledge_base_id, document_id, version_id, object_id,
+              generation, format, source_name, mime_type, created_at)
+          VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+        `).run(
+          jobId, authorityToken, target.knowledgeBaseId, documentId, versionId,
+          generation, source.format, source.name, source.mimeType, now,
+        )
+        session.opened.database.prepare(`
+          INSERT INTO document_import_heads
+            (document_id, generation, authoritative_job_id, authority_token)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(document_id) DO UPDATE SET
+            generation = excluded.generation,
+            authoritative_job_id = excluded.authoritative_job_id,
+            authority_token = excluded.authority_token
+        `).run(documentId, generation, jobId, authorityToken)
+        session.opened.database.prepare(
+          "UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ?",
+        ).run(now, documentId)
+        const snapshotTask = this.imports.beginSnapshot(session, {
+          jobId, documentId, knowledgeBaseId: target.knowledgeBaseId,
+        })
+        finishSnapshotTask = () => snapshotTask.complete()
+      })())
+    } catch (error) {
+      finishSnapshotTask?.()
+      throw error
+    }
     if (priorJobId) this.imports.abort(priorJobId)
 
     try {
       const objectMasterKey = await session.objectKeyStore.loadActiveKey()
       let snapshot: EncryptedObjectSnapshot
       try {
-        snapshot = await createEncryptedObjectSnapshot({
+        snapshot = await (this.options.createObjectSnapshot ?? createEncryptedObjectSnapshot)({
           sourcePath,
           objectPath,
           userKey: objectMasterKey,
         })
-        snapshotCreated = true
       } finally {
         objectMasterKey.fill(0)
       }
@@ -720,8 +767,24 @@ export class KnowledgeService implements KnowledgePersistence {
         const accepted = await this.mutate(session, () => session.opened.database.transaction(() => {
           const authoritative = session.opened.database.prepare(`
             SELECT 1 FROM document_import_heads
-            WHERE document_id = ? AND generation = ?
-              AND authoritative_job_id = ? AND authority_token = ?
+            JOIN jobs ON jobs.id = document_import_heads.authoritative_job_id
+            JOIN local_import_jobs ON local_import_jobs.job_id = jobs.id
+            JOIN documents ON documents.id = document_import_heads.document_id
+            JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
+            LEFT JOIN purge_operations AS document_purge
+              ON document_purge.entity_kind = 'document' AND document_purge.target_id = documents.id
+            LEFT JOIN purge_operations AS base_purge
+              ON base_purge.entity_kind = 'knowledge_base'
+              AND base_purge.target_id = knowledge_bases.id
+            WHERE document_import_heads.document_id = ?
+              AND document_import_heads.generation = ?
+              AND document_import_heads.authoritative_job_id = ?
+              AND document_import_heads.authority_token = ?
+              AND jobs.status = 'pending'
+              AND local_import_jobs.object_id IS NULL
+              AND documents.status <> 'recycled'
+              AND knowledge_bases.status = 'active'
+              AND document_purge.id IS NULL AND base_purge.id IS NULL
           `).get(documentId, generation, jobId, authorityToken)
           if (!authoritative) return false
           session.opened.database.prepare(`
@@ -733,9 +796,6 @@ export class KnowledgeService implements KnowledgePersistence {
             "UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ?",
           ).run(this.now(), documentId)
           session.opened.database.prepare(
-            "UPDATE jobs SET status = 'pending', updated_at = ? WHERE id = ?",
-          ).run(this.now(), jobId)
-          session.opened.database.prepare(
             'UPDATE local_import_jobs SET object_id = ? WHERE job_id = ?',
           ).run(objectId, jobId)
           return true
@@ -745,6 +805,8 @@ export class KnowledgeService implements KnowledgePersistence {
       } finally {
         snapshot.wrappedFileKey.fill(0)
       }
+      finishSnapshotTask?.()
+      finishSnapshotTask = undefined
       this.imports.schedule(session, {
         knowledgeBaseId: target.knowledgeBaseId,
         documentId,
@@ -777,11 +839,13 @@ export class KnowledgeService implements KnowledgePersistence {
       } catch {
         // Preserve the import failure; close/logout may already be tearing the database down.
       }
-      if (snapshotCreated && !sourceObjectStored) {
-        try { await unlink(objectPath) } catch { /* Preserve the import failure. */ }
+      if (!sourceObjectStored) {
+        try { await removeFileDurably(objectPath) } catch { /* Preserve the import failure. */ }
       }
       if (typeof error === 'object' && error !== null && 'code' in error) throw error
       failure('INTERNAL_ERROR')
+    } finally {
+      finishSnapshotTask?.()
     }
   }
 
@@ -806,7 +870,11 @@ export class KnowledgeService implements KnowledgePersistence {
     kind: 'document' | 'knowledge_base',
     id: string,
   ): Promise<void> {
-    await new KnowledgePurgeService({
+    await this.purgeService(session).purge(kind, id)
+  }
+
+  private purgeService(session: OpenKnowledgeSession): KnowledgePurgeService {
+    return new KnowledgePurgeService({
       opened: session.opened,
       objectsDirectory: session.objectsDirectory,
       now: () => this.now(),
@@ -819,11 +887,11 @@ export class KnowledgeService implements KnowledgePersistence {
       cancelImportJobs: (entityKind, targetId, now) => (
         this.imports.cancelJobs(session, entityKind, targetId, now)
       ),
-      abortAndDrain: jobIds => this.imports.abortAndDrain(jobIds),
+      abortAndDrain: (kind, id) => this.imports.abortAndDrainScope(session, kind, id),
       unlinkObject: this.options.unlinkKnowledgeObject,
       vacuumDatabase: this.options.vacuumKnowledgeDatabase,
       rotateDatabaseKey: this.options.rotateKnowledgeDatabaseKey,
-    }).purge(kind, id)
+    })
   }
 
   private track<T>(operation: Promise<T>): Promise<T> {

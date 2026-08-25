@@ -38,8 +38,12 @@ interface ActiveImport {
   readonly session: KnowledgeImportSession
   readonly documentId: string
   readonly knowledgeBaseId: string
-  readonly controller: AbortController
+  readonly controller?: AbortController
   readonly operation: Promise<void>
+}
+
+export interface KnowledgeSnapshotTask {
+  complete(): void
 }
 
 export async function serializeKnowledgeMutation<T>(
@@ -68,6 +72,32 @@ export class KnowledgeImportRuntime {
 
   constructor(private readonly options: KnowledgeImportRuntimeOptions) {}
 
+  beginSnapshot(
+    session: KnowledgeImportSession,
+    scope: Pick<ImportPublication, 'jobId' | 'documentId' | 'knowledgeBaseId'>,
+  ): KnowledgeSnapshotTask {
+    if (this.active.has(scope.jobId)) throw new Error('Knowledge import task is already active')
+    let resolve!: () => void
+    const operation = new Promise<void>(release => { resolve = release })
+    const active: ActiveImport = {
+      session,
+      documentId: scope.documentId,
+      knowledgeBaseId: scope.knowledgeBaseId,
+      operation,
+    }
+    this.active.set(scope.jobId, active)
+    this.options.track(operation)
+    let completed = false
+    return {
+      complete: () => {
+        if (completed) return
+        completed = true
+        if (this.active.get(scope.jobId) === active) this.active.delete(scope.jobId)
+        resolve()
+      },
+    }
+  }
+
   schedule(session: KnowledgeImportSession, publication: ImportPublication): void {
     if (this.options.isClosing() || this.active.has(publication.jobId)) return
     const controller = new AbortController()
@@ -90,24 +120,28 @@ export class KnowledgeImportRuntime {
   }
 
   abort(jobId: string): void {
-    this.active.get(jobId)?.controller.abort()
+    this.active.get(jobId)?.controller?.abort()
   }
 
   abortSession(session: KnowledgeImportSession): void {
     for (const active of this.active.values()) {
-      if (active.session === session) active.controller.abort()
+      if (active.session === session) active.controller?.abort()
     }
   }
 
-  async abortAndDrain(jobIds: readonly string[]): Promise<void> {
-    const operations: Promise<void>[] = []
-    for (const jobId of jobIds) {
-      const active = this.active.get(jobId)
-      if (!active) continue
-      active.controller.abort()
-      operations.push(active.operation)
+  async abortAndDrainScope(
+    session: KnowledgeImportSession,
+    kind: PurgeEntityKind,
+    id: string,
+  ): Promise<void> {
+    const activeTasks = [...this.active.values()].filter(active => (
+      active.session === session
+      && (kind === 'document' ? active.documentId === id : active.knowledgeBaseId === id)
+    ))
+    for (const active of activeTasks) {
+      active.controller?.abort()
     }
-    await Promise.allSettled(operations)
+    await Promise.allSettled(activeTasks.map(active => active.operation))
   }
 
   cancelJobs(
@@ -115,29 +149,30 @@ export class KnowledgeImportRuntime {
     kind: PurgeEntityKind,
     id: string,
     now: number,
-  ): string[] {
+  ): void {
     const predicate = kind === 'document'
       ? 'local_import_jobs.document_id = ?'
       : 'local_import_jobs.knowledge_base_id = ?'
-    const rows = session.opened.database.prepare(`
-      SELECT local_import_jobs.job_id AS jobId
-      FROM local_import_jobs JOIN jobs ON jobs.id = local_import_jobs.job_id
-      WHERE ${predicate} AND jobs.status IN ('pending', 'running')
-    `).all(id) as Array<{ jobId: string }>
-    if (rows.length === 0) return []
-    const jobIds = rows.map(row => row.jobId)
-    const placeholders = jobIds.map(() => '?').join(', ')
     session.opened.database.prepare(`
       UPDATE jobs SET status = 'cancelled', error_code = 'LIFECYCLE_CANCELLED', updated_at = ?
-      WHERE id IN (${placeholders}) AND status IN ('pending', 'running')
-    `).run(now, ...jobIds)
+      WHERE id IN (SELECT job_id FROM local_import_jobs WHERE ${predicate})
+        AND status IN ('pending', 'running')
+    `).run(now, id)
     session.opened.database.prepare(`
       UPDATE document_versions SET status = 'failed'
       WHERE status = 'staging' AND id IN (
-        SELECT version_id FROM local_import_jobs WHERE job_id IN (${placeholders})
+        SELECT version_id FROM local_import_jobs WHERE ${predicate}
       )
-    `).run(...jobIds)
-    return jobIds
+    `).run(id)
+    if (kind === 'document') {
+      session.opened.database.prepare('DELETE FROM document_import_heads WHERE document_id = ?').run(id)
+    } else {
+      session.opened.database.prepare(`
+        DELETE FROM document_import_heads WHERE document_id IN (
+          SELECT id FROM documents WHERE knowledge_base_id = ?
+        )
+      `).run(id)
+    }
   }
 
   async reconcile(session: KnowledgeImportSession): Promise<void> {

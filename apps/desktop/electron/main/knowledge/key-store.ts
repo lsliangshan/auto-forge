@@ -14,7 +14,7 @@ interface WrappedKeyRecord {
 const DATABASE_KEY_BYTES = 32
 
 export interface DurableFileHandlePort {
-  writeFile(value: string): Promise<void>
+  writeFile(value: string | Uint8Array): Promise<void>
   sync(): Promise<void>
   close(): Promise<void>
 }
@@ -67,7 +67,7 @@ async function syncDirectory(directory: string, fileSystem: DurableFileSystemPor
 
 export async function writeFileDurably(
   recordPath: string,
-  serialized: string,
+  contents: string | Uint8Array,
   fileSystem: DurableFileSystemPort = nodeFileSystem,
 ): Promise<void> {
   const directory = dirname(recordPath)
@@ -77,7 +77,7 @@ export async function writeFileDurably(
   try {
     const handle = await fileSystem.open(temporaryPath, 'wx', 0o600)
     try {
-      await handle.writeFile(serialized)
+      await handle.writeFile(contents)
       await handle.sync()
     } finally {
       await handle.close()
@@ -95,6 +95,19 @@ export async function writeFileDurably(
     }
     throw error
   }
+}
+
+export async function removeFileDurably(
+  path: string,
+  fileSystem: DurableFileSystemPort = nodeFileSystem,
+): Promise<void> {
+  try {
+    await fileSystem.unlink(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  await syncDirectory(dirname(path), fileSystem)
 }
 
 function parseRecord(serialized: string): WrappedKeyRecord {

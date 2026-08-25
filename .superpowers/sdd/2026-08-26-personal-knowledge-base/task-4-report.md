@@ -168,3 +168,139 @@ Tests  1 failed | 2861 passed (2862)
 ```
 
 The sole full-suite failure is the same unrelated pre-existing Application context-summary billing case at `application.test.ts:3865`: it receives `CONTEXT_LIMIT_EXCEEDED` instead of a completed stream. All Task 4 focused and integration boundaries are green.
+
+## Fix round 2: snapshot authority, scoped drains, and automatic recovery
+
+### Implementation and self-review
+
+- Snapshot creation is registered from the first durable job transaction. Recycle and purge now cancel the scoped jobs and delete their document authority heads before awaiting any filesystem or parser work. Snapshot acceptance joins the authority head, local job, parent job, active document/base, and purge journals; it can publish only the still-pending matching generation/token. Rejected or post-rename-failed snapshots durably remove the unmanaged object and never insert a source row.
+- The import runtime registry now tracks both snapshot and parser work by session, document, and knowledge-base scope, independently of current database status. Destructive lifecycle aborts and drains every task in scope, including a parser already marked `SUPERSEDED`; stale completion remains observable as failed and cannot publish.
+- Session open resumes all encrypted `purge_operations` before import reconciliation or session admission. Graph deletion captures parent job IDs before cascades erase `local_import_jobs`, deletes those parents in the same transaction, then resumes unlink, `VACUUM`, database-key rotation, and journal removal from the last monotonic durable state.
+- Encrypted snapshots reuse the Task 2 durable writer: restrictive temporary creation, complete write, file `fsync`, close, rename, then parent-directory `fsync`. Only the existing narrow unsupported-directory-sync errors are tolerated; other failures reject acknowledgement and remain safely cleanup-retryable.
+- Availability now runs one real encrypted tiny-TXT parser job with an explicit 5-second abort and parser timeout, validates the matching result, clears transient keys, and removes its temporary directory. It still creates no knowledge base and always terminates the parser and closes the encrypted database/key resources.
+
+### RED commands and captured output
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'revokes authority and drains snapshot creation'
+Test Files  1 failed (1)
+Tests  2 failed | 23 skipped (25)
+recycle: expected finishedBeforeSnapshot false; received true
+purge: expected local_import_jobs/jobs count 0; received 1
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'drains a superseded active parser'
+Test Files  1 failed (1)
+Tests  2 failed | 23 skipped (25)
+recycle: expected finishedBeforeSupersededParser false; received true
+purge: expected finishedBeforeSupersededParser false; received true
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'automatically resumes a durable purge'
+Test Files  1 failed (1)
+Tests  3 failed | 22 skipped (25)
+unlink, VACUUM, and rekey cases all retained the pre-purge wrapped database key because open did not resume the journal
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/encrypted-object-store.test.ts -t 'parent-directory sync'
+Test Files  1 failed (1)
+Tests  2 failed | 2 skipped (4)
+expected directory-sync boundary to be reached; received false because the snapshot writer neither injected nor performed it
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'post-rename snapshot sync failure'
+Test Files  1 failed (1)
+Tests  1 failed | 24 skipped (25)
+expected no managed .afobj after failed acknowledgement; one renamed object remained
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'enables local storage only|maps real encrypted-storage'
+Test Files  1 failed (1)
+Tests  2 failed | 23 skipped (25)
+expected parser parseCalls 1; received 0
+expected parser terminal failure to report unavailable; received local.available=true
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'enables local storage only'
+Test Files  1 failed (1)
+Tests  1 failed | 24 skipped (25)
+AssertionError: expected undefined to be 5000
+```
+
+### GREEN commands and output
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'revokes authority and drains snapshot creation|drains a superseded active parser|automatically resumes a durable purge'
+Test Files  1 passed (1)
+Tests  7 passed | 18 skipped (25)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/encrypted-object-store.test.ts electron/main/knowledge/key-store.test.ts
+Test Files  2 passed (2)
+Tests  7 passed (7)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'post-rename snapshot sync failure'
+Test Files  1 passed (1)
+Tests  1 passed | 24 skipped (25)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'enables local storage only|maps real encrypted-storage'
+Test Files  1 passed (1)
+Tests  2 passed | 23 skipped (25)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge electron/main/ipc/register-ipc.test.ts
+Test Files  9 passed (9)
+Tests  109 passed (109)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/application.test.ts -t 'owns path-free knowledge|holds knowledge owner derivation|reopens admission safely'
+Test Files  1 passed (1)
+Tests  3 passed | 147 skipped (150)
+```
+
+```text
+$ pnpm typecheck
+Scope: 4 of 5 workspace projects
+packages/shared typecheck: Done
+packages/workflow-sdk typecheck: Done
+packages/workflow-schema typecheck: Done
+apps/desktop typecheck: Done
+```
+
+```text
+$ pnpm exec eslint <all 7 changed round-two source/test files>
+(no output; exit 0)
+$ git diff --check
+(no output; exit 0)
+```
+
+```text
+$ pnpm build
+packages/shared build: Done
+packages/workflow-sdk build: Done
+packages/workflow-schema build: Done
+out/preload/parser.cjs  0.51 kB
+out/renderer/electron/main/knowledge/parser-worker.html  0.46 kB
+CJS Build success
+```
+
+```text
+$ pnpm test
+Test Files  1 failed | 103 passed (104)
+Tests  1 failed | 2868 passed (2869)
+```
+
+The sole repository-suite failure remains the same unrelated pre-existing Application context-summary billing case at `application.test.ts:3865`: it receives `CONTEXT_LIMIT_EXCEEDED` instead of the expected completed stream. All round-two knowledge, IPC, and auth-admission boundaries pass.

@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, rename } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { lstat, open } from 'node:fs/promises'
+import { writeFileDurably, type DurableFileSystemPort } from './key-store.js'
 
 const FILE_KEY_BYTES = 32
 const IV_BYTES = 12
@@ -95,6 +95,7 @@ export async function createEncryptedObjectSnapshot(input: {
   objectPath: string
   userKey: Buffer
   maxSourceBytes?: number
+  fileSystem?: DurableFileSystemPort
 }): Promise<EncryptedObjectSnapshot> {
   const plaintext = await readStableRegularFile(input.sourcePath, input.maxSourceBytes ?? MAX_KNOWLEDGE_OBJECT_BYTES)
   const fileKey = randomBytes(FILE_KEY_BYTES)
@@ -103,16 +104,7 @@ export async function createEncryptedObjectSnapshot(input: {
     const encrypted = seal(OBJECT_MAGIC, plaintext, fileKey)
     const wrappedFileKey = seal(WRAP_MAGIC, fileKey, wrapKey)
     const contentHash = createHash('sha256').update(plaintext).digest('hex')
-    await mkdir(dirname(input.objectPath), { recursive: true, mode: 0o700 })
-    const temporaryPath = `${input.objectPath}.${randomBytes(12).toString('hex')}.tmp`
-    const handle = await open(temporaryPath, 'wx', 0o600)
-    try {
-      await handle.writeFile(encrypted)
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    await rename(temporaryPath, input.objectPath)
+    await writeFileDurably(input.objectPath, encrypted, input.fileSystem)
     return { objectPath: input.objectPath, wrappedFileKey, encryptedBytes: encrypted.length, contentHash }
   } finally {
     plaintext.fill(0)

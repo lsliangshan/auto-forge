@@ -6,10 +6,10 @@ import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
-import { readEncryptedObjectSnapshot } from './encrypted-object-store.js'
+import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeKeyStore } from './key-store.js'
-import { KnowledgeService, type KnowledgeParserPort } from './knowledge-service.js'
+import { KnowledgeService, type KnowledgeParserPort, type KnowledgeServiceOptions } from './knowledge-service.js'
 import { DEFAULT_PARSER_LIMITS, type ParserResponse } from './parser-protocol.js'
 import { parseEncryptedDocument } from './parser-worker.js'
 
@@ -47,11 +47,13 @@ function safeStorage(): SafeStoragePort {
 class InProcessParser implements KnowledgeParserPort {
   terminated = false
   parseCalls = 0
+  lastTimeoutMs?: number
   handler?: (input: Parameters<KnowledgeParserPort['parse']>[0]) => Promise<ParserResponse>
   onTerminate?: () => void
 
   async parse(input: Parameters<KnowledgeParserPort['parse']>[0]): Promise<ParserResponse> {
     this.parseCalls += 1
+    this.lastTimeoutMs = input.timeoutMs
     if (this.handler) return this.handler(input)
     const encrypted = await readEncryptedObjectSnapshot(input.objectPath)
     const fileKey = Buffer.from(input.fileKey)
@@ -79,6 +81,7 @@ async function fixture(options: {
   unlinkKnowledgeObject?: (path: string) => Promise<void>
   vacuumKnowledgeDatabase?: (database: OpenedUserKnowledgeDatabase['database']) => void
   rotateKnowledgeDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
+  createObjectSnapshot?: typeof createEncryptedObjectSnapshot
 } = {}) {
   const rootDirectory = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-service-'))
   directories.push(rootDirectory)
@@ -86,7 +89,8 @@ async function fixture(options: {
   const parsers: InProcessParser[] = []
   const picks: string[] = []
   const exports: string[] = []
-  const createService = () => new KnowledgeService({
+  const createService = () => {
+    const serviceOptions: KnowledgeServiceOptions = {
       rootDirectory,
       safeStorage: storage,
       createParser: async () => {
@@ -109,7 +113,10 @@ async function fixture(options: {
       unlinkKnowledgeObject: options.unlinkKnowledgeObject,
       vacuumKnowledgeDatabase: options.vacuumKnowledgeDatabase,
       rotateKnowledgeDatabaseKey: options.rotateKnowledgeDatabaseKey,
-    })
+      createObjectSnapshot: options.createObjectSnapshot,
+    }
+    return new KnowledgeService(serviceOptions)
+  }
   const service = createService()
   return { rootDirectory, storage, service, createService, parsers, picks, exports }
 }
@@ -171,11 +178,14 @@ afterEach(async () => {
 describe('KnowledgeService lifecycle', () => {
   it('enables local storage only on the verified darwin arm64 runtime gate', async () => {
     const app = await fixture()
-    await expect(app.service.getFeatureAvailability({ userId: 'alice' })).resolves.toEqual({
+    const availability = await app.service.getFeatureAvailability({ userId: 'alice' })
+    expect(availability).toEqual({
       local: { available: true, reasons: [] },
       cloud: { available: false, reasons: ['kill_switch_enabled'] },
     })
     expect(app.parsers).toHaveLength(1)
+    expect(app.parsers[0]?.parseCalls).toBe(1)
+    expect(app.parsers[0]?.lastTimeoutMs).toBe(5_000)
     expect(app.parsers[0]?.terminated).toBe(true)
     const probed = await openUserKnowledgeDatabase({
       rootDirectory: app.rootDirectory, userId: 'alice', safeStorage: app.storage,
@@ -219,6 +229,18 @@ describe('KnowledgeService lifecycle', () => {
     await expect(parserUnavailable.getFeatureAvailability({ userId: 'alice' })).resolves.toMatchObject({
       local: { available: false, reasons: ['native_dependency_unavailable'] },
     })
+    const parserJobFailure = new InProcessParser()
+    parserJobFailure.handler = async input => ({
+      version: 1, type: 'error', jobId: input.jobId, code: 'PARSER_INTERNAL_ERROR',
+    })
+    const parserCannotParse = new KnowledgeService({
+      ...common,
+      createParser: async () => parserJobFailure,
+    })
+    await expect(parserCannotParse.getFeatureAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      local: { available: false, reasons: ['native_dependency_unavailable'] },
+    })
+    expect(parserJobFailure.terminated).toBe(true)
     const ftsUnavailable = new KnowledgeService({
       ...common,
       createParser: async () => new InProcessParser(),
@@ -377,6 +399,131 @@ describe('KnowledgeService lifecycle', () => {
     await app.service.close()
   })
 
+  it('revokes authority and drains snapshot creation before recycling without accepting its object', async () => {
+    const snapshotStarted = deferred<void>()
+    const releaseSnapshot = deferred<void>()
+    const app = await fixture({
+      createObjectSnapshot: async input => {
+        snapshotStarted.resolve()
+        await releaseSnapshot.promise
+        return createEncryptedObjectSnapshot(input)
+      },
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'snapshot-recycle.txt', '快照期间回收'))
+    const importing = app.service.importDocument(owner, base!.id)
+    await snapshotStarted.promise
+    const [pending] = await app.service.listDocuments(owner, base!.id)
+
+    let lifecycleFinished = false
+    const recycling = app.service.recycleDocument(owner, pending!.id).then(() => { lifecycleFinished = true })
+    await new Promise(resolve => setImmediate(resolve))
+    const finishedBeforeSnapshot = lifecycleFinished
+    const during = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    const authorityDuringDrain = during.database.prepare(
+      'SELECT count(*) AS count FROM document_import_heads WHERE document_id = ?',
+    ).get(pending!.id)
+    const jobDuringDrain = during.database.prepare(`
+      SELECT jobs.status FROM jobs JOIN local_import_jobs ON local_import_jobs.job_id = jobs.id
+      WHERE local_import_jobs.document_id = ?
+    `).get(pending!.id)
+    during.close()
+    releaseSnapshot.resolve()
+
+    const importOutcome = await importing.then(value => ({ value }), error => ({ error }))
+    await recycling
+    await app.service.close()
+
+    expect(finishedBeforeSnapshot).toBe(false)
+    expect(authorityDuringDrain).toEqual({ count: 0 })
+    expect(jobDuringDrain).toEqual({ status: 'cancelled' })
+    expect(importOutcome).toMatchObject({ error: { code: 'CANCELLED' } })
+    const inspected = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    expect(inspected.database.prepare('SELECT count(*) AS count FROM source_objects').get()).toEqual({ count: 0 })
+    expect(inspected.database.prepare("SELECT count(*) AS count FROM jobs WHERE status = 'pending'").get())
+      .toEqual({ count: 0 })
+    inspected.close()
+    expect(() => findFileEnding(app.rootDirectory, '.afobj')).toThrow('.afobj not found')
+  })
+
+  it('revokes authority and drains snapshot creation before purge removes the import graph', async () => {
+    const snapshotStarted = deferred<void>()
+    const releaseSnapshot = deferred<void>()
+    const app = await fixture({
+      createObjectSnapshot: async input => {
+        snapshotStarted.resolve()
+        await releaseSnapshot.promise
+        return createEncryptedObjectSnapshot(input)
+      },
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'snapshot-purge.txt', '快照期间永久删除'))
+    const importing = app.service.importDocument(owner, base!.id)
+    await snapshotStarted.promise
+    const [pending] = await app.service.listDocuments(owner, base!.id)
+
+    let lifecycleFinished = false
+    const purging = app.service.purgeDocument(owner, pending!.id).then(() => { lifecycleFinished = true })
+    await new Promise(resolve => setImmediate(resolve))
+    const finishedBeforeSnapshot = lifecycleFinished
+    const during = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    const authorityDuringDrain = during.database.prepare(
+      'SELECT count(*) AS count FROM document_import_heads WHERE document_id = ?',
+    ).get(pending!.id)
+    during.close()
+    releaseSnapshot.resolve()
+
+    const importOutcome = await importing.then(value => ({ value }), error => ({ error }))
+    await purging
+    await app.service.close()
+
+    expect(finishedBeforeSnapshot).toBe(false)
+    expect(authorityDuringDrain).toEqual({ count: 0 })
+    expect(importOutcome).toMatchObject({ error: { code: 'CANCELLED' } })
+    const inspected = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    for (const table of ['source_objects', 'local_import_jobs', 'jobs']) {
+      expect(inspected.database.prepare(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({ count: 0 })
+    }
+    inspected.close()
+    expect(() => findFileEnding(app.rootDirectory, '.afobj')).toThrow('.afobj not found')
+  })
+
+  it('does not acknowledge a post-rename snapshot sync failure and removes its unmanaged object', async () => {
+    const syncFailure = Object.assign(new Error('injected object directory sync failure'), { code: 'EIO' })
+    const app = await fixture({
+      createObjectSnapshot: async input => {
+        await createEncryptedObjectSnapshot(input)
+        throw syncFailure
+      },
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'snapshot-sync-failure.txt', '不得确认的快照'))
+
+    await expect(app.service.importDocument(owner, base!.id)).rejects.toBe(syncFailure)
+    expect((await app.service.listDocuments(owner, base!.id))[0]).toMatchObject({ status: 'failed' })
+    await app.service.close()
+
+    const inspected = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    expect(inspected.database.prepare('SELECT count(*) AS count FROM source_objects').get()).toEqual({ count: 0 })
+    expect(inspected.database.prepare("SELECT count(*) AS count FROM jobs WHERE status = 'pending'").get())
+      .toEqual({ count: 0 })
+    inspected.close()
+    expect(() => findFileEnding(app.rootDirectory, '.afobj')).toThrow('.afobj not found')
+  })
+
   it('cancels and drains a parsing import before recycling can become non-authoritative', async () => {
     const app = await fixture()
     const owner = { userId: 'alice' }
@@ -476,6 +623,57 @@ describe('KnowledgeService lifecycle', () => {
     expect((await app.service.search(owner, 'conversation_1', '较旧替换')).results).toHaveLength(0)
     await app.service.close()
   })
+
+  it.each(['recycle', 'purge'] as const)(
+    'drains a superseded active parser before %s lifecycle completion',
+    async (lifecycle) => {
+      const app = await fixture()
+      const owner = { userId: 'alice' }
+      const [base] = await app.service.listBases(owner)
+      app.picks.push(await writeSource(app.rootDirectory, 'superseded-original.txt', '初始版本'))
+      const imported = await app.service.importDocument(owner, base!.id)
+      await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+
+      const oldStarted = deferred<Parameters<KnowledgeParserPort['parse']>[0]>()
+      const oldFinish = deferred<ParserResponse>()
+      let replacementNumber = 0
+      app.parsers[0]!.handler = async input => {
+        replacementNumber += 1
+        if (replacementNumber === 1) {
+          oldStarted.resolve(input)
+          return oldFinish.promise
+        }
+        return parsedText(input.jobId, '最新替换内容')
+      }
+      app.picks.push(await writeSource(app.rootDirectory, 'superseded-old.txt', '较旧替换内容'))
+      await app.service.replaceDocument(owner, imported!.id)
+      const oldInput = await oldStarted.promise
+      app.picks.push(await writeSource(app.rootDirectory, 'superseded-new.txt', '最新替换内容'))
+      await app.service.replaceDocument(owner, imported!.id)
+      await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.name)
+        .toBe('superseded-new.txt')
+      expect(oldInput.signal?.aborted).toBe(true)
+
+      const operation = (lifecycle === 'recycle'
+        ? app.service.recycleDocument(owner, imported!.id)
+        : app.service.purgeDocument(owner, imported!.id)
+      )
+      const finishedBeforeSupersededParser = await Promise.race([
+        operation.then(() => true),
+        new Promise<false>(resolve => setTimeout(() => resolve(false), 250)),
+      ])
+      oldFinish.resolve(parsedText(oldInput.jobId, '不得发布的较旧替换内容'))
+      await operation
+
+      expect(finishedBeforeSupersededParser).toBe(false)
+      if (lifecycle === 'recycle') {
+        expect((await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('deleted')
+      } else {
+        expect(await app.service.listDocuments(owner, base!.id)).toEqual([])
+      }
+      await app.service.close()
+    },
+  )
 
   it('recovers a durable interrupted import once and removes unreferenced managed object orphans', async () => {
     const app = await fixture()
@@ -659,11 +857,12 @@ describe('KnowledgeService lifecycle', () => {
       const databaseKeyPath = findFile(app.rootDirectory, 'knowledge-key.json')
       const keyBefore = await readFile(databaseKeyPath, 'utf8')
 
+      await app.service.recycleDocument(owner, imported!.id)
       await expect(app.service.purgeDocument(owner, imported!.id)).rejects.toThrow(`injected ${failureStep} failure`)
       await app.service.close()
 
       const reopened = app.createService()
-      await expect(reopened.purgeDocument(owner, imported!.id)).resolves.toBeUndefined()
+      await reopened.listBases(owner)
       expect(await reopened.listDocuments(owner, base!.id)).toEqual([])
       await expect(readFile(objectPath)).rejects.toMatchObject({ code: 'ENOENT' })
       expect(await readFile(databaseKeyPath, 'utf8')).not.toBe(keyBefore)
@@ -672,8 +871,9 @@ describe('KnowledgeService lifecycle', () => {
       const inspected = await openUserKnowledgeDatabase({
         rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
       })
-      expect(inspected.database.prepare('SELECT count(*) AS count FROM purge_operations').get())
-        .toEqual({ count: 0 })
+      for (const table of ['purge_operations', 'source_objects', 'local_import_jobs', 'jobs', 'tombstones']) {
+        expect(inspected.database.prepare(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({ count: 0 })
+      }
       inspected.close()
     },
   )

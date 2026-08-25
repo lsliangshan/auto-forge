@@ -33,8 +33,8 @@ export interface KnowledgePurgeServiceOptions {
   readonly id: () => string
   readonly mutate: <T>(operation: () => T | Promise<T>) => Promise<T>
   readonly requireTarget: (kind: PurgeEntityKind, id: string) => void
-  readonly cancelImportJobs: (kind: PurgeEntityKind, id: string, now: number) => string[]
-  readonly abortAndDrain: (jobIds: readonly string[]) => Promise<void>
+  readonly cancelImportJobs: (kind: PurgeEntityKind, id: string, now: number) => void
+  readonly abortAndDrain: (kind: PurgeEntityKind, id: string) => Promise<void>
   readonly unlinkObject?: (path: string) => Promise<void>
   readonly vacuumDatabase?: (database: Database.Database) => void
   readonly rotateDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
@@ -43,10 +43,18 @@ export interface KnowledgePurgeServiceOptions {
 export class KnowledgePurgeService {
   constructor(private readonly options: KnowledgePurgeServiceOptions) {}
 
+  async resumeAll(): Promise<void> {
+    const operations = this.database.prepare(`
+      SELECT entity_kind AS kind, target_id AS targetId
+      FROM purge_operations ORDER BY created_at, id
+    `).all() as Array<{ kind: PurgeEntityKind; targetId: string }>
+    for (const operation of operations) await this.purge(operation.kind, operation.targetId)
+  }
+
   async purge(kind: PurgeEntityKind, id: string): Promise<void> {
     const prepared = await this.options.mutate(() => this.database.transaction(() => {
       const existing = this.readJournal(kind, id)
-      if (existing) return { journal: existing, cancelledJobIds: [] as string[] }
+      if (existing) return existing
       this.options.requireTarget(kind, id)
       const scope = kind === 'document' ? 'documents.id = ?' : 'documents.knowledge_base_id = ?'
       const objects = this.database.prepare(`
@@ -67,16 +75,22 @@ export class KnowledgePurgeService {
           (id, entity_kind, target_id, state, object_ids_json, object_names_json, created_at, updated_at)
         VALUES (?, ?, ?, 'prepared', ?, ?, ?, ?)
       `).run(journal.id, kind, id, JSON.stringify(objectIds), JSON.stringify(objectNames), now, now)
-      const cancelledJobIds = this.options.cancelImportJobs(kind, id, now)
-      return { journal, cancelledJobIds }
+      this.options.cancelImportJobs(kind, id, now)
+      return journal
     })())
-    await this.options.abortAndDrain(prepared.cancelledJobIds)
+    await this.options.abortAndDrain(kind, id)
 
-    let journal = prepared.journal
+    let journal = prepared
     if (journal.state === 'prepared') {
       await this.options.mutate(() => this.database.transaction(() => {
         const current = this.readJournal(kind, id)
         if (!current || current.state !== 'prepared') return
+        const jobScope = kind === 'document'
+          ? 'local_import_jobs.document_id = ?'
+          : 'local_import_jobs.knowledge_base_id = ?'
+        const jobIds = (this.database.prepare(`
+          SELECT job_id AS id FROM local_import_jobs WHERE ${jobScope}
+        `).all(id) as Array<{ id: string }>).map(row => row.id)
         if (kind === 'document') {
           this.database.prepare('DELETE FROM documents WHERE id = ?').run(id)
           this.database.prepare(
@@ -88,6 +102,8 @@ export class KnowledgePurgeService {
         }
         const deleteObject = this.database.prepare('DELETE FROM source_objects WHERE id = ?')
         for (const objectId of current.objectIds) deleteObject.run(objectId)
+        const deleteJob = this.database.prepare('DELETE FROM jobs WHERE id = ?')
+        for (const jobId of jobIds) deleteJob.run(jobId)
         this.database.prepare(`
           UPDATE purge_operations SET state = 'graph_deleted', updated_at = ?
           WHERE id = ? AND state = 'prepared'
