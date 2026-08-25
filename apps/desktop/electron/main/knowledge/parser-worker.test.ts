@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { deflateSync } from 'node:zlib'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -54,6 +56,103 @@ function minimalPdf(text?: string): Uint8Array {
   return new TextEncoder().encode(body)
 }
 
+function compressedPdf(text: string): Uint8Array {
+  const decoded = Buffer.from(`BT /F1 12 Tf 72 720 Td (${text}) Tj ET`)
+  const compressed = deflateSync(decoded)
+  const beforeStream = Buffer.from('<< /Filter /FlateDecode /Length ' + compressed.length + ' >>\nstream\n')
+  const streamObject = Buffer.concat([beforeStream, compressed, Buffer.from('\nendstream')])
+  const objects = [
+    Buffer.from('<< /Type /Catalog /Pages 2 0 R >>'),
+    Buffer.from('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+    Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>'),
+    Buffer.from('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'),
+    streamObject,
+  ]
+  const parts = [Buffer.from('%PDF-1.4\n')]
+  const offsets: number[] = []
+  let length = parts[0]!.length
+  objects.forEach((object, index) => {
+    offsets.push(length)
+    const entry = Buffer.concat([Buffer.from(`${index + 1} 0 obj\n`), object, Buffer.from('\nendobj\n')])
+    parts.push(entry)
+    length += entry.length
+  })
+  const xref = length
+  const trailer = Buffer.from(`xref\n0 6\n0000000000 65535 f \n${offsets.map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`)
+  return Buffer.concat([...parts, trailer])
+}
+
+const PDF_PASSWORD_PADDING = Buffer.from([
+  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+  0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+])
+
+function rc4(key: Uint8Array, input: Uint8Array): Buffer {
+  const state = Uint8Array.from({ length: 256 }, (_, index) => index)
+  let j = 0
+  for (let index = 0; index < 256; index += 1) {
+    j = (j + state[index]! + key[index % key.length]!) & 0xff
+    ;[state[index], state[j]] = [state[j]!, state[index]!]
+  }
+  const output = Buffer.alloc(input.length)
+  let i = 0
+  j = 0
+  for (let index = 0; index < input.length; index += 1) {
+    i = (i + 1) & 0xff
+    j = (j + state[i]!) & 0xff
+    ;[state[i], state[j]] = [state[j]!, state[i]!]
+    output[index] = input[index]! ^ state[(state[i]! + state[j]!) & 0xff]!
+  }
+  return output
+}
+
+function passwordProtectedPdf(): Uint8Array {
+  const pad = (password: string) => Buffer.concat([Buffer.from(password, 'ascii'), PDF_PASSWORD_PADDING]).subarray(0, 32)
+  const digest = (...parts: Uint8Array[]) => createHash('md5').update(Buffer.concat(parts)).digest()
+  const userPassword = pad('test')
+  const ownerKey = digest(pad('owner')).subarray(0, 5)
+  const ownerEntry = rc4(ownerKey, userPassword)
+  const permissions = Buffer.alloc(4)
+  permissions.writeInt32LE(-4)
+  const fileId = digest(Buffer.from('autoforge-parser-password-fixture', 'ascii'))
+  const encryptionKey = digest(userPassword, ownerEntry, permissions, fileId).subarray(0, 5)
+  const userEntry = rc4(encryptionKey, PDF_PASSWORD_PADDING)
+  const objectNumber = Buffer.from([5, 0, 0, 0, 0])
+  const streamKey = digest(encryptionKey, objectNumber).subarray(0, 10)
+  const encryptedStream = rc4(streamKey, Buffer.from('BT /F1 12 Tf 20 20 Td (Encrypted PDF) Tj ET', 'ascii'))
+  const objects = [
+    Buffer.from('<< /Type /Catalog /Pages 2 0 R >>'),
+    Buffer.from('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+    Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 50] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>'),
+    Buffer.from('<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>'),
+    Buffer.concat([Buffer.from(`<< /Length ${encryptedStream.length} >>\nstream\n`), encryptedStream, Buffer.from('\nendstream')]),
+    Buffer.from(`<< /Filter /Standard /V 1 /R 2 /Length 40 /O <${ownerEntry.toString('hex')}> /U <${userEntry.toString('hex')}> /P -4 >>`),
+  ]
+  const parts = [Buffer.from('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n', 'latin1')]
+  const offsets: number[] = []
+  let length = parts[0]!.length
+  objects.forEach((object, index) => {
+    offsets.push(length)
+    const entry = Buffer.concat([Buffer.from(`${index + 1} 0 obj\n`), object, Buffer.from('\nendobj\n')])
+    parts.push(entry)
+    length += entry.length
+  })
+  parts.push(Buffer.from(`xref\n0 7\n0000000000 65535 f \n${offsets.map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size 7 /Root 1 0 R /Encrypt 6 0 R /ID [<${fileId.toString('hex')}> <${fileId.toString('hex')}>] >>\nstartxref\n${length}\n%%EOF\n`))
+  return Buffer.concat(parts)
+}
+
+function underreportZipOutput(input: Uint8Array): Uint8Array {
+  const bytes = Buffer.from(input)
+  for (let offset = 0; offset + 46 <= bytes.length; offset += 1) {
+    if (bytes.readUInt32LE(offset) !== 0x02014b50) continue
+    bytes.writeUInt32LE(1, offset + 24)
+    const localOffset = bytes.readUInt32LE(offset + 42)
+    if (localOffset + 30 <= bytes.length && bytes.readUInt32LE(localOffset) === 0x04034b50) bytes.writeUInt32LE(1, localOffset + 22)
+    offset += 45 + bytes.readUInt16LE(offset + 28) + bytes.readUInt16LE(offset + 30) + bytes.readUInt16LE(offset + 32)
+  }
+  return bytes
+}
+
 describe('sandbox parser core', () => {
   it('parses fatal UTF-8 TXT with line and character coordinates', async () => {
     const result = await parseEncryptedDocument(await encryptedRequest('txt', new TextEncoder().encode('第一行\nsecond line')))
@@ -79,6 +178,20 @@ describe('sandbox parser core', () => {
     expect(JSON.stringify(html)).not.toContain('steal')
   })
 
+  it('drops nested Markdown raw HTML and preserves safe body/div HTML text', async () => {
+    const markdown = await parseEncryptedDocument(await encryptedRequest('markdown', new TextEncoder().encode(
+      'Before <span>safe</span> after <script>evil()</script>',
+    )))
+    expect(markdown).toMatchObject({ type: 'result', text: 'Before safe after' })
+    expect(JSON.stringify(markdown)).not.toMatch(/<span>|script|evil/)
+
+    const html = await parseEncryptedDocument(await encryptedRequest('html', new TextEncoder().encode(
+      '<body>loose<div>safe <span>inner</span><script>bad()</script></div><p>paragraph</p></body>',
+    )))
+    expect(html).toMatchObject({ type: 'result', blocks: [{ text: 'loose' }, { text: 'safe inner' }, { text: 'paragraph' }] })
+    expect(JSON.stringify(html)).not.toContain('bad')
+  })
+
   it('parses a DOCX paragraph without exposing images or external files', async () => {
     const mammothEntry = require.resolve('mammoth')
     const fixture = await readFile(join(dirname(mammothEntry), '../test/test-data/single-paragraph.docx'))
@@ -87,13 +200,31 @@ describe('sandbox parser core', () => {
     expect(result.type === 'result' ? result.text.length : 0).toBeGreaterThan(0)
   })
 
+  it('measures actual DOCX inflation instead of trusting ZIP metadata', async () => {
+    const mammothEntry = require.resolve('mammoth')
+    const fixture = await readFile(join(dirname(mammothEntry), '../test/test-data/single-paragraph.docx'))
+    const limits = { ...DEFAULT_PARSER_LIMITS, maxDecompressedBytes: 256 }
+    expect(await parseEncryptedDocument(await encryptedRequest('docx', underreportZipOutput(fixture), limits))).toMatchObject({
+      type: 'error', code: 'PARSER_LIMIT_EXCEEDED',
+    })
+  })
+
   it('parses text-layer PDF and rejects scanned and encrypted PDFs explicitly', async () => {
     const textPdf = await parseEncryptedDocument(await encryptedRequest('pdf', minimalPdf('PDF text')))
     expect(textPdf).toMatchObject({ type: 'result', blocks: [{ text: 'PDF text', coordinate: { kind: 'pdf', page: 1 } }] })
     const scanned = await parseEncryptedDocument(await encryptedRequest('pdf', minimalPdf()))
     expect(scanned).toMatchObject({ type: 'error', code: 'PARSER_SCANNED_DOCUMENT' })
-    const encrypted = new TextEncoder().encode('%PDF-1.4\n1 0 obj << /Encrypt 2 0 R >> endobj\n%%EOF')
+    const encrypted = passwordProtectedPdf()
     expect(await parseEncryptedDocument(await encryptedRequest('pdf', encrypted))).toMatchObject({ type: 'error', code: 'PARSER_ENCRYPTED_DOCUMENT' })
+    expect(await parseEncryptedDocument(await encryptedRequest('pdf', minimalPdf('/Encrypt is ordinary text')))).toMatchObject({ type: 'result', text: '/Encrypt is ordinary text' })
+  })
+
+  it('stops PDF decoded streams before they exceed the caller decompression budget', async () => {
+    const expanding = compressedPdf('A'.repeat(2_048))
+    const limits = { ...DEFAULT_PARSER_LIMITS, maxDecompressedBytes: 256 }
+    expect(await parseEncryptedDocument(await encryptedRequest('pdf', expanding, limits))).toMatchObject({
+      type: 'error', code: 'PARSER_LIMIT_EXCEEDED',
+    })
   })
 
   it('rejects malformed, oversized, and unsupported content with stable errors', async () => {

@@ -1,7 +1,7 @@
 import * as mammoth from 'mammoth/mammoth.browser.js'
 import { parse as parseHtmlDocument } from 'parse5'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs'
-import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
+import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.mjs?url'
 import remarkParse from 'remark-parse'
 import { unified } from 'unified'
 import type { ParserBlock, ParserFormat, ParserLimits } from '../parser-protocol.js'
@@ -29,9 +29,26 @@ function enforce(document: ParsedDocument, limits: ParserLimits): ParsedDocument
   return document
 }
 
-function textOf(node: { value?: string; children?: MarkdownNode[] }): string {
+const DROPPED_MARKDOWN_HTML = new Set(['script', 'style', 'noscript', 'template', 'iframe', 'object', 'embed', 'svg', 'math'])
+
+function textOf(node: MarkdownNode, depths = new Map<string, number>()): string {
+  if (node.type === 'html') return ''
   if (typeof node.value === 'string') return node.value
-  return (node.children ?? []).map(textOf).join('')
+  let output = ''
+  for (const child of node.children ?? []) {
+    if (child.type === 'html') {
+      for (const match of child.value?.matchAll(/<\s*(\/?)\s*([a-z0-9-]+)\b([^>]*)>/gi) ?? []) {
+        const tag = match[2]?.toLowerCase()
+        if (!tag || !DROPPED_MARKDOWN_HTML.has(tag)) continue
+        if (match[1]) depths.set(tag, Math.max(0, (depths.get(tag) ?? 0) - 1))
+        else if (!match[3]?.trimEnd().endsWith('/')) depths.set(tag, (depths.get(tag) ?? 0) + 1)
+      }
+      continue
+    }
+    if ([...depths.values()].some(depth => depth > 0)) continue
+    output += textOf(child, depths)
+  }
+  return output
 }
 
 function parseTxt(bytes: Uint8Array): ParsedDocument {
@@ -69,11 +86,18 @@ function parseMarkdown(bytes: Uint8Array): ParsedDocument {
 
 const DROPPED_HTML = new Set(['script', 'style', 'noscript', 'template', 'iframe', 'object', 'embed', 'svg', 'math'])
 const HTML_BLOCKS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'pre', 'blockquote', 'td', 'th'])
+const HTML_CONTAINERS = new Set(['body', 'div'])
 
 function htmlText(node: TreeNode): string {
   if (node.nodeName === '#text') return node.value ?? ''
   if (node.tagName && DROPPED_HTML.has(node.tagName)) return ''
   return (node.childNodes ?? []).map(htmlText).join(' ')
+}
+
+function htmlContainerText(node: TreeNode): string {
+  if (node.nodeName === '#text') return node.value ?? ''
+  if (node.tagName && (DROPPED_HTML.has(node.tagName) || HTML_BLOCKS.has(node.tagName) || HTML_CONTAINERS.has(node.tagName))) return ''
+  return (node.childNodes ?? []).map(htmlContainerText).join(' ')
 }
 
 function parseHtml(bytes: Uint8Array): ParsedDocument {
@@ -83,6 +107,9 @@ function parseHtml(bytes: Uint8Array): ParsedDocument {
   try { root = parseHtmlDocument(source) as unknown as TreeNode } catch { throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT') }
   const blocks: ParserBlock[] = []
   const headings: string[] = []
+  const addBlock = (text: string) => {
+    blocks.push({ id: `html-${blocks.length + 1}`, text, coordinate: { kind: 'html', path: headings.filter(Boolean), blockIndex: blocks.length } })
+  }
   const visit = (node: TreeNode) => {
     if (node.tagName && DROPPED_HTML.has(node.tagName)) return
     if (node.tagName && HTML_BLOCKS.has(node.tagName)) {
@@ -93,9 +120,13 @@ function parseHtml(bytes: Uint8Array): ParsedDocument {
           headings.splice(depth - 1)
           headings[depth - 1] = text
         }
-        blocks.push({ id: `html-${blocks.length + 1}`, text, coordinate: { kind: 'html', path: headings.filter(Boolean), blockIndex: blocks.length } })
+        addBlock(text)
       }
       return
+    }
+    if (node.tagName && HTML_CONTAINERS.has(node.tagName)) {
+      const text = normalized((node.childNodes ?? []).map(htmlContainerText).join(' '))
+      if (text) addBlock(text)
     }
     for (const child of node.childNodes ?? []) visit(child)
   }
@@ -103,27 +134,83 @@ function parseHtml(bytes: Uint8Array): ParsedDocument {
   return { text: blocks.map(block => block.text).join('\n'), blocks }
 }
 
-function inspectDocxArchive(bytes: Uint8Array, limits: ParserLimits): void {
+async function inspectDocxArchive(bytes: Uint8Array, limits: ParserLimits): Promise<void> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  let entries = 0
+  let end = -1
+  for (let offset = bytes.length - 22, minimum = Math.max(0, bytes.length - 65_557); offset >= minimum; offset -= 1) {
+    if (view.getUint32(offset, true) === 0x06054b50) {
+      end = offset
+      break
+    }
+  }
+  if (end < 0) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+  const commentLength = view.getUint16(end + 20, true)
+  const entries = view.getUint16(end + 10, true)
+  const centralSize = view.getUint32(end + 12, true)
+  const centralOffset = view.getUint32(end + 16, true)
+  if (end + 22 + commentLength !== bytes.length || view.getUint16(end + 4, true) !== 0 || view.getUint16(end + 6, true) !== 0 || view.getUint16(end + 8, true) !== entries || entries === 0 || entries === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff || centralOffset + centralSize > end) {
+    throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+  }
+  if (entries > limits.maxBlocks) throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
   let total = 0
-  for (let offset = 0; offset + 46 <= bytes.length; offset += 1) {
-    if (view.getUint32(offset, true) !== 0x02014b50) continue
-    entries += 1
+  let offset = centralOffset
+  for (let index = 0; index < entries; index += 1) {
+    if (offset + 46 > end || view.getUint32(offset, true) !== 0x02014b50) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
     const flags = view.getUint16(offset + 8, true)
     if ((flags & 1) !== 0) throw new DocumentParserError('PARSER_ENCRYPTED_DOCUMENT')
-    total += view.getUint32(offset + 24, true)
-    if (total > limits.maxDecompressedBytes || entries > limits.maxBlocks) throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
+    const method = view.getUint16(offset + 10, true)
+    const compressedSize = view.getUint32(offset + 20, true)
+    const declaredSize = view.getUint32(offset + 24, true)
     const name = view.getUint16(offset + 28, true)
     const extra = view.getUint16(offset + 30, true)
     const comment = view.getUint16(offset + 32, true)
-    offset += 45 + name + extra + comment
+    const localOffset = view.getUint32(offset + 42, true)
+    const next = offset + 46 + name + extra + comment
+    if (next > end || compressedSize === 0xffffffff || declaredSize === 0xffffffff || localOffset === 0xffffffff || localOffset + 30 > bytes.length || view.getUint32(localOffset, true) !== 0x04034b50) {
+      throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+    }
+    const localName = view.getUint16(localOffset + 26, true)
+    const localExtra = view.getUint16(localOffset + 28, true)
+    if ((view.getUint16(localOffset + 6, true) & 1) !== 0) throw new DocumentParserError('PARSER_ENCRYPTED_DOCUMENT')
+    if (view.getUint16(localOffset + 8, true) !== method) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+    const dataStart = localOffset + 30 + localName + localExtra
+    const dataEnd = dataStart + compressedSize
+    if (dataEnd > bytes.length) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+
+    let actualSize = 0
+    if (method === 0) {
+      actualSize = compressedSize
+      total += actualSize
+      if (total > limits.maxDecompressedBytes) throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
+    } else if (method === 8) {
+      try {
+        const compressed = bytes.slice(dataStart, dataEnd).buffer as ArrayBuffer
+        const reader = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader()
+        for (;;) {
+          const chunk = await reader.read()
+          if (chunk.done) break
+          actualSize += chunk.value.byteLength
+          total += chunk.value.byteLength
+          if (total > limits.maxDecompressedBytes) {
+            await reader.cancel().catch(() => undefined)
+            throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
+          }
+        }
+      } catch (error) {
+        if (error instanceof DocumentParserError) throw error
+        throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+      }
+    } else {
+      throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+    }
+    if (actualSize !== declaredSize) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+    offset = next
   }
-  if (entries === 0) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+  if (offset !== centralOffset + centralSize) throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
 }
 
 async function parseDocx(bytes: Uint8Array, limits: ParserLimits): Promise<ParsedDocument> {
-  inspectDocxArchive(bytes, limits)
+  await inspectDocxArchive(bytes, limits)
   try {
     const copy = bytes.slice().buffer
     const result = await mammoth.convertToHtml({ arrayBuffer: copy }, {
@@ -147,12 +234,11 @@ async function parseDocx(bytes: Uint8Array, limits: ParserLimits): Promise<Parse
 }
 
 async function parsePdf(bytes: Uint8Array, limits: ParserLimits): Promise<ParsedDocument> {
-  if (new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.length, 1_048_576))).includes('/Encrypt')) {
-    throw new DocumentParserError('PARSER_ENCRYPTED_DOCUMENT')
-  }
+  let task: ReturnType<typeof getDocument> | undefined
   try {
-    const task = getDocument({
+    task = getDocument({
       data: bytes.slice(),
+      maxDecodedStreamBytes: limits.maxDecompressedBytes,
       disableFontFace: true,
       useSystemFonts: false,
       useWorkerFetch: false,
@@ -170,14 +256,18 @@ async function parsePdf(bytes: Uint8Array, limits: ParserLimits): Promise<Parsed
       if (text) blocks.push({ id: `page-${pageNumber}`, text, coordinate: { kind: 'pdf', page: pageNumber, itemStart: 0, itemEnd: content.items.length } })
       page.cleanup()
     }
-    await task.destroy()
     if (blocks.length === 0) throw new DocumentParserError('PARSER_SCANNED_DOCUMENT')
     return { text: blocks.map(block => block.text).join('\n'), blocks }
   } catch (error) {
     if (error instanceof DocumentParserError) throw error
     const name = String((error as Error).name)
     if (/PasswordException/i.test(name)) throw new DocumentParserError('PARSER_ENCRYPTED_DOCUMENT')
+    if (/PDF decoded stream limit exceeded/.test(String((error as Error).message))) {
+      throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
+    }
     throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
+  } finally {
+    await task?.destroy().catch(() => undefined)
   }
 }
 

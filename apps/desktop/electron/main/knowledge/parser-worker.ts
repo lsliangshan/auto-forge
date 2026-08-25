@@ -50,6 +50,7 @@ export async function parseEncryptedDocument(input: unknown): Promise<ParserResp
   } catch (error) {
     return { version: 1, type: 'error', jobId: request.jobId, code: error instanceof DocumentParserError ? error.code : 'PARSER_INTERNAL_ERROR' }
   } finally {
+    new Uint8Array(request.encryptedBytes).fill(0)
     new Uint8Array(request.fileKey).fill(0)
   }
 }

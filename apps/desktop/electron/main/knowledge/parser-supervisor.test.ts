@@ -17,7 +17,7 @@ class FakePort extends EventEmitter {
   postMessage = vi.fn()
 }
 
-async function harness(response?: unknown) {
+async function harness(response?: unknown, options: { readEncryptedSnapshot?: () => Promise<Buffer> } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'autoforge-supervisor-'))
   directories.push(directory)
   const sourcePath = join(directory, 'source.txt')
@@ -62,6 +62,7 @@ async function harness(response?: unknown) {
     preloadPath: '/app/out/preload/parser.cjs',
     partitionId: () => 'autoforge-parser-test-unique',
     processMemoryBytes,
+    readEncryptedSnapshot: options.readEncryptedSnapshot ?? (async () => readFile(objectPath)),
   }
   return { supervisor: new ParserSupervisor(dependencies), createWindow, window, webContents, parserSession, processMemoryBytes, port1, port2, objectPath, fileKey, getNetworkHandler: () => networkHandler }
 }
@@ -94,6 +95,7 @@ describe('sandbox parser supervisor', () => {
     expect(JSON.stringify(sent)).not.toMatch(/master|safeStorage|cloudbase|provider|env/i)
     expect(h.webContents.postMessage.mock.calls[0]?.[2]).toEqual([h.port1])
     expect(h.window.destroy).toHaveBeenCalledOnce()
+    expect(h.port1.close).toHaveBeenCalledOnce()
     expect(h.port2.close).toHaveBeenCalledOnce()
     expect(h.parserSession.clearStorageData).toHaveBeenCalledOnce()
     expect(h.parserSession.closeAllConnections).toHaveBeenCalledOnce()
@@ -133,6 +135,91 @@ describe('sandbox parser supervisor', () => {
     await expect(parse).resolves.toMatchObject({ type: 'error', code: 'PARSER_CANCELLED' })
     expect(h.window.destroy).toHaveBeenCalledOnce()
     expect(h.port2.close).toHaveBeenCalledOnce()
+  })
+
+  it('tracks jobs before snapshot I/O and never launches a renderer after shutdown', async () => {
+    let releaseRead!: (value: Buffer) => void
+    const encrypted = Buffer.alloc(64, 9)
+    const h = await harness(undefined, { readEncryptedSnapshot: () => new Promise(resolve => { releaseRead = resolve }) })
+    const parse = h.supervisor.parse({ jobId: 'job-starting', format: 'txt', objectPath: h.objectPath, fileKey: h.fileKey })
+    await vi.waitFor(() => expect(releaseRead).toBeTypeOf('function'))
+    let shutdownFinished = false
+    const shutdown = h.supervisor.terminateAll().then(() => { shutdownFinished = true })
+    await Promise.resolve()
+    expect(shutdownFinished).toBe(false)
+    releaseRead(encrypted)
+    await shutdown
+    await expect(parse).resolves.toMatchObject({ type: 'error', code: 'PARSER_CANCELLED' })
+    expect(h.createWindow).not.toHaveBeenCalled()
+    expect(h.fileKey.every(byte => byte === 0)).toBe(true)
+    expect(encrypted.every(byte => byte === 0)).toBe(true)
+
+    const laterKey = Buffer.alloc(32, 4)
+    await expect(h.supervisor.parse({ jobId: 'job-after-close', format: 'txt', objectPath: h.objectPath, fileKey: laterKey })).resolves.toMatchObject({ code: 'PARSER_CANCELLED' })
+    expect(laterKey.every(byte => byte === 0)).toBe(true)
+    expect(h.createWindow).not.toHaveBeenCalled()
+  })
+
+  it('clears secrets and ignores late load after load or renderer failure', async () => {
+    const load = await harness()
+    load.window.loadFile.mockImplementation(() => new Promise(() => undefined))
+    const encrypted = await readFile(load.objectPath)
+    ;(load.supervisor as unknown as { dependencies: ParserRendererDependencies }).dependencies.readEncryptedSnapshot = async () => encrypted
+    const pending = load.supervisor.parse({ jobId: 'job-load-timeout', format: 'txt', objectPath: load.objectPath, fileKey: load.fileKey, timeoutMs: 100 })
+    await expect(pending).resolves.toMatchObject({ code: 'PARSER_TIMEOUT' })
+    expect(load.fileKey.every(byte => byte === 0)).toBe(true)
+    expect(encrypted.every(byte => byte === 0)).toBe(true)
+    load.webContents.emit('did-finish-load')
+    expect(load.webContents.postMessage).not.toHaveBeenCalled()
+
+    const gone = await harness()
+    gone.window.loadFile.mockImplementation(async () => { gone.webContents.emit('render-process-gone') })
+    await expect(gone.supervisor.parse({ jobId: 'job-gone', format: 'txt', objectPath: gone.objectPath, fileKey: gone.fileKey })).resolves.toMatchObject({ code: 'PARSER_INTERNAL_ERROR' })
+    expect(gone.fileKey.every(byte => byte === 0)).toBe(true)
+
+    const rejectedBytes = Buffer.alloc(64, 3)
+    const rejected = await harness(undefined, { readEncryptedSnapshot: async () => rejectedBytes })
+    rejected.window.loadFile.mockRejectedValue(new Error('load failed'))
+    await expect(rejected.supervisor.parse({ jobId: 'job-load-failed', format: 'txt', objectPath: rejected.objectPath, fileKey: rejected.fileKey })).resolves.toMatchObject({ code: 'PARSER_INTERNAL_ERROR' })
+    expect(rejected.fileKey.every(byte => byte === 0)).toBe(true)
+    expect(rejectedBytes.every(byte => byte === 0)).toBe(true)
+  })
+
+  it('clears the one-time key when session/window/channel construction fails', async () => {
+    const h = await harness()
+    h.createWindow.mockImplementation(() => { throw new Error('window construction') })
+    await expect(h.supervisor.parse({ jobId: 'job-construction', format: 'txt', objectPath: h.objectPath, fileKey: h.fileKey })).resolves.toMatchObject({ code: 'PARSER_INTERNAL_ERROR' })
+    expect(h.fileKey.every(byte => byte === 0)).toBe(true)
+    expect(h.parserSession.closeAllConnections).toHaveBeenCalledOnce()
+    expect(h.parserSession.clearStorageData).toHaveBeenCalledOnce()
+  })
+
+  it('settles while attempting every cleanup action even when cleanup throws', async () => {
+    const h = await harness({ version: 1, type: 'error', jobId: 'job-cleanup', code: 'PARSER_MALFORMED_DOCUMENT' })
+    h.port1.close.mockImplementation(() => { throw new Error('port1 close') })
+    h.port2.close.mockImplementation(() => { throw new Error('port2 close') })
+    h.window.destroy.mockImplementation(() => { throw new Error('destroy') })
+    h.parserSession.closeAllConnections.mockRejectedValue(new Error('connections'))
+    h.parserSession.clearStorageData.mockRejectedValue(new Error('storage'))
+    await expect(h.supervisor.parse({ jobId: 'job-cleanup', format: 'txt', objectPath: h.objectPath, fileKey: h.fileKey })).resolves.toMatchObject({ code: 'PARSER_MALFORMED_DOCUMENT' })
+    expect(h.port1.close).toHaveBeenCalledOnce()
+    expect(h.port2.close).toHaveBeenCalledOnce()
+    expect(h.window.destroy).toHaveBeenCalledOnce()
+    expect(h.parserSession.closeAllConnections).toHaveBeenCalledOnce()
+    expect(h.parserSession.clearStorageData).toHaveBeenCalledOnce()
+  })
+
+  it('rejects caller-limit and coordinate violations from the renderer', async () => {
+    const response = (request: { jobId: string }) => ({
+      version: 1, type: 'result', jobId: request.jobId, text: '123456',
+      blocks: [{ id: 'page-1', text: '123456', coordinate: { kind: 'pdf', page: 1, itemStart: 0, itemEnd: 1 } }],
+      chunks: [{ index: 0, text: '123456', blockIds: ['page-1'] }],
+    })
+    const h = await harness(response)
+    await expect(h.supervisor.parse({
+      jobId: 'job-lowered', format: 'txt', objectPath: h.objectPath, fileKey: h.fileKey,
+      limits: { ...DEFAULT_PARSER_LIMITS, maxTextChars: 5 },
+    })).resolves.toMatchObject({ type: 'error', code: 'PARSER_PROTOCOL_INVALID' })
   })
 
   it('fails closed and tears down for malformed renderer messages', async () => {
