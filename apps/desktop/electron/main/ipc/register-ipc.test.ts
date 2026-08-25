@@ -111,7 +111,10 @@ function services(): DesktopIpcServices {
       listDocuments: vi.fn().mockResolvedValue([]),
       getConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
       updateConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
-      getFeatureAvailability: vi.fn().mockResolvedValue({ available: false, reasons: ['encrypted_storage_unavailable'] }),
+      getFeatureAvailability: vi.fn().mockResolvedValue({
+        local: { available: false, reasons: ['encrypted_storage_unavailable'] },
+        cloud: { available: false, reasons: ['encrypted_storage_unavailable'] },
+      }),
       getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false }),
       getConsent: vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'unknown' }),
     },
@@ -348,11 +351,12 @@ describe('registerDesktopIpc', () => {
     await app.invoke(ipcChannels.knowledgeGetEntitlement)
     await app.invoke(ipcChannels.knowledgeGetConsent)
 
-    expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith()
-    expect(app.dependencies.knowledge.listDocuments).toHaveBeenCalledWith('kb_1')
-    expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith('conversation_1')
-    expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith('conversation_1', selection)
-    expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith()
+    const owner = { userId: 'user_1' }
+    expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.listDocuments).toHaveBeenCalledWith(owner, 'kb_1')
+    expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith(owner, 'conversation_1')
+    expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith(owner, 'conversation_1', selection)
+    expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
 
     for (const [channel, input] of [
       [ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1', userId: 'other_user' }],
@@ -363,6 +367,30 @@ describe('registerDesktopIpc', () => {
       await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     }
     expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledTimes(1)
+  })
+
+  it('binds every knowledge operation to the authenticated owner instead of renderer-controlled IDs', async () => {
+    const app = harness()
+    const ownerSession = { ...authSession, user: { id: 'user_alice', account: 'Alice' } }
+    const owner = { userId: 'user_alice' }
+    const selection = { knowledgeBaseIds: ['kb_bob'], knowledgeMode: 'mixed' as const }
+    vi.mocked(app.dependencies.auth.requireSession).mockResolvedValue(ownerSession)
+
+    await app.invoke(ipcChannels.knowledgeListBases)
+    await app.invoke(ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_bob' })
+    await app.invoke(ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_bob' })
+    await app.invoke(ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_bob', selection })
+    await app.invoke(ipcChannels.knowledgeGetFeatureAvailability)
+    await app.invoke(ipcChannels.knowledgeGetEntitlement)
+    await app.invoke(ipcChannels.knowledgeGetConsent)
+
+    expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.listDocuments).toHaveBeenCalledWith(owner, 'kb_bob')
+    expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith(owner, 'conversation_bob')
+    expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith(owner, 'conversation_bob', selection)
+    expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.getEntitlement).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.getConsent).toHaveBeenCalledWith(owner)
   })
 
   it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {

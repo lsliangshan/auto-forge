@@ -101,9 +101,21 @@ describe('cross-process contracts', () => {
   })
 
   it('reports fail-closed feature availability and public entitlement state', () => {
-    expect(knowledgeFeatureAvailabilitySchema.parse({ available: false, reasons: ['encrypted_storage_unavailable'] }))
-      .toEqual({ available: false, reasons: ['encrypted_storage_unavailable'] })
-    expect(knowledgeFeatureAvailabilitySchema.safeParse({ available: true, reasons: ['fts_unavailable'] }).success).toBe(false)
+    expect(knowledgeFeatureAvailabilitySchema.parse({
+      local: { available: true, reasons: [] },
+      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+    })).toEqual({
+      local: { available: true, reasons: [] },
+      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+    })
+    expect(knowledgeFeatureAvailabilitySchema.safeParse({
+      local: { available: false, reasons: ['kill_switch_enabled'] },
+      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+    }).success).toBe(false)
+    expect(knowledgeFeatureAvailabilitySchema.safeParse({
+      local: { available: true, reasons: ['fts_unavailable'] },
+      cloud: { available: true, reasons: [] },
+    }).success).toBe(false)
     expect(knowledgeEntitlementStateSchema.parse({
       tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
     })).toMatchObject({ tier: 'free', status: 'active' })

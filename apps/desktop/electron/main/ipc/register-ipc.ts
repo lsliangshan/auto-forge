@@ -17,6 +17,7 @@ import {
   type MediaRemoveDraftRequest,
 } from '@autoforge/shared'
 import type { z } from 'zod'
+import type { KnowledgeOwner } from '../knowledge/knowledge-types.js'
 import { isTrustedRendererUrl, type RendererTarget } from '../renderer-trust.js'
 
 export type { RendererTarget } from '../renderer-trust.js'
@@ -63,13 +64,13 @@ export interface DesktopIpcServices {
   permissions: DesktopAPI['permissions']
   settings: DesktopAPI['settings']
   knowledge: {
-    listBases(): Promise<KnowledgeBase[]>
-    listDocuments(knowledgeBaseId: string): Promise<KnowledgeDocument[]>
-    getConversationSelection(conversationId: string): Promise<KnowledgeSelection>
-    updateConversationSelection(conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
-    getFeatureAvailability(): Promise<KnowledgeFeatureAvailability>
-    getEntitlement(): Promise<KnowledgeEntitlementState>
-    getConsent(): Promise<KnowledgeConsentState>
+    listBases(owner: KnowledgeOwner): Promise<KnowledgeBase[]>
+    listDocuments(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument[]>
+    getConversationSelection(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSelection>
+    updateConversationSelection(owner: KnowledgeOwner, conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
+    getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability>
+    getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
+    getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>
   }
   system: DesktopAPI['system']
 }
@@ -153,6 +154,18 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     ))
     registered.push(channel)
   }
+  const registerKnowledge = <Channel extends RequestChannel>(
+    channel: Channel,
+    operation: (
+      owner: KnowledgeOwner,
+      input: z.infer<(typeof ipcRequestSchemas)[Channel]>,
+    ) => unknown | Promise<unknown>,
+  ) => {
+    register(channel, async (input) => {
+      const session = await options.services.auth.requireSession()
+      return operation({ userId: session.user.id }, input)
+    }, { anonymous: true })
+  }
 
   register(ipcChannels.authGetSession, () => options.services.auth.getSession(), { anonymous: true })
   register(ipcChannels.authRefreshAuthorization, () => options.services.auth.refreshAuthorization())
@@ -216,16 +229,17 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsGetTokenUsage, () => options.services.settings.getTokenUsage())
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
   register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
-  register(ipcChannels.knowledgeListBases, () => options.services.knowledge.listBases())
-  register(ipcChannels.knowledgeListDocuments, (input) => options.services.knowledge.listDocuments(input.knowledgeBaseId))
-  register(ipcChannels.knowledgeGetConversationSelection, (input) => options.services.knowledge.getConversationSelection(input.conversationId))
-  register(ipcChannels.knowledgeUpdateConversationSelection, (input) => options.services.knowledge.updateConversationSelection(
+  registerKnowledge(ipcChannels.knowledgeListBases, (owner) => options.services.knowledge.listBases(owner))
+  registerKnowledge(ipcChannels.knowledgeListDocuments, (owner, input) => options.services.knowledge.listDocuments(owner, input.knowledgeBaseId))
+  registerKnowledge(ipcChannels.knowledgeGetConversationSelection, (owner, input) => options.services.knowledge.getConversationSelection(owner, input.conversationId))
+  registerKnowledge(ipcChannels.knowledgeUpdateConversationSelection, (owner, input) => options.services.knowledge.updateConversationSelection(
+    owner,
     input.conversationId,
     input.selection,
   ))
-  register(ipcChannels.knowledgeGetFeatureAvailability, () => options.services.knowledge.getFeatureAvailability())
-  register(ipcChannels.knowledgeGetEntitlement, () => options.services.knowledge.getEntitlement())
-  register(ipcChannels.knowledgeGetConsent, () => options.services.knowledge.getConsent())
+  registerKnowledge(ipcChannels.knowledgeGetFeatureAvailability, (owner) => options.services.knowledge.getFeatureAvailability(owner))
+  registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))
+  registerKnowledge(ipcChannels.knowledgeGetConsent, (owner) => options.services.knowledge.getConsent(owner))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 

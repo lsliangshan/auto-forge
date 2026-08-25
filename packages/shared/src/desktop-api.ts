@@ -86,7 +86,22 @@ export const knowledgeConsentStateSchema = z.object({
 }).strict()
 export type KnowledgeConsentState = z.infer<typeof knowledgeConsentStateSchema>
 
-export const knowledgeFeatureAvailabilitySchema = z.object({
+const knowledgeLocalAvailabilitySchema = z.object({
+  available: z.boolean(),
+  reasons: z.array(z.enum([
+    'native_dependency_unavailable',
+    'encrypted_storage_unavailable',
+    'safe_storage_unavailable',
+    'fts_unavailable',
+    'packaging_unverified',
+  ])).max(5),
+}).strict().superRefine(({ available, reasons }, context) => {
+  if ((available && reasons.length > 0) || (!available && reasons.length === 0)) {
+    context.addIssue({ code: 'custom', message: 'Knowledge availability must fail closed with explicit reasons' })
+  }
+})
+
+const knowledgeCloudAvailabilitySchema = z.object({
   available: z.boolean(),
   reasons: z.array(z.enum([
     'native_dependency_unavailable',
@@ -101,6 +116,11 @@ export const knowledgeFeatureAvailabilitySchema = z.object({
     context.addIssue({ code: 'custom', message: 'Knowledge availability must fail closed with explicit reasons' })
   }
 })
+
+export const knowledgeFeatureAvailabilitySchema = z.object({
+  local: knowledgeLocalAvailabilitySchema,
+  cloud: knowledgeCloudAvailabilitySchema,
+}).strict()
 export type KnowledgeFeatureAvailability = z.infer<typeof knowledgeFeatureAvailabilitySchema>
 
 const browserAuditOriginSchema = z.string().superRefine((value, context) => {

@@ -27,3 +27,12 @@
 
 - Reviewed request schemas: they reject extra fields and never accept paths, user IDs, SQL, caller-selected `topK`, or index IDs. Feature availability exposes only enum reasons, not native exception details.
 - The selection maximum of 32 is a DTO safety bound; the specified retrieval limit is enforced separately at eight evidence results. Actual encrypted persistence, entitlement validation, consent persistence, and selection ownership checks intentionally remain later tasks.
+
+## Fix round 1
+
+- Changed the knowledge IPC service seam so every knowledge operation receives a `KnowledgeOwner` derived solely from `auth.requireSession()`; renderer-provided IDs remain resource identifiers and cannot select an owner.
+- Split feature availability into independently fail-closed `local` and `cloud` scopes. `kill_switch_enabled` is valid only in the cloud scope, allowing local management/export/delete/authorized retrieval to remain available.
+- Covering tests: `packages/shared/src/contracts.test.ts`, `apps/desktop/electron/main/ipc/register-ipc.test.ts`, and `apps/desktop/electron/preload/bridge.test.ts`.
+- RED: `pnpm test packages/shared/src/contracts.test.ts apps/desktop/electron/preload/bridge.test.ts apps/desktop/electron/main/ipc/register-ipc.test.ts` — 3 failures (the new scoped-availability contract and two owner-propagation assertions).
+- GREEN: `pnpm --filter @autoforge/shared build && pnpm test packages/shared/src/contracts.test.ts apps/desktop/electron/preload/bridge.test.ts apps/desktop/electron/main/ipc/register-ipc.test.ts` — 3 files, 120 tests passed.
+- Typecheck: `pnpm --filter @autoforge/shared typecheck && pnpm --filter @autoforge/desktop typecheck` — both passed; `git diff --check` passed.

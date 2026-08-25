@@ -24,7 +24,7 @@ export interface KnowledgePersistence {
     conversationId: string,
     selection: KnowledgeSelection,
   ): Promise<KnowledgeSelection>
-  getFeatureAvailability(): Promise<KnowledgeFeatureAvailability>
+  getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability>
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
   getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>
 }

@@ -109,6 +109,17 @@ describe('preload desktop bridge', () => {
     expect(app.api.knowledge).not.toHaveProperty('invoke')
   })
 
+  it('preserves separate local and cloud availability states', async () => {
+    const app = harness()
+    const availability = {
+      local: { available: true, reasons: [] },
+      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+    } as const
+    vi.mocked(app.ipcRenderer.invoke).mockResolvedValueOnce(availability)
+
+    await expect(app.api.knowledge.getFeatureAvailability()).resolves.toEqual(availability)
+  })
+
   it('uses literal fixed channels without exposing a generic transport', async () => {
     const app = harness()
     await app.api.chat.renameConversation('c1', 'Renamed')
