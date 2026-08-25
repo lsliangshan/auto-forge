@@ -441,14 +441,13 @@ function optimisticMessageMutation(
   })
 }
 
-interface MutationReceipt {
-  id: string
-  kind: SyncMutation['kind']
-  entityId: string
-  baseRevision: number
-  resultRevision: number | null
-  payload: unknown
-  receivedAt: string
+type MutationReceipt = RemoteMutation
+type OrdinaryRemoteMutation = Exclude<RemoteMutation, { compacted: true }>
+
+function isCompactedReceipt(
+  mutation: MutationReceipt,
+): mutation is Extract<RemoteMutation, { compacted: true }> {
+  return 'compacted' in mutation && mutation.compacted === true
 }
 
 function requireRemoteRevision(mutation: MutationReceipt): number {
@@ -472,7 +471,11 @@ function requireOwnedConversation(
 }
 
 function sameMutationIdentity(local: SyncMutation, remote: MutationReceipt): boolean {
-  const payloadsMatch = local.kind === 'message.append' && remote.kind === 'message.append'
+  const payloadsMatch = isCompactedReceipt(remote)
+    ? remote.kind !== 'message.append'
+      || (local.kind === 'message.append'
+        && local.payload.conversationId === remote.conversationId)
+    : local.kind === 'message.append' && remote.kind === 'message.append'
     ? isDeepStrictEqual(
         canonicalMessagePayload(local.payload),
         canonicalMessagePayload(remote.payload as typeof local.payload),
@@ -703,7 +706,7 @@ function acknowledgeLocalMutation(
 
 function sameConversationCreate(
   row: z.infer<typeof conversationRowSchema>,
-  mutation: Extract<RemoteMutation, { kind: 'conversation.create' }>,
+  mutation: Extract<OrdinaryRemoteMutation, { kind: 'conversation.create' }>,
 ): boolean {
   return row.title === mutation.payload.title
     && row.titleState === mutation.payload.titleState
@@ -733,7 +736,7 @@ function storedMessage(database: SqliteDatabase, id: string) {
 
 function sameMessageAppend(
   stored: NonNullable<ReturnType<typeof storedMessage>>,
-  mutation: Extract<RemoteMutation, { kind: 'message.append' }>,
+  mutation: Extract<OrdinaryRemoteMutation, { kind: 'message.append' }>,
 ): boolean {
   return stored.id === mutation.payload.id
     && stored.conversationId === mutation.payload.conversationId
@@ -759,6 +762,10 @@ function applyRemoteMutation(
   const matchingEvidence = validateReceiptEvidence(database, mutation)
   if (matchingEvidence !== undefined) {
     acknowledgeLocalMutation(database, ownerUserId, matchingEvidence, mutation, 'evidence')
+    return
+  }
+  if (isCompactedReceipt(mutation)) {
+    applyCompactedRemoteMutation(database, ownerUserId, mutation)
     return
   }
   const revision = requireValidRemoteResult(mutation)
@@ -934,6 +941,44 @@ function applyRemoteMutation(
   }
 }
 
+function applyCompactedRemoteMutation(
+  database: SqliteDatabase,
+  ownerUserId: string,
+  mutation: Extract<RemoteMutation, { compacted: true }>,
+): void {
+  const revision = requireValidRemoteResult(mutation)
+  const conversationId = mutation.kind === 'message.append'
+    ? mutation.conversationId
+    : mutation.entityId
+  const current = remoteConversation(database, ownerUserId, conversationId)
+  // Purged content is never reconstructed from a compacted cursor anchor.
+  if (current === undefined) return
+  if (current.revision > revision) return
+  if (current.revision !== mutation.baseRevision && current.revision !== revision) {
+    throw new UserDataConsistencyError()
+  }
+  const deletedAt = mutation.kind === 'conversation.delete'
+    ? timestamp(mutation.receivedAt)
+    : mutation.kind === 'conversation.restore'
+      ? null
+      : current.deletedAt
+  const result = database.prepare(`
+    UPDATE conversations
+    SET revision = @revision,
+        deleted_at = @deletedAt,
+        sync_state = 'synced',
+        updated_at = MAX(updated_at, @receivedAt)
+    WHERE id = @conversationId
+  `).run({
+    conversationId,
+    revision,
+    deletedAt,
+    receivedAt: timestamp(mutation.receivedAt),
+  })
+  if (result.changes !== 1) throw new UserDataConsistencyError()
+  recomputeConversationSyncState(database, ownerUserId, conversationId)
+}
+
 function conversationPage(
   database: SqliteDatabase,
   ownerUserId: string,
@@ -1094,7 +1139,7 @@ function affectedConversationId(mutation: SyncMutation | RemoteMutation): string
     case 'conversation.restore':
       return mutation.entityId
     case 'message.append':
-      return mutation.payload.conversationId
+      return 'compacted' in mutation ? mutation.conversationId : mutation.payload.conversationId
     default:
       return undefined
   }
@@ -1166,7 +1211,7 @@ function acknowledgePushResults(
     for (const [id, mutation] of sentById) {
       const result = resultById.get(id)
       if (!result) throw new UserDataConsistencyError()
-      const receipt: MutationReceipt = {
+      const receipt = {
         id: mutation.id,
         kind: mutation.kind,
         entityId: mutation.entityId,
@@ -1174,7 +1219,7 @@ function acknowledgePushResults(
         resultRevision: result.revision ?? null,
         payload: mutation.payload,
         receivedAt: mutation.occurredAt,
-      }
+      } as OrdinaryRemoteMutation
       const local = validateOutboxReceipt(database, receipt, false)
       if (local?.state !== 'syncing') throw new UserDataConsistencyError()
       if (result.status === 'applied') {

@@ -575,20 +575,21 @@ describe('workbench', () => {
 
   it('shows an actionable durable sync warning and clears it after recovery', async () => {
     const api = createApi()
+    let listener!: Parameters<DesktopAPI['chat']['onEvent']>[0]
+    vi.mocked(api.chat.onEvent).mockImplementation((value) => { listener = value; return vi.fn() })
     vi.mocked(api.chat.listConversations).mockResolvedValue({
       items: [conversationSummary('visible-conversation', '2026-07-20T00:00:00.000Z')],
-      syncWarningSince: '2026-07-19T00:00:00.000Z',
     })
     const { wrapper } = await mountApp('/chat', api)
 
+    listener({
+      type: 'sync_warning_updated', warningSince: '2026-07-19T00:00:00.000Z',
+    })
     await vi.waitFor(() => expect(wrapper.get('[data-testid="durable-sync-warning"]').text())
       .toContain('24 小时'))
-    vi.mocked(api.chat.listConversations).mockResolvedValue({
-      items: [conversationSummary('visible-conversation', '2026-07-20T00:00:00.000Z')],
-    })
-    await wrapper.get('[data-testid="retry-durable-sync"]').trigger('click')
-    await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith(undefined))
+    listener({ type: 'sync_warning_updated' })
     await vi.waitFor(() => expect(wrapper.find('[data-testid="durable-sync-warning"]').exists()).toBe(false))
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(1)
   })
 
   it('serializes settings patches so older full responses cannot roll back newer fields', async () => {

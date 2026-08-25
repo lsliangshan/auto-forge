@@ -40,6 +40,7 @@ interface SyncEngineDependencies {
   clearTimeout: (handle: TimerHandle) => void
   jitter: (delay: number, attempt: number) => number
   onConversationChanged: (conversationIds: readonly string[]) => void
+  onWarningChanged: (binding: UserDataBindingToken, warningSince?: number) => void
 }
 
 interface ActiveBinding {
@@ -74,15 +75,23 @@ const defaultDependencies: SyncEngineDependencies = {
   clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
   jitter: (delay) => Math.round(delay * (0.75 + Math.random() * 0.5)),
   onConversationChanged: () => undefined,
+  onWarningChanged: () => undefined,
 }
 
 function affectedConversationIds(
-  mutations: readonly { kind: string; entityId: string; payload: unknown }[],
+  mutations: readonly {
+    kind: string
+    entityId: string
+    payload?: unknown
+    conversationId?: string
+  }[],
 ): string[] {
   const ids = new Set<string>()
   for (const mutation of mutations) {
     if (mutation.kind.startsWith('conversation.')) ids.add(mutation.entityId)
-    if (mutation.kind === 'message.append'
+    if (mutation.kind === 'message.append' && mutation.conversationId) {
+      ids.add(mutation.conversationId)
+    } else if (mutation.kind === 'message.append'
       && typeof mutation.payload === 'object'
       && mutation.payload !== null
       && 'conversationId' in mutation.payload
@@ -122,6 +131,8 @@ export class UserDataSyncEngine {
   #binding?: ActiveBinding
   #status: UserDataSyncStatus = { state: 'paused' }
   #timer?: TimerHandle
+  #warningTimer?: TimerHandle
+  #warningSince?: number
   #drainPromise?: Promise<void>
   #lifecycleTail: Promise<void> = Promise.resolve()
   #flushRequested = false
@@ -148,6 +159,7 @@ export class UserDataSyncEngine {
       this.#binding = { generation, userId, deviceId, store: this.stores.open(userId) }
       this.#pullFailureAttempt = 0
       this.#status = { state: 'idle' }
+      this.#refreshWarning(this.#binding)
     })
   }
 
@@ -157,8 +169,10 @@ export class UserDataSyncEngine {
       return Promise.resolve()
     }
     if (this.#status.state === 'retrying') {
+      this.#refreshWarning(binding)
       return this.#drainPromise ?? Promise.resolve()
     }
+    this.#refreshWarning(binding)
     this.#flushRequested = true
     return this.#ensureDrain(binding)
   }
@@ -223,6 +237,7 @@ export class UserDataSyncEngine {
       this.#flushRequested = false
       this.#pullRequested = false
       binding.store.outbox.retryFailed(entityId)
+      this.#refreshWarning(binding)
       if (entityId !== undefined) this.#notify(binding, [entityId])
       this.#status = { state: 'idle' }
       this.#flushRequested = true
@@ -244,15 +259,16 @@ export class UserDataSyncEngine {
     this.#flushRequested = false
     this.#pullRequested = false
     this.#clearTimer()
+    this.#clearWarning(binding)
     if (binding) this.#syncingIds.delete(binding.generation)
     this.#drainPromise = undefined
     this.#status = { state: 'paused' }
   }
 
   status(): UserDataSyncStatus {
-    const oldest = this.#binding?.store.outbox.oldestPendingOrFailedAt()
-    return oldest !== undefined && this.#dependencies.now() - oldest >= SYNC_WARNING_AGE_MS
-      ? { ...this.#status, warningSince: oldest }
+    if (this.#binding && this.#status.state !== 'paused') this.#refreshWarning(this.#binding)
+    return this.#warningSince !== undefined
+      ? { ...this.#status, warningSince: this.#warningSince }
       : { ...this.#status }
   }
 
@@ -279,6 +295,7 @@ export class UserDataSyncEngine {
     this.#flushRequested = false
     this.#pullRequested = false
     this.#clearTimer()
+    this.#clearWarning(binding)
     await this.#drainPromise
     if (binding) {
       for (const id of this.#syncingIds.get(binding.generation) ?? []) {
@@ -458,6 +475,7 @@ export class UserDataSyncEngine {
     } else if (pullOutcome === 'success') {
       this.#status = { state: 'idle' }
     }
+    this.#refreshWarning(binding)
   }
 
   #pushEventBytes(deviceId: string, mutations: readonly SyncMutation[]): number {
@@ -585,6 +603,7 @@ export class UserDataSyncEngine {
 
   #pauseForAuth(): void {
     this.#clearTimer()
+    this.#clearWarning(this.#binding)
     this.#status = { state: 'paused', errorCode: 'AUTH_REQUIRED' }
   }
 
@@ -622,6 +641,51 @@ export class UserDataSyncEngine {
     try {
       this.#dependencies.onConversationChanged([...new Set(conversationIds)])
     } catch { /* Projection notifications are observational. */ }
+  }
+
+  #refreshWarning(binding: ActiveBinding): void {
+    if (!this.#isCurrent(binding)) return
+    this.#clearWarningTimer()
+    const oldest = binding.store.outbox.oldestPendingOrFailedAt()
+    const delay = oldest === undefined
+      ? undefined
+      : oldest + SYNC_WARNING_AGE_MS - this.#dependencies.now()
+    const nextWarning = delay !== undefined && delay <= 0 ? oldest : undefined
+    if (this.#warningSince !== nextWarning) {
+      this.#warningSince = nextWarning
+      try {
+        this.#dependencies.onWarningChanged(
+          { userId: binding.userId, generation: binding.generation },
+          nextWarning,
+        )
+      } catch { /* Warning notifications are observational. */ }
+    }
+    if (delay !== undefined && delay > 0) {
+      this.#warningTimer = this.#dependencies.setTimeout(() => {
+        this.#warningTimer = undefined
+        this.#refreshWarning(binding)
+      }, delay)
+    }
+  }
+
+  #clearWarning(binding?: ActiveBinding): void {
+    this.#clearWarningTimer()
+    if (this.#warningSince === undefined) return
+    this.#warningSince = undefined
+    if (binding) {
+      try {
+        this.#dependencies.onWarningChanged(
+          { userId: binding.userId, generation: binding.generation },
+          undefined,
+        )
+      } catch { /* Warning notifications are observational. */ }
+    }
+  }
+
+  #clearWarningTimer(): void {
+    if (this.#warningTimer === undefined) return
+    this.#dependencies.clearTimeout(this.#warningTimer)
+    this.#warningTimer = undefined
   }
 
   #clearTimer(): void {

@@ -628,6 +628,34 @@ function parseSyncPushResponse(value) {
 }
 
 function parsePulledMutation(value) {
+  if (value?.compacted === true) {
+    const isMessage = value.kind === 'message.append'
+    const allowedKind = [
+      'conversation.create', 'conversation.rename', 'conversation.delete',
+      'conversation.restore', 'message.append',
+    ].includes(value.kind)
+    const requiredKeys = [
+      'id', 'kind', 'entityId', 'baseRevision', 'resultRevision', 'compacted', 'receivedAt',
+      ...(isMessage ? ['conversationId'] : []),
+    ]
+    if (!allowedKind || !hasStrictShape(value, requiredKeys)
+      || !identifier(value.id)
+      || !identifier(value.entityId)
+      || !nonnegativeInteger(value.baseRevision)
+      || (value.resultRevision !== null && !nonnegativeInteger(value.resultRevision))
+      || (isMessage && !identifier(value.conversationId))
+      || !timestamp(value.receivedAt)) return undefined
+    return {
+      id: value.id,
+      kind: value.kind,
+      entityId: value.entityId,
+      baseRevision: value.baseRevision,
+      resultRevision: value.resultRevision,
+      compacted: true,
+      ...(isMessage ? { conversationId: value.conversationId } : {}),
+      receivedAt: value.receivedAt,
+    }
+  }
   const payloadIsValid = value?.kind === 'legacy.import'
     ? validateStoredLegacyReceipt(value.payload)
     : validateMutationPayload(value?.kind, value?.payload)

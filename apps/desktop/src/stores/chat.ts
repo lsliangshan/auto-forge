@@ -947,6 +947,10 @@ export const useChatStore = defineStore('chat', {
       }
     },
     applyChatEvent(event: ChatEvent) {
+      if (event.type === 'sync_warning_updated') {
+        this.syncWarningSince = event.warningSince
+        return
+      }
       if (event.type === 'conversation_updated') {
         this.conversations = mergeConversationPages(
           this.conversations.filter(({ id }) => id !== event.conversationId),

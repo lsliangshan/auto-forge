@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
-import type { SyncMutation } from '@autoforge/shared'
+import type { PulledMutation, SyncMutation } from '@autoforge/shared'
 import { openAppDatabase } from './client.js'
 import { UserDataStoreManager } from './user-data-client.js'
 
@@ -97,6 +97,24 @@ function pulledMutation<T extends SyncMutation>(
     resultRevision: number
     receivedAt: string
   }
+}
+
+function compactedMutation(
+  mutation: SyncMutation,
+  resultRevision: number,
+): PulledMutation {
+  return {
+    id: mutation.id,
+    kind: mutation.kind as 'conversation.create',
+    entityId: mutation.entityId,
+    baseRevision: mutation.baseRevision,
+    resultRevision,
+    compacted: true,
+    receivedAt: '2026-10-24T01:00:00.000Z',
+    ...(mutation.kind === 'message.append'
+      ? { kind: mutation.kind, conversationId: mutation.payload.conversationId }
+      : {}),
+  } as PulledMutation
 }
 
 function deleteConversationMutation(index: number): SyncMutation {
@@ -253,6 +271,62 @@ describe('UserDataStoreManager', () => {
         { entityId: 'offline_text_user_2', baseRevision: 3 },
       ])
     expect(projectedConversation(store, conversationId)?.revision).toBe(4)
+    manager.close()
+  })
+
+  it('replays direct media generation and its later queued mutation without a revision gap', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const local = manager.open('cloud-alice')
+    const conversationId = 'direct_media_conversation'
+    local.outbox.recordWithConversation(
+      createConversationMutation('direct_media_create', conversationId),
+    )
+    local.chatRuns.startMediaGeneration({
+      userMessage: {
+        id: 'direct_media_user', conversationId, role: 'user',
+        blocks: [{ type: 'text', text: 'generate an image' }], createdAt: 2_000,
+      },
+      userAssetIds: [],
+      assistantMessage: {
+        id: 'direct_media_assistant', conversationId, role: 'assistant',
+        blocks: [{
+          type: 'media_generation', blockId: 'direct_media_block',
+          jobId: 'direct_media_request', kind: 'image', status: 'in_progress',
+        }],
+        createdAt: 2_001,
+      },
+      run: {
+        id: 'direct_media_run', conversationId, requestId: 'direct_media_request',
+        userId: 'cloud-alice', provider: 'openrouter', model: 'image-model',
+        status: 'running', startedAt: 2_000,
+      },
+    })
+    const later = {
+      ...appendMessageMutation('direct_media_later_mutation', conversationId, 'direct_media_later'),
+      baseRevision: projectedConversation(local, conversationId)!.revision,
+    }
+    local.outbox.recordWithMessage(later)
+
+    const queued = local.outbox.list(10)
+    expect(queued.map(({ baseRevision }) => baseRevision)).toEqual([0, 1, 2])
+    expect(projectedConversation(local, conversationId)?.revision).toBe(3)
+
+    const remote = manager.open('cloud-bob')
+    remote.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_direct_media',
+      mutations: queued.map((mutation, index) => pulledMutation({
+        id: mutation.id,
+        kind: mutation.kind,
+        entityId: mutation.entityId,
+        baseRevision: mutation.baseRevision,
+        payload: mutation.payload,
+        occurredAt: mutation.occurredAt,
+      } as SyncMutation, index + 1)),
+    }, 1)
+    expect(projectedConversation(remote, conversationId)).toMatchObject({ revision: 3 })
+    expect(remote.messages.listPage({ conversationId, limit: 100 }).items.map(({ id }) => id))
+      .toEqual(['direct_media_user', 'direct_media_later'])
     manager.close()
   })
 
@@ -918,6 +992,34 @@ describe('UserDataStoreManager', () => {
     expect(consumed.prepare('SELECT COUNT(*) AS count FROM sync_receipt_evidence').get())
       .toEqual({ count: 0 })
     consumed.close()
+  })
+
+  it('consumes original duplicate evidence from a payload-free compacted receipt', () => {
+    const root = temporaryRoot()
+    const manager = new UserDataStoreManager(root)
+    const store = manager.open('cloud-alice')
+    const create = createConversationMutation('compacted_evidence_create', 'compacted_evidence')
+    store.outbox.recordWithConversation(create)
+    store.outbox.markSyncing([create.id])
+    store.outbox.acknowledgePushResults(
+      [create], [{ id: create.id, status: 'duplicate', revision: 1 }],
+    )
+
+    expect(() => store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_compacted_evidence',
+      mutations: [compactedMutation(create, 1)],
+    }, 1)).not.toThrow()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_compacted_evidence')
+    expect(projectedConversation(store, create.entityId)).toMatchObject({
+      title: create.payload.title, revision: 1, syncState: 'synced',
+    })
+    manager.close()
+
+    const inspection = new Database(cachePath(root, 'cloud-alice'), { readonly: true })
+    expect(inspection.prepare('SELECT COUNT(*) AS count FROM sync_receipt_evidence').get())
+      .toEqual({ count: 0 })
+    inspection.close()
   })
 
   it('recomputes one conversation projection from all mixed outbox rows', () => {
@@ -1733,7 +1835,7 @@ describe('UserDataStoreManager', () => {
         id: `purged_create_${checkpoint}`, kind: 'conversation.create', entityId: conversationId,
         baseRevision: 0, occurredAt: '2026-06-01T00:00:00.000Z',
         payload: {
-          title: '[deleted conversation]', titleState: 'user_named',
+          title: 'Never reconstruct or redact this title', titleState: 'user_named',
           createdAt: '2026-06-01T00:00:00.000Z',
           lastActivityAt: '2026-06-01T00:01:00.000Z',
           metadataUpdatedAt: '2026-06-01T00:00:00.000Z',
@@ -1744,7 +1846,8 @@ describe('UserDataStoreManager', () => {
         entityId: `purged_message_${checkpoint}`, baseRevision: 1,
         occurredAt: '2026-06-01T00:01:00.000Z',
         payload: {
-          id: `purged_message_${checkpoint}`, conversationId, role: 'user', blocks: [],
+          id: `purged_message_${checkpoint}`, conversationId, role: 'user',
+          blocks: [{ type: 'text', text: 'Never reconstruct or redact this message' }],
           createdAt: '2026-06-01T00:01:00.000Z',
         },
       }
@@ -1752,8 +1855,8 @@ describe('UserDataStoreManager', () => {
         id: `purged_delete_${checkpoint}`, kind: 'conversation.delete', entityId: conversationId,
         baseRevision: 2, occurredAt: '2026-06-01T00:02:00.000Z', payload: {},
       }
-      const prefix = [pulledMutation(create, 1), pulledMutation(message, 2)]
-      const tombstone = pulledMutation(deletion, 3)
+      const prefix = [compactedMutation(create, 1), compactedMutation(message, 2)]
+      const tombstone = compactedMutation(deletion, 3)
 
       if (checkpoint === 'at') {
         store.sync.applyRemotePage({
@@ -1775,7 +1878,7 @@ describe('UserDataStoreManager', () => {
       }
 
       expect(store.conversations.listPage({ limit: 50 }).items).toEqual([])
-      expect(store.messages.get(`purged_message_${checkpoint}`)?.blocks).toEqual([])
+      expect(store.messages.get(`purged_message_${checkpoint}`)).toBeUndefined()
       expect(store.sync.getCheckpoint()?.remoteCursor).toBe(
         checkpoint === 'after' ? 'cursor_after_purge' : 'cursor_purge_tombstone',
       )

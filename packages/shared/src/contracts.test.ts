@@ -343,6 +343,41 @@ describe('cross-process contracts', () => {
     }).success).toBe(false)
   })
 
+  it('accepts only strict server-authored compacted conversation receipts', () => {
+    const compactedMessage = {
+      id: 'message_mutation_1',
+      kind: 'message.append' as const,
+      entityId: 'message_1',
+      conversationId: 'conversation_1',
+      baseRevision: 1,
+      resultRevision: 2,
+      compacted: true as const,
+      receivedAt: '2026-08-24T00:00:00.000Z',
+    }
+    const compactedDelete = {
+      id: 'delete_mutation_1',
+      kind: 'conversation.delete' as const,
+      entityId: 'conversation_1',
+      baseRevision: 2,
+      resultRevision: 3,
+      compacted: true as const,
+      receivedAt: '2026-08-24T00:00:01.000Z',
+    }
+
+    expect(pulledMutationSchema.parse(compactedMessage)).toEqual(compactedMessage)
+    expect(pulledMutationSchema.parse(compactedDelete)).toEqual(compactedDelete)
+    expect(syncMutationSchema.safeParse(compactedMessage).success).toBe(false)
+    for (const invalid of [
+      { ...compactedMessage, payload: { blocks: [{ type: 'text', text: 'secret' }] } },
+      { ...compactedMessage, conversationId: undefined },
+      { ...compactedDelete, conversationId: 'conversation_1' },
+      { ...compactedDelete, secret: 'not allowed' },
+      { ...compactedDelete, kind: 'usage.record' },
+    ]) {
+      expect(pulledMutationSchema.safeParse(invalid).success).toBe(false)
+    }
+  })
+
   it('matches Task 3 token-aware workflow proposal arg sanitization', () => {
     expect(sanitizeOpaqueWorkflowArgs({
       query: 'status:open',
@@ -1394,6 +1429,19 @@ describe('cross-process contracts', () => {
       { tombstone: { deletedAt: '2026-08-25T00:00:00.000Z' } },
     ]) {
       expect(() => chatEventSchema.parse({ ...event, ...privateField })).toThrow()
+    }
+  })
+
+  it('carries a strict owner-free global sync warning state event', () => {
+    const warning = {
+      type: 'sync_warning_updated',
+      warningSince: '2026-08-23T12:00:00.000Z',
+    }
+    expect(chatEventSchema.parse(warning)).toEqual(warning)
+    expect(chatEventSchema.parse({ type: 'sync_warning_updated' }))
+      .toEqual({ type: 'sync_warning_updated' })
+    for (const privateField of [{ userId: 'alice' }, { uid: 'alice' }, { extra: true }]) {
+      expect(() => chatEventSchema.parse({ ...warning, ...privateField })).toThrow()
     }
   })
 

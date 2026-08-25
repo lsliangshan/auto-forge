@@ -844,6 +844,34 @@ describe('CloudBase PostgreSQL user data RPC client', () => {
     await expect(rpc('autoforge_sync_pull', {})).resolves.toEqual(output)
   })
 
+  it('accepts only payload-free compacted receipts emitted by sync pull', async () => {
+    const output = {
+      mutations: [{
+        id: 'message_mutation_1', kind: 'message.append', entityId: 'message_1',
+        conversationId: 'conversation_1', baseRevision: 1, resultRevision: 2,
+        compacted: true, receivedAt: occurredAt,
+      }],
+      cursor: opaqueCursor,
+    }
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse(output)),
+    })
+    await expect(rpc('autoforge_sync_pull', {})).resolves.toEqual(output)
+
+    const forged = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-secret',
+      fetchImpl: vi.fn().mockResolvedValue(mockRpcResponse({
+        ...output,
+        mutations: [{ ...output.mutations[0], payload: { blocks: ['secret'] } }],
+      })),
+    })
+    await expect(forged('autoforge_sync_pull', {}))
+      .rejects.toEqual({ code: 'SERVICE_UNAVAILABLE' })
+  })
+
   it('rejects pulled mutations whose entity identity disagrees with the strict payload', async () => {
     const rpc = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest',

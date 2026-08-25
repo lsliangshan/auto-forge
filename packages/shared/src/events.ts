@@ -259,6 +259,10 @@ const conversationEventSummarySchema = z.object({
 
 export const chatEventSchema = z.discriminatedUnion('type', [
   z.object({
+    type: z.literal('sync_warning_updated'),
+    warningSince: timestampSchema.optional(),
+  }).strict(),
+  z.object({
     type: z.literal('block'),
     conversationId: identifierSchema,
     messageId: identifierSchema,

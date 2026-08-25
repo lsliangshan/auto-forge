@@ -2144,6 +2144,8 @@ describe('AgentOrchestrator', () => {
               ? event.title
               : event.type === 'conversation_updated'
                 ? event.conversation.title
+                : event.type === 'sync_warning_updated'
+                  ? event.warningSince ?? 'cleared'
                 : event.conversationId
       order.push(`emit:${event.type}:${detail}`)
     }

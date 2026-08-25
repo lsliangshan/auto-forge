@@ -1091,7 +1091,7 @@ const pulledMutationBaseShape = {
   receivedAt: timestampSchema,
 }
 
-export const pulledMutationSchema = z.discriminatedUnion('kind', [
+const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
   z.object({
     ...pulledMutationBaseShape,
     kind: z.literal('conversation.create'),
@@ -1159,6 +1159,41 @@ export const pulledMutationSchema = z.discriminatedUnion('kind', [
     })
   }
 })
+
+const compactedPulledMutationBaseShape = {
+  ...pulledMutationBaseShape,
+  compacted: z.literal(true),
+}
+
+export const compactedPulledMutationSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.create'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.rename'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.delete'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.restore'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('message.append'),
+    conversationId: identifierSchema,
+  }).strict(),
+])
+export type CompactedPulledMutation = z.infer<typeof compactedPulledMutationSchema>
+
+export const pulledMutationSchema = z.union([
+  ordinaryPulledMutationSchema,
+  compactedPulledMutationSchema,
+])
 export type PulledMutation = z.infer<typeof pulledMutationSchema>
 
 export const modelTokenUsageSchema = z.object({

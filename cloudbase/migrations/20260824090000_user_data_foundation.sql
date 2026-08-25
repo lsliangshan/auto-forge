@@ -738,15 +738,21 @@ BEGIN
     LIMIT p_limit
   )
   SELECT jsonb_build_object(
-    'mutations', COALESCE(jsonb_agg(jsonb_build_object(
+    'mutations', COALESCE(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
       'id', page.mutation_id,
       'kind', page.kind,
       'entityId', page.entity_id,
       'baseRevision', page.base_revision,
       'resultRevision', page.result_revision,
-      'payload', page.mutation_payload->'payload',
+      'payload', CASE WHEN page.mutation_payload->>'compacted' = 'true'
+        THEN NULL ELSE page.mutation_payload->'payload' END,
+      'compacted', CASE WHEN page.mutation_payload->>'compacted' = 'true'
+        THEN true ELSE NULL END,
+      'conversationId', CASE WHEN page.mutation_payload->>'compacted' = 'true'
+        AND page.kind = 'message.append'
+        THEN page.mutation_payload->'conversationId' ELSE NULL END,
       'receivedAt', autoforge_iso_timestamp(page.received_at)
-    ) ORDER BY page.server_sequence), '[]'::jsonb),
+    )) ORDER BY page.server_sequence), '[]'::jsonb),
     'cursor', COALESCE((array_agg(page.cursor_token::text ORDER BY page.server_sequence DESC))[1], next_cursor)
   ) INTO result
   FROM page;
@@ -1305,59 +1311,66 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   purged_count bigint;
+  purge_before timestamptz := clock_timestamp() - interval '30 days';
+  candidate_snapshot jsonb;
+  purge_candidates jsonb := '[]'::jsonb;
+  candidate record;
+  locked_deleted_at timestamptz;
 BEGIN
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'ownerUserId', conversation.owner_user_id,
+    'conversationId', conversation.id
+  ) ORDER BY conversation.owner_user_id, conversation.id), '[]'::jsonb)
+  INTO candidate_snapshot
+  FROM app_conversations conversation
+  WHERE conversation.deleted_at < purge_before;
+
+  FOR candidate IN
+    SELECT * FROM jsonb_to_recordset(candidate_snapshot)
+      AS item("ownerUserId" bigint, "conversationId" varchar)
+    ORDER BY "ownerUserId", "conversationId"
+  LOOP
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+      candidate."ownerUserId"::text || ':' || candidate."conversationId", 0
+    ));
+    SELECT conversation.deleted_at INTO locked_deleted_at
+    FROM app_conversations conversation
+    WHERE conversation.owner_user_id = candidate."ownerUserId"
+      AND conversation.id = candidate."conversationId"
+    FOR UPDATE;
+    IF FOUND AND locked_deleted_at < purge_before THEN
+      purge_candidates := purge_candidates || jsonb_build_array(jsonb_build_object(
+        'ownerUserId', candidate."ownerUserId",
+        'conversationId', candidate."conversationId"
+      ));
+    END IF;
+  END LOOP;
+
   UPDATE app_usage_events usage
   SET conversation_id = NULL
-  WHERE EXISTS (
-    SELECT 1
-    FROM app_conversations conversation
-    WHERE conversation.owner_user_id = usage.owner_user_id
-      AND conversation.id = usage.conversation_id
-      AND conversation.deleted_at < clock_timestamp() - interval '30 days'
-  );
+  FROM jsonb_to_recordset(purge_candidates)
+    AS candidate("ownerUserId" bigint, "conversationId" varchar)
+  WHERE usage.owner_user_id = candidate."ownerUserId"
+    AND usage.conversation_id = candidate."conversationId";
 
   WITH compacted AS (
     SELECT mutation.server_sequence,
-           jsonb_build_object(
-             'id', mutation.mutation_id,
-             'kind', mutation.kind,
-             'entityId', mutation.entity_id,
-             'baseRevision', mutation.base_revision,
-             'payload', CASE
-               WHEN mutation.kind = 'conversation.create' THEN jsonb_build_object(
-                 'title', '[deleted conversation]',
-                 'titleState', 'user_named',
-                 'createdAt', mutation.mutation_payload->'payload'->'createdAt',
-                 'lastActivityAt', mutation.mutation_payload->'payload'->'lastActivityAt',
-                 'metadataUpdatedAt', mutation.mutation_payload->'payload'->'metadataUpdatedAt'
-               )
-               WHEN mutation.kind = 'conversation.rename' THEN jsonb_build_object(
-                 'title', '[deleted conversation]',
-                 'titleState', 'user_named',
-                 'metadataUpdatedAt', mutation.mutation_payload->'payload'->'metadataUpdatedAt'
-               )
-               WHEN mutation.kind = 'message.append' THEN jsonb_build_object(
-                 'id', mutation.mutation_payload->'payload'->'id',
-                 'conversationId', mutation.mutation_payload->'payload'->'conversationId',
-                 'role', mutation.mutation_payload->'payload'->'role',
-                 'blocks', '[]'::jsonb,
-                 'createdAt', mutation.mutation_payload->'payload'->'createdAt'
-               )
-               ELSE '{}'::jsonb
-             END,
-             'occurredAt', mutation.mutation_payload->'occurredAt'
-           ) AS mutation_payload
+           jsonb_strip_nulls(jsonb_build_object(
+             'compacted', true,
+             'conversationId', CASE WHEN mutation.kind = 'message.append'
+               THEN mutation.mutation_payload->'payload'->'conversationId' ELSE NULL END
+           )) AS mutation_payload
     FROM app_sync_mutations mutation
-    JOIN app_conversations conversation
-      ON conversation.owner_user_id = mutation.owner_user_id
-     AND conversation.deleted_at < clock_timestamp() - interval '30 days'
+    JOIN jsonb_to_recordset(purge_candidates)
+      AS candidate("ownerUserId" bigint, "conversationId" varchar)
+      ON candidate."ownerUserId" = mutation.owner_user_id
      AND (
        mutation.kind IN (
          'conversation.create', 'conversation.rename', 'conversation.delete',
          'conversation.restore'
-       ) AND mutation.entity_id = conversation.id
+       ) AND mutation.entity_id = candidate."conversationId"
        OR mutation.kind = 'message.append'
-         AND mutation.mutation_payload->'payload'->>'conversationId' = conversation.id
+         AND mutation.mutation_payload->'payload'->>'conversationId' = candidate."conversationId"
      )
   )
   UPDATE app_sync_mutations mutation
@@ -1366,7 +1379,10 @@ BEGIN
   WHERE mutation.server_sequence = compacted.server_sequence;
 
   DELETE FROM app_conversations conversation
-  WHERE conversation.deleted_at < clock_timestamp() - interval '30 days';
+  USING jsonb_to_recordset(purge_candidates)
+    AS candidate("ownerUserId" bigint, "conversationId" varchar)
+  WHERE conversation.owner_user_id = candidate."ownerUserId"
+    AND conversation.id = candidate."conversationId";
   GET DIAGNOSTICS purged_count = ROW_COUNT;
   RETURN purged_count;
 END;

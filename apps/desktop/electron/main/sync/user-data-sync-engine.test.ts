@@ -120,34 +120,34 @@ class FakeClock {
   readonly delays: number[] = []
   readonly cleared: unknown[] = []
   #nextId = 1
-  #timers = new Map<number, () => void>()
+  #timers = new Map<number, { callback: () => void; delay: number }>()
 
   now = () => this.nowValue
   setTimeout = (callback: () => void, delay: number): number => {
     const id = this.#nextId++
     this.delays.push(delay)
-    this.#timers.set(id, callback)
+    this.#timers.set(id, { callback, delay })
     return id
   }
   clearTimeout = (id: unknown): void => {
-    this.cleared.push(id)
+    const timer = this.#timers.get(id as number)
+    if (timer && timer.delay <= 5 * 60 * 1_000) this.cleared.push(id)
     this.#timers.delete(id as number)
   }
   nextDelay(): number | undefined {
-    return this.delays.at(-1)
+    return [...this.#timers.values()].sort((left, right) => left.delay - right.delay)[0]?.delay
   }
   async fireNext(): Promise<void> {
-    const entry = this.#timers.entries().next().value as [number, () => void] | undefined
+    const entry = [...this.#timers.entries()].sort((left, right) => left[1].delay - right[1].delay)[0]
     if (!entry) throw new Error('No timer scheduled')
-    const [id, callback] = entry
+    const [id, timer] = entry
     this.#timers.delete(id)
-    const delay = this.delays.at(-1) ?? 0
-    this.nowValue += delay
-    callback()
+    this.nowValue += timer.delay
+    timer.callback()
     await Promise.resolve()
   }
   timerCount(): number {
-    return this.#timers.size
+    return [...this.#timers.values()].filter(({ delay }) => delay <= 5 * 60 * 1_000).length
   }
 }
 
@@ -156,6 +156,8 @@ function createEngine(
   call: (input: CloudBaseUserDataCall) => Promise<UserDataFunctionResponse>,
   clock = new FakeClock(),
   onConversationChanged: (conversationIds: readonly string[]) => void = () => undefined,
+  onWarningChanged: (binding: { userId: string; generation: number }, warningSince?: number) => void
+    = () => undefined,
 ) {
   return {
     clock,
@@ -165,6 +167,7 @@ function createEngine(
       clearTimeout: clock.clearTimeout,
       jitter: (delay) => delay,
       onConversationChanged,
+      onWarningChanged,
     }),
   }
 }
@@ -189,6 +192,46 @@ describe('UserDataSyncEngine', () => {
 
       expect(engine.status()).toMatchObject({ state: 'idle', warningSince: 1_000 })
       store.outbox.delete(mutation.id)
+      expect(engine.status()).toEqual({ state: 'idle' })
+    } finally {
+      manager.close()
+      now.mockRestore()
+    }
+  })
+
+  it('emits an owner-scoped durable warning at the idle threshold and clears on recovery', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const manager = createManager()
+    try {
+      const store = manager.open('alice')
+      const mutation: SyncMutation = {
+        id: 'privacy_warning_mutation', kind: 'privacy.consent',
+        entityId: 'privacy-warning-v1', baseRevision: 0,
+        payload: {
+          purpose: 'cloud_sync', documentVersion: 'privacy-warning-v1',
+          consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+        },
+        occurredAt: '2026-08-25T00:00:00.000Z',
+      }
+      store.outbox.record(mutation)
+      const events: Array<{ userId: string; generation: number; warningSince?: number }> = []
+      const { engine, clock } = createEngine(
+        manager,
+        async () => success({ mutations: [], cursor: null }),
+        new FakeClock(),
+        undefined,
+        (binding, warningSince) => events.push({ ...binding, warningSince }),
+      )
+      clock.nowValue = 1_000
+      await engine.start('alice', 'device-a')
+
+      expect(clock.nextDelay()).toBe(24 * 60 * 60 * 1_000)
+      await clock.fireNext()
+      expect(events).toEqual([{ userId: 'alice', generation: 2, warningSince: 1_000 }])
+
+      store.outbox.delete(mutation.id)
+      await engine.flush()
+      expect(events.at(-1)).toEqual({ userId: 'alice', generation: 2, warningSince: undefined })
       expect(engine.status()).toEqual({ state: 'idle' })
     } finally {
       manager.close()
@@ -691,19 +734,30 @@ describe('UserDataSyncEngine', () => {
     expect(store.outbox.listReady(Number.MAX_SAFE_INTEGER, 100)).toEqual([])
   })
 
-  it('treats an identical duplicate receipt as replay-safe', async () => {
+  it('reconciles a lost applied response through duplicate push and compacted pull', async () => {
     const manager = createManager()
     const store = manager.open('alice')
     const mutation = createMutation(2)
     store.outbox.recordWithConversation(mutation)
+    const compacted = {
+      id: mutation.id,
+      kind: mutation.kind,
+      entityId: mutation.entityId,
+      baseRevision: mutation.baseRevision,
+      resultRevision: 1,
+      compacted: true as const,
+      receivedAt: '2026-10-25T00:00:00.000Z',
+    }
     const { engine } = createEngine(manager, async (input) => input.action === 'syncPush'
       ? success({ results: [{ id: mutation.id, status: 'duplicate', revision: 1 }], cursor: 'cursor_duplicate_push' })
-      : success({ mutations: [], cursor: null }))
+      : success({ mutations: [compacted], cursor: 'cursor_compacted_receipt' }))
 
     await engine.start('alice', 'device-a')
     await engine.flush()
 
     expect(store.outbox.find(mutation.id)).toBeUndefined()
+    expect(store.sync.getCheckpoint()?.remoteCursor).toBe('cursor_compacted_receipt')
+    expect(store.conversations.get(mutation.entityId)?.title).toBe(mutation.payload.title)
     expect(engine.status()).toEqual({ state: 'idle' })
   })
 

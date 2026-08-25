@@ -705,8 +705,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       ? new CloudBaseUserDataPort(cloudBasePorts.functions)
       : { call: async () => { throw failure('SERVICE_UNAVAILABLE') } })
   let notifyConversationChanges: (conversationIds: readonly string[]) => void = () => undefined
+  let notifySyncWarning: (
+    binding: { userId: string; generation: number }, warningSince?: number,
+  ) => void = () => undefined
   const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores, {
     onConversationChanged: (conversationIds) => { notifyConversationChanges(conversationIds) },
+    onWarningChanged: (binding, warningSince) => { notifySyncWarning(binding, warningSince) },
   })
   const legacyUserDataImporter = new LegacyUserDataImporter(database, userDataSync)
   const storedDeviceId = database.appSettings.get('user-data.device-id.v1')?.value
@@ -739,6 +743,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await userDataSync.start(session.user.id, deviceId)
       await bindUserMedia(session)
       boundUserId = session.user.id
+      const warningSince = userDataSync.status().warningSince
+      if (warningSince !== undefined) {
+        notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
+      }
       await userDataSync.pull()
       activateUserReconciliation(runtimeRecovered)
       await activateVideoJobs(runtimeRecovered)
@@ -1241,6 +1249,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     now: Date.now,
   })
   const emitChat = (event: ChatEvent) => {
+    if (event.type === 'sync_warning_updated') {
+      try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
+      return
+    }
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
       activeRequests.delete(event.requestId)
       if (userReconciliationActive) providerUsageReconciliationLoop.notifyUsageEnded()
@@ -1306,6 +1318,20 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         emitChat({ type: 'conversation_removed', conversationId })
       }
     }
+  }
+  notifySyncWarning = (binding, warningSince) => {
+    if (boundUserId !== binding.userId || auth.currentUserId() !== binding.userId) return
+    try {
+      if (userDataSync.captureBinding(binding.userId).generation !== binding.generation) return
+    } catch {
+      return
+    }
+    emitChat({
+      type: 'sync_warning_updated',
+      ...(warningSince === undefined ? {} : {
+        warningSince: new Date(warningSince).toISOString(),
+      }),
+    })
   }
   const conversationContext = createConversationContextManager(chatDatabase)
   const agent = new AgentOrchestrator({
