@@ -82,6 +82,11 @@ function parseAction(event, uid) {
         p_document_id: event.documentId, p_version_id: event.versionId,
         p_byte_size: event.byteSize, p_sha256: event.sha256,
       }]
+    case 'completeUpload':
+      if (!nonEmptyString(event.uploadTicket)) return undefined
+      return ['autoforge_knowledge_get_upload', {
+        ...common, p_upload_ticket: event.uploadTicket,
+      }]
     case 'pushMutation':
       if (!nonEmptyString(event.mutationId)
         || !nonEmptyString(event.knowledgeBaseId)
@@ -137,10 +142,13 @@ function parseAction(event, uid) {
         || !Array.isArray(event.storageReferences)
         || event.storageReferences.length < 1 || event.storageReferences.length > 100
         || event.storageReferences.some(reference => !nonEmptyString(reference, 512))) return undefined
-      return ['autoforge_knowledge_cleanup_orphans', {
+      return ['autoforge_knowledge_prepare_orphan_cleanup', {
         ...common, p_request_id: event.requestId, p_knowledge_base_id: event.knowledgeBaseId,
         p_storage_references: event.storageReferences,
       }]
+    case 'getJob':
+      if (!nonEmptyString(event.jobId)) return undefined
+      return ['autoforge_knowledge_get_job', { ...common, p_job_id: event.jobId }]
     case 'getEntitlement':
       return ['autoforge_knowledge_get_entitlement', common]
     default:
@@ -148,7 +156,7 @@ function parseAction(event, uid) {
   }
 }
 
-function createKnowledgeHandler({ rpc }) {
+function createKnowledgeHandler({ rpc, storage }) {
   return async (rawEvent, context) => {
     const uid = callerUid(context)
     if (!uid) return { ok: false, error: { code: 'AUTH_REQUIRED' } }
@@ -156,10 +164,70 @@ function createKnowledgeHandler({ rpc }) {
     const parsed = parseAction(event, uid)
     if (!parsed) return { ok: false, error: { code: 'INVALID_INPUT' } }
     try {
-      return { ok: true, data: await rpc(parsed[0], parsed[1]) }
+      const data = await rpc(parsed[0], parsed[1])
+      if (event.action === 'authorizeUpload') {
+        if (!storage) throw { code: 'INTERNAL_ERROR' }
+        const uploadAuthorization = await storage.createUploadAuthorization({
+          uploadTicket: data.uploadTicket,
+          storageReference: data.storageReference,
+          byteSize: event.byteSize,
+          sha256: event.sha256,
+          expiresAt: data.expiresAt,
+        })
+        return { ok: true, data: { ...data, uploadAuthorization } }
+      }
+      if (event.action === 'completeUpload') {
+        if (!storage) throw { code: 'INTERNAL_ERROR' }
+        const observed = await storage.statObject(data.storageReference)
+        return { ok: true, data: await rpc('autoforge_knowledge_verify_upload', {
+          p_caller_user_id: uid, p_upload_ticket: event.uploadTicket,
+          p_actual_byte_size: observed.byteSize, p_actual_sha256: observed.sha256,
+        }) }
+      }
+      if (event.action === 'cleanupOrphans') {
+        if (!storage) throw { code: 'INTERNAL_ERROR' }
+        await storage.deleteObjects(data.storageReferences)
+        return { ok: true, data: await rpc('autoforge_knowledge_complete_orphan_cleanup', {
+          p_caller_user_id: uid, p_request_id: event.requestId,
+          p_knowledge_base_id: event.knowledgeBaseId,
+          p_storage_references: data.storageReferences,
+        }) }
+      }
+      return { ok: true, data }
     } catch (error) {
       return { ok: false, error: { code: safeErrorCode(error) } }
     }
+  }
+}
+
+function createPostgresStorageClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
+  if (!baseUrl || !serviceKey) throw new Error('CloudBase PostgreSQL Storage is not configured')
+  const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
+  async function request(path, body, allowEmpty = false) {
+    let response
+    try {
+      response = await fetchImpl(`${normalizedBaseUrl}${path}`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${serviceKey}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    } catch {
+      throw { code: 'TRANSIENT_FAILURE' }
+    }
+    const result = await response.json().catch(() => undefined)
+    if (response.ok && (isRecord(result) || allowEmpty)) return result
+    throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
+  }
+  return {
+    createUploadAuthorization(input) {
+      return request('/upload-authorizations', input)
+    },
+    statObject(storageReference) {
+      return request('/objects/stat', { storageReference })
+    },
+    async deleteObjects(storageReferences) {
+      await request('/objects/delete', { storageReferences }, true)
+    },
   }
 }
 
@@ -185,4 +253,4 @@ function createPostgresRpcClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
   }
 }
 
-module.exports = { createKnowledgeHandler, createPostgresRpcClient }
+module.exports = { createKnowledgeHandler, createPostgresRpcClient, createPostgresStorageClient }

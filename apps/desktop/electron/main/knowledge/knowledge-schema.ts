@@ -307,6 +307,7 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
       knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
       mode TEXT NOT NULL CHECK (mode IN ('local_only', 'syncing', 'synced', 'paused', 'converting', 'failed')),
       published_generation_id TEXT,
+      epoch INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
       updated_at INTEGER NOT NULL
     ) STRICT;
 
@@ -336,10 +337,26 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
       created_at INTEGER NOT NULL
     ) STRICT;
 
+    CREATE TABLE IF NOT EXISTS cloud_sync_conversions (
+      knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+      operation_id TEXT NOT NULL UNIQUE,
+      request_id TEXT NOT NULL UNIQUE,
+      state TEXT NOT NULL CHECK (state IN ('downloading', 'verified', 'purge_accepted', 'completed')),
+      expected_published_generation_id TEXT,
+      previous_mode TEXT NOT NULL CHECK (previous_mode IN ('local_only', 'syncing', 'synced', 'paused', 'failed')),
+      expected_digest TEXT,
+      actual_digest TEXT,
+      deletion_job_id TEXT,
+      error_code TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+
     CREATE TABLE IF NOT EXISTS conflicts (
       id TEXT PRIMARY KEY,
       knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
       entity_kind TEXT NOT NULL,
+      conflict_kind TEXT NOT NULL CHECK (conflict_kind IN ('content', 'delete_vs_update')),
       entity_id TEXT NOT NULL,
       local_version TEXT,
       remote_version TEXT,

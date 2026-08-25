@@ -68,10 +68,16 @@ export type CloudPushMutationResult = z.infer<typeof pushResultSchema>
 const changesSchema = z.object({
   kind: z.literal('incremental'),
   nextSequence: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
   changes: z.array(changeSchema).max(1_000),
 }).strict()
 const staleCursorSchema = z.object({ kind: z.literal('cursor_stale') }).strict()
 export type CloudPullChangesResult = z.infer<typeof changesSchema> | z.infer<typeof staleCursorSchema>
+const snapshotSchema = z.object({
+  kind: z.literal('snapshot'),
+  nextSequence: z.number().int().nonnegative(),
+  changes: z.array(changeSchema).max(100_000),
+}).strict()
 
 const publishedSchema = z.object({
   generationId: identifier,
@@ -84,6 +90,12 @@ const uploadAuthorizationSchema = z.object({
   objectId: identifier,
   jobId: identifier,
   expiresAt: z.string().datetime(),
+  uploadAuthorization: z.object({
+    url: z.string().url().refine(value => value.startsWith('https://')),
+    method: z.literal('PUT'),
+    headers: z.record(z.string(), z.string().max(1_024)),
+    expiresAt: z.string().datetime(),
+  }).strict(),
 }).strict()
 const cloudEntitlementSchema = z.object({
   tier: z.enum(['free', 'member']),
@@ -204,17 +216,16 @@ export class CloudBaseKnowledgeClient {
       'pullChanges', { ...parsed.data, limit: 1_000 }, z.union([changesSchema, staleCursorSchema]),
     )
     if (result.kind === 'incremental'
-      && (result.nextSequence < parsed.data.afterSequence
-        || result.changes.some(change => change.sequence > result.nextSequence))) {
+      && !validPage(result, parsed.data.afterSequence)) {
       throw new CloudKnowledgeError('INTERNAL_ERROR')
     }
     return result
   }
 
-  fullResync(input: { knowledgeBaseId: string }): Promise<z.infer<typeof changesSchema>> {
+  fullResync(input: { knowledgeBaseId: string }): Promise<z.infer<typeof snapshotSchema>> {
     const parsed = z.object({ knowledgeBaseId: identifier }).strict().safeParse(input)
     if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
-    return this.invoke('fullResync', parsed.data, changesSchema)
+    return this.invoke('fullResync', parsed.data, snapshotSchema)
   }
 
   publishGeneration(input: PublishGenerationInput): Promise<z.infer<typeof publishedSchema>> {
@@ -257,10 +268,38 @@ export class CloudBaseKnowledgeClient {
     const parsed = z.object({
       requestId: identifier,
       knowledgeBaseId: identifier,
-      storageReferences: z.array(identifier).min(1).max(100),
+      storageReferences: z.array(z.string().trim().min(1).max(512)).min(1).max(100),
     }).strict().safeParse(input)
     if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
     return this.invoke('cleanupOrphans', parsed.data, z.object({ removed: z.number().int().nonnegative() }).strict())
+  }
+
+  completeUpload(input: { uploadTicket: string }): Promise<{
+    objectId: string
+    storageReference: string
+    verified: true
+  }> {
+    const parsed = z.object({ uploadTicket: identifier }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('completeUpload', parsed.data, z.object({
+      objectId: identifier,
+      storageReference: z.string().trim().min(1).max(512),
+      verified: z.literal(true),
+    }).strict())
+  }
+
+  getJob(input: { jobId: string }): Promise<{
+    jobId: string
+    state: 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+    errorCode: string | null
+  }> {
+    const parsed = z.object({ jobId: identifier }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('getJob', parsed.data, z.object({
+      jobId: identifier,
+      state: z.enum(['queued', 'running', 'paused', 'completed', 'failed', 'cancelled']),
+      errorCode: z.string().max(64).nullable(),
+    }).strict())
   }
 
   private async invoke<T>(action: string, data: Record<string, unknown>, schema: z.ZodType<T>): Promise<T> {
@@ -283,4 +322,19 @@ export class CloudBaseKnowledgeClient {
     if (!result.success) throw new CloudKnowledgeError('INTERNAL_ERROR')
     return result.data
   }
+}
+
+function validPage(
+  page: z.infer<typeof changesSchema>,
+  afterSequence: number,
+): boolean {
+  let previous = afterSequence
+  for (const change of page.changes) {
+    if (change.sequence <= previous) return false
+    previous = change.sequence
+  }
+  if (page.changes.length === 0) {
+    return !page.hasMore && page.nextSequence === afterSequence
+  }
+  return page.nextSequence === previous && (!page.hasMore || page.nextSequence > afterSequence)
 }

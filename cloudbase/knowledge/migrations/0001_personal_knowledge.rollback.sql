@@ -1,9 +1,12 @@
 BEGIN;
 
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM service_role;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_orphans(varchar, varchar, varchar, jsonb) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(varchar, varchar, varchar, jsonb) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_orphan_cleanup(varchar, varchar, varchar, jsonb) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_job(varchar, varchar, varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_delete_base(varchar, varchar, varchar, varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_publish_generation(varchar, varchar, varchar, varchar, varchar) FROM service_role;
@@ -11,12 +14,17 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar) 
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM service_role;
 
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_retention(varchar, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_claim_job(varchar, varchar, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_entitlement(varchar);
-DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_orphans(varchar, varchar, varchar, jsonb);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_job(varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_orphan_cleanup(varchar, varchar, varchar, jsonb);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_prepare_orphan_cleanup(varchar, varchar, varchar, jsonb);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cancel_job(varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_delete_base(varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_publish_generation(varchar, varchar, varchar, varchar, varchar);
@@ -24,6 +32,8 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_full_resync(varchar, varchar)
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_upload(varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_require_cloud(bigint);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_caller(varchar);
@@ -34,8 +44,15 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_reject_mutation();
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_generation_lifecycle();
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_version_lifecycle();
 
+ALTER TABLE IF EXISTS public.knowledge_bases
+  DROP CONSTRAINT IF EXISTS knowledge_bases_published_generation_owner_fk;
+ALTER TABLE IF EXISTS public.knowledge_documents
+  DROP CONSTRAINT IF EXISTS knowledge_documents_active_version_owner_fk;
+
 DROP TABLE IF EXISTS public.knowledge_requests;
 DROP TABLE IF EXISTS public.knowledge_entitlements;
+DROP TABLE IF EXISTS public.knowledge_upload_authorizations;
+DROP TABLE IF EXISTS public.knowledge_sync_floors;
 DROP TABLE IF EXISTS public.knowledge_conflicts;
 DROP TABLE IF EXISTS public.knowledge_tombstones;
 DROP TABLE IF EXISTS public.knowledge_changes;

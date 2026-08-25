@@ -21,7 +21,7 @@ export interface CloudKnowledgeRemote {
   pushMutation(input: PushMutationInput): Promise<CloudPushMutationResult>
   pullChanges(input: { knowledgeBaseId: string; afterSequence: number }): Promise<CloudPullChangesResult>
   fullResync(input: { knowledgeBaseId: string }): Promise<{
-    kind: 'incremental'
+    kind: 'snapshot'
     nextSequence: number
     changes: CloudKnowledgeChange[]
   }>
@@ -35,6 +35,11 @@ export interface CloudKnowledgeRemote {
     knowledgeBaseId: string
     expectedPublishedGenerationId: string | null
   }): Promise<{ deletionJobId: string }>
+  getJob(input: { jobId: string }): Promise<{
+    jobId: string
+    state: 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+    errorCode: string | null
+  }>
   cancelJob(input: { requestId: string; jobId: string }): Promise<void>
   cleanupOrphans(input: {
     requestId: string
@@ -65,6 +70,23 @@ interface MutationRow {
   leaseToken: string
 }
 
+interface SyncResult {
+  status: 'offline' | 'paused' | 'synced' | 'failed'
+  processed: number
+  conflicts: number
+}
+
+interface ConversionRow {
+  operationId: string
+  requestId: string
+  state: 'downloading' | 'verified' | 'purge_accepted' | 'completed'
+  expectedPublishedGenerationId: string | null
+  deletionJobId: string | null
+  expectedDigest: string | null
+  actualDigest: string | null
+  previousMode: CloudSyncMode
+}
+
 interface ErrorShape {
   code?: unknown
   retryable?: unknown
@@ -78,7 +100,7 @@ function classified(error: unknown): { code: string; retryable: boolean } {
   const candidate = typeof error === 'object' && error !== null ? error as ErrorShape : {}
   return {
     code: typeof candidate.code === 'string' ? candidate.code : 'INTERNAL_ERROR',
-    retryable: candidate.retryable === true,
+    retryable: candidate.code === 'TRANSIENT_FAILURE' && candidate.retryable === true,
   }
 }
 
@@ -90,6 +112,8 @@ function encodePayload(value: Record<string, unknown>): string {
 }
 
 export class KnowledgeSyncService {
+  private readonly activeSynchronizations = new Map<string, Promise<SyncResult>>()
+
   constructor(
     private readonly database: Database.Database,
     private readonly remote: CloudKnowledgeRemote,
@@ -133,15 +157,27 @@ export class KnowledgeSyncService {
     generationId: string
   }): Promise<void> {
     if (!this.dependencies.isOnline()) throw syncError('OFFLINE')
+    const control = this.getControl(input.knowledgeBaseId)
     await this.remote.beginSync(input)
+    if (!this.isEpochCurrent(input.knowledgeBaseId, control.epoch)) throw syncError('CONFLICT')
     this.setState(input.knowledgeBaseId, 'syncing', null)
   }
 
-  async synchronize(knowledgeBaseId: string): Promise<{
-    status: 'offline' | 'paused' | 'synced' | 'failed'
-    processed: number
-    conflicts: number
-  }> {
+  synchronize(knowledgeBaseId: string): Promise<SyncResult> {
+    const active = this.activeSynchronizations.get(knowledgeBaseId)
+    if (active) return active
+    const synchronization = this.runSynchronization(knowledgeBaseId)
+    this.activeSynchronizations.set(knowledgeBaseId, synchronization)
+    const clear = () => {
+      if (this.activeSynchronizations.get(knowledgeBaseId) === synchronization) {
+        this.activeSynchronizations.delete(knowledgeBaseId)
+      }
+    }
+    void synchronization.then(clear, clear)
+    return synchronization
+  }
+
+  private async runSynchronization(knowledgeBaseId: string): Promise<SyncResult> {
     const state = this.getState(knowledgeBaseId)
     if (state.mode === 'paused' || state.mode === 'converting') {
       return { status: 'paused', processed: 0, conflicts: 0 }
@@ -149,7 +185,8 @@ export class KnowledgeSyncService {
     if (!this.dependencies.isOnline()) {
       return { status: 'offline', processed: 0, conflicts: 0 }
     }
-    this.setMode(knowledgeBaseId, 'syncing')
+    const epoch = this.setMode(knowledgeBaseId, 'syncing')
+    this.expireTerminalLeases(knowledgeBaseId)
     let processed = 0
     let conflicts = 0
     while (true) {
@@ -165,26 +202,35 @@ export class KnowledgeSyncService {
           baseRevision: mutation.baseRevision,
           payload: JSON.parse(mutation.payloadJson) as Record<string, unknown>,
         })
+        if (!this.isActive(knowledgeBaseId, epoch)) {
+          return { status: 'paused', processed, conflicts }
+        }
         if (result.status === 'conflict') {
           if (this.recordConflict(mutation, result)) conflicts += 1
         } else {
           if (this.completeMutation(mutation)) processed += 1
         }
       } catch (error) {
+        if (!this.isActive(knowledgeBaseId, epoch)) {
+          return { status: 'paused', processed, conflicts }
+        }
         this.failMutation(mutation, error)
       }
     }
 
-    await this.pull(knowledgeBaseId)
+    await this.pull(knowledgeBaseId, epoch)
+    if (!this.isActive(knowledgeBaseId, epoch)) {
+      return { status: 'paused', processed, conflicts }
+    }
     const failures = this.database.prepare(`
       SELECT count(*) AS count FROM cloud_sync_mutations
       WHERE knowledge_base_id = ? AND state = 'failed'
     `).get(knowledgeBaseId) as { count: number }
     if (failures.count > 0) {
-      this.setMode(knowledgeBaseId, 'failed')
+      this.compareAndSetMode(knowledgeBaseId, epoch, 'failed')
       return { status: 'failed', processed, conflicts }
     }
-    this.setMode(knowledgeBaseId, 'synced')
+    this.compareAndSetMode(knowledgeBaseId, epoch, 'synced')
     return { status: 'synced', processed, conflicts }
   }
 
@@ -217,21 +263,26 @@ export class KnowledgeSyncService {
     knowledgeBaseId: string
     generationId: string
   }): Promise<void> {
-    const current = this.getState(input.knowledgeBaseId)
+    const current = this.getControl(input.knowledgeBaseId)
     const published = await this.remote.publishGeneration({
       ...input,
       expectedPublishedGenerationId: current.publishedGenerationId,
     })
+    if (!this.isEpochCurrent(input.knowledgeBaseId, current.epoch)
+      || ['paused', 'converting'].includes(this.getState(input.knowledgeBaseId).mode)) {
+      throw syncError('CONFLICT')
+    }
     const now = this.dependencies.now()
     this.database.transaction(() => {
       this.database.prepare(`
         INSERT INTO cloud_sync_states (
-          knowledge_base_id, mode, published_generation_id, updated_at
-        ) VALUES (?, 'synced', ?, ?)
+          knowledge_base_id, mode, published_generation_id, epoch, updated_at
+        ) VALUES (?, 'synced', ?, 1, ?)
         ON CONFLICT(knowledge_base_id) DO UPDATE SET
           mode = 'synced', published_generation_id = excluded.published_generation_id,
-          updated_at = excluded.updated_at
-      `).run(input.knowledgeBaseId, published.generationId, now)
+          epoch = cloud_sync_states.epoch + 1, updated_at = excluded.updated_at
+        WHERE cloud_sync_states.epoch = ?
+      `).run(input.knowledgeBaseId, published.generationId, now, current.epoch)
       this.upsertCursor(input.knowledgeBaseId, published.sequence, now)
     })()
   }
@@ -244,35 +295,141 @@ export class KnowledgeSyncService {
       actualDigest: string
     }>,
   ): Promise<void> {
-    const previous = this.getState(knowledgeBaseId)
-    this.setMode(knowledgeBaseId, 'converting')
-    try {
+    let conversion = this.database.prepare(`
+      SELECT operation_id AS operationId, request_id AS requestId, state,
+        expected_published_generation_id AS expectedPublishedGenerationId,
+        deletion_job_id AS deletionJobId, expected_digest AS expectedDigest,
+        actual_digest AS actualDigest, previous_mode AS previousMode
+      FROM cloud_sync_conversions WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId) as ConversionRow | undefined
+    if (!conversion) {
+      const previous = this.getState(knowledgeBaseId)
+      const operationId = this.dependencies.id()
+      const requestId = this.dependencies.id()
+      const now = this.dependencies.now()
+      this.database.transaction(() => {
+        this.database.prepare(`
+          INSERT INTO cloud_sync_conversions (
+            knowledge_base_id, operation_id, request_id, state,
+            expected_published_generation_id, previous_mode, created_at, updated_at
+          ) VALUES (?, ?, ?, 'downloading', ?, ?, ?, ?)
+        `).run(
+          knowledgeBaseId, operationId, requestId, previous.publishedGenerationId,
+          previous.mode, now, now,
+        )
+        this.setMode(knowledgeBaseId, 'converting')
+      })()
+      conversion = {
+        operationId, requestId, state: 'downloading',
+        expectedPublishedGenerationId: previous.publishedGenerationId,
+        deletionJobId: null, expectedDigest: null, actualDigest: null,
+        previousMode: previous.mode,
+      }
+    }
+    if (conversion.state === 'downloading') {
       const verification = await downloadAndVerify()
       if (!verification.complete
         || !verification.expectedDigest
         || verification.expectedDigest !== verification.actualDigest) {
+        const previousMode = conversion.previousMode
+        const expectedPublishedGenerationId = conversion.expectedPublishedGenerationId
+        this.database.transaction(() => {
+          this.database.prepare(
+            'DELETE FROM cloud_sync_conversions WHERE knowledge_base_id = ?',
+          ).run(knowledgeBaseId)
+          this.setState(
+            knowledgeBaseId, previousMode, expectedPublishedGenerationId,
+          )
+        })()
         throw syncError('INTEGRITY_FAILED')
       }
-      await this.remote.deleteKnowledgeBase({
-        requestId: this.dependencies.id(),
-        knowledgeBaseId,
-        expectedPublishedGenerationId: previous.publishedGenerationId,
-      })
-      const now = this.dependencies.now()
-      this.database.transaction(() => {
-        this.database.prepare('DELETE FROM sync_cursors WHERE knowledge_base_id = ?').run(knowledgeBaseId)
-        this.database.prepare(`
-          INSERT INTO cloud_sync_states (
-            knowledge_base_id, mode, published_generation_id, updated_at
-          ) VALUES (?, 'local_only', NULL, ?)
-          ON CONFLICT(knowledge_base_id) DO UPDATE SET
-            mode = 'local_only', published_generation_id = NULL, updated_at = excluded.updated_at
-        `).run(knowledgeBaseId, now)
-      })()
-    } catch (error) {
-      this.setState(knowledgeBaseId, previous.mode, previous.publishedGenerationId)
-      throw error
+      this.database.prepare(`
+        UPDATE cloud_sync_conversions SET state = 'verified', expected_digest = ?,
+          actual_digest = ?, error_code = NULL, updated_at = ? WHERE knowledge_base_id = ?
+      `).run(
+        verification.expectedDigest, verification.actualDigest,
+        this.dependencies.now(), knowledgeBaseId,
+      )
+      conversion = { ...conversion, state: 'verified',
+        expectedDigest: verification.expectedDigest, actualDigest: verification.actualDigest }
     }
+    if (conversion.state === 'verified') {
+      const accepted = await this.remote.deleteKnowledgeBase({
+        requestId: conversion.requestId,
+        knowledgeBaseId,
+        expectedPublishedGenerationId: conversion.expectedPublishedGenerationId,
+      })
+      this.database.prepare(`
+        UPDATE cloud_sync_conversions SET state = 'purge_accepted', deletion_job_id = ?,
+          error_code = NULL, updated_at = ? WHERE knowledge_base_id = ? AND state = 'verified'
+      `).run(accepted.deletionJobId, this.dependencies.now(), knowledgeBaseId)
+      conversion = { ...conversion, state: 'purge_accepted', deletionJobId: accepted.deletionJobId }
+    }
+    if (!conversion.deletionJobId) throw syncError('INTERNAL_ERROR')
+    let job: Awaited<ReturnType<CloudKnowledgeRemote['getJob']>> | undefined
+    for (let poll = 0; poll < 3; poll += 1) {
+      job = await this.remote.getJob({ jobId: conversion.deletionJobId })
+      if (job.state === 'completed') break
+      if (job.state === 'failed' || job.state === 'cancelled') {
+        this.setMode(knowledgeBaseId, 'failed')
+        throw syncError(job.errorCode ?? 'INTERNAL_ERROR')
+      }
+    }
+    if (job?.state !== 'completed') throw Object.assign(new Error('TRANSIENT_FAILURE'), {
+      code: 'TRANSIENT_FAILURE', retryable: true as const,
+    })
+    const now = this.dependencies.now()
+    this.database.transaction(() => {
+      this.database.prepare(`
+        UPDATE cloud_sync_conversions SET state = 'completed', error_code = NULL, updated_at = ?
+        WHERE knowledge_base_id = ? AND state = 'purge_accepted' AND deletion_job_id = ?
+      `).run(now, knowledgeBaseId, conversion.deletionJobId)
+      this.database.prepare('DELETE FROM sync_cursors WHERE knowledge_base_id = ?').run(knowledgeBaseId)
+      this.setState(knowledgeBaseId, 'local_only', null)
+    })()
+  }
+
+  private expireTerminalLeases(knowledgeBaseId: string): void {
+    const now = this.dependencies.now()
+    this.database.prepare(`
+      UPDATE cloud_sync_mutations SET state = 'failed', error_code = 'LEASE_EXPIRED',
+        lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+      WHERE knowledge_base_id = ? AND state = 'leased' AND attempt >= ?
+        AND lease_expires_at <= ?
+    `).run(now, knowledgeBaseId, MAX_ATTEMPTS, now)
+  }
+
+  private isActive(knowledgeBaseId: string, epoch: number): boolean {
+    const state = this.getControl(knowledgeBaseId)
+    return state.epoch === epoch && state.mode === 'syncing'
+  }
+
+  private isEpochCurrent(knowledgeBaseId: string, epoch: number): boolean {
+    return this.getControl(knowledgeBaseId).epoch === epoch
+  }
+
+  private compareAndSetMode(knowledgeBaseId: string, epoch: number, mode: CloudSyncMode): boolean {
+    const updated = this.database.prepare(`
+      UPDATE cloud_sync_states SET mode = ?, epoch = epoch + 1, updated_at = ?
+      WHERE knowledge_base_id = ? AND epoch = ?
+    `).run(mode, this.dependencies.now(), knowledgeBaseId, epoch)
+    return updated.changes === 1
+  }
+
+  private getControl(knowledgeBaseId: string): {
+    mode: CloudSyncMode
+    publishedGenerationId: string | null
+    epoch: number
+  } {
+    const row = this.database.prepare(`
+      SELECT mode, published_generation_id AS publishedGenerationId, epoch
+      FROM cloud_sync_states WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId) as {
+      mode: CloudSyncMode
+      publishedGenerationId: string | null
+      epoch: number
+    } | undefined
+    return row ?? { mode: 'local_only', publishedGenerationId: null, epoch: 0 }
   }
 
   async cancelMutation(mutationId: string): Promise<void> {
@@ -382,35 +539,51 @@ export class KnowledgeSyncService {
       if (updated.changes !== 1) return false
       this.database.prepare(`
         INSERT INTO conflicts (
-          id, knowledge_base_id, entity_kind, entity_id, local_version,
-          remote_version, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+          id, knowledge_base_id, entity_kind, conflict_kind, entity_id,
+          local_version, remote_version, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
         ON CONFLICT(id) DO NOTHING
       `).run(
-        `cloud:${mutation.id}`, mutation.knowledgeBaseId,
-        result.conflictKind === 'delete_vs_update' ? 'delete_vs_update' : mutation.entityKind,
-        mutation.entityId, result.localRevision, result.remoteRevision, now,
+        `cloud:${mutation.id}`, mutation.knowledgeBaseId, mutation.entityKind,
+        result.conflictKind, mutation.entityId, result.localRevision, result.remoteRevision, now,
       )
       return true
     })()
   }
 
-  private async pull(knowledgeBaseId: string): Promise<void> {
+  private async pull(knowledgeBaseId: string, epoch: number): Promise<void> {
     const cursor = this.database.prepare(`
       SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?
     `).get(knowledgeBaseId) as { sequence: number } | undefined
-    let result = await this.remote.pullChanges({
-      knowledgeBaseId,
-      afterSequence: cursor?.sequence ?? 0,
-    })
-    let full = false
-    if (result.kind === 'cursor_stale') {
-      result = await this.remote.fullResync({ knowledgeBaseId })
-      full = true
+    let afterSequence = cursor?.sequence ?? 0
+    while (true) {
+      const result = await this.remote.pullChanges({ knowledgeBaseId, afterSequence })
+      if (!this.isActive(knowledgeBaseId, epoch)) return
+      if (result.kind === 'cursor_stale') {
+        const snapshot = await this.remote.fullResync({ knowledgeBaseId })
+        if (!this.isActive(knowledgeBaseId, epoch)) return
+        await this.dependencies.replaceRemoteSnapshot(snapshot.changes)
+        if (!this.isActive(knowledgeBaseId, epoch)) return
+        this.upsertCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
+        return
+      }
+      if (result.nextSequence < afterSequence
+        || (result.hasMore && result.nextSequence <= afterSequence)
+        || (result.changes.length === 0 && result.nextSequence !== afterSequence)) {
+        throw syncError('INTERNAL_ERROR')
+      }
+      for (const change of result.changes) {
+        if (change.sequence <= afterSequence || change.sequence > result.nextSequence) {
+          throw syncError('INTERNAL_ERROR')
+        }
+        await this.dependencies.applyRemoteChange(change)
+        if (!this.isActive(knowledgeBaseId, epoch)) return
+        afterSequence = change.sequence
+      }
+      if (result.nextSequence !== afterSequence) throw syncError('INTERNAL_ERROR')
+      this.upsertCursor(knowledgeBaseId, result.nextSequence, this.dependencies.now())
+      if (!result.hasMore) return
     }
-    if (full) await this.dependencies.replaceRemoteSnapshot(result.changes)
-    else for (const change of result.changes) await this.dependencies.applyRemoteChange(change)
-    this.upsertCursor(knowledgeBaseId, result.nextSequence, this.dependencies.now())
   }
 
   private upsertCursor(knowledgeBaseId: string, sequence: number, now: number): void {
@@ -421,8 +594,9 @@ export class KnowledgeSyncService {
     `).run(knowledgeBaseId, sequence, now)
   }
 
-  private setMode(knowledgeBaseId: string, mode: CloudSyncMode): void {
+  private setMode(knowledgeBaseId: string, mode: CloudSyncMode): number {
     this.setState(knowledgeBaseId, mode, this.getState(knowledgeBaseId).publishedGenerationId)
+    return this.getControl(knowledgeBaseId).epoch
   }
 
   private setState(
@@ -432,11 +606,11 @@ export class KnowledgeSyncService {
   ): void {
     this.database.prepare(`
       INSERT INTO cloud_sync_states (
-        knowledge_base_id, mode, published_generation_id, updated_at
-      ) VALUES (?, ?, ?, ?)
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, ?, ?, 1, ?)
       ON CONFLICT(knowledge_base_id) DO UPDATE SET
         mode = excluded.mode, published_generation_id = excluded.published_generation_id,
-        updated_at = excluded.updated_at
+        epoch = cloud_sync_states.epoch + 1, updated_at = excluded.updated_at
     `).run(knowledgeBaseId, mode, publishedGenerationId, this.dependencies.now())
   }
 }

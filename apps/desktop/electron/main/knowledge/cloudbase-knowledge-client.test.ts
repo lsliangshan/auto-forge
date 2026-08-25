@@ -92,6 +92,10 @@ describe('CloudBaseKnowledgeClient', () => {
       .mockResolvedValueOnce({ result: { ok: true, data: {
         uploadTicket: 'ticket_1', storageReference: 'storage/object_1', objectId: 'object_1',
         jobId: 'job_1', expiresAt: '2026-08-26T12:15:00.000Z',
+        uploadAuthorization: {
+          url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT', headers: {},
+          expiresAt: '2026-08-26T12:15:00.000Z',
+        },
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: {
         tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
@@ -125,5 +129,58 @@ describe('CloudBaseKnowledgeClient', () => {
         revision: 'local_1', generationId: 'generation_1',
       },
     })
+  })
+
+  it('accepts page cursors only when hasMore can advance safely', async () => {
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        kind: 'incremental', nextSequence: 1000, hasMore: true,
+        changes: [{ sequence: 1000, entityKind: 'document', entityId: 'document_1000',
+          operation: 'upsert', revision: 'r1000', payload: {} }],
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        kind: 'incremental', nextSequence: 1000, hasMore: true, changes: [],
+      } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 0 }))
+      .resolves.toMatchObject({ nextSequence: 1000, hasMore: true })
+    await expect(client.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 1000 }))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+  })
+
+  it('accepts a full snapshot and 512-character storage references', async () => {
+    const storageReference = 's'.repeat(512)
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        kind: 'snapshot', nextSequence: 42,
+        changes: [{ sequence: 42, entityKind: 'document', entityId: 'document_1',
+          operation: 'upsert', revision: 'r42', payload: {} }],
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: { removed: 1 } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.fullResync({ knowledgeBaseId: 'kb_1' }))
+      .resolves.toMatchObject({ kind: 'snapshot', nextSequence: 42 })
+    await expect(client.cleanupOrphans({
+      requestId: 'cleanup_1', knowledgeBaseId: 'kb_1', storageReferences: [storageReference],
+    })).resolves.toEqual({ removed: 1 })
+  })
+
+  it('completes mediated uploads and reads purge job state without storage credentials', async () => {
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        objectId: 'object_1', storageReference: 'knowledge/1/kb_1/object_1', verified: true,
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        jobId: 'job_1', state: 'completed', errorCode: null,
+      } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.completeUpload({ uploadTicket: 'ticket_1' }))
+      .resolves.toMatchObject({ verified: true })
+    await expect(client.getJob({ jobId: 'job_1' }))
+      .resolves.toEqual({ jobId: 'job_1', state: 'completed', errorCode: null })
+    expect(JSON.stringify(callFunction.mock.calls)).not.toMatch(/serviceKey|service.?role|cos/i)
   })
 })
