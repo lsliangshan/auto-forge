@@ -2,7 +2,9 @@
 
 Date: 2026-08-25
 
-Target HEAD: `3b59c090ed355cfc7150de9c565e27f43c41cc5b`
+Fix-wave base: `3b59c090ed355cfc7150de9c565e27f43c41cc5b`
+
+Verified code HEAD: `5fa8aa8ba816062091ea9eb548296710c04a3d91`
 
 Commit message: `fix: converge cloud conversation metadata replay`
 
@@ -191,5 +193,20 @@ Result: SQL copies are byte-identical and the diff has no whitespace errors.
 
 ## Concerns / deferred verification
 
-- Per instruction, no deployment, credentials, push, merge, PR, Playwright end-to-end run, or final root full-gate matrix was performed.
+- The implementer pass did not deploy, access credentials, push, merge, create a PR, run Playwright, or run the final root full-gate matrix. The controller subsequently ran the complete local gate matrix recorded below.
 - No live PostgreSQL service was available in this fix wave. SQL execution semantics were checked through focused migration assertions, strict function tests, byte identity, and downstream repository tests; the controller should include the normal PostgreSQL/integration gate if available.
+
+## Controller-run final gate matrix
+
+Run on 2026-08-25 after the independent whole-branch scoped re-review approved all three fixes:
+
+- `pnpm test` — exit 0; 102 test files and 2,899 tests passed.
+- `pnpm typecheck` — exit 0 across all four participating workspace projects.
+- `pnpm build` — exit 0 for shared/workflow packages, Electron Main/Preload/Renderer, workflow worker, and Cloud sync E2E bundle. Rollup emitted only the existing third-party `@vueuse/core` pure-annotation warnings.
+- `pnpm exec playwright test apps/desktop/tests/e2e/cloud-user-data-sync.spec.ts` — exit 0; all 9 serial scenarios passed, including the new lost-response-after-purge case.
+- Focused ESLint over every added/modified TypeScript, TSX, Vue, and JavaScript path in `44cf8ce..5fa8aa8` — exit 0 with 0 errors and 25 existing Vue formatting warnings.
+- `cmp cloudbase/migrations/20260824090000_user_data_foundation.sql cloudbase/user-data/migrations/0001_user_data_foundation.sql` — exit 0; byte-identical.
+- `git diff --check 44cf8ce..5fa8aa8` and `git diff --check` — exit 0.
+- `git status --porcelain=v1 -uall` — empty before this report-only update.
+
+The remaining staging-only gap is unchanged: no live PostgreSQL/CloudBase deployment, grant check, purge/restore race, or cross-UID RPC test was performed, and no credentials were accessed.
