@@ -201,6 +201,18 @@ function hasMemberAccess(entitlement: KnowledgeEntitlementState): boolean {
     && (entitlement.status === 'active' || entitlement.status === 'offline_grace')
 }
 
+const SEARCHABLE_BASE_PREDICATE = `
+  knowledge_bases.status = 'active'
+  AND EXISTS (
+    SELECT 1 FROM documents AS searchable_documents
+    JOIN document_versions AS searchable_versions
+      ON searchable_versions.id = searchable_documents.active_version_id
+    WHERE searchable_documents.knowledge_base_id = knowledge_bases.id
+      AND searchable_documents.status <> 'recycled'
+      AND searchable_versions.status = 'ready'
+  )
+`
+
 export class KnowledgeService implements KnowledgePersistence {
   private session: OpenKnowledgeSession | undefined
   private opening: Promise<OpenKnowledgeSession> | undefined
@@ -224,19 +236,14 @@ export class KnowledgeService implements KnowledgePersistence {
         count(documents.id) AS documentCount,
         coalesce(sum(CASE WHEN documents.status IN ('pending', 'processing') THEN 1 ELSE 0 END), 0) AS processingCount,
         coalesce(sum(CASE WHEN documents.status = 'failed' THEN 1 ELSE 0 END), 0) AS failedCount,
-        coalesce(sum(CASE WHEN documents.status <> 'recycled'
-          AND EXISTS (
-            SELECT 1 FROM document_versions
-            WHERE document_versions.id = documents.active_version_id
-              AND document_versions.status = 'ready'
-          ) THEN 1 ELSE 0 END), 0) AS searchableDocumentCount
+        CASE WHEN ${SEARCHABLE_BASE_PREDICATE} THEN 1 ELSE 0 END AS searchable
       FROM knowledge_bases
       LEFT JOIN documents ON documents.knowledge_base_id = knowledge_bases.id
       GROUP BY knowledge_bases.id
       ORDER BY knowledge_bases.created_at, knowledge_bases.id
     `).all() as Array<{
       id: string; name: string; status: 'active' | 'read_only' | 'recycled'; updatedAt: number
-      documentCount: number; processingCount: number; failedCount: number; searchableDocumentCount: number
+      documentCount: number; processingCount: number; failedCount: number; searchable: number
     }>
     return rows.map(row => ({
       id: row.id,
@@ -251,7 +258,7 @@ export class KnowledgeService implements KnowledgePersistence {
             : row.failedCount > 0
               ? 'failed'
               : 'ready',
-      searchable: row.status === 'active' && row.searchableDocumentCount > 0,
+      searchable: Boolean(row.searchable),
       documentCount: row.documentCount,
       updatedAt: iso(row.updatedAt),
     }))
@@ -417,7 +424,7 @@ export class KnowledgeService implements KnowledgePersistence {
       FROM conversation_selection_bases
       JOIN knowledge_bases ON knowledge_bases.id = conversation_selection_bases.knowledge_base_id
       WHERE conversation_selection_bases.conversation_id = ?
-        AND knowledge_bases.status = 'active'
+        AND ${SEARCHABLE_BASE_PREDICATE}
       ORDER BY conversation_selection_bases.ordinal
     `).all(conversationId) as Array<{ knowledgeBaseId: string }>
     return { knowledgeBaseIds: bases.map(row => row.knowledgeBaseId), knowledgeMode: selection.knowledgeMode }
@@ -440,7 +447,7 @@ export class KnowledgeService implements KnowledgePersistence {
       const placeholders = selection.knowledgeBaseIds.map(() => '?').join(', ')
       const count = session.opened.database.prepare(`
         SELECT count(*) AS count FROM knowledge_bases
-        WHERE id IN (${placeholders}) AND status = 'active'
+        WHERE id IN (${placeholders}) AND ${SEARCHABLE_BASE_PREDICATE}
       `).get(...selection.knowledgeBaseIds) as { count: number }
       if (count.count !== selection.knowledgeBaseIds.length) failure('NOT_FOUND')
     }

@@ -570,6 +570,20 @@ describe('knowledge three-pane workspace', () => {
 
     expect(wrapper.get('[data-testid="inspector-panel"]').text()).toContain('仅原有已就绪版本可检索')
   })
+
+  it('marks a deleted document as deleted and non-retrievable even when a ready version remains', async () => {
+    const api = createApi({
+      bases: [localBase],
+      documents: [{ ...readyDocument, status: 'deleted' }],
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    const inspector = wrapper.get('[data-testid="inspector-panel"]')
+    expect(inspector.text()).toContain('不可检索（文件已删除）')
+    expect(inspector.text()).not.toContain('仅本地关键词检索')
+  })
 })
 
 describe('conversation knowledge preferences', () => {
@@ -615,7 +629,64 @@ describe('conversation knowledge preferences', () => {
     expect(wrapper.text()).toContain('已删除或不可用')
     expect(wrapper.get('[data-testid="knowledge-base-kb_syncing"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="knowledge-base-kb_readonly"]').attributes('disabled')).toBeDefined()
-    expect(wrapper.get('[data-testid="knowledge-base-kb_deleted"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-base-kb_deleted"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it.each(['expired', 'unavailable'] as const)(
+    'labels local processing as local processing while entitlement is %s',
+    async (status) => {
+      const api = createApi({
+        bases: [{ ...localBase, status: 'processing', searchable: true }],
+        entitlement: { tier: 'member', status, betaEnabled: true, cloudEnabled: false },
+      })
+      const { wrapper } = await mountComposer(api)
+
+      expect(wrapper.text()).toContain('本地处理中')
+      expect(wrapper.text()).not.toContain('同步中')
+    },
+  )
+
+  it('lets a checked stale disabled library be deselected', async () => {
+    const staleBase = { ...localBase, status: 'read_only' as const, searchable: false }
+    const api = createApi({
+      bases: [staleBase],
+      selection: { knowledgeBaseIds: [staleBase.id], knowledgeMode: 'strict' },
+    })
+    const { chat, wrapper } = await mountComposer(api)
+    const choice = wrapper.get('[data-testid="knowledge-base-kb_local"]')
+
+    expect(choice.attributes('aria-checked')).toBe('true')
+    expect(choice.attributes('disabled')).toBeUndefined()
+    await choice.trigger('click')
+    await flushPromises()
+
+    expect(api.knowledge.updateConversationSelection).toHaveBeenCalledWith('conversation_1', {
+      knowledgeBaseIds: [], knowledgeMode: 'strict',
+    })
+    expect(chat.knowledgeSelection).toEqual({ knowledgeBaseIds: [], knowledgeMode: 'strict' })
+  })
+
+  it('keeps an optimistically checked library removable when catalog state becomes stale before save', async () => {
+    const firstSave = deferred<KnowledgeSelection>()
+    const api = createApi({ selection: emptySelection })
+    vi.mocked(api.knowledge.updateConversationSelection)
+      .mockReturnValueOnce(firstSave.promise)
+      .mockImplementationOnce(async (_conversationId, selection) => selection)
+    const { chat, pinia, wrapper } = await mountComposer(api)
+    const choice = wrapper.get('[data-testid="knowledge-base-kb_local"]')
+
+    await choice.trigger('click')
+    const knowledge = useKnowledgeStore(pinia)
+    knowledge.bases = [{ ...localBase, status: 'read_only', searchable: false }]
+    await flushPromises()
+    expect(choice.attributes('disabled')).toBeUndefined()
+
+    await choice.trigger('click')
+    firstSave.resolve({ knowledgeBaseIds: [localBase.id], knowledgeMode: 'mixed' })
+    await flushPromises()
+
+    expect(api.knowledge.updateConversationSelection).toHaveBeenNthCalledWith(2, 'conversation_1', emptySelection)
+    expect(chat.knowledgeSelection).toEqual(emptySelection)
   })
 
   it('uses Main searchable state for processing and failed choices while keeping read-only retention unsearchable', async () => {

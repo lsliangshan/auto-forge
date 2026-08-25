@@ -282,6 +282,36 @@ describe('KnowledgeService lifecycle', () => {
     await app.service.close()
   })
 
+  it('admits only active libraries with a published ready document and removes the last recycled document', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+
+    await expect(app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+    app.picks.push(await writeSource(app.rootDirectory, 'published.txt', '可检索的已发布内容'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await expect(app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })).resolves.toEqual({ knowledgeBaseIds: [base!.id], knowledgeMode: 'strict' })
+
+    await app.service.recycleDocument(owner, imported!.id)
+
+    await expect(app.service.listBases(owner)).resolves.toEqual([
+      expect.objectContaining({ id: base!.id, searchable: false }),
+    ])
+    await expect(app.service.getConversationSelection(owner, 'conversation_1')).resolves.toEqual({
+      knowledgeBaseIds: [], knowledgeMode: 'strict',
+    })
+    await expect(app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'mixed',
+    })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await app.service.close()
+  })
+
   it('removes read-only retained libraries from authoritative conversation scope and search', async () => {
     const app = await fixture()
     const owner = { userId: 'alice' }
@@ -412,6 +442,9 @@ describe('KnowledgeService lifecycle', () => {
     await expect(app.service.updateConversationSelection(alice, 'conversation_alice', {
       knowledgeBaseIds: ['foreign_base'], knowledgeMode: 'strict',
     })).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    app.picks.push(await writeSource(app.rootDirectory, 'owned.txt', '归属校验内容'))
+    await app.service.importDocument(alice, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(alice, base!.id))[0]?.status).toBe('ready')
     await expect(app.service.updateConversationSelection(alice, 'conversation_alice', {
       knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
     })).resolves.toEqual({ knowledgeBaseIds: [base!.id], knowledgeMode: 'strict' })
@@ -900,6 +933,7 @@ describe('KnowledgeService lifecycle', () => {
     const [base] = await app.service.listBases(owner)
     app.picks.push(await writeSource(app.rootDirectory, 'durable.txt', '持久化北京政务知识'))
     await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
     await app.service.updateConversationSelection(owner, 'conversation_1', {
       knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
     })

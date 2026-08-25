@@ -14,7 +14,7 @@
         role="checkbox"
         :data-testid="`knowledge-base-${choice.base.id}`"
         :aria-checked="selection.knowledgeBaseIds.includes(choice.base.id)"
-        :disabled="disabled || choice.disabled"
+        :disabled="disabled || (choice.disabled && !selection.knowledgeBaseIds.includes(choice.base.id))"
         :title="choice.label"
         @click="toggleBase(choice.base.id)"
       >
@@ -75,7 +75,7 @@ function choiceFor(base: KnowledgeBase, missing = false): Choice {
     || !['active', 'offline_grace'].includes(knowledge.entitlement.status)) {
     const reason = knowledge.entitlement?.status === 'expired' ? '会员已过期' : '权益不可用'
     const state = base.status === 'processing'
-      ? '同步中 · '
+      ? `${base.kind === 'cloud' ? '同步中' : '本地处理中'} · `
       : base.status === 'read_only'
         ? '只读 · '
         : base.status === 'failed'

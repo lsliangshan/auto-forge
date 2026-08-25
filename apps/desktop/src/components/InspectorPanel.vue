@@ -228,6 +228,7 @@ const knowledgeRetrievalStatus = computed(() => {
   const base = knowledge.selectedBase
   const document = knowledge.selectedDocument
   if (!base || !document) return '不可用'
+  if (document.status === 'deleted') return '不可检索（文件已删除）'
   if (base.status === 'read_only') return '不可检索（只读保留）'
   if (!knowledge.entitlement
     || !['active', 'offline_grace'].includes(knowledge.entitlement.status)) {

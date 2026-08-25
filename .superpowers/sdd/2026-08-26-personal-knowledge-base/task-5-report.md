@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented the `/knowledge` three-pane workspace and per-conversation knowledge preferences, then completed two review hardening waves. Navigation remains exactly Chat, Knowledge Base, Workflows, Developer, Executions, optional User Management, Settings. The implementation uses only the path-free `DesktopAPI.knowledge` namespace and does not add knowledge import to chat attachments.
+Implemented the `/knowledge` three-pane workspace and per-conversation knowledge preferences, then completed three review hardening waves. Navigation remains exactly Chat, Knowledge Base, Workflows, Developer, Executions, optional User Management, Settings. The implementation uses only the path-free `DesktopAPI.knowledge` namespace and does not add knowledge import to chat attachments.
 
 ## Implementation
 
@@ -13,7 +13,7 @@ Implemented the `/knowledge` three-pane workspace and per-conversation knowledge
 - Free-tier advisory gates mirror Main's one-library/one-active-logical-file authority: once the default library exists, create is disabled; once it has an active document, import is disabled while replacement remains available. Paid active members retain multi-library/import actions.
 - Both recycle actions require explicit confirmation. The workspace adds listbox/option selection state, radio-group/group semantics, `aria-busy`, polite loading state, and scoped action disabling.
 - Chat preference saves remain serialized per conversation, but owner reset discards the old queue. Each conversation separately retains the last Main-confirmed snapshot. A failed latest save reloads authoritative Main state; if that reload also fails it rolls back only to that confirmed snapshot, never another optimistic request. Older failures cannot overwrite newer state/errors, and the latest success clears only the selected conversation's error.
-- Main now publishes an explicit path-free `searchable` base bit derived from an active published ready version. Processing/failed/paused libraries are selectable only when that bit proves a ready generation exists. `read_only` means non-retained downgrade data: encrypted/exportable/deletable but not searchable or selectable, matching the approved spec and Main's active-base retrieval filter. Local parsing is labeled local processing, never cloud syncing; the inspector separately reports entitlement, scope, ready-version, failed-replacement, local-processing, and cloud-sync retrieval state.
+- Main now uses one literal active-plus-published-ready SQL predicate to publish the path-free `searchable` bit, filter persisted conversation selections, and admit selection updates. Recycling the last ready document therefore removes a saved base from authoritative reads and rejects re-selection. Processing/failed/paused libraries are selectable only when the bit proves a ready generation exists. `read_only` data remains encrypted/exportable/deletable but not searchable or newly selectable. A checked stale/read-only/deleted choice remains enabled only for removal, including while an earlier optimistic save is in flight. Local parsing is labeled local processing, never cloud syncing; a deleted document is reported deleted/non-retrievable before retained-version or base state is considered.
 
 ## TDD evidence
 
@@ -28,16 +28,17 @@ Implemented the `/knowledge` three-pane workspace and per-conversation knowledge
 - Retrieval RED: `read_only` was advertised as searchable, local parsing as syncing, and the inspector ignored entitlement/ready-version evidence. GREEN uses Main's explicit `searchable` distinction and the approved downgrade semantics.
 - Confirmed-snapshot RED: two failed queued saves plus failed authoritative reload fell back to the first optimistic edit. GREEN records only successful load/save/reload responses as fallback state.
 - Timeout RED: an early child exit passed with code 0, while timeout cleanup belonged to the child that could be killed. GREEN makes the parent own the process group and temp root, rejects a missing completion marker, and proves a SIGTERM-ignoring descendant is killed before the root is removed.
+- Authoritative-selection RED: Main accepted an active empty base, retained it after its last ready document was recycled, and three queries encoded different notions of eligibility. GREEN reuses the same published-ready predicate in catalog, selection read, and selection write paths; the new lifecycle test covers empty admission, successful publication, last-document recycle, stale selection filtering, and rejected re-admission.
+- Stale-choice RED: checked read-only/deleted choices and choices that became unavailable during an in-flight save were HTML-disabled, trapping the user. GREEN disables an unavailable choice only when it is unchecked, with component tests proving the actual empty preference mutation and final Store state.
 
 ## Final verification
 
-- Shared contracts: 76 tests passed.
-- Renderer: `pnpm --filter @autoforge/desktop exec vitest run --config vitest.config.ts` — 10 files, 374 tests passed.
-- Main knowledge/Application/IPC/Preload/timeout review slice — 5 files, 17 passed, 212 skipped.
-- Full focused KnowledgeService plus timeout-runner suite — 34 tests passed.
-- Desktop Node and Renderer typecheck passed.
-- Targeted ESLint over all changed source/test/smoke files with `--quiet` passed.
-- `pnpm smoke:knowledge-ui` passed, including native preparation and the production build.
+- Focused Main KnowledgeService: 33 tests passed; focused knowledge Renderer component/Store: 35 tests passed.
+- Full Renderer: 10 files, 379 tests passed.
+- Full Desktop Node: 88 files and 2,366 tests passed; the single pre-existing context-summary billing test still fails with `CONTEXT_LIMIT_EXCEEDED` instead of completion, matching the baseline ledger and outside Task 5.
+- Workspace shared, Desktop Node, and Renderer typecheck passed.
+- Targeted ESLint over all round-3 changed source/test files with `--quiet` passed.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui` passed, including native preparation and the production build.
 - `git diff --check` passed.
 
 ## Real Electron smoke
