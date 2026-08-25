@@ -132,6 +132,36 @@ export interface BrowserRegionImage {
   readonly data: string
 }
 
+export interface BrowserVisualEvidenceTile {
+  readonly tileId: string
+  readonly mediaType: 'image/png'
+  readonly dataBase64: string
+  readonly width: number
+  readonly height: number
+  readonly documentX: number
+  readonly documentY: number
+}
+
+export interface BrowserVisualNodePlacement {
+  readonly nodeId: string
+  readonly tileId: string
+  readonly x: number
+  readonly y: number
+  readonly width: number
+  readonly height: number
+}
+
+export interface BrowserVisualEvidenceBundle {
+  readonly snapshotId: string
+  readonly bindingId: string
+  readonly origin: string
+  readonly navigationEpoch: number
+  readonly capturedAt: string
+  readonly pages: readonly BrowserPageSnapshot[]
+  readonly tiles: readonly BrowserVisualEvidenceTile[]
+  readonly placements: readonly BrowserVisualNodePlacement[]
+}
+
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
   if (!value || typeof value !== 'object' || seen.has(value)) return value
   seen.add(value)

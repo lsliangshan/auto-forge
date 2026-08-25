@@ -29,6 +29,7 @@ import type {
   BrowserPageSnapshot,
   BrowserSemanticNode,
   BrowserValueSource,
+  BrowserVisualEvidenceBundle,
 } from '../browser/browser-continuation-types.js'
 import type { BrowserLoginWaitCoordinator } from '../browser/browser-login-wait-coordinator.js'
 import type { BrowserManualResumeCoordinator } from '../browser/browser-manual-resume-coordinator.js'
@@ -123,7 +124,7 @@ interface BrowserActionAuditRepository {
 
 interface BrowserContinuationToolExecutorDependencies {
   readonly registry: Pick<BrowserContinuationRegistry, 'acquire'>
-  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'endRun'>
+  readonly inspector: Pick<BrowserPageInspector, 'inspect' | 'fieldEvidence' | 'resolveRef' | 'currentPageContext' | 'captureVisualEvidence' | 'endRun'>
   readonly workspace: BrowserContinuationWorkspacePort
   readonly loginWait: Pick<BrowserLoginWaitCoordinator, 'wait' | 'cancel'>
   readonly manualWait: Pick<BrowserManualResumeCoordinator, 'wait' | 'cancel'>
@@ -150,6 +151,7 @@ interface ActiveRunState {
   waitersCancelled: boolean
   lease?: BrowserContinuationLease
   nextAuditSequence?: number
+  latestSnapshot?: BrowserPageSnapshot
   readonly snapshots: Map<string, BrowserPageSnapshot>
 }
 
@@ -175,6 +177,10 @@ export type BrowserManualWaitResult =
 
 export type BrowserContinuationValidationResult =
   | { readonly kind: 'valid' }
+  | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
+
+export type BrowserVisualEvidenceResult =
+  | { readonly kind: 'success'; readonly data: BrowserVisualEvidenceBundle }
   | { readonly kind: 'tool_error'; readonly code: AppErrorCode }
 
 function failure(code: AppErrorCode): AppError {
@@ -252,6 +258,35 @@ function isSnapshotIndependentAction(action: BrowserAction): boolean {
     || (action.type === 'scroll' && action.ref === undefined)
 }
 
+function sameSnapshot(left: BrowserPageSnapshot, right: BrowserPageSnapshot): boolean {
+  return left.snapshotId === right.snapshotId
+    && left.bindingId === right.bindingId
+    && left.origin === right.origin
+    && left.url === right.url
+    && left.title === right.title
+    && left.capturedAt === right.capturedAt
+    && left.navigationEpoch === right.navigationEpoch
+    && left.auth === right.auth
+    && left.cursor === right.cursor
+    && left.serializedBytes === right.serializedBytes
+    && left.nodes.length === right.nodes.length
+    && left.nodes.every((node, index) => {
+      const candidate = right.nodes[index]
+      return candidate !== undefined
+        && node.ref === candidate.ref
+        && node.parentRef === candidate.parentRef
+        && node.role === candidate.role
+        && node.name === candidate.name
+        && node.value === candidate.value
+        && node.enabled === candidate.enabled
+        && node.checked === candidate.checked
+        && node.selected === candidate.selected
+        && node.answerable === candidate.answerable
+        && node.actions.length === candidate.actions.length
+        && node.actions.every((action, actionIndex) => action === candidate.actions[actionIndex])
+    })
+}
+
 export class BrowserContinuationToolExecutor {
   private readonly guard: BrowserActionGuard
   private readonly id: () => string
@@ -274,7 +309,7 @@ export class BrowserContinuationToolExecutor {
     rawInput: unknown,
     context: BrowserContinuationRunContext,
   ): Promise<BrowserContinuationToolResult> {
-    if (!this.runAdmitted(context.runId) || this.isTerminalRun(context.runId)) {
+    if (!this.isRunActive(context.runId) || this.isTerminalRun(context.runId)) {
       return { kind: 'tool_error', code: 'CANCELLED' }
     }
     if (tool !== 'browser_session_inspect'
@@ -314,6 +349,119 @@ export class BrowserContinuationToolExecutor {
 
   async takeOver(runId: string): Promise<void> {
     await this.endRun(runId)
+  }
+
+  async captureVisualEvidence(
+    input: {
+      readonly bindingId: string
+      readonly snapshotId: string
+      readonly pages: readonly BrowserPageSnapshot[]
+    },
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserVisualEvidenceResult> {
+    try {
+      const state = this.runs.get(context.runId)
+      if (!state || state.runId !== context.runId || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension) {
+        throw failure('CANCELLED')
+      }
+      if (state.bindingId !== input.bindingId) throw failure('NO_BOUND_PAGE')
+      const lease = state.lease
+      if (!lease) throw failure('CANCELLED')
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      const snapshot = state.latestSnapshot
+      const finalPage = input.pages.at(-1)
+      if (!snapshot || input.snapshotId !== snapshot.snapshotId || !finalPage
+        || input.pages.some((page) => page.snapshotId !== input.snapshotId
+          || page.bindingId !== input.bindingId
+          || page.origin !== snapshot.origin
+          || page.navigationEpoch !== snapshot.navigationEpoch)
+        || !sameSnapshot(finalPage, snapshot)) {
+        throw failure('PAGE_CHANGED')
+      }
+      const page = await this.dependencies.workspace.getContinuationState(
+        lease.binding.tabId,
+        context.runId,
+      )
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      if (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch) {
+        throw failure('PAGE_CHANGED')
+      }
+      const captureInput = {
+        lease,
+        tabId: lease.binding.tabId,
+        navigationEpoch: page.navigationEpoch,
+        origin: page.origin,
+        pages: input.pages,
+        ...(context.signal === undefined ? {} : { signal: context.signal }),
+      }
+      const data = await this.dependencies.inspector.captureVisualEvidence(captureInput)
+      if (this.runs.get(context.runId) !== state || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension || state.bindingId !== input.bindingId
+        || state.lease !== lease) {
+        return { kind: 'tool_error', code: 'CANCELLED' }
+      }
+      if (state.latestSnapshot !== snapshot) {
+        return { kind: 'tool_error', code: state.latestSnapshot === undefined ? 'CANCELLED' : 'PAGE_CHANGED' }
+      }
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      return { kind: 'success', data }
+    } catch (error) {
+      return { kind: 'tool_error', code: toSafeAppError(error).code }
+    }
+  }
+
+  async validateVisualEvidence(
+    input: {
+      readonly bindingId: string
+      readonly snapshotId: string
+      readonly pages: readonly BrowserPageSnapshot[]
+    },
+    context: BrowserContinuationRunContext,
+  ): Promise<BrowserContinuationValidationResult> {
+    try {
+      const state = this.runs.get(context.runId)
+      if (!state || state.runId !== context.runId || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension) {
+        throw failure('CANCELLED')
+      }
+      if (state.bindingId !== input.bindingId) throw failure('NO_BOUND_PAGE')
+      const lease = state.lease
+      if (!lease) throw failure('CANCELLED')
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      const snapshot = state.latestSnapshot
+      const finalPage = input.pages.at(-1)
+      if (!snapshot || input.snapshotId !== snapshot.snapshotId || !finalPage
+        || input.pages.some((page) => page.snapshotId !== input.snapshotId
+          || page.bindingId !== input.bindingId
+          || page.origin !== snapshot.origin
+          || page.navigationEpoch !== snapshot.navigationEpoch)
+        || !sameSnapshot(finalPage, snapshot)) {
+        throw failure('PAGE_CHANGED')
+      }
+      const page = await this.dependencies.workspace.getContinuationState(
+        lease.binding.tabId,
+        context.runId,
+      )
+      await lease.assertEligible()
+      this.assertActive(state, context)
+      if (this.runs.get(context.runId) !== state || !this.isRunActive(context.runId)
+        || context.signal?.aborted || state.suspension || state.bindingId !== input.bindingId
+        || state.lease !== lease) throw failure('CANCELLED')
+      if (state.latestSnapshot !== snapshot) {
+        throw failure(state.latestSnapshot === undefined ? 'CANCELLED' : 'PAGE_CHANGED')
+      }
+      if (page.origin !== snapshot.origin || page.navigationEpoch !== snapshot.navigationEpoch) {
+        throw failure('PAGE_CHANGED')
+      }
+      return { kind: 'valid' }
+    } catch (error) {
+      return { kind: 'tool_error', code: toSafeAppError(error).code }
+    }
   }
 
   async waitForAuthentication(
@@ -533,6 +681,7 @@ export class BrowserContinuationToolExecutor {
       await lease.assertEligible()
       this.assertActive(state, context)
       state.snapshots.set(result.snapshotId, result)
+      state.latestSnapshot = result
       const privateFieldEvidence = this.dependencies.inspector.fieldEvidence(result.snapshotId)
       this.audit(state, context, page.origin, 'inspect', 'page', 'sensitive_read', 'completed')
       audited = true
@@ -558,7 +707,6 @@ export class BrowserContinuationToolExecutor {
             state, context, page.origin, 'inspect', 'page', 'sensitive_read',
             terminal.code === 'CANCELLED' ? 'cancelled' : 'failed', terminal.code,
           )
-          audited = true
           throw terminalError
         }
         try {
@@ -570,7 +718,6 @@ export class BrowserContinuationToolExecutor {
             state, context, handoffPage.origin, 'inspect', 'page',
             'sensitive_read', 'handed_off', 'MANUAL_INTERVENTION_REQUIRED',
           )
-          audited = true
           return result
         } catch (handoffError) {
           const handoffFailure = toSafeAppError(handoffError)
@@ -582,7 +729,6 @@ export class BrowserContinuationToolExecutor {
             state, context, handoffPage.origin, 'handoff', 'page',
             'external_action', 'failed', handoffFailure.code,
           )
-          audited = true
           throw handoffError
         }
       }
@@ -741,7 +887,6 @@ export class BrowserContinuationToolExecutor {
               state, context, page.origin, normalized, target,
               terminal.code === 'CANCELLED' ? 'cancelled' : 'failed', terminal.code,
             )
-            audited = true
             throw terminalError
           }
           try {
@@ -762,7 +907,6 @@ export class BrowserContinuationToolExecutor {
               state, context, handoffPage.origin, 'handoff', targetSummary(target),
               'external_action', 'failed', handoffFailure.code,
             )
-            audited = true
             throw handoffError
           }
         }
@@ -1061,7 +1205,7 @@ export class BrowserContinuationToolExecutor {
     return true
   }
 
-  private runAdmitted(runId: string): boolean {
+  private isRunActive(runId: string): boolean {
     try {
       return this.dependencies.isRunActive(runId)
     } catch {
@@ -1093,6 +1237,7 @@ export class BrowserContinuationToolExecutor {
   ): Promise<void> {
     const lease = state.lease
     state.snapshots.clear()
+    state.latestSnapshot = undefined
     this.dependencies.inspector.endRun(state.runId)
     if (!preserveHighlight && lease) {
       await this.dependencies.workspace.clearContinuationHighlight(lease.binding.tabId).catch(() => undefined)

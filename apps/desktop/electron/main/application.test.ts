@@ -173,6 +173,7 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspaceTestPort {
       x: 0, y: 0, width: 10, height: 10, viewportWidth: 1200, viewportHeight: 800,
     })),
     captureNodeScreenshot: vi.fn(async () => 'image'),
+    capturePageScreenshot: vi.fn(async () => 'image'),
     onPageInvalidated: vi.fn(() => () => undefined),
     describeContinuation: vi.fn(async () => ({
       pageLabel: 'permit.example.gov.cn',
@@ -3865,6 +3866,39 @@ describe('createApplicationRuntime', () => {
     expect(followUp).toContain('名称: image.png')
     expect(followUp).not.toContain(png.toString('base64'))
     expect(followUp).not.toContain(source)
+    await runtime.close()
+  })
+
+  it('propagates image-input support from the selected text route to the agent run', async () => {
+    const run = vi.spyOn(AgentOrchestrator.prototype, 'run').mockResolvedValue({
+      requestId: 'vision_request', status: 'completed',
+    })
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-vision-route-'))
+    directories.push(root)
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [visionTextModelInfo('openrouter/vision')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    const settings = await runtime.services.settings.get()
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        ...settings.defaultModels,
+        openrouter: { text: 'openrouter/vision' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    await runtime.services.chat.send(chatInput(conversation.id, '读取附件页面'))
+    await vi.waitFor(() => expect(run).toHaveBeenCalled())
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ supportsImageInput: true }))
     await runtime.close()
   })
 

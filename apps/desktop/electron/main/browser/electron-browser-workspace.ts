@@ -786,8 +786,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const allRawNodes = accessibility.nodes ?? []
       if (allRawNodes.length > MAX_BROWSER_INSPECTION_RAW_NODES) throw failure('ACTION_LIMIT_EXCEEDED')
       const rawNodes = allRawNodes
-        .filter((node) => node.frameId === undefined || node.frameId === frameId)
         .filter((node) => typeof node.nodeId === 'string' && typeof node.backendDOMNodeId === 'number')
+      const mainFrameRawNodes = rawNodes.filter((node) => (
+        node.frameId === undefined || node.frameId === frameId
+      ))
       const nodes: BrowserInspectionNode[] = []
       for (const rawNode of rawNodes) {
         const backendNodeId = rawNode.backendDOMNodeId!
@@ -802,7 +804,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       const locatorMatches = []
       let locatorMatchCount = 0
       for (const locator of input.locators) {
-        const backendNodeIds = await this.resolveLocatorMatches(state, locator, rawNodes, budget)
+        const backendNodeIds = await this.resolveLocatorMatches(state, locator, mainFrameRawNodes, budget)
         this.assertContinuationState(state, input)
         locatorMatchCount += backendNodeIds.length
         if (locatorMatchCount > maxBrowserInspectionTotalLocatorMatches) {
@@ -915,6 +917,28 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     input: Parameters<BrowserPageCdpPort['captureNodeScreenshot']>[0],
   ): Promise<string> {
     return this.captureContinuationNodeScreenshot(input)
+  }
+
+  async capturePageScreenshot(
+    input: Parameters<BrowserPageCdpPort['capturePageScreenshot']>[0],
+  ): Promise<string> {
+    const state = this.continuationState(input)
+    return this.restricted(state, [input.expectedOrigin], async () => {
+      this.assertContinuationState(state, input)
+      const { x, y, width, height } = input.clip
+      if (![x, y, width, height].every(Number.isFinite)
+        || x < 0 || y < 0 || width <= 0 || height <= 0
+        || width * height > 1_000_000) throw failure('UNSUPPORTED_CONTROL')
+      const screenshot = await this.command(state, 'Page.captureScreenshot', {
+        format: 'png', fromSurface: true, captureBeyondViewport: true,
+        clip: { x, y, width, height, scale: 1 },
+      }) as { data?: unknown }
+      this.assertContinuationState(state, input)
+      if (typeof screenshot.data !== 'string' || screenshot.data.length === 0) {
+        throw failure('INTERNAL_ERROR')
+      }
+      return screenshot.data
+    })
   }
 
   async closeContinuation(tabId: string): Promise<void> {
@@ -1920,8 +1944,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
     const inputType = attributes.get('type')?.toLowerCase()
     const autocomplete = attributes.get('autocomplete')?.toLowerCase()
     const style = attributes.get('style')?.toLowerCase() ?? ''
+    const ariaHidden = attributes.get('aria-hidden')?.toLowerCase() === 'true'
     const hidden = attributes.has('hidden')
-      || attributes.get('aria-hidden')?.toLowerCase() === 'true'
+      || ariaHidden
       || inputType === 'hidden'
       || /(?:display\s*:\s*none|visibility\s*:\s*hidden)/u.test(style)
     const readOnly = axReadOnly === true || attributes.has('readonly') || attributes.get('aria-readonly') === 'true'
@@ -1932,6 +1957,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       ...(inputType === undefined ? {} : { inputType }),
       ...(autocomplete === undefined ? {} : { autocomplete }),
       ...(hidden ? { hidden: true } : {}),
+      ...(ariaHidden ? { ariaHidden: true } : {}),
       ...(readOnly ? { readOnly: true } : {}),
       ...(contentEditable ? { contentEditable: true } : {}),
       ...(href === undefined ? {} : { href }),

@@ -396,6 +396,11 @@ describe('ElectronBrowserWorkspace', () => {
             value: { type: 'string', value: 'hidden-token' },
           },
           {
+            nodeId: 'ax_aria_hidden', parentId: 'ax_main', backendDOMNodeId: 13, frameId: 'frame_main', ignored: false,
+            role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '账户口令' },
+            value: { type: 'string', value: 'aria-hidden-secret' },
+          },
+          {
             nodeId: 'ax_other', backendDOMNodeId: 99, frameId: 'frame_other', ignored: false,
             role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: '其他 frame' },
           },
@@ -422,6 +427,12 @@ describe('ElectronBrowserWorkspace', () => {
         if (input?.backendNodeId === 12) {
           return { node: { backendNodeId: 12, nodeName: 'INPUT', attributes: ['type', 'hidden', 'value', 'hidden-token'] } }
         }
+        if (input?.backendNodeId === 13) {
+          return { node: { backendNodeId: 13, nodeName: 'INPUT', attributes: ['type', 'password', 'aria-hidden', 'true', 'value', 'aria-hidden-secret'] } }
+        }
+        if (input?.backendNodeId === 99) {
+          return { node: { backendNodeId: 99, nodeName: 'INPUT', attributes: ['type', 'password'] } }
+        }
         return { node: { backendNodeId: input?.backendNodeId, nodeName: input?.backendNodeId === 11 ? 'INPUT' : 'MAIN', attributes: input?.backendNodeId === 11 ? ['type', 'date', 'readonly', ''] : [] } }
       }
       if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
@@ -447,7 +458,7 @@ describe('ElectronBrowserWorkspace', () => {
       runId: 'agent_run_1',
       expectedOrigin: 'https://www.baidu.com',
       expectedNavigationEpoch: tab.navigationEpoch,
-      locators: ['role=main', 'css=main', 'css=form#login'],
+      locators: ['role=main', 'role=textbox', 'css=main', 'css=form#login'],
     })
 
     expect(result).toMatchObject({
@@ -463,10 +474,17 @@ describe('ElectronBrowserWorkspace', () => {
       expect.objectContaining({ backendNodeId: 10, role: 'main', name: '办事详情', dom: { tagName: 'main' } }),
       expect.objectContaining({ backendNodeId: 11, role: 'textbox', name: '有效期至', value: '2028-06-30', dom: { tagName: 'input', inputType: 'date', readOnly: true } }),
       expect.objectContaining({ backendNodeId: 12, dom: { tagName: 'input', inputType: 'hidden', hidden: true } }),
+      expect.objectContaining({ backendNodeId: 13, dom: { tagName: 'input', inputType: 'password', hidden: true, ariaHidden: true } }),
+      expect.objectContaining({
+        backendNodeId: 99, frameId: 'frame_other', role: 'textbox', name: '其他 frame',
+        dom: { tagName: 'input', inputType: 'password' },
+      }),
     ])
     expect(JSON.stringify(result)).not.toContain('hidden-token')
+    expect(JSON.stringify(result)).not.toContain('aria-hidden-secret')
     expect(result.locatorMatches).toEqual([
       { locator: 'role=main', backendNodeIds: [10] },
+      { locator: 'role=textbox', backendNodeIds: [11, 12, 13] },
       { locator: 'css=main', backendNodeIds: [10] },
       { locator: 'css=form#login', backendNodeIds: [] },
     ])
@@ -493,6 +511,55 @@ describe('ElectronBrowserWorkspace', () => {
       },
     })
     expect(commands.some(({ method }) => method === 'Runtime.evaluate')).toBe(false)
+  })
+
+  it('captures a bounded page clip for the current readable continuation', async () => {
+    const { workspace, views } = createHarness((method) => (
+      method === 'Page.captureScreenshot' ? { data: 'cG5n' } : {}
+    ))
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/detail', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'run_1')
+
+    await expect(workspace.capturePageScreenshot({
+      tabId: tab.id, runId: 'run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, locators: [],
+      clip: { x: 10, y: 20, width: 500, height: 300 },
+    })).resolves.toBe('cG5n')
+
+    expect(views[1]!.webContents.debugger.commands).toContainEqual({
+      method: 'Page.captureScreenshot',
+      params: {
+        format: 'png', fromSurface: true, captureBeyondViewport: true,
+        clip: { x: 10, y: 20, width: 500, height: 300, scale: 1 },
+      },
+    })
+  })
+
+  it('rejects page clip changes before the CDP response returns', async () => {
+    const screenshot = deferred<unknown>()
+    const { workspace, views } = createHarness((method) => (
+      method === 'Page.captureScreenshot' ? screenshot.promise : {}
+    ))
+    const tab = await workspace.acquire(executionInput())
+    await tab.open('https://www.baidu.com/detail', ['https://www.baidu.com'])
+    await workspace.releaseExecution('e1')
+    await workspace.acquireContinuation(tab.id, 'run_1')
+
+    const pending = workspace.capturePageScreenshot({
+      tabId: tab.id, runId: 'run_1', expectedOrigin: 'https://www.baidu.com',
+      expectedNavigationEpoch: tab.navigationEpoch, locators: [],
+      clip: { x: 10, y: 20, width: 500, height: 300 },
+    })
+    await vi.waitFor(() => expect(views[1]!.webContents.debugger.commands)
+      .toContainEqual(expect.objectContaining({ method: 'Page.captureScreenshot' })))
+    const target = views[1]!.webContents
+    target.currentUrl = 'https://www.baidu.com/changed'
+    target.emit('did-navigate', {}, target.currentUrl)
+    screenshot.resolve({ data: 'stale-png' })
+
+    await expect(pending).rejects.toMatchObject({ code: 'PAGE_CHANGED' })
   })
 
   it('fails closed before describing an oversized AX tree instead of returning a partial snapshot', async () => {
@@ -1182,7 +1249,6 @@ describe('ElectronBrowserWorkspace', () => {
   })
 
   it('observes only suspended physical input and page activity', async () => {
-    let targetContents: FakeWebContents | undefined
     const harness = createHarness((method) => {
       if (method === 'DOM.getDocument') return { root: { nodeId: 1 } }
       if (method === 'Accessibility.queryAXTree') {
@@ -1210,7 +1276,7 @@ describe('ElectronBrowserWorkspace', () => {
     const lease = await registry.acquire(binding.bindingId, {
       userId: 'user_1', conversationId: 'conversation_1', runId: 'run_activity',
     })
-    targetContents = views[1]!.webContents
+    const targetContents = views[1]!.webContents
     targetContents.currentUrl = 'https://www.baidu.com/login'
     const activities: Array<{ kind: string }> = []
     const unsubscribe = workspace.onContinuationActivity((activity) => { activities.push(activity) })

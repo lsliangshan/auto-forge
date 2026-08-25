@@ -1308,6 +1308,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                   ...(durationMs === undefined ? {} : { durationMs }),
                 })),
                 allowTools: route.supportsTools,
+                supportsImageInput: route.supportsImageInput,
                 userId: session.user.id,
                 providerSnapshot,
                 provider: route.provider,

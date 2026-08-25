@@ -23,12 +23,14 @@ import type {
   BrowserContinuationLease,
   BrowserPageSnapshot,
   BrowserSemanticNode,
+  BrowserVisualEvidenceBundle,
 } from '../browser/browser-continuation-types.js'
 import {
   BrowserContinuationToolExecutor,
   type BrowserContinuationRunContext,
   type BrowserContinuationToolName,
   type BrowserContinuationToolResult,
+  type BrowserVisualEvidenceResult,
 } from './browser-continuation-tool-executor.js'
 import {
   BrowserPageInspector,
@@ -244,6 +246,7 @@ function textRunInput(
     assetIds: [],
     currentMedia: [],
     allowTools: true,
+    supportsImageInput: false,
   }
 }
 
@@ -274,6 +277,22 @@ function attachBrowserContinuation(
       input: unknown,
       context: BrowserContinuationRunContext,
     ) => Promise<BrowserContinuationToolResult>
+    captureVisualEvidence?: (
+      input: {
+        bindingId: string
+        snapshotId: string
+        pages: readonly BrowserPageSnapshot[]
+      },
+      context: BrowserContinuationRunContext,
+    ) => Promise<BrowserVisualEvidenceResult>
+    validateVisualEvidence?: (
+      input: {
+        bindingId: string
+        snapshotId: string
+        pages: readonly BrowserPageSnapshot[]
+      },
+      context: BrowserContinuationRunContext,
+    ) => Promise<{ kind: 'valid' } | { kind: 'tool_error'; code: AppErrorCode }>
     waitForAuthentication?: (
       runId: string,
       context: BrowserContinuationRunContext,
@@ -312,6 +331,10 @@ function attachBrowserContinuation(
           ? { kind: 'success' as const, data: { completedActions: 0 } }
           : { kind: 'handoff' as const, code: 'MANUAL_ACTION_REQUIRED' as const }
     ))),
+    captureVisualEvidence: vi.fn(options.captureVisualEvidence),
+    validateVisualEvidence: vi.fn(options.validateVisualEvidence ?? (async () => ({
+      kind: 'valid' as const,
+    }))),
     endRun: vi.fn(async () => undefined),
     cancel: vi.fn(async () => undefined),
     takeOver: vi.fn(async () => undefined),
@@ -400,6 +423,7 @@ async function inspectedStaticFields(fields: string[]): Promise<BrowserContinuat
     readNode: async ({ backendNodeId }) => nodes.find((candidate) => candidate.backendNodeId === backendNodeId),
     getNodeBox: async () => ({ x: 0, y: 0, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }),
     captureNodeScreenshot: async () => '',
+    capturePageScreenshot: async () => '',
     onPageInvalidated: () => () => undefined,
   }
   const lease: BrowserContinuationLease = Object.freeze({
@@ -489,6 +513,7 @@ async function inspectedAttachmentTable(): Promise<BrowserContinuationToolResult
     ),
     getNodeBox: async () => ({ x: 0, y: 0, width: 100, height: 20, viewportWidth: 1_200, viewportHeight: 800 }),
     captureNodeScreenshot: async () => '',
+    capturePageScreenshot: async () => '',
     onPageInvalidated: () => () => undefined,
   }
   const lease: BrowserContinuationLease = Object.freeze({
@@ -511,6 +536,32 @@ async function inspectedAttachmentTable(): Promise<BrowserContinuationToolResult
     return { kind: 'success', data: { trust: 'untrusted_page_data', snapshot } }
   } finally {
     inspector.dispose()
+  }
+}
+
+const minimalPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+
+function visualBundleFor(
+  pages: readonly BrowserPageSnapshot[],
+  placedNodeIds: readonly string[],
+): BrowserVisualEvidenceBundle {
+  const firstPage = pages[0]!
+  return {
+    snapshotId: firstPage.snapshotId,
+    bindingId: firstPage.bindingId,
+    origin: firstPage.origin,
+    navigationEpoch: firstPage.navigationEpoch,
+    capturedAt: '2026-08-24T08:00:01.000Z',
+    pages,
+    tiles: [{
+      tileId: 'visual_tile_1', mediaType: 'image/png',
+      dataBase64: minimalPngBase64,
+      width: 1, height: 1, documentX: 0, documentY: 0,
+    }],
+    placements: placedNodeIds.map((nodeId) => ({
+      nodeId, tileId: 'visual_tile_1', x: 0, y: 0,
+      width: 1, height: 1,
+    })),
   }
 }
 
@@ -1347,6 +1398,7 @@ describe('AgentOrchestrator', () => {
       assetIds: ['asset_image'],
       currentMedia: [{ kind: 'image' }],
       allowTools: false,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
     })
@@ -1481,6 +1533,7 @@ describe('AgentOrchestrator', () => {
       assetIds: [],
       currentMedia: [],
       allowTools: false,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
     })
@@ -1966,6 +2019,7 @@ describe('AgentOrchestrator', () => {
       assetIds: [],
       currentMedia: [{ kind: 'image' }],
       allowTools: true,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
     })
@@ -2369,6 +2423,7 @@ describe('AgentOrchestrator', () => {
       assetIds: [],
       currentMedia: [{ kind: 'image' }],
       allowTools: false,
+      supportsImageInput: false,
       provider: 'openrouter',
       model: 'vision-model',
       requestId: 'media_request',
@@ -5002,6 +5057,464 @@ describe('AgentOrchestrator', () => {
       { bindingId: 'binding_1', intent: '运行查询并读取附件页面' },
       expect.any(Object),
     )
+  })
+
+  it('uses visual attachment fallback to answer all uploaded names in page order', async () => {
+    const inspected = await inspectedAttachmentTable()
+    if (inspected.kind !== 'success') throw new Error('expected attachment snapshot')
+    const originalSnapshot = (inspected.data as { snapshot: BrowserPageSnapshot }).snapshot
+    const ambiguousParent = originalSnapshot.nodes.find(({ role }) => role === 'table')!
+    const flatAttachmentNodes = originalSnapshot.nodes.map((node) => (
+      node.answerable === true ? { ...node, parentRef: ambiguousParent.ref } : node
+    ))
+    const snapshot = { ...originalSnapshot, nodes: flatAttachmentNodes }
+    const flattenedInspection: BrowserContinuationToolResult = {
+      kind: 'success', data: { trust: 'untrusted_page_data', snapshot },
+    }
+    const uploadedAttachmentNames = [
+      '学历证书',
+      '学位证书',
+      '应税收入材料',
+      '户口本首页及本人页',
+      '诚信声明',
+      '婚姻证明材料',
+      '在京合法稳定住所证明',
+      '其他材料',
+    ]
+    const uploadedAttachmentNodeIds = uploadedAttachmentNames.map((name) => (
+      flatAttachmentNodes.find((node) => node.answerable === true && node.name === name)!.ref
+    ))
+    const uploadedStatusNodeIds = flatAttachmentNodes
+      .filter((node) => node.answerable === true && node.name === '已上传')
+      .map(({ ref }) => ref)
+    const visualBundle = visualBundleFor(
+      [snapshot],
+      [...uploadedAttachmentNodeIds, ...uploadedStatusNodeIds],
+    )
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'inspect',
+        name: 'browser_session_inspect',
+        arguments: { bindingId: 'binding_1', intent: '读取附件管理页面' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'semantic_empty',
+        name: 'report_browser_page_evidence',
+        arguments: { shape: 'list', selectedNodeIds: [], supportingNodeIds: [] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'visual_answer',
+        name: 'report_browser_visual_evidence',
+        arguments: {
+          shape: 'list', selectedNodeIds: uploadedAttachmentNodeIds,
+          supportingNodeIds: uploadedStatusNodeIds,
+        },
+      },
+      { type: 'usage', inputTokens: 11, outputTokens: 4, totalTokens: 15, costUsd: '0.03' },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const requestId = 'visual_attachment_request'
+    let cachedActive: object | undefined
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => flattenedInspection,
+      captureVisualEvidence: async () => ({ kind: 'success', data: visualBundle }),
+      validateVisualEvidence: async () => {
+        cachedActive = (Reflect.get(orchestrator, 'activeByRequest') as Map<string, object>).get(requestId)
+        return { kind: 'valid' }
+      },
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    await expect(orchestrator.run({
+      ...textRunInput({
+        conversationId: 'browser_conversation', content: '我上传了哪些附件',
+        provider: 'openrouter', model: 'model', requestId,
+      }),
+      supportsImageInput: true,
+    })).resolves.toMatchObject({ status: 'completed' })
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    for (const name of uploadedAttachmentNames) expect(terminal.split(name)).toHaveLength(2)
+    expect(terminal).not.toContain('职称证书和评审材料')
+    for (let index = 1; index < uploadedAttachmentNames.length; index += 1) {
+      expect(terminal.indexOf(uploadedAttachmentNames[index - 1]!))
+        .toBeLessThan(terminal.indexOf(uploadedAttachmentNames[index]!))
+    }
+    expect(terminal).toContain('证件详情 / https://permit.example.gov.cn')
+    expect(terminal).toContain('读取时间：2026-08-24T08:00:01.000Z')
+    expect(terminal).not.toContain('读取时间：2026-08-24T08:00:00.000Z')
+    expect(terminal).not.toMatch(/已上传|未上传|2021-09-08|2024-12-11|查看 删除|dataBase64|"kind":"image"/u)
+    expect(terminal).not.toContain(minimalPngBase64)
+    expect(JSON.stringify(dependencies.records.events)).not.toMatch(/dataBase64|"kind":"image"/u)
+    expect(JSON.stringify(dependencies.records.events)).not.toContain(minimalPngBase64)
+    expect(browser.executor.captureVisualEvidence).toHaveBeenCalledOnce()
+    expect(browser.executor.captureVisualEvidence).toHaveBeenCalledWith({
+      bindingId: 'binding_1', snapshotId: snapshot.snapshotId, pages: [snapshot],
+    }, expect.objectContaining({
+      userId: 'user_1', conversationId: 'browser_conversation', currentUser: expect.any(Object),
+    }))
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(3)
+    const nonVisualProviderCalls = JSON.stringify(
+      vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.slice(0, 2),
+    )
+    expect(nonVisualProviderCalls).not.toMatch(/dataBase64|"kind":"image"/u)
+    expect(nonVisualProviderCalls).not.toContain(minimalPngBase64)
+    expect(dependencies.records.terminal.at(-1)).toMatchObject({
+      inputTokens: 11, outputTokens: 4, costUsd: '0.03',
+    })
+    expect(dependencies.records.usage.filter(({ method, args }) => (
+      method === 'start'
+      && (args[0] as { operationKey?: string }).operationKey?.includes('browser-visual-evidence')
+    ))).toHaveLength(1)
+    if (!cachedActive) throw new Error('expected cached active visual evidence state')
+    const cachedAnswer = await Reflect.get(orchestrator, 'matchedBrowserVisualPageAnswer')
+      .call(orchestrator, cachedActive) as string | undefined
+    expect(cachedAnswer).toContain('读取时间：2026-08-24T08:00:01.000Z')
+    expect(browser.executor.captureVisualEvidence).toHaveBeenCalledOnce()
+    expect(browser.executor.validateVisualEvidence).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['workspace navigation epoch changes', 'PAGE_CHANGED'],
+    ['the latest snapshot is replaced', 'PAGE_CHANGED'],
+    ['run cleanup wins the race', 'CANCELLED'],
+  ] as const)('does not render or cache visual selection when %s during resolver execution', async (
+    _case,
+    validationCode,
+  ) => {
+    const snapshot: BrowserPageSnapshot = {
+      snapshotId: 'snapshot_1', bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+      url: 'https://permit.example.gov.cn/detail', title: '证件详情',
+      capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1, auth: 'authenticated',
+      nodes: [{
+        ref: 'stale_visual_value', role: 'statictext', name: '不应渲染的旧答案',
+        enabled: true, actions: [], answerable: true,
+      }],
+      serializedBytes: 1_000,
+    }
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => []
+    let mainTurn = 0
+    let resolverStarted!: () => void
+    let releaseResolver!: () => void
+    let stale = false
+    const resolverPending = new Promise<void>((resolve) => { resolverStarted = resolve })
+    const resolverGate = new Promise<void>((resolve) => { releaseResolver = resolve })
+    dependencies.providerInstances.openrouter.stream = vi.fn((request: ModelStreamRequest) => {
+      const toolNames = request.tools?.map(({ function: { name } }) => name) ?? []
+      if (toolNames.includes('report_browser_page_evidence')) return events([{
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_semantic_empty',
+        name: 'report_browser_page_evidence',
+        arguments: { shape: 'list', selectedNodeIds: [], supportingNodeIds: [] },
+      }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+      if (toolNames.includes('report_browser_visual_evidence')) {
+        return (async function* () {
+          resolverStarted()
+          await resolverGate
+          yield {
+            type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_visual_answer',
+            name: 'report_browser_visual_evidence',
+            arguments: {
+              shape: 'scalar', selectedNodeIds: ['stale_visual_value'], supportingNodeIds: [],
+            },
+          } as const
+          yield {
+            type: 'usage', inputTokens: 10, outputTokens: 2, totalTokens: 12, costUsd: '0.01',
+          } as const
+          yield { type: 'finish', choiceIndex: 0, reason: 'tool_calls' } as const
+        })()
+      }
+      mainTurn += 1
+      return mainTurn === 1
+        ? events([{
+            type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_inspect',
+            name: 'browser_session_inspect',
+            arguments: { bindingId: 'binding_1', intent: '读取页面值' },
+          }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+        : events([{ type: 'finish', choiceIndex: 0, reason: 'stop' }])
+    })
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({
+        kind: 'success', data: { trust: 'untrusted_page_data', snapshot },
+      }),
+      captureVisualEvidence: async () => ({
+        kind: 'success', data: visualBundleFor([snapshot], ['stale_visual_value']),
+      }),
+      validateVisualEvidence: async () => {
+        dependencies.records.order.push('visual.validate')
+        return stale
+          ? { kind: 'tool_error', code: validationCode }
+          : { kind: 'valid' }
+      },
+    })
+    const running = new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'browser_conversation', content: '读取页面值',
+        provider: 'openrouter', model: 'model', requestId: `visual_revalidate_${validationCode}`,
+      }),
+      supportsImageInput: true,
+    })
+
+    await resolverPending
+    stale = true
+    releaseResolver()
+
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).not.toContain('不应渲染的旧答案')
+    expect(browser.executor.validateVisualEvidence).toHaveBeenCalled()
+    expect(browser.executor.captureVisualEvidence).toHaveBeenCalledTimes(2)
+    const validationIndexes = dependencies.records.order.flatMap((entry, index) => (
+      entry === 'visual.validate' ? [index] : []
+    ))
+    expect(validationIndexes).toHaveLength(2)
+    for (const index of validationIndexes) {
+      expect(dependencies.records.order.slice(0, index)).toContain('usage.report')
+    }
+  })
+
+  it.each([
+    { name: 'semantic selection succeeds', mode: 'semantic-success', supportsImageInput: true, content: '读取页面值' },
+    { name: 'vision input is unsupported', mode: 'early-empty', supportsImageInput: false, content: '读取页面值' },
+    { name: 'a cursor remains', mode: 'no-early', supportsImageInput: true, content: '读取页面值' },
+    { name: 'there are no answerable nodes', mode: 'no-answerable', supportsImageInput: true, content: '读取页面值' },
+    { name: 'the user authorized mutation', mode: 'authorized', supportsImageInput: true, content: '填写页面值' },
+    { name: 'the user authorized navigation', mode: 'authorized', supportsImageInput: true, content: '打开 https://permit.example.gov.cn/detail' },
+  ])('does not capture visual fallback when $name', async ({
+    mode, supportsImageInput, content,
+  }) => {
+    const answerable = mode !== 'no-answerable'
+    const snapshot: BrowserPageSnapshot = {
+      snapshotId: 'snapshot_1', bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+      url: 'https://permit.example.gov.cn/detail', title: '证件详情',
+      capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1, auth: 'authenticated',
+      nodes: [{
+        ref: 'visual_value', role: 'statictext', name: '页面值', enabled: true, actions: [],
+        ...(answerable ? { answerable: true } : {}),
+      }],
+      ...(mode === 'no-early' ? { cursor: 'cursor_1' } : {}),
+      serializedBytes: 1_000,
+    }
+    const inspectTurn: ProviderStreamEvent[] = [{
+      type: 'tool_call', choiceIndex: 0, index: 0, id: 'eligibility_inspect',
+      name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取页面' },
+    }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }]
+    const semanticTurn: ProviderStreamEvent[] = [{
+      type: 'tool_call', choiceIndex: 0, index: 0, id: 'eligibility_semantic',
+      name: 'report_browser_page_evidence', arguments: {
+        shape: 'list',
+        selectedNodeIds: mode === 'semantic-success' ? ['visual_value'] : [],
+        supportingNodeIds: [],
+      },
+    }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }]
+    const stopTurn: ProviderStreamEvent[] = [{ type: 'finish', choiceIndex: 0, reason: 'stop' }]
+    const turns = mode === 'semantic-success'
+      ? [inspectTurn, semanticTurn]
+      : mode === 'early-empty'
+        ? [inspectTurn, semanticTurn, stopTurn]
+        : mode === 'authorized'
+          ? [inspectTurn, stopTurn, semanticTurn]
+          : [inspectTurn, stopTurn]
+    const dependencies = harness(turns)
+    dependencies.workflows.list = async () => []
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({ kind: 'success', data: { trust: 'untrusted_page_data', snapshot } }),
+      captureVisualEvidence: async () => ({
+        kind: 'success', data: visualBundleFor([snapshot], ['visual_value']),
+      }),
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run({
+      ...textRunInput({
+        conversationId: 'browser_conversation', content, provider: 'openrouter', model: 'model',
+      }),
+      supportsImageInput,
+    })).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.captureVisualEvidence).not.toHaveBeenCalled()
+    expect(dependencies.records.usage.some(({ method, args }) => (
+      method === 'start'
+      && (args[0] as { operationKey?: string }).operationKey?.includes('browser-visual-evidence')
+    ))).toBe(false)
+  })
+
+  it.each([
+    { name: 'capture error', captureError: true },
+    { name: 'empty visual selection', captureError: false },
+  ])('caches $name for one visual fallback attempt per evidence revision', async ({ captureError }) => {
+    const snapshot: BrowserPageSnapshot = {
+      snapshotId: 'snapshot_1', bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+      url: 'https://permit.example.gov.cn/detail', title: '证件详情',
+      capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1, auth: 'authenticated',
+      nodes: [{
+        ref: 'visual_value', role: 'statictext', name: '页面值', enabled: true,
+        actions: [], answerable: true,
+      }],
+      serializedBytes: 1_000,
+    }
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cache_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取页面' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'cache_semantic_empty',
+        name: 'report_browser_page_evidence',
+        arguments: { shape: 'list', selectedNodeIds: [], supportingNodeIds: [] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], ...(captureError ? [] : [[
+      {
+        type: 'tool_call' as const, choiceIndex: 0 as const, index: 0, id: 'cache_visual_empty',
+        name: 'report_browser_visual_evidence',
+        arguments: { shape: 'list', selectedNodeIds: [], supportingNodeIds: [] },
+      },
+      { type: 'finish' as const, choiceIndex: 0 as const, reason: 'tool_calls' },
+    ]]), [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    dependencies.workflows.list = async () => []
+    const requestId = `visual_cache_${captureError}`
+    let cachedActive: object | undefined
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({ kind: 'success', data: { trust: 'untrusted_page_data', snapshot } }),
+      captureVisualEvidence: async () => captureError
+        ? { kind: 'tool_error', code: 'INTERNAL_ERROR' }
+        : { kind: 'success', data: visualBundleFor([snapshot], ['visual_value']) },
+      validateVisualEvidence: async () => {
+        cachedActive = (Reflect.get(orchestrator, 'activeByRequest') as Map<string, object>).get(requestId)
+        return { kind: 'valid' }
+      },
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+
+    await expect(orchestrator.run({
+      ...textRunInput({
+        conversationId: 'browser_conversation', content: '读取页面值',
+        provider: 'openrouter', model: 'model', requestId,
+      }),
+      supportsImageInput: true,
+    })).resolves.toMatchObject({ status: 'completed' })
+
+    expect(browser.executor.captureVisualEvidence).toHaveBeenCalledOnce()
+    expect(dependencies.records.usage.filter(({ method, args }) => (
+      method === 'start'
+      && (args[0] as { operationKey?: string }).operationKey?.includes('browser-visual-evidence')
+    ))).toHaveLength(captureError ? 0 : 1)
+    expect(dependencies.providerInstances.openrouter.stream)
+      .toHaveBeenCalledTimes(captureError ? 3 : 4)
+    if (!captureError) {
+      if (!cachedActive) throw new Error('expected cached active visual evidence state')
+      expect(Reflect.get(cachedActive, 'browserVisualEvidenceCapturedAt')).toBeUndefined()
+      expect(Reflect.get(cachedActive, 'browserVisualEvidenceMatchRevision'))
+        .toBe(Reflect.get(cachedActive, 'browserPageEvidenceRevision'))
+    }
+  })
+
+  it.each([
+    { name: 'success', staleResult: 'success' as const },
+    { name: 'tool error', staleResult: 'tool_error' as const },
+  ])('discards a stale visual fallback capture $name before resolver or cache commit', async ({
+    staleResult,
+  }) => {
+    const snapshot = (ref: string, name: string): BrowserPageSnapshot => ({
+      snapshotId: `snapshot_${ref}`, bindingId: 'binding_1', origin: 'https://permit.example.gov.cn',
+      url: 'https://permit.example.gov.cn/detail', title: '证件详情',
+      capturedAt: '2026-04-08T00:00:00.000Z', navigationEpoch: 1, auth: 'authenticated',
+      nodes: [{ ref, role: 'statictext', name, enabled: true, actions: [], answerable: true }],
+      serializedBytes: 1_000,
+    })
+    const oldSnapshot = snapshot('old_value', '旧页面值')
+    const newSnapshot = snapshot('new_value', '新页面值')
+    const dependencies = harness([])
+    dependencies.workflows.list = async () => []
+    let mainTurn = 0
+    let visualResolverTurns = 0
+    dependencies.providerInstances.openrouter.stream = vi.fn((request: ModelStreamRequest) => {
+      const toolNames = request.tools?.map(({ function: { name } }) => name) ?? []
+      if (toolNames.includes('report_browser_page_evidence')) return events([{
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_semantic_empty',
+        name: 'report_browser_page_evidence',
+        arguments: { shape: 'list', selectedNodeIds: [], supportingNodeIds: [] },
+      }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+      if (toolNames.includes('report_browser_visual_evidence')) {
+        visualResolverTurns += 1
+        const selectedNodeId = JSON.stringify(request.messages).includes('new_value')
+          ? 'new_value'
+          : 'old_value'
+        return events([{
+          type: 'tool_call', choiceIndex: 0, index: 0, id: `stale_visual_${selectedNodeId}`,
+          name: 'report_browser_visual_evidence',
+          arguments: { shape: 'scalar', selectedNodeIds: [selectedNodeId], supportingNodeIds: [] },
+        }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+      }
+      mainTurn += 1
+      return mainTurn === 1
+        ? events([{
+            type: 'tool_call', choiceIndex: 0, index: 0, id: 'stale_inspect',
+            name: 'browser_session_inspect',
+            arguments: { bindingId: 'binding_1', intent: '读取页面值' },
+          }, { type: 'finish', choiceIndex: 0, reason: 'tool_calls' }])
+        : events([{ type: 'finish', choiceIndex: 0, reason: 'stop' }])
+    })
+    let resolveOldCapture!: (result: BrowserVisualEvidenceResult) => void
+    let resolveNewCapture!: (result: BrowserVisualEvidenceResult) => void
+    const oldCapture = new Promise<BrowserVisualEvidenceResult>((resolve) => { resolveOldCapture = resolve })
+    const newCapture = new Promise<BrowserVisualEvidenceResult>((resolve) => { resolveNewCapture = resolve })
+    const browser = attachBrowserContinuation(dependencies, {
+      execute: async () => ({
+        kind: 'success', data: { trust: 'untrusted_page_data', snapshot: oldSnapshot },
+      }),
+      captureVisualEvidence: async () => (
+        browser.executor.captureVisualEvidence.mock.calls.length === 1 ? oldCapture : newCapture
+      ),
+    })
+    const orchestrator = new AgentOrchestrator(dependencies)
+    const requestId = `stale_visual_capture_${staleResult}`
+    const running = orchestrator.run({
+      ...textRunInput({
+        conversationId: 'browser_conversation', content: '读取页面值',
+        provider: 'openrouter', model: 'model', requestId,
+      }),
+      supportsImageInput: true,
+    })
+
+    await vi.waitFor(() => expect(browser.executor.captureVisualEvidence).toHaveBeenCalledOnce())
+    const active = (Reflect.get(orchestrator, 'activeByRequest') as Map<string, {
+      browserCandidate: unknown
+      browserPageEvidenceRevision: number
+      browserVisualEvidenceMatchRevision?: number
+    }>).get(requestId)!
+    const staleRevision = active.browserPageEvidenceRevision
+    Reflect.get(orchestrator, 'rememberBrowserEvidence').call(
+      orchestrator,
+      active,
+      active.browserCandidate,
+      newSnapshot,
+      Object.freeze([]),
+    )
+    expect(active.browserPageEvidenceRevision).toBeGreaterThan(staleRevision)
+    resolveOldCapture(staleResult === 'success'
+      ? { kind: 'success', data: visualBundleFor([oldSnapshot], ['old_value']) }
+      : { kind: 'tool_error', code: 'INTERNAL_ERROR' })
+
+    await vi.waitFor(() => expect(browser.executor.captureVisualEvidence).toHaveBeenCalledTimes(2))
+    expect(visualResolverTurns).toBe(0)
+    expect(active.browserVisualEvidenceMatchRevision).not.toBe(staleRevision)
+    resolveNewCapture({ kind: 'success', data: visualBundleFor([newSnapshot], ['new_value']) })
+
+    await expect(running).resolves.toMatchObject({ status: 'completed' })
+    expect(visualResolverTurns).toBe(1)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('新页面值')
+    expect(terminal).not.toContain('旧页面值')
   })
 
   it('answers an attachment question from full-page row context', async () => {
