@@ -160,7 +160,7 @@ function expectPrivateStaticField(
   value: string,
   role = 'statictext',
 ): void {
-  const field = snapshot.nodes.find((candidate) => candidate.name === label)
+  const field = snapshot.nodes.find((candidate) => candidate.name === label && candidate.role === role)
   expect(field).toEqual(expect.objectContaining({
     ref: expect.any(String), role, name: label, enabled: true, actions: [],
   }))
@@ -963,6 +963,39 @@ describe('BrowserPageInspector', () => {
     const port = new FakeCdpPort([
       node(10, 'main', '个人信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
       node(11, 'StaticText', '证件号码：430722******8715'),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input(binding(), { intent: '我的证件号码是多少' }))
+
+    expectPrivateStaticField(inspector, snapshot, '证件号码', '430722******8715')
+  })
+
+  it('keeps a masked certificate number split across adjacent text nodes', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '个人信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(11, 'StaticText', '证件编号：202111127927'),
+      node(20, 'none', '', { axNodeId: 'ax_field', parentAxNodeId: 'ax_main', ignored: true }),
+      node(12, 'StaticText', '证件号码：', { parentAxNodeId: 'ax_field' }),
+      node(13, 'StaticText', '430722******8715', { parentAxNodeId: 'ax_field' }),
+    ])
+    const inspector = new BrowserPageInspector(port, { id: idSequence() })
+
+    const snapshot = await inspector.inspect(input(binding(), { intent: '我的证件号码是多少' }))
+
+    expectPrivateStaticField(inspector, snapshot, '证件编号', '202111127927')
+    expectPrivateStaticField(inspector, snapshot, '证件号码', '430722******8715')
+  })
+
+  it('keeps a masked certificate number split across adjacent table cells', async () => {
+    const port = new FakeCdpPort([
+      node(10, 'main', '个人信息', { axNodeId: 'ax_main', parentAxNodeId: undefined }),
+      node(20, 'table', '证件信息', { axNodeId: 'ax_table', parentAxNodeId: 'ax_main' }),
+      node(21, 'row', '证件号码 430722******8715', { axNodeId: 'ax_row', parentAxNodeId: 'ax_table' }),
+      node(22, 'cell', '证件号码', { axNodeId: 'ax_label_cell', parentAxNodeId: 'ax_row' }),
+      node(23, 'StaticText', '证件号码', { axNodeId: 'ax_label', parentAxNodeId: 'ax_label_cell' }),
+      node(24, 'cell', '430722******8715', { axNodeId: 'ax_value_cell', parentAxNodeId: 'ax_row' }),
+      node(25, 'StaticText', '430722******8715', { axNodeId: 'ax_value', parentAxNodeId: 'ax_value_cell' }),
     ])
     const inspector = new BrowserPageInspector(port, { id: idSequence() })
 

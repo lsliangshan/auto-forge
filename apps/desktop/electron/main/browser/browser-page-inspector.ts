@@ -343,6 +343,12 @@ const staticEducationValues: ReadonlySet<string> = new Set([
   '硕士',
   '博士',
 ])
+const staticStructuredFieldLabels: ReadonlySet<string> = new Set([
+  ...staticDateLabels,
+  ...staticCertificateNumberLabels,
+  ...staticCertificateTypeLabels,
+  ...staticEducationLabels,
+])
 function failure(code: AppErrorCode): AppError {
   return toSafeAppError({ code })
 }
@@ -478,6 +484,75 @@ function structuredStaticField(rawText: string): StructuredStaticField | null | 
     normalizedText(rawText.slice(0, delimiter.index)),
     normalizedText(rawText.slice(delimiter.index + delimiter[0].length)),
   )
+}
+
+interface SplitStructuredStaticFields {
+  readonly byBackendNodeId: ReadonlyMap<number, StructuredStaticField>
+  readonly redactedBackendNodeIds: ReadonlySet<number>
+}
+
+function standaloneStructuredFieldLabel(rawText: string): { name: string; hasDelimiter: boolean } | undefined {
+  if (unsafeStaticFieldRawText.test(rawText)) return undefined
+  const normalized = normalizedText(rawText)
+  const hasDelimiter = /[:：]$/u.test(normalized)
+  const name = (hasDelimiter ? normalized.slice(0, -1) : normalized).trim()
+  if (!name || /[:：]/u.test(name) || !staticStructuredFieldLabels.has(name.toLowerCase())) return undefined
+  return { name, hasDelimiter }
+}
+
+function splitStructuredStaticFields(
+  readableNodes: readonly BrowserInspectionNode[],
+  ancestryNodes: readonly BrowserInspectionNode[],
+): SplitStructuredStaticFields {
+  const byAxId = new Map(ancestryNodes.map((node) => [node.axNodeId, node]))
+  const textNodes = readableNodes.filter((node) => rawStaticTextRoles.has(node.role))
+  const byBackendNodeId = new Map<number, StructuredStaticField>()
+  const redactedBackendNodeIds = new Set<number>()
+  const scope = (node: BrowserInspectionNode): { key: string; broad: boolean } | undefined => {
+    const parent = node.parentAxNodeId ? byAxId.get(node.parentAxNodeId) : undefined
+    if (!parent) return undefined
+    const parentRole = normalizedRole(parent.role)
+    if (['cell', 'gridcell', 'layouttablecell'].includes(parentRole)) {
+      const row = parent.parentAxNodeId ? byAxId.get(parent.parentAxNodeId) : undefined
+      if (row && ['row', 'layouttablerow'].includes(normalizedRole(row.role))) {
+        return { key: row.axNodeId, broad: false }
+      }
+    }
+    return {
+      key: parent.axNodeId,
+      broad: ['document', 'main'].includes(parentRole),
+    }
+  }
+
+  for (let index = 0; index + 1 < textNodes.length; index += 1) {
+    const labelNode = textNodes[index]!
+    const valueNode = textNodes[index + 1]!
+    const label = standaloneStructuredFieldLabel(labelNode.name)
+    const labelScope = scope(labelNode)
+    const valueScope = scope(valueNode)
+    if (!label || !labelScope || !valueScope || labelScope.key !== valueScope.key
+      || (labelScope.broad && !label.hasDelimiter)
+      || redactedBackendNodeIds.has(labelNode.backendNodeId)
+      || redactedBackendNodeIds.has(valueNode.backendNodeId)
+      || standaloneStructuredFieldLabel(valueNode.name)) continue
+    const field = validatedStructuredField(label.name, normalizedText(valueNode.name))
+    if (!field) continue
+    byBackendNodeId.set(labelNode.backendNodeId, field)
+    let current: BrowserInspectionNode | undefined = valueNode
+    const seen = new Set<string>()
+    while (current && !seen.has(current.axNodeId)) {
+      seen.add(current.axNodeId)
+      if (normalizedText(current.name).includes(field.value)
+        || (current.value !== undefined && normalizedText(current.value).includes(field.value))) {
+        redactedBackendNodeIds.add(current.backendNodeId)
+      }
+      current = current.parentAxNodeId ? byAxId.get(current.parentAxNodeId) : undefined
+    }
+  }
+  return {
+    byBackendNodeId,
+    redactedBackendNodeIds,
+  }
 }
 
 function safeUrl(value: string, expectedOrigin: string): string {
@@ -1026,15 +1101,18 @@ export class BrowserPageInspector {
     const auth = this.classifyAuth(binding, page, visibleNodes)
     const readable = this.readableNodes(binding, page, mainFrameNodes, visibleNodes)
     const restrictedRegions = this.restrictedRegionBackendIds(mainFrameNodes)
+    const splitFields = splitStructuredStaticFields(readable, mainFrameNodes)
     const preliminaryCandidates = readable.flatMap((node): SafeCandidate[] => {
+      if (splitFields.redactedBackendNodeIds.has(node.backendNodeId)) return []
       const role = normalizedRole(node.role)
       if (!semanticRoles.has(role) || authNode(node)) return []
       const rawValue = node.value === undefined ? undefined : safeText(node.value)
-      const structuredField = rawStaticTextRoles.has(node.role)
-        ? structuredStaticField(node.name)
-        : node.dom.readOnly === true && rawValue !== undefined
-          ? validatedStructuredField(normalizedText(node.name), normalizedText(rawValue))
-          : undefined
+      const structuredField = splitFields.byBackendNodeId.get(node.backendNodeId)
+        ?? (rawStaticTextRoles.has(node.role)
+          ? structuredStaticField(node.name)
+          : node.dom.readOnly === true && rawValue !== undefined
+            ? validatedStructuredField(normalizedText(node.name), normalizedText(rawValue))
+            : undefined)
       if (structuredField === null) return []
       const name = structuredField?.name ?? safeText(node.name) ?? ''
       if (!name && !structuralRoles.has(role)) return []

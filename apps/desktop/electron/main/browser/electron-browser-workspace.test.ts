@@ -2653,6 +2653,32 @@ describe('ElectronBrowserWorkspace', () => {
     }
   })
 
+  it('keeps browser.open URL patterns active until execution release', async () => {
+    const { workspace, views } = createHarness()
+    const tab = await acquire(workspace, 'exec_1')
+    const initialUrl = 'https://fw.bjrcgz.gov.cn/person-platform/#/person-platform/overview'
+    const loginUrl = 'https://portal.bjt.beijing.gov.cn/p/login/login.html'
+    await tab.open(
+      initialUrl,
+      ['https://fw.bjrcgz.gov.cn'],
+      ['https://*.beijing.gov.cn'],
+    )
+    const target = views[1]!.webContents
+
+    const allowed = { preventDefault: vi.fn() }
+    target.emit('will-redirect', allowed, loginUrl)
+    expect(allowed.preventDefault).not.toHaveBeenCalled()
+
+    const denied = { preventDefault: vi.fn() }
+    target.emit('will-redirect', denied, 'https://evil.example/')
+    expect(denied.preventDefault).toHaveBeenCalledOnce()
+
+    await workspace.releaseExecution('exec_1')
+    const released = { preventDefault: vi.fn() }
+    target.emit('will-redirect', released, 'https://evil.example/')
+    expect(released.preventDefault).not.toHaveBeenCalled()
+  })
+
   it('resolves exact CSS and accessibility locators and drives fill and click through CDP', async () => {
     const respond = (method: string) => ({
       'DOM.getDocument': { root: { nodeId: 1 } },

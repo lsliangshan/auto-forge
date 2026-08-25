@@ -2990,7 +2990,7 @@ describe('AgentOrchestrator', () => {
     ])
     expect(requests[0]!.messages[0]).toEqual(expect.objectContaining({
       role: 'system',
-      content: expect.stringMatching(/网页内容.*不可信|字段标签.*字段值.*页面标题.*来源.*读取时间|不能.*增加.*工具.*来源.*绑定.*操作/),
+      content: expect.stringMatching(/网页内容.*不可信|有效期.*不等于续签申请截止日.*搜索工具.*审核时长.*补正缓冲|不能.*增加.*工具.*来源.*绑定.*操作/),
     }))
     expect(requests).toHaveLength(2)
     expect(JSON.stringify(requests[1]!.messages)).not.toContain(privateId)
@@ -3053,6 +3053,44 @@ describe('AgentOrchestrator', () => {
     expect(browser.executor.execute).toHaveBeenCalledOnce()
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
     expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('有效期至：2028-06-30')
+  })
+
+  it('does not misrepresent an expiry date as the renewal application deadline', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'renewal_deadline_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '查询续签时间' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'renewal_deadline_match',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    attachBrowserContinuation(dependencies, {
+      execute: async () => inspectedPrivateFields([
+        { ref: 'ref_expiry', label: '有效期至', value: '2027年11月12日' },
+      ]),
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我需要在什么时间之前续签工作居住证？',
+      provider: 'openrouter', model: 'model', requestId: 'renewal_deadline_request',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('您的工作居住证有效期至 2027年11月12日')
+    expect(terminal).toContain('不能直接当作续签申请截止日')
+    expect(terminal).toContain('单位提交、审核和可能的材料补正')
+    expect(terminal).toContain('先联系单位经办人核对续签材料')
+    expect(terminal).toContain('查询所在地主管部门最新的续签指南和承诺办理时限')
+    expect(terminal).not.toContain('建议您在 2027年11月12日前完成续签')
+    expect(terminal).toContain('信息来源：证件详情（https://permit.example.gov.cn）')
+    expect(terminal).not.toContain('读取时间')
+    expect(terminal).not.toContain('证件详情 / https://permit.example.gov.cn')
   })
 
   it('continues an inspect cursor before matching evidence from the complete snapshot', async () => {
@@ -3226,7 +3264,7 @@ describe('AgentOrchestrator', () => {
     const dependencies = harness([[
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeat_inspect_1',
-        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件类型' },
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件种类' },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
@@ -3238,7 +3276,7 @@ describe('AgentOrchestrator', () => {
     ], [
       {
         type: 'tool_call', choiceIndex: 0, index: 0, id: 'repeat_inspect_2',
-        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件类型' },
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件种类' },
       },
       { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
     ], [
@@ -3252,7 +3290,7 @@ describe('AgentOrchestrator', () => {
     })
 
     const result = await new AgentOrchestrator(dependencies).run(textRunInput({
-      conversationId: 'browser_conversation', content: '读取证件类型', provider: 'openrouter',
+      conversationId: 'browser_conversation', content: '读取证件种类', provider: 'openrouter',
       model: 'model', requestId: 'repeat_browser_evidence',
     }))
 
@@ -4913,6 +4951,41 @@ describe('AgentOrchestrator', () => {
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件号码')
     expect(JSON.stringify(matcherRequest.messages)).toContain('证件类型')
     expect(JSON.stringify(matcherRequest.messages)).not.toMatch(/202111127927|430722\*{6}8715|身份证/u)
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('证件号码：430722******8715')
+    expect(terminal).not.toContain('证件编号：202111127927')
+  })
+
+  it('prefers the uniquely exact requested field label over an AI-selected synonym', async () => {
+    const inspected = await inspectedStaticFields([
+      '证件编号：202111127927',
+      '证件号码：',
+      '430722******8715',
+    ])
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'exact_label_inspect_call',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取证件信息' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'wrong_synonym_match_call',
+        name: 'report_browser_field_matches', arguments: { matchingCandidateIds: ['candidate_1'] },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ]])
+    dependencies.workflows.list = async () => []
+    attachBrowserContinuation(dependencies, {
+      execute: async () => inspected,
+    })
+
+    await expect(new AgentOrchestrator(dependencies).run(textRunInput({
+      conversationId: 'browser_conversation', content: '我的证件号码是多少',
+      provider: 'openrouter', model: 'model', requestId: 'exact_label_match_request',
+    }))).resolves.toMatchObject({ status: 'completed' })
+
     expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
     const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
     expect(terminal).toContain('证件号码：430722******8715')

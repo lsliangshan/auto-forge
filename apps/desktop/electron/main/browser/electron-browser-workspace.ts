@@ -239,6 +239,7 @@ interface TargetTabState {
   navigationEpoch: number
   activityRevision: number
   automationOrigins?: readonly string[]
+  automationUrlPatterns?: readonly string[]
   allowedOrigins?: readonly string[]
   allowedUrlPatterns?: readonly string[]
   navigationViolation?: AppError
@@ -551,6 +552,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       if (state.ownerExecutionId === executionId) state.ownerExecutionId = undefined
       if (state.activeOperations === 0) {
         state.automationOrigins = undefined
+        state.automationUrlPatterns = undefined
         state.allowedOrigins = undefined
         state.allowedUrlPatterns = undefined
         state.navigationViolation = undefined
@@ -1775,7 +1777,9 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
       return
     }
     const restrictedOrigins = state.allowedOrigins ?? (state.ownerExecutionId ? state.automationOrigins : undefined)
-    const matchesAllowedPattern = state.allowedUrlPatterns
+    const restrictedPatterns = state.allowedUrlPatterns
+      ?? (state.ownerExecutionId ? state.automationUrlPatterns : undefined)
+    const matchesAllowedPattern = restrictedPatterns
       ?.some((pattern) => matchesHttpsUrlPattern(pattern, url)) ?? false
     if (restrictedOrigins && !restrictedOrigins.includes(origin) && !matchesAllowedPattern) {
       event.preventDefault()
@@ -1841,6 +1845,7 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
         : allowedUrlPatterns
           ? [originOf(current)]
           : [...new Set([...allowedOrigins, originOf(current)])]
+      if (allowedUrlPatterns) state.automationUrlPatterns = [...allowedUrlPatterns]
       return result
     } finally {
       state.activeOperations -= 1
@@ -1848,7 +1853,10 @@ export class ElectronBrowserWorkspace implements BrowserWorkspacePort, BrowserPa
         state.allowedOrigins = undefined
         state.allowedUrlPatterns = undefined
         state.navigationViolation = undefined
-        if (!state.ownerExecutionId && !state.ownerContinuationRunId) state.automationOrigins = undefined
+        if (!state.ownerExecutionId && !state.ownerContinuationRunId) {
+          state.automationOrigins = undefined
+          state.automationUrlPatterns = undefined
+        }
       }
     }
   }
