@@ -798,6 +798,9 @@ describe('createApplicationRuntime', () => {
     const alice = await authenticate(runtime, 'KnowledgeAlice')
     const [base] = await runtime.services.knowledge.listBases({ userId: alice.user.id })
     const imported = await runtime.services.knowledge.importDocument({ userId: alice.user.id }, base!.id)
+    await expect.poll(async () => (
+      await runtime.services.knowledge.listDocuments({ userId: alice.user.id }, base!.id)
+    )[0]?.status).toBe('ready')
     const conversation = await runtime.services.chat.createConversation()
     await runtime.services.knowledge.updateConversationSelection(
       { userId: alice.user.id },
@@ -832,6 +835,103 @@ describe('createApplicationRuntime', () => {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
     }
+  })
+
+  it('holds knowledge owner derivation through completion and rejects stale-epoch IPC during logout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-admission-'))
+    directories.push(root)
+    const order: string[] = []
+    const authDelegate = createTestAuthService()
+    const authService: AuthService = {
+      ...authDelegate,
+      logout: async () => {
+        order.push('auth-logout')
+        await authDelegate.logout()
+      },
+    }
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      createKnowledgeParser: async (): Promise<KnowledgeParserPort> => ({
+        async parse(input) {
+          input.fileKey.fill(0)
+          return { version: 1, type: 'error', jobId: input.jobId, code: 'PARSER_CANCELLED' }
+        },
+        async terminateAll() { order.push('parser-terminate') },
+      }),
+      knowledgePlatform: 'darwin', knowledgeArch: 'arm64',
+    }))
+    const alice = await authenticate(runtime, 'AdmissionAlice')
+    await runtime.services.knowledgeAdmission.run(async () => {
+      const session = await runtime.services.auth.requireSession()
+      return runtime.services.knowledge.listBases({ userId: session.user.id })
+    })
+    const entered = deferred<void>()
+    const release = deferred<void>()
+    const stale = runtime.services.knowledgeAdmission.run(async () => {
+      const session = await runtime.services.auth.requireSession()
+      entered.resolve()
+      await release.promise
+      order.push(`knowledge-${session.user.id}`)
+      return runtime.services.knowledge.listBases({ userId: session.user.id })
+    })
+    await entered.promise
+
+    const logout = runtime.services.auth.logout()
+    const concurrent = runtime.services.knowledgeAdmission.run(async () => {
+      const session = await runtime.services.auth.requireSession()
+      return runtime.services.knowledge.listBases({ userId: session.user.id })
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    expect(order).toEqual([])
+    release.resolve()
+
+    await expect(stale).rejects.toMatchObject({ code: 'CONFLICT' })
+    await logout
+    await expect(concurrent).rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
+    expect(order).toEqual([`knowledge-${alice.user.id}`, 'parser-terminate', 'auth-logout'])
+    await runtime.close()
+  })
+
+  it('reopens admission safely after a failed auth transition without automatically reviving old knowledge resources', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-admission-failure-'))
+    directories.push(root)
+    const authDelegate = createTestAuthService()
+    const transitionError = new Error('injected auth transition failure')
+    const authService: AuthService = {
+      ...authDelegate,
+      logout: async () => { throw transitionError },
+    }
+    let parserCreations = 0
+    let parserTerminations = 0
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      createKnowledgeParser: async (): Promise<KnowledgeParserPort> => {
+        parserCreations += 1
+        return {
+          async parse(input) {
+            input.fileKey.fill(0)
+            return { version: 1, type: 'error', jobId: input.jobId, code: 'PARSER_CANCELLED' }
+          },
+          async terminateAll() { parserTerminations += 1 },
+        }
+      },
+      knowledgePlatform: 'darwin', knowledgeArch: 'arm64',
+    }))
+    await authenticate(runtime, 'AdmissionFailureAlice')
+    await runtime.services.knowledgeAdmission.run(async () => {
+      const session = await runtime.services.auth.requireSession()
+      return runtime.services.knowledge.listBases({ userId: session.user.id })
+    })
+
+    await expect(runtime.services.auth.logout()).rejects.toBe(transitionError)
+    expect({ parserCreations, parserTerminations }).toEqual({ parserCreations: 1, parserTerminations: 1 })
+
+    await runtime.services.knowledgeAdmission.run(async () => {
+      const session = await runtime.services.auth.requireSession()
+      return runtime.services.knowledge.listBases({ userId: session.user.id })
+    })
+    expect(parserCreations).toBe(2)
+    await runtime.close()
   })
 
   it('rejects selector-less resolution instead of using an id and version fallback', async () => {

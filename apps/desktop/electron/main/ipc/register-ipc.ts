@@ -47,6 +47,9 @@ export interface DesktopIpcServices {
   auth: DesktopAPI['auth'] & {
     requireSession(): Promise<AuthSession>
   }
+  knowledgeAdmission: {
+    run<T>(operation: () => Promise<T>): Promise<T>
+  }
   userAdmin: DesktopAPI['userAdmin']
   profile: DesktopAPI['profile']
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
@@ -173,10 +176,10 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       input: z.infer<(typeof ipcRequestSchemas)[Channel]>,
     ) => unknown | Promise<unknown>,
   ) => {
-    register(channel, async (input) => {
+    register(channel, input => options.services.knowledgeAdmission.run(async () => {
       const session = await options.services.auth.requireSession()
       return operation({ userId: session.user.id }, input)
-    }, { anonymous: true })
+    }), { anonymous: true })
   }
 
   register(ipcChannels.authGetSession, () => options.services.auth.getSession(), { anonymous: true })

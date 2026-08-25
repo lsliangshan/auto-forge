@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, open, rename, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type Database from 'better-sqlite3-multiple-ciphers'
+import { toSafeAppError } from '@autoforge/shared'
 import { readDecryptedObjectSnapshot, unwrapSnapshotFileKey } from './encrypted-object-store.js'
+
+const MAX_EXPORT_VERSIONS = 256
+const MAX_EXPORT_BYTES = 128 * 1024 * 1024
 
 interface ExportObjectRow {
   documentId: string
@@ -107,6 +111,16 @@ export class KnowledgeExportService {
       id: string; name: string; status: string; createdAt: number; updatedAt: number
     } | undefined
     if (!base) throw Object.assign(new Error('Knowledge base was not found'), { code: 'NOT_FOUND' })
+    const aggregate = this.options.database.prepare(`
+      SELECT count(*) AS versionCount, coalesce(sum(source_objects.byte_size), 0) AS byteSize
+      FROM documents
+      JOIN document_versions ON document_versions.document_id = documents.id
+      JOIN source_objects ON source_objects.id = document_versions.source_object_id
+      WHERE documents.knowledge_base_id = ?
+    `).get(knowledgeBaseId) as { versionCount: number; byteSize: number }
+    if (aggregate.versionCount > MAX_EXPORT_VERSIONS || aggregate.byteSize > MAX_EXPORT_BYTES) {
+      throw toSafeAppError({ code: 'INVALID_INPUT' })
+    }
     const rows = this.options.database.prepare(`
       SELECT documents.id AS documentId, documents.name AS documentName,
         documents.mime_type AS mimeType, documents.status AS documentStatus,

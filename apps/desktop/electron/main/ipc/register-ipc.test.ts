@@ -8,6 +8,12 @@ import {
   type IpcMainPort,
 } from './register-ipc.js'
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(release => { resolve = release })
+  return { promise, resolve }
+}
+
 const appSettings: AppSettings = {
   theme: 'system', language: 'zh-CN', dataDirectory: '/data', logDirectory: '/logs',
   activeProvider: 'deepseek', defaultModels: {
@@ -59,6 +65,9 @@ function services(): DesktopIpcServices {
       loginWithPassword: vi.fn().mockResolvedValue(authSession),
       logout: vi.fn().mockResolvedValue(undefined),
       requireSession: vi.fn().mockResolvedValue(authSession),
+    },
+    knowledgeAdmission: {
+      run: <T>(operation: () => Promise<T>) => operation(),
     },
     userAdmin: {
       list: vi.fn().mockResolvedValue({ items: [], page: 1, pageSize: 20, total: 0 }),
@@ -417,6 +426,10 @@ describe('registerDesktopIpc', () => {
     await app.invoke(ipcChannels.knowledgeListVersions, { documentId: 'document_bob' })
     await app.invoke(ipcChannels.knowledgeImportDocument, { knowledgeBaseId: 'kb_bob' })
     await app.invoke(ipcChannels.knowledgeReplaceDocument, { documentId: 'document_bob' })
+    await app.invoke(ipcChannels.knowledgeRecycleDocument, { documentId: 'document_bob' })
+    await app.invoke(ipcChannels.knowledgePurgeDocument, { documentId: 'document_bob' })
+    await app.invoke(ipcChannels.knowledgeRecycleBase, { knowledgeBaseId: 'kb_bob' })
+    await app.invoke(ipcChannels.knowledgePurgeBase, { knowledgeBaseId: 'kb_bob' })
     await app.invoke(ipcChannels.knowledgeGetConversationSelection, { conversationId: 'conversation_bob' })
     await app.invoke(ipcChannels.knowledgeUpdateConversationSelection, { conversationId: 'conversation_bob', selection })
     await app.invoke(ipcChannels.knowledgeSearch, { conversationId: 'conversation_bob', query: '北京' })
@@ -430,12 +443,37 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.knowledge.listVersions).toHaveBeenCalledWith(owner, 'document_bob')
     expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'kb_bob')
     expect(app.dependencies.knowledge.replaceDocument).toHaveBeenCalledWith(owner, 'document_bob')
+    expect(app.dependencies.knowledge.recycleDocument).toHaveBeenCalledWith(owner, 'document_bob')
+    expect(app.dependencies.knowledge.purgeDocument).toHaveBeenCalledWith(owner, 'document_bob')
+    expect(app.dependencies.knowledge.recycleBase).toHaveBeenCalledWith(owner, 'kb_bob')
+    expect(app.dependencies.knowledge.purgeBase).toHaveBeenCalledWith(owner, 'kb_bob')
     expect(app.dependencies.knowledge.getConversationSelection).toHaveBeenCalledWith(owner, 'conversation_bob')
     expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith(owner, 'conversation_bob', selection)
     expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, 'conversation_bob', '北京')
     expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.getEntitlement).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.getConsent).toHaveBeenCalledWith(owner)
+  })
+
+  it('holds admission across authenticated owner derivation and the complete knowledge operation', async () => {
+    const app = harness()
+    const admitted = deferred<void>()
+    const release = deferred<void>()
+    app.dependencies.knowledgeAdmission.run = vi.fn(async operation => {
+      admitted.resolve()
+      await release.promise
+      return operation()
+    })
+
+    const listing = app.invoke(ipcChannels.knowledgeListBases)
+    await admitted.promise
+    expect(app.dependencies.auth.requireSession).not.toHaveBeenCalled()
+    expect(app.dependencies.knowledge.listBases).not.toHaveBeenCalled()
+    release.resolve()
+    await listing
+
+    expect(app.dependencies.auth.requireSession).toHaveBeenCalledOnce()
+    expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith({ userId: 'user_1' })
   })
 
   it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {

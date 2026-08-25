@@ -17,7 +17,6 @@ import type { SafeStoragePort } from '../security/secret-store.js'
 import {
   createEncryptedObjectSnapshot,
   hashStableKnowledgeSource,
-  unwrapSnapshotFileKey,
   type EncryptedObjectSnapshot,
 } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
@@ -25,29 +24,28 @@ import { KnowledgeExportService } from './export-service.js'
 import { KnowledgeKeyStore } from './key-store.js'
 import { LocalKnowledgeRetriever, type LocalKnowledgeSearchOutcome } from './local-retriever.js'
 import type { KnowledgeOwner, KnowledgePersistence } from './knowledge-types.js'
-import type { ParserStartInput } from './parser-supervisor.js'
-import type { ParserFormat, ParserResponse } from './parser-protocol.js'
+import type { ParserFormat } from './parser-protocol.js'
+import { KnowledgePurgeService } from './purge-service.js'
+import {
+  KnowledgeImportRuntime,
+  serializeKnowledgeMutation,
+  type KnowledgeImportSession,
+  type KnowledgeParserPort,
+} from './import-job-runtime.js'
+
+export type { KnowledgeParserPort } from './import-job-runtime.js'
 
 const DEFAULT_BASE_NAME = '我的知识库'
 const OBJECT_KEY_CHECK = 'object_master_key_check_v1'
 const OBJECT_KEY_CHECK_DOMAIN = 'autoforge:knowledge:object-master-key-check:v1'
 const RECYCLE_PERIOD_MS = 30 * 24 * 60 * 60 * 1_000
 
-export interface KnowledgeParserPort {
-  parse(input: ParserStartInput): Promise<ParserResponse>
-  terminateAll(): Promise<void>
-}
-
 export interface KnowledgeEntitlementPort {
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
 }
 
-interface OpenKnowledgeSession {
+interface OpenKnowledgeSession extends KnowledgeImportSession {
   readonly owner: KnowledgeOwner
-  readonly opened: OpenedUserKnowledgeDatabase
-  readonly parser: KnowledgeParserPort
-  readonly objectKeyStore: KnowledgeKeyStore
-  readonly objectsDirectory: string
 }
 
 export interface KnowledgeServiceOptions {
@@ -64,6 +62,10 @@ export interface KnowledgeServiceOptions {
   readonly platform?: NodeJS.Platform
   readonly arch?: string
   readonly runtimeAvailable?: boolean
+  readonly unlinkKnowledgeObject?: (path: string) => Promise<void>
+  readonly vacuumKnowledgeDatabase?: (database: Database.Database) => void
+  readonly rotateKnowledgeDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
+  readonly openKnowledgeDatabase?: typeof openUserKnowledgeDatabase
 }
 
 interface DocumentRow {
@@ -164,6 +166,11 @@ export class KnowledgeService implements KnowledgePersistence {
   private closePromise: Promise<void> | undefined
   private closing = false
   private readonly mutations = new Set<Promise<unknown>>()
+  private readonly imports = new KnowledgeImportRuntime({
+    now: () => this.now(),
+    isClosing: () => this.closing,
+    track: operation => { this.track(operation) },
+  })
 
   constructor(private readonly options: KnowledgeServiceOptions) {}
 
@@ -274,49 +281,57 @@ export class KnowledgeService implements KnowledgePersistence {
 
   async recycleDocument(owner: KnowledgeOwner, documentId: string): Promise<void> {
     const session = await this.ensureSession(owner)
-    const document = this.requireDocument(session, documentId)
-    const now = this.now()
-    session.opened.database.transaction(() => {
-      session.opened.database.prepare(
-        "UPDATE documents SET status = 'recycled', updated_at = ? WHERE id = ?",
-      ).run(now, documentId)
-      session.opened.database.prepare(`
-        INSERT INTO tombstones (id, knowledge_base_id, entity_kind, entity_id, sequence, deleted_at, expires_at)
-        VALUES (?, ?, 'document', ?, 0, ?, ?)
-      `).run(this.id(), document.knowledgeBaseId, documentId, now, now + RECYCLE_PERIOD_MS)
-    })()
+    const cancelled = await this.mutate(session, () => {
+      const document = this.requireDocument(session, documentId)
+      const now = this.now()
+      return session.opened.database.transaction(() => {
+        const jobs = this.imports.cancelJobs(session, 'document', documentId, now)
+        session.opened.database.prepare(
+          "UPDATE documents SET status = 'recycled', updated_at = ? WHERE id = ?",
+        ).run(now, documentId)
+        session.opened.database.prepare(`
+          INSERT INTO tombstones (id, knowledge_base_id, entity_kind, entity_id, sequence, deleted_at, expires_at)
+          VALUES (?, ?, 'document', ?, 0, ?, ?)
+        `).run(this.id(), document.knowledgeBaseId, documentId, now, now + RECYCLE_PERIOD_MS)
+        return jobs
+      })()
+    })
+    await this.imports.abortAndDrain(cancelled)
   }
 
   async purgeDocument(owner: KnowledgeOwner, documentId: string): Promise<void> {
     const session = await this.ensureSession(owner)
-    this.requireDocument(session, documentId)
     await this.track(this.purge(session, 'document', documentId))
   }
 
   async recycleBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void> {
     const session = await this.ensureSession(owner)
-    this.requireBase(session, knowledgeBaseId)
-    const now = this.now()
-    session.opened.database.transaction(() => {
-      session.opened.database.prepare(
-        "UPDATE knowledge_bases SET status = 'recycled', updated_at = ? WHERE id = ?",
-      ).run(now, knowledgeBaseId)
-      session.opened.database.prepare(
-        "UPDATE documents SET status = 'recycled', updated_at = ? WHERE knowledge_base_id = ?",
-      ).run(now, knowledgeBaseId)
-      session.opened.database.prepare(
-        'DELETE FROM conversation_selection_bases WHERE knowledge_base_id = ?',
-      ).run(knowledgeBaseId)
-      session.opened.database.prepare(`
-        INSERT INTO tombstones (id, knowledge_base_id, entity_kind, entity_id, sequence, deleted_at, expires_at)
-        VALUES (?, ?, 'knowledge_base', ?, 0, ?, ?)
-      `).run(this.id(), knowledgeBaseId, knowledgeBaseId, now, now + RECYCLE_PERIOD_MS)
-    })()
+    const cancelled = await this.mutate(session, () => {
+      this.requireBase(session, knowledgeBaseId)
+      const now = this.now()
+      return session.opened.database.transaction(() => {
+        const jobs = this.imports.cancelJobs(session, 'knowledge_base', knowledgeBaseId, now)
+        session.opened.database.prepare(
+          "UPDATE knowledge_bases SET status = 'recycled', updated_at = ? WHERE id = ?",
+        ).run(now, knowledgeBaseId)
+        session.opened.database.prepare(
+          "UPDATE documents SET status = 'recycled', updated_at = ? WHERE knowledge_base_id = ?",
+        ).run(now, knowledgeBaseId)
+        session.opened.database.prepare(
+          'DELETE FROM conversation_selection_bases WHERE knowledge_base_id = ?',
+        ).run(knowledgeBaseId)
+        session.opened.database.prepare(`
+          INSERT INTO tombstones (id, knowledge_base_id, entity_kind, entity_id, sequence, deleted_at, expires_at)
+          VALUES (?, ?, 'knowledge_base', ?, 0, ?, ?)
+        `).run(this.id(), knowledgeBaseId, knowledgeBaseId, now, now + RECYCLE_PERIOD_MS)
+        return jobs
+      })()
+    })
+    await this.imports.abortAndDrain(cancelled)
   }
 
   async purgeBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void> {
     const session = await this.ensureSession(owner)
-    this.requireBase(session, knowledgeBaseId)
     await this.track(this.purge(session, 'knowledge_base', knowledgeBaseId))
   }
 
@@ -393,12 +408,37 @@ export class KnowledgeService implements KnowledgePersistence {
   }
 
   async getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability> {
-    void owner
-    const reasons: KnowledgeFeatureAvailability['local']['reasons'] = []
-    if (this.options.runtimeAvailable === false) reasons.push('native_dependency_unavailable')
-    if ((this.options.platform ?? process.platform) !== 'darwin'
-      || (this.options.arch ?? process.arch) !== 'arm64') reasons.push('packaging_unverified')
-    if (!await this.options.safeStorage.isAvailable()) reasons.push('safe_storage_unavailable')
+    const reasons = await this.preflightAvailability()
+    if (reasons.length === 0) {
+      let opened: OpenedUserKnowledgeDatabase | undefined
+      let parser: KnowledgeParserPort | undefined
+      let stage: 'storage' | 'parser' = 'storage'
+      try {
+        opened = await (this.options.openKnowledgeDatabase ?? openUserKnowledgeDatabase)({
+          rootDirectory: this.options.rootDirectory,
+          userId: owner.userId,
+          safeStorage: this.options.safeStorage,
+        })
+        const directory = dirname(opened.databasePath)
+        await initializeObjectKey(
+          opened.database,
+          new KnowledgeKeyStore(join(directory, 'knowledge-object-key.json'), this.options.safeStorage),
+        )
+        stage = 'parser'
+        parser = await this.options.createParser()
+      } catch (error) {
+        if (stage === 'parser') reasons.push('native_dependency_unavailable')
+        else if (String((error as Error).message).toLowerCase().match(/fts|trigram/)) reasons.push('fts_unavailable')
+        else reasons.push('encrypted_storage_unavailable')
+      } finally {
+        try { await parser?.terminateAll() } catch {
+          if (reasons.length === 0) reasons.push('native_dependency_unavailable')
+        }
+        try { opened?.close() } catch {
+          if (reasons.length === 0) reasons.push('encrypted_storage_unavailable')
+        }
+      }
+    }
     return {
       local: { available: reasons.length === 0, reasons },
       cloud: { available: false, reasons: ['kill_switch_enabled'] },
@@ -427,6 +467,7 @@ export class KnowledgeService implements KnowledgePersistence {
         }
         if (session) {
           let teardownError: unknown
+          this.imports.abortSession(session)
           try { await session.parser.terminateAll() } catch (error) { teardownError = error }
           await Promise.allSettled([...this.mutations])
           try { session.opened.close() } catch (error) { teardownError ??= error }
@@ -460,12 +501,11 @@ export class KnowledgeService implements KnowledgePersistence {
   }
 
   private async openSession(owner: KnowledgeOwner): Promise<OpenKnowledgeSession> {
-    const availability = await this.getFeatureAvailability(owner)
-    if (!availability.local.available) failure('SERVICE_UNAVAILABLE')
+    if ((await this.preflightAvailability()).length > 0) failure('SERVICE_UNAVAILABLE')
     let opened: OpenedUserKnowledgeDatabase | undefined
     let parser: KnowledgeParserPort | undefined
     try {
-      opened = await openUserKnowledgeDatabase({
+      opened = await (this.options.openKnowledgeDatabase ?? openUserKnowledgeDatabase)({
         rootDirectory: this.options.rootDirectory,
         userId: owner.userId,
         safeStorage: this.options.safeStorage,
@@ -483,7 +523,9 @@ export class KnowledgeService implements KnowledgePersistence {
         parser,
         objectKeyStore,
         objectsDirectory: join(directory, 'objects'),
+        mutationTail: Promise.resolve(),
       }
+      await this.imports.reconcile(session)
       this.session = session
       return session
     } catch (error) {
@@ -493,6 +535,15 @@ export class KnowledgeService implements KnowledgePersistence {
       if (typeof error === 'object' && error !== null && 'code' in error) throw error
       failure('SERVICE_UNAVAILABLE')
     }
+  }
+
+  private async preflightAvailability(): Promise<KnowledgeFeatureAvailability['local']['reasons']> {
+    const reasons: KnowledgeFeatureAvailability['local']['reasons'] = []
+    if (this.options.runtimeAvailable === false) reasons.push('native_dependency_unavailable')
+    if ((this.options.platform ?? process.platform) !== 'darwin'
+      || (this.options.arch ?? process.arch) !== 'arm64') reasons.push('packaging_unverified')
+    if (!await this.options.safeStorage.isAvailable()) reasons.push('safe_storage_unavailable')
+    return reasons
   }
 
   private ensureDefaultBase(session: OpenKnowledgeSession): void {
@@ -514,6 +565,7 @@ export class KnowledgeService implements KnowledgePersistence {
     ).get(id) as { id: string; name: string; status: 'active' | 'read_only' | 'recycled' } | undefined
     if (!base) failure('NOT_FOUND')
     if (writable && base.status !== 'active') failure('FORBIDDEN')
+    if (writable && this.hasPurgeJournal(session, 'knowledge_base', id)) failure('CONFLICT')
     return base
   }
 
@@ -532,7 +584,21 @@ export class KnowledgeService implements KnowledgePersistence {
     } | undefined
     if (!document) failure('NOT_FOUND')
     if (writable && (document.status === 'recycled' || document.baseStatus !== 'active')) failure('FORBIDDEN')
+    if (writable && (
+      this.hasPurgeJournal(session, 'document', id)
+      || this.hasPurgeJournal(session, 'knowledge_base', document.knowledgeBaseId)
+    )) failure('CONFLICT')
     return document
+  }
+
+  private hasPurgeJournal(
+    session: OpenKnowledgeSession,
+    kind: 'document' | 'knowledge_base',
+    targetId: string,
+  ): boolean {
+    return session.opened.database.prepare(
+      'SELECT 1 FROM purge_operations WHERE entity_kind = ? AND target_id = ?',
+    ).get(kind, targetId) !== undefined
   }
 
   private async requireConversation(owner: KnowledgeOwner, conversationId: string): Promise<void> {
@@ -555,13 +621,15 @@ export class KnowledgeService implements KnowledgePersistence {
     const relativeName = `${objectId}.afobj`
     const objectPath = join(session.objectsDirectory, relativeName)
     const jobId = this.id()
+    const authorityToken = this.id()
     const now = this.now()
     let sourceObjectStored = false
     let snapshotCreated = false
     let versionNumber = 1
-    session.opened.database.transaction(() => {
-      const base = this.requireBase(session, target.knowledgeBaseId, true)
-      void base
+    let generation = 1
+    let priorJobId: string | undefined
+    await this.mutate(session, () => session.opened.database.transaction(() => {
+      this.requireBase(session, target.knowledgeBaseId, true)
       if (!target.documentId && !hasMemberAccess(entitlement)) {
         const count = session.opened.database.prepare(`
           SELECT count(*) AS count FROM documents
@@ -577,15 +645,29 @@ export class KnowledgeService implements KnowledgePersistence {
           SELECT coalesce(max(version_number), 0) + 1 AS number
           FROM document_versions WHERE document_id = ?
         `).get(documentId) as { number: number }).number
-        session.opened.database.prepare(
-          "UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ?",
-        ).run(now, documentId)
       } else {
         session.opened.database.prepare(`
           INSERT INTO documents
             (id, knowledge_base_id, name, mime_type, status, created_at, updated_at)
           VALUES (?, ?, ?, ?, 'pending', ?, ?)
         `).run(documentId, target.knowledgeBaseId, source.name, source.mimeType, now, now)
+      }
+      const head = session.opened.database.prepare(`
+        SELECT generation, authoritative_job_id AS jobId
+        FROM document_import_heads WHERE document_id = ?
+      `).get(documentId) as { generation: number; jobId: string } | undefined
+      generation = (head?.generation ?? 0) + 1
+      priorJobId = head?.jobId
+      if (priorJobId) {
+        session.opened.database.prepare(`
+          UPDATE jobs SET status = 'cancelled', error_code = 'SUPERSEDED', updated_at = ?
+          WHERE id = ? AND status IN ('pending', 'running')
+        `).run(now, priorJobId)
+        session.opened.database.prepare(`
+          UPDATE document_versions SET status = 'failed'
+          WHERE id = (SELECT version_id FROM local_import_jobs WHERE job_id = ?)
+            AND status = 'staging'
+        `).run(priorJobId)
       }
       session.opened.database.prepare(`
         INSERT INTO document_versions
@@ -596,7 +678,29 @@ export class KnowledgeService implements KnowledgePersistence {
         INSERT INTO jobs (id, kind, entity_id, status, created_at, updated_at)
         VALUES (?, 'local_import', ?, 'pending', ?, ?)
       `).run(jobId, versionId, now, now)
-    })()
+      session.opened.database.prepare(`
+        INSERT INTO local_import_jobs
+          (job_id, authority_token, knowledge_base_id, document_id, version_id, object_id,
+            generation, format, source_name, mime_type, created_at)
+        VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+      `).run(
+        jobId, authorityToken, target.knowledgeBaseId, documentId, versionId,
+        generation, source.format, source.name, source.mimeType, now,
+      )
+      session.opened.database.prepare(`
+        INSERT INTO document_import_heads
+          (document_id, generation, authoritative_job_id, authority_token)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+          generation = excluded.generation,
+          authoritative_job_id = excluded.authoritative_job_id,
+          authority_token = excluded.authority_token
+      `).run(documentId, generation, jobId, authorityToken)
+      session.opened.database.prepare(
+        "UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ?",
+      ).run(now, documentId)
+    })())
+    if (priorJobId) this.imports.abort(priorJobId)
 
     try {
       const objectMasterKey = await session.objectKeyStore.loadActiveKey()
@@ -613,7 +717,13 @@ export class KnowledgeService implements KnowledgePersistence {
       }
       if (snapshot.contentHash !== contentHash) throw new Error('Knowledge source changed between validation and snapshot')
       try {
-        session.opened.database.transaction(() => {
+        const accepted = await this.mutate(session, () => session.opened.database.transaction(() => {
+          const authoritative = session.opened.database.prepare(`
+            SELECT 1 FROM document_import_heads
+            WHERE document_id = ? AND generation = ?
+              AND authoritative_job_id = ? AND authority_token = ?
+          `).get(documentId, generation, jobId, authorityToken)
+          if (!authoritative) return false
           session.opened.database.prepare(`
             INSERT INTO source_objects
               (id, relative_name, wrapped_file_key, byte_size, content_hash, created_at)
@@ -623,116 +733,47 @@ export class KnowledgeService implements KnowledgePersistence {
             "UPDATE documents SET status = 'processing', updated_at = ? WHERE id = ?",
           ).run(this.now(), documentId)
           session.opened.database.prepare(
-            "UPDATE jobs SET status = 'running', attempt = 1, updated_at = ? WHERE id = ?",
+            "UPDATE jobs SET status = 'pending', updated_at = ? WHERE id = ?",
           ).run(this.now(), jobId)
-        })()
-        sourceObjectStored = true
+          session.opened.database.prepare(
+            'UPDATE local_import_jobs SET object_id = ? WHERE job_id = ?',
+          ).run(objectId, jobId)
+          return true
+        })())
+        sourceObjectStored = accepted
+        if (!accepted) failure('CANCELLED')
       } finally {
         snapshot.wrappedFileKey.fill(0)
       }
-
-      const objectMasterKeyForParse = await session.objectKeyStore.loadActiveKey()
-      let fileKey: Buffer
-      try {
-        const stored = session.opened.database.prepare(
-          'SELECT wrapped_file_key AS wrappedFileKey FROM source_objects WHERE id = ?',
-        ).get(objectId) as { wrappedFileKey: Buffer }
-        fileKey = unwrapSnapshotFileKey(Buffer.from(stored.wrappedFileKey), objectMasterKeyForParse)
-      } finally {
-        objectMasterKeyForParse.fill(0)
-      }
-      let response: ParserResponse
-      try {
-        response = await session.parser.parse({
-          jobId,
-          format: source.format,
-          objectPath,
-          fileKey,
-        })
-      } finally {
-        fileKey.fill(0)
-      }
-      if (response.type === 'error') {
-        const code = ['PARSER_TIMEOUT', 'PARSER_INTERNAL_ERROR'].includes(response.code)
-          ? 'SERVICE_UNAVAILABLE'
-          : response.code === 'PARSER_CANCELLED'
-            ? 'CANCELLED'
-            : 'INVALID_INPUT'
-        failure(code)
-      }
-      session.opened.database.transaction(() => {
-        const insertBlock = session.opened.database.prepare(`
-          INSERT INTO knowledge_blocks (id, version_id, ordinal, kind, text, coordinates_json)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `)
-        for (const [ordinal, block] of response.blocks.entries()) {
-          insertBlock.run(
-            `${versionId}:${block.id}`,
-            versionId,
-            ordinal,
-            block.coordinate.kind,
-            block.text,
-            JSON.stringify(block.coordinate),
-          )
-        }
-        const insertChunk = session.opened.database.prepare(`
-          INSERT INTO kb_chunks
-            (id, knowledge_base_id, document_id, version_id, block_id, ordinal, body, coordinates_json)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        const blocks = new Map(response.blocks.map(block => [block.id, {
-          ...block,
-          storedId: `${versionId}:${block.id}`,
-        }]))
-        for (const chunk of response.chunks) {
-          const block = blocks.get(chunk.blockIds[0]!)
-          if (!block) throw new Error('Knowledge parser returned an unknown block')
-          insertChunk.run(
-            `${versionId}:${chunk.index}`,
-            target.knowledgeBaseId,
-            documentId,
-            versionId,
-            block.storedId,
-            chunk.index,
-            chunk.text,
-            JSON.stringify(block.coordinate),
-          )
-        }
-        const active = session.opened.database.prepare(
-          'SELECT active_version_id AS activeVersionId FROM documents WHERE id = ?',
-        ).get(documentId) as { activeVersionId?: string }
-        if (active.activeVersionId) {
-          session.opened.database.prepare(
-            "UPDATE document_versions SET status = 'superseded' WHERE id = ? AND status = 'ready'",
-          ).run(active.activeVersionId)
-        }
-        session.opened.database.prepare(
-          "UPDATE document_versions SET status = 'ready' WHERE id = ?",
-        ).run(versionId)
-        session.opened.database.prepare(`
-          UPDATE documents SET active_version_id = ?, name = ?, mime_type = ?,
-            status = 'ready', updated_at = ? WHERE id = ?
-        `).run(versionId, source.name, source.mimeType, this.now(), documentId)
-        session.opened.database.prepare(
-          "UPDATE jobs SET status = 'completed', updated_at = ? WHERE id = ?",
-        ).run(this.now(), jobId)
-      })()
+      this.imports.schedule(session, {
+        knowledgeBaseId: target.knowledgeBaseId,
+        documentId,
+        versionId,
+        objectId,
+        jobId,
+        format: source.format,
+        objectPath,
+        sourceName: source.name,
+        mimeType: source.mimeType,
+        generation,
+        authorityToken,
+      })
       return this.readDocument(session, documentId)
     } catch (error) {
       try {
-        session.opened.database.transaction(() => {
-          session.opened.database.prepare(
-            "UPDATE document_versions SET status = 'failed' WHERE id = ? AND status = 'staging'",
-          ).run(versionId)
-          session.opened.database.prepare(`
-            UPDATE documents SET status =
-              CASE WHEN active_version_id IS NULL THEN 'failed' ELSE 'ready' END,
-              updated_at = ? WHERE id = ?
-          `).run(this.now(), documentId)
-          session.opened.database.prepare(`
-            UPDATE jobs SET status = 'failed', error_code = ?, updated_at = ? WHERE id = ?
-          `).run('IMPORT_FAILED', this.now(), jobId)
-        })()
+        await this.imports.fail(session, {
+          knowledgeBaseId: target.knowledgeBaseId,
+          documentId,
+          versionId,
+          objectId,
+          jobId,
+          format: source.format,
+          objectPath,
+          sourceName: source.name,
+          mimeType: source.mimeType,
+          generation,
+          authorityToken,
+        }, 'IMPORT_FAILED')
       } catch {
         // Preserve the import failure; close/logout may already be tearing the database down.
       }
@@ -742,6 +783,10 @@ export class KnowledgeService implements KnowledgePersistence {
       if (typeof error === 'object' && error !== null && 'code' in error) throw error
       failure('INTERNAL_ERROR')
     }
+  }
+
+  private async mutate<T>(session: OpenKnowledgeSession, operation: () => T | Promise<T>): Promise<T> {
+    return serializeKnowledgeMutation(session, operation)
   }
 
   private readDocument(session: OpenKnowledgeSession, documentId: string): KnowledgeDocument {
@@ -761,37 +806,24 @@ export class KnowledgeService implements KnowledgePersistence {
     kind: 'document' | 'knowledge_base',
     id: string,
   ): Promise<void> {
-    const scope = kind === 'document' ? 'documents.id = ?' : 'documents.knowledge_base_id = ?'
-    const objects = session.opened.database.prepare(`
-      SELECT source_objects.id, source_objects.relative_name AS relativeName
-      FROM source_objects
-      JOIN document_versions ON document_versions.source_object_id = source_objects.id
-      JOIN documents ON documents.id = document_versions.document_id
-      WHERE ${scope}
-    `).all(id) as Array<{ id: string; relativeName: string }>
-    session.opened.database.transaction(() => {
-      if (kind === 'document') {
-        session.opened.database.prepare('DELETE FROM documents WHERE id = ?').run(id)
-        session.opened.database.prepare(
-          "DELETE FROM tombstones WHERE entity_kind = 'document' AND entity_id = ?",
-        ).run(id)
-      } else {
-        session.opened.database.prepare('DELETE FROM knowledge_bases WHERE id = ?').run(id)
-        session.opened.database.prepare(
-          "DELETE FROM tombstones WHERE entity_kind = 'knowledge_base' AND entity_id = ?",
-        ).run(id)
-      }
-      const deleteObject = session.opened.database.prepare('DELETE FROM source_objects WHERE id = ?')
-      for (const object of objects) deleteObject.run(object.id)
-    })()
-    for (const object of objects) {
-      if (!/^[0-9a-f-]{36}\.afobj$/.test(object.relativeName)) failure('INTERNAL_ERROR')
-      try { await unlink(join(session.objectsDirectory, object.relativeName)) } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      }
-    }
-    session.opened.database.exec('VACUUM')
-    await session.opened.rotateKey()
+    await new KnowledgePurgeService({
+      opened: session.opened,
+      objectsDirectory: session.objectsDirectory,
+      now: () => this.now(),
+      id: () => this.id(),
+      mutate: operation => this.mutate(session, operation),
+      requireTarget: (entityKind, targetId) => {
+        if (entityKind === 'document') this.requireDocument(session, targetId)
+        else this.requireBase(session, targetId)
+      },
+      cancelImportJobs: (entityKind, targetId, now) => (
+        this.imports.cancelJobs(session, entityKind, targetId, now)
+      ),
+      abortAndDrain: jobIds => this.imports.abortAndDrain(jobIds),
+      unlinkObject: this.options.unlinkKnowledgeObject,
+      vacuumDatabase: this.options.vacuumKnowledgeDatabase,
+      rotateDatabaseKey: this.options.rotateKnowledgeDatabaseKey,
+    }).purge(kind, id)
   }
 
   private track<T>(operation: Promise<T>): Promise<T> {

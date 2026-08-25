@@ -254,6 +254,41 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, updated_at);
 
+    CREATE TABLE IF NOT EXISTS local_import_jobs (
+      job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+      authority_token TEXT NOT NULL UNIQUE,
+      knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+      document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+      object_id TEXT REFERENCES source_objects(id) ON DELETE SET NULL,
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      format TEXT NOT NULL CHECK (format IN ('pdf', 'docx', 'txt', 'markdown', 'html')),
+      source_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS local_import_jobs_document
+      ON local_import_jobs(document_id, generation DESC);
+
+    CREATE TABLE IF NOT EXISTS document_import_heads (
+      document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      authoritative_job_id TEXT NOT NULL REFERENCES jobs(id),
+      authority_token TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS purge_operations (
+      id TEXT PRIMARY KEY,
+      entity_kind TEXT NOT NULL CHECK (entity_kind IN ('document', 'knowledge_base')),
+      target_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('prepared', 'graph_deleted', 'objects_unlinked', 'vacuumed')),
+      object_ids_json TEXT NOT NULL,
+      object_names_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(entity_kind, target_id)
+    ) STRICT;
+
     CREATE TABLE IF NOT EXISTS sync_cursors (
       knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
       sequence INTEGER NOT NULL CHECK (sequence >= 0),

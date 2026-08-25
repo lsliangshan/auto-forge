@@ -108,6 +108,7 @@ import {
   type KnowledgeEntitlementPort,
   type KnowledgeParserPort,
 } from './knowledge/knowledge-service.js'
+import { KnowledgeAdmissionGate } from './knowledge/knowledge-admission.js'
 
 export interface ApplicationPaths {
   database: string
@@ -1141,6 +1142,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     arch: options.knowledgeArch,
     runtimeAvailable: options.createKnowledgeParser !== undefined,
   })
+  const knowledgeAdmission = new KnowledgeAdmissionGate()
   const beforeAuthIdentityChange = async (): Promise<void> => {
     await knowledge.close()
     const current = await auth.getSession()
@@ -1149,18 +1151,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
 
   let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
+    knowledgeAdmission,
     auth: {
-      getSession: async () => {
-        const session = await auth.getSession()
-        if (!session) await knowledge.close()
-        return session
-      },
+      getSession: () => knowledgeAdmission.transition(async () => {
+        await knowledge.close()
+        return auth.getSession()
+      }),
       refreshAuthorization: () => auth.refreshAuthorization(),
       sendOtp: (input) => auth.sendOtp(input),
-      verifyOtp: async (input) => { await beforeAuthIdentityChange(); return auth.verifyOtp(input) },
+      verifyOtp: (input) => knowledgeAdmission.transition(async () => {
+        await beforeAuthIdentityChange()
+        return auth.verifyOtp(input)
+      }),
       cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
-      loginWithPassword: async (input) => { await beforeAuthIdentityChange(); return auth.loginWithPassword(input) },
-      logout: async () => { await beforeAuthIdentityChange(); await auth.logout() },
+      loginWithPassword: (input) => knowledgeAdmission.transition(async () => {
+        await beforeAuthIdentityChange()
+        return auth.loginWithPassword(input)
+      }),
+      logout: () => knowledgeAdmission.transition(async () => {
+        await beforeAuthIdentityChange()
+        await auth.logout()
+      }),
       requireSession: () => auth.requireSession(),
     },
     userAdmin: {

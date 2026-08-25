@@ -47,3 +47,124 @@ Implemented the login-scoped local knowledge service and verified it on the curr
 - macOS x64 and Windows x64 remain unverified and fail closed. The local feature is enabled only on verified darwin/arm64 with available safeStorage and a configured parser runtime.
 - Signed paid entitlements and cloud access intentionally remain later work. The default is local-only free policy; cloud availability retains the kill switch.
 - `VACUUM` provides a logical encrypted database rebuild and key rotation provides new database encryption material; neither is represented as physical media erasure.
+
+## Fix round 1: durable concurrency and recovery
+
+### Implementation and self-review
+
+- Split the approved responsibilities so `KnowledgeService` no longer duplicates background job or purge transaction logic: `KnowledgeImportRuntime` owns job claim/reconciliation/CAS publication/cancellation, `KnowledgePurgeService` owns the durable purge state machine, and `KnowledgeAdmissionGate` owns auth epochs.
+- Added encrypted-only `local_import_jobs`, `document_import_heads`, and `purge_operations`. Import authority tokens are random opaque values; a newer generation cancels the previous generation, and every publication transaction checks job status, generation, job ID, and authority token before making a version ready.
+- Import now returns after the encrypted snapshot, source row, and pending job are durable. Session open reconciles stale running jobs, resumes authoritative pending jobs, marks missing snapshots failed, removes only strictly validated unreferenced managed objects, and does not parse an already-completed job twice.
+- Recycle and purge cancel authoritative jobs before aborting/draining parser work. A prepared purge journal blocks later replacements/imports in the same entity scope, closing the gap while parser cleanup is awaited.
+- Purge validates every managed object name before graph deletion and persists monotonic `prepared -> graph_deleted -> objects_unlinked -> vacuumed` states. Retry after reopen tolerates an already-unlinked file, reruns `VACUUM` only from its durable state, completes database-key rotation, and clears the journal last. Base purge removes all tombstones scoped to the base.
+- Auth transitions increment admission epoch before queueing, then hold exclusive admission across knowledge close and the underlying restore/register/login/logout mutation. Knowledge IPC derives its owner inside the same admitted operation and rejects a stale epoch after completion. Failed auth transitions release admission without reopening the old knowledge session.
+- Availability now probes the real encrypted database/FTS/object-key/parser boundaries and closes the probe parser/database without creating a knowledge base. Export rejects more than 256 versions or 128 MiB of encrypted originals before aggregate materialization. Production parser creation verifies emitted worker/preload files and contains no development path.
+
+### RED commands and captured output
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'acknowledges|cancels and drains|authoritative generations|recovers a durable'
+FAIL acknowledges a durable encrypted import before parsing completes
+  expected the acknowledgement to match { status: 'parsing', versionCount: 1 }; received undefined before parse completion
+FAIL cancels and drains a parsing import before recycling/purge
+  expected AbortSignal.aborted to be true before lifecycle completion; received false
+FAIL uses authoritative generations so two replacements completing out of order keep the newest result
+  older completion replaced the newest active version
+FAIL recovers a durable interrupted import once
+  reopened import remained failed instead of becoming ready
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'resumes a durable purge|validates every managed object|removes every document and base tombstone'
+FAIL resumes a durable purge after unlink/vacuum/rekey failure
+  injected failures were not observed and retry lost the already-deleted target
+FAIL validates every managed object name before committing purge graph deletion
+  tampered relative name committed graph deletion
+FAIL removes every document and base tombstone scoped to a purged knowledge base
+  expected 0 scoped tombstones; received 2
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/application.test.ts -t 'knowledge owner derivation|reopens admission safely'
+FAIL holds knowledge owner derivation through completion and rejects stale-epoch IPC during logout
+FAIL reopens admission safely after a failed auth transition
+  knowledgeAdmission was undefined before the admission gate was composed
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'maps real encrypted-storage|rejects an export'
+FAIL maps real encrypted-storage, FTS, and parser probe failures
+  parser probe was not called and parser failure still reported local.available=true
+FAIL rejects an export whose encrypted version aggregate exceeds the fixed Main memory bound
+  oversized export resolved instead of rejecting
+```
+
+The final journal-admission gap was reproduced after the seam split with the exact command/output below:
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'cancels and drains a parsing import before purge'
+FAIL |desktop-node| electron/main/knowledge/knowledge-service.test.ts > KnowledgeService lifecycle > cancels and drains a parsing import before purge removes its graph and object
+AssertionError: promise resolved "{ …(7) }" instead of rejecting
+Test Files  1 failed (1)
+Tests  1 failed | 19 skipped (20)
+```
+
+### GREEN commands and output
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'cancels and drains a parsing import before purge'
+Test Files  1 passed (1)
+Tests  1 passed | 19 skipped (20)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/knowledge-service.test.ts -t 'resumes a durable purge|cancels and drains a parsing import before purge|removes every document and base tombstone|validates every managed object name'
+Test Files  1 passed (1)
+Tests  6 passed | 14 skipped (20)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge electron/main/ipc/register-ipc.test.ts
+Test Files  9 passed (9)
+Tests  102 passed (102)
+```
+
+```text
+$ node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/application.test.ts -t 'owns path-free knowledge|holds knowledge owner derivation|reopens admission safely'
+Test Files  1 passed (1)
+Tests  3 passed | 147 skipped (150)
+```
+
+```text
+$ pnpm typecheck
+Scope: 4 of 5 workspace projects
+packages/shared typecheck: Done
+packages/workflow-sdk typecheck: Done
+packages/workflow-schema typecheck: Done
+apps/desktop typecheck: Done
+```
+
+```text
+$ pnpm exec eslint <all 13 changed Task 4 source/test files>
+(no output; exit 0)
+$ git diff --check
+(no output; exit 0)
+```
+
+```text
+$ pnpm build
+packages/shared build: Done
+packages/workflow-sdk build: Done
+packages/workflow-schema build: Done
+out/preload/parser.cjs  0.51 kB
+out/renderer/electron/main/knowledge/parser-worker.html  0.46 kB
+CJS Build success
+```
+
+```text
+$ pnpm test
+Test Files  1 failed | 103 passed (104)
+Tests  1 failed | 2861 passed (2862)
+```
+
+The sole full-suite failure is the same unrelated pre-existing Application context-summary billing case at `application.test.ts:3865`: it receives `CONTEXT_LIMIT_EXCEEDED` instead of a completed stream. All Task 4 focused and integration boundaries are green.

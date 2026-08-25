@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { EventEmitter } from 'node:events'
+import { stat } from 'node:fs/promises'
 import { DEFAULT_PARSER_LIMITS, parseParserRequest, parseParserResponse, type ParserFormat, type ParserLimits, type ParserResponse } from './parser-protocol.js'
 import { readEncryptedObjectSnapshot } from './encrypted-object-store.js'
 
@@ -252,6 +253,8 @@ export class ParserSupervisor {
 }
 
 export async function createElectronParserSupervisor(workerHtmlPath: string, preloadPath: string): Promise<ParserSupervisor> {
+  const [worker, preload] = await Promise.all([stat(workerHtmlPath), stat(preloadPath)])
+  if (!worker.isFile() || !preload.isFile()) throw new Error('Knowledge parser assets must be regular files')
   const electron = await import('electron')
   return new ParserSupervisor({
     workerHtmlPath,

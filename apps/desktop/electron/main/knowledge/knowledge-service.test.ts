@@ -1,18 +1,40 @@
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
 import { readEncryptedObjectSnapshot } from './encrypted-object-store.js'
+import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeKeyStore } from './key-store.js'
 import { KnowledgeService, type KnowledgeParserPort } from './knowledge-service.js'
 import { DEFAULT_PARSER_LIMITS, type ParserResponse } from './parser-protocol.js'
 import { parseEncryptedDocument } from './parser-worker.js'
 
 const directories: string[] = []
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(release => { resolve = release })
+  return { promise, resolve }
+}
+
+function parsedText(jobId: string, text: string): ParserResponse {
+  return {
+    version: 1,
+    type: 'result',
+    jobId,
+    text,
+    blocks: [{
+      id: 'block_1',
+      text,
+      coordinate: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: text.length },
+    }],
+    chunks: [{ index: 0, text, blockIds: ['block_1'] }],
+  }
+}
 
 function safeStorage(): SafeStoragePort {
   return {
@@ -24,9 +46,12 @@ function safeStorage(): SafeStoragePort {
 
 class InProcessParser implements KnowledgeParserPort {
   terminated = false
+  parseCalls = 0
   handler?: (input: Parameters<KnowledgeParserPort['parse']>[0]) => Promise<ParserResponse>
+  onTerminate?: () => void
 
   async parse(input: Parameters<KnowledgeParserPort['parse']>[0]): Promise<ParserResponse> {
+    this.parseCalls += 1
     if (this.handler) return this.handler(input)
     const encrypted = await readEncryptedObjectSnapshot(input.objectPath)
     const fileKey = Buffer.from(input.fileKey)
@@ -44,12 +69,16 @@ class InProcessParser implements KnowledgeParserPort {
 
   async terminateAll(): Promise<void> {
     this.terminated = true
+    this.onTerminate?.()
   }
 }
 
 async function fixture(options: {
   entitlement?: KnowledgeEntitlementState
   ownsConversation?: (userId: string, conversationId: string) => boolean
+  unlinkKnowledgeObject?: (path: string) => Promise<void>
+  vacuumKnowledgeDatabase?: (database: OpenedUserKnowledgeDatabase['database']) => void
+  rotateKnowledgeDatabaseKey?: (opened: OpenedUserKnowledgeDatabase) => Promise<void>
 } = {}) {
   const rootDirectory = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-service-'))
   directories.push(rootDirectory)
@@ -57,28 +86,32 @@ async function fixture(options: {
   const parsers: InProcessParser[] = []
   const picks: string[] = []
   const exports: string[] = []
-  const service = new KnowledgeService({
-    rootDirectory,
-    safeStorage: storage,
-    createParser: async () => {
-      const parser = new InProcessParser()
-      parsers.push(parser)
-      return parser
-    },
-    chooseImportFile: async () => picks.shift(),
-    chooseExportPath: async () => exports.shift(),
-    entitlement: {
-      getEntitlement: async () => options.entitlement ?? {
-        tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+  const createService = () => new KnowledgeService({
+      rootDirectory,
+      safeStorage: storage,
+      createParser: async () => {
+        const parser = new InProcessParser()
+        parsers.push(parser)
+        return parser
       },
-    },
-    ownsConversation: async (owner, conversationId) => (
-      options.ownsConversation?.(owner.userId, conversationId) ?? true
-    ),
-    platform: 'darwin',
-    arch: 'arm64',
-  })
-  return { rootDirectory, storage, service, parsers, picks, exports }
+      chooseImportFile: async () => picks.shift(),
+      chooseExportPath: async () => exports.shift(),
+      entitlement: {
+        getEntitlement: async () => options.entitlement ?? {
+          tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+        },
+      },
+      ownsConversation: async (owner, conversationId) => (
+        options.ownsConversation?.(owner.userId, conversationId) ?? true
+      ),
+      platform: 'darwin',
+      arch: 'arm64',
+      unlinkKnowledgeObject: options.unlinkKnowledgeObject,
+      vacuumKnowledgeDatabase: options.vacuumKnowledgeDatabase,
+      rotateKnowledgeDatabaseKey: options.rotateKnowledgeDatabaseKey,
+    })
+  const service = createService()
+  return { rootDirectory, storage, service, createService, parsers, picks, exports }
 }
 
 async function writeSource(root: string, name: string, content: string): Promise<string> {
@@ -99,6 +132,20 @@ function findFile(root: string, name: string): string {
     }
   }
   throw new Error(`${name} not found`)
+}
+
+function findFileEnding(root: string, suffix: string): string {
+  const pending = [root]
+  while (pending.length > 0) {
+    const directory = pending.pop()!
+    const entries = readdirSync(directory, { withFileTypes: true })
+    for (const entry of entries) {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) pending.push(path)
+      else if (entry.name.endsWith(suffix)) return path
+    }
+  }
+  throw new Error(`${suffix} not found`)
 }
 
 function readStoredZipEntry(archive: Buffer, expectedName: string): Buffer {
@@ -128,6 +175,14 @@ describe('KnowledgeService lifecycle', () => {
       local: { available: true, reasons: [] },
       cloud: { available: false, reasons: ['kill_switch_enabled'] },
     })
+    expect(app.parsers).toHaveLength(1)
+    expect(app.parsers[0]?.terminated).toBe(true)
+    const probed = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: 'alice', safeStorage: app.storage,
+    })
+    expect(probed.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get())
+      .toEqual({ count: 0 })
+    probed.close()
     const unavailable = new KnowledgeService({
       rootDirectory: app.rootDirectory,
       safeStorage: app.storage,
@@ -146,6 +201,42 @@ describe('KnowledgeService lifecycle', () => {
       .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
   })
 
+  it('maps real encrypted-storage, FTS, and parser probe failures to scoped unavailable reasons', async () => {
+    const app = await fixture()
+    const common = {
+      rootDirectory: app.rootDirectory,
+      safeStorage: app.storage,
+      chooseImportFile: async () => undefined,
+      chooseExportPath: async () => undefined,
+      ownsConversation: async () => true,
+      platform: 'darwin' as const,
+      arch: 'arm64',
+    }
+    const parserUnavailable = new KnowledgeService({
+      ...common,
+      createParser: async () => { throw new Error('parser asset unavailable') },
+    })
+    await expect(parserUnavailable.getFeatureAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      local: { available: false, reasons: ['native_dependency_unavailable'] },
+    })
+    const ftsUnavailable = new KnowledgeService({
+      ...common,
+      createParser: async () => new InProcessParser(),
+      openKnowledgeDatabase: async () => { throw new Error('Encrypted knowledge database requires FTS5') },
+    })
+    await expect(ftsUnavailable.getFeatureAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      local: { available: false, reasons: ['fts_unavailable'] },
+    })
+    const encryptedUnavailable = new KnowledgeService({
+      ...common,
+      createParser: async () => new InProcessParser(),
+      openKnowledgeDatabase: async () => { throw new Error('encrypted driver failed') },
+    })
+    await expect(encryptedUnavailable.getFeatureAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      local: { available: false, reasons: ['encrypted_storage_unavailable'] },
+    })
+  })
+
   it('creates the lazy default library and enforces free 1-library/1-active-file limits in Main', async () => {
     const app = await fixture()
     const owner = { userId: 'alice' }
@@ -156,8 +247,9 @@ describe('KnowledgeService lifecycle', () => {
 
     app.picks.push(await writeSource(app.rootDirectory, 'first.txt', '北京政务服务指南'))
     await expect(app.service.importDocument(owner, defaultBase!.id)).resolves.toMatchObject({
-      name: 'first.txt', status: 'ready', versionCount: 1,
+      name: 'first.txt', status: 'parsing', versionCount: 1,
     })
+    await expect.poll(async () => (await app.service.listDocuments(owner, defaultBase!.id))[0]?.status).toBe('ready')
     app.picks.push(await writeSource(app.rootDirectory, 'second.txt', '第二份文件'))
     await expect(app.service.importDocument(owner, defaultBase!.id)).rejects.toMatchObject({ code: 'CONFLICT' })
     await app.service.close()
@@ -226,6 +318,7 @@ describe('KnowledgeService lifecycle', () => {
     const [base] = await app.service.listBases(owner)
     app.picks.push(await writeSource(app.rootDirectory, 'policy.txt', '旧政策北京政务服务'))
     const imported = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
     await app.service.updateConversationSelection(owner, 'conversation_1', {
       knowledgeBaseIds: [base!.id], knowledgeMode: 'mixed',
     })
@@ -242,7 +335,8 @@ describe('KnowledgeService lifecycle', () => {
     expect((await app.service.listDocuments(owner, base!.id))[0]?.name).toBe('policy.txt')
     expect((await app.service.search(owner, 'conversation_1', '新政策')).results).toHaveLength(0)
     release({ version: 1, type: 'error', jobId: 'ignored', code: 'PARSER_MALFORMED_DOCUMENT' })
-    await expect(replacing).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(replacing).resolves.toMatchObject({ status: 'parsing' })
+    await expect.poll(async () => (await app.service.listVersions(owner, imported!.id))[0]?.status).toBe('failed')
     expect((await app.service.search(owner, 'conversation_1', '旧政策')).results).toHaveLength(1)
     expect(await app.service.listVersions(owner, imported!.id)).toEqual([
       expect.objectContaining({ number: 2, status: 'failed' }),
@@ -251,10 +345,171 @@ describe('KnowledgeService lifecycle', () => {
 
     app.parsers[0]!.handler = undefined
     app.picks.push(await writeSource(app.rootDirectory, 'policy-final.txt', '新政策北京政务办理'))
-    await expect(app.service.replaceDocument(owner, imported!.id)).resolves.toMatchObject({ status: 'ready', versionCount: 3 })
+    await expect(app.service.replaceDocument(owner, imported!.id)).resolves.toMatchObject({ status: 'parsing', versionCount: 3 })
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
     expect((await app.service.search(owner, 'conversation_1', '旧政策')).results).toHaveLength(0)
     expect((await app.service.search(owner, 'conversation_1', '新政策')).results).toHaveLength(1)
     await app.service.close()
+  })
+
+  it('acknowledges a durable encrypted import before parsing completes and publishes it in the background', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    const started = deferred<Parameters<KnowledgeParserPort['parse']>[0]>()
+    const finish = deferred<ParserResponse>()
+    app.parsers[0]!.handler = async input => {
+      started.resolve(input)
+      return finish.promise
+    }
+    app.picks.push(await writeSource(app.rootDirectory, 'background.txt', '后台导入北京政务'))
+
+    let acknowledged: Awaited<ReturnType<KnowledgeService['importDocument']>> | undefined
+    const importing = app.service.importDocument(owner, base!.id).then(value => { acknowledged = value; return value })
+    const input = await started.promise
+    await Promise.resolve()
+    const acknowledgedBeforeParseFinished = acknowledged
+    finish.resolve(parsedText(input.jobId, '后台导入北京政务'))
+    await importing
+
+    expect(acknowledgedBeforeParseFinished).toMatchObject({ status: 'parsing', versionCount: 1 })
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.close()
+  })
+
+  it('cancels and drains a parsing import before recycling can become non-authoritative', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    const started = deferred<Parameters<KnowledgeParserPort['parse']>[0]>()
+    const finish = deferred<ParserResponse>()
+    let drained = false
+    app.parsers[0]!.handler = async input => {
+      started.resolve(input)
+      input.signal?.addEventListener('abort', () => {
+        finish.resolve({ version: 1, type: 'error', jobId: input.jobId, code: 'PARSER_CANCELLED' })
+      }, { once: true })
+      try { return await finish.promise } finally { drained = true }
+    }
+    app.picks.push(await writeSource(app.rootDirectory, 'recycle-race.txt', '不可复活的回收内容'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    const input = await started.promise
+
+    const recycling = app.service.recycleDocument(owner, imported!.id)
+    await new Promise(resolve => setImmediate(resolve))
+    const abortedBeforeLifecycleReturned = input.signal?.aborted === true
+    if (!abortedBeforeLifecycleReturned) finish.resolve(parsedText(input.jobId, '不可复活的回收内容'))
+    await recycling
+    await expect.poll(() => drained).toBe(true)
+
+    expect(abortedBeforeLifecycleReturned).toBe(true)
+    expect((await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('deleted')
+    await app.service.close()
+  })
+
+  it('cancels and drains a parsing import before purge removes its graph and object', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    const started = deferred<Parameters<KnowledgeParserPort['parse']>[0]>()
+    const finish = deferred<ParserResponse>()
+    app.parsers[0]!.handler = async input => {
+      started.resolve(input)
+      return finish.promise
+    }
+    app.picks.push(await writeSource(app.rootDirectory, 'purge-race.txt', '不可复活的永久删除内容'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    const input = await started.promise
+    const objectPath = findFileEnding(app.rootDirectory, '.afobj')
+
+    const purging = app.service.purgeDocument(owner, imported!.id)
+    await expect.poll(() => input.signal?.aborted).toBe(true)
+    app.picks.push(await writeSource(app.rootDirectory, 'purge-race-replacement.txt', '不得进入清除范围'))
+    await expect(app.service.replaceDocument(owner, imported!.id)).rejects.toMatchObject({ code: 'CONFLICT' })
+    finish.resolve({ version: 1, type: 'error', jobId: input.jobId, code: 'PARSER_CANCELLED' })
+    await purging
+
+    expect(await app.service.listDocuments(owner, base!.id)).toEqual([])
+    await expect(readFile(objectPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await app.service.close()
+  })
+
+  it('uses authoritative generations so two replacements completing out of order keep the newest result', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'original.txt', '初始政策北京政务'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'mixed',
+    })
+
+    const pending: Array<{
+      input: Parameters<KnowledgeParserPort['parse']>[0]
+      finish: ReturnType<typeof deferred<ParserResponse>>
+    }> = []
+    app.parsers[0]!.handler = async input => {
+      const finish = deferred<ParserResponse>()
+      pending.push({ input, finish })
+      return finish.promise
+    }
+    app.picks.push(await writeSource(app.rootDirectory, 'older.txt', '较旧替换北京政务'))
+    await expect(app.service.replaceDocument(owner, imported!.id)).resolves.toMatchObject({ status: 'parsing' })
+    await expect.poll(() => pending.length).toBe(1)
+    app.picks.push(await writeSource(app.rootDirectory, 'newest.txt', '最新替换北京政务'))
+    await expect(app.service.replaceDocument(owner, imported!.id)).resolves.toMatchObject({ status: 'parsing' })
+    await expect.poll(() => pending.length).toBe(2)
+
+    pending[1]!.finish.resolve(parsedText(pending[1]!.input.jobId, '最新替换北京政务'))
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.name).toBe('newest.txt')
+    pending[0]!.finish.resolve(parsedText(pending[0]!.input.jobId, '较旧替换北京政务'))
+    await expect.poll(async () => (await app.service.listVersions(owner, imported!.id))[0]?.status).toBe('ready')
+
+    expect((await app.service.listDocuments(owner, base!.id))[0]).toMatchObject({ name: 'newest.txt', status: 'ready' })
+    expect(await app.service.listVersions(owner, imported!.id)).toEqual([
+      expect.objectContaining({ number: 3, status: 'ready' }),
+      expect.objectContaining({ number: 2, status: 'failed' }),
+      expect.objectContaining({ number: 1, status: 'retired' }),
+    ])
+    expect((await app.service.search(owner, 'conversation_1', '最新替换')).results).toHaveLength(1)
+    expect((await app.service.search(owner, 'conversation_1', '较旧替换')).results).toHaveLength(0)
+    await app.service.close()
+  })
+
+  it('recovers a durable interrupted import once and removes unreferenced managed object orphans', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    const started = deferred<Parameters<KnowledgeParserPort['parse']>[0]>()
+    const finish = deferred<ParserResponse>()
+    app.parsers[0]!.handler = async input => { started.resolve(input); return finish.promise }
+    app.parsers[0]!.onTerminate = () => {
+      void started.promise.then(input => finish.resolve({
+        version: 1, type: 'error', jobId: input.jobId, code: 'PARSER_CANCELLED',
+      }))
+    }
+    app.picks.push(await writeSource(app.rootDirectory, 'resume.txt', '重启恢复北京政务'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    await started.promise
+    const managedPath = findFileEnding(app.rootDirectory, '.afobj')
+    const orphanPath = join(dirname(managedPath), `${randomUUID()}.afobj`)
+    await writeFile(orphanPath, 'orphan')
+    await app.service.close()
+
+    const reopened = app.createService()
+    await reopened.listBases(owner)
+    await expect.poll(async () => (await reopened.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    expect((await reopened.listDocuments(owner, base!.id))[0]).toMatchObject({ id: imported!.id, versionCount: 1 })
+    await expect(readFile(orphanPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await reopened.close()
+
+    const third = app.createService()
+    await third.listBases(owner)
+    await new Promise(resolve => setImmediate(resolve))
+    expect(app.parsers.at(-1)?.parseCalls).toBe(0)
+    expect((await third.listVersions(owner, imported!.id))).toHaveLength(1)
+    await third.close()
   })
 
   it('reopens durable imports and selections while missing or replaced object keys fail closed', async () => {
@@ -343,5 +598,127 @@ describe('KnowledgeService lifecycle', () => {
     })
     expect(manifestText).not.toMatch(/(?:relativeName|wrappedFileKey|localPath|sourcePath|vector|secret|url)/i)
     await app.service.close()
+  })
+
+  it('rejects an export whose encrypted version aggregate exceeds the fixed Main memory bound', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'bounded.txt', 'bounded export'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.close()
+    const tamper = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    tamper.database.prepare('UPDATE source_objects SET byte_size = ?').run(128 * 1024 * 1024 + 1)
+    tamper.close()
+
+    const reopened = app.createService()
+    const exportPath = join(app.rootDirectory, 'too-large.zip')
+    app.exports.push(exportPath)
+    await expect(reopened.exportBase(owner, base!.id)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(readFile(exportPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await reopened.close()
+  })
+
+  it.each(['unlink', 'vacuum', 'rekey'] as const)(
+    'resumes a durable purge after a %s failure and restart without requiring the deleted graph',
+    async (failureStep) => {
+      let failed = false
+      const app = await fixture({
+        unlinkKnowledgeObject: async path => {
+          if (failureStep === 'unlink' && !failed) {
+            failed = true
+            await unlink(path)
+            throw new Error('injected unlink failure')
+          }
+          await unlink(path)
+        },
+        vacuumKnowledgeDatabase: database => {
+          if (failureStep === 'vacuum' && !failed) {
+            failed = true
+            throw new Error('injected vacuum failure')
+          }
+          database.exec('VACUUM')
+        },
+        rotateKnowledgeDatabaseKey: async opened => {
+          if (failureStep === 'rekey' && !failed) {
+            failed = true
+            throw new Error('injected rekey failure')
+          }
+          await opened.rotateKey()
+        },
+      })
+      const owner = { userId: 'alice' }
+      const [base] = await app.service.listBases(owner)
+      app.picks.push(await writeSource(app.rootDirectory, `${failureStep}.txt`, `purge ${failureStep}`))
+      const imported = await app.service.importDocument(owner, base!.id)
+      await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+      const objectPath = findFileEnding(app.rootDirectory, '.afobj')
+      const databaseKeyPath = findFile(app.rootDirectory, 'knowledge-key.json')
+      const keyBefore = await readFile(databaseKeyPath, 'utf8')
+
+      await expect(app.service.purgeDocument(owner, imported!.id)).rejects.toThrow(`injected ${failureStep} failure`)
+      await app.service.close()
+
+      const reopened = app.createService()
+      await expect(reopened.purgeDocument(owner, imported!.id)).resolves.toBeUndefined()
+      expect(await reopened.listDocuments(owner, base!.id)).toEqual([])
+      await expect(readFile(objectPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await readFile(databaseKeyPath, 'utf8')).not.toBe(keyBefore)
+      await reopened.close()
+
+      const inspected = await openUserKnowledgeDatabase({
+        rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+      })
+      expect(inspected.database.prepare('SELECT count(*) AS count FROM purge_operations').get())
+        .toEqual({ count: 0 })
+      inspected.close()
+    },
+  )
+
+  it('validates every managed object name before committing purge graph deletion', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'tampered.txt', 'tampered purge'))
+    const imported = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    const tamper = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    tamper.database.prepare("UPDATE source_objects SET relative_name = '../escape.afobj'").run()
+    tamper.close()
+
+    await expect(app.service.purgeDocument(owner, imported!.id)).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    expect(await app.service.listDocuments(owner, base!.id)).toHaveLength(1)
+    await app.service.close()
+  })
+
+  it('removes every document and base tombstone scoped to a purged knowledge base', async () => {
+    const app = await fixture({
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false },
+    })
+    const owner = { userId: 'alice' }
+    const base = await app.service.createBase(owner, 'Tombstones')
+    for (const name of ['one.txt', 'two.txt']) {
+      app.picks.push(await writeSource(app.rootDirectory, name, name))
+      const imported = await app.service.importDocument(owner, base.id)
+      await expect.poll(async () => (await app.service.listDocuments(owner, base.id))
+        .find(document => document.id === imported!.id)?.status).toBe('ready')
+      await app.service.recycleDocument(owner, imported!.id)
+    }
+    await app.service.recycleBase(owner, base.id)
+    await app.service.purgeBase(owner, base.id)
+    await app.service.close()
+
+    const inspected = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    expect(inspected.database.prepare(
+      'SELECT count(*) AS count FROM tombstones WHERE knowledge_base_id = ?',
+    ).get(base.id)).toEqual({ count: 0 })
+    inspected.close()
   })
 })

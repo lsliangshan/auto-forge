@@ -6,7 +6,11 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createEncryptedObjectSnapshot, unwrapSnapshotFileKey } from './encrypted-object-store.js'
 import { DEFAULT_PARSER_LIMITS } from './parser-protocol.js'
-import { ParserSupervisor, type ParserRendererDependencies } from './parser-supervisor.js'
+import {
+  createElectronParserSupervisor,
+  ParserSupervisor,
+  type ParserRendererDependencies,
+} from './parser-supervisor.js'
 
 const directories: string[] = []
 afterEach(async () => Promise.all(directories.splice(0).map(async path => (await import('node:fs/promises')).rm(path, { recursive: true, force: true }))))
@@ -243,5 +247,14 @@ describe('sandbox parser supervisor', () => {
     expect(html).toContain("default-src 'none'")
     expect(html).toContain("connect-src 'none'")
     expect(html).not.toMatch(/unsafe-inline|unsafe-eval/)
+  })
+
+  it('fails the runtime probe before construction when packaged parser assets are missing', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-supervisor-assets-'))
+    directories.push(directory)
+    await expect(createElectronParserSupervisor(
+      join(directory, 'missing-worker.html'),
+      join(directory, 'missing-preload.cjs'),
+    )).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })
