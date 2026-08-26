@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { knowledgeSearchResultSchema } from '@autoforge/shared'
 
 export interface CloudBaseFunctionPort {
   callFunction(options: { name: string; data: Record<string, unknown> }): Promise<unknown>
@@ -14,6 +15,8 @@ export const cloudKnowledgeErrorCodes = [
   'GENERATION_NOT_READY',
   'ENTITLEMENT_REQUIRED',
   'KILL_SWITCH_ENABLED',
+  'EMBEDDING_CONSENT_REQUIRED',
+  'EMBEDDING_MODEL_INVALID',
   'TRANSIENT_FAILURE',
   'INTERNAL_ERROR',
 ] as const
@@ -111,6 +114,47 @@ const beginSyncSchema = z.object({
   generationId: identifier,
   status: z.literal('staging'),
 }).strict()
+const embeddingConsentSchema = z.object({
+  processor: z.literal('tokenhub'),
+  processingRegion: z.literal('Guangzhou'),
+  model: z.literal('kinfra-text-embedding-0.6b'),
+  dimensions: z.literal(1024),
+  status: z.enum(['unknown', 'granted', 'denied', 'revoked']),
+  retrievalMode: z.enum(['hybrid', 'keyword_only', 'reindexing']),
+  updatedAt: z.string().datetime().optional(),
+}).strict().superRefine(({ status, retrievalMode }, context) => {
+  if (status !== 'granted' && retrievalMode !== 'keyword_only') {
+    context.addIssue({ code: 'custom', path: ['retrievalMode'], message: 'Consent is required' })
+  }
+})
+const publishedGenerationSchema = z.object({
+  knowledgeBaseId: identifier,
+  generationId: identifier,
+}).strict()
+const publishedGenerationListSchema = z.array(publishedGenerationSchema).max(32).superRefine(
+  (generations, context) => {
+    if (new Set(generations.map(({ knowledgeBaseId }) => knowledgeBaseId)).size !== generations.length) {
+      context.addIssue({ code: 'custom', message: 'Knowledge base generations must be unique' })
+    }
+  },
+)
+const publishedSearchSchema = z.object({
+  mode: z.enum(['hybrid', 'keyword_only']),
+  degradationReason: z.enum([
+    'consent_unavailable', 'provider_unavailable', 'model_deprecated', 'small_index_limit',
+  ]).nullable(),
+  results: z.array(z.object({
+    generationId: identifier,
+    evidence: knowledgeSearchResultSchema,
+  }).strict()).max(8),
+}).strict()
+const driftProbeSchema = z.discriminatedUnion('drifted', [
+  z.object({
+    drifted: z.literal(false),
+    publishedGenerationId: identifier.nullable(),
+  }).strict(),
+  publishedSchema.extend({ drifted: z.literal(true) }).strict(),
+])
 
 const successEnvelope = z.object({ ok: z.literal(true), data: z.unknown() }).strict()
 const failureEnvelope = z.object({
@@ -171,6 +215,81 @@ export class CloudBaseKnowledgeClient {
 
   getEntitlement(): Promise<z.infer<typeof cloudEntitlementSchema>> {
     return this.invoke('getEntitlement', {}, cloudEntitlementSchema)
+  }
+
+  getEmbeddingConsent(): Promise<z.infer<typeof embeddingConsentSchema>> {
+    return this.invoke('getEmbeddingConsent', {}, embeddingConsentSchema)
+  }
+
+  setEmbeddingConsent(input: {
+    requestId: string
+    status: 'granted' | 'denied' | 'revoked'
+  }): Promise<z.infer<typeof embeddingConsentSchema>> {
+    const parsed = z.object({
+      requestId: identifier,
+      status: z.enum(['granted', 'denied', 'revoked']),
+    }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('setEmbeddingConsent', parsed.data, embeddingConsentSchema)
+  }
+
+  capturePublishedSnapshot(input: {
+    knowledgeBaseIds: string[]
+  }): Promise<Array<z.infer<typeof publishedGenerationSchema>>> {
+    const parsed = z.object({
+      knowledgeBaseIds: z.array(identifier).min(1).max(32).refine(
+        ids => new Set(ids).size === ids.length,
+        { message: 'Knowledge base IDs must be unique' },
+      ),
+    }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('capturePublishedSnapshot', parsed.data, publishedGenerationListSchema)
+  }
+
+  searchPublished(input: {
+    query: string
+    generationSnapshot: Array<z.infer<typeof publishedGenerationSchema>>
+    topK: number
+  }): Promise<z.infer<typeof publishedSearchSchema>> {
+    const parsed = z.object({
+      query: z.string().trim().min(1).max(1_000),
+      generationSnapshot: publishedGenerationListSchema.min(1),
+      topK: z.number().int().min(1).max(8),
+    }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('searchPublished', parsed.data, publishedSearchSchema)
+  }
+
+  buildEmbeddingGeneration(input: {
+    requestId: string
+    knowledgeBaseId: string
+    generationId: string
+    expectedPublishedGenerationId: string | null
+  }): Promise<z.infer<typeof publishedSchema>> {
+    const parsed = z.object({
+      requestId: identifier,
+      knowledgeBaseId: identifier,
+      generationId: identifier,
+      expectedPublishedGenerationId: identifier.nullable(),
+    }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('buildEmbeddingGeneration', parsed.data, publishedSchema)
+  }
+
+  probeEmbeddingDrift(input: {
+    requestId: string
+    knowledgeBaseId: string
+    generationId: string
+    expectedPublishedGenerationId: string | null
+  }): Promise<z.infer<typeof driftProbeSchema>> {
+    const parsed = z.object({
+      requestId: identifier,
+      knowledgeBaseId: identifier,
+      generationId: identifier,
+      expectedPublishedGenerationId: identifier.nullable(),
+    }).strict().safeParse(input)
+    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
+    return this.invoke('probeEmbeddingDrift', parsed.data, driftProbeSchema)
   }
 
   beginSync(input: {

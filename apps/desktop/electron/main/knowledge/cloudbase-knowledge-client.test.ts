@@ -183,4 +183,92 @@ describe('CloudBaseKnowledgeClient', () => {
       .resolves.toEqual({ jobId: 'job_1', state: 'completed', errorCode: null })
     expect(JSON.stringify(callFunction.mock.calls)).not.toMatch(/serviceKey|service.?role|cos/i)
   })
+
+  it('keeps embedding consent, published snapshots, and hybrid search inside Main', async () => {
+    const evidence = {
+      evidenceId: 'evidence_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
+      versionId: 'version_1', snippet: 'Published excerpt.', score: 0.5,
+      citation: {
+        evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
+        kind: 'markdown', nodeId: 'node_release',
+      },
+    }
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'granted', retrievalMode: 'hybrid', updatedAt: '2026-08-26T00:00:00.000Z',
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'revoked', retrievalMode: 'keyword_only', updatedAt: '2026-08-26T00:01:00.000Z',
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: [
+        { knowledgeBaseId: 'kb_1', generationId: 'generation_live' },
+      ] } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        mode: 'keyword_only', degradationReason: 'consent_unavailable',
+        results: [{ generationId: 'generation_live', evidence }],
+      } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.getEmbeddingConsent()).resolves.toMatchObject({ status: 'granted' })
+    await expect(client.setEmbeddingConsent({ requestId: 'consent_1', status: 'revoked' }))
+      .resolves.toMatchObject({ status: 'revoked', retrievalMode: 'keyword_only' })
+    const snapshot = await client.capturePublishedSnapshot({ knowledgeBaseIds: ['kb_1'] })
+    await expect(client.searchPublished({
+      query: 'release policy', generationSnapshot: snapshot, topK: 8,
+    })).resolves.toMatchObject({ mode: 'keyword_only', results: [{ generationId: 'generation_live' }] })
+
+    expect(callFunction).toHaveBeenNthCalledWith(2, {
+      name: 'autoforge-knowledge',
+      data: { action: 'setEmbeddingConsent', requestId: 'consent_1', status: 'revoked' },
+    })
+    expect(callFunction).toHaveBeenNthCalledWith(4, {
+      name: 'autoforge-knowledge', data: {
+        action: 'searchPublished', query: 'release policy',
+        generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+        topK: 8,
+      },
+    })
+    expect(JSON.stringify(callFunction.mock.calls)).not.toMatch(/userId|ownerId|serviceKey|cos/i)
+  })
+
+  it('rejects caller-selected oversized scope, topK, model, and generation fields', async () => {
+    const callFunction = vi.fn()
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.capturePublishedSnapshot({ knowledgeBaseIds: ['kb_1', 'kb_1'] }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(client.searchPublished({
+      query: 'release policy',
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+      topK: 99,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(client.buildEmbeddingGeneration({
+      requestId: 'build_1', knowledgeBaseId: 'kb_1', generationId: 'generation_shadow',
+      expectedPublishedGenerationId: 'generation_live',
+      model: 'attacker-model',
+    } as never)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(callFunction).not.toHaveBeenCalled()
+  })
+
+  it('requests a server-owned drift probe without exposing probe text or model controls', async () => {
+    const callFunction = vi.fn().mockResolvedValue({ result: { ok: true, data: {
+      drifted: false, publishedGenerationId: 'generation_live',
+    } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+
+    await expect(client.probeEmbeddingDrift({
+      requestId: 'probe_1', knowledgeBaseId: 'kb_1', generationId: 'generation_shadow',
+      expectedPublishedGenerationId: 'generation_live',
+    })).resolves.toEqual({ drifted: false, publishedGenerationId: 'generation_live' })
+    expect(callFunction).toHaveBeenCalledWith({
+      name: 'autoforge-knowledge', data: {
+        action: 'probeEmbeddingDrift', requestId: 'probe_1', knowledgeBaseId: 'kb_1',
+        generationId: 'generation_shadow', expectedPublishedGenerationId: 'generation_live',
+      },
+    })
+  })
 })

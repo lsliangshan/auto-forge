@@ -522,7 +522,14 @@ export class KnowledgeService implements KnowledgePersistence {
 
   getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState> {
     return this.options.getConsent?.(owner)
-      ?? Promise.resolve({ provider: 'deepseek', status: 'unknown' })
+      ?? Promise.resolve({
+        chatProvider: { provider: 'deepseek', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'unknown', retrievalMode: 'keyword_only',
+        },
+      })
   }
 
   close(): Promise<void> {

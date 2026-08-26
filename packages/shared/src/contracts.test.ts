@@ -23,8 +23,10 @@ import {
   knowledgeBaseSchema,
   knowledgeCitationReferenceSchema,
   knowledgeDocumentSchema,
+  knowledgeEmbeddingConsentStateSchema,
   knowledgeEntitlementStateSchema,
   knowledgeFeatureAvailabilitySchema,
+  knowledgeConsentStateSchema,
   knowledgeSearchResultsSchema,
   knowledgeSearchOutcomeSchema,
   knowledgeSelectionSchema,
@@ -144,6 +146,28 @@ describe('cross-process contracts', () => {
     expect(knowledgeEntitlementStateSchema.parse({
       tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
     })).toMatchObject({ tier: 'free', status: 'active' })
+  })
+
+  it('keeps TokenHub embedding consent separate from chat-provider disclosure', () => {
+    const consent = {
+      chatProvider: { provider: 'openrouter', status: 'denied' },
+      embedding: {
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'revoked', retrievalMode: 'keyword_only',
+        updatedAt: '2026-08-26T00:00:00.000Z',
+      },
+    } as const
+    expect(knowledgeConsentStateSchema.parse(consent)).toEqual(consent)
+    expect(knowledgeEmbeddingConsentStateSchema.safeParse({
+      ...consent.embedding, status: 'denied', retrievalMode: 'hybrid',
+    }).success).toBe(false)
+    expect(knowledgeConsentStateSchema.safeParse({
+      provider: 'openrouter', status: 'granted',
+    }).success).toBe(false)
+    expect(knowledgeConsentStateSchema.safeParse({
+      ...consent, embedding: { ...consent.embedding, dimensions: 1536 },
+    }).success).toBe(false)
   })
 
   it('validates CloudBase username, password, phone, email, and OTP inputs', () => {

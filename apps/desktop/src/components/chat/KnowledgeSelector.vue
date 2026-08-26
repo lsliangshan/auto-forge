@@ -102,9 +102,14 @@ function choiceFor(base: KnowledgeBase, missing = false): Choice {
     return { base, label: `${base.kind === 'cloud' ? '同步中' : '本地处理中'} · 已就绪版本可用`, disabled: false }
   }
   if (base.kind === 'local') return { base, label: '仅本地 · 关键词检索', disabled: false }
+  const retrievalMode = knowledge.consent?.embedding.retrievalMode
   return {
     base,
-    label: knowledge.consent?.status === 'granted' ? '已同步' : '已同步 · 关键词检索',
+    label: retrievalMode === 'hybrid'
+      ? '已同步 · 混合检索'
+      : retrievalMode === 'reindexing'
+        ? '已同步 · 向量重建中，暂用关键词检索'
+        : '已同步 · 关键词检索',
     disabled: false,
   }
 }

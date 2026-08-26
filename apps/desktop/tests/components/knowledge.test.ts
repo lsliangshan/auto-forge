@@ -95,7 +95,14 @@ function createApi(input: {
       search: vi.fn(),
       getFeatureAvailability: vi.fn().mockResolvedValue(input.featureAvailability ?? available),
       getEntitlement: vi.fn().mockResolvedValue(input.entitlement ?? free),
-      getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'denied' }),
+      getConsent: vi.fn().mockResolvedValue({
+        chatProvider: { provider: 'openrouter', status: 'denied' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'revoked', retrievalMode: 'keyword_only',
+        },
+      }),
     },
     system: { getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
@@ -171,7 +178,14 @@ describe('knowledge Store boundary', () => {
     knowledge.versionsByDocument = { [readyDocument.id]: [] }
     knowledge.availability = available
     knowledge.entitlement = free
-    knowledge.consent = { provider: 'openrouter', status: 'denied' }
+    knowledge.consent = {
+      chatProvider: { provider: 'openrouter', status: 'denied' },
+      embedding: {
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'revoked', retrievalMode: 'keyword_only',
+      },
+    }
 
     const loadingCatalog = knowledge.refreshCatalog()
     const loadingDocuments = knowledge.loadDocuments(localBase.id)
@@ -569,6 +583,26 @@ describe('knowledge three-pane workspace', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-testid="inspector-panel"]').text()).toContain('仅原有已就绪版本可检索')
+  })
+
+  it('shows TokenHub Guangzhou consent separately and keeps revoked cloud search keyword-only', async () => {
+    const cloudBase = { ...localBase, id: 'kb_cloud', kind: 'cloud' as const }
+    const api = createApi({
+      bases: [cloudBase], documents: [{ ...readyDocument, knowledgeBaseId: cloudBase.id }],
+      featureAvailability: {
+        local: { available: true, reasons: [] }, cloud: { available: true, reasons: [] },
+      },
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true },
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    const inspector = wrapper.get('[data-testid="inspector-panel"]').text()
+    expect(inspector).toContain('关键词检索')
+    expect(inspector).toContain('TokenHub（广州）')
+    expect(inspector).toContain('已撤回')
+    expect(inspector).not.toContain('OpenRouter（广州）')
   })
 
   it('marks a deleted document as deleted and non-retrievable even when a ready version remains', async () => {

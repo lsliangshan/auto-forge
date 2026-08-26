@@ -18,11 +18,15 @@
 4. 验证用户 JWT 由 CloudBase 运行时映射到 `context.auth.uid`；事件体中的用户字段始终被忽略。
 5. 只有完成迁移、私有存储、RLS、会员签名密钥、杀开关和集成测试后，才可在服务端打开 Cloud 功能。当前桌面端继续返回 `kill_switch_enabled`。
 6. 由受信任 worker 定时调用 `autoforge_knowledge_cleanup_retention(worker_id, limit)`；函数先持久提高每个知识库的 retention floor，再清理满 90 天且不再受墓碑保护的 change。还需验证第三次过期租约进入 `failed`，仅 `TRANSIENT_FAILURE` 可以重新排队。
+7. 混合检索发布前，单独配置服务端 `AUTOFORGE_TOKENHUB_BASE_URL` 与 `AUTOFORGE_TOKENHUB_API_KEY`，并验证 TokenHub `kinfra-text-embedding-0.6b` 在广州处理、固定返回 1024 维向量。该凭据不得进入 Electron。当前仓库没有获批的 TokenHub 集成凭据，Cloud/Beta 开关继续关闭。
+8. 在隔离预发布环境验证向量维度约束、仅 published generation 可检索、撤回授权后向量删除、关键词降级、漂移 shadow 构建/原子切换、旧 generation 七日保留及 owner RLS；这些都不是仓库单元测试对真实 CloudBase/PostgreSQL 的证明。
 
 ## 生命周期边界
 
 - 上传授权、对象元数据校验、同步变更、原子发布、删除、取消和孤儿清理由云函数/RPC 执行。孤儿清理先幂等删除私有 Storage 字节，再提交数据库删除。
 - `knowledge_versions` 和 `knowledge_index_generations` 是不可变生成；仅 ready 生成可原子切换为 published。
+- TokenHub 嵌入授权与聊天提供商披露授权相互独立。未同意或已撤回时不向 TokenHub 发送文本；撤回会删除向量，但保留 generation-chunk 映射以继续关键词检索。原始文件、规范文本/分块和持久向量都留在上海侧。
+- 小索引路径在上海侧执行精确余弦，并用确定性的 RRF 融合关键词/向量排名；不调用外部 reranker。TokenHub 故障或模型弃用时，已发布 generation 继续关键词检索，staging/failed generation 永不进入结果。
 - 作业使用 token、过期租约、CAS 与幂等 request/mutation id；仅瞬时错误最多重试三次。
 - 增量游标基于单调 sequence；每页 `nextSequence` 只能等于该页最后一条，`hasMore` 驱动继续拉取。新客户端、过期游标以及保留窗口内无 change 的知识库使用原子 snapshot；墓碑与 change 的清理下限持久保留。
 - 暂停不会删除云数据；转本地必须先完整下载并校验，再请求云端删除。

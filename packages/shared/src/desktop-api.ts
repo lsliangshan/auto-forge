@@ -85,10 +85,34 @@ export const knowledgeEntitlementStateSchema = z.object({
 }).strict()
 export type KnowledgeEntitlementState = z.infer<typeof knowledgeEntitlementStateSchema>
 
-export const knowledgeConsentStateSchema = z.object({
+export const knowledgeChatProviderConsentStateSchema = z.object({
   provider: z.enum(['openrouter', 'deepseek']),
   status: z.enum(['unknown', 'granted', 'denied']),
   updatedAt: timestampSchema.optional(),
+}).strict()
+export type KnowledgeChatProviderConsentState = z.infer<typeof knowledgeChatProviderConsentStateSchema>
+
+export const knowledgeEmbeddingConsentStateSchema = z.object({
+  processor: z.literal('tokenhub'),
+  processingRegion: z.literal('Guangzhou'),
+  model: z.literal('kinfra-text-embedding-0.6b'),
+  dimensions: z.literal(1024),
+  status: z.enum(['unknown', 'granted', 'denied', 'revoked']),
+  retrievalMode: z.enum(['hybrid', 'keyword_only', 'reindexing']),
+  updatedAt: timestampSchema.optional(),
+}).strict().superRefine(({ status, retrievalMode }, context) => {
+  if (status !== 'granted' && retrievalMode !== 'keyword_only') {
+    context.addIssue({
+      code: 'custom', path: ['retrievalMode'],
+      message: 'Embedding retrieval requires granted TokenHub consent',
+    })
+  }
+})
+export type KnowledgeEmbeddingConsentState = z.infer<typeof knowledgeEmbeddingConsentStateSchema>
+
+export const knowledgeConsentStateSchema = z.object({
+  chatProvider: knowledgeChatProviderConsentStateSchema,
+  embedding: knowledgeEmbeddingConsentStateSchema,
 }).strict()
 export type KnowledgeConsentState = z.infer<typeof knowledgeConsentStateSchema>
 

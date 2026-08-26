@@ -138,7 +138,14 @@ function services(): DesktopIpcServices {
         cloud: { available: false, reasons: ['encrypted_storage_unavailable'] },
       }),
       getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false }),
-      getConsent: vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'unknown' }),
+      getConsent: vi.fn().mockResolvedValue({
+        chatProvider: { provider: 'deepseek', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'unknown', retrievalMode: 'keyword_only',
+        },
+      }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }

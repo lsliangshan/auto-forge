@@ -1137,7 +1137,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       database.conversations.get(conversationId)?.userId === owner.userId
     ),
     entitlement: options.knowledgeEntitlement,
-    getConsent: async () => ({ provider: (await settings.get()).activeProvider, status: 'unknown' }),
+    getConsent: async () => ({
+      chatProvider: { provider: (await settings.get()).activeProvider, status: 'unknown' },
+      embedding: {
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'unknown', retrievalMode: 'keyword_only',
+      },
+    }),
     platform: options.knowledgePlatform,
     arch: options.knowledgeArch,
     runtimeAvailable: options.createKnowledgeParser !== undefined,
