@@ -170,3 +170,42 @@
 - Rechecked marker crash ordering, deletion/corruption/restart recovery, owner-key privacy, token advancement on signed and sticky fail-closed state, server row exactness, four-digit timestamp grammar, every `this.options.cloud` await, synced-cache denial, local-only immutable snapshot completion, and recycled purge reachability.
 - Additional issues found were the async-validation microtask gap and rejection of real-schema member terminal rows; each received a literal RED and narrow fix before final verification.
 - Round 2 final assessment before external gates: Critical 0, Important 0, Minor 0.
+
+## Fix Round 3/5: monotonic authority and signed free state
+
+### Review findings resolved
+
+- Replaced the independent boolean enrollment marker with a versioned owner-hash-bound appSettings watermark containing only `maxIssuedAt`, `maxObservedAt`, and the SHA-256 of the exact canonical accepted envelope. The watermark commits before encryption/cache replacement. A failed encryption or cache write therefore safe-locks against the older record. Restart rejects lower issued/clock values, same-issued equivocation, a restored whole old ciphertext, corrupt owner binding, and corrupt schema without storing raw entitlement payload outside safeStorage. Legacy boolean or safely missing markers migrate only from a valid decrypted owner-bound record; owners remain isolated.
+- Added canonical signed `tier` to the pre-deployment v1 grammar in Main and server. The real default database row signs as free/active with empty entitlements and `membershipExpiresAt === issuedAt`; Main verifies it to writable local-only 1-base/1-logical-file authority with no membership lifecycle. Free rows cannot carry beta/cloud entitlements or member-only statuses. Member active/offline-grace and member expired/revoked retain exact membership horizons and 30/60-day lifecycle behavior.
+- Reordered every cloud/tool authorization sequence so the local asynchronous refresh completes first and the final await is the legacy server snapshot. The next remote operation or return follows only synchronous full server-state/version validation plus local revision CAS. Post-remote validation follows the same local-refresh -> final-server -> synchronous-CAS order. A changed server version discards consent/search results and prevents synced-cache fallback even when all grant booleans still look active.
+- Made delayed base purge publication selection-aware. It always removes the purged base/cache, but clears or replaces selection only if that base is still selected after the await; a newer base/document selection remains intact.
+
+### Exact RED/GREEN evidence
+
+- Independent watermark/cache: RED 6 failed / 28 passed (34 total). Missing cases were watermark-before-cache crash order, normal/migration watermark persistence, whole old ciphertext rollback, same-issued equivocation, and corrupt watermark denial. GREEN verifier/cache full suite: 35/35 after the signed grammar update.
+- Signed free grammar: server RED 3 failed / 3 passed; Signer -> Verifier RED 1 failed / 34 skipped; Signer -> Verifier -> KnowledgeService RED 1 failed / 57 skipped because the default free row became expired lifecycle state. GREEN: signer 6/6, verifier/cache 35/35, and the end-to-end service focus 1 passed / 62 skipped.
+- Server-final ordering/version: RED 5 failed / 58 skipped. Cloud availability and local-only new Agent admission survived a server kill/version flip during local refresh; consent read/mutation accepted a new server version; rejected remote search disclosed synced cached evidence after version advance. GREEN focused: 5 passed / 58 skipped.
+- Delayed base purge: RED 1 failed / 47 skipped because the newer selected document was cleared. GREEN focused: 1 passed / 47 skipped; full Renderer knowledge 48/48.
+- Final stale-kill self-review: RED 1 failed / 35 skipped because a signed member kill snapshot one millisecond past `snapshotExpiresAt` still returned active and could preserve paid local write/search authority indefinitely. GREEN focused: 1 passed / 35 skipped. A signed kill remains active only through its exact snapshot boundary, is never offline-graced, and stale verification fails closed with `snapshot_expired`.
+
+### Verification
+
+- Verifier + KnowledgeService: 99/99.
+- Electron Main/Application/IPC/Preload: 16 files, 403 passed / exactly 1 failed (404 total). The sole failure is the unrelated context-summary billing baseline; its emitted error block and final failed status both contain exactly `CONTEXT_LIMIT_EXCEEDED`.
+- Renderer knowledge: 48/48. Shared contracts + CloudBase handler: 125/125 (81 + 44). Server signer: 6/6.
+- `pnpm typecheck`: all four typed workspace projects passed. `pnpm lint --quiet`: exit 0.
+- `pnpm build`: shared/workflow packages, Electron Main, Preload, Renderer, parser worker, and workflow worker passed.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui`: real Electron Renderer -> Preload -> IPC -> Main -> parser -> encrypted persistence and restart restore passed with `{"ok":true}`; import acknowledgement, ready document, strict selector persistence, and restored selection were visible.
+
+### External gates unchanged
+
+- No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified.
+- Production build-time trusted keys remain empty and the Cloud Function entry still has no signer. Beta, cloud, and new Agent knowledge admission remain closed; authoritative free local 1-base/1-file management remains usable.
+- Pre-production must prove the real RPC row, KMS signature/key rotation, server-version transitions, owner isolation, rollback recovery, RLS, and cloud object lifecycle before enablement. Logical purge still makes no physical SSD, snapshot, log, or third-party backup erasure claim.
+
+### Self-review
+
+- Rechecked watermark crash order, whole-ciphertext rollback, same-issued hash binding, legacy migration, corrupt owner isolation, free/member canonical grammar, fixed literal signatures, local quota reconciliation, member terminal windows, and every server/cloud await.
+- Moved synced cached fallback computation before final post-remote authorization and returns only its already-computed result after the final server/CAS segment; no synced evidence is loaded after that validation.
+- Found and fixed one preserved Round 1 issue during final self-review: `killSwitchEnabled` had incorrectly bypassed snapshot expiry for member local authority. Literal boundary coverage now proves exact-expiry denial without granting offline grace.
+- Round 3 assessment before prohibited external gates: Critical 0, Important 0, Minor 0.

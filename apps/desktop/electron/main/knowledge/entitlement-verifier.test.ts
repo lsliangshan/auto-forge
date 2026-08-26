@@ -1,5 +1,6 @@
 import { createPrivateKey, sign } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -32,9 +33,19 @@ const PRIVATE_KEY = createPrivateKey(`-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIPw1EZH4rU2rAWoikip2sgTamPoODfyfnO4IDFB68He9
 -----END PRIVATE KEY-----
 `)
+const require = createRequire(import.meta.url)
+const { createKnowledgeEntitlementSigner } = require('../../../../../cloudbase/knowledge/function/entitlement-envelope.js') as {
+  createKnowledgeEntitlementSigner(deployment: Readonly<{
+    keyId: string
+    snapshotTtlMs: number
+    now: () => number
+    signCanonical: (bytes: Buffer) => Promise<Buffer>
+  }>): (ownerId: string, databaseRecord: unknown) => Promise<unknown>
+}
 
 const ACTIVE_PAYLOAD: KnowledgeEntitlementEnvelope['payload'] = {
   userId: 'alice',
+  tier: 'member',
   entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
   issuedAt: '2026-08-26T00:00:00.000Z',
   snapshotExpiresAt: '2026-08-26T01:00:00.000Z',
@@ -43,7 +54,7 @@ const ACTIVE_PAYLOAD: KnowledgeEntitlementEnvelope['payload'] = {
   keyId: 'test-key-1',
   killSwitchEnabled: false,
 }
-const ACTIVE_SIGNATURE = 'pS-5z6-4NKgBNCyKPPPoMEpgKqzXyXaYu0Ww-ngWX40xRoGo_zogU399TJn46YSxZGZOzs7qRLk72vmEhmeHBw'
+const ACTIVE_SIGNATURE = 'Gw5jNSjgeDk91712kEA0jBUDLTm9fNYFPsO77crz4rFcfW2S1qZosAKbJUy6q9WZyY0f6mrRoqjXcvTDPpWPDw'
 const ACTIVE_ENVELOPE: KnowledgeEntitlementEnvelope = {
   version: 1,
   payload: ACTIVE_PAYLOAD,
@@ -67,10 +78,19 @@ function verifier(now: string, keys: Readonly<Record<string, string>> = { 'test-
 
 function enrollmentStore() {
   const enrolled = new Set<string>()
+  const watermarks = new Map<string, unknown>()
   return {
     enrolled,
+    watermarks,
     isEnrolled: async (ownerKey: string) => enrolled.has(ownerKey),
     enroll: async (ownerKey: string) => { enrolled.add(ownerKey) },
+    read: async (ownerKey: string) => watermarks.has(ownerKey)
+      ? watermarks.get(ownerKey)
+      : enrolled.has(ownerKey) ? true : undefined,
+    write: async (ownerKey: string, watermark: unknown) => {
+      enrolled.add(ownerKey)
+      watermarks.set(ownerKey, watermark)
+    },
   }
 }
 
@@ -101,6 +121,28 @@ describe('KnowledgeEntitlementVerifier', () => {
     })
   })
 
+  it('verifies the real default server row as active free local-only authority without membership lifecycle', async () => {
+    const signer = createKnowledgeEntitlementSigner(Object.freeze({
+      keyId: 'test-key-1',
+      snapshotTtlMs: 60 * 60 * 1_000,
+      now: () => Date.parse('2026-08-26T00:00:00.000Z'),
+      signCanonical: async (bytes: Buffer) => sign(null, bytes, PRIVATE_KEY),
+    }))
+    const envelope = await signer('alice', {
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      killSwitchEnabled: true, version: 0, validUntil: null,
+    })
+
+    expect(envelope).toMatchObject({ payload: {
+      userId: 'alice', tier: 'free', entitlements: [], membershipStatus: 'active',
+      killSwitchEnabled: true,
+    } })
+    expect(verifier('2026-08-26T00:30:00.000Z').verify('alice', envelope)).toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+  })
+
   it.each([
     ['wrong user', 'bob', ACTIVE_ENVELOPE, { 'test-key-1': PUBLIC_KEY }, 'wrong_user'],
     ['wrong key id', 'alice', { ...ACTIVE_ENVELOPE, payload: { ...ACTIVE_PAYLOAD, keyId: 'missing-key' } }, { 'test-key-1': PUBLIC_KEY }, 'untrusted_key'],
@@ -119,19 +161,31 @@ describe('KnowledgeEntitlementVerifier', () => {
       .toThrow('snapshot_expired')
   })
 
-  it('never grants grace to signed expired, revoked, kill-switched, or membership-expired state', () => {
+  it('never grants grace to signed expired, revoked, or membership-expired state', () => {
     const now = '2026-08-26T02:00:00.000Z'
     for (const [envelope, expectedStatus] of [
       [signedEnvelope({ membershipStatus: 'expired', membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt }), 'expired'],
       [signedEnvelope({ membershipStatus: 'revoked', membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt }), 'expired'],
-      [signedEnvelope({ killSwitchEnabled: true }), 'active'],
       [signedEnvelope({ membershipExpiresAt: '2026-08-26T02:00:00.000Z' }), 'expired'],
     ] as const) {
       const state = verifier(now).verify('alice', envelope)
+      expect(state.tier).toBe('member')
       expect(state.status).toBe(expectedStatus)
       expect(state.knowledgeToolEnabled).toBe(false)
       expect(state.cloudEnabled).toBe(false)
     }
+  })
+
+  it('does not let a stale signed kill snapshot preserve member local access', () => {
+    const killed = signedEnvelope({ killSwitchEnabled: true })
+
+    expect(verifier('2026-08-26T01:00:00.000Z').verify('alice', killed)).toMatchObject({
+      status: 'active',
+      killSwitchEnabled: true,
+      knowledgeToolEnabled: false,
+    })
+    expect(() => verifier('2026-08-26T01:00:00.001Z').verify('alice', killed))
+      .toThrow('snapshot_expired')
   })
 
   it('fails closed for future-issued snapshots beyond skew and accepts the exact skew boundary', () => {
@@ -172,9 +226,9 @@ describe('KnowledgeEntitlementVerifier', () => {
       membershipExpiresAt: '2026-08-25T12:00:00.000Z',
       membershipStatus: 'revoked',
     })
-    expect(verifier('2026-09-24T11:59:59.999Z').verify('alice', revoked).lifecycle.phase)
+    expect(verifier('2026-09-24T11:59:59.999Z').verify('alice', revoked).lifecycle!.phase)
       .toBe('download_window')
-    expect(verifier('2026-09-24T12:00:00.000Z').verify('alice', revoked).lifecycle.phase)
+    expect(verifier('2026-09-24T12:00:00.000Z').verify('alice', revoked).lifecycle!.phase)
       .toBe('recycle_window')
   })
 
@@ -189,7 +243,7 @@ describe('KnowledgeEntitlementVerifier', () => {
       membershipExpiresAt: '2026-08-26T00:00:00.000Z',
       membershipStatus: 'expired',
     })
-    expect(verifier(now).verify('alice', expired).lifecycle.phase).toBe(phase)
+    expect(verifier(now).verify('alice', expired).lifecycle!.phase).toBe(phase)
   })
 
   it('ships with no production trusted key until deployment supplies an approved public key', () => {
@@ -420,6 +474,16 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
     })).rejects.toThrow('injected encryption failure')
     expect(enrollment.enrolled).toHaveLength(1)
     expect([...enrollment.enrolled][0]).not.toContain('alice')
+    expect(enrollment.watermarks).toHaveLength(1)
+    const watermark = [...enrollment.watermarks.values()][0]
+    expect(watermark).toMatchObject({
+      version: 1,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+      acceptedEnvelopeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+    expect(JSON.stringify(watermark)).not.toContain('alice')
+    expect(JSON.stringify(watermark)).not.toContain(ACTIVE_PAYLOAD.membershipExpiresAt)
     expect(await readdir(directory)).toEqual([])
 
     const restarted = new KnowledgeEntitlementAuthority({
@@ -459,6 +523,7 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
     const restarted = safeStorageCache(directory, storage, enrollment)
     await expect(restarted.read('alice')).resolves.toEqual(record)
     await expect(restarted.read('bob')).resolves.toBeUndefined()
+    expect(enrollment.watermarks).toHaveLength(1)
   })
 
   it.each(['deleted', 'corrupt'] as const)(
@@ -577,8 +642,91 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
       maxObservedAt: '2026-08-26T00:30:00.000Z',
     })
     enrollment.enrolled.clear()
+    enrollment.watermarks.clear()
 
     await expect(cache.read('alice')).resolves.toMatchObject({ maxIssuedAt: newer.payload.issuedAt })
     expect(enrollment.enrolled).toHaveLength(1)
+    expect([...enrollment.watermarks.values()][0]).toMatchObject({
+      maxIssuedAt: newer.payload.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })
+  })
+
+  it('rejects a whole old valid ciphertext restored after a newer kill-switch watermark committed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-replay-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async value => Buffer.from(`wrapped:${value}`),
+      decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+    }
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
+    await cache.write('alice', {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })
+    const recordPath = join(directory, (await readdir(directory)).find(file => file.endsWith('.json'))!)
+    const oldCiphertext = await readFile(recordPath)
+    const killed = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-27T00:10:00.000Z',
+      killSwitchEnabled: true,
+    })
+    await cache.write('alice', {
+      envelope: killed,
+      maxIssuedAt: killed.payload.issuedAt,
+      maxObservedAt: '2026-08-26T00:40:00.000Z',
+    })
+    await writeFile(recordPath, oldCiphertext)
+
+    await expect(safeStorageCache(directory, storage, enrollment).read('alice'))
+      .rejects.toThrow(/rollback|watermark/i)
+  })
+
+  it('rejects same-issued envelope equivocation before replacing the independent watermark', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-equivocation-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async value => Buffer.from(`wrapped:${value}`),
+      decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+    }
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
+    const activeRecord = {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    }
+    await cache.write('alice', activeRecord)
+    const originalWatermark = [...enrollment.watermarks.values()][0]
+    const equivocated = signedEnvelope({ membershipExpiresAt: '2026-10-26T00:00:00.000Z' })
+
+    await expect(cache.write('alice', { ...activeRecord, envelope: equivocated }))
+      .rejects.toThrow(/equivocation|watermark/i)
+    expect([...enrollment.watermarks.values()][0]).toEqual(originalWatermark)
+  })
+
+  it('fails closed on a corrupt independent watermark without using the encrypted record', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-watermark-corrupt-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async value => Buffer.from(`wrapped:${value}`),
+      decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+    }
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
+    await cache.write('alice', {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })
+    const [ownerKey] = enrollment.enrolled
+    enrollment.watermarks.set(ownerKey!, { version: 1, ownerHash: 'tampered' })
+
+    await expect(cache.read('alice')).rejects.toThrow(/watermark/i)
   })
 })

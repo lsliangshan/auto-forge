@@ -18,6 +18,7 @@ const canonicalTimestampSchema = z.string().datetime().refine(
 )
 const payloadSchema = z.object({
   userId: z.string().min(1).max(256).refine(value => value.trim() === value, 'user_id_not_canonical'),
+  tier: z.enum(['free', 'member']),
   entitlements: z.array(z.enum(['knowledge_base_beta', 'knowledge_base_cloud'])).max(2)
     .refine(values => new Set(values).size === values.length, 'duplicate_entitlement')
     .refine(values => values.every((value, index) => index === 0 || values[index - 1]! < value), 'entitlements_not_canonical'),
@@ -27,7 +28,15 @@ const payloadSchema = z.object({
   membershipStatus: z.enum(['active', 'expired', 'revoked']),
   keyId: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/),
   killSwitchEnabled: z.boolean(),
-}).strict()
+}).strict().superRefine((payload, context) => {
+  if (payload.tier === 'free' && (
+    payload.entitlements.length > 0
+    || payload.membershipStatus !== 'active'
+    || payload.membershipExpiresAt !== payload.issuedAt
+  )) {
+    context.addIssue({ code: 'custom', path: ['tier'], message: 'free_entitlement_not_canonical' })
+  }
+})
 const envelopeSchema = z.object({
   version: z.literal(1),
   payload: payloadSchema,
@@ -50,9 +59,24 @@ export interface KnowledgeEntitlementEnvelopeCache {
   write(userId: string, record: KnowledgeEntitlementCacheRecord): Promise<void>
 }
 
+const enrollmentWatermarkSchema = z.object({
+  version: z.literal(1),
+  ownerHash: z.string().regex(/^[a-f0-9]{64}$/),
+  maxIssuedAt: canonicalTimestampSchema,
+  maxObservedAt: canonicalTimestampSchema,
+  acceptedEnvelopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict()
+type KnowledgeEntitlementEnrollmentWatermark = z.infer<typeof enrollmentWatermarkSchema>
+
+function parseEnrollmentWatermark(input: unknown): KnowledgeEntitlementEnrollmentWatermark {
+  try { return enrollmentWatermarkSchema.parse(input) } catch (error) {
+    throw new Error('Knowledge entitlement watermark is invalid', { cause: error })
+  }
+}
+
 export interface KnowledgeEntitlementEnrollmentStore {
-  isEnrolled(ownerKey: string): Promise<boolean>
-  enroll(ownerKey: string): Promise<void>
+  read(ownerKey: string): Promise<unknown | undefined>
+  write(ownerKey: string, watermark: KnowledgeEntitlementEnrollmentWatermark): Promise<void>
 }
 
 export class AppSettingsKnowledgeEntitlementEnrollmentStore implements KnowledgeEntitlementEnrollmentStore {
@@ -61,15 +85,14 @@ export class AppSettingsKnowledgeEntitlementEnrollmentStore implements Knowledge
     set(key: string, value: unknown): unknown
   }) {}
 
-  async isEnrolled(ownerKey: string): Promise<boolean> {
-    const stored = this.settings.get(this.key(ownerKey))
-    if (stored === undefined) return false
-    if (stored.value !== true) throw new Error('Knowledge entitlement enrollment marker is invalid')
-    return true
+  async read(ownerKey: string): Promise<unknown | undefined> {
+    return this.settings.get(this.key(ownerKey))?.value
   }
 
-  async enroll(ownerKey: string): Promise<void> {
-    this.settings.set(this.key(ownerKey), true)
+  async write(ownerKey: string, watermark: KnowledgeEntitlementEnrollmentWatermark): Promise<void> {
+    const parsed = parseEnrollmentWatermark(watermark)
+    if (parsed.ownerHash !== ownerKey) throw new Error('Knowledge entitlement watermark owner mismatch')
+    this.settings.set(this.key(ownerKey), parsed)
   }
 
   private key(ownerKey: string): string {
@@ -101,7 +124,8 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
       throw new Error('Secure storage is unavailable for knowledge entitlement cache')
     }
     const ownerKey = this.ownerKey(userId)
-    const enrolled = await this.enrollment.isEnrolled(ownerKey)
+    const storedWatermark = await this.enrollment.read(ownerKey)
+    const enrolled = storedWatermark !== undefined
     let serialized: string
     try { serialized = await readFile(this.recordPath(userId), 'utf8') } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -115,7 +139,18 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
     const decrypted = await this.safeStorage.decrypt(Buffer.from(wrapped.ciphertext, 'base64'))
     const parsed = cacheRecordSchema.parse(JSON.parse(decrypted.value))
     if (parsed.userId !== userId) throw new Error('Knowledge entitlement cache owner mismatch')
-    if (!enrolled) await this.enrollment.enroll(ownerKey)
+    const watermark = this.watermark(ownerKey, parsed.record)
+    if (storedWatermark === undefined || storedWatermark === true) {
+      await this.enrollment.write(ownerKey, watermark)
+    } else {
+      const current = parseEnrollmentWatermark(storedWatermark)
+      if (current.ownerHash !== ownerKey) throw new Error('Knowledge entitlement watermark owner mismatch')
+      if (current.maxIssuedAt !== watermark.maxIssuedAt
+        || current.maxObservedAt !== watermark.maxObservedAt
+        || current.acceptedEnvelopeHash !== watermark.acceptedEnvelopeHash) {
+        throw new Error('Knowledge entitlement cache rollback does not match independent watermark')
+      }
+    }
     if (decrypted.shouldReEncrypt) await this.write(userId, parsed.record)
     return parsed.record
   }
@@ -126,7 +161,23 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
     }
     const parsed = cacheRecordSchema.parse({ version: 1, userId, record })
     const ownerKey = this.ownerKey(userId)
-    if (!await this.enrollment.isEnrolled(ownerKey)) await this.enrollment.enroll(ownerKey)
+    const watermark = this.watermark(ownerKey, parsed.record)
+    const storedWatermark = await this.enrollment.read(ownerKey)
+    if (storedWatermark !== undefined && storedWatermark !== true) {
+      const current = parseEnrollmentWatermark(storedWatermark)
+      if (current.ownerHash !== ownerKey) throw new Error('Knowledge entitlement watermark owner mismatch')
+      const nextIssuedAt = Date.parse(watermark.maxIssuedAt)
+      const currentIssuedAt = Date.parse(current.maxIssuedAt)
+      if (nextIssuedAt < currentIssuedAt
+        || Date.parse(watermark.maxObservedAt) < Date.parse(current.maxObservedAt)) {
+        throw new Error('Knowledge entitlement watermark rollback rejected')
+      }
+      if (nextIssuedAt === currentIssuedAt
+        && watermark.acceptedEnvelopeHash !== current.acceptedEnvelopeHash) {
+        throw new Error('Knowledge entitlement watermark equivocation rejected')
+      }
+    }
+    await this.enrollment.write(ownerKey, watermark)
     const encrypted = await this.safeStorage.encrypt(JSON.stringify(parsed))
     await writeFileDurably(this.recordPath(userId), JSON.stringify({
       version: 1,
@@ -136,6 +187,24 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
 
   private recordPath(userId: string): string {
     return join(this.directory, `${this.ownerKey(userId)}.json`)
+  }
+
+  private watermark(
+    ownerHash: string,
+    record: KnowledgeEntitlementCacheRecord,
+  ): KnowledgeEntitlementEnrollmentWatermark {
+    const acceptedEnvelopeHash = createHash('sha256').update(JSON.stringify({
+      version: record.envelope.version,
+      payload: JSON.parse(canonicalPayloadBytes(record.envelope.payload).toString()),
+      signature: record.envelope.signature,
+    })).digest('hex')
+    return parseEnrollmentWatermark({
+      version: 1,
+      ownerHash,
+      maxIssuedAt: record.maxIssuedAt,
+      maxObservedAt: record.maxObservedAt,
+      acceptedEnvelopeHash,
+    })
   }
 
   private ownerKey(userId: string): string {
@@ -149,8 +218,8 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
 export type VerifiedKnowledgeEntitlementState = KnowledgeEntitlementState & {
   readonly knowledgeToolEnabled: boolean
   readonly killSwitchEnabled: boolean
-  readonly membershipExpiresAt: string
-  readonly lifecycle: {
+  readonly membershipExpiresAt?: string
+  readonly lifecycle?: {
     readonly phase: 'active' | 'download_window' | 'recycle_window' | 'purge_eligible'
     readonly requiresSelection: boolean
     readonly downloadUntil: string
@@ -168,6 +237,7 @@ function verificationFailure(reason: string): never {
 function canonicalPayloadBytes(payload: KnowledgeEntitlementEnvelope['payload']): Buffer {
   return Buffer.from(JSON.stringify({
     userId: payload.userId,
+    tier: payload.tier,
     entitlements: payload.entitlements,
     issuedAt: payload.issuedAt,
     snapshotExpiresAt: payload.snapshotExpiresAt,
@@ -218,13 +288,22 @@ export class KnowledgeEntitlementVerifier {
     const issuedAt = Date.parse(envelope.payload.issuedAt)
     const snapshotExpiresAt = Date.parse(envelope.payload.snapshotExpiresAt)
     const membershipExpiresAt = Date.parse(envelope.payload.membershipExpiresAt)
+    const free = envelope.payload.tier === 'free'
     const terminal = envelope.payload.membershipStatus !== 'active'
     if (snapshotExpiresAt < issuedAt
-      || (!terminal && membershipExpiresAt <= issuedAt)
-      || (terminal && membershipExpiresAt > issuedAt)) {
+      || (!free && !terminal && membershipExpiresAt <= issuedAt)
+      || (!free && terminal && membershipExpiresAt > issuedAt)) {
       verificationFailure('invalid_time_order')
     }
     if (issuedAt - now > CLOCK_SKEW_MS) verificationFailure('issued_in_future')
+
+    if (free) {
+      if (now > snapshotExpiresAt + OFFLINE_GRACE_MS) verificationFailure('snapshot_expired')
+      return {
+        tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+        knowledgeToolEnabled: false, killSwitchEnabled: envelope.payload.killSwitchEnabled,
+      }
+    }
 
     const downloadUntil = membershipExpiresAt + WINDOW_MS
     const recycleUntil = downloadUntil + WINDOW_MS
@@ -232,11 +311,12 @@ export class KnowledgeEntitlementVerifier {
     const killSwitchEnabled = envelope.payload.killSwitchEnabled
     let status: VerifiedKnowledgeEntitlementState['status']
     if (membershipEnded) status = 'expired'
-    else if (now <= snapshotExpiresAt || killSwitchEnabled) status = 'active'
+    else if (now <= snapshotExpiresAt) status = 'active'
+    else if (killSwitchEnabled) verificationFailure('snapshot_expired')
     else if (now <= snapshotExpiresAt + OFFLINE_GRACE_MS) status = 'offline_grace'
     else verificationFailure('snapshot_expired')
 
-    const phase: VerifiedKnowledgeEntitlementState['lifecycle']['phase'] = !membershipEnded
+    const phase: NonNullable<VerifiedKnowledgeEntitlementState['lifecycle']>['phase'] = !membershipEnded
       ? 'active'
       : now < downloadUntil
         ? 'download_window'
@@ -250,7 +330,7 @@ export class KnowledgeEntitlementVerifier {
     const cloudEnabled = betaEnabled
       && envelope.payload.entitlements.includes('knowledge_base_cloud')
     return {
-      tier: member ? 'member' : 'free',
+      tier: 'member',
       status,
       betaEnabled,
       cloudEnabled,

@@ -41,6 +41,7 @@ test('derives the canonical envelope only from trusted owner, strict DB state, a
     version: 1,
     payload: {
       userId: 'alice',
+      tier: 'member',
       entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
       issuedAt: '2026-08-26T00:00:00.000Z',
       snapshotExpiresAt: '2026-08-26T01:00:00.000Z',
@@ -52,7 +53,7 @@ test('derives the canonical envelope only from trusted owner, strict DB state, a
     signature: Buffer.alloc(64, 0x5a).toString('base64url'),
   })
   assert.equal(signedBytes.toString(),
-    '{"userId":"alice","entitlements":["knowledge_base_beta","knowledge_base_cloud"],"issuedAt":"2026-08-26T00:00:00.000Z","snapshotExpiresAt":"2026-08-26T01:00:00.000Z","membershipExpiresAt":"2026-09-26T00:00:00.000Z","membershipStatus":"active","keyId":"kms-key-2026-08","killSwitchEnabled":false}')
+    '{"userId":"alice","tier":"member","entitlements":["knowledge_base_beta","knowledge_base_cloud"],"issuedAt":"2026-08-26T00:00:00.000Z","snapshotExpiresAt":"2026-08-26T01:00:00.000Z","membershipExpiresAt":"2026-09-26T00:00:00.000Z","membershipStatus":"active","keyId":"kms-key-2026-08","killSwitchEnabled":false}')
   assert.deepEqual(signedBytes, canonicalKnowledgeEntitlementPayload(envelope.payload))
 })
 
@@ -93,7 +94,7 @@ test('maps the literal RPC active, offline-grace, expired, unavailable, and free
   assert.equal(offlineGrace.payload.membershipExpiresAt, '2026-09-26T00:00:00.000Z')
 
   const expired = await signer('alice', {
-    tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+    tier: 'member', status: 'expired', betaEnabled: true, cloudEnabled: true,
     killSwitchEnabled: true, version: 8, validUntil: '2026-08-25T12:00:00.000Z',
   })
   assert.equal(expired.payload.membershipStatus, 'expired')
@@ -105,12 +106,13 @@ test('maps the literal RPC active, offline-grace, expired, unavailable, and free
     validUntil: '2026-08-25T12:00:00.000Z',
   })
   assert.equal(expiredMember.payload.membershipStatus, 'expired')
+  assert.equal(expiredMember.payload.tier, 'member')
   assert.equal(expiredMember.payload.membershipExpiresAt, '2026-08-25T12:00:00.000Z')
   assert.deepEqual(expiredMember.payload.entitlements,
     ['knowledge_base_beta', 'knowledge_base_cloud'])
 
   const unavailable = await signer('alice', {
-    tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false,
+    tier: 'member', status: 'unavailable', betaEnabled: true, cloudEnabled: true,
     killSwitchEnabled: true, version: 9, validUntil: null,
   })
   assert.equal(unavailable.payload.membershipStatus, 'revoked')
@@ -122,6 +124,7 @@ test('maps the literal RPC active, offline-grace, expired, unavailable, and free
     validUntil: null,
   })
   assert.equal(unavailableMember.payload.membershipStatus, 'revoked')
+  assert.equal(unavailableMember.payload.tier, 'member')
   assert.equal(unavailableMember.payload.membershipExpiresAt, '2026-08-26T00:00:00.000Z')
   assert.deepEqual(unavailableMember.payload.entitlements,
     ['knowledge_base_beta', 'knowledge_base_cloud'])
@@ -130,7 +133,8 @@ test('maps the literal RPC active, offline-grace, expired, unavailable, and free
     tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
     killSwitchEnabled: true, version: 0, validUntil: null,
   })
-  assert.equal(neverMember.payload.membershipStatus, 'expired')
+  assert.equal(neverMember.payload.tier, 'free')
+  assert.equal(neverMember.payload.membershipStatus, 'active')
   assert.equal(neverMember.payload.membershipExpiresAt, '2026-08-26T00:00:00.000Z')
 })
 
@@ -139,6 +143,10 @@ test('rejects inconsistent literal RPC rows instead of repairing trusted databas
   for (const record of [
     { ...activeRecord, status: 'expired', validUntil: null },
     { ...activeRecord, tier: 'free', status: 'offline_grace', betaEnabled: false, cloudEnabled: false },
+    { ...activeRecord, tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+      validUntil: '2026-08-25T12:00:00.000Z' },
+    { ...activeRecord, tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false,
+      validUntil: null },
     { ...activeRecord, validUntil: null },
     { ...activeRecord, tier: 'free', status: 'active', validUntil: null },
     { ...activeRecord, tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,

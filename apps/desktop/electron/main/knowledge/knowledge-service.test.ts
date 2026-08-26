@@ -1,6 +1,7 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createPrivateKey, randomBytes, randomUUID, sign } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -13,6 +14,7 @@ import type {
 } from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
 import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './encrypted-object-store.js'
+import { KnowledgeEntitlementVerifier } from './entitlement-verifier.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeKeyStore, removeFileDurably } from './key-store.js'
 import {
@@ -25,6 +27,23 @@ import { DEFAULT_PARSER_LIMITS, type ParserResponse } from './parser-protocol.js
 import { parseEncryptedDocument } from './parser-worker.js'
 
 const directories: string[] = []
+const require = createRequire(import.meta.url)
+const { createKnowledgeEntitlementSigner } = require('../../../../../cloudbase/knowledge/function/entitlement-envelope.js') as {
+  createKnowledgeEntitlementSigner(deployment: Readonly<{
+    keyId: string
+    snapshotTtlMs: number
+    now: () => number
+    signCanonical: (bytes: Buffer) => Promise<Buffer>
+  }>): (ownerId: string, databaseRecord: unknown) => Promise<unknown>
+}
+const ENTITLEMENT_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA97YWmXI20+rOSQmtkgJIn0IbiaLrp6KZly2Enn0pyac=
+-----END PUBLIC KEY-----
+`
+const ENTITLEMENT_PRIVATE_KEY = createPrivateKey(`-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIPw1EZH4rU2rAWoikip2sgTamPoODfyfnO4IDFB68He9
+-----END PRIVATE KEY-----
+`)
 
 interface TargetKnowledgeCloudPort {
   getEntitlement(): Promise<KnowledgeEntitlementState & {
@@ -288,6 +307,38 @@ afterEach(async () => {
 })
 
 describe('KnowledgeService lifecycle', () => {
+  it('keeps a Signer-to-Verifier free owner writable at one local base and one logical file', async () => {
+    const signer = createKnowledgeEntitlementSigner(Object.freeze({
+      keyId: 'test-key-1', snapshotTtlMs: 60 * 60 * 1_000,
+      now: () => Date.parse('2026-08-26T00:00:00.000Z'),
+      signCanonical: async (bytes: Buffer) => sign(null, bytes, ENTITLEMENT_PRIVATE_KEY),
+    }))
+    const envelope = await signer('alice', {
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      killSwitchEnabled: true, version: 0, validUntil: null,
+    })
+    const entitlement = new KnowledgeEntitlementVerifier({
+      trustedKeys: { 'test-key-1': ENTITLEMENT_PUBLIC_KEY },
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    }).verify('alice', envelope)
+    const app = await fixture({ entitlement })
+    const owner = { userId: 'alice' }
+
+    await expect(app.service.getEntitlement(owner)).resolves.toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'signed-free.txt', '签名免费文件'))
+    const document = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status)
+      .toBe('ready')
+    app.picks.push(await writeSource(app.rootDirectory, 'signed-free-replaced.txt', '签名免费替换'))
+    await expect(app.service.replaceDocument(owner, document!.id)).resolves.toBeDefined()
+    await expect(app.service.createBase(owner, '第二库')).rejects.toMatchObject({ code: 'CONFLICT' })
+    await app.service.close()
+  })
+
   it('captures immutable selection and ready-version scope for the whole Agent turn', async () => {
     const app = await fixture({
       entitlement: {
@@ -399,6 +450,42 @@ describe('KnowledgeService lifecycle', () => {
     await app.service.close()
   })
 
+  it('refreshes local authority before the final server snapshot for cloud availability', async () => {
+    const active: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      knowledgeToolEnabled: true, killSwitchEnabled: false,
+    }
+    const refreshStarted = deferred<void>()
+    const releaseRefresh = deferred<boolean>()
+    const entitlementPort: KnowledgeEntitlementPort = {
+      getEntitlement: async () => active,
+      getAuthorizationSnapshot: async () => ({ entitlement: active, revision: 1 }),
+      isAuthorizationSnapshotCurrent: async () => {
+        refreshStarted.resolve()
+        return releaseRefresh.promise
+      },
+      isAuthorizationSnapshotCurrentNow: () => true,
+    }
+    let server: TargetCloudEntitlement = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      killSwitchEnabled: false, version: 1, validUntil: '2026-09-26T00:00:00.000Z',
+    }
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async () => ({ ...server })),
+      getEmbeddingConsent: vi.fn(), setEmbeddingConsent: vi.fn(),
+      capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({ entitlementPort, cloud })
+
+    const availability = app.service.getFeatureAvailability({ userId: 'alice' })
+    await refreshStarted.promise
+    server = { ...server, killSwitchEnabled: true, version: 2 }
+    releaseRefresh.resolve(true)
+
+    await expect(availability).resolves.toMatchObject({ cloud: { available: false } })
+    await app.service.close()
+  })
+
   it('closes the synchronous token CAS after asynchronous authorization refresh', async () => {
     const active: KnowledgeEntitlementState = {
       tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
@@ -466,6 +553,129 @@ describe('KnowledgeService lifecycle', () => {
     })
 
     await expect(capture).resolves.toEqual({ selected: false, knowledgeMode: 'strict' })
+    await app.service.close()
+  })
+
+  it('refreshes local authority before the final server snapshot for local-only Agent admission', async () => {
+    const active: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+      knowledgeToolEnabled: true, killSwitchEnabled: false,
+    }
+    const refreshStarted = deferred<void>()
+    const releaseRefresh = deferred<boolean>()
+    const entitlementPort: KnowledgeEntitlementPort = {
+      getEntitlement: async () => active,
+      getAuthorizationSnapshot: async () => ({ entitlement: active, revision: 1 }),
+      isAuthorizationSnapshotCurrent: async () => {
+        refreshStarted.resolve()
+        return releaseRefresh.promise
+      },
+      isAuthorizationSnapshotCurrentNow: () => true,
+    }
+    let server: TargetCloudEntitlement = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+      killSwitchEnabled: false, version: 1, validUntil: '2026-09-26T00:00:00.000Z',
+    }
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async () => ({ ...server })),
+      getEmbeddingConsent: vi.fn(), setEmbeddingConsent: vi.fn(),
+      capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({ entitlementPort, cloud })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'ordered-agent.txt', '有序本地 Agent'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status)
+      .toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+
+    const capture = app.service.captureSearchSnapshot(owner, 'conversation_1')
+    await refreshStarted.promise
+    server = { ...server, killSwitchEnabled: true, version: 2 }
+    releaseRefresh.resolve(true)
+
+    await expect(capture).resolves.toEqual({ selected: false, knowledgeMode: 'strict' })
+    await app.service.close()
+  })
+
+  it('discards a consent read when the final server snapshot advances version', async () => {
+    const active: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      knowledgeToolEnabled: true, killSwitchEnabled: false,
+    }
+    const events: string[] = []
+    const entitlementPort: KnowledgeEntitlementPort = {
+      getEntitlement: async () => active,
+      getAuthorizationSnapshot: async () => {
+        events.push('local:snapshot')
+        return { entitlement: active, revision: 1 }
+      },
+      isAuthorizationSnapshotCurrent: async () => {
+        events.push('local:refresh')
+        return true
+      },
+      isAuthorizationSnapshotCurrentNow: () => true,
+    }
+    let serverCalls = 0
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => {
+        serverCalls += 1
+        events.push(`server:${serverCalls}`)
+        return {
+          tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+          killSwitchEnabled: false, version: serverCalls, validUntil: '2026-09-26T00:00:00.000Z',
+        }
+      }),
+      getEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => {
+        events.push('remote:consent-read')
+        return {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'granted', retrievalByBase: [],
+        }
+      }),
+      setEmbeddingConsent: vi.fn(), capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({ entitlementPort, cloud })
+
+    await expect(app.service.getConsent({ userId: 'alice' })).resolves.toMatchObject({
+      embedding: { status: 'unknown', retrievalByBase: [] },
+    })
+    expect(events).toEqual([
+      'local:snapshot', 'local:refresh', 'server:1', 'remote:consent-read',
+      'local:refresh', 'server:2',
+    ])
+    await app.service.close()
+  })
+
+  it('rejects a consent mutation when the final server snapshot advances version', async () => {
+    const active: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      knowledgeToolEnabled: true, killSwitchEnabled: false,
+    }
+    const entitlementPort = revisionEntitlement(active).port
+    let serverCalls = 0
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        killSwitchEnabled: false, version: ++serverCalls,
+        validUntil: '2026-09-26T00:00:00.000Z',
+      })),
+      getEmbeddingConsent: vi.fn(),
+      setEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'granted', retrievalByBase: [],
+      })),
+      capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({ entitlementPort, cloud })
+
+    await expect(app.service.setEmbeddingConsent({ userId: 'alice' }, 'granted'))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
     await app.service.close()
   })
 
@@ -695,6 +905,53 @@ describe('KnowledgeService lifecycle', () => {
     await expect(app.service.captureSearchSnapshot(owner, 'conversation_1')).resolves.toEqual({
       selected: false, knowledgeMode: 'strict',
     })
+    await app.service.close()
+  })
+
+  it('does not use synced cached evidence after remote rejection when the final server version advances', async () => {
+    let serverCalls = 0
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        killSwitchEnabled: false, version: ++serverCalls === 3 ? 2 : 1,
+        validUntil: '2026-09-26T00:00:00.000Z',
+      })),
+      getEmbeddingConsent: vi.fn(), setEmbeddingConsent: vi.fn(),
+      capturePublishedSnapshot: vi.fn(async ({ knowledgeBaseIds }: Parameters<TargetKnowledgeCloudPort['capturePublishedSnapshot']>[0]) => knowledgeBaseIds.map(
+        knowledgeBaseId => ({ knowledgeBaseId, generationId: 'generation_1' }),
+      )),
+      searchPublished: vi.fn(async () => { throw new Error('remote rejected') }),
+    }
+    const app = await fixture({
+      entitlement: {
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        knowledgeToolEnabled: true, killSwitchEnabled: false,
+      },
+      cloud,
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'version-fallback.txt', '版本变化后不可回退缓存'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status)
+      .toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    const opened = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    opened.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base!.id)
+    opened.close()
+
+    await expect(app.service.search(owner, 'conversation_1', '不可回退缓存')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    expect(cloud.searchPublished).toHaveBeenCalledTimes(1)
     await app.service.close()
   })
 

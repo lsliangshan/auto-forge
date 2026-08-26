@@ -85,6 +85,10 @@ export interface KnowledgeAuthorizationSnapshot {
   readonly revision: number
 }
 
+interface KnowledgeCloudAuthorizationSnapshot extends KnowledgeAuthorizationSnapshot {
+  readonly serverVersion: number
+}
+
 export interface KnowledgeCloudPort extends CloudHybridRetrievalPort {
   getEntitlement(): Promise<KnowledgeEntitlementState & {
     killSwitchEnabled: boolean
@@ -715,11 +719,12 @@ export class KnowledgeService implements KnowledgePersistence {
         return localRetriever.search(localIds, normalizedQuery)
       }
     } catch {
+      const cachedCloudResults = (await localRetriever.search(cloudIds, normalizedQuery)).results
       if (!await this.cloudAuthorizationStillCurrent(owner, authorization)
         || !this.authorizationStillCurrentNow(owner, authorization)) {
         return localRetriever.search(localIds, normalizedQuery)
       }
-      cloudResults = (await localRetriever.search(cloudIds, normalizedQuery)).results
+      cloudResults = cachedCloudResults
     }
     return { kind: 'results', results: mergeRankedResults(localResults, cloudResults) }
   }
@@ -853,18 +858,18 @@ export class KnowledgeService implements KnowledgePersistence {
       : (await local.searchVersions(scope.localVersionIds, query)).results
     const authorization = await this.cloudAuthorization(owner)
     if (!authorization || !this.authorizationStillCurrentNow(owner, authorization)) {
-      return local.searchVersions(scope.localVersionIds, query)
+      return { kind: 'results', results: localResults }
     }
     try {
       const cloudResults = (await scope.cloud.retriever.search(scope.cloud.snapshot, query)).results
       if (!await this.cloudAuthorizationStillCurrent(owner, authorization)
         || !this.authorizationStillCurrentNow(owner, authorization)) {
-        return local.searchVersions(scope.localVersionIds, query)
+        return { kind: 'results', results: localResults }
       }
       return { kind: 'results', results: mergeRankedResults(localResults, cloudResults) }
     } catch {
       await this.cloudAuthorizationStillCurrent(owner, authorization)
-      return local.searchVersions(scope.localVersionIds, query)
+      return { kind: 'results', results: localResults }
     }
   }
 
@@ -1088,7 +1093,7 @@ export class KnowledgeService implements KnowledgePersistence {
 
   private async cloudAuthorization(
     owner: KnowledgeOwner,
-  ): Promise<KnowledgeAuthorizationSnapshot | undefined> {
+  ): Promise<KnowledgeCloudAuthorizationSnapshot | undefined> {
     if (!this.options.cloud) return undefined
     try {
       const authorization = await this.authorizationSnapshot(owner)
@@ -1098,16 +1103,13 @@ export class KnowledgeService implements KnowledgePersistence {
         || !['active', 'offline_grace'].includes(entitlement.status)
         || !entitlement.betaEnabled
         || !entitlement.cloudEnabled) return undefined
+      if (!await this.authorizationStillCurrent(owner, authorization)
+        || !this.authorizationStillCurrentNow(owner, authorization)) return undefined
       const server = await this.options.cloud.getEntitlement()
-      const serverAllows = !server.killSwitchEnabled
-        && server.tier === 'member'
-        && ['active', 'offline_grace'].includes(server.status)
-        && server.betaEnabled
-        && server.cloudEnabled
-      if (!serverAllows) return undefined
-      const current = await this.authorizationStillCurrent(owner, authorization)
-      return current && this.authorizationStillCurrentNow(owner, authorization)
-        ? authorization : undefined
+      return this.serverAllowsCloud(server)
+        && this.authorizationStillCurrentNow(owner, authorization)
+        ? { ...authorization, serverVersion: server.version }
+        : undefined
     } catch {
       return undefined
     }
@@ -1115,22 +1117,18 @@ export class KnowledgeService implements KnowledgePersistence {
 
   private async cloudAuthorizationStillCurrent(
     owner: KnowledgeOwner,
-    authorization: KnowledgeAuthorizationSnapshot,
+    authorization: KnowledgeCloudAuthorizationSnapshot,
   ): Promise<boolean> {
     if (!this.options.cloud || !await this.authorizationStillCurrent(owner, authorization)
       || !this.authorizationStillCurrentNow(owner, authorization)) return false
     try {
       const server = await this.options.cloud.getEntitlement()
-      if (server.killSwitchEnabled
-        || server.tier !== 'member'
-        || !['active', 'offline_grace'].includes(server.status)
-        || !server.betaEnabled
-        || !server.cloudEnabled) return false
+      return this.serverAllowsCloud(server)
+        && server.version === authorization.serverVersion
+        && this.authorizationStillCurrentNow(owner, authorization)
     } catch {
       return false
     }
-    const current = await this.authorizationStillCurrent(owner, authorization)
-    return current && this.authorizationStillCurrentNow(owner, authorization)
   }
 
   private async knowledgeToolAuthorization(
@@ -1141,23 +1139,31 @@ export class KnowledgeService implements KnowledgePersistence {
     if (entitlement.knowledgeToolEnabled !== true || entitlement.killSwitchEnabled === true) {
       return undefined
     }
+    if (!await this.authorizationStillCurrent(owner, authorization)
+      || !this.authorizationStillCurrentNow(owner, authorization)) return undefined
     if (!this.options.cloud) return authorization
     try {
       const server = await this.options.cloud.getEntitlement()
-      const serverAllows = !server.killSwitchEnabled
-        && server.tier === 'member'
-        && ['active', 'offline_grace'].includes(server.status)
-        && server.betaEnabled
-      if (!serverAllows) return undefined
+      return this.serverAllowsKnowledgeTool(server)
+        && this.authorizationStillCurrentNow(owner, authorization)
+        ? authorization : undefined
     } catch {
       // A still-valid signed local snapshot may remain usable offline; remote state can only deny.
-      const current = await this.authorizationStillCurrent(owner, authorization)
-      return current && this.authorizationStillCurrentNow(owner, authorization)
-        ? authorization : undefined
+      return this.authorizationStillCurrentNow(owner, authorization) ? authorization : undefined
     }
-    const current = await this.authorizationStillCurrent(owner, authorization)
-    return current && this.authorizationStillCurrentNow(owner, authorization)
-      ? authorization : undefined
+  }
+
+  private serverAllowsKnowledgeTool(server: Awaited<ReturnType<KnowledgeCloudPort['getEntitlement']>>): boolean {
+    return Number.isSafeInteger(server.version)
+      && server.version >= 0
+      && !server.killSwitchEnabled
+      && server.tier === 'member'
+      && ['active', 'offline_grace'].includes(server.status)
+      && server.betaEnabled
+  }
+
+  private serverAllowsCloud(server: Awaited<ReturnType<KnowledgeCloudPort['getEntitlement']>>): boolean {
+    return this.serverAllowsKnowledgeTool(server) && server.cloudEnabled
   }
 
   close(): Promise<void> {

@@ -2,6 +2,7 @@
 
 const PAYLOAD_KEYS = Object.freeze([
   'userId',
+  'tier',
   'entitlements',
   'issuedAt',
   'snapshotExpiresAt',
@@ -32,7 +33,8 @@ function parsePayload(input) {
   }
   if (typeof input.userId !== 'string' || input.userId.trim() !== input.userId
     || input.userId.length < 1 || input.userId.length > 256) throw new Error('invalid entitlement payload')
-  if (!Array.isArray(input.entitlements) || input.entitlements.length > 2
+  if (!['free', 'member'].includes(input.tier)
+    || !Array.isArray(input.entitlements) || input.entitlements.length > 2
     || input.entitlements.some(value => !ENTITLEMENTS.has(value))
     || input.entitlements.some((value, index) => index > 0 && input.entitlements[index - 1] >= value)) {
     throw new Error('invalid entitlement payload')
@@ -42,15 +44,21 @@ function parsePayload(input) {
   if (!canonicalTimestamp(input.issuedAt)
     || !canonicalTimestamp(input.snapshotExpiresAt)
     || !canonicalTimestamp(input.membershipExpiresAt)
-    || Date.parse(input.snapshotExpiresAt) < issuedAt
-    || (input.membershipStatus === 'active' && membershipExpiresAt <= issuedAt)
-    || (input.membershipStatus !== 'active' && membershipExpiresAt > issuedAt)) {
+    || Date.parse(input.snapshotExpiresAt) < issuedAt) {
     throw new Error('invalid entitlement payload')
   }
   if (!MEMBERSHIP_STATUSES.has(input.membershipStatus)
     || typeof input.keyId !== 'string'
     || !/^[A-Za-z0-9._-]{1,128}$/.test(input.keyId)
     || typeof input.killSwitchEnabled !== 'boolean') throw new Error('invalid entitlement payload')
+  if (input.tier === 'free') {
+    if (input.entitlements.length > 0
+      || input.membershipStatus !== 'active'
+      || membershipExpiresAt !== issuedAt) throw new Error('invalid entitlement payload')
+  } else if ((input.membershipStatus === 'active' && membershipExpiresAt <= issuedAt)
+    || (input.membershipStatus !== 'active' && membershipExpiresAt > issuedAt)) {
+    throw new Error('invalid entitlement payload')
+  }
   return Object.freeze(Object.fromEntries(PAYLOAD_KEYS.map(key => [
     key,
     key === 'entitlements' ? Object.freeze([...input.entitlements]) : input[key],
@@ -103,8 +111,18 @@ function parseDatabaseRecord(input, issuedAt) {
       membershipExpiresAt: input.validUntil,
     }
   }
+  if (input.tier === 'free') {
+    if (input.status !== 'active'
+      || input.betaEnabled
+      || input.cloudEnabled
+      || input.validUntil !== null) throw new Error('invalid entitlement database record')
+    return {
+      ...input,
+      membershipStatus: 'active',
+      membershipExpiresAt: new Date(issuedAt).toISOString(),
+    }
+  }
   if (input.status === 'offline_grace'
-    || (input.tier === 'free' && (input.betaEnabled || input.cloudEnabled))
     || (input.tier === 'member' && input.status === 'expired' && input.validUntil === null)
     || (input.validUntil !== null && Date.parse(input.validUntil) > issuedAt)) {
     throw new Error('invalid entitlement database record')
@@ -153,6 +171,7 @@ function createKnowledgeEntitlementSigner(deployment) {
     if (record.cloudEnabled) entitlements.push('knowledge_base_cloud')
     return createSignedKnowledgeEntitlementEnvelope({
       userId: ownerId,
+      tier: record.tier,
       entitlements,
       issuedAt,
       snapshotExpiresAt,

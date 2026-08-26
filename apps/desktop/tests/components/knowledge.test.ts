@@ -694,6 +694,34 @@ describe('knowledge three-pane workspace', () => {
     expect(knowledge.selectedDocumentId).toBe(otherDocument.id)
   })
 
+  it('finishes delayed base purge without clearing a newly selected other base and document', async () => {
+    const otherBase: KnowledgeBase = { ...localBase, id: 'kb_other', name: '其他资料' }
+    const otherDocument: KnowledgeDocument = {
+      ...readyDocument, id: 'document_other', knowledgeBaseId: otherBase.id, name: '其他.md',
+    }
+    const api = createApi({ bases: [localBase, otherBase] })
+    vi.mocked(api.knowledge.listDocuments).mockImplementation(async baseId => (
+      baseId === localBase.id ? [readyDocument] : [otherDocument]
+    ))
+    const pendingPurge = deferred<void>()
+    vi.mocked(api.knowledge.purgeBase).mockReturnValue(pendingPurge.promise)
+    const { pinia } = await mountKnowledge(api)
+    const knowledge = useKnowledgeStore(pinia)
+
+    const purge = knowledge.purgeSelectedBase()
+    await vi.waitFor(() => expect(api.knowledge.purgeBase).toHaveBeenCalledWith(localBase.id))
+    await knowledge.selectBase(otherBase.id)
+    await knowledge.selectDocument(otherDocument.id)
+    pendingPurge.resolve()
+    await purge
+
+    expect(knowledge.bases).toEqual([otherBase])
+    expect(knowledge.documentsByBase[localBase.id]).toBeUndefined()
+    expect(knowledge.documentsByBase[otherBase.id]).toEqual([otherDocument])
+    expect(knowledge.selectedBaseId).toBe(otherBase.id)
+    expect(knowledge.selectedDocumentId).toBe(otherDocument.id)
+  })
+
   it('exposes labeled listbox selection and non-blocking background refresh state', async () => {
     const { wrapper } = await mountKnowledge()
 

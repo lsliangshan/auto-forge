@@ -429,9 +429,11 @@ export const useKnowledgeStore = defineStore('knowledge', {
         if (!isCurrent()) return
         this.bases = this.bases.filter(({ id }) => id !== baseId)
         delete this.documentsByBase[baseId]
-        this.selectedBaseId = this.bases[0]?.id ?? ''
-        this.selectedDocumentId = ''
-        if (this.selectedBaseId) await this.loadDocuments(this.selectedBaseId)
+        if (this.selectedBaseId === baseId) {
+          this.selectedBaseId = this.bases[0]?.id ?? ''
+          this.selectedDocumentId = ''
+          if (this.selectedBaseId) await this.loadDocuments(this.selectedBaseId)
+        }
       })
     },
     async refreshProcessing() {
