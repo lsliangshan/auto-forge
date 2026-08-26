@@ -17,12 +17,18 @@ import {
   type ProviderStreamEvent,
 } from './agent-orchestrator.js'
 import { scopeHash } from '../permissions/policy-engine.js'
-import type { ConversationHistoryPort } from '../chat/conversation-context.js'
+import {
+  estimateRequestTokens,
+  resolveChatInputBudget,
+  type ConversationHistoryPort,
+  type PrepareConversationContextInput,
+} from '../chat/conversation-context.js'
 import type {
   ModelMessage,
   ModelProvider,
   ModelProviderSnapshot,
   ModelStreamRequest,
+  ModelTool,
 } from '../chat/model-provider.js'
 import {
   ProviderUsageConsistencyError,
@@ -1249,7 +1255,7 @@ describe('AgentOrchestrator', () => {
       ...textRunInput({
         conversationId: 'c1', content: '我的代号是什么？', provider: 'openrouter', model: 'model',
       }),
-      contextLength: 4_096,
+      contextLength: 32_000,
       currentMedia,
     })
 
@@ -1263,7 +1269,7 @@ describe('AgentOrchestrator', () => {
       },
       callIdentity: { requestId: 'id_1', chatRunId: 'id_3', userId: 'user_1' },
       model: 'model',
-      contextLength: 4_096,
+      contextLength: 32_000,
       leadingMessages: [expect.objectContaining({
         role: 'system', content: expect.stringContaining('AutoForge Main'),
       })],
@@ -6643,6 +6649,27 @@ function finalBlocks(dependencies: ReturnType<typeof harness>): ChatBlock[] {
   return (dependencies.records.terminal.at(-1) as { blocks: ChatBlock[] }).blocks
 }
 
+function historyLeavingRequestBudget(
+  input: PrepareConversationContextInput,
+  remainingTokens: number,
+): ModelMessage[] {
+  const budget = resolveChatInputBudget(input.contextLength)
+  let low = 0
+  let high = budget
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    const messages: ModelMessage[] = [
+      ...(input.leadingMessages ?? []),
+      { role: 'assistant', content: '历'.repeat(middle) },
+      input.currentMessage,
+    ]
+    const tokens = estimateRequestTokens({ messages, tools: input.tools, currentMedia: input.currentMedia })
+    if (tokens <= budget - remainingTokens) low = middle
+    else high = middle - 1
+  }
+  return [{ role: 'assistant', content: '历'.repeat(low) }]
+}
+
 describe('Agent knowledge grounding', () => {
   it('keeps exact workflow-only launches free of browser and knowledge continuation tools', async () => {
     const dependencies = harness([toolTurn])
@@ -6948,6 +6975,115 @@ describe('Agent knowledge grounding', () => {
         .flatMap(message => [...message.content.matchAll(/evidence_[0-9]+/g)].map(match => match[0])),
     )
     expect(evidenceIds.size).toBe(8)
+  })
+
+  it('bounds every knowledge continuation and sends only evidence newly admitted by that search', async () => {
+    const evidence = Array.from({ length: 8 }, (_, index): KnowledgeSearchResult => {
+      const number = index + 1
+      const sentence = `第${number}条申请材料需要身份证明。`
+      return {
+        ...groundedEvidence,
+        evidenceId: `bounded_evidence_${number}`,
+        knowledgeBaseId: `bounded_kb_${number}`,
+        documentId: `bounded_document_${number}`,
+        versionId: `bounded_version_${number}`,
+        snippet: `${sentence}${'资'.repeat(4_000 - sentence.length)}`,
+        citation: {
+          ...groundedEvidence.citation,
+          documentId: `bounded_document_${number}`,
+          versionId: `bounded_version_${number}`,
+        },
+      }
+    })
+    const dependencies = harness([
+      knowledgeSearchTurn('bounded_search_1', '第一次查询'),
+      knowledgeSearchTurn('bounded_search_2', '第二次查询'),
+      groundedAnswerTurn('bounded_answer', [
+        {
+          text: '第1条申请材料需要身份证明。',
+          support: 'knowledge',
+          citationIds: ['bounded_evidence_1'],
+        },
+        {
+          text: '第8条申请材料需要身份证明。',
+          support: 'knowledge',
+          citationIds: ['bounded_evidence_8'],
+        },
+      ]),
+    ])
+    dependencies.workflows.list = async () => []
+    dependencies.history.prepare.mockImplementation(async input => historyLeavingRequestBudget(input, 3_000))
+    const observedRequests: Array<{ messages: ModelMessage[]; tools: ModelTool[] }> = []
+    const providerStream = vi.mocked(dependencies.providerInstances.openrouter.stream)
+    const snapshottingStream = vi.fn((request: ModelStreamRequest) => {
+      observedRequests.push({
+        messages: structuredClone(request.messages),
+        tools: structuredClone(request.tools ?? []),
+      })
+      return providerStream(request)
+    })
+    dependencies.providerInstances.openrouter.stream = snapshottingStream
+    const knowledge = attachKnowledge(dependencies, {
+      search: (_query, callIndex) => ({
+        kind: 'results',
+        results: callIndex === 1 ? evidence.slice(0, 4) : evidence.slice(4),
+      }),
+    })
+    const contextLength = 20_000
+
+    const result = await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'bounded_knowledge_continuations', content: '连续查询两次再回答',
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot, { contextLength }))
+
+    expect(result).toMatchObject({ status: 'completed' })
+    const budget = resolveChatInputBudget(contextLength)
+    expect(observedRequests).toHaveLength(3)
+    for (const request of observedRequests) {
+      expect(estimateRequestTokens({
+        messages: request.messages,
+        tools: request.tools,
+        currentMedia: [],
+      })).toBeLessThanOrEqual(budget)
+    }
+    const finalRequest = observedRequests[2]!
+    const firstExchange = finalRequest.messages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'bounded_search_1'
+    )) as Extract<ModelMessage, { role: 'tool' }>
+    const secondExchange = finalRequest.messages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'bounded_search_2'
+    )) as Extract<ModelMessage, { role: 'tool' }>
+    expect(firstExchange.content).toContain('bounded_evidence_1')
+    expect(firstExchange.content).toContain('bounded_evidence_4')
+    expect(firstExchange.content).not.toContain('bounded_evidence_5')
+    expect(secondExchange.content).toContain('bounded_evidence_5')
+    expect(secondExchange.content).toContain('bounded_evidence_8')
+    expect(secondExchange.content).not.toContain('bounded_evidence_1')
+    expect(`${firstExchange.content}\n${secondExchange.content}`).toContain('bounded_evidence_8')
+  })
+
+  it('fails closed before a knowledge continuation whose identity-only payload cannot fit', async () => {
+    const dependencies = harness([
+      knowledgeSearchTurn('impossible_search', '申请材料'),
+      groundedAnswerTurn('must_not_reach_provider', [{
+        text: '申请材料应当包含身份证明。',
+        support: 'knowledge', citationIds: ['evidence_1'],
+      }]),
+    ])
+    dependencies.workflows.list = async () => []
+    dependencies.history.prepare.mockImplementation(async input => historyLeavingRequestBudget(input, 16))
+    const knowledge = attachKnowledge(dependencies, {
+      results: [{ ...groundedEvidence, snippet: '申请材料应当包含身份证明。'.repeat(200) }],
+    })
+    const contextLength = 20_000
+
+    const result = await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'impossible_knowledge_continuation', content: '查申请材料',
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot, { contextLength }))
+
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'CONTEXT_LIMIT_EXCEEDED' } })
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledOnce()
   })
 
   it('delimits prompt-injection text as untrusted evidence without changing tools or policy', async () => {
