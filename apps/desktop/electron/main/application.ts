@@ -92,6 +92,7 @@ import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pin
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
+import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
 import { QiniuAvatarUploader } from './profile/avatar-uploader.js'
 import { ProfileService } from './profile/profile-service.js'
@@ -2484,6 +2485,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
     },
+    knowledge: createUnavailableKnowledgeService(),
     system: {
       openExternal: async (url) => {
         const parsed = openExternalRequestSchema.safeParse({ url })

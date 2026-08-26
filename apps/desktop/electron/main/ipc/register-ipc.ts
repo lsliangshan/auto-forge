@@ -11,6 +11,7 @@ import {
   type MediaRemoveDraftRequest,
 } from '@autoforge/shared'
 import type { z } from 'zod'
+import type { KnowledgeOwner, KnowledgeService } from '../knowledge/knowledge-types.js'
 import { isTrustedRendererUrl, type RendererTarget } from '../renderer-trust.js'
 
 export type { RendererTarget } from '../renderer-trust.js'
@@ -56,6 +57,7 @@ export interface DesktopIpcServices {
   executions: Omit<DesktopAPI['executions'], 'onEvent'>
   permissions: DesktopAPI['permissions']
   settings: DesktopAPI['settings']
+  knowledge: KnowledgeService
   system: DesktopAPI['system']
 }
 
@@ -139,6 +141,26 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     registered.push(channel)
   }
 
+  const registerKnowledge = <Channel extends RequestChannel>(
+    channel: Channel,
+    operation: (
+      owner: KnowledgeOwner,
+      input: z.infer<(typeof ipcRequestSchemas)[Channel]>,
+    ) => unknown | Promise<unknown>,
+  ) => {
+    options.ipcMain.handle(channel, (event, input) => invokeValidated(
+      channel,
+      event,
+      input,
+      options,
+      async (value: never) => {
+        const session = await options.services.auth.requireSession()
+        return operation({ userId: session.user.id }, value)
+      },
+    ))
+    registered.push(channel)
+  }
+
   register(ipcChannels.authGetSession, () => options.services.auth.getSession(), { anonymous: true })
   register(ipcChannels.authRefreshAuthorization, () => options.services.auth.refreshAuthorization())
   register(ipcChannels.authSendOtp, (input) => options.services.auth.sendOtp(input), { anonymous: true })
@@ -208,6 +230,30 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.settingsGetRemoteUsage, () => options.services.settings.getRemoteUsage())
   register(ipcChannels.settingsClearLocalData, (input) => options.services.settings.clearLocalData(input.scope))
   register(ipcChannels.settingsClearBrowserData, () => options.services.settings.clearBrowserData())
+  registerKnowledge(ipcChannels.knowledgeList, (owner) => options.services.knowledge.list(owner))
+  registerKnowledge(ipcChannels.knowledgeCreateBase, (owner, input) => options.services.knowledge.create(owner, input.name))
+  registerKnowledge(ipcChannels.knowledgeListDocuments, (owner, input) => options.services.knowledge.listDocuments(owner, input.baseId))
+  registerKnowledge(ipcChannels.knowledgeListVersions, (owner, input) => options.services.knowledge.listVersions(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgePickImportFiles, (owner) => options.services.knowledge.pickImportFiles(owner))
+  registerKnowledge(ipcChannels.knowledgeImportDocument, (owner, input) => (
+    options.services.knowledge.importDocument(owner, input.baseId, input.importHandleId)
+  ))
+  registerKnowledge(ipcChannels.knowledgeReplaceDocument, (owner, input) => (
+    options.services.knowledge.replaceDocument(owner, input.documentId, input.importHandleId)
+  ))
+  registerKnowledge(ipcChannels.knowledgeRecycleDocument, (owner, input) => options.services.knowledge.recycleDocument(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgePurgeDocument, (owner, input) => options.services.knowledge.purgeDocument(owner, input.documentId))
+  registerKnowledge(ipcChannels.knowledgeRecycleBase, (owner, input) => options.services.knowledge.recycleBase(owner, input.baseId))
+  registerKnowledge(ipcChannels.knowledgePurgeBase, (owner, input) => options.services.knowledge.purgeBase(owner, input.baseId))
+  registerKnowledge(ipcChannels.knowledgeExportBase, (owner, input) => options.services.knowledge.exportBase(owner, input.baseId))
+  registerKnowledge(ipcChannels.knowledgeGetSelection, (owner, input) => options.services.knowledge.getSelection(owner, input.conversationId))
+  registerKnowledge(ipcChannels.knowledgeUpdateSelection, (owner, input) => (
+    options.services.knowledge.updateSelection(owner, input.conversationId, input.selection)
+  ))
+  registerKnowledge(ipcChannels.knowledgeSearch, (owner, input) => options.services.knowledge.search(owner, input.query))
+  registerKnowledge(ipcChannels.knowledgeGetAvailability, (owner) => options.services.knowledge.getAvailability(owner))
+  registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))
+  registerKnowledge(ipcChannels.knowledgeGetConsent, (owner) => options.services.knowledge.getConsent(owner))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 

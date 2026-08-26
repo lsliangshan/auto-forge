@@ -13,6 +13,60 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 const workflowSourceSchema = z.enum(['installed', 'development'])
 const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 
+const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('pdf'), page: z.number().int().positive(),
+    startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    kind: z.literal('docx'), headingPath: z.array(nonEmptyStringSchema).max(32), paragraph: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    kind: z.literal('text'), line: z.number().int().positive(),
+    startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({ kind: z.literal('html'), structuralPath: nonEmptyStringSchema.max(500) }).strict(),
+])
+
+export const knowledgeCitationSchema = z.object({
+  evidenceId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  coordinate: knowledgeCoordinateSchema,
+}).strict()
+export type KnowledgeCitation = z.infer<typeof knowledgeCitationSchema>
+
+export const knowledgeEvidenceSchema = z.object({
+  id: identifierSchema,
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  snippet: nonEmptyStringSchema.max(4_000),
+  score: z.number().finite().min(0).max(1),
+  citation: knowledgeCitationSchema,
+}).strict().superRefine(({ id, documentId, versionId, citation }, context) => {
+  if (citation.evidenceId !== id || citation.documentId !== documentId || citation.versionId !== versionId) {
+    context.addIssue({ code: 'custom', path: ['citation'], message: 'Knowledge citation must reference this evidence item' })
+  }
+})
+export type KnowledgeEvidence = z.infer<typeof knowledgeEvidenceSchema>
+
+const knowledgeDocumentEventSummarySchema = z.object({
+  id: identifierSchema,
+  baseId: identifierSchema,
+  name: nonEmptyStringSchema.max(500),
+  mimeType: nonEmptyStringSchema.max(200),
+  status: z.enum(['queued', 'copying', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted']),
+  versionCount: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+}).strict()
+
+export const knowledgeEventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('document_updated'), document: knowledgeDocumentEventSummarySchema }).strict(),
+  z.object({ type: z.literal('document_removed'), documentId: identifierSchema }).strict(),
+])
+export type KnowledgeEvent = z.infer<typeof knowledgeEventSchema>
+
 function opaqueKeyTokens(key: string): string[] {
   return key
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')

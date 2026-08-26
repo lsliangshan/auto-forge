@@ -120,6 +120,36 @@ function services(): DesktopIpcServices {
         byokUnavailableCount: 0, timezone: 'UTC', displayCurrency: 'USD',
       }),
     },
+    knowledge: {
+      list: vi.fn().mockResolvedValue([]),
+      create: vi.fn().mockResolvedValue({
+        id: 'base_1', name: 'Policies', kind: 'local', status: 'ready', searchable: true,
+        documentCount: 0, updatedAt: '2026-08-26T00:00:00.000Z',
+      }),
+      listDocuments: vi.fn().mockResolvedValue([]),
+      listVersions: vi.fn().mockResolvedValue([]),
+      pickImportFiles: vi.fn().mockResolvedValue([{
+        id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+      }]),
+      importDocument: vi.fn().mockResolvedValue({
+        id: 'document_1', baseId: 'base_1', name: 'policy.txt', mimeType: 'text/plain',
+        status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+      }),
+      replaceDocument: vi.fn(), recycleDocument: vi.fn(), purgeDocument: vi.fn(),
+      recycleBase: vi.fn(), purgeBase: vi.fn(), exportBase: vi.fn(),
+      getSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
+      updateSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
+      search: vi.fn().mockResolvedValue([]),
+      getAvailability: vi.fn().mockResolvedValue({
+        encryption: { available: true }, parser: { available: false, reason: 'parser_unavailable' },
+        cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+        embedding: { available: false, reason: 'embedding_unavailable' },
+        entitlement: { available: false, reason: 'entitlement_unavailable' },
+        beta: { available: false, reason: 'beta_disabled' }, cloud: { available: false, reason: 'cloud_disabled' },
+      }),
+      getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false }),
+      getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+    },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }
 }
@@ -395,6 +425,35 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.chatSend, { conversationId: '', content: '' }))
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     expect(app.dependencies.chat.send).not.toHaveBeenCalled()
+  })
+
+  it('derives knowledge ownership in Main and rejects paths, user IDs, and search limits before service admission', async () => {
+    // Catches a production change that trusts renderer identity, filesystem paths, or retrieval scope.
+    const app = harness()
+
+    await expect(app.invoke(ipcChannels.knowledgePickImportFiles)).resolves.toEqual([{
+      id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+    }])
+    await expect(app.invoke(ipcChannels.knowledgeImportDocument, {
+      baseId: 'base_1', importHandleId: 'import_1',
+    })).resolves.toMatchObject({ id: 'document_1', baseId: 'base_1' })
+    await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合同' })).resolves.toEqual([])
+
+    const owner = { userId: 'user_1' }
+    expect(app.dependencies.knowledge.pickImportFiles).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'base_1', 'import_1')
+    expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, '合同')
+
+    for (const [channel, input] of [
+      [ipcChannels.knowledgeList, { userId: 'forged' }],
+      [ipcChannels.knowledgeImportDocument, { baseId: 'base_1', importHandleId: 'import_1', path: '/private/source.txt' }],
+      [ipcChannels.knowledgeSearch, { query: '合同', topK: 99 }],
+    ] as const) {
+      await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(app.dependencies.knowledge.list).not.toHaveBeenCalled()
+    expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledOnce()
+    expect(app.dependencies.knowledge.search).toHaveBeenCalledOnce()
   })
 
   it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {

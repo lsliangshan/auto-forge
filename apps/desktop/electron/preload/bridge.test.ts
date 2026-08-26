@@ -276,6 +276,48 @@ describe('preload desktop bridge', () => {
     expect(app.api).not.toHaveProperty('ipcRenderer')
   })
 
+  it('uses fixed path-free knowledge channels and returns only opaque import handles', async () => {
+    // Catches a production change that exposes a generic filesystem bridge or forwards a local path.
+    const app = harness()
+    vi.mocked(app.ipcRenderer.invoke).mockResolvedValueOnce([{
+      id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+    }])
+
+    await expect(app.api.knowledge.pickImportFiles()).resolves.toEqual([{
+      id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
+    }])
+    await app.api.knowledge.importDocument('base_1', 'import_1')
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgePickImportFiles, undefined)
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeImportDocument, {
+      baseId: 'base_1', importHandleId: 'import_1',
+    })
+    expect(app.api).not.toHaveProperty('getPathForFile')
+    expect(JSON.stringify(app.api)).not.toContain('/private')
+  })
+
+  it('forwards only strict owner-free knowledge events', () => {
+    // Catches a production change that forwards owner scope or local paths from Main events.
+    const app = harness()
+    const listener = vi.fn()
+    app.api.knowledge.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.knowledgeEvent)!][0]!
+    const event = {
+      type: 'document_updated',
+      document: {
+        id: 'document_1', baseId: 'base_1', name: 'policy.txt', mimeType: 'text/plain',
+        status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
+      },
+    }
+
+    wrapped({}, event)
+    wrapped({}, { ...event, ownerUserId: 'private-owner' })
+    wrapped({}, { ...event, path: '/private/policy.txt' })
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
+  })
+
   it('normalizes IPC errors without exposing resolved paths', async () => {
     const app = harness({ getPathForFile: () => '/private/photo.png' })
     vi.mocked(app.ipcRenderer.invoke).mockRejectedValueOnce(new Error('open /private/photo.png failed'))

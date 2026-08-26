@@ -29,6 +29,11 @@ import {
   legacyImportPreviewSchema,
   listConversationsRequestSchema,
   listMessagesRequestSchema,
+  knowledgeAvailabilitySchema,
+  knowledgeImportRequestSchema,
+  knowledgeListRequestSchema,
+  knowledgeSelectionSchema,
+  knowledgeSearchRequestSchema,
   logoutRequestSchema,
   logoutResultSchema,
   retryConversationSyncRequestSchema,
@@ -1763,6 +1768,47 @@ describe('cross-process contracts', () => {
       workflowName: '百度搜索', source: 'installed', actionSummary: '打开百度首页', permissionIndex: 0,
       capability: 'browser.navigate', scope: { origins: ['https://www.baidu.com'] }, scopeHash: 'a'.repeat(64),
     })).toThrow()
+  })
+
+  it('rejects renderer-controlled knowledge authority and path inputs before Main admission', () => {
+    // Catches a production change that lets Renderer widen a knowledge search or select a local file path.
+    expect(knowledgeSearchRequestSchema.parse({ query: '合同' })).toEqual({ query: '合同' })
+    expect(knowledgeSearchRequestSchema.safeParse({ query: '合同', topK: 99 }).success).toBe(false)
+    expect(knowledgeListRequestSchema.safeParse({ userId: 'forged' }).success).toBe(false)
+    expect(knowledgeImportRequestSchema.parse({ baseId: 'base_1', importHandleId: 'import_1' }))
+      .toEqual({ baseId: 'base_1', importHandleId: 'import_1' })
+    expect(knowledgeImportRequestSchema.safeParse({ baseId: 'base_1', importHandleId: 'import_1', path: '/tmp/secret' }).success)
+      .toBe(false)
+  })
+
+  it('keeps knowledge selections strict and owner-free', () => {
+    // Catches a production change that accepts foreign base scope or renderer-supplied index metadata.
+    expect(knowledgeSelectionSchema.parse({ baseIds: [], mode: 'mixed' })).toEqual({ baseIds: [], mode: 'mixed' })
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1', 'base_1'], mode: 'strict' }).success).toBe(false)
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1'], mode: 'mixed', generationId: 'foreign' }).success).toBe(false)
+  })
+
+  it('reports each knowledge gate separately and fails closed with its matching reason', () => {
+    // Catches a production change that conflates encryption, parser, cloud, or commercial gates.
+    const availability = {
+      encryption: { available: true },
+      parser: { available: false, reason: 'parser_unavailable' },
+      cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+      embedding: { available: false, reason: 'embedding_unavailable' },
+      entitlement: { available: false, reason: 'entitlement_unavailable' },
+      beta: { available: false, reason: 'beta_disabled' },
+      cloud: { available: false, reason: 'cloud_disabled' },
+    }
+
+    expect(knowledgeAvailabilitySchema.parse(availability)).toEqual(availability)
+    expect(knowledgeAvailabilitySchema.safeParse({
+      ...availability,
+      encryption: { available: false },
+    }).success).toBe(false)
+    expect(knowledgeAvailabilitySchema.safeParse({
+      ...availability,
+      parser: { available: false, reason: 'cloudbase_unavailable' },
+    }).success).toBe(false)
   })
 
   it('requires bound approval context fields', () => {
