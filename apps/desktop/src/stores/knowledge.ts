@@ -109,6 +109,10 @@ export const useKnowledgeStore = defineStore('knowledge', {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
       return Boolean(base && base.status !== 'recycled' && state.availability?.local.available)
     },
+    canPurge(state): boolean {
+      const base = state.bases.find(({ id }) => id === state.selectedBaseId)
+      return Boolean(base && state.availability?.local.available)
+    },
     canExport(state): boolean {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
       return Boolean(base && base.status !== 'recycled' && state.availability?.local.available)
@@ -387,13 +391,16 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     async purgeSelectedDocument() {
       const document = this.selectedDocument
-      if (!document || this.operationPending || !this.canRecycle) return
+      if (!document || this.operationPending || !this.canPurge) return
+      const knowledgeBaseId = document.knowledgeBaseId
       await this.runOperation('永久删除文件失败', async (isCurrent) => {
         await getDesktopApi().knowledge.purgeDocument(document.id)
         if (!isCurrent()) return
-        this.documentsByBase[document.knowledgeBaseId] = this.documents
+        this.documentsByBase[knowledgeBaseId] = (this.documentsByBase[knowledgeBaseId] ?? [])
           .filter(({ id }) => id !== document.id)
-        this.selectedDocumentId = ''
+        if (this.selectedBaseId === knowledgeBaseId && this.selectedDocumentId === document.id) {
+          this.selectedDocumentId = ''
+        }
       })
     },
     async exportSelectedBase() {
@@ -416,7 +423,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     async purgeSelectedBase() {
       const baseId = this.selectedBaseId
-      if (!baseId || this.operationPending || !this.canRecycle) return
+      if (!baseId || this.operationPending || !this.canPurge) return
       await this.runOperation('永久删除知识库失败', async (isCurrent) => {
         await getDesktopApi().knowledge.purgeBase(baseId)
         if (!isCurrent()) return

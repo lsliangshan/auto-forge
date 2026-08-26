@@ -640,6 +640,60 @@ describe('knowledge three-pane workspace', () => {
     expect(api.knowledge.purgeBase).toHaveBeenCalledWith('kb_local')
   })
 
+  it('keeps recycled documents and libraries reachable for confirmed permanent purge', async () => {
+    const recycledBase: KnowledgeBase = {
+      ...localBase, status: 'recycled', searchable: false,
+    }
+    const deletedDocument: KnowledgeDocument = {
+      ...readyDocument, status: 'deleted', readOnly: true,
+    }
+    const { api, wrapper } = await mountKnowledge(createApi({
+      bases: [recycledBase], documents: [deletedDocument],
+    }))
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+
+    expect(wrapper.get('[data-testid="knowledge-recycle-document"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-purge-document"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="knowledge-recycle-base"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-purge-base"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('[data-testid="knowledge-purge-document"]').trigger('click')
+    await flushPromises()
+    expect(api.knowledge.purgeDocument).toHaveBeenCalledWith('document_1')
+    await wrapper.get('[data-testid="knowledge-purge-base"]').trigger('click')
+    await flushPromises()
+    expect(api.knowledge.purgeBase).toHaveBeenCalledWith('kb_local')
+    expect(confirm).toHaveBeenCalledTimes(2)
+  })
+
+  it('finishes delayed document purge against its original base without changing a newer selection', async () => {
+    const otherBase: KnowledgeBase = { ...localBase, id: 'kb_other', name: '其他资料' }
+    const otherDocument: KnowledgeDocument = {
+      ...readyDocument, id: 'document_other', knowledgeBaseId: otherBase.id, name: '其他.md',
+    }
+    const api = createApi({ bases: [localBase, otherBase] })
+    vi.mocked(api.knowledge.listDocuments).mockImplementation(async baseId => (
+      baseId === localBase.id ? [readyDocument] : [otherDocument]
+    ))
+    const pendingPurge = deferred<void>()
+    vi.mocked(api.knowledge.purgeDocument).mockReturnValue(pendingPurge.promise)
+    const { pinia, wrapper } = await mountKnowledge(api)
+    const knowledge = useKnowledgeStore(pinia)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+
+    const purge = knowledge.purgeSelectedDocument()
+    await vi.waitFor(() => expect(api.knowledge.purgeDocument).toHaveBeenCalledWith('document_1'))
+    await knowledge.selectBase(otherBase.id)
+    await knowledge.selectDocument(otherDocument.id)
+    pendingPurge.resolve()
+    await purge
+
+    expect(knowledge.documentsByBase[localBase.id]).toEqual([])
+    expect(knowledge.documentsByBase[otherBase.id]).toEqual([otherDocument])
+    expect(knowledge.selectedBaseId).toBe(otherBase.id)
+    expect(knowledge.selectedDocumentId).toBe(otherDocument.id)
+  })
+
   it('exposes labeled listbox selection and non-blocking background refresh state', async () => {
     const { wrapper } = await mountKnowledge()
 

@@ -1,6 +1,7 @@
 import { createHash, createPublicKey, verify } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
@@ -49,6 +50,34 @@ export interface KnowledgeEntitlementEnvelopeCache {
   write(userId: string, record: KnowledgeEntitlementCacheRecord): Promise<void>
 }
 
+export interface KnowledgeEntitlementEnrollmentStore {
+  isEnrolled(ownerKey: string): Promise<boolean>
+  enroll(ownerKey: string): Promise<void>
+}
+
+export class AppSettingsKnowledgeEntitlementEnrollmentStore implements KnowledgeEntitlementEnrollmentStore {
+  constructor(private readonly settings: {
+    get(key: string): { value: unknown } | undefined
+    set(key: string, value: unknown): unknown
+  }) {}
+
+  async isEnrolled(ownerKey: string): Promise<boolean> {
+    const stored = this.settings.get(this.key(ownerKey))
+    if (stored === undefined) return false
+    if (stored.value !== true) throw new Error('Knowledge entitlement enrollment marker is invalid')
+    return true
+  }
+
+  async enroll(ownerKey: string): Promise<void> {
+    this.settings.set(this.key(ownerKey), true)
+  }
+
+  private key(ownerKey: string): string {
+    if (!/^[a-f0-9]{64}$/.test(ownerKey)) throw new Error('Knowledge entitlement enrollment owner is invalid')
+    return `knowledge-entitlement-enrolled:v1:${ownerKey}`
+  }
+}
+
 const cacheRecordSchema = z.object({
   version: z.literal(1),
   userId: z.string().min(1).max(256).refine(value => value.trim() === value, 'user_id_not_canonical'),
@@ -63,6 +92,7 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
   constructor(
     private readonly directory: string,
     private readonly safeStorage: SafeStoragePort,
+    private readonly enrollment: KnowledgeEntitlementEnrollmentStore,
   ) {}
 
   async read(userId: string): Promise<KnowledgeEntitlementCacheRecord | undefined> {
@@ -70,15 +100,12 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
     if (!await this.safeStorage.isAvailable()) {
       throw new Error('Secure storage is unavailable for knowledge entitlement cache')
     }
+    const ownerKey = this.ownerKey(userId)
+    const enrolled = await this.enrollment.isEnrolled(ownerKey)
     let serialized: string
     try { serialized = await readFile(this.recordPath(userId), 'utf8') } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        try {
-          await readFile(this.enrollmentPath(userId), 'utf8')
-        } catch (enrollmentError) {
-          if ((enrollmentError as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-          throw enrollmentError
-        }
+        if (!enrolled) return undefined
         throw new Error('Knowledge entitlement cache is missing for an enrolled owner', { cause: error })
       }
       throw error
@@ -88,6 +115,7 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
     const decrypted = await this.safeStorage.decrypt(Buffer.from(wrapped.ciphertext, 'base64'))
     const parsed = cacheRecordSchema.parse(JSON.parse(decrypted.value))
     if (parsed.userId !== userId) throw new Error('Knowledge entitlement cache owner mismatch')
+    if (!enrolled) await this.enrollment.enroll(ownerKey)
     if (decrypted.shouldReEncrypt) await this.write(userId, parsed.record)
     return parsed.record
   }
@@ -97,12 +125,8 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
       throw new Error('Secure storage is unavailable for knowledge entitlement cache')
     }
     const parsed = cacheRecordSchema.parse({ version: 1, userId, record })
-    try {
-      await readFile(this.enrollmentPath(userId), 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      await writeFileDurably(this.enrollmentPath(userId), JSON.stringify({ version: 1 }))
-    }
+    const ownerKey = this.ownerKey(userId)
+    if (!await this.enrollment.isEnrolled(ownerKey)) await this.enrollment.enroll(ownerKey)
     const encrypted = await this.safeStorage.encrypt(JSON.stringify(parsed))
     await writeFileDurably(this.recordPath(userId), JSON.stringify({
       version: 1,
@@ -111,19 +135,14 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
   }
 
   private recordPath(userId: string): string {
-    const owner = createHash('sha256')
-      .update('autoforge:knowledge-entitlement-owner:v1:')
-      .update(userId)
-      .digest('hex')
-    return join(this.directory, `${owner}.json`)
+    return join(this.directory, `${this.ownerKey(userId)}.json`)
   }
 
-  private enrollmentPath(userId: string): string {
-    const owner = createHash('sha256')
+  private ownerKey(userId: string): string {
+    return createHash('sha256')
       .update('autoforge:knowledge-entitlement-owner:v1:')
       .update(userId)
       .digest('hex')
-    return join(this.directory, `${owner}.enrolled`)
   }
 }
 
@@ -252,6 +271,11 @@ export class KnowledgeEntitlementAuthority {
   private readonly verifier: KnowledgeEntitlementVerifier
   private readonly ownerTails = new Map<string, Promise<void>>()
   private readonly failedOwners = new Set<string>()
+  private readonly ownerAuthorizations = new Map<string, {
+    fingerprint: string
+    revision: number
+    entitlement: KnowledgeEntitlementState
+  }>()
 
   constructor(private readonly options: {
     readonly trustedKeys: Readonly<Record<string, string>>
@@ -266,9 +290,30 @@ export class KnowledgeEntitlementAuthority {
   }
 
   async getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState> {
-    if (!owner.userId || owner.userId.trim() !== owner.userId) return failClosedEntitlement()
+    return (await this.getAuthorizationSnapshot(owner)).entitlement
+  }
+
+  async getAuthorizationSnapshot(owner: KnowledgeOwner): Promise<{
+    entitlement: KnowledgeEntitlementState
+    revision: number
+  }> {
+    if (!owner.userId || owner.userId.trim() !== owner.userId) {
+      return { entitlement: failClosedEntitlement(), revision: 0 }
+    }
     const previous = this.ownerTails.get(owner.userId) ?? Promise.resolve()
-    const operation = previous.catch(() => undefined).then(() => this.getEntitlementSerialized(owner))
+    const operation = previous.catch(() => undefined).then(async () => {
+      const decision = await this.getEntitlementSerialized(owner)
+      const previousAuthorization = this.ownerAuthorizations.get(owner.userId)
+      const revision = previousAuthorization === undefined
+        ? 1
+        : previousAuthorization.fingerprint === decision.fingerprint
+          && isDeepStrictEqual(previousAuthorization.entitlement, decision.entitlement)
+          ? previousAuthorization.revision
+          : previousAuthorization.revision + 1
+      const authorization = { ...decision, revision }
+      this.ownerAuthorizations.set(owner.userId, authorization)
+      return { entitlement: authorization.entitlement, revision: authorization.revision }
+    })
     const tail = operation.then(() => undefined, () => undefined)
     this.ownerTails.set(owner.userId, tail)
     try {
@@ -278,19 +323,41 @@ export class KnowledgeEntitlementAuthority {
     }
   }
 
-  private async getEntitlementSerialized(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState> {
-    if (this.failedOwners.has(owner.userId)) return failClosedEntitlement()
+  async isAuthorizationSnapshotCurrent(
+    owner: KnowledgeOwner,
+    expected: { entitlement: KnowledgeEntitlementState; revision: number },
+  ): Promise<boolean> {
+    const current = await this.getAuthorizationSnapshot(owner)
+    return current.revision === expected.revision
+      && isDeepStrictEqual(current.entitlement, expected.entitlement)
+  }
+
+  isAuthorizationSnapshotCurrentNow(
+    owner: KnowledgeOwner,
+    expected: { entitlement: KnowledgeEntitlementState; revision: number },
+  ): boolean {
+    const current = this.ownerAuthorizations.get(owner.userId)
+    return current?.revision === expected.revision
+      && isDeepStrictEqual(current.entitlement, expected.entitlement)
+  }
+
+  private async getEntitlementSerialized(owner: KnowledgeOwner): Promise<{
+    entitlement: KnowledgeEntitlementState
+    fingerprint: string
+  }> {
+    const failed = () => ({ entitlement: failClosedEntitlement(), fingerprint: 'fail-closed' })
+    if (this.failedOwners.has(owner.userId)) return failed()
     const now = this.options.now?.() ?? Date.now()
     let cached: KnowledgeEntitlementCacheRecord | undefined
     try {
       cached = await this.options.cache.read(owner.userId)
     } catch {
       this.failedOwners.add(owner.userId)
-      return failClosedEntitlement()
+      return failed()
     }
     if (cached && now < Date.parse(cached.maxObservedAt)) {
       this.failedOwners.add(owner.userId)
-      return failClosedEntitlement()
+      return failed()
     }
 
     let cachedState: VerifiedKnowledgeEntitlementState | undefined
@@ -299,7 +366,7 @@ export class KnowledgeEntitlementAuthority {
         cachedState = this.verifier.verify(owner.userId, cached.envelope)
       } catch {
         this.failedOwners.add(owner.userId)
-        return failClosedEntitlement()
+        return failed()
       }
     }
 
@@ -327,10 +394,10 @@ export class KnowledgeEntitlementAuthority {
     const accepted = fetchedMayStartOrContinue && fetchedIsMonotonic
       ? fetched
       : cachedState === undefined ? undefined : cached!.envelope
-    if (!accepted) return failClosedEntitlement()
+    if (!accepted) return failed()
 
     let state: VerifiedKnowledgeEntitlementState
-    try { state = this.verifier.verify(owner.userId, accepted) } catch { return failClosedEntitlement() }
+    try { state = this.verifier.verify(owner.userId, accepted) } catch { return failed() }
     const record: KnowledgeEntitlementCacheRecord = {
       envelope: accepted,
       maxIssuedAt: new Date(Math.max(maximumIssuedAt, Date.parse(accepted.payload.issuedAt))).toISOString(),
@@ -342,8 +409,8 @@ export class KnowledgeEntitlementAuthority {
       await this.options.cache.write(owner.userId, record)
     } catch {
       this.failedOwners.add(owner.userId)
-      return failClosedEntitlement()
+      return failed()
     }
-    return state
+    return { entitlement: state, fingerprint: accepted.signature }
   }
 }

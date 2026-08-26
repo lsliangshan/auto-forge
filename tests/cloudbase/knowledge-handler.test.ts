@@ -72,7 +72,7 @@ describe('CloudBase knowledge function', () => {
   it('fails signed entitlement issuance closed without a configured signer', async () => {
     const rpc = vi.fn().mockResolvedValue({
       tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
-      membershipExpiresAt: '2026-09-26T00:00:00.000Z', killSwitchEnabled: false,
+      killSwitchEnabled: false, version: 7, validUntil: '2026-09-26T00:00:00.000Z',
     })
     const handler = createKnowledgeHandler({ rpc })
     await expect(handler({ action: 'getEntitlement' }, context)).resolves.toEqual({
@@ -83,7 +83,7 @@ describe('CloudBase knowledge function', () => {
   it('signs getEntitlement only with runtime owner and the server database row', async () => {
     const record = {
       tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
-      membershipExpiresAt: '2026-09-26T00:00:00.000Z', killSwitchEnabled: false,
+      killSwitchEnabled: false, version: 7, validUntil: '2026-09-26T00:00:00.000Z',
     }
     const rpc = vi.fn().mockResolvedValue(record)
     const entitlementSigner = vi.fn().mockResolvedValue({ version: 1, signature: 'signed' })
@@ -91,6 +91,23 @@ describe('CloudBase knowledge function', () => {
     await expect(handler({
       action: 'getEntitlement', userId: 'attacker', keyId: 'attacker-key',
       issuedAt: '2099-01-01T00:00:00.000Z', betaEnabled: false,
+    }, context)).resolves.toEqual({ ok: true, data: { version: 1, signature: 'signed' } })
+    expect(entitlementSigner).toHaveBeenCalledWith('2089908515857502208', record)
+  })
+
+  it.each([
+    ['offline grace', { tier: 'member', status: 'offline_grace', betaEnabled: true, cloudEnabled: true,
+      killSwitchEnabled: false, version: 8, validUntil: '2026-09-26T00:00:00.000Z' }],
+    ['unavailable', { tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false,
+      killSwitchEnabled: true, version: 9, validUntil: null }],
+  ] as const)('passes the exact %s RPC record to the trusted signer', async (_label, record) => {
+    const rpc = vi.fn().mockResolvedValue(record)
+    const entitlementSigner = vi.fn().mockResolvedValue({ version: 1, signature: 'signed' })
+    const handler = createKnowledgeHandler({ rpc, entitlementSigner })
+
+    await expect(handler({
+      action: 'getEntitlement', status: 'active', validUntil: '2099-01-01T00:00:00.000Z',
+      version: 999, killSwitchEnabled: false,
     }, context)).resolves.toEqual({ ok: true, data: { version: 1, signature: 'signed' } })
     expect(entitlementSigner).toHaveBeenCalledWith('2089908515857502208', record)
   })

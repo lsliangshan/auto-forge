@@ -136,7 +136,7 @@
         <el-button
           data-testid="knowledge-purge-document"
           type="danger"
-          :disabled="!knowledge.canRecycle || knowledge.operationPending"
+          :disabled="!knowledge.canPurge || knowledge.operationPending"
           @click="purgeDocument"
         >立即永久删除</el-button>
       </div>

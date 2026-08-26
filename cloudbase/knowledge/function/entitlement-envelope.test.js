@@ -12,8 +12,9 @@ const activeRecord = Object.freeze({
   status: 'active',
   betaEnabled: true,
   cloudEnabled: true,
-  membershipExpiresAt: '2026-09-26T00:00:00.000Z',
   killSwitchEnabled: false,
+  version: 7,
+  validUntil: '2026-09-26T00:00:00.000Z',
 })
 
 function deployment(overrides = {}) {
@@ -62,6 +63,7 @@ test('rejects caller-shaped owner, key, time, and entitlement fields instead of 
     { ...activeRecord, keyId: 'attacker-key' },
     { ...activeRecord, issuedAt: '2099-01-01T00:00:00.000Z' },
     { ...activeRecord, entitlements: [] },
+    { ...activeRecord, membershipExpiresAt: '2099-01-01T00:00:00.000Z' },
     { ...activeRecord, cloudEnabled: true, betaEnabled: false },
   ]) {
     await assert.rejects(createKnowledgeEntitlementSigner(deployment())('alice', record),
@@ -80,17 +82,79 @@ test('requires a frozen deploy config and injected KMS signer', () => {
   })), /private KMS signer is required/)
 })
 
-test('enforces active and terminal membership time order from the strict DB record', async () => {
+test('maps the literal RPC active, offline-grace, expired, unavailable, and free rows', async () => {
   const signer = createKnowledgeEntitlementSigner(deployment())
   await assert.rejects(signer('alice', {
     ...activeRecord,
-    membershipExpiresAt: '2026-08-26T00:00:00.000Z',
+    validUntil: '2026-08-26T00:00:00.000Z',
   }), /invalid entitlement database record/)
-  const revoked = await signer('alice', {
-    ...activeRecord,
-    tier: 'free', status: 'revoked', betaEnabled: false, cloudEnabled: false,
-    membershipExpiresAt: '2026-08-25T12:00:00.000Z',
+  const offlineGrace = await signer('alice', { ...activeRecord, status: 'offline_grace' })
+  assert.equal(offlineGrace.payload.membershipStatus, 'active')
+  assert.equal(offlineGrace.payload.membershipExpiresAt, '2026-09-26T00:00:00.000Z')
+
+  const expired = await signer('alice', {
+    tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+    killSwitchEnabled: true, version: 8, validUntil: '2026-08-25T12:00:00.000Z',
   })
-  assert.equal(revoked.payload.membershipStatus, 'revoked')
-  assert.equal(revoked.payload.membershipExpiresAt, '2026-08-25T12:00:00.000Z')
+  assert.equal(expired.payload.membershipStatus, 'expired')
+  assert.equal(expired.payload.membershipExpiresAt, '2026-08-25T12:00:00.000Z')
+
+  const expiredMember = await signer('alice', {
+    ...activeRecord,
+    status: 'expired',
+    validUntil: '2026-08-25T12:00:00.000Z',
+  })
+  assert.equal(expiredMember.payload.membershipStatus, 'expired')
+  assert.equal(expiredMember.payload.membershipExpiresAt, '2026-08-25T12:00:00.000Z')
+  assert.deepEqual(expiredMember.payload.entitlements,
+    ['knowledge_base_beta', 'knowledge_base_cloud'])
+
+  const unavailable = await signer('alice', {
+    tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false,
+    killSwitchEnabled: true, version: 9, validUntil: null,
+  })
+  assert.equal(unavailable.payload.membershipStatus, 'revoked')
+  assert.equal(unavailable.payload.membershipExpiresAt, '2026-08-26T00:00:00.000Z')
+
+  const unavailableMember = await signer('alice', {
+    ...activeRecord,
+    status: 'unavailable',
+    validUntil: null,
+  })
+  assert.equal(unavailableMember.payload.membershipStatus, 'revoked')
+  assert.equal(unavailableMember.payload.membershipExpiresAt, '2026-08-26T00:00:00.000Z')
+  assert.deepEqual(unavailableMember.payload.entitlements,
+    ['knowledge_base_beta', 'knowledge_base_cloud'])
+
+  const neverMember = await signer('alice', {
+    tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+    killSwitchEnabled: true, version: 0, validUntil: null,
+  })
+  assert.equal(neverMember.payload.membershipStatus, 'expired')
+  assert.equal(neverMember.payload.membershipExpiresAt, '2026-08-26T00:00:00.000Z')
+})
+
+test('rejects inconsistent literal RPC rows instead of repairing trusted database state', async () => {
+  const signer = createKnowledgeEntitlementSigner(deployment())
+  for (const record of [
+    { ...activeRecord, status: 'expired', validUntil: null },
+    { ...activeRecord, tier: 'free', status: 'offline_grace', betaEnabled: false, cloudEnabled: false },
+    { ...activeRecord, validUntil: null },
+    { ...activeRecord, tier: 'free', status: 'active', validUntil: null },
+    { ...activeRecord, tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+      validUntil: '2026-09-26T00:00:00.000Z' },
+    { ...activeRecord, version: -1 },
+  ]) {
+    await assert.rejects(signer('alice', record), /invalid entitlement database record/)
+  }
+})
+
+test('never signs an extended-year timestamp that the Main four-digit grammar rejects', async () => {
+  const signer = createKnowledgeEntitlementSigner(deployment({
+    now: () => Date.parse('+010000-01-01T00:00:00.000Z'),
+  }))
+  await assert.rejects(signer('alice', {
+    tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false,
+    killSwitchEnabled: true, version: 1, validUntil: null,
+  }), /invalid deployment clock|invalid entitlement payload/)
 })

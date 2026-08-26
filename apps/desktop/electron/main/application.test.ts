@@ -1117,7 +1117,9 @@ describe('createApplicationRuntime', () => {
     expect(functions.callFunction).toHaveBeenNthCalledWith(2, {
       name: 'autoforge-knowledge', data: { action: 'getEmbeddingConsent' },
     })
-    const mutation = vi.mocked(functions.callFunction).mock.calls[3]?.[0]
+    const mutation = vi.mocked(functions.callFunction).mock.calls
+      .map(([input]) => input)
+      .find(({ data }) => data.action === 'setEmbeddingConsent')
     expect(mutation).toEqual({
       name: 'autoforge-knowledge',
       data: {

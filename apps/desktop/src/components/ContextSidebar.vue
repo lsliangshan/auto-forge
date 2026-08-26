@@ -128,7 +128,7 @@
           data-testid="knowledge-purge-base"
           size="small"
           type="danger"
-          :disabled="!knowledge.canRecycle || knowledge.operationPending"
+          :disabled="!knowledge.canPurge || knowledge.operationPending"
           @click="purgeKnowledgeBase"
         >永久删除</el-button>
       </div>

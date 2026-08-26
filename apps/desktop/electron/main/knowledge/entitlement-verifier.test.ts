@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import {
   KnowledgeEntitlementAuthority,
   KnowledgeEntitlementVerifier,
@@ -62,6 +63,28 @@ function signedEnvelope(
 
 function verifier(now: string, keys: Readonly<Record<string, string>> = { 'test-key-1': PUBLIC_KEY }) {
   return new KnowledgeEntitlementVerifier({ trustedKeys: keys, now: () => Date.parse(now) })
+}
+
+function enrollmentStore() {
+  const enrolled = new Set<string>()
+  return {
+    enrolled,
+    isEnrolled: async (ownerKey: string) => enrolled.has(ownerKey),
+    enroll: async (ownerKey: string) => { enrolled.add(ownerKey) },
+  }
+}
+
+function safeStorageCache(
+  directory: string,
+  storage: SafeStoragePort,
+  enrollment: ReturnType<typeof enrollmentStore>,
+): SafeStorageKnowledgeEntitlementCache {
+  const Cache = SafeStorageKnowledgeEntitlementCache as unknown as new (
+    directory: string,
+    safeStorage: SafeStoragePort,
+    enrollment: ReturnType<typeof enrollmentStore>,
+  ) => SafeStorageKnowledgeEntitlementCache
+  return new Cache(directory, storage, enrollment)
 }
 
 describe('KnowledgeEntitlementVerifier', () => {
@@ -345,10 +368,42 @@ describe('KnowledgeEntitlementAuthority', () => {
     })
     expect(fetchEnvelope).toHaveBeenCalledTimes(1)
   })
+
+  it('exposes a monotonic per-owner authorization token that invalidates an older grant', async () => {
+    const stored = cache()
+    let current = ACTIVE_ENVELOPE
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => current,
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    }) as unknown as KnowledgeEntitlementAuthority & {
+      getAuthorizationSnapshot(owner: { userId: string }): Promise<{
+        entitlement: KnowledgeEntitlementState
+        revision: number
+      }>
+      isAuthorizationSnapshotCurrent(owner: { userId: string }, snapshot: {
+        entitlement: KnowledgeEntitlementState
+        revision: number
+      }): Promise<boolean>
+    }
+
+    expect(typeof authority.getAuthorizationSnapshot).toBe('function')
+    const active = await authority.getAuthorizationSnapshot({ userId: 'alice' })
+    current = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-27T00:10:00.000Z',
+      killSwitchEnabled: true,
+    })
+    await expect(authority.isAuthorizationSnapshotCurrent({ userId: 'alice' }, active))
+      .resolves.toBe(false)
+    const killed = await authority.getAuthorizationSnapshot({ userId: 'alice' })
+    expect(killed.revision).toBeGreaterThan(active.revision)
+    expect(killed.entitlement).toMatchObject({ killSwitchEnabled: true, knowledgeToolEnabled: false })
+  })
 })
 
 describe('SafeStorageKnowledgeEntitlementCache', () => {
-  it('durably enrolls the owner before the first encrypted record so a failed first write cannot re-bootstrap', async () => {
+  it('commits independent Main enrollment before the first encrypted record so a failed first write cannot re-bootstrap', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-order-'))
     directories.push(directory)
     const storage: SafeStoragePort = {
@@ -356,13 +411,16 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
       encrypt: async () => { throw new Error('injected encryption failure') },
       decrypt: async () => { throw new Error('not reached') },
     }
-    const cache = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
     await expect(cache.write('alice', {
       envelope: ACTIVE_ENVELOPE,
       maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
       maxObservedAt: '2026-08-26T00:30:00.000Z',
     })).rejects.toThrow('injected encryption failure')
-    expect(await readdir(directory)).toEqual([expect.stringMatching(/\.enrolled$/)])
+    expect(enrollment.enrolled).toHaveLength(1)
+    expect([...enrollment.enrolled][0]).not.toContain('alice')
+    expect(await readdir(directory)).toEqual([])
 
     const restarted = new KnowledgeEntitlementAuthority({
       trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache,
@@ -374,7 +432,7 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
     })
   })
 
-  it('persists one encrypted owner-scoped record and reloads it after restart without cross-user bleed', async () => {
+  it('persists one encrypted owner-scoped record and reloads it with independent owner enrollment', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-'))
     directories.push(directory)
     const storage: SafeStoragePort = {
@@ -387,16 +445,18 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
       maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
       maxObservedAt: '2026-08-26T00:30:00.000Z',
     }
-    const first = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+    const enrollment = enrollmentStore()
+    const first = safeStorageCache(directory, storage, enrollment)
     await first.write('alice', record)
     const files = await readdir(directory)
-    expect(files).toHaveLength(2)
+    expect(files).toHaveLength(1)
+    expect(files.some(file => file.endsWith('.enrolled'))).toBe(false)
     const recordFile = files.find(file => file.endsWith('.json'))!
     const disk = await readFile(join(directory, recordFile), 'utf8')
     expect(disk).not.toContain('alice')
     expect(disk).not.toContain(ACTIVE_PAYLOAD.membershipExpiresAt)
 
-    const restarted = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+    const restarted = safeStorageCache(directory, storage, enrollment)
     await expect(restarted.read('alice')).resolves.toEqual(record)
     await expect(restarted.read('bob')).resolves.toBeUndefined()
   })
@@ -411,7 +471,8 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
         encrypt: async value => Buffer.from(`wrapped:${value}`),
         decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
       }
-      const cache = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+      const enrollment = enrollmentStore()
+      const cache = safeStorageCache(directory, storage, enrollment)
       await cache.write('alice', {
         envelope: ACTIVE_ENVELOPE,
         maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
@@ -441,7 +502,8 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
       encrypt: async value => Buffer.from(`wrapped:${value}`),
       decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
     }
-    const cache = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
     await cache.write('alice', {
       envelope: ACTIVE_ENVELOPE,
       maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
@@ -462,5 +524,61 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
     await expect(authority.getEntitlement({ userId: 'bob' })).resolves.toMatchObject({
       tier: 'member', killSwitchEnabled: false,
     })
+    expect(enrollment.enrolled).toHaveLength(2)
+  })
+
+  it('denies replay after both legacy cache-directory files are deleted while independent enrollment remains', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-independent-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async value => Buffer.from(`wrapped:${value}`),
+      decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+    }
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
+    await cache.write('alice', {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })
+    await writeFile(join(directory, 'legacy.enrolled'), '{"version":1}')
+    await Promise.all((await readdir(directory)).map(file => unlink(join(directory, file))))
+    expect(enrollment.enrolled).toHaveLength(1)
+
+    const restarted = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY },
+      cache: safeStorageCache(directory, storage, enrollment),
+      fetchEnvelope: async () => ACTIVE_ENVELOPE,
+      now: () => Date.parse('2026-08-26T00:31:00.000Z'),
+    })
+    await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+  })
+
+  it('restores a missing independent marker only from a valid record without resetting max history', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-marker-restore-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async value => Buffer.from(`wrapped:${value}`),
+      decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+    }
+    const enrollment = enrollmentStore()
+    const cache = safeStorageCache(directory, storage, enrollment)
+    const newer = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-27T00:10:00.000Z',
+    })
+    await cache.write('alice', {
+      envelope: newer,
+      maxIssuedAt: newer.payload.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })
+    enrollment.enrolled.clear()
+
+    await expect(cache.read('alice')).resolves.toMatchObject({ maxIssuedAt: newer.payload.issuedAt })
+    expect(enrollment.enrolled).toHaveLength(1)
   })
 })

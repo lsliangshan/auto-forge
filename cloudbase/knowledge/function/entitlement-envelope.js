@@ -12,12 +12,14 @@ const PAYLOAD_KEYS = Object.freeze([
 ])
 const ENTITLEMENTS = new Set(['knowledge_base_beta', 'knowledge_base_cloud'])
 const MEMBERSHIP_STATUSES = new Set(['active', 'expired', 'revoked'])
+const DATABASE_STATUSES = new Set(['active', 'offline_grace', 'expired', 'unavailable'])
 const DATABASE_RECORD_KEYS = Object.freeze([
-  'tier', 'status', 'betaEnabled', 'cloudEnabled', 'membershipExpiresAt', 'killSwitchEnabled',
+  'tier', 'status', 'betaEnabled', 'cloudEnabled', 'killSwitchEnabled', 'version', 'validUntil',
 ])
 
 function canonicalTimestamp(value) {
   return typeof value === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
     && !Number.isNaN(Date.parse(value))
     && new Date(Date.parse(value)).toISOString() === value
 }
@@ -79,19 +81,39 @@ function parseDatabaseRecord(input, issuedAt) {
   if (keys.length !== DATABASE_RECORD_KEYS.length
     || keys.some(key => !DATABASE_RECORD_KEYS.includes(key))
     || !['member', 'free'].includes(input.tier)
-    || !MEMBERSHIP_STATUSES.has(input.status)
+    || !DATABASE_STATUSES.has(input.status)
     || typeof input.betaEnabled !== 'boolean'
     || typeof input.cloudEnabled !== 'boolean'
     || (input.cloudEnabled && !input.betaEnabled)
     || typeof input.killSwitchEnabled !== 'boolean'
-    || !canonicalTimestamp(input.membershipExpiresAt)
-    || (input.status === 'active' && input.tier !== 'member')
-    || (input.status !== 'active' && input.tier !== 'free')
-    || (input.status === 'active' && Date.parse(input.membershipExpiresAt) <= issuedAt)
-    || (input.status !== 'active' && Date.parse(input.membershipExpiresAt) > issuedAt)) {
+    || !Number.isSafeInteger(input.version)
+    || input.version < 0
+    || !(input.validUntil === null || canonicalTimestamp(input.validUntil))) {
     throw new Error('invalid entitlement database record')
   }
-  return input
+  const activeMembership = input.tier === 'member'
+    && (input.status === 'active' || input.status === 'offline_grace')
+  if (activeMembership) {
+    if (input.validUntil === null || Date.parse(input.validUntil) <= issuedAt) {
+      throw new Error('invalid entitlement database record')
+    }
+    return {
+      ...input,
+      membershipStatus: 'active',
+      membershipExpiresAt: input.validUntil,
+    }
+  }
+  if (input.status === 'offline_grace'
+    || (input.tier === 'free' && (input.betaEnabled || input.cloudEnabled))
+    || (input.tier === 'member' && input.status === 'expired' && input.validUntil === null)
+    || (input.validUntil !== null && Date.parse(input.validUntil) > issuedAt)) {
+    throw new Error('invalid entitlement database record')
+  }
+  return {
+    ...input,
+    membershipStatus: input.status === 'unavailable' ? 'revoked' : 'expired',
+    membershipExpiresAt: input.validUntil ?? new Date(issuedAt).toISOString(),
+  }
 }
 
 function createKnowledgeEntitlementSigner(deployment) {
@@ -114,6 +136,17 @@ function createKnowledgeEntitlementSigner(deployment) {
       || ownerId.length < 1 || ownerId.length > 256) throw new Error('invalid entitlement owner')
     const issuedAtMs = now()
     if (!Number.isSafeInteger(issuedAtMs)) throw new Error('invalid deployment clock')
+    let issuedAt
+    let snapshotExpiresAt
+    try {
+      issuedAt = new Date(issuedAtMs).toISOString()
+      snapshotExpiresAt = new Date(issuedAtMs + snapshotTtlMs).toISOString()
+    } catch {
+      throw new Error('invalid deployment clock')
+    }
+    if (!canonicalTimestamp(issuedAt) || !canonicalTimestamp(snapshotExpiresAt)) {
+      throw new Error('invalid deployment clock')
+    }
     const record = parseDatabaseRecord(databaseRecord, issuedAtMs)
     const entitlements = []
     if (record.betaEnabled) entitlements.push('knowledge_base_beta')
@@ -121,10 +154,10 @@ function createKnowledgeEntitlementSigner(deployment) {
     return createSignedKnowledgeEntitlementEnvelope({
       userId: ownerId,
       entitlements,
-      issuedAt: new Date(issuedAtMs).toISOString(),
-      snapshotExpiresAt: new Date(issuedAtMs + snapshotTtlMs).toISOString(),
+      issuedAt,
+      snapshotExpiresAt,
       membershipExpiresAt: record.membershipExpiresAt,
-      membershipStatus: record.status,
+      membershipStatus: record.membershipStatus,
       keyId,
       killSwitchEnabled: record.killSwitchEnabled,
     }, signCanonical)

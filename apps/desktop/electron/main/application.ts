@@ -113,6 +113,7 @@ import {
 } from './knowledge/knowledge-service.js'
 import { KnowledgeAdmissionGate } from './knowledge/knowledge-admission.js'
 import {
+  AppSettingsKnowledgeEntitlementEnrollmentStore,
   KnowledgeEntitlementAuthority,
   PRODUCTION_KNOWLEDGE_ENTITLEMENT_TRUSTED_KEYS,
   SafeStorageKnowledgeEntitlementCache,
@@ -1198,6 +1199,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     cache: new SafeStorageKnowledgeEntitlementCache(
       join(options.paths.data, 'knowledge', 'entitlements'),
       options.safeStorage,
+      new AppSettingsKnowledgeEntitlementEnrollmentStore(database.appSettings),
     ),
   })
   knowledge = new KnowledgeService({

@@ -128,3 +128,45 @@
 - Production build-time trusted keys remain empty; beta, cloud, and new Agent knowledge admission remain closed. The free local 1-base/1-file management surface remains authoritative and usable.
 - The authenticated signer seam has no production signer. Remote conversion/download remains explicitly unavailable until an owner-scoped pre-production cloud client, approved KMS signer/public key, and release-gate evidence exist.
 - Logical purge does not claim physical SSD, snapshot, log, or third-party backup erasure.
+
+## Fix Round 2/5: independent enrollment and entitlement CAS
+
+### Review findings resolved
+
+- Moved prior-enrollment state out of the entitlement-cache directory into the existing Main-owned application `appSettings` repository. The key contains only a domain-separated owner SHA-256. The independent marker commits before the encrypted record; marker-present plus missing/corrupt/decrypt-invalid record denies. A valid record with a missing marker restores only the marker while retaining its `maxIssuedAt`/`maxObservedAt`; an invalid record cannot reset history. Deleting both legacy cache-directory files while the independent marker survives now denies replay after restart. Never-enrolled owners still bootstrap independently.
+- Added a per-owner monotonic authorization revision to `KnowledgeEntitlementAuthority`. A new signed envelope, kill/revoke/fail-closed transition, or changed full authorization advances the token. Async refresh compares token plus the complete state, and a final synchronous CAS closes the microtask gap before every next cloud side effect or returned admission/result.
+- Reworked the deployable signer to consume the exact production RPC row `{tier,status,betaEnabled,cloudEnabled,killSwitchEnabled,version,validUntil}`. Runtime UID remains the only owner source; frozen deployment config owns key id, clock, and TTL. Member `active/offline_grace` with a future `validUntil` maps to signed active; free/expired maps to expired; unavailable maps to revoked; null terminal time uses trusted issuance for free/unavailable. Inconsistent rows and client-selected fields fail closed. Both checked-in migrations already emitted this exact contract, so no migration rewrite was needed.
+- Aligned server canonical timestamps with Main's four-digit-year grammar. Extended-year `Date#toISOString()` values are rejected before signing.
+- Applied the same authorization token across cloud availability, legacy server admission, direct/captured cloud search, cloud snapshot capture, consent reads, and consent mutations. Each remote await is followed by signed-token validation, server additional-denial validation where applicable, another signed refresh, and final synchronous CAS before another remote call or return. Signed kill/revoke discards late results; server kill still prevents synced-cache fallback. An already-captured local-only immutable Agent turn remains usable.
+- Split Renderer `canPurge` from `canRecycle`. Recycled documents and bases remain reachable for confirmed strict purge while recycle stays disabled. A delayed document purge updates only the original base cache and does not clear or replace a newer selected base/document.
+
+### Exact RED/GREEN evidence
+
+- Independent enrollment and authority token: RED 6 failed / 25 passed; GREEN 31/31. Literal cases cover marker-before-record failure, one encrypted directory record with no sibling marker, deletion of both old directory files, corrupt/missing enrolled record, valid-record marker restoration without max-history loss, restart, owner isolation, and active-to-kill token invalidation.
+- Actual RPC signer and timestamp grammar: RED 3 failed / 3 passed; GREEN 6/6. The handler's runtime-owner/exact-row forwarding boundary was already correct and remained GREEN 4 passed / 40 skipped; the missing behavior was the signer accepting that row.
+- Final signer contract self-review added literal member `expired`/`unavailable` rows permitted by the real database schema: RED 1 failed / 5 passed because terminal member rows were rejected; GREEN 6/6. Their original entitlement flags remain signed, but the signed expired/revoked status denies capability. A member-expired row without an actual terminal timestamp and a free row carrying paid flags remain inconsistent and fail closed.
+- First TOCTOU slice: RED 4 failed / 52 skipped. It reproduced stale cloud availability, new Agent admission after signed kill during the legacy await, returned granted consent after kill, and starting remote search after kill during snapshot capture. The corrected setup produced assertion failures rather than fixture errors.
+- Self-review synchronous CAS slice: RED 1 failed / 56 skipped because a queued owner revision could advance after async validation but before caller continuation. GREEN focused result: 7 passed / 50 skipped, including the pre-existing local-only captured-turn positive and legacy server-kill synced-cache regression.
+- Recycled purge and Renderer race: RED 2 failed / 45 skipped; GREEN focused 2/2 and full Renderer 47/47.
+- First broad Electron rerun exposed one Task 9 regression plus the known baseline: 390 passed / 2 failed. The regression was a brittle Application test fixed to locate the consent mutation by action after the new post-check calls; focused rerun passed 1/1. No production gate was weakened.
+
+### Final verification
+
+- Entitlement verifier + KnowledgeService: 87/87 before the final synchronous-CAS addition; the final combined Electron runner includes the added case.
+- Electron Main/Application/IPC/Preload: 16 files, 392 passed / exactly 1 failed (393 total). The sole failure remains the unrelated context-summary billing baseline; its emitted error block and failed status both contain exactly `CONTEXT_LIMIT_EXCEEDED`.
+- Renderer knowledge: 47/47. Shared contracts + CloudBase handler: 125/125 (81 + 44). Server signer: 6/6.
+- `pnpm typecheck`: all four typed workspace projects passed after the final CAS change.
+- `pnpm lint --quiet`: exit 0. `pnpm typecheck`: all four typed workspace projects passed. `pnpm --filter @autoforge/desktop smoke:knowledge-ui` rebuilt Main, Preload, Renderer, parser/workflow workers and passed the real Electron Renderer -> Preload -> IPC -> Main -> parser -> encrypted-persistence path with `{"ok":true}`. Final `git diff --check` and staged-diff verification passed before commit.
+
+### External gates unchanged
+
+- No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified.
+- Production build-time trusted keys remain empty; the Cloud Function entry still supplies no signer. Beta, cloud, and new Agent knowledge admission remain closed while authoritative free local 1-base/1-file management remains usable.
+- The existing migrations were inspected only; no live migration or external mutation ran. Pre-production must prove the RPC row, KMS signer, key rotation/revocation, owner isolation, and clock behavior before enablement.
+- Cloud download/convert remains explicitly unavailable pending the owner-scoped pre-production client and release gate. Logical purge still makes no physical SSD, snapshot, log, or third-party backup erasure claim.
+
+### Self-review
+
+- Rechecked marker crash ordering, deletion/corruption/restart recovery, owner-key privacy, token advancement on signed and sticky fail-closed state, server row exactness, four-digit timestamp grammar, every `this.options.cloud` await, synced-cache denial, local-only immutable snapshot completion, and recycled purge reachability.
+- Additional issues found were the async-validation microtask gap and rejection of real-schema member terminal rows; each received a literal RED and narrow fix before final verification.
+- Round 2 final assessment before external gates: Critical 0, Important 0, Minor 0.
