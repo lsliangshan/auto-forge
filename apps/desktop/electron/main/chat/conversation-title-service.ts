@@ -84,6 +84,7 @@ export class ConversationTitleService {
       let finishReason: string | undefined
       for await (const event of trackProviderStream({
         operationKey: `conversation-title:${input.requestId}`,
+        purpose: 'conversation_title',
         attribution: {
           userId: input.userId,
           requestId: input.requestId,

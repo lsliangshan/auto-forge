@@ -17,7 +17,10 @@ import {
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { openAppDatabase } from '../database/client.js'
+import {
+  openTestUserDataDatabase,
+  type TestUserDataDatabase,
+} from '../../test-support/user-data-database.js'
 import {
   MEDIA_LIMITS,
   createMediaAssetService,
@@ -29,11 +32,9 @@ const mp3 = Buffer.concat([Buffer.from('ID3\u0004\u0000\u0000\u0000\u0000\u0000\
 const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(12)])
 const roots: string[] = []
 
-type Database = ReturnType<typeof openAppDatabase>
-
 let root: string
 let mediaRoot: string
-let database: Database
+let database: TestUserDataDatabase
 
 async function stagingEntries(conversationId = 'conversation_1') {
   try {
@@ -95,7 +96,7 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'autoforge-media-service-'))
   roots.push(root)
   mediaRoot = join(root, 'managed-media')
-  database = openAppDatabase(join(root, 'database.sqlite'))
+  database = openTestUserDataDatabase(root, 'media_test_user')
   database.conversations.insert({ id: 'conversation_1', title: 'Media' })
 })
 

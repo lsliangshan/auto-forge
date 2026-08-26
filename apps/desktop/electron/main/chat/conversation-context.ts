@@ -304,6 +304,7 @@ async function streamSummary(
   try {
     for await (const event of trackProviderStream({
       operationKey,
+      purpose: 'context_compression',
       attribution: {
         userId: input.callIdentity.userId,
         requestId: input.callIdentity.requestId,

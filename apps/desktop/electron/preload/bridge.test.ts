@@ -118,6 +118,32 @@ describe('preload desktop bridge', () => {
     expect(app.api).not.toHaveProperty('invoke')
   })
 
+  it('maps owner-free cloud consent, legacy import, preferences, and remote usage methods', async () => {
+    const app = harness()
+    const cloudSyncConsent = {
+      purpose: 'cloud_sync' as const, documentVersion: 'cloud-sync-2026-08',
+      consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+    }
+    const importRequest = { includeUnowned: false, cloudSyncConsent }
+
+    await app.api.settings.recordPrivacyConsent(cloudSyncConsent)
+    await app.api.settings.previewLegacyImport()
+    await app.api.settings.importLegacyData(importRequest)
+    await app.api.settings.getAccountDataPreferences()
+    await app.api.settings.updateAccountDataPreferences({ timezone: 'UTC', displayCurrency: 'USD' })
+    await app.api.settings.getRemoteUsage()
+
+    expect(vi.mocked(app.ipcRenderer.invoke).mock.calls.slice(-6)).toEqual([
+      [ipcChannels.settingsRecordPrivacyConsent, cloudSyncConsent],
+      [ipcChannels.settingsPreviewLegacyImport, undefined],
+      [ipcChannels.settingsImportLegacyData, importRequest],
+      [ipcChannels.settingsGetAccountDataPreferences, undefined],
+      [ipcChannels.settingsUpdateAccountDataPreferences, { timezone: 'UTC', displayCurrency: 'USD' }],
+      [ipcChannels.settingsGetRemoteUsage, undefined],
+    ])
+    expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toMatch(/owner|userId|uid/i)
+  })
+
   it('removes an exact workflow version through its fixed channel', async () => {
     const app = harness()
     await app.api.workflows.remove('browser.search.baidu', '1.0.0')
@@ -137,8 +163,21 @@ describe('preload desktop bridge', () => {
 
   it('reads persisted messages through the fixed conversation channel', async () => {
     const app = harness()
-    await app.api.chat.listMessages('conversation_1')
-    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(ipcChannels.chatListMessages, { conversationId: 'conversation_1' })
+    await app.api.chat.listConversations({ limit: 50, cursor: 'opaque-cursor-0001' })
+    await app.api.chat.listMessages({
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0002',
+    })
+    await app.api.chat.retrySync('conversation_1')
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.chatListConversations, {
+      limit: 50, cursor: 'opaque-cursor-0001',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.chatListMessages, {
+      conversationId: 'conversation_1', limit: 100, cursor: 'opaque-cursor-0002',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.chatRetrySync, {
+      conversationId: 'conversation_1',
+    })
+    expect(JSON.stringify(vi.mocked(app.ipcRenderer.invoke).mock.calls)).not.toContain('userId')
   })
 
   it('maps browser continuation takeover, redacted audit, and explicit data clearing to fixed channels', async () => {
@@ -259,5 +298,44 @@ describe('preload desktop bridge', () => {
     unsubscribe()
     expect(app.ipcRenderer.removeListener).toHaveBeenCalledTimes(1)
     expect(app.ipcRenderer.removeListener).toHaveBeenCalledWith(ipcChannels.chatEvent, wrapped)
+  })
+
+  it('forwards only strict owner-free conversation projection events', () => {
+    const app = harness()
+    const listener = vi.fn()
+    app.api.chat.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.chatEvent)!][0]!
+    const event = {
+      type: 'conversation_updated',
+      conversationId: 'conversation_1',
+      conversation: {
+        id: 'conversation_1', title: 'Updated', titleState: 'user_named', revision: 2,
+        syncState: 'syncing', createdAt: '2026-08-25T00:00:00.000Z',
+        lastActivityAt: '2026-08-25T00:01:00.000Z',
+        metadataUpdatedAt: '2026-08-25T00:01:00.000Z',
+      },
+    }
+
+    wrapped({}, event)
+    wrapped({}, { ...event, ownerUserId: 'private-owner' })
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
+  })
+
+  it('forwards only the strict owner-free conversation removal event', () => {
+    const app = harness()
+    const listener = vi.fn()
+    app.api.chat.onEvent(listener)
+    const wrapped = [...app.listeners.get(ipcChannels.chatEvent)!][0]!
+    const event = { type: 'conversation_removed', conversationId: 'conversation_1' }
+
+    wrapped({}, event)
+    wrapped({}, { ...event, uid: 'private-owner' })
+    wrapped({}, { ...event, revision: 3 })
+    wrapped({}, { ...event, tombstone: { deletedAt: '2026-08-25T00:00:00.000Z' } })
+
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(event)
   })
 })

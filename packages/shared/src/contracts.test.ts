@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   appErrorCodeSchema,
+  accountDataPreferencesSchema,
+  accountDataPreferencesRecordSchema,
   appSettingsSchema,
   approvalDecisionSchema,
   authCredentialsSchema,
@@ -13,22 +15,42 @@ import {
   chatBlockSchema,
   chatEventSchema,
   chatSendInputSchema,
+  byokUsageEventSchema,
+  conversationPageSchema,
+  conversationSummarySchema,
   executionEventSchema,
   generationOptionsSchema,
   ipcRequestSchemas,
   ipcResponseSchemas,
   ipcChannels,
+  legacyImportConfirmRequestSchema,
+  legacyImportRequestSchema,
+  legacyImportResultSchema,
+  legacyImportPreviewSchema,
+  listConversationsRequestSchema,
+  listMessagesRequestSchema,
+  logoutRequestSchema,
+  logoutResultSchema,
+  retryConversationSyncRequestSchema,
   listProviderModelsRequestSchema,
+  messagePageSchema,
   mediaAssetSchema,
   mediaBlockSchema,
   modelInfoSchema,
   normalizeProxySettings,
   parseProxyBypassText,
   permissionGrantSchema,
+  privacyConsentSchema,
+  remoteUsageSnapshotSchema,
+  providerUsageModalitySchema,
   providerCredentialStatusSchema,
   proxySettingsSchema,
+  pulledMutationSchema,
+  sanitizeOpaqueWorkflowArgs,
   toSafeAppError,
   tokenUsageSnapshotSchema,
+  syncMutationResultSchema,
+  syncMutationSchema,
   userAdminListRequestSchema,
   userAdminListResponseSchema,
   userAdminUpdateRoleRequestSchema,
@@ -40,6 +62,563 @@ import {
 } from './index'
 
 describe('cross-process contracts', () => {
+  it('requires an explicit typed discard confirmation for logout', () => {
+    expect(logoutRequestSchema.parse(undefined)).toBeUndefined()
+    expect(logoutRequestSchema.parse({ discardPending: true })).toEqual({ discardPending: true })
+    expect(logoutRequestSchema.parse({ preservePending: true })).toEqual({ preservePending: true })
+    expect(logoutRequestSchema.safeParse({ discardPending: false }).success).toBe(false)
+    expect(logoutRequestSchema.safeParse({ discardPending: true, userId: 'forged' }).success).toBe(false)
+    expect(logoutResultSchema.parse({ status: 'logged_out' })).toEqual({ status: 'logged_out' })
+    expect(logoutResultSchema.parse({ status: 'pending_sync', pendingCount: 3 }))
+      .toEqual({ status: 'pending_sync', pendingCount: 3 })
+    expect(logoutResultSchema.parse({ status: 'sync_timeout' }))
+      .toEqual({ status: 'sync_timeout' })
+  })
+
+  it('requires strict opaque cursor requests and paged chat responses', () => {
+    const cursor = 'opaque-cursor-0001'
+    expect(listConversationsRequestSchema.parse({ limit: 50 })).toEqual({ limit: 50 })
+    expect(listConversationsRequestSchema.parse({ limit: 50, cursor }))
+      .toEqual({ limit: 50, cursor })
+    expect(listMessagesRequestSchema.parse({ conversationId: 'conv_1', limit: 100 }))
+      .toEqual({ conversationId: 'conv_1', limit: 100 })
+    expect(listMessagesRequestSchema.parse({ conversationId: 'conv_1', limit: 100, cursor }))
+      .toEqual({ conversationId: 'conv_1', limit: 100, cursor })
+    expect(listConversationsRequestSchema.safeParse({ limit: 50, userId: 'forged' }).success).toBe(false)
+    expect(listMessagesRequestSchema.safeParse({ conversationId: 'conv_1', limit: 100, cursor: 'short' }).success)
+      .toBe(false)
+    expect(retryConversationSyncRequestSchema.parse({ conversationId: 'conv_1' }))
+      .toEqual({ conversationId: 'conv_1' })
+    for (const forged of [
+      { conversationId: 'conv_1', userId: 'forged' },
+      { conversationId: 'conv_1', mutationId: 'mutation_1' },
+      { conversationId: 'conv_1', force: true },
+      { conversationId: 'conv_1', error: { code: 'SYNC_CONFLICT' } },
+    ]) expect(retryConversationSyncRequestSchema.safeParse(forged).success).toBe(false)
+
+    const summary = {
+      id: 'conv_1',
+      title: '会话',
+      titleState: 'user_named' as const,
+      revision: 2,
+      syncState: 'synced' as const,
+      createdAt: '2026-08-24T00:00:00.000Z',
+      lastActivityAt: '2026-08-24T00:01:00.000Z',
+      metadataUpdatedAt: '2026-08-24T00:02:00.000Z',
+    }
+    expect(conversationSummarySchema.parse(summary)).toEqual(summary)
+    expect(conversationSummarySchema.parse({
+      ...summary, syncWarningSince: '2026-08-23T00:00:00.000Z',
+    })).toMatchObject({ syncWarningSince: '2026-08-23T00:00:00.000Z' })
+    expect(conversationPageSchema.parse({ items: [summary], nextCursor: cursor }))
+      .toEqual({ items: [summary], nextCursor: cursor })
+    expect(conversationPageSchema.parse({
+      items: [summary], syncWarningSince: '2026-08-23T00:00:00.000Z',
+    })).toMatchObject({ syncWarningSince: '2026-08-23T00:00:00.000Z' })
+    expect.soft(conversationPageSchema.safeParse({
+      items: Array.from({ length: 51 }, (_, index) => ({ ...summary, id: `conv_${index}` })),
+    }).success).toBe(false)
+    expect(ipcRequestSchemas[ipcChannels.chatListConversations].parse({ limit: 50 }))
+      .toEqual({ limit: 50 })
+    expect(ipcResponseSchemas[ipcChannels.chatListConversations].parse({ items: [summary] }))
+      .toEqual({ items: [summary] })
+    const message = {
+      id: 'message_1',
+      conversationId: 'conv_1',
+      role: 'user' as const,
+      blocks: [],
+      createdAt: '2026-08-24T00:00:30.000Z',
+    }
+    expect(messagePageSchema.parse({ items: [message], previousCursor: cursor }))
+      .toEqual({ items: [message], previousCursor: cursor })
+    expect.soft(messagePageSchema.safeParse({
+      items: Array.from({ length: 101 }, (_, index) => ({ ...message, id: `message_${index}` })),
+    }).success).toBe(false)
+    expect(ipcResponseSchemas[ipcChannels.chatListMessages].parse({ items: [message] }))
+      .toEqual({ items: [message] })
+    expect(ipcRequestSchemas[ipcChannels.chatRetrySync].parse({ conversationId: 'conv_1' }))
+      .toEqual({ conversationId: 'conv_1' })
+    expect(ipcRequestSchemas[ipcChannels.chatRetrySync].parse({})).toEqual({})
+    expect(ipcResponseSchemas[ipcChannels.chatRetrySync].parse(undefined)).toBeUndefined()
+  })
+
+  it('enforces strict per-kind sync mutation payloads', () => {
+    const mutationBase = {
+      id: 'mut_1',
+      entityId: 'conv_1',
+      baseRevision: 0,
+      occurredAt: '2026-08-24T00:00:00.000Z',
+    }
+    const conversationCreate = {
+      ...mutationBase,
+      kind: 'conversation.create' as const,
+      payload: {
+        title: '新会话',
+        titleState: 'pending' as const,
+        createdAt: '2026-08-24T00:00:00.000Z',
+        lastActivityAt: '2026-08-24T00:00:00.000Z',
+        metadataUpdatedAt: '2026-08-24T00:00:00.000Z',
+      },
+    }
+    expect(syncMutationSchema.parse(conversationCreate)).toEqual(conversationCreate)
+    expect(syncMutationSchema.safeParse({ ...conversationCreate, userId: 'forged' }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({ ...conversationCreate, ownerUserId: 'forged' }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({ ...conversationCreate, uid: 'forged' }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({
+      ...conversationCreate,
+      payload: { ...conversationCreate.payload, ownerUserId: 'forged' },
+    }).success).toBe(false)
+    expect(syncMutationSchema.safeParse({
+      ...conversationCreate,
+      payload: { ...conversationCreate.payload, clientSecret: 'secret' },
+    }).success).toBe(false)
+
+    const messageAppend = {
+      ...mutationBase,
+      kind: 'message.append' as const,
+      entityId: 'message_1',
+      payload: {
+        id: 'message_1',
+        conversationId: 'conv_1',
+        role: 'user' as const,
+        blocks: [],
+        createdAt: '2026-08-24T00:00:30.000Z',
+      },
+    }
+    expect(syncMutationSchema.parse(messageAppend)).toEqual(messageAppend)
+    expect(syncMutationSchema.safeParse({
+      ...messageAppend, payload: { ...messageAppend.payload, userId: 'forged' },
+    }).success).toBe(false)
+
+    const conversationMutations = [
+      {
+        ...mutationBase,
+        kind: 'conversation.rename' as const,
+        payload: {
+          title: '手动命名',
+          titleState: 'user_named' as const,
+          metadataUpdatedAt: '2026-08-24T00:01:00.000Z',
+        },
+      },
+      { ...mutationBase, kind: 'conversation.delete' as const, payload: {} },
+      { ...mutationBase, kind: 'conversation.restore' as const, payload: {} },
+    ]
+    for (const conversationMutation of conversationMutations) {
+      expect(syncMutationSchema.parse(conversationMutation)).toEqual(conversationMutation)
+      expect(syncMutationSchema.safeParse({
+        ...conversationMutation,
+        payload: { ...conversationMutation.payload, ownerUserId: 'forged' },
+      }).success).toBe(false)
+    }
+
+    const generationPreferences = {
+      outputType: 'image' as const,
+      models: { image: 'openrouter/image-model' },
+      generation: {
+        image: { count: 1 as const, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+        audio: { format: 'mp3' },
+        video: {
+          durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false,
+        },
+      },
+    }
+    const conversationPreferences = {
+      ...mutationBase,
+      kind: 'conversation.preferences' as const,
+      payload: {
+        preferences: generationPreferences,
+        metadataUpdatedAt: '2026-08-24T00:02:00.000Z',
+      },
+    }
+    expect(syncMutationSchema.parse(conversationPreferences)).toEqual(conversationPreferences)
+    expect(syncMutationSchema.safeParse({
+      ...conversationPreferences,
+      payload: {
+        ...conversationPreferences.payload,
+        preferences: { ...generationPreferences, ownerUserId: 'forged' },
+      },
+    }).success).toBe(false)
+    const pulledConversationPreferences = {
+      id: conversationPreferences.id,
+      kind: conversationPreferences.kind,
+      entityId: conversationPreferences.entityId,
+      baseRevision: conversationPreferences.baseRevision,
+      resultRevision: 1,
+      payload: conversationPreferences.payload,
+      receivedAt: conversationPreferences.occurredAt,
+    }
+    expect(pulledMutationSchema.parse(pulledConversationPreferences))
+      .toEqual(pulledConversationPreferences)
+
+    const cloudSyncConsent = {
+      purpose: 'cloud_sync' as const,
+      documentVersion: 'privacy-2026-08',
+      consentedAt: '2026-08-24T00:00:00.000Z',
+      clientVersion: '2.0.0',
+    }
+    const unownedImportConsent = {
+      ...cloudSyncConsent,
+      purpose: 'legacy_unowned_import' as const,
+      documentVersion: 'legacy-import-2026-08',
+    }
+    const privacyConsentMutation = {
+      ...mutationBase,
+      kind: 'privacy.consent' as const,
+      entityId: 'privacy-2026-08',
+      payload: cloudSyncConsent,
+    }
+    expect(syncMutationSchema.parse(privacyConsentMutation)).toEqual(privacyConsentMutation)
+    const legacyImportMutation = {
+      ...mutationBase,
+      kind: 'legacy.import' as const,
+      entityId: 'batch_1',
+      payload: {
+        batchId: 'batch_1', includeUnowned: true, cloudSyncConsent, unownedImportConsent,
+      },
+    }
+    expect(syncMutationSchema.parse(legacyImportMutation)).toEqual(legacyImportMutation)
+    expect(syncMutationSchema.safeParse({
+      ...mutationBase,
+      kind: 'legacy.import',
+      entityId: 'batch_1',
+      payload: { batchId: 'batch_1', includeUnowned: true, cloudSyncConsent },
+    }).success).toBe(false)
+
+    expect(syncMutationSchema.parse({
+      ...mutationBase,
+      kind: 'preferences.update',
+      entityId: 'preferences',
+      payload: { timezone: 'Asia/Shanghai', displayCurrency: 'CNY' },
+    })).toMatchObject({ kind: 'preferences.update' })
+    expect(syncMutationSchema.safeParse({
+      ...mutationBase,
+      kind: 'preferences.update',
+      entityId: 'preferences',
+      payload: { timezone: 'Asia/Shanghai', displayCurrency: 'EUR' },
+    }).success).toBe(false)
+
+    const usagePayload = {
+      id: 'usage_1',
+      operationId: 'operation_1',
+      purpose: 'chat_reply',
+      credentialOwner: 'user' as const,
+      billable: false as const,
+      provider: 'openrouter' as const,
+      model: 'openai/gpt-5',
+      modality: 'text' as const,
+      costStatus: 'estimated' as const,
+      inputTokens: 12,
+      outputTokens: 4,
+      estimatedCostUsd: '0.0012',
+      occurredAt: '2026-08-24T00:00:00.000Z',
+    }
+    const usageMutation = {
+      ...mutationBase, kind: 'usage.record' as const, entityId: 'usage_1', payload: usagePayload,
+    }
+    expect(syncMutationSchema.parse(usageMutation)).toEqual(usageMutation)
+    for (const invalidUsage of [
+      { ...usagePayload, credentialOwner: 'platform' },
+      { ...usagePayload, billable: true },
+      { ...usagePayload, costStatus: 'reported' },
+    ]) {
+      expect(syncMutationSchema.safeParse({
+        ...mutationBase, kind: 'usage.record', entityId: 'usage_1', payload: invalidUsage,
+      }).success).toBe(false)
+    }
+
+    for (const mismatch of [
+      { ...messageAppend, entityId: 'different_message' },
+      { ...legacyImportMutation, entityId: 'different_batch' },
+      { ...privacyConsentMutation, entityId: 'different_document' },
+      { ...usageMutation, entityId: 'different_usage' },
+    ]) {
+      const result = syncMutationSchema.safeParse(mismatch)
+      expect.soft(result.success).toBe(false)
+      if (result.success) continue
+      expect.soft(result.error.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'custom',
+          path: ['entityId'],
+          message: 'Mutation entity identity does not match its payload.',
+        }),
+      ]))
+      expect.soft(JSON.stringify(result.error.issues)).not.toContain(mismatch.entityId)
+    }
+
+    expect(syncMutationResultSchema.parse({ id: 'mut_1', status: 'applied', revision: 1 }))
+      .toEqual({ id: 'mut_1', status: 'applied', revision: 1 })
+    expect(syncMutationResultSchema.parse({ id: 'mut_1', status: 'duplicate', revision: 1 }))
+      .toEqual({ id: 'mut_1', status: 'duplicate', revision: 1 })
+    expect(syncMutationResultSchema.parse({
+      id: 'mut_1', status: 'conflict', errorCode: 'SYNC_CONFLICT',
+    })).toEqual({ id: 'mut_1', status: 'conflict', errorCode: 'SYNC_CONFLICT' })
+    expect(syncMutationResultSchema.parse({
+      id: 'mut_1', status: 'rejected', errorCode: 'INVALID_INPUT',
+    })).toEqual({ id: 'mut_1', status: 'rejected', errorCode: 'INVALID_INPUT' })
+    for (const invalidResult of [
+      { id: 'mut_1', status: 'applied' },
+      { id: 'mut_1', status: 'duplicate' },
+      { id: 'mut_1', status: 'conflict', errorCode: 'SYNC_CONFLICT', revision: 1 },
+      { id: 'mut_1', status: 'conflict' },
+      { id: 'mut_1', status: 'rejected', errorCode: 'INVALID_INPUT', revision: 1 },
+      { id: 'mut_1', status: 'rejected' },
+    ]) {
+      expect(syncMutationResultSchema.safeParse(invalidResult).success).toBe(false)
+    }
+    expect(syncMutationResultSchema.safeParse({ id: 'mut_1', status: 'unknown' }).success).toBe(false)
+  })
+
+  it('separates reduced pulled legacy receipts from strict push mutations', () => {
+    const receipt = {
+      id: 'legacy_receipt_1',
+      kind: 'legacy.import' as const,
+      entityId: 'legacy_batch_1',
+      baseRevision: 0,
+      resultRevision: 0,
+      payload: { batchId: 'legacy_batch_1', includeUnowned: true },
+      receivedAt: '2026-08-24T00:00:00.000Z',
+    }
+
+    expect(pulledMutationSchema.parse(receipt)).toEqual(receipt)
+    expect(syncMutationSchema.safeParse({
+      id: receipt.id,
+      kind: receipt.kind,
+      entityId: receipt.entityId,
+      baseRevision: receipt.baseRevision,
+      payload: receipt.payload,
+      occurredAt: receipt.receivedAt,
+    }).success).toBe(false)
+    expect(pulledMutationSchema.safeParse({
+      ...receipt,
+      payload: { ...receipt.payload, clientSecret: 'secret' },
+    }).success).toBe(false)
+    expect(pulledMutationSchema.safeParse({
+      ...receipt,
+      entityId: 'different_batch',
+    }).success).toBe(false)
+  })
+
+  it('accepts only strict server-authored compacted conversation receipts', () => {
+    const compactedMessage = {
+      id: 'message_mutation_1',
+      kind: 'message.append' as const,
+      entityId: 'message_1',
+      conversationId: 'conversation_1',
+      baseRevision: 1,
+      resultRevision: 2,
+      compacted: true as const,
+      receivedAt: '2026-08-24T00:00:00.000Z',
+    }
+    const compactedDelete = {
+      id: 'delete_mutation_1',
+      kind: 'conversation.delete' as const,
+      entityId: 'conversation_1',
+      baseRevision: 2,
+      resultRevision: 3,
+      compacted: true as const,
+      receivedAt: '2026-08-24T00:00:01.000Z',
+    }
+    const compactedPreferences = {
+      ...compactedDelete,
+      id: 'preferences_mutation_1',
+      kind: 'conversation.preferences' as const,
+    }
+
+    expect(pulledMutationSchema.parse(compactedMessage)).toEqual(compactedMessage)
+    expect(pulledMutationSchema.parse(compactedDelete)).toEqual(compactedDelete)
+    expect(pulledMutationSchema.parse(compactedPreferences)).toEqual(compactedPreferences)
+    expect(syncMutationSchema.safeParse(compactedMessage).success).toBe(false)
+    for (const invalid of [
+      { ...compactedMessage, payload: { blocks: [{ type: 'text', text: 'secret' }] } },
+      { ...compactedMessage, conversationId: undefined },
+      { ...compactedDelete, conversationId: 'conversation_1' },
+      { ...compactedDelete, secret: 'not allowed' },
+      { ...compactedPreferences, payload: { preferences: { outputType: 'image' } } },
+      { ...compactedDelete, kind: 'usage.record' },
+    ]) {
+      expect(pulledMutationSchema.safeParse(invalid).success).toBe(false)
+    }
+  })
+
+  it('matches Task 3 token-aware workflow proposal arg sanitization', () => {
+    expect(sanitizeOpaqueWorkflowArgs({
+      query: 'status:open',
+      fluid: 'hydraulic',
+      liquid: 'water',
+      sql: 'select private',
+      ServiceKey: 'service-private',
+      rootPath: '/Users/private/project',
+      nested: {
+        Authorization: 'auth-private',
+        authorizationHeader: 'header-private',
+        cookieValue: 'cookie-private',
+        uidValue: 'uid-private',
+        filePathValue: 'file-private',
+        callerUserId: 'user-private',
+        access_token: 'token-private',
+        passwordValue: 'password-private',
+        promptText: 'prompt-private',
+        response_body: 'response-private',
+        imageBase64: 'base64-private',
+        credentialOwner: 'owner-private',
+      },
+    })).toEqual({
+      query: 'status:open',
+      fluid: 'hydraulic',
+      liquid: 'water',
+      sql: '[REDACTED]',
+      ServiceKey: '[REDACTED]',
+      rootPath: '[REDACTED]',
+      nested: {
+        Authorization: '[REDACTED]',
+        authorizationHeader: '[REDACTED]',
+        cookieValue: '[REDACTED]',
+        uidValue: '[REDACTED]',
+        filePathValue: '[REDACTED]',
+        callerUserId: '[REDACTED]',
+        access_token: '[REDACTED]',
+        passwordValue: '[REDACTED]',
+        promptText: '[REDACTED]',
+        response_body: '[REDACTED]',
+        imageBase64: '[REDACTED]',
+        credentialOwner: '[REDACTED]',
+      },
+    })
+    expect(sanitizeOpaqueWorkflowArgs(['plain', { query: 'kept', token: 'hidden' }]))
+      .toEqual(['plain', { query: 'kept', token: '[REDACTED]' }])
+  })
+
+  it('keeps cloud-sync and unowned legacy import consent distinct', () => {
+    const cloudSyncConsent = {
+      purpose: 'cloud_sync' as const,
+      documentVersion: 'privacy-2026-08',
+      consentedAt: '2026-08-24T00:00:00.000Z',
+      clientVersion: '2.0.0',
+    }
+    const unownedImportConsent = {
+      ...cloudSyncConsent,
+      purpose: 'legacy_unowned_import' as const,
+      documentVersion: 'legacy-import-2026-08',
+    }
+    expect(legacyImportPreviewSchema.parse({
+      ownedCount: 4,
+      unownedCount: 2,
+      requiresUnownedConfirmation: true,
+    })).toEqual({ ownedCount: 4, unownedCount: 2, requiresUnownedConfirmation: true })
+    expect(legacyImportPreviewSchema.safeParse({
+      ownedCount: 4,
+      unownedCount: 2,
+      requiresUnownedConfirmation: false,
+    }).success).toBe(false)
+    expect(privacyConsentSchema.parse(cloudSyncConsent)).toEqual(cloudSyncConsent)
+    expect(legacyImportConfirmRequestSchema.parse({
+      batchId: 'batch_1',
+      includeUnowned: true,
+      cloudSyncConsent,
+      unownedImportConsent,
+    })).toMatchObject({ batchId: 'batch_1', includeUnowned: true })
+    expect(legacyImportConfirmRequestSchema.safeParse({
+      batchId: 'batch_1', includeUnowned: true, cloudSyncConsent,
+    }).success).toBe(false)
+    expect(legacyImportConfirmRequestSchema.safeParse({
+      batchId: 'batch_1', includeUnowned: true,
+      cloudSyncConsent: unownedImportConsent,
+      unownedImportConsent: cloudSyncConsent,
+    }).success).toBe(false)
+    expect(legacyImportConfirmRequestSchema.safeParse({
+      batchId: 'batch_1', includeUnowned: false, cloudSyncConsent, unownedImportConsent,
+    }).success).toBe(false)
+    expect(legacyImportRequestSchema.parse({
+      includeUnowned: false, cloudSyncConsent,
+    })).toEqual({ includeUnowned: false, cloudSyncConsent })
+    expect(legacyImportRequestSchema.safeParse({
+      batchId: 'renderer-controlled', includeUnowned: false, cloudSyncConsent,
+    }).success).toBe(false)
+  })
+
+  it('defines strict account preferences and safe BYOK usage events', () => {
+    expect(accountDataPreferencesSchema.parse({})).toEqual({
+      timezone: 'Asia/Shanghai',
+      displayCurrency: 'CNY',
+    })
+    expect(accountDataPreferencesSchema.parse({ timezone: 'America/New_York', displayCurrency: 'USD' }))
+      .toEqual({ timezone: 'America/New_York', displayCurrency: 'USD' })
+    expect(accountDataPreferencesSchema.safeParse({ timezone: 'UTC', displayCurrency: 'EUR' }).success).toBe(false)
+
+    const usage = {
+      id: 'usage_1',
+      operationId: 'operation_1',
+      purpose: 'chat_reply',
+      credentialOwner: 'user' as const,
+      billable: false as const,
+      provider: 'openrouter' as const,
+      model: 'openai/gpt-5',
+      modality: 'text' as const,
+      costStatus: 'estimated' as const,
+      inputTokens: 12,
+      outputTokens: 4,
+      estimatedCostUsd: '0.0012',
+      occurredAt: '2026-08-24T00:00:00.000Z',
+    }
+    expect(providerUsageModalitySchema.parse('video')).toBe('video')
+    expect(byokUsageEventSchema.parse(usage)).toEqual(usage)
+    const unavailableUsage = { ...usage, costStatus: 'unavailable' as const }
+    Reflect.deleteProperty(unavailableUsage, 'estimatedCostUsd')
+    expect(byokUsageEventSchema.parse(unavailableUsage)).toMatchObject({ costStatus: 'unavailable' })
+    expect(byokUsageEventSchema.safeParse({ ...usage, estimatedCostUsd: undefined }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({
+      ...usage, costStatus: 'unavailable', estimatedCostUsd: '0.0012',
+    }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, credentialOwner: 'platform' }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, billable: true }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, costStatus: 'reported' }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, displayCurrency: 'CNY' }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, apiKey: 'secret' }).success).toBe(false)
+    expect(byokUsageEventSchema.safeParse({ ...usage, apiKeyFingerprint: 'fingerprint' }).success).toBe(false)
+  })
+
+  it('defines strict owner-free public legacy, preference, and remote usage responses', () => {
+    expect(legacyImportResultSchema.parse({
+      batchId: 'batch_1-0', status: 'applied', importedConversations: 2, importedMessages: 4,
+    })).toEqual({
+      batchId: 'batch_1-0', status: 'applied', importedConversations: 2, importedMessages: 4,
+    })
+    expect(accountDataPreferencesRecordSchema.parse({
+      timezone: 'Asia/Shanghai', displayCurrency: 'CNY', revision: 2,
+      updatedAt: '2026-08-25T00:00:00.000Z',
+    })).toMatchObject({ revision: 2 })
+    const usage = {
+      startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
+      inputTokens: 10, outputTokens: 5, totalTokens: 15,
+      confirmedPlatformCost: null, pendingCount: 1,
+      byokEstimatedCostUsd: '0.01', byokEstimatedCount: 2, byokUnavailableCount: 1,
+      timezone: 'Asia/Shanghai', displayCurrency: 'CNY',
+      lastSyncAt: '2026-08-25T00:00:00.000Z',
+    }
+    expect(remoteUsageSnapshotSchema.parse(usage)).toEqual(usage)
+    for (const unsafe of [
+      { ...usage, ownerUserId: 'alice' },
+      { ...usage, apiKey: 'secret' },
+      { ...usage, apiKeyFingerprint: 'fingerprint' },
+    ]) expect(remoteUsageSnapshotSchema.safeParse(unsafe).success).toBe(false)
+  })
+
+  it('exposes safe cloud-sync errors', () => {
+    for (const code of [
+      'SYNC_CONFLICT',
+      'SYNC_FAILED',
+      'UPGRADE_REQUIRED',
+      'IMPORT_CONFIRMATION_REQUIRED',
+      'OUTBOX_LIMIT_EXCEEDED',
+    ] as const) {
+      expect(appErrorCodeSchema.parse(code)).toBe(code)
+      expect(toSafeAppError({ code, message: 'sensitive detail' })).toEqual({
+        code,
+        message: expect.any(String),
+      })
+    }
+  })
+
   it('validates CloudBase username, password, phone, email, and OTP inputs', () => {
     expect(authCredentialsSchema.parse({ account: '  Alice_1  ', password: '密码密码密码密码' }))
       .toEqual({ account: 'Alice_1', password: '密码密码密码密码' })
@@ -873,6 +1452,61 @@ describe('cross-process contracts', () => {
     })).toThrow()
   })
 
+  it('carries an owner-free strict conversation sync projection event', () => {
+    const event = {
+      type: 'conversation_updated',
+      conversationId: 'conversation_1',
+      conversation: {
+        id: 'conversation_1',
+        title: 'Synced title',
+        titleState: 'user_named',
+        revision: 2,
+        syncState: 'synced',
+        createdAt: '2026-08-23T12:00:00.000Z',
+        lastActivityAt: '2026-08-23T12:01:00.000Z',
+        metadataUpdatedAt: '2026-08-23T12:01:00.000Z',
+      },
+    }
+    expect(chatEventSchema.parse(event)).toEqual(event)
+    expect(() => chatEventSchema.parse({
+      ...event,
+      conversation: { ...event.conversation, userId: 'private-owner' },
+    })).toThrow()
+    expect(() => chatEventSchema.parse({
+      ...event,
+      conversationId: 'different-conversation',
+    })).toThrow()
+  })
+
+  it('carries only a conversation ID in a strict removal event', () => {
+    const event = {
+      type: 'conversation_removed',
+      conversationId: 'conversation_1',
+    }
+    expect(chatEventSchema.parse(event)).toEqual(event)
+    for (const privateField of [
+      { uid: 'private-owner' },
+      { ownerUserId: 'private-owner' },
+      { revision: 3 },
+      { tombstone: { deletedAt: '2026-08-25T00:00:00.000Z' } },
+    ]) {
+      expect(() => chatEventSchema.parse({ ...event, ...privateField })).toThrow()
+    }
+  })
+
+  it('carries a strict owner-free global sync warning state event', () => {
+    const warning = {
+      type: 'sync_warning_updated',
+      warningSince: '2026-08-23T12:00:00.000Z',
+    }
+    expect(chatEventSchema.parse(warning)).toEqual(warning)
+    expect(chatEventSchema.parse({ type: 'sync_warning_updated' }))
+      .toEqual({ type: 'sync_warning_updated' })
+    for (const privateField of [{ userId: 'alice' }, { uid: 'alice' }, { extra: true }]) {
+      expect(() => chatEventSchema.parse({ ...warning, ...privateField })).toThrow()
+    }
+  })
+
   it('allows attachment-only understanding but rejects empty or encoded sends', () => {
     expect(chatSendInputSchema.parse({
       conversationId: 'conversation_1',
@@ -1198,9 +1832,10 @@ describe('cross-process contracts', () => {
   })
 
   it('requires a conversation identity when reading persisted messages', () => {
-    expect(ipcRequestSchemas[ipcChannels.chatListMessages].parse({ conversationId: 'conversation_1' }))
-      .toEqual({ conversationId: 'conversation_1' })
-    expect(() => ipcRequestSchemas[ipcChannels.chatListMessages].parse({})).toThrow()
+    expect(ipcRequestSchemas[ipcChannels.chatListMessages].parse({
+      conversationId: 'conversation_1', limit: 100,
+    })).toEqual({ conversationId: 'conversation_1', limit: 100 })
+    expect(() => ipcRequestSchemas[ipcChannels.chatListMessages].parse({ limit: 100 })).toThrow()
   })
 
   it('rejects a persistent approval without an exact workflow version', () => {

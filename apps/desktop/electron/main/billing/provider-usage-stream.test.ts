@@ -27,7 +27,9 @@ function harness(values: readonly ModelStreamEvent[], streamError?: unknown) {
     bindIdentity: vi.fn((_key, input) => { order.push('bind'); return input as never }),
     report: vi.fn((_key, input) => { order.push('report'); return input as never }),
     markUnknown: vi.fn((key) => { order.push('unknown'); return key as never }),
-  } satisfies Pick<ProviderUsageRepository, 'start' | 'bindIdentity' | 'report' | 'markUnknown'>
+    recordByokUsage: vi.fn((event) => { order.push('byok'); return event }),
+  } satisfies Pick<ProviderUsageRepository,
+    'start' | 'bindIdentity' | 'report' | 'markUnknown' | 'recordByokUsage'>
   const stream = vi.fn(async function* () {
     order.push('stream')
     yield* events(values)
@@ -44,6 +46,7 @@ function harness(values: readonly ModelStreamEvent[], streamError?: unknown) {
   }
   const tracked = trackProviderStream({
     operationKey: 'operation_1',
+    purpose: 'assistant_reply',
     attribution: {
       userId: 'user_1', requestId: 'request_1', chatRunId: 'run_1',
       model: 'openrouter/model', modality: 'text',
@@ -68,7 +71,7 @@ describe('trackProviderStream', () => {
 
     await expect(collect(test.tracked)).resolves.toHaveLength(3)
 
-    expect(test.order).toEqual(['start', 'stream', 'bind', 'report'])
+    expect(test.order).toEqual(['start', 'stream', 'bind', 'report', 'byok'])
     expect(test.providerUsage.start).toHaveBeenCalledWith({
       id: 'usage_1', operationKey: 'operation_1', userId: 'user_1',
       provider: 'openrouter', apiKeyFingerprint: 'fingerprint_1',
@@ -84,6 +87,14 @@ describe('trackProviderStream', () => {
       costUsd: '0.000000000009', endedAt: 100,
     })
     expect(test.providerUsage.markUnknown).not.toHaveBeenCalled()
+    expect(test.providerUsage.recordByokUsage).toHaveBeenCalledWith({
+      id: 'usage_1', operationId: 'operation_1', purpose: 'assistant_reply',
+      credentialOwner: 'user', billable: false, provider: 'openrouter',
+      model: 'openrouter/model', modality: 'text', inputTokens: 2, outputTokens: 3,
+      costStatus: 'estimated', estimatedCostUsd: '0.000000000009',
+      occurredAt: '1970-01-01T00:00:00.100Z',
+    })
+    expect(JSON.stringify(test.providerUsage.recordByokUsage.mock.calls)).not.toMatch(/apiKey|fingerprint/i)
   })
 
   it('marks missing cost unknown while preserving its generation identity', async () => {
@@ -163,6 +174,7 @@ describe('trackProviderStream', () => {
     }
     const tracked = trackProviderStream({
       operationKey: 'operation_error_frame',
+      purpose: 'assistant_reply',
       attribution: {
         userId: 'user_1', requestId: 'request_error_frame', chatRunId: 'run_error_frame',
         model: 'openrouter/model', modality: 'text',
@@ -181,7 +193,7 @@ describe('trackProviderStream', () => {
     if (expectedCost === undefined) {
       expect(test.providerUsage.report).not.toHaveBeenCalled()
       expect(test.providerUsage.markUnknown).toHaveBeenCalledWith('operation_error_frame', 200)
-      expect(test.order).toEqual(['start', 'bind', 'unknown'])
+      expect(test.order).toEqual(['start', 'bind', 'unknown', 'byok'])
     } else {
       expect(test.providerUsage.report).toHaveBeenCalledOnce()
       expect(test.providerUsage.report).toHaveBeenCalledWith('operation_error_frame', {
@@ -189,7 +201,7 @@ describe('trackProviderStream', () => {
         costUsd: expectedCost, endedAt: 200,
       })
       expect(test.providerUsage.markUnknown).not.toHaveBeenCalled()
-      expect(test.order).toEqual(['start', 'bind', 'report'])
+      expect(test.order).toEqual(['start', 'bind', 'report', 'byok'])
     }
     expect(fetch).toHaveBeenCalledTimes(1)
     expect(sleep).not.toHaveBeenCalled()
@@ -219,6 +231,7 @@ describe('trackProviderStream', () => {
     const test = harness([])
     const tracked = trackProviderStream({
       operationKey: 'operation_choice_error',
+      purpose: 'assistant_reply',
       attribution: {
         userId: 'user_1', requestId: 'request_choice_error', chatRunId: 'run_choice_error',
         model: 'openrouter/model', modality: 'text',
@@ -292,8 +305,11 @@ describe('trackProviderStream', () => {
     },
   )
 
-  it('does not create a ledger event for a DeepSeek snapshot or serialize end-user data itself', async () => {
-    const test = harness([{ type: 'finish', choiceIndex: 0, reason: 'stop' }])
+  it('records a safe unavailable BYOK event for DeepSeek without key or fingerprint fields', async () => {
+    const test = harness([
+      { type: 'usage', inputTokens: 7, outputTokens: 4, totalTokens: 11 },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ])
     const deepSeek: ModelProviderSnapshot = {
       providerId: 'deepseek',
       provider: {
@@ -305,6 +321,7 @@ describe('trackProviderStream', () => {
 
     await collect(trackProviderStream({
       operationKey: 'deepseek_1',
+      purpose: 'assistant_reply',
       attribution: { userId: 'user_1', requestId: 'request_1', model: 'deepseek-chat', modality: 'text' },
       request,
       provider: deepSeek,
@@ -314,5 +331,12 @@ describe('trackProviderStream', () => {
 
     expect(test.providerUsage.start).not.toHaveBeenCalled()
     expect(test.stream).toHaveBeenCalledWith(request)
+    expect(test.providerUsage.recordByokUsage).toHaveBeenCalledWith({
+      id: 'usage_2', operationId: 'deepseek_1', purpose: 'assistant_reply',
+      credentialOwner: 'user', billable: false, provider: 'deepseek', model: 'deepseek-chat',
+      modality: 'text', inputTokens: 7, outputTokens: 4, costStatus: 'unavailable',
+      occurredAt: '1970-01-01T00:00:00.100Z',
+    })
+    expect(JSON.stringify(test.providerUsage.recordByokUsage.mock.calls)).not.toMatch(/apiKey|fingerprint|endUser/i)
   })
 })

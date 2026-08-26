@@ -3,7 +3,13 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import ElementPlus, { ElMessage, ElMessageBox } from 'element-plus'
-import type { AppSettings, DesktopAPI, ModelInfo, TokenUsageSnapshot } from '@autoforge/shared'
+import type {
+  AppSettings,
+  ConversationSummary,
+  DesktopAPI,
+  ModelInfo,
+  TokenUsageSnapshot,
+} from '@autoforge/shared'
 import App from '../../src/App.vue'
 import ExecutionCard from '../../src/components/chat/ExecutionCard.vue'
 import { tokenColors } from '../../src/components/settings/token-usage-chart-options'
@@ -82,6 +88,23 @@ function usageSnapshot(totalTokens: number, model = 'alpha/model'): TokenUsageSn
   }
 }
 
+function conversationSummary(
+  id: string,
+  lastActivityAt: string,
+  syncState: ConversationSummary['syncState'] = 'synced',
+): ConversationSummary {
+  return {
+    id,
+    title: id,
+    titleState: 'user_named',
+    revision: 1,
+    syncState,
+    createdAt: '2026-07-19T00:00:00.000Z',
+    lastActivityAt,
+    metadataUpdatedAt: lastActivityAt,
+  }
+}
+
 function computedColor(value: string) {
   const probe = document.createElement('span')
   probe.style.color = value
@@ -96,7 +119,7 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
     auth: {
       getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
       cancelOtp: vi.fn().mockResolvedValue(undefined), loginWithPassword: vi.fn(),
-      logout: vi.fn().mockResolvedValue(undefined),
+      logout: vi.fn().mockResolvedValue({ status: 'logged_out' }),
     },
     profile: {
       get: vi.fn().mockResolvedValue({ userId: 'user_1', account: 'Alice' }),
@@ -104,9 +127,19 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       pickAndUploadAvatar: vi.fn().mockResolvedValue(null),
     },
     chat: {
-      listConversations: vi.fn().mockResolvedValue([]), createConversation: vi.fn(),
-      listMessages: vi.fn().mockResolvedValue([]),
+      listConversations: vi.fn().mockResolvedValue({ items: [] }), createConversation: vi.fn(),
+      listMessages: vi.fn().mockResolvedValue({ items: [] }),
       renameConversation: vi.fn(), deleteConversation: vi.fn(), send: vi.fn(), cancel: vi.fn(),
+      retrySync: vi.fn().mockResolvedValue(undefined),
+      getGenerationPreferences: vi.fn().mockResolvedValue({
+        outputType: 'auto', models: {},
+        generation: {
+          image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+          audio: { format: 'mp3' },
+          video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+        },
+      }),
+      updateGenerationPreferences: vi.fn(),
       onEvent: vi.fn(() => vi.fn()),
     },
     workflows: {
@@ -135,6 +168,21 @@ function createApi(overrides: Partial<DesktopAPI> = {}): DesktopAPI {
       })),
       listProviderModels: vi.fn().mockResolvedValue([]), clearLocalData: vi.fn(),
       getTokenUsage: vi.fn().mockResolvedValue(usageSnapshot(0)),
+      recordPrivacyConsent: vi.fn().mockResolvedValue(undefined),
+      previewLegacyImport: vi.fn().mockResolvedValue({
+        ownedCount: 2, unownedCount: 1, requiresUnownedConfirmation: true,
+      }),
+      importLegacyData: vi.fn().mockResolvedValue([{ batchId: 'batch_1-0', status: 'applied' }]),
+      getAccountDataPreferences: vi.fn().mockResolvedValue({ timezone: 'Asia/Shanghai', displayCurrency: 'CNY' }),
+      updateAccountDataPreferences: vi.fn().mockResolvedValue({ timezone: 'Asia/Shanghai', displayCurrency: 'CNY' }),
+      getRemoteUsage: vi.fn().mockResolvedValue({
+        startedAt: '2026-08-01T00:00:00.000Z', endedAt: '2026-08-25T00:00:00.000Z',
+        inputTokens: 10, outputTokens: 5, totalTokens: 15,
+        confirmedPlatformCost: null, pendingCount: 2,
+        byokEstimatedCostUsd: '0.01', byokEstimatedCount: 1, byokUnavailableCount: 1,
+        timezone: 'Asia/Shanghai', displayCurrency: 'CNY',
+        lastSyncAt: '2026-08-25T00:00:00.000Z',
+      }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
     ...overrides,
@@ -180,6 +228,46 @@ async function mountApp(path = '/chat', api = createApi()) {
 }
 
 describe('workbench', () => {
+  it('shows remote usage classifications and requires separate confirmation for unowned legacy history', async () => {
+    const confirm = vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValueOnce('confirm')
+      .mockResolvedValueOnce('confirm')
+    const { wrapper, api } = await mountApp('/settings')
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="remote-usage-summary"]').text())
+      .toContain('BYOK 估算'))
+    const text = wrapper.get('[data-testid="remote-usage-summary"]').text()
+    expect(text).toContain('平台已确认消费')
+    expect(text).toContain('待同步 2 笔')
+    expect(text).toContain('$0.01')
+    expect(text).toContain('Asia/Shanghai')
+    expect(text).not.toContain('BYOK 已确认')
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.importLegacyData).toHaveBeenCalledOnce())
+    expect(confirm).toHaveBeenCalledTimes(2)
+    expect(api.settings.importLegacyData).toHaveBeenCalledWith(expect.objectContaining({
+      includeUnowned: true,
+      cloudSyncConsent: expect.objectContaining({ purpose: 'cloud_sync' }),
+      unownedImportConsent: expect.objectContaining({ purpose: 'legacy_unowned_import' }),
+    }))
+  })
+
+  it('does not persist either consent when unowned legacy import confirmation is cancelled', async () => {
+    vi.spyOn(ElMessageBox, 'confirm')
+      .mockResolvedValueOnce('confirm')
+      .mockRejectedValueOnce('cancel')
+    const { wrapper, api } = await mountApp('/settings')
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="legacy-import-button"]').exists())
+      .toBe(true))
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await Promise.resolve()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.settings.importLegacyData).not.toHaveBeenCalled()
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
     setActivePinia(createPinia())
@@ -387,14 +475,127 @@ describe('workbench', () => {
     const api = createApi()
     let resolveList!: (value: Awaited<ReturnType<DesktopAPI['chat']['listConversations']>>) => void
     vi.mocked(api.chat.listConversations).mockReturnValue(new Promise((resolve) => { resolveList = resolve }))
-    vi.mocked(api.chat.createConversation).mockResolvedValue({ id: 'new', title: '新会话', createdAt: '2026-07-19T00:00:01.000Z', updatedAt: '2026-07-19T00:00:01.000Z' })
+    vi.mocked(api.chat.createConversation).mockResolvedValue({
+      ...conversationSummary('new', '2026-07-19T00:00:01.000Z', 'pending'), title: '新会话',
+    })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const store = useChatStore()
     const loading = store.loadConversations()
     await store.createConversation()
-    resolveList([{ id: 'old', title: '旧快照', createdAt: '2026-07-19T00:00:00.000Z', updatedAt: '2026-07-19T00:00:00.000Z' }])
+    resolveList({ items: [{
+      ...conversationSummary('old', '2026-07-19T00:00:00.000Z'), title: '旧快照',
+    }] })
     await loading
     expect(store.conversations.map(({ id }) => id)).toEqual(['new'])
+  })
+
+  it('asks for cloud-sync consent once before retrying the first conversation create', async () => {
+    const api = createApi()
+    vi.mocked(api.chat.createConversation)
+      .mockRejectedValueOnce({
+        code: 'IMPORT_CONFIRMATION_REQUIRED',
+        message: 'Importing this local history requires confirmation.',
+      })
+      .mockResolvedValueOnce({
+        ...conversationSummary('new', '2026-08-25T00:00:00.000Z', 'pending'),
+        title: '新会话',
+      })
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValueOnce('confirm')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+
+    await store.createConversation()
+
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(api.settings.recordPrivacyConsent).toHaveBeenCalledWith(expect.objectContaining({
+      purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08', clientVersion: '0.1.0',
+    }))
+    expect(api.chat.createConversation).toHaveBeenCalledTimes(2)
+    expect(store.selectedConversationId).toBe('new')
+  })
+
+  it('leaves the first conversation unwritten when cloud-sync consent is cancelled', async () => {
+    const api = createApi()
+    vi.mocked(api.chat.createConversation).mockRejectedValueOnce({
+      code: 'IMPORT_CONFIRMATION_REQUIRED',
+      message: 'Importing this local history requires confirmation.',
+    })
+    vi.spyOn(ElMessageBox, 'confirm').mockRejectedValueOnce('cancel')
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+
+    await store.createConversation()
+
+    expect(api.settings.recordPrivacyConsent).not.toHaveBeenCalled()
+    expect(api.chat.createConversation).toHaveBeenCalledOnce()
+    expect(store.conversations).toEqual([])
+  })
+
+  it('appends cursor pages once, removes duplicate rows, and preserves selection order', async () => {
+    const api = createApi()
+    const older = conversationSummary('older', '2026-07-19T00:00:00.000Z')
+    const newer = conversationSummary('newer', '2026-07-20T00:00:00.000Z')
+    vi.mocked(api.chat.listConversations)
+      .mockResolvedValueOnce({ items: [newer], nextCursor: 'opaque-cursor-0001' })
+      .mockResolvedValueOnce({ items: [older, newer] })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.conversations = [older]
+    store.selectedConversationId = 'older'
+
+    await store.loadConversations()
+    await Promise.all([store.loadMoreConversations(), store.loadMoreConversations()])
+
+    expect(api.chat.listConversations).toHaveBeenNthCalledWith(1, { limit: 50 })
+    expect(api.chat.listConversations).toHaveBeenNthCalledWith(2, {
+      limit: 50, cursor: 'opaque-cursor-0001',
+    })
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(2)
+    expect(store.conversations.map(({ id }) => id)).toEqual(['newer', 'older'])
+    expect(store.selectedConversationId).toBe('older')
+    expect(store.nextConversationCursor).toBeUndefined()
+  })
+
+  it('shows every sync state without exposing owner data and offers a targeted retry', async () => {
+    const api = createApi()
+    const failed = { ...conversationSummary('failed-conversation', '2026-07-20T00:00:00.000Z', 'failed'), title: '需重试' }
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [
+      failed,
+      conversationSummary('pending-conversation', '2026-07-19T00:00:03.000Z', 'pending'),
+      conversationSummary('syncing-conversation', '2026-07-19T00:00:02.000Z', 'syncing'),
+      conversationSummary('synced-conversation', '2026-07-19T00:00:01.000Z', 'synced'),
+    ] })
+    const { wrapper } = await mountApp('/chat', api)
+
+    await vi.waitFor(() => expect(new Set(wrapper
+      .findAll('[data-testid="conversation-sync-status"]')
+      .map((status) => status.attributes('aria-label')))).toEqual(new Set([
+      '同步失败', '等待同步', '正在同步', '同步完成',
+    ])))
+    const retry = wrapper.get('[data-testid="retry-conversation-sync"]')
+    expect(retry.attributes('aria-label')).toContain('需重试')
+    await retry.trigger('click')
+    await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('failed-conversation'))
+    expect(wrapper.html()).not.toContain('userId')
+  })
+
+  it('shows an actionable durable sync warning and clears it after recovery', async () => {
+    const api = createApi()
+    let listener!: Parameters<DesktopAPI['chat']['onEvent']>[0]
+    vi.mocked(api.chat.onEvent).mockImplementation((value) => { listener = value; return vi.fn() })
+    vi.mocked(api.chat.listConversations).mockResolvedValue({
+      items: [conversationSummary('visible-conversation', '2026-07-20T00:00:00.000Z')],
+    })
+    const { wrapper } = await mountApp('/chat', api)
+
+    listener({
+      type: 'sync_warning_updated', warningSince: '2026-07-19T00:00:00.000Z',
+    })
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="durable-sync-warning"]').text())
+      .toContain('24 小时'))
+    listener({ type: 'sync_warning_updated' })
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="durable-sync-warning"]').exists()).toBe(false))
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(1)
   })
 
   it('serializes settings patches so older full responses cannot roll back newer fields', async () => {
@@ -1022,11 +1223,11 @@ describe('workbench', () => {
     })).toEqual(['Token 趋势', '模型用量'])
 
     const table = wrapper.get('.billing-table')
-    expect(table.attributes('aria-label')).toBe('模型用量与 OpenRouter 消费')
+    expect(table.attributes('aria-label')).toBe('模型用量与 OpenRouter BYOK 估算')
     const headers = table.findAll('th')
     expect(headers).toHaveLength(8)
     expect(headers.map((cell) => cell.text()))
-      .toEqual(['Provider', '模型', '输入 Token', '输出 Token', '总 Token', 'OpenRouter 消费', '已确认', '待确认'])
+      .toEqual(['Provider', '模型', '输入 Token', '输出 Token', '总 Token', 'OpenRouter BYOK 估算', '已估算', '费用不可用'])
     expect(headers.map((cell) => cell.attributes('scope'))).toEqual(Array(8).fill('col'))
     expect(table.get('tbody tr').findAll('td').map((cell) => cell.text()))
       .toEqual(['OpenRouter', 'precise/model', '1,200', '34', '1,234', '$0', '0', '0'])
@@ -1107,14 +1308,14 @@ describe('workbench', () => {
       .toContain('$0.0000001'))
 
     expect(wrapper.get('[data-testid="billing-panel"] h2').text()).toBe('用量与消费')
-    expect(wrapper.get('[data-testid="billing-summary-known"]').text()).toContain('已确认 1 笔')
+    expect(wrapper.get('[data-testid="billing-summary-known"]').text()).toContain('已取得费用估算 1 笔')
     const warning = wrapper.get('[data-testid="billing-cost-warning"]')
-    expect(warning.text()).toBe('有 2 笔费用待确认')
+    expect(warning.text()).toBe('有 2 笔费用不可用')
     const help = warning.get('[data-testid="billing-cost-help"]')
     expect(help.attributes('tabindex')).toBe('0')
     expect(help.attributes('role')).toBe('img')
-    expect(help.attributes('aria-label')).toBe('查看待确认费用说明')
-    const explanation = '这表示部分 OpenRouter 调用暂未取得准确费用。当前显示的消费金额不包含这些费用，无需手动确认，系统会自动尝试查询。'
+    expect(help.attributes('aria-label')).toBe('查看费用不可用说明')
+    const explanation = '这表示部分 OpenRouter BYOK 调用暂未取得费用估算。当前显示的估算金额不包含这些调用，系统会自动尝试查询。'
     const tooltip = wrapper.findAllComponents({ name: 'ElTooltip' })
       .find((component) => component.props('content') === explanation)
     expect(tooltip?.props('content')).toBe(explanation)

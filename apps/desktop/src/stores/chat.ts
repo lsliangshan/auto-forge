@@ -11,6 +11,7 @@ import type {
   MediaAsset,
 } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
+import { ElMessageBox } from 'element-plus'
 
 export type UiChatBlock = ChatBlock & { id: string }
 export interface UiChatMessage {
@@ -20,6 +21,9 @@ export interface UiChatMessage {
   createdAt: string
 }
 export type ChatSendAcknowledgement = (accepted: boolean) => void
+type ConversationEventOverlay =
+  | { version: number; type: 'updated'; conversation: ConversationSummary }
+  | { version: number; type: 'removed' }
 
 interface ChatHub { listeners: Set<(event: ChatEvent) => void>; unsubscribe: () => void }
 const hubs = new WeakMap<DesktopAPI, ChatHub>()
@@ -178,6 +182,82 @@ function mergeMessageSnapshots(
   ]
 }
 
+function sortConversations(conversations: ConversationSummary[]): ConversationSummary[] {
+  return [...conversations].sort((left, right) => (
+    right.lastActivityAt.localeCompare(left.lastActivityAt) || left.id.localeCompare(right.id)
+  ))
+}
+
+function mergeConversationPages(
+  existing: ConversationSummary[],
+  incoming: ConversationSummary[],
+): ConversationSummary[] {
+  const byId = new Map(existing.map((conversation) => [conversation.id, conversation]))
+  for (const conversation of incoming) byId.set(conversation.id, conversation)
+  return sortConversations([...byId.values()])
+}
+
+function applyConversationEventOverlays(
+  conversations: ConversationSummary[],
+  requestEventVersion: number,
+  overlays: Readonly<Record<string, ConversationEventOverlay>>,
+): ConversationSummary[] {
+  const byId = new Map(conversations.map((conversation) => [conversation.id, conversation]))
+  for (const [conversationId, overlay] of Object.entries(overlays)) {
+    if (overlay.version <= requestEventVersion) continue
+    if (overlay.type === 'removed') byId.delete(conversationId)
+    else byId.set(conversationId, overlay.conversation)
+  }
+  return sortConversations([...byId.values()])
+}
+
+function advanceActivity(current: string, candidate: string, latest: string): string {
+  const currentAt = Date.parse(current)
+  const candidateAt = Date.parse(candidate)
+  const latestAt = Date.parse(latest)
+  return new Date(Math.max(candidateAt, currentAt + 1, latestAt + 1)).toISOString()
+}
+
+function updateConversationActivity(
+  conversations: ConversationSummary[],
+  conversationId: string,
+  candidateAt: string,
+  patch: Partial<ConversationSummary> = {},
+): ConversationSummary[] {
+  const current = conversations.find(({ id }) => id === conversationId)
+  if (!current) return conversations
+  const latest = conversations.reduce(
+    (activity, conversation) => conversation.lastActivityAt > activity
+      ? conversation.lastActivityAt
+      : activity,
+    current.lastActivityAt,
+  )
+  return mergeConversationPages(
+    conversations.filter(({ id }) => id !== conversationId),
+    [{
+      ...current,
+      ...patch,
+      syncState: 'pending',
+      lastActivityAt: advanceActivity(current.lastActivityAt, candidateAt, latest),
+    }],
+  )
+}
+
+function mergeHistoryPages(older: UiChatMessage[], current: UiChatMessage[]): UiChatMessage[] {
+  const order: string[] = []
+  const byId = new Map<string, UiChatMessage>()
+  for (const message of [...older, ...current]) {
+    const existing = byId.get(message.id)
+    if (!existing) {
+      order.push(message.id)
+      byId.set(message.id, message)
+      continue
+    }
+    byId.set(message.id, mergeMessageSnapshots([existing], [message])[0]!)
+  }
+  return order.map((id) => byId.get(id)!)
+}
+
 function closedAdmissions(store: object): Set<string> {
   let closed = closedMediaAdmissions.get(store)
   if (!closed) {
@@ -190,8 +270,11 @@ function closedAdmissions(store: object): Set<string> {
 export const useChatStore = defineStore('chat', {
   state: () => ({
     conversations: [] as ConversationSummary[],
+    nextConversationCursor: undefined as string | undefined,
+    syncWarningSince: undefined as string | undefined,
     selectedConversationId: '' as string,
     messagesByConversation: {} as Record<string, UiChatMessage[]>,
+    previousMessageCursorByConversation: {} as Record<string, string | undefined>,
     draftsByConversation: {} as Record<string, MediaAsset[]>,
     preferencesByConversation: {} as Record<string, ConversationGenerationPreferences>,
     pendingRequestByConversation: {} as Record<string, true>,
@@ -205,6 +288,14 @@ export const useChatStore = defineStore('chat', {
     _selectionVersion: 0,
     _messageVersions: {} as Record<string, number>,
     _messageLoadVersions: {} as Record<string, number>,
+    _conversationPageRequests: {} as Record<string, number>,
+    _conversationEventVersion: 0,
+    _conversationEventOverlays: {} as Record<string, ConversationEventOverlay>,
+    _messagePageRequests: {} as Record<string, number>,
+    _preferenceLoadRequests: {} as Record<string, number>,
+    _pageRequestSequence: 0,
+    _dataGeneration: 0,
+    _syncWarningVersion: 0,
     _preferenceVersions: {} as Record<string, number>,
     _stateEpoch: 0,
     _subscribed: false,
@@ -234,12 +325,17 @@ export const useChatStore = defineStore('chat', {
       this._loadVersion += 1
       this._selectionVersion += 1
       this._stateEpoch += 1
+      this._dataGeneration += 1
+      this._syncWarningVersion += 1
       storeReleases.get(this)?.()
       storeReleases.delete(this)
       this._subscribed = false
       this.conversations = []
+      this.nextConversationCursor = undefined
+      this.syncWarningSince = undefined
       this.selectedConversationId = ''
       this.messagesByConversation = {}
+      this.previousMessageCursorByConversation = {}
       this.draftsByConversation = {}
       this.preferencesByConversation = {}
       this.pendingRequestByConversation = {}
@@ -249,6 +345,12 @@ export const useChatStore = defineStore('chat', {
       this._terminalRequests = {}
       this._messageVersions = {}
       this._messageLoadVersions = {}
+      this._pageRequestSequence += 1
+      this._conversationPageRequests = {}
+      this._conversationEventVersion = 0
+      this._conversationEventOverlays = {}
+      this._messagePageRequests = {}
+      this._preferenceLoadRequests = {}
       this._preferenceVersions = {}
       closedMediaAdmissions.delete(this)
       this.loading = false
@@ -270,20 +372,38 @@ export const useChatStore = defineStore('chat', {
         }
       }
     },
-    async loadConversations() {
+    async loadConversations(hydrateSelected = true, force = false) {
       this.ensureSubscriptions()
+      const requestKey = 'initial'
+      if (this._conversationPageRequests[requestKey] && !force) return
       const version = ++this._loadVersion
+      const requestToken = ++this._pageRequestSequence
+      const dataGeneration = this._dataGeneration
+      const syncWarningVersion = this._syncWarningVersion
+      const conversationEventVersion = this._conversationEventVersion
+      this._conversationPageRequests[requestKey] = requestToken
       this.loading = true
       this.error = ''
       try {
-        const conversations = await getDesktopApi().chat.listConversations()
-        if (version !== this._loadVersion) return
-        this.conversations = conversations
-        if (!conversations.some(({ id }) => id === this.selectedConversationId)) {
-          this.selectedConversationId = conversations[0]?.id ?? ''
+        const page = await getDesktopApi().chat.listConversations({ limit: 50 })
+        if (version !== this._loadVersion
+          || dataGeneration !== this._dataGeneration
+          || this._conversationPageRequests[requestKey] !== requestToken) return
+        const selected = this.conversations.find(({ id }) => id === this.selectedConversationId)
+        this.conversations = applyConversationEventOverlays(
+          mergeConversationPages(selected ? [selected] : [], page.items),
+          conversationEventVersion,
+          this._conversationEventOverlays,
+        )
+        this.nextConversationCursor = page.nextCursor
+        if (syncWarningVersion === this._syncWarningVersion) {
+          this.syncWarningSince = page.syncWarningSince
+        }
+        if (!this.selectedConversationId) {
+          this.selectedConversationId = this.conversations[0]?.id ?? ''
           this._selectionVersion += 1
         }
-        if (this.selectedConversationId) {
+        if (hydrateSelected && this.selectedConversationId) {
           await Promise.all([
             this.messagesByConversation[this.selectedConversationId] === undefined
               ? this.loadMessages(this.selectedConversationId)
@@ -294,18 +414,82 @@ export const useChatStore = defineStore('chat', {
           ])
         }
       } catch (error) {
-        if (version === this._loadVersion) this.error = displayError(error, '会话加载失败')
+        if (version === this._loadVersion
+          && dataGeneration === this._dataGeneration
+          && this._conversationPageRequests[requestKey] === requestToken) {
+          this.error = displayError(error, '会话加载失败')
+        }
       } finally {
-        if (version === this._loadVersion) this.loading = false
+        const requestIsCurrent = dataGeneration === this._dataGeneration
+          && this._conversationPageRequests[requestKey] === requestToken
+        if (requestIsCurrent) delete this._conversationPageRequests[requestKey]
+        if (requestIsCurrent && version === this._loadVersion) this.loading = false
+      }
+    },
+    async loadMoreConversations() {
+      const cursor = this.nextConversationCursor
+      if (!cursor || this._conversationPageRequests[cursor]) return
+      const requestToken = ++this._pageRequestSequence
+      const dataGeneration = this._dataGeneration
+      const syncWarningVersion = this._syncWarningVersion
+      const conversationEventVersion = this._conversationEventVersion
+      this._conversationPageRequests[cursor] = requestToken
+      try {
+        const page = await getDesktopApi().chat.listConversations({ limit: 50, cursor })
+        if (dataGeneration !== this._dataGeneration
+          || this._conversationPageRequests[cursor] !== requestToken
+          || this.nextConversationCursor !== cursor) return
+        this.conversations = applyConversationEventOverlays(
+          mergeConversationPages(this.conversations, page.items),
+          conversationEventVersion,
+          this._conversationEventOverlays,
+        )
+        this.nextConversationCursor = page.nextCursor
+        if (syncWarningVersion === this._syncWarningVersion) {
+          this.syncWarningSince = page.syncWarningSince
+        }
+      } catch (error) {
+        if (dataGeneration === this._dataGeneration
+          && this._conversationPageRequests[cursor] === requestToken) {
+          this.error = displayError(error, '会话加载失败')
+        }
+      } finally {
+        if (dataGeneration === this._dataGeneration
+          && this._conversationPageRequests[cursor] === requestToken) {
+          delete this._conversationPageRequests[cursor]
+        }
       }
     },
     async createConversation() {
       this.error = ''
       try {
-        const conversation = await getDesktopApi().chat.createConversation()
+        const api = getDesktopApi()
+        let conversation: ConversationSummary
+        try {
+          conversation = await api.chat.createConversation()
+        } catch (error) {
+          if (typeof error !== 'object' || error === null
+            || !('code' in error) || error.code !== 'IMPORT_CONFIRMATION_REQUIRED') throw error
+          try {
+            await ElMessageBox.confirm(
+              '开启云同步后，新会话会保存到当前 AutoForge 账户。',
+              '开启账户云同步',
+              { type: 'warning', confirmButtonText: '同意并创建', cancelButtonText: '取消' },
+            )
+          } catch (confirmationError) {
+            if (confirmationError === 'cancel' || confirmationError === 'close') return
+            throw confirmationError
+          }
+          const appInfo = await api.system.getAppInfo()
+          await api.settings.recordPrivacyConsent({
+            purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+            consentedAt: new Date().toISOString(), clientVersion: appInfo.version,
+          })
+          conversation = await api.chat.createConversation()
+        }
         this._loadVersion += 1
         this.loading = false
-        this.conversations.unshift(conversation)
+        this.conversations = mergeConversationPages(this.conversations, [conversation])
         closedAdmissions(this).delete(conversation.id)
         this.selectedConversationId = conversation.id
         this._selectionVersion += 1
@@ -320,7 +504,10 @@ export const useChatStore = defineStore('chat', {
         this._loadVersion += 1
         this.loading = false
         const index = this.conversations.findIndex((item) => item.id === id)
-        if (index >= 0) this.conversations[index] = updated
+        if (index >= 0) this.conversations = mergeConversationPages(
+          this.conversations.filter((item) => item.id !== id),
+          [updated],
+        )
       } catch (error) { this.error = displayError(error, '重命名失败') }
     },
     async deleteConversation(id: string) {
@@ -334,6 +521,7 @@ export const useChatStore = defineStore('chat', {
           this.loading = false
           this.conversations = this.conversations.filter((item) => item.id !== id)
           delete this.messagesByConversation[id]
+          delete this.previousMessageCursorByConversation[id]
           delete this.draftsByConversation[id]
           delete this.preferencesByConversation[id]
           delete this.pendingRequestByConversation[id]
@@ -374,16 +562,22 @@ export const useChatStore = defineStore('chat', {
       ])
     },
     async loadMessages(conversationId: string) {
-      const selectionVersion = this._selectionVersion
+      const requestKey = `${conversationId}:latest`
+      if (this._messagePageRequests[requestKey]) return
       const mutationVersion = this._messageVersions[conversationId] ?? 0
       const loadVersion = (this._messageLoadVersions[conversationId] ?? 0) + 1
       this._messageLoadVersions[conversationId] = loadVersion
+      const requestToken = ++this._pageRequestSequence
+      const dataGeneration = this._dataGeneration
+      this._messagePageRequests[requestKey] = requestToken
       try {
-        const messages = await getDesktopApi().chat.listMessages(conversationId)
-        if (this.selectedConversationId !== conversationId
-          || selectionVersion !== this._selectionVersion
+        const page = await getDesktopApi().chat.listMessages({ conversationId, limit: 100 })
+        if (dataGeneration !== this._dataGeneration
+          || this._messagePageRequests[requestKey] !== requestToken
+          || this.selectedConversationId !== conversationId
           || loadVersion !== this._messageLoadVersions[conversationId]) return
-        const snapshot = messages.map(persistedMessage)
+        const snapshot = page.items.map(persistedMessage)
+        this.previousMessageCursorByConversation[conversationId] = page.previousCursor
         if (mutationVersion !== (this._messageVersions[conversationId] ?? 0)) {
           this.messagesByConversation[conversationId] = mergeMessageSnapshots(
             snapshot,
@@ -393,24 +587,88 @@ export const useChatStore = defineStore('chat', {
           this.messagesByConversation[conversationId] = snapshot
         }
       } catch (error) {
-        if (this.selectedConversationId === conversationId && selectionVersion === this._selectionVersion) {
+        if (dataGeneration === this._dataGeneration
+          && this._messagePageRequests[requestKey] === requestToken
+          && this.selectedConversationId === conversationId) {
           this.error = displayError(error, '消息记录加载失败')
+        }
+      } finally {
+        if (dataGeneration === this._dataGeneration
+          && this._messagePageRequests[requestKey] === requestToken) {
+          delete this._messagePageRequests[requestKey]
         }
       }
     },
+    async loadOlderMessages(conversationId: string) {
+      const cursor = this.previousMessageCursorByConversation[conversationId]
+      const requestKey = `${conversationId}:${cursor ?? 'complete'}`
+      if (!cursor || this._messagePageRequests[requestKey]) return
+      const requestToken = ++this._pageRequestSequence
+      const dataGeneration = this._dataGeneration
+      this._messagePageRequests[requestKey] = requestToken
+      try {
+        const page = await getDesktopApi().chat.listMessages({
+          conversationId,
+          limit: 100,
+          cursor,
+        })
+        if (dataGeneration !== this._dataGeneration
+          || this._messagePageRequests[requestKey] !== requestToken
+          || this.previousMessageCursorByConversation[conversationId] !== cursor) return
+        this.messagesByConversation[conversationId] = mergeHistoryPages(
+          page.items.map(persistedMessage),
+          this.messagesByConversation[conversationId] ?? [],
+        )
+        this.previousMessageCursorByConversation[conversationId] = page.previousCursor
+      } catch (error) {
+        if (dataGeneration === this._dataGeneration
+          && this._messagePageRequests[requestKey] === requestToken
+          && this.selectedConversationId === conversationId) {
+          this.error = displayError(error, '消息记录加载失败')
+        }
+      } finally {
+        if (dataGeneration === this._dataGeneration
+          && this._messagePageRequests[requestKey] === requestToken) {
+          delete this._messagePageRequests[requestKey]
+        }
+      }
+    },
+    async retrySync(conversationId?: string) {
+      try {
+        await getDesktopApi().chat.retrySync(conversationId)
+        await this.loadConversations(false, true)
+      } catch (error) {
+        this.error = displayError(error, '同步重试失败')
+      }
+    },
     async loadGenerationPreferences(conversationId: string) {
+      if (this._preferenceLoadRequests[conversationId]) return
       const epoch = this._stateEpoch
       const version = (this._preferenceVersions[conversationId] ?? 0) + 1
       this._preferenceVersions[conversationId] = version
+      const requestToken = ++this._pageRequestSequence
+      const dataGeneration = this._dataGeneration
+      this._preferenceLoadRequests[conversationId] = requestToken
       try {
         const preferences = await getDesktopApi().chat.getGenerationPreferences(conversationId)
-        if (epoch !== this._stateEpoch || version !== this._preferenceVersions[conversationId]) return
+        if (dataGeneration !== this._dataGeneration
+          || this._preferenceLoadRequests[conversationId] !== requestToken
+          || epoch !== this._stateEpoch
+          || this.selectedConversationId !== conversationId
+          || version !== this._preferenceVersions[conversationId]) return
         this.preferencesByConversation[conversationId] = preferences
       } catch (error) {
-        if (epoch === this._stateEpoch
+        if (dataGeneration === this._dataGeneration
+          && this._preferenceLoadRequests[conversationId] === requestToken
+          && epoch === this._stateEpoch
           && version === this._preferenceVersions[conversationId]
           && this.selectedConversationId === conversationId) {
           this.error = displayError(error, '生成设置加载失败')
+        }
+      } finally {
+        if (dataGeneration === this._dataGeneration
+          && this._preferenceLoadRequests[conversationId] === requestToken) {
+          delete this._preferenceLoadRequests[conversationId]
         }
       }
     },
@@ -593,6 +851,14 @@ export const useChatStore = defineStore('chat', {
         || this.isRunning) return false
       const conversationId = this.selectedConversationId
       const epoch = this._stateEpoch
+      const previousConversation = this.conversations.find(({ id }) => id === conversationId)
+      this.conversations = updateConversationActivity(
+        this.conversations,
+        conversationId,
+        new Date().toISOString(),
+      )
+      const optimisticActivity = this.conversations.find(({ id }) => id === conversationId)
+        ?.lastActivityAt
       this.pendingRequestByConversation[conversationId] = true
       this.awaitingResponseByConversation[conversationId] = true
       const drafts = this.draftsByConversation[conversationId] ?? []
@@ -666,6 +932,13 @@ export const useChatStore = defineStore('chat', {
         delete this._cancelRequestedByConversation[conversationId]
         this.messagesByConversation[conversationId] = (this.messagesByConversation[conversationId] ?? [])
           .filter(({ id }) => id !== localId)
+        const currentConversation = this.conversations.find(({ id }) => id === conversationId)
+        if (previousConversation && currentConversation?.lastActivityAt === optimisticActivity) {
+          this.conversations = mergeConversationPages(
+            this.conversations.filter(({ id }) => id !== conversationId),
+            [previousConversation],
+          )
+        }
         this._messageVersions[conversationId] = (this._messageVersions[conversationId] ?? 0) + 1
         this.reportConversationError(conversationId, epoch, displayError(error, '消息发送失败'))
         return false
@@ -683,15 +956,139 @@ export const useChatStore = defineStore('chat', {
       try { await getDesktopApi().chat.cancel(requestId) }
       catch (error) { this.error = displayError(error, '取消生成失败') }
     },
+    async refreshAfterConversationRemoval(
+      dataGeneration: number,
+      selectedBeforeRemoval: string,
+      selectedLatestLoadInvalidated: boolean,
+      selectedOlderCursorsInvalidated: readonly string[],
+      selectedPreferenceLoadInvalidated: boolean,
+    ) {
+      try {
+        await this.loadConversations(false)
+        if (dataGeneration !== this._dataGeneration) return
+        const conversationId = this.selectedConversationId
+        if (!conversationId) return
+        const selectedConversationWasPreserved = conversationId === selectedBeforeRemoval
+        await Promise.all([
+          this.messagesByConversation[conversationId] === undefined
+            || (selectedConversationWasPreserved && selectedLatestLoadInvalidated)
+            ? this.loadMessages(conversationId)
+            : undefined,
+          this.preferencesByConversation[conversationId] === undefined
+            || (selectedConversationWasPreserved && selectedPreferenceLoadInvalidated)
+            ? this.loadGenerationPreferences(conversationId)
+            : undefined,
+        ])
+        if (dataGeneration !== this._dataGeneration
+          || this.selectedConversationId !== conversationId
+          || !selectedConversationWasPreserved) return
+        const previousCursor = this.previousMessageCursorByConversation[conversationId]
+        if (previousCursor && selectedOlderCursorsInvalidated.includes(previousCursor)) {
+          await this.loadOlderMessages(conversationId)
+        }
+      } catch (error) {
+        if (dataGeneration === this._dataGeneration) {
+          this.error = displayError(error, '会话刷新失败')
+        }
+      }
+    },
     applyChatEvent(event: ChatEvent) {
+      if (event.type === 'sync_warning_updated') {
+        this._syncWarningVersion += 1
+        this.syncWarningSince = event.warningSince
+        return
+      }
+      if (event.type === 'conversation_updated') {
+        const current = this.conversations.find(({ id }) => id === event.conversationId)
+        const refreshPreferences = this.selectedConversationId === event.conversationId
+          && current?.metadataUpdatedAt !== event.conversation.metadataUpdatedAt
+          && (this.preferencesByConversation[event.conversationId] !== undefined
+            || this._preferenceLoadRequests[event.conversationId] !== undefined)
+        const version = ++this._conversationEventVersion
+        this._conversationEventOverlays[event.conversationId] = {
+          version,
+          type: 'updated',
+          conversation: event.conversation,
+        }
+        this.conversations = mergeConversationPages(
+          this.conversations.filter(({ id }) => id !== event.conversationId),
+          [event.conversation],
+        )
+        if (refreshPreferences) {
+          this._preferenceVersions[event.conversationId]
+            = (this._preferenceVersions[event.conversationId] ?? 0) + 1
+          delete this._preferenceLoadRequests[event.conversationId]
+          void this.loadGenerationPreferences(event.conversationId)
+        }
+        return
+      }
+      if (event.type === 'conversation_removed') {
+        const version = ++this._conversationEventVersion
+        this._conversationEventOverlays[event.conversationId] = { version, type: 'removed' }
+        const selectedBeforeRemoval = this.selectedConversationId
+        const selectedMessageRequestPrefix = `${selectedBeforeRemoval}:`
+        const selectedLatestRequestKey = `${selectedBeforeRemoval}:latest`
+        const selectedLatestLoadInvalidated = selectedBeforeRemoval !== ''
+          && this._messagePageRequests[selectedLatestRequestKey] !== undefined
+        const selectedOlderCursorsInvalidated = selectedBeforeRemoval === '' ? [] : Object.keys(
+          this._messagePageRequests,
+        ).filter((requestKey) => (
+          requestKey.startsWith(selectedMessageRequestPrefix)
+          && requestKey !== selectedLatestRequestKey
+        )).map((requestKey) => requestKey.slice(selectedMessageRequestPrefix.length))
+        const selectedPreferenceLoadInvalidated = selectedBeforeRemoval !== ''
+          && this._preferenceLoadRequests[selectedBeforeRemoval] !== undefined
+        const removedIndex = this.conversations.findIndex(({ id }) => id === event.conversationId)
+        this.conversations = this.conversations.filter(({ id }) => id !== event.conversationId)
+        delete this.messagesByConversation[event.conversationId]
+        delete this.previousMessageCursorByConversation[event.conversationId]
+        delete this.draftsByConversation[event.conversationId]
+        delete this.preferencesByConversation[event.conversationId]
+        delete this.pendingRequestByConversation[event.conversationId]
+        delete this.activeRequestByConversation[event.conversationId]
+        delete this.awaitingResponseByConversation[event.conversationId]
+        delete this._cancelRequestedByConversation[event.conversationId]
+        delete this._messageVersions[event.conversationId]
+        delete this._messageLoadVersions[event.conversationId]
+        this._preferenceVersions[event.conversationId]
+          = (this._preferenceVersions[event.conversationId] ?? 0) + 1
+        closedAdmissions(this).add(event.conversationId)
+        this._loadVersion += 1
+        this._dataGeneration += 1
+        this._conversationPageRequests = {}
+        this._messagePageRequests = {}
+        this._preferenceLoadRequests = {}
+        this.loading = false
+        if (this.selectedConversationId === event.conversationId) {
+          const nextIndex = removedIndex < 0 ? 0 : Math.min(removedIndex, this.conversations.length - 1)
+          this.selectedConversationId = nextIndex < 0 ? '' : (this.conversations[nextIndex]?.id ?? '')
+          this._selectionVersion += 1
+        }
+        const dataGeneration = this._dataGeneration
+        void this.refreshAfterConversationRemoval(
+          dataGeneration,
+          selectedBeforeRemoval,
+          selectedLatestLoadInvalidated,
+          selectedOlderCursorsInvalidated,
+          selectedPreferenceLoadInvalidated,
+        )
+        return
+      }
       if (event.type === 'conversation_title_updated') {
         const index = this.conversations.findIndex(({ id }) => id === event.conversationId)
         if (index >= 0) {
-          this.conversations[index] = {
+          const updated = {
             ...this.conversations[index]!,
             title: event.title,
-            updatedAt: event.updatedAt,
+            titleState: 'ai_named' as const,
+            metadataUpdatedAt: event.updatedAt,
           }
+          this.conversations = updateConversationActivity(
+            this.conversations,
+            event.conversationId,
+            event.updatedAt,
+            updated,
+          )
         }
         return
       }
@@ -699,6 +1096,11 @@ export const useChatStore = defineStore('chat', {
         if (event.status === 'running') {
           if (!this._terminalRequests[event.requestId]) this.activeRequestByConversation[event.conversationId] = event.requestId
         } else {
+          this.conversations = updateConversationActivity(
+            this.conversations,
+            event.conversationId,
+            new Date().toISOString(),
+          )
           delete this.awaitingResponseByConversation[event.conversationId]
           const matchedActive = this.activeRequestByConversation[event.conversationId] === event.requestId
           if (matchedActive) delete this.activeRequestByConversation[event.conversationId]

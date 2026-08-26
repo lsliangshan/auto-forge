@@ -886,7 +886,7 @@ async function seedBinding(input: Record<string, unknown>): Promise<{ bindingId:
       status: 'completed', startedAt: Date.now(), endedAt: Date.now(),
     })
     database.executions.insert({
-      id: executionId, workflowId: provenance.workflowId, workflowVersion,
+      id: executionId, ownerUserId: userId, workflowId: provenance.workflowId, workflowVersion,
       chatRunId, status: 'completed', createdAt: Date.now(),
     })
   } finally {
@@ -1072,8 +1072,13 @@ async function resetScenario(): Promise<void> {
   manualQuietClockEnabled = false
   manualQuietNow = 0
   manualQuietTimers.clear()
-  const conversations = await runtime!.services.chat.listConversations()
-  for (const conversation of conversations) await runtime!.services.chat.deleteConversation(conversation.id)
+  while (true) {
+    const page = await runtime!.services.chat.listConversations({ limit: 50 })
+    if (page.items.length === 0) break
+    for (const conversation of page.items) {
+      await runtime!.services.chat.deleteConversation(conversation.id)
+    }
+  }
 }
 
 function durableRows(conversationId: string): { bindings: string; audits: string; messages: string } {
@@ -1161,7 +1166,7 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
   if (!runtime) throw new Error('Application runtime is unavailable')
   if (name === 'resetScenario') return resetScenario()
   if (name === 'selectedConversation') {
-    return (await runtime.services.chat.listConversations())[0]?.id ?? ''
+    return (await runtime.services.chat.listConversations({ limit: 50 })).items[0]?.id ?? ''
   }
   if (name === 'waitForIdle') {
     const deadline = Date.now() + 15_000

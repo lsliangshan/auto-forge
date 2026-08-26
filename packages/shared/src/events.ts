@@ -13,6 +13,49 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 const workflowSourceSchema = z.enum(['installed', 'development'])
 const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 
+function opaqueKeyTokens(key: string): string[] {
+  return key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((token) => token.toLowerCase())
+}
+
+const sensitiveOpaqueTokens = new Set([
+  'authorization', 'base64', 'cookie', 'cookies', 'credential', 'credentials',
+  'owner', 'password', 'passwords', 'prompt', 'prompts', 'secret', 'secrets',
+  'sql', 'token', 'tokens', 'uid',
+])
+
+function hasOpaqueTokenPair(tokens: readonly string[], first: string, second: string): boolean {
+  return tokens.some((token, index) => token === first && tokens[index + 1] === second)
+}
+
+function sensitiveOpaqueKey(key: string): boolean {
+  const tokens = opaqueKeyTokens(key)
+  if (tokens.some((token) => sensitiveOpaqueTokens.has(token))) return true
+  return hasOpaqueTokenPair(tokens, 'auth', 'header')
+    || hasOpaqueTokenPair(tokens, 'user', 'id')
+    || hasOpaqueTokenPair(tokens, 'api', 'key')
+    || hasOpaqueTokenPair(tokens, 'service', 'key')
+    || hasOpaqueTokenPair(tokens, 'response', 'body')
+    || ['local', 'file', 'root', 'absolute'].some((prefix) => (
+      hasOpaqueTokenPair(tokens, prefix, 'path')
+    ))
+    || (tokens.length === 1 && tokens[0] === 'path')
+}
+
+// Keep byte-for-byte semantics aligned with Task 3's standalone CloudBase copy.
+export function sanitizeOpaqueWorkflowArgs(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeOpaqueWorkflowArgs)
+  if (typeof value !== 'object' || value === null) return value
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+    key,
+    sensitiveOpaqueKey(key) ? '[REDACTED]' : sanitizeOpaqueWorkflowArgs(child),
+  ]))
+}
+
 function declaredScopeMatchesCapability(capability: string, scope: Record<string, unknown>): boolean {
   const needsOrigins = capability.startsWith('browser.') || capability === 'network.fetch'
   const needsPaths = capability.startsWith('filesystem.')
@@ -202,7 +245,23 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
 
 export type ChatBlock = z.infer<typeof chatBlockSchema>
 
+const conversationEventSummarySchema = z.object({
+  id: identifierSchema,
+  title: nonEmptyStringSchema,
+  titleState: z.enum(['pending', 'generating', 'ai_named', 'user_named', 'failed']),
+  revision: z.number().int().nonnegative(),
+  syncState: z.enum(['synced', 'pending', 'syncing', 'failed']),
+  syncWarningSince: timestampSchema.optional(),
+  createdAt: timestampSchema,
+  lastActivityAt: timestampSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+
 export const chatEventSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('sync_warning_updated'),
+    warningSince: timestampSchema.optional(),
+  }).strict(),
   z.object({
     type: z.literal('block'),
     conversationId: identifierSchema,
@@ -229,12 +288,28 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     title: z.string().trim().min(1).max(20),
     updatedAt: timestampSchema,
   }).strict(),
+  z.object({
+    type: z.literal('conversation_updated'),
+    conversationId: identifierSchema,
+    conversation: conversationEventSummarySchema,
+  }).strict(),
+  z.object({
+    type: z.literal('conversation_removed'),
+    conversationId: identifierSchema,
+  }).strict(),
 ]).superRefine((event, context) => {
   if (event.type === 'block_update' && event.blockId !== event.block.blockId) {
     context.addIssue({
       code: 'custom',
       path: ['blockId'],
       message: 'Replacement block identity must match the updated block',
+    })
+  }
+  if (event.type === 'conversation_updated' && event.conversationId !== event.conversation.id) {
+    context.addIssue({
+      code: 'custom',
+      path: ['conversationId'],
+      message: 'Conversation identity must match the updated projection',
     })
   }
 })

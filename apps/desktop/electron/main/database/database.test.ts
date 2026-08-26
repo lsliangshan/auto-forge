@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -6,11 +6,84 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { sql } from 'drizzle-orm'
 import { authAccountSchema, chatBlockSchema, type ConversationGenerationPreferences } from '@autoforge/shared'
-import { openAppDatabase } from './client.js'
+import { openAppDatabase as openProductionAppDatabase } from './client.js'
 import { resolveMigrationDirectory } from './migrations.js'
-import { ProviderUsageConsistencyError } from './repositories.js'
+import { createRepositories, ProviderUsageConsistencyError } from './repositories.js'
 
 const temporaryDirectories: string[] = []
+
+function openAppDatabase(path: string) {
+  const production = openProductionAppDatabase(path)
+  const sqlite = new Database(path)
+  sqlite.pragma('foreign_keys = ON')
+  const repositories = createRepositories(sqlite)
+  repositories.messages.upgradeLegacyApprovals()
+  const recoverInterrupted = () => sqlite.transaction(() => {
+    const endedAt = Date.now()
+    const executions = sqlite.prepare(`
+      UPDATE executions
+      SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = ?
+      WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')
+    `).run(endedAt).changes
+    const interruptedRuns = sqlite.prepare(`
+      SELECT id, request_id AS requestId
+      FROM chat_runs
+      WHERE status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `).all() as Array<{ id: string; requestId: string }>
+    const preservedRequestIds = new Set(repositories.mediaGenerationJobs.reconcileInterrupted(endedAt))
+    let chatRuns = 0
+    const failRun = sqlite.prepare(`
+      UPDATE chat_runs
+      SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
+      WHERE id = @id
+        AND status IN ('queued', 'awaiting_approval', 'running', 'streaming')
+    `)
+    const failedRequestIds: string[] = []
+    for (const run of interruptedRuns) {
+      if (preservedRequestIds.has(run.requestId)) continue
+      const changes = failRun.run({ id: run.id, endedAt }).changes
+      const reconciled = changes === 1 || sqlite.prepare(`
+        SELECT 1 FROM chat_runs
+        WHERE id = @id AND status = 'failed'
+          AND error_code = 'INTERNAL_ERROR' AND ended_at = @endedAt
+      `).get({ id: run.id, endedAt }) !== undefined
+      if (reconciled) {
+        chatRuns += 1
+        failedRequestIds.push(run.requestId)
+      }
+    }
+    repositories.messages.failInterruptedBrowserStatuses(failedRequestIds)
+    repositories.messages.invalidatePendingAgentApprovals()
+    repositories.messages.failInterruptedMediaGenerations()
+    repositories.conversations.failInterruptedTitleGenerations()
+    return { executions, chatRuns }
+  })()
+  recoverInterrupted()
+  const clearConversations = () => sqlite.transaction(() => {
+    sqlite.prepare('DELETE FROM conversations').run()
+  })()
+  const clearLocalData = (scope: 'conversations' | 'executions' | 'all') => sqlite.transaction(() => {
+    if (scope === 'executions' || scope === 'all') sqlite.prepare('DELETE FROM executions').run()
+    if (scope === 'conversations' || scope === 'all') sqlite.prepare('DELETE FROM conversations').run()
+  })()
+  return {
+    ...production,
+    conversations: repositories.conversations,
+    messages: repositories.messages,
+    conversationContexts: repositories.conversationContexts,
+    mediaAssets: repositories.mediaAssets,
+    mediaGenerationJobs: repositories.mediaGenerationJobs,
+    chatRuns: repositories.chatRuns,
+    providerUsage: repositories.providerUsage,
+    recoverInterrupted,
+    clearConversations,
+    clearLocalData,
+    close() {
+      sqlite.close()
+      production.close()
+    },
+  }
+}
 
 function openTestDatabase() {
   const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-'))
@@ -85,6 +158,84 @@ function createV4Database() {
     .run('run_v4', 'conversation_v4', 'request_v4', 'model-v4', 'completed', 1)
   sqlite.close()
   return { database: openAppDatabase(path), path }
+}
+
+function createV12ExecutionBoundaryDatabase() {
+  const directory = mkdtempSync(join(tmpdir(), 'autoforge-database-v12-execution-boundary-'))
+  temporaryDirectories.push(directory)
+  const path = join(directory, 'autoforge.sqlite')
+  const sqlite = new Database(path)
+  sqlite.pragma('foreign_keys = ON')
+  const migrationDirectory = fileURLToPath(new URL('../../../resources/migrations/', import.meta.url))
+  const migrations = readdirSync(migrationDirectory)
+    .map((fileName) => ({ fileName, version: Number.parseInt(fileName.slice(0, 4), 10) }))
+    .filter(({ fileName, version }) => fileName.endsWith('.sql') && version <= 12)
+    .sort((left, right) => left.version - right.version)
+  for (const migration of migrations) {
+    sqlite.exec(readFileSync(join(migrationDirectory, migration.fileName), 'utf8'))
+    sqlite.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)')
+      .run(migration.version, migration.version)
+  }
+  sqlite.prepare(`
+    INSERT INTO local_users (id, account, account_normalized, password_digest, created_at, updated_at)
+    VALUES ('execution_boundary_user', 'Execution boundary', 'execution boundary', 'digest', 1, 1)
+  `).run()
+  sqlite.prepare(`
+    INSERT INTO conversations (id, title, created_at, updated_at)
+    VALUES ('execution_boundary_conversation', 'Execution boundary', 1, 1)
+  `).run()
+  sqlite.prepare(`
+    INSERT INTO chat_runs (id, conversation_id, request_id, model, status, started_at, ended_at)
+    VALUES (
+      'legacy_global_run', 'execution_boundary_conversation', 'legacy_global_request',
+      'legacy-model', 'completed', 1, 2
+    )
+  `).run()
+  sqlite.prepare(`
+    INSERT INTO executions (
+      id, workflow_id, workflow_version, chat_run_id, status, input_json, result_json,
+      error_code, created_at, started_at, ended_at
+    ) VALUES (
+      'legacy_execution', 'workflow.boundary', '1.0.0', 'legacy_global_run', 'completed',
+      '{"input":"preserved"}', '{"result":"preserved"}', NULL, 3, 4, 5
+    )
+  `).run()
+  sqlite.prepare(`
+    INSERT INTO execution_steps (
+      id, execution_id, sequence, name, status, percent, started_at, ended_at
+    ) VALUES ('legacy_step', 'legacy_execution', 1, 'preserved step', 'completed', 100, 4, 5)
+  `).run()
+  sqlite.prepare(`
+    INSERT INTO execution_logs (
+      id, execution_id, sequence, level, message, metadata_json, created_at
+    ) VALUES (
+      'legacy_log', 'legacy_execution', 1, 'info', 'preserved log',
+      '{"metadata":"preserved"}', 5
+    )
+  `).run()
+  sqlite.prepare(`
+    INSERT INTO browser_tab_bindings (
+      id, tab_id, user_id, conversation_id, chat_run_id, execution_id, workflow_id,
+      workflow_version, source, build_hash, security_fingerprint, permission_matrix_json,
+      status, terminal_reason, created_at, ended_at
+    ) VALUES (
+      'legacy_binding', 'legacy_tab', 'execution_boundary_user',
+      'execution_boundary_conversation', 'legacy_global_run', 'legacy_execution',
+      'workflow.boundary', '1.0.0', 'installed', NULL, ?, '{}', 'closed',
+      'PAGE_CLOSED', 6, 7
+    )
+  `).run('f'.repeat(64))
+  sqlite.prepare(`
+    INSERT INTO browser_action_audits (
+      id, binding_id, chat_run_id, sequence, origin, action, target_summary, risk,
+      outcome, error_code, created_at
+    ) VALUES (
+      'legacy_audit', 'legacy_binding', 'legacy_global_run', 1, 'https://example.com',
+      'inspect', 'preserved audit', 'sensitive_read', 'completed', NULL, 7
+    )
+  `).run()
+  sqlite.close()
+  return path
 }
 
 function insertLocalUser(database: ReturnType<typeof openTestDatabase>, id: string, account: string) {
@@ -224,6 +375,188 @@ afterEach(() => {
 })
 
 describe('openAppDatabase', () => {
+  it('exposes global legacy conversations as read-only import data', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-legacy-read-only-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    openProductionAppDatabase(path).close()
+    const seed = new Database(path)
+    seed.prepare(`
+      INSERT INTO conversations (id, title, created_at, updated_at)
+      VALUES ('legacy_read_only', 'Legacy', 1, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO executions (
+        id, owner_user_id, workflow_id, workflow_version, status, input_json, created_at
+      ) VALUES ('legacy_execution', 'legacy-user', 'workflow', '1.0.0', 'completed', '{}', 1)
+    `).run()
+    seed.close()
+    const database = openProductionAppDatabase(path)
+    const expected = { code: 'CONFLICT', message: 'The requested operation conflicts with existing state.' }
+
+    expect(database.conversations.list().map(({ id }) => id)).toEqual(['legacy_read_only'])
+    expect(() => database.conversations.insert({ id: 'forbidden_insert', title: 'Forbidden' }))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.conversations.renameByUser('legacy_read_only', 'Forbidden'))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.conversations.delete('legacy_read_only'))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.conversations.claimLegacyAndListForUser('cloud-alice'))
+      .toThrow(expect.objectContaining(expected))
+    expect(() => database.clearConversations()).toThrow(expect.objectContaining(expected))
+    expect(() => database.clearLocalData('all')).toThrow(expect.objectContaining(expected))
+    expect(database.conversations.get('legacy_read_only')).toBeDefined()
+    expect(database.executions.get('legacy_execution')).toBeDefined()
+
+    database.clearLocalData('executions')
+    expect(database.executions.get('legacy_execution')).toBeUndefined()
+    database.close()
+  })
+
+  it('keeps every sensitive legacy surface byte-for-byte stable across open and recovery', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autoforge-legacy-sensitive-read-only-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'autoforge.sqlite')
+    openProductionAppDatabase(path).close()
+    const seed = new Database(path)
+    seed.prepare(`
+      INSERT INTO conversations (
+        id, title, title_state, created_at, updated_at
+      ) VALUES ('legacy_sensitive', 'Legacy sensitive', 'generating', 1, 1)
+    `).run()
+    const legacyApproval = JSON.stringify([{
+      type: 'approval', executionId: 'legacy_sensitive_execution',
+      workflowId: 'legacy.workflow', workflowVersion: '1.0.0', permissionIndex: 0,
+      capability: 'browser.open', scope: { origins: ['https://example.com'] },
+      scopeHash: 'a'.repeat(64),
+    }])
+    seed.prepare(`
+      INSERT INTO messages (
+        id, conversation_id, role, blocks_json, ordinal, created_at
+      ) VALUES ('legacy_sensitive_message', 'legacy_sensitive', 'assistant', ?, 1, 1)
+    `).run(legacyApproval)
+    seed.prepare(`
+      INSERT INTO conversation_contexts (
+        conversation_id, summary_text, through_ordinal, estimated_tokens, updated_at
+      ) VALUES ('legacy_sensitive', 'private legacy summary', 1, 3, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO chat_runs (
+        id, conversation_id, request_id, model, status, started_at
+      ) VALUES ('legacy_sensitive_run', 'legacy_sensitive', 'legacy_sensitive_request',
+        'model', 'running', 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO local_users (
+        id, account, account_normalized, password_digest, created_at, updated_at
+      ) VALUES ('legacy-user', 'Legacy user', 'legacy user', 'digest', 1, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO provider_usage_events (
+        id, operation_key, user_id, provider, request_id, model, modality, status,
+        reconcile_attempts, started_at
+      ) VALUES ('legacy_sensitive_usage', 'legacy_sensitive_operation', 'legacy-user',
+        'openrouter', 'legacy_sensitive_usage_request', 'model', 'text', 'pending', 0, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO media_assets (
+        id, conversation_id, message_id, source, kind, original_name, relative_path,
+        status, created_at, updated_at
+      ) VALUES ('legacy_sensitive_asset', 'legacy_sensitive', 'legacy_sensitive_message',
+        'generated', 'image', 'legacy.png', 'legacy_sensitive/legacy.png',
+        'staging', 1, 1)
+    `).run()
+    seed.prepare(`
+      INSERT INTO media_generation_jobs (
+        id, conversation_id, assistant_message_id, provider, model, kind,
+        provider_job_id, status, parameters_json, next_poll_at, poll_attempts,
+        created_at, updated_at
+      ) VALUES ('legacy_sensitive_job', 'legacy_sensitive', 'legacy_sensitive_message',
+        'openrouter', 'model', 'video', 'provider_job', 'pending', '{}', 1, 0, 1, 1)
+    `).run()
+    const sensitiveSnapshot = (sqlite: Database.Database) => JSON.stringify([
+      'conversations',
+      'messages',
+      'conversation_contexts',
+      'chat_runs',
+      'provider_usage_events',
+      'media_assets',
+      'media_generation_jobs',
+    ].map((table) => [table, sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]))
+    const before = sensitiveSnapshot(seed)
+    seed.close()
+
+    const database = openProductionAppDatabase(path)
+    const expected = {
+      code: 'CONFLICT',
+      message: 'The requested operation conflicts with existing state.',
+    }
+    expect(database.messages.get('legacy_sensitive_message')).toBeDefined()
+    expect(database.conversationContexts.get('legacy_sensitive')).toBeDefined()
+    expect(database.chatRuns.get('legacy_sensitive_run')).toBeDefined()
+    expect(database.providerUsage.find('legacy_sensitive_operation')).toBeDefined()
+    expect(database.mediaAssets.get('legacy_sensitive_asset')).toBeDefined()
+    expect(database.mediaAssets.listForConversation('legacy_sensitive')).toHaveLength(1)
+    expect(database.mediaAssets.listUnclaimedBefore(2)).toEqual([])
+    expect(database.mediaGenerationJobs.get('legacy_sensitive_job')).toBeDefined()
+    expect(database.mediaGenerationJobs.listResumable(2)).toHaveLength(1)
+    expect(database.mediaGenerationJobs.listActive()).toHaveLength(1)
+    for (const mutate of [
+      () => database.messages.insert({
+        id: 'forbidden_message', conversationId: 'legacy_sensitive', role: 'user',
+        blocks: [{ type: 'text', text: 'forbidden' }], createdAt: 2,
+      }),
+      () => database.messages.update('legacy_sensitive_message', { executionId: 'forbidden' }),
+      () => database.messages.replaceBlock(
+        'legacy_sensitive_message', 'forbidden', { type: 'text', text: 'forbidden' },
+      ),
+      () => database.messages.upgradeLegacyApprovals(),
+      () => database.messages.invalidatePendingAgentApprovals(),
+      () => database.messages.failInterruptedMediaGenerations(),
+      () => database.messages.failInterruptedBrowserStatuses(['legacy_sensitive_request']),
+      () => database.conversationContexts.advance({
+        conversationId: 'legacy_sensitive', expectedThroughOrdinal: 1,
+        summaryText: 'forbidden', throughOrdinal: 2, estimatedTokens: 1, updatedAt: 2,
+      }),
+      () => database.chatRuns.insert({
+        id: 'forbidden_run', conversationId: 'legacy_sensitive', requestId: 'forbidden_request',
+        model: 'model', status: 'running', startedAt: 2,
+      }),
+      () => database.chatRuns.startMediaGeneration({} as never),
+      () => database.chatRuns.update('legacy_sensitive_run', { status: 'failed' }),
+      () => database.chatRuns.finalizeWithMessage(
+        'legacy_sensitive_run', 'legacy_sensitive_message', 'legacy_sensitive_request', {} as never,
+      ),
+      () => database.providerUsage.start({} as never),
+      () => database.providerUsage.bindIdentity('legacy_sensitive_operation', {}),
+      () => database.providerUsage.report('legacy_sensitive_operation', {} as never),
+      () => database.providerUsage.markUnknown('legacy_sensitive_operation', 2),
+      () => database.providerUsage.recordReconcileFailure('legacy_sensitive_operation', 2),
+      () => database.mediaAssets.insert({} as never),
+      () => database.mediaAssets.update('legacy_sensitive_asset', { status: 'failed' }),
+      () => database.mediaAssets.delete('legacy_sensitive_asset'),
+      () => database.mediaGenerationJobs.insert({} as never),
+      () => database.mediaGenerationJobs.startSubmissionIntent({} as never),
+      () => database.mediaGenerationJobs.bindSubmitted('legacy_sensitive_job', {} as never),
+      () => database.mediaGenerationJobs.insertTurn({} as never),
+      () => database.mediaGenerationJobs.reconcileInterrupted(2),
+      () => database.mediaGenerationJobs.update('legacy_sensitive_job', { status: 'failed' }),
+      () => database.mediaGenerationJobs.transition('legacy_sensitive_job', ['pending'], {} as never),
+      () => database.mediaGenerationJobs.complete('legacy_sensitive_job', ['pending'], {} as never),
+      () => database.mediaGenerationJobs.fail(
+        'legacy_sensitive_job', ['pending'], 'MEDIA_GENERATION_FAILED', 2,
+      ),
+    ]) expect(mutate).toThrow(expect.objectContaining(expected))
+
+    expect(database.providerUsage.recoverPending(2)).toBe(0)
+    expect(database.providerUsage.listReconcilable(2)).toEqual([])
+    expect(database.recoverInterrupted()).toEqual({ executions: 0, chatRuns: 0 })
+    database.close()
+    const inspection = new Database(path, { readonly: true })
+    expect(sensitiveSnapshot(inspection)).toBe(before)
+    inspection.close()
+  })
+
   it('packages migrations where the migration runner resolves them', () => {
     const configPath = fileURLToPath(new URL('../../../electron-builder.yml', import.meta.url))
     const config = readFileSync(configPath, 'utf8')
@@ -243,21 +576,22 @@ describe('openAppDatabase', () => {
 
     database.executions.insert({
       id: 'exec_1',
+      ownerUserId: 'test-user',
       status: 'running',
       workflowId: 'w',
       workflowVersion: '1.0.0',
     })
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(14)
     const inspection = new Database(path, { readonly: true })
     expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string; on_delete: string }>)
       .map(({ table, on_delete }) => ({ table, on_delete })))
       .toEqual(expect.arrayContaining([
         { table: 'local_users', on_delete: 'CASCADE' },
-        { table: 'conversations', on_delete: 'CASCADE' },
-        { table: 'chat_runs', on_delete: 'SET NULL' },
         { table: 'executions', on_delete: 'SET NULL' },
       ]))
+    expect((inspection.prepare('PRAGMA foreign_key_list(browser_tab_bindings)').all() as Array<{ table: string }>)
+      .map(({ table }) => table)).not.toEqual(expect.arrayContaining(['conversations', 'chat_runs']))
     expect((inspection.prepare('PRAGMA index_list(browser_action_audits)').all() as Array<{ name: string }>).map(({ name }) => name))
       .toEqual(expect.arrayContaining(['browser_action_audits_binding_sequence_idx']))
     expect((inspection.prepare('PRAGMA index_list(browser_tab_bindings)').all() as Array<{ name: string }>).map(({ name }) => name))
@@ -265,6 +599,141 @@ describe('openAppDatabase', () => {
     inspection.close()
     expect(database.executions.markInterrupted()).toBe(1)
     expect(database.executions.get('exec_1')?.status).toBe('interrupted')
+  })
+
+  it('migrates v12 executions to opaque user-cache chat-run correlation without losing dependent data or semantics', () => {
+    const path = createV12ExecutionBoundaryDatabase()
+    const tableSnapshot = (sqlite: Database.Database) => Object.fromEntries([
+      'executions',
+      'execution_steps',
+      'execution_logs',
+      'browser_tab_bindings',
+      'browser_action_audits',
+    ].map((table) => [table, sqlite.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]))
+    const v12 = new Database(path)
+    v12.pragma('foreign_keys = ON')
+    const before = tableSnapshot(v12)
+    expect(() => v12.prepare(`
+      INSERT INTO executions (
+        id, workflow_id, workflow_version, chat_run_id, status, input_json, created_at
+      ) VALUES ('blocked_user_cache_execution', 'workflow.boundary', '1.0.0', ?, 'queued', '{}', 8)
+    `).run('user_cache_run_not_in_global_chat_runs')).toThrow('FOREIGN KEY constraint failed')
+    v12.close()
+
+    const database = openProductionAppDatabase(path)
+    expect(() => database.executions.insert({
+      id: 'user_cache_execution',
+      ownerUserId: 'execution_boundary_user',
+      workflowId: 'workflow.boundary',
+      workflowVersion: '1.0.0',
+      chatRunId: 'user_cache_run_not_in_global_chat_runs',
+      status: 'completed',
+      input: { source: 'user-cache' },
+      result: { inserted: true },
+      createdAt: 8,
+      startedAt: 9,
+      endedAt: 10,
+    })).not.toThrow()
+    expect(database.executions.update('user_cache_execution', {
+      chatRunId: 'updated_user_cache_run_not_in_global_chat_runs',
+      result: { updated: true },
+    })).toMatchObject({
+      chatRunId: 'updated_user_cache_run_not_in_global_chat_runs',
+      result: { updated: true },
+    })
+    expect(database.executions.get('user_cache_execution')).toMatchObject({
+      chatRunId: 'updated_user_cache_run_not_in_global_chat_runs',
+      input: { source: 'user-cache' },
+      result: { updated: true },
+    })
+    expect(database.chatRuns.get('user_cache_run_not_in_global_chat_runs')).toBeUndefined()
+    expect(database.chatRuns.get('updated_user_cache_run_not_in_global_chat_runs')).toBeUndefined()
+    expect(database.schemaVersion()).toBe(14)
+    database.close()
+
+    const inspection = new Database(path)
+    inspection.pragma('foreign_keys = ON')
+    const after = tableSnapshot(inspection)
+    expect(after.executions).toEqual([
+      ...(before.executions as Array<Record<string, unknown>>)
+        .map((execution) => ({ ...execution, owner_user_id: null })),
+      expect.objectContaining({
+        id: 'user_cache_execution',
+        chat_run_id: 'updated_user_cache_run_not_in_global_chat_runs',
+      }),
+    ])
+    expect(after.execution_steps).toEqual(before.execution_steps)
+    expect(after.execution_logs).toEqual(before.execution_logs)
+    expect(after.browser_tab_bindings).toEqual(before.browser_tab_bindings)
+    expect(after.browser_action_audits).toEqual(before.browser_action_audits)
+    expect((inspection.prepare('PRAGMA foreign_key_list(executions)').all() as Array<{ table: string }>)
+      .map(({ table }) => table)).not.toContain('chat_runs')
+    expect(inspection.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+    for (const [table, indexes] of [
+      ['executions', ['executions_status_created_at_idx', 'executions_created_at_idx']],
+      ['execution_steps', ['execution_steps_execution_sequence_idx']],
+      ['execution_logs', ['execution_logs_execution_sequence_idx']],
+      ['browser_tab_bindings', ['browser_tab_bindings_conversation_status_idx']],
+      ['browser_action_audits', ['browser_action_audits_binding_sequence_idx']],
+    ] as const) {
+      const names = (inspection.prepare(`PRAGMA index_list(${table})`).all() as Array<{ name: string }>)
+        .map(({ name }) => name)
+      expect(names).toEqual(expect.arrayContaining([...indexes]))
+    }
+
+    inspection.prepare("DELETE FROM executions WHERE id = 'legacy_execution'").run()
+    expect(inspection.prepare("SELECT id FROM execution_steps WHERE id = 'legacy_step'").get()).toBeUndefined()
+    expect(inspection.prepare("SELECT id FROM execution_logs WHERE id = 'legacy_log'").get()).toBeUndefined()
+    expect(inspection.prepare("SELECT execution_id FROM browser_tab_bindings WHERE id = 'legacy_binding'").get())
+      .toEqual({ execution_id: null })
+    expect(inspection.prepare("SELECT id FROM browser_action_audits WHERE id = 'legacy_audit'").get())
+      .toEqual({ id: 'legacy_audit' })
+    inspection.prepare("DELETE FROM browser_tab_bindings WHERE id = 'legacy_binding'").run()
+    expect(inspection.prepare("SELECT id FROM browser_action_audits WHERE id = 'legacy_audit'").get())
+      .toBeUndefined()
+    expect(inspection.prepare('PRAGMA foreign_key_check').all()).toEqual([])
+    inspection.close()
+  })
+
+  it('migrates legacy executions as unowned and requires trusted ownership for new rows', () => {
+    const path = createV12ExecutionBoundaryDatabase()
+    const database = openProductionAppDatabase(path)
+
+    expect(database.executions.getForUser('legacy_execution', 'execution_boundary_user'))
+      .toBeUndefined()
+    expect(database.executions.listForUser('execution_boundary_user')).toEqual([])
+    expect(() => database.executions.insert({
+      id: 'missing_owner_execution',
+      workflowId: 'workflow.boundary',
+      workflowVersion: '1.0.0',
+      status: 'completed',
+    } as never)).toThrow()
+    expect(database.executions.insert({
+      id: 'owned_execution',
+      ownerUserId: 'execution_boundary_user',
+      workflowId: 'workflow.boundary',
+      workflowVersion: '1.0.0',
+      status: 'completed',
+    })).toMatchObject({ id: 'owned_execution', ownerUserId: 'execution_boundary_user' })
+    expect(database.executions.getForUser('owned_execution', 'other_user')).toBeUndefined()
+    expect(database.executions.updateForUser(
+      'owned_execution', 'other_user', { status: 'cancelled' },
+    )).toBeUndefined()
+    expect(database.executions.getForUser('owned_execution', 'execution_boundary_user'))
+      .toMatchObject({ status: 'completed' })
+    expect(database.executionSteps.listForUser('owned_execution', 'other_user')).toEqual([])
+    expect(database.executionLogs.listForUser('owned_execution', 'other_user')).toEqual([])
+    expect(database.schemaVersion()).toBe(14)
+    database.close()
+
+    const inspection = new Database(path, { readonly: true })
+    expect(inspection.prepare(
+      "SELECT owner_user_id FROM executions WHERE id = 'legacy_execution'",
+    ).get()).toEqual({ owner_user_id: null })
+    expect(inspection.prepare(
+      "SELECT owner_user_id FROM executions WHERE id = 'owned_execution'",
+    ).get()).toEqual({ owner_user_id: 'execution_boundary_user' })
+    inspection.close()
   })
 
   it('persists redacted browser continuation audits and expires active bindings on recovery', () => {
@@ -278,7 +747,7 @@ describe('openAppDatabase', () => {
       model: 'model', status: 'completed', startedAt: 1,
     })
     const execution = database.executions.insert({
-      id: 'browser_execution', status: 'completed', workflowId: 'gov.permit', workflowVersion: '1.0.0',
+      id: 'browser_execution', ownerUserId: 'browser_user', status: 'completed', workflowId: 'gov.permit', workflowVersion: '1.0.0',
     })
 
     const binding = database.browserTabBindings.insert({
@@ -371,13 +840,15 @@ describe('openAppDatabase', () => {
     database.recoverInterrupted()
     expect(database.browserTabBindings.get(binding.id)).toMatchObject({ status: 'revoked', endedAt: 20 })
     database.conversations.delete(conversation.id)
-    expect(database.browserTabBindings.get(binding.id)).toBeUndefined()
+    expect(database.browserTabBindings.get(binding.id)).toMatchObject({
+      id: binding.id, conversationId: conversation.id, status: 'revoked',
+    })
   })
 
   it('upgrades a populated v1 database without losing conversations or messages', () => {
     const database = createV1Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.conversations.get('conversation_v1')).toMatchObject({
       title: 'Persisted v1',
       titleState: 'user_named',
@@ -391,7 +862,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v3 database without losing business data', () => {
     const database = createV3Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.conversations.get('conversation_v3')).toMatchObject({ title: 'Persisted v3' })
     expect(database.messages.get('message_v3')).toMatchObject({
       blocks: [{ type: 'text', text: 'before auth' }],
@@ -402,7 +873,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database without losing local users', () => {
     const { database } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.localAuth.findUserByNormalizedAccount('legacy')).toMatchObject({
       id: 'user_v4', account: 'Legacy',
     })
@@ -422,7 +893,7 @@ describe('openAppDatabase', () => {
   it('upgrades a populated v4 database with nullable chat-run ownership', () => {
     const { database, path } = createV4Database()
 
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(14)
     const inspection = new Database(path)
     expect(inspection.prepare(`
       SELECT user_id AS userId, provider
@@ -926,7 +1397,7 @@ describe('openAppDatabase', () => {
   })
 
   it('retains provider usage after conversation deletion and local-data clearing', () => {
-    const database = openTestDatabase()
+    const { database, path } = openInspectableTestDatabase()
     insertLocalUser(database, 'user_retention', 'Retention')
     for (const suffix of ['delete', 'clear_conversations', 'clear_all']) {
       const conversationId = `conversation_usage_${suffix}`
@@ -942,11 +1413,25 @@ describe('openAppDatabase', () => {
     }
 
     database.conversations.delete('conversation_usage_delete')
+    database.executions.insert({
+      id: 'execution_clear_all',
+      ownerUserId: 'user_retention',
+      workflowId: 'workflow_clear_all',
+      workflowVersion: '1.0.0',
+      status: 'completed',
+    })
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
-    database.clearConversations()
+    const production = openProductionAppDatabase(path)
+    expect(() => production.clearConversations()).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    expect(database.conversations.get('conversation_usage_clear_conversations')).toBeDefined()
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
-    database.clearLocalData('all')
+    expect(() => production.clearLocalData('all')).toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    expect(database.conversations.get('conversation_usage_clear_all')).toBeDefined()
+    expect(database.executions.get('execution_clear_all')).toBeDefined()
+    production.clearLocalData('executions')
+    expect(database.executions.get('execution_clear_all')).toBeUndefined()
     expect(database.providerUsage.summarize({ userId: 'user_retention', yesterdayStartedAt: 0, todayStartedAt: 0, weekStartedAt: 0, monthStartedAt: 0, endedAt: 10 }).allTime.openRouterKnownCostCount).toBe(3)
+    production.close()
   })
 
   it('backfills insertion order and allocates independent conversation ordinals', () => {
@@ -998,7 +1483,7 @@ describe('openAppDatabase', () => {
     database.conversations.insert({ id: 'recovery_conversation', title: 'Recovery' })
     for (const status of ['queued', 'awaiting_approval', 'running']) {
       database.executions.insert({
-        id: `execution_${status}`, status, workflowId: 'workflow', workflowVersion: '1.0.0',
+        id: `execution_${status}`, ownerUserId: 'recovery_user', status, workflowId: 'workflow', workflowVersion: '1.0.0',
       })
       database.chatRuns.insert({
         id: `run_${status}`, conversationId: 'recovery_conversation', requestId: `request_${status}`,
@@ -1119,6 +1604,7 @@ describe('openAppDatabase', () => {
     })
     database.executions.insert({
       id: 'execution_approval_recovery', status: 'awaiting_approval',
+      ownerUserId: 'approval_recovery_user',
       workflowId: 'workflow.recovery', workflowVersion: '1.0.0',
     })
     database.chatRuns.insert({
@@ -1386,7 +1872,7 @@ describe('openAppDatabase', () => {
     sqlite.close()
 
     const database = openAppDatabase(path)
-    expect(database.schemaVersion()).toBe(11)
+    expect(database.schemaVersion()).toBe(14)
     expect(database.messages.get('current_message')?.blocks).toEqual([currentApproval])
     expect(database.messages.hasWorkflowApproval('current_execution')).toBe(true)
     expect(database.messages.hasWorkflowApproval('legacy_execution')).toBe(true)
@@ -1875,6 +2361,7 @@ describe('openAppDatabase', () => {
     insertVideo('request_valid_paused', 'paused')
     database.executions.insert({
       id: 'execution_parameters_recovery',
+      ownerUserId: 'parameters_recovery_user',
       status: 'running',
       workflowId: 'workflow',
       workflowVersion: '1.0.0',
@@ -2025,8 +2512,8 @@ describe('openAppDatabase', () => {
       .toThrow('Owned chat run requires a provider')
   })
 
-  it('summarizes retained token usage by model across five periods', () => {
-    const database = openTestDatabase()
+  it('summarizes retained token usage and preserves it during global legacy clearing', () => {
+    const { database, path } = openInspectableTestDatabase()
     insertLocalUser(database, 'usage_user', 'usage@example.com')
     database.conversations.insert({ id: 'conversation_usage', title: 'Usage' })
     const insert = (
@@ -2085,14 +2572,12 @@ describe('openAppDatabase', () => {
     })
     expect(usage.allTime.models.some(({ model }) => model === 'ignored/model')).toBe(false)
 
-    database.clearLocalData('conversations')
-    expect(database.chatRuns.summarizeTokenUsage(query)).toEqual({
-      today: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      yesterday: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      week: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      month: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-      allTime: { inputTokens: 0, outputTokens: 0, totalTokens: 0, models: [], trend: [] },
-    })
+    const production = openProductionAppDatabase(path)
+    expect(() => production.clearLocalData('conversations'))
+      .toThrow(expect.objectContaining({ code: 'CONFLICT' }))
+    expect(database.chatRuns.summarizeTokenUsage(query)).toEqual(usage)
+    expect(database.conversations.get('conversation_usage')).toMatchObject({ id: 'conversation_usage' })
+    production.close()
   })
 
   it('groups token usage trends by local calendar boundaries and excludes the query end point', () => {
@@ -2719,6 +3204,7 @@ describe('openAppDatabase', () => {
     const database = openTestDatabase()
     database.executions.insert({
       id: 'execution_1',
+      ownerUserId: 'execution_log_user',
       status: 'running',
       workflowId: 'workflow_1',
       workflowVersion: '1.0.0',
@@ -2743,7 +3229,7 @@ describe('openAppDatabase', () => {
 
   it('redacts complete plain-text secret values before persistence and return', () => {
     const database = openTestDatabase()
-    database.executions.insert({ id: 'execution_2', status: 'running', workflowId: 'workflow_1', workflowVersion: '1.0.0' })
+    database.executions.insert({ id: 'execution_2', ownerUserId: 'execution_log_user', status: 'running', workflowId: 'workflow_1', workflowVersion: '1.0.0' })
     const message = 'Authorization: Bearer sk-secret; X-API-Key: api-secret; token=token-secret; password=password-secret'
     const returned = database.executionLogs.insert({
       id: 'log_2',

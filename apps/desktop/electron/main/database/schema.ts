@@ -148,9 +148,10 @@ export const workflowFiles = sqliteTable('workflow_files', {
 
 export const executions = sqliteTable('executions', {
   id: text('id').primaryKey(),
+  ownerUserId: text('owner_user_id'),
   workflowId: text('workflow_id').notNull(),
   workflowVersion: text('workflow_version').notNull(),
-  chatRunId: text('chat_run_id').references(() => chatRuns.id, { onDelete: 'set null' }),
+  chatRunId: text('chat_run_id'),
   status: text('status').notNull(),
   inputJson: text('input_json').notNull(),
   resultJson: text('result_json'),
@@ -161,6 +162,7 @@ export const executions = sqliteTable('executions', {
 }, (table) => [
   index('executions_status_created_at_idx').on(table.status, table.createdAt),
   index('executions_created_at_idx').on(table.createdAt),
+  index('executions_owner_created_at_idx').on(table.ownerUserId, table.createdAt, table.id),
 ])
 
 export const executionSteps = sqliteTable('execution_steps', {
@@ -299,8 +301,8 @@ export const browserTabBindings = sqliteTable('browser_tab_bindings', {
   id: text('id').primaryKey(),
   tabId: text('tab_id').notNull(),
   userId: text('user_id').notNull().references(() => localUsers.id, { onDelete: 'cascade' }),
-  conversationId: text('conversation_id').notNull().references(() => conversations.id, { onDelete: 'cascade' }),
-  chatRunId: text('chat_run_id').references(() => chatRuns.id, { onDelete: 'set null' }),
+  conversationId: text('conversation_id').notNull(),
+  chatRunId: text('chat_run_id'),
   executionId: text('execution_id').references(() => executions.id, { onDelete: 'set null' }),
   workflowId: text('workflow_id').notNull(),
   workflowVersion: text('workflow_version').notNull(),
@@ -319,7 +321,7 @@ export const browserTabBindings = sqliteTable('browser_tab_bindings', {
 export const browserActionAudits = sqliteTable('browser_action_audits', {
   id: text('id').primaryKey(),
   bindingId: text('binding_id').notNull().references(() => browserTabBindings.id, { onDelete: 'cascade' }),
-  chatRunId: text('chat_run_id').references(() => chatRuns.id, { onDelete: 'set null' }),
+  chatRunId: text('chat_run_id'),
   sequence: integer('sequence').notNull(),
   origin: text('origin').notNull(),
   action: text('action').notNull(),

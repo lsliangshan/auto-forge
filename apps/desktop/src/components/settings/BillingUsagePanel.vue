@@ -19,6 +19,19 @@
       </el-button>
     </header>
     <div class="billing-body">
+      <dl
+        v-if="remoteUsage"
+        class="remote-usage-summary"
+        data-testid="remote-usage-summary"
+      >
+        <div><dt>平台已确认消费</dt><dd>{{ remoteUsage.confirmedPlatformCost ? `${remoteUsage.confirmedPlatformCost.amount} ${remoteUsage.confirmedPlatformCost.currency}` : '—' }}</dd></div>
+        <div><dt>待同步 {{ formatTokens(remoteUsage.pendingCount) }} 笔</dt></div>
+        <div><dt>BYOK 估算</dt><dd>{{ formatUsd(remoteUsage.byokEstimatedCostUsd) }} · {{ formatTokens(remoteUsage.byokEstimatedCount) }} 笔</dd></div>
+        <div><dt>BYOK 费用不可用</dt><dd>{{ formatTokens(remoteUsage.byokUnavailableCount) }} 笔</dd></div>
+        <div><dt>云端 Token</dt><dd>{{ formatTokens(remoteUsage.totalTokens) }}</dd></div>
+        <div><dt>时区与显示币种</dt><dd>{{ remoteUsage.timezone }} · {{ remoteUsage.displayCurrency }}</dd></div>
+        <div><dt>上次同步</dt><dd>{{ remoteUsage.lastSyncAt ? rangeFormatter.format(new Date(remoteUsage.lastSyncAt)) : '—' }}</dd></div>
+      </dl>
       <p
         v-if="error"
         class="billing-error"
@@ -99,17 +112,17 @@
           <div
             data-testid="billing-summary-cost"
           >
-            <dt>OpenRouter 消费</dt>
+            <dt>OpenRouter BYOK 估算</dt>
             <dd>{{ formatUsd(activeUsage.openRouterCostUsd) }}</dd>
             <p data-testid="billing-summary-known">
-              已确认 {{ formatTokens(activeUsage.openRouterKnownCostCount) }} 笔
+              已取得费用估算 {{ formatTokens(activeUsage.openRouterKnownCostCount) }} 笔
             </p>
             <p
               v-if="activeUsage.openRouterUnknownCostCount > 0"
               data-testid="billing-cost-warning"
               class="billing-cost-warning"
             >
-              有 {{ formatTokens(activeUsage.openRouterUnknownCostCount) }} 笔费用待确认
+              有 {{ formatTokens(activeUsage.openRouterUnknownCostCount) }} 笔费用不可用
               <el-tooltip
                 :content="pendingCostExplanation"
                 :trigger="['hover', 'focus']"
@@ -120,7 +133,7 @@
                   data-testid="billing-cost-help"
                   tabindex="0"
                   role="img"
-                  aria-label="查看待确认费用说明"
+                  aria-label="查看费用不可用说明"
                 >
                   <QuestionFilled />
                 </el-icon>
@@ -153,7 +166,7 @@
           <div class="billing-table-wrap">
             <table
               class="billing-table"
-              aria-label="模型用量与 OpenRouter 消费"
+              aria-label="模型用量与 OpenRouter BYOK 估算"
             >
               <thead>
                 <tr>
@@ -173,13 +186,13 @@
                     总 Token
                   </th>
                   <th scope="col">
-                    OpenRouter 消费
+                    OpenRouter BYOK 估算
                   </th>
                   <th scope="col">
-                    已确认
+                    已估算
                   </th>
                   <th scope="col">
-                    待确认
+                    费用不可用
                   </th>
                 </tr>
               </thead>
@@ -214,7 +227,7 @@
 
 <script setup lang="ts">
 import { QuestionFilled, Refresh } from '@element-plus/icons-vue'
-import type { TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '@autoforge/shared'
+import type { RemoteUsageSnapshot, TokenUsagePeriod, TokenUsagePeriodKey, TokenUsageSnapshot } from '@autoforge/shared'
 import { computed, ref } from 'vue'
 import TokenUsageBarChart from './TokenUsageBarChart.vue'
 import TokenUsageLineChart from './TokenUsageLineChart.vue'
@@ -222,6 +235,7 @@ import { tokenColors } from './token-usage-chart-options'
 
 const props = defineProps<{
   usage?: TokenUsageSnapshot
+  remoteUsage?: RemoteUsageSnapshot
   loading: boolean
   error: string
 }>()
@@ -253,7 +267,7 @@ const providerLabels = {
   openrouter: 'OpenRouter',
   deepseek: 'DeepSeek',
 } as const
-const pendingCostExplanation = '这表示部分 OpenRouter 调用暂未取得准确费用。当前显示的消费金额不包含这些费用，无需手动确认，系统会自动尝试查询。'
+const pendingCostExplanation = '这表示部分 OpenRouter BYOK 调用暂未取得费用估算。当前显示的估算金额不包含这些调用，系统会自动尝试查询。'
 const tokenFormatter = new Intl.NumberFormat('zh-CN')
 const rangeFormatter = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -341,6 +355,29 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin: 0 0 16px;
+}
+
+.remote-usage-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 16px;
+}
+
+.remote-usage-summary div {
+  padding: 10px;
+  border: 1px solid var(--af-border);
+  border-radius: 10px;
+}
+
+.remote-usage-summary dt {
+  color: var(--af-text-muted);
+  font-size: 12px;
+}
+
+.remote-usage-summary dd {
+  margin: 4px 0 0;
+  font-weight: 600;
 }
 
 .billing-summary div {
@@ -437,6 +474,10 @@ const formatRange = (usage: TokenUsagePeriod, key: TokenUsagePeriodKey) => {
   }
 
   .billing-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .remote-usage-summary {
     grid-template-columns: 1fr;
   }
 

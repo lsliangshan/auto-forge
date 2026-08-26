@@ -2222,7 +2222,15 @@ describe('AgentOrchestrator', () => {
         ? event.block.type
         : event.type === 'status'
           ? event.status
-          : event.type === 'block_update' ? event.block.type : event.title
+          : event.type === 'block_update'
+            ? event.block.type
+            : event.type === 'conversation_title_updated'
+              ? event.title
+              : event.type === 'conversation_updated'
+                ? event.conversation.title
+                : event.type === 'sync_warning_updated'
+                  ? event.warningSince ?? 'cleared'
+                : event.conversationId
       order.push(`emit:${event.type}:${detail}`)
     }
 

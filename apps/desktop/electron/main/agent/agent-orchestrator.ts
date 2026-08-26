@@ -1141,6 +1141,7 @@ export class AgentOrchestrator {
       }
       for await (const event of trackProviderStream({
         operationKey,
+        purpose: 'assistant_reply',
         attribution: {
           userId: active.userId,
           requestId: active.requestId,
@@ -1265,6 +1266,7 @@ export class AgentOrchestrator {
     let finishReason: string | undefined
     for await (const event of trackProviderStream({
       operationKey: `agent:${active.requestId}:workflow-routing`,
+      purpose: 'workflow_routing',
       attribution: {
         userId: active.userId,
         requestId: active.requestId,

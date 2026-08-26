@@ -100,6 +100,7 @@ export async function matchBrowserFieldSemantics(
   try {
     for await (const event of trackProviderStream({
       operationKey: `agent:${input.requestId}:browser-field-match:${input.evidenceRevision}`,
+      purpose: 'browser_field_matching',
       attribution: {
         userId: input.userId,
         requestId: input.requestId,

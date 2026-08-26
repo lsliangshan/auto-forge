@@ -2,12 +2,20 @@ import { randomUUID } from 'node:crypto'
 import { copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
+  accountDataPreferencesDefaults,
+  accountDataPreferencesRecordSchema,
+  accountDataPreferencesSchema,
+  byokUsageEventSchema,
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  legacyImportRequestSchema,
   openExternalRequestSchema,
+  privacyConsentSchema,
+  remoteUsageSnapshotSchema,
   toSafeAppError,
   type AppError,
   type AppSettings,
+  type AccountDataPreferences,
   type AuthorizationSnapshot,
   type AuthSession,
   type ChatBlock,
@@ -24,6 +32,7 @@ import {
   type WorkflowDetail,
   type WorkflowQuery,
   type WorkflowSummary,
+  type SyncMutation,
 } from '@autoforge/shared'
 import type { WorkflowManifest } from '@autoforge/workflow-schema'
 import {
@@ -60,6 +69,10 @@ import { resolveChatRoute } from './chat/multimodal-router.js'
 import type { ModelContentPart } from './chat/model-provider.js'
 import { VideoJobRunner } from './chat/video-job-runner.js'
 import { openAppDatabase } from './database/client.js'
+import { UserDataStoreManager, type UserDataStore } from './database/user-data-client.js'
+import { CloudBaseUserDataPort } from './cloud/cloudbase-user-data-port.js'
+import { UserDataSyncEngine } from './sync/user-data-sync-engine.js'
+import { LegacyUserDataImporter } from './sync/legacy-user-data-import.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
@@ -70,10 +83,11 @@ import type { CloudBaseIdentityRepository } from './database/cloudbase-identity-
 import { PolicyEngine } from './permissions/policy-engine.js'
 import { SecretStore, type SafeStoragePort } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
-import { createMediaAssetService } from './media/media-asset-service.js'
+import { createMediaAssetService, type MediaAssetService } from './media/media-asset-service.js'
 import { ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { createProviderUsageReconciliationLoop } from './billing/provider-usage-reconciliation-loop.js'
 import { MediaLifecycle } from './media/media-lifecycle.js'
+import { resolveUserMediaRoot } from './media/user-media-root.js'
 import { PinnedMediaTransport, type PinnedMediaTransportPort } from './media/pinned-media-transport.js'
 import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
@@ -130,7 +144,11 @@ type ApplicationFailureSource =
   | 'execution-shutdown'
   | 'continuation-shutdown'
   | 'browser-shutdown'
+  | 'sync-pause'
+  | 'user-cache-close'
   | 'database-close'
+
+const CLOUD_SYNC_DOCUMENT_VERSION = 'cloud-sync-2026-08'
 
 interface ApplicationFailureRecord {
   error: unknown
@@ -152,6 +170,8 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'execution-shutdown': 70,
   'continuation-shutdown': 80,
   'browser-shutdown': 90,
+  'sync-pause': 95,
+  'user-cache-close': 96,
   'database-close': 100,
 }
 
@@ -184,6 +204,8 @@ export interface ApplicationRuntimeOptions {
   authService?: AuthService
   roleService?: BusinessRoleService
   cloudbaseEnv?: NodeJS.ProcessEnv
+  userDataStores?: UserDataStoreManager
+  userDataSyncPort?: Pick<CloudBaseUserDataPort, 'call'>
   networkProxy: NetworkProxyPort
   mediaTransport?: PinnedMediaTransportPort
   modelProviders?: Partial<Record<ModelProviderId, ApplicationModelProviderPort>>
@@ -205,6 +227,8 @@ export interface ApplicationRuntimeOptions {
   projectServiceOptions?: WorkflowProjectServiceOptions
   appInfo?: { version: string; platform: 'darwin' | 'win32' }
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
+  /** @internal Allows deterministic bounded-logout tests. */
+  logoutSyncTimeoutMs?: number
 }
 
 interface ObservedAuthService extends AuthService {
@@ -418,8 +442,80 @@ export class MaintenanceGate {
   }
 }
 
+class UserDataAdmissionGate {
+  private closed = false
+  private stopped = false
+  private active = 0
+  private readonly drainWaiters = new Set<() => void>()
+
+  private resolveDrainWaiters(): void {
+    if (this.active !== 0) return
+    for (const resolve of this.drainWaiters) resolve()
+    this.drainWaiters.clear()
+  }
+
+  acceptsNewWork(): boolean {
+    return !this.closed && !this.stopped
+  }
+
+  async run<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.closed || this.stopped) throw failure('CONFLICT')
+    this.active += 1
+    try {
+      return await operation()
+    } finally {
+      this.active -= 1
+      this.resolveDrainWaiters()
+    }
+  }
+
+  async transition<T>(operation: (waitForActive: () => Promise<void>) => Promise<T>): Promise<T> {
+    if (this.closed || this.stopped) throw failure('CONFLICT')
+    this.closed = true
+    try {
+      return await operation(async () => {
+        if (this.active === 0) return
+        await new Promise<void>((resolve) => { this.drainWaiters.add(resolve) })
+      })
+    } finally {
+      this.closed = false
+    }
+  }
+
+  async stopAndDrain(): Promise<void> {
+    this.stopped = true
+    this.closed = true
+    if (this.active === 0) return
+    await new Promise<void>((resolve) => { this.drainWaiters.add(resolve) })
+  }
+}
+
 function iso(timestamp: number | undefined): string | undefined {
   return timestamp === undefined ? undefined : new Date(timestamp).toISOString()
+}
+
+function timeZoneParts(date: Date, timeZone: string): Record<string, number> {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).filter(({ type }) => type !== 'literal')
+    .map(({ type, value }) => [type, Number(value)]))
+}
+
+function startOfMonthInTimeZone(now: Date, timeZone: string): Date {
+  const current = timeZoneParts(now, timeZone)
+  const localMidnight = Date.UTC(current.year!, current.month! - 1, 1)
+  let instant = localMidnight
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const represented = timeZoneParts(new Date(instant), timeZone)
+    const offset = Date.UTC(
+      represented.year!, represented.month! - 1, represented.day!,
+      represented.hour!, represented.minute!, represented.second!,
+    ) - instant
+    instant = localMidnight - offset
+  }
+  return new Date(instant)
 }
 
 function summary(workflow: WorkflowDetail): WorkflowSummary {
@@ -602,6 +698,96 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     roleService,
   )
+  const userDataStores = options.userDataStores
+    ?? new UserDataStoreManager(join(options.paths.data, 'user-caches'))
+  const userDataSyncPort = options.userDataSyncPort
+    ?? (cloudBasePorts
+      ? new CloudBaseUserDataPort(cloudBasePorts.functions)
+      : { call: async () => { throw failure('SERVICE_UNAVAILABLE') } })
+  let notifyConversationChanges: (conversationIds: readonly string[]) => void = () => undefined
+  let notifySyncWarning: (
+    binding: { userId: string; generation: number }, warningSince?: number,
+  ) => void = () => undefined
+  const userDataSync = new UserDataSyncEngine(userDataSyncPort, userDataStores, {
+    onConversationChanged: (conversationIds) => { notifyConversationChanges(conversationIds) },
+    onWarningChanged: (binding, warningSince) => { notifySyncWarning(binding, warningSince) },
+  })
+  const legacyUserDataImporter = new LegacyUserDataImporter(database, userDataSync)
+  const storedDeviceId = database.appSettings.get('user-data.device-id.v1')?.value
+  const deviceId = typeof storedDeviceId === 'string'
+    && storedDeviceId.length > 0
+    && storedDeviceId.length <= 128
+    && storedDeviceId.trim() === storedDeviceId
+    && !storedDeviceId.includes('\0')
+    ? storedDeviceId
+    : randomUUID()
+  if (deviceId !== storedDeviceId) database.appSettings.set('user-data.device-id.v1', deviceId)
+  let boundUserId: string | undefined
+  let runtimeRecovered = false
+  let userDataLifecycleTail = Promise.resolve()
+  let activateUserReconciliation: (recoverInterrupted: boolean) => void = () => undefined
+  let pauseUserReconciliation = async (): Promise<void> => undefined
+  let activateVideoJobs: (recoverInterrupted: boolean) => Promise<void> = async () => undefined
+  let pauseVideoJobs = async (): Promise<void> => undefined
+  let bindUserMedia: (session: AuthSession) => Promise<void> = async () => undefined
+  let pauseUserMedia = (): void => undefined
+  let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
+  const bindUserData = (session: AuthSession): Promise<void> => {
+    const operation = userDataLifecycleTail.then(async () => {
+      if (boundUserId === session.user.id && userDataStores.current()) {
+        await bindUserMedia(session)
+        activateUserReconciliation(runtimeRecovered)
+        await activateVideoJobs(runtimeRecovered)
+        return
+      }
+      await userDataSync.start(session.user.id, deviceId)
+      await bindUserMedia(session)
+      boundUserId = session.user.id
+      const warningSince = userDataSync.status().warningSince
+      if (warningSince !== undefined) {
+        notifySyncWarning(userDataSync.captureBinding(session.user.id), warningSince)
+      }
+      await userDataSync.pull()
+      activateUserReconciliation(runtimeRecovered)
+      await activateVideoJobs(runtimeRecovered)
+    })
+    userDataLifecycleTail = operation.catch(() => undefined)
+    return operation
+  }
+  const pauseUserData = (): Promise<void> => {
+    const operation = userDataLifecycleTail.then(async () => {
+      await pauseVideoJobs()
+      await pauseUserReconciliation()
+      await userDataSync.pause()
+      pauseUserMedia()
+      userDataStores.close()
+      boundUserId = undefined
+    })
+    userDataLifecycleTail = operation.catch(() => undefined)
+    return operation
+  }
+  const prepareUserDataDiscard = (): Promise<void> => {
+    const operation = userDataLifecycleTail.then(async () => {
+      await pauseVideoJobs()
+      await pauseUserReconciliation()
+      userDataSync.discard()
+      pauseUserMedia()
+      userDataStores.close()
+      boundUserId = undefined
+    })
+    userDataLifecycleTail = operation.catch(() => undefined)
+    return operation
+  }
+  const currentUserData = (): UserDataStore => {
+    const current = userDataStores.current()
+    if (!current) throw failure('AUTH_REQUIRED')
+    return current
+  }
+  const requireAuthenticatedSession = async (): Promise<AuthSession> => {
+    const session = await auth.requireSession()
+    await bindUserData(session)
+    return session
+  }
   const userAdmin = new UserAdminService(auth, roleService ?? {
     listUsers: async () => { throw failure('SERVICE_UNAVAILABLE') },
     updateUserRole: async () => { throw failure('SERVICE_UNAVAILABLE') },
@@ -615,6 +801,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     upload: qiniuUploader,
   })
   const maintenance = new MaintenanceGate()
+  const userDataAdmission = new UserDataAdmissionGate()
   const providerDiagnostics = new ProviderDiagnosticLog(options.paths.logs)
   const settings = new SettingsService(database.appSettings, {
     theme: 'system',
@@ -644,17 +831,172 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       diagnostic: providerDiagnostics.forProvider('deepseek'),
     }),
   })
+  const queueUserDataFlush = (): void => {
+    void userDataSync.flush().catch(() => undefined)
+  }
+  const userRepository = <Key extends keyof UserDataStore>(key: Key): UserDataStore[Key] => (
+    new Proxy({}, {
+      get(_target, property) {
+        const repository = currentUserData()[key] as object
+        const value = Reflect.get(repository, property)
+        return typeof value === 'function' ? value.bind(repository) : value
+      },
+    }) as UserDataStore[Key]
+  )
+  const cachedMessages = userRepository('messages')
+  const cachedConversations = userRepository('conversations')
+  const chatConversations = new Proxy(cachedConversations, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver)
+      if (property !== 'completeTitleGeneration' && property !== 'updateGenerationPreferences') {
+        return value
+      }
+      return (...args: unknown[]) => {
+        const result = (value as (...parameters: unknown[]) => unknown)(...args)
+        if (result !== undefined) queueUserDataFlush()
+        return result
+      }
+    },
+  }) as AppRepositories['conversations']
+  const chatMessages = new Proxy(cachedMessages, {
+    get(target, property, receiver) {
+      if (property === 'insertWithAssets') {
+        return (value: Parameters<AppRepositories['messages']['insertWithAssets']>[0], assetIds: string[]) => {
+          const store = currentUserData()
+          const summary = store.conversations.getSummary(value.conversationId)
+          if (!summary) throw failure('NOT_FOUND')
+          const occurredAt = new Date(value.createdAt).toISOString()
+          const mutation: SyncMutation = {
+            id: randomUUID(), kind: 'message.append', entityId: value.id,
+            baseRevision: summary.revision, occurredAt,
+            payload: {
+              id: value.id, conversationId: value.conversationId,
+              role: value.role === 'user' ? 'user' : 'assistant',
+              blocks: chatBlockSchema.array().parse(value.blocks),
+              ...(value.executionId === undefined ? {} : { executionId: value.executionId }),
+              createdAt: occurredAt,
+            },
+          }
+          store.outbox.recordWithMessage(mutation, assetIds)
+          queueUserDataFlush()
+          const stored = store.messages.get(value.id)
+          if (!stored) throw failure('INTERNAL_ERROR')
+          return stored
+        }
+      }
+      return Reflect.get(target, property, receiver)
+    },
+  }) as AppRepositories['messages']
+  const cachedChatRuns = userRepository('chatRuns')
+  const chatRuns = new Proxy(cachedChatRuns, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver)
+      if (property !== 'startMediaGeneration' && property !== 'finalizeWithMessage') return value
+      return (...args: unknown[]) => {
+        const result = (value as (...parameters: unknown[]) => unknown)(...args)
+        queueUserDataFlush()
+        return result
+      }
+    },
+  }) as AppRepositories['chatRuns']
+  const cachedProviderUsage = userRepository('providerUsage')
+  const providerUsage = new Proxy(cachedProviderUsage, {
+    get(target, property, receiver) {
+      if (property === 'recordByokUsage') {
+        return (input: unknown) => {
+          const event = byokUsageEventSchema.parse(input)
+          const store = currentUserData()
+          store.outbox.record({
+            id: event.id,
+            kind: 'usage.record',
+            entityId: event.id,
+            baseRevision: 0,
+            occurredAt: event.occurredAt,
+            payload: event,
+          })
+          queueUserDataFlush()
+        }
+      }
+      return Reflect.get(target, property, receiver)
+    },
+  }) as AppRepositories['providerUsage']
+  const chatDatabase: AppRepositories = {
+    ...database,
+    conversations: chatConversations,
+    messages: chatMessages,
+    conversationContexts: userRepository('conversationContexts'),
+    mediaAssets: userRepository('mediaAssets'),
+    mediaGenerationJobs: userRepository('mediaGenerationJobs'),
+    chatRuns,
+    providerUsage,
+  }
   const providerUsageReconciler = new ProviderUsageReconciler({
-    providerUsage: database.providerUsage,
+    providerUsage: chatDatabase.providerUsage,
     providers: providerRegistry,
   })
   const projects = new WorkflowProjectService(database, options.paths.installations, options.projectServiceOptions)
   const registry = new WorkflowRegistry(database, projects)
-  const media = createMediaAssetService({ database, mediaRoot: join(options.paths.data, 'media') })
-  const mediaLifecycle = new MediaLifecycle({
-    database,
-    mediaRoot: join(options.paths.data, 'media'),
+  const enqueueConversationDelete = (conversationId: string): void => {
+    const store = currentUserData()
+    const summary = store.conversations.getSummary(conversationId)
+    if (!summary) throw failure('NOT_FOUND')
+    store.outbox.recordWithConversation({
+      id: randomUUID(), kind: 'conversation.delete', entityId: conversationId,
+      baseRevision: summary.revision, payload: {}, occurredAt: new Date().toISOString(),
+    })
+    queueUserDataFlush()
+  }
+  const mediaLifecycleDatabase = {
+    ...chatDatabase,
+    conversations: {
+      get: (id: string) => chatDatabase.conversations.get(id),
+      list: () => chatDatabase.conversations.list(),
+      delete: enqueueConversationDelete,
+    },
+    clearConversations: () => {
+      for (const conversation of currentUserData().conversations.list()) {
+        if (currentUserData().conversations.getSummary(conversation.id)) {
+          enqueueConversationDelete(conversation.id)
+        }
+      }
+    },
+  }
+  let boundMediaUserId: string | undefined
+  let boundMediaService: MediaAssetService | undefined
+  let boundMediaLifecycle: MediaLifecycle | undefined
+  const currentMediaService = (): MediaAssetService => {
+    if (!boundMediaService) throw failure('AUTH_REQUIRED')
+    return boundMediaService
+  }
+  const currentMediaLifecycle = (): MediaLifecycle => {
+    if (!boundMediaLifecycle) throw failure('AUTH_REQUIRED')
+    return boundMediaLifecycle
+  }
+  const media = new Proxy({} as MediaAssetService, {
+    get: (_target, property) => {
+      const service = currentMediaService()
+      const value = Reflect.get(service, property)
+      return typeof value === 'function' ? value.bind(service) : value
+    },
   })
+  bindUserMedia = async (session) => {
+    if (boundMediaUserId === session.user.id && boundMediaService && boundMediaLifecycle) return
+    const mediaRoot = resolveUserMediaRoot(options.paths.data, session.user.id)
+    const service = createMediaAssetService({ database: chatDatabase, mediaRoot })
+    const lifecycle = new MediaLifecycle({ database: mediaLifecycleDatabase, mediaRoot })
+    await lifecycle.recover()
+    boundMediaUserId = session.user.id
+    boundMediaService = service
+    boundMediaLifecycle = lifecycle
+  }
+  pauseUserMedia = () => {
+    boundMediaUserId = undefined
+    boundMediaService = undefined
+    boundMediaLifecycle = undefined
+  }
+  deleteUserMedia = async (userId) => {
+    await rm(resolveUserMediaRoot(options.paths.data, userId), { recursive: true, force: true })
+  }
   const providerCredentialEpoch = new Map<ModelProviderId, number>()
   const modelCatalog = new Map<ModelProviderId, {
     credentialEpoch: number
@@ -729,8 +1071,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     onTakeOver: async ({ binding, runId }) => {
       const session = await auth.requireSession()
-      const run = database.chatRuns.get(runId)
-      const conversation = database.conversations.get(binding.conversationId)
+      const run = chatDatabase.chatRuns.get(runId)
+      const conversation = chatDatabase.conversations.get(binding.conversationId)
       if (!run
         || !conversation
         || session.user.id !== binding.userId
@@ -815,6 +1157,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
 
   const activeExecutions = new Set<string>()
   const activeRequests = new Set<string>()
+  const activeChatAdmissions = new Set<Promise<void>>()
   const activeChatWork = new Map<string, {
     conversationId: string
     promise: Promise<void>
@@ -834,10 +1177,29 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let acceptingWork = true
   const failureRecorder = createApplicationFailureRecorder(() => { acceptingWork = false })
   const recordFailure = failureRecorder.record
-  const providerUsageReconciliationLoop = createProviderUsageReconciliationLoop(
+  const createReconciliationLoop = () => createProviderUsageReconciliationLoop(
     providerUsageReconciler,
     (error) => { recordFailure(error, 'reconciliation-stop') },
   )
+  let providerUsageReconciliationLoop = createReconciliationLoop()
+  let userReconciliationActive = false
+  let userRecoveryStarted = false
+  activateUserReconciliation = (recoverInterrupted) => {
+    if (!userReconciliationActive) {
+      providerUsageReconciliationLoop = createReconciliationLoop()
+      userReconciliationActive = true
+    }
+    if (recoverInterrupted && !userRecoveryStarted) {
+      userRecoveryStarted = true
+      providerUsageReconciliationLoop.start()
+    }
+  }
+  pauseUserReconciliation = async () => {
+    if (!userReconciliationActive) return
+    userReconciliationActive = false
+    userRecoveryStarted = false
+    await providerUsageReconciliationLoop.stop()
+  }
   const trackChatWork = (
     requestId: string,
     conversationId: string,
@@ -864,7 +1226,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (['queued', 'awaiting_approval', 'running'].includes(event.status)) activeExecutions.add(event.executionId)
       else activeExecutions.delete(event.executionId)
     }
-    if (auth.isAuthenticated()) {
+    const ownerUserId = database.executions.get(event.executionId)?.ownerUserId
+    if (auth.isAuthenticated() && ownerUserId !== undefined && ownerUserId === auth.currentUserId()) {
       try { options.emitExecution(event) } catch { /* Renderer events are observational. */ }
     }
   }
@@ -882,17 +1245,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
   })
   const conversationTitles = new ConversationTitleService({
-    repositories: database,
+    repositories: chatDatabase,
     emit: (event) => emitChat(event),
     id: randomUUID,
     now: Date.now,
   })
   const emitChat = (event: ChatEvent) => {
+    if (event.type === 'sync_warning_updated') {
+      try { options.emitChat(event) } catch { /* Renderer events are observational. */ }
+      return
+    }
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
       activeRequests.delete(event.requestId)
-      providerUsageReconciliationLoop.notifyUsageEnded()
+      if (userReconciliationActive) providerUsageReconciliationLoop.notifyUsageEnded()
     }
-    const ownerId = database.conversations.get(event.conversationId)?.userId
+    const ownerId = chatDatabase.conversations.get(event.conversationId)?.userId
     const belongsToCurrentUser = ownerId !== undefined && ownerId === auth.currentUserId()
     if (belongsToCurrentUser && event.type === 'block' && event.block.type === 'approval') {
       emitExecution({
@@ -912,7 +1279,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       const context = conversationTitleContexts.get(event.requestId)
       conversationTitleContexts.delete(event.requestId)
       if (event.status !== 'completed') return
-      const run = database.chatRuns.getByRequestId(event.requestId)
+      const run = chatDatabase.chatRuns.getByRequestId(event.requestId)
       if (
         context
         && belongsToCurrentUser
@@ -921,6 +1288,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         && run?.userId === context.userId
         && run.provider === context.providerSnapshot.providerId
         && (providerCredentialEpoch.get(run.provider) ?? 0) === context.providerCredentialEpoch
+        && userDataAdmission.acceptsNewWork()
       ) {
         const controller = new AbortController()
         const promise = conversationTitles.generate({
@@ -939,14 +1307,38 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           promise,
         })
       } else {
-        database.conversations.failPendingTitleGeneration(event.conversationId)
+        chatDatabase.conversations.failPendingTitleGeneration(event.conversationId)
       }
     }
   }
-  const conversationContext = createConversationContextManager(database)
+  notifyConversationChanges = (conversationIds) => {
+    for (const conversationId of conversationIds) {
+      const conversation = currentUserData().conversations.getSummary(conversationId)
+      if (conversation) {
+        emitChat({ type: 'conversation_updated', conversationId, conversation })
+      } else {
+        emitChat({ type: 'conversation_removed', conversationId })
+      }
+    }
+  }
+  notifySyncWarning = (binding, warningSince) => {
+    if (boundUserId !== binding.userId || auth.currentUserId() !== binding.userId) return
+    try {
+      if (userDataSync.captureBinding(binding.userId).generation !== binding.generation) return
+    } catch {
+      return
+    }
+    emitChat({
+      type: 'sync_warning_updated',
+      ...(warningSince === undefined ? {} : {
+        warningSince: new Date(warningSince).toISOString(),
+      }),
+    })
+  }
+  const conversationContext = createConversationContextManager(chatDatabase)
   const agent = new AgentOrchestrator({
     workflows: registry,
-    persistence: createAgentPersistence(database),
+    persistence: createAgentPersistence(chatDatabase),
     history: conversationContext,
     policy,
     executions,
@@ -958,7 +1350,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     checkRemainingBudgets: ({ toolExecutions }) => (
       toolExecutions >= 5 ? 'TOOL_CALL_LIMIT' : undefined
     ),
-    providerUsage: database.providerUsage,
+    providerUsage: chatDatabase.providerUsage,
     emit: emitChat,
     developerMode: () => settings.get().developerMode,
     browserContinuation: {
@@ -968,7 +1360,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
-  const persistence = createAgentPersistence(database)
+  const persistence = createAgentPersistence(chatDatabase)
   const mediaGeneration = new MediaGenerationOrchestrator({
     providers: providerRegistry,
     persistence,
@@ -977,17 +1369,29 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       transport: options.mediaTransport ?? new PinnedMediaTransport(),
       withTransportLease: options.networkProxy.withTransportLease.bind(options.networkProxy),
     }),
-    providerUsage: database.providerUsage,
+    providerUsage: chatDatabase.providerUsage,
     emit: emitChat,
   })
-  const videoJobs = new VideoJobRunner({
-    database,
-    providerUsage: database.providerUsage,
+  const createVideoJobs = () => new VideoJobRunner({
+    database: chatDatabase,
+    providerUsage: chatDatabase.providerUsage,
     providers: providerRegistry,
     media,
     emit: emitChat,
     onBackgroundFailure: (error) => { recordFailure(error, 'video-background') },
+    onMutationCommitted: () => { queueUserDataFlush() },
   })
+  let videoJobs = createVideoJobs()
+  activateVideoJobs = async (recoverInterrupted) => {
+    if (recoverInterrupted) await videoJobs.recover()
+  }
+  pauseVideoJobs = async () => {
+    try {
+      await videoJobs.stop()
+    } finally {
+      videoJobs = createVideoJobs()
+    }
+  }
 
   const requireValidCredential = async (snapshot: ModelProviderSnapshot): Promise<void> => {
     const result = await snapshot.provider.validateCredential()
@@ -1042,7 +1446,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   }
 
   const requireOwnedConversation = (conversationId: string, userId: string) => {
-    const conversation = database.conversations.get(conversationId)
+    const conversation = chatDatabase.conversations.get(conversationId)
     if (!conversation || conversation.userId !== userId) throw failure('NOT_FOUND')
     return conversation
   }
@@ -1060,7 +1464,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return live
   }
   const requireOwnedBrowserRun = (requestId: string, conversationId: string, userId: string) => {
-    const run = database.chatRuns.getByRequestId(requestId)
+    const run = chatDatabase.chatRuns.getByRequestId(requestId)
     if (!run || run.userId !== userId || run.conversationId !== conversationId) throw failure('NOT_FOUND')
     return run
   }
@@ -1078,7 +1482,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const currentBrowserRequest = (bindingId: string, userId: string) => {
     const lease = browserContinuations.currentLease(bindingId)
     if (!lease || lease.binding.userId !== userId) throw failure('NOT_FOUND')
-    const run = database.chatRuns.get(lease.runId)
+    const run = chatDatabase.chatRuns.get(lease.runId)
     if (!run || run.userId !== userId || run.conversationId !== lease.binding.conversationId) {
       throw failure('NOT_FOUND')
     }
@@ -1098,7 +1502,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const cancelAgentRequestsForUser = async (userId: string): Promise<void> => {
     const requestIds = [...activeRequests].filter((requestId) => (
-      database.chatRuns.getByRequestId(requestId)?.userId === userId
+      chatDatabase.chatRuns.getByRequestId(requestId)?.userId === userId
     ))
     const results = await Promise.allSettled(requestIds.map((requestId) => agent.cancel(requestId)))
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -1111,22 +1515,117 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
   }
-  const beforeAuthIdentityChange = async (): Promise<void> => {
+  const beforeAuthIdentityChange = async (
+    waitForActive: () => Promise<void>,
+    pause = true,
+  ): Promise<void> => {
     const current = await auth.getSession()
-    if (current) await resetBrowserIdentity(current.user.id)
+    if (current) {
+      await resetBrowserIdentity(current.user.id)
+      const admissions = [...activeChatAdmissions]
+      if (admissions.length > 0) {
+        await Promise.all(admissions)
+        await new Promise<void>((resolve) => { setImmediate(resolve) })
+        await resetBrowserIdentity(current.user.id)
+      }
+      await Promise.all([...activeChatWork.values()].map(({ promise }) => promise))
+      const titleWork = [...activeConversationTitleWork.values()]
+      for (const work of titleWork) work.controller.abort()
+      await Promise.all(titleWork.map(({ promise }) => promise))
+      await waitForActive()
+      if (pause) await pauseUserData()
+      return
+    }
+    await waitForActive()
+  }
+  const transitionIdentity = <T>(operation: () => Promise<T>): Promise<T> => (
+    userDataAdmission.transition(async (waitForActive) => {
+      try {
+        await beforeAuthIdentityChange(waitForActive)
+        return await operation()
+      } catch (error) {
+        const restored = await auth.getSession().catch(() => null)
+        if (restored) await bindUserData(restored)
+        else await pauseUserData()
+        throw error
+      }
+    })
+  )
+  const flushForLogout = async (timeoutMs: number): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        userDataSync.flush().then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs)
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 
   let settingsUpdateTail = Promise.resolve()
-  const services: DesktopIpcServices = {
+  const ungatedServices: DesktopIpcServices = {
     auth: {
-      getSession: () => auth.getSession(),
-      refreshAuthorization: () => auth.refreshAuthorization(),
+      getSession: () => userDataAdmission.transition(async (waitForActive) => {
+        try {
+          await waitForActive()
+          const session = await auth.getSession()
+          if (session) await bindUserData(session)
+          else await pauseUserData()
+          return session
+        } catch (error) {
+          const restored = await auth.getSession().catch(() => null)
+          if (restored) await bindUserData(restored)
+          throw error
+        }
+      }),
+      refreshAuthorization: () => userDataAdmission.run(async () => {
+        const session = await auth.refreshAuthorization()
+        await bindUserData(session)
+        return session
+      }),
       sendOtp: (input) => auth.sendOtp(input),
-      verifyOtp: async (input) => { await beforeAuthIdentityChange(); return auth.verifyOtp(input) },
+      verifyOtp: (input) => transitionIdentity(async () => {
+        const session = await auth.verifyOtp(input)
+        await bindUserData(session)
+        return session
+      }),
       cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
-      loginWithPassword: async (input) => { await beforeAuthIdentityChange(); return auth.loginWithPassword(input) },
-      logout: async () => { await beforeAuthIdentityChange(); await auth.logout() },
-      requireSession: () => auth.requireSession(),
+      loginWithPassword: (input) => transitionIdentity(async () => {
+        const session = await auth.loginWithPassword(input)
+        await bindUserData(session)
+        return session
+      }),
+      logout: (input) => userDataAdmission.transition(async (waitForActive) => {
+        const session = await auth.requireSession()
+        const deadline = Date.now() + (options.logoutSyncTimeoutMs ?? 5_000)
+        await beforeAuthIdentityChange(waitForActive, false)
+        const flushed = await flushForLogout(Math.max(0, deadline - Date.now()))
+        if (!flushed) return { status: 'sync_timeout' as const }
+        if (input && 'discardPending' in input) {
+          await prepareUserDataDiscard()
+        } else {
+          const pendingCount = currentUserData().outbox.countPending()
+          if (!input && pendingCount > 0) {
+            return { status: 'pending_sync' as const, pendingCount }
+          }
+          await pauseUserData()
+        }
+        try {
+          await auth.logout()
+        } catch (error) {
+          await bindUserData(session)
+          throw error
+        }
+        if (!input || 'discardPending' in input) {
+          await deleteUserMedia(session.user.id)
+          userDataStores.closeAndDelete(session.user.id)
+        }
+        return { status: 'logged_out' as const }
+      }),
+      requireSession: () => userDataAdmission.run(requireAuthenticatedSession),
     },
     userAdmin: {
       list: (input) => userAdmin.list(input),
@@ -1141,56 +1640,66 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
     },
     chat: {
-      listConversations: async () => {
-        const session = await auth.requireSession()
-        return database.conversations.claimLegacyAndListForUser(session.user.id).map((conversation) => ({
-          id: conversation.id,
-          title: conversation.title,
-          createdAt: new Date(conversation.createdAt).toISOString(),
-          updatedAt: new Date(conversation.updatedAt).toISOString(),
-        }))
+      listConversations: async (input) => {
+        await requireAuthenticatedSession()
+        const page = currentUserData().conversations.listPage(input)
+        const warningSince = userDataSync.status().warningSince
+        void userDataSync.pull().catch(() => undefined)
+        return {
+          ...page,
+          ...(warningSince === undefined ? {} : {
+            syncWarningSince: new Date(warningSince).toISOString(),
+          }),
+        }
       },
-      listMessages: async (conversationId) => {
-        const session = await auth.requireSession()
-        requireOwnedConversation(conversationId, session.user.id)
-        return database.messages.listForConversation(conversationId).map((message) => {
-          if (message.role !== 'user' && message.role !== 'assistant') throw failure('INTERNAL_ERROR')
-          return {
-            id: message.id,
-            conversationId: message.conversationId,
-            role: message.role,
-            blocks: chatBlockSchema.array().parse(message.blocks),
-            ...(message.executionId ? { executionId: message.executionId } : {}),
-            createdAt: new Date(message.createdAt).toISOString(),
-          }
-        })
+      listMessages: async (input) => {
+        const session = await requireAuthenticatedSession()
+        requireOwnedConversation(input.conversationId, session.user.id)
+        const page = currentUserData().messages.listPage(input)
+        void userDataSync.pull().catch(() => undefined)
+        return page
       },
       createConversation: async () => {
-        const session = await auth.requireSession()
-        const conversation = database.conversations.insert({
-          id: randomUUID(), title: '新会话', titleState: 'pending', userId: session.user.id,
-        })
-        return {
-          id: conversation.id,
-          title: conversation.title,
-          createdAt: new Date(conversation.createdAt).toISOString(),
-          updatedAt: new Date(conversation.updatedAt).toISOString(),
+        await requireAuthenticatedSession()
+        const store = currentUserData()
+        if (store.account.getConsent('cloud_sync')?.documentVersion
+          !== CLOUD_SYNC_DOCUMENT_VERSION) {
+          throw failure('IMPORT_CONFIRMATION_REQUIRED')
         }
+        const id = randomUUID()
+        const occurredAt = new Date().toISOString()
+        store.outbox.recordWithConversation({
+          id: randomUUID(), kind: 'conversation.create', entityId: id, baseRevision: 0,
+          occurredAt,
+          payload: {
+            title: '新会话', titleState: 'pending', createdAt: occurredAt,
+            lastActivityAt: occurredAt, metadataUpdatedAt: occurredAt,
+          },
+        })
+        queueUserDataFlush()
+        const conversation = store.conversations.getSummary(id)
+        if (!conversation) throw failure('INTERNAL_ERROR')
+        return conversation
       },
       renameConversation: async (conversationId, title) => {
-        const session = await auth.requireSession()
+        const session = await requireAuthenticatedSession()
         requireOwnedConversation(conversationId, session.user.id)
-        const conversation = database.conversations.renameByUser(conversationId, title)
+        const store = currentUserData()
+        const existing = store.conversations.getSummary(conversationId)
+        if (!existing) throw failure('NOT_FOUND')
+        const occurredAt = new Date().toISOString()
+        store.outbox.recordWithConversation({
+          id: randomUUID(), kind: 'conversation.rename', entityId: conversationId,
+          baseRevision: existing.revision, occurredAt,
+          payload: { title, titleState: 'user_named', metadataUpdatedAt: occurredAt },
+        })
+        queueUserDataFlush()
+        const conversation = store.conversations.getSummary(conversationId)
         if (!conversation) throw failure('NOT_FOUND')
-        return {
-          id: conversation.id,
-          title: conversation.title,
-          createdAt: new Date(conversation.createdAt).toISOString(),
-          updatedAt: new Date(conversation.updatedAt).toISOString(),
-        }
+        return conversation
       },
       deleteConversation: async (conversationId) => {
-        const session = await auth.requireSession()
+        const session = await requireAuthenticatedSession()
         requireOwnedConversation(conversationId, session.user.id)
         return maintenance.runExclusive(
           () => [...activeChatWork.values()].some((work) => work.conversationId !== conversationId)
@@ -1198,7 +1707,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               (work) => work.conversationId !== conversationId,
             )
             || mediaGeneration.hasActiveRuns()
-            || database.mediaGenerationJobs.listActive().length > 0
+            || chatDatabase.mediaGenerationJobs.listActive().length > 0
             || activeExecutions.size > 0
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
@@ -1212,13 +1721,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             for (const work of titleRequests) work.controller.abort()
             await Promise.all(titleRequests.map((work) => work.promise))
             await browserContinuations.revokeConversation(conversationId, 'CANCELLED')
-            await mediaLifecycle.deleteConversation(conversationId)
+            await currentMediaLifecycle().deleteConversation(conversationId)
           },
         )
+      },
+      retrySync: async (conversationId) => {
+        const session = await requireAuthenticatedSession()
+        if (conversationId !== undefined) requireOwnedConversation(conversationId, session.user.id)
+        await userDataSync.retry(conversationId)
       },
       send: async (input) => {
         const session = await auth.requireSession()
         const releaseStart = maintenance.beginStart()
+        let finishAdmission!: () => void
+        const admission = new Promise<void>((resolve) => { finishAdmission = resolve })
+        activeChatAdmissions.add(admission)
         try {
           if (!acceptingWork) throw failure('CONFLICT')
           const conversation = requireOwnedConversation(input.conversationId, session.user.id)
@@ -1342,12 +1859,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           return { requestId }
         } finally {
           releaseStart()
+          activeChatAdmissions.delete(admission)
+          finishAdmission()
         }
       },
       cancel: async (requestId) => {
         const session = await auth.requireSession()
         const conversationId = activeChatWork.get(requestId)?.conversationId
-          ?? database.chatRuns.getByRequestId(requestId)?.conversationId
+          ?? chatDatabase.chatRuns.getByRequestId(requestId)?.conversationId
         if (!conversationId) throw failure('NOT_FOUND')
         requireOwnedConversation(conversationId, session.user.id)
         await Promise.allSettled([
@@ -1389,7 +1908,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         requireOwnedConversation(conversationId, session.user.id)
         const normalized = conversationGenerationPreferencesSchema.safeParse(preferences)
         if (!normalized.success) throw failure('INVALID_INPUT')
-        const conversation = database.conversations.updateGenerationPreferences(conversationId, normalized.data)
+        const conversation = chatDatabase.conversations.updateGenerationPreferences(conversationId, normalized.data)
         if (!conversation?.generationPreferences) throw failure('NOT_FOUND')
         return conversationGenerationPreferencesSchema.parse(conversation.generationPreferences)
       },
@@ -1421,29 +1940,31 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       saveCopy: async (assetId) => {
         const session = await auth.requireSession()
-        const record = database.mediaAssets.get(assetId)
-        if (record) requireOwnedConversation(record.conversationId, session.user.id)
+        const record = chatDatabase.mediaAssets.get(assetId)
+        if (!record) throw failure('NOT_FOUND')
+        requireOwnedConversation(record.conversationId, session.user.id)
         const asset = await media.resolveReadyAsset(assetId)
         const destination = await options.chooseMediaSavePath(asset.name)
         if (destination) await copyFile(asset.absolutePath, destination)
       },
       reveal: async (assetId) => {
         const session = await auth.requireSession()
-        const record = database.mediaAssets.get(assetId)
-        if (record) requireOwnedConversation(record.conversationId, session.user.id)
+        const record = chatDatabase.mediaAssets.get(assetId)
+        if (!record) throw failure('NOT_FOUND')
+        requireOwnedConversation(record.conversationId, session.user.id)
         const asset = await media.resolveReadyAsset(assetId)
         options.revealPath(asset.absolutePath)
       },
       pauseVideoJob: async (jobId) => {
         const session = await auth.requireSession()
-        const job = database.mediaGenerationJobs.get(jobId)
+        const job = chatDatabase.mediaGenerationJobs.get(jobId)
         if (!job) throw failure('NOT_FOUND')
         requireOwnedConversation(job.conversationId, session.user.id)
         return videoJobs.pause(jobId)
       },
       resumeVideoJob: async (jobId) => {
         const session = await auth.requireSession()
-        const job = database.mediaGenerationJobs.get(jobId)
+        const job = chatDatabase.mediaGenerationJobs.get(jobId)
         if (!job) throw failure('NOT_FOUND')
         requireOwnedConversation(job.conversationId, session.user.id)
         return videoJobs.resume(jobId)
@@ -1576,7 +2097,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     executions: {
       list: async (query?: ExecutionQuery) => {
-        let records = database.executions.list()
+        const session = await auth.requireSession()
+        let records = database.executions.listForUser(session.user.id)
         if (query?.status) records = records.filter((execution) => execution.status === query.status)
         if (query?.workflowId) records = records.filter((execution) => execution.workflowId === query.workflowId)
         if (query?.search) records = records.filter((execution) => `${execution.id}\n${execution.workflowId}`.toLocaleLowerCase().includes(query.search!.toLocaleLowerCase()))
@@ -1585,21 +2107,22 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return records.map(executionSummary)
       },
       get: async (executionId) => {
-        const execution = database.executions.get(executionId)
+        const session = await auth.requireSession()
+        const execution = database.executions.getForUser(executionId, session.user.id)
         if (!execution) throw failure('NOT_FOUND')
         const result: ExecutionDetail = {
           ...executionSummary(execution),
           input: execution.input,
           ...(execution.result === undefined ? {} : { output: execution.result }),
           ...(execution.errorCode ? { error: { code: execution.errorCode, message: toSafeAppError({ code: execution.errorCode }).message } } : {}),
-          steps: database.executionSteps.list(executionId).map((step) => ({
+          steps: database.executionSteps.listForUser(executionId, session.user.id).map((step) => ({
             id: step.id,
             label: step.name,
             status: step.status as 'running' | 'completed' | 'failed',
             ...(iso(step.startedAt) ? { startedAt: iso(step.startedAt) } : {}),
             ...(iso(step.endedAt) ? { finishedAt: iso(step.endedAt) } : {}),
           })),
-          logs: database.executionLogs.list(executionId).map((log) => ({
+          logs: database.executionLogs.listForUser(executionId, session.user.id).map((log) => ({
             id: log.id,
             level: log.level as 'debug' | 'info' | 'warn' | 'error',
             message: log.message,
@@ -1609,8 +2132,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return result
       },
       decide: async (decision) => {
+        const session = await auth.requireSession()
         const agentOwned = agent.recognizesExecution(decision.executionId)
-          || database.messages.hasWorkflowApproval(decision.executionId)
+          || chatDatabase.messages.hasWorkflowApproval(decision.executionId)
+        if (!agentOwned && !database.executions.getForUser(decision.executionId, session.user.id)) {
+          throw failure('NOT_FOUND')
+        }
         let result
         try {
           result = await agent.resumeApproval(decision)
@@ -1622,6 +2149,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         if (result.error?.code === 'CONFLICT') await executions.decide(decision)
       },
       cancel: async (executionId) => {
+        const session = await auth.requireSession()
+        if (!database.executions.getForUser(executionId, session.user.id)) {
+          throw failure('NOT_FOUND')
+        }
         const cancelledAgent = await agent.cancelExecution(executionId)
         if (!cancelledAgent) await executions.cancel(executionId)
         await browser.closeExecution(executionId)
@@ -1701,9 +2232,157 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         return createTokenUsageSnapshot(
           now,
           session.user.id,
-          (query) => database.chatRuns.summarizeTokenUsage(query),
-          (query) => database.providerUsage.summarize(query),
+          (query) => chatDatabase.chatRuns.summarizeTokenUsage(query),
+          (query) => chatDatabase.providerUsage.summarize(query),
         )
+      },
+      recordPrivacyConsent: async (input) => {
+        await requireAuthenticatedSession()
+        const consent = privacyConsentSchema.safeParse(input)
+        if (!consent.success
+          || consent.data.purpose !== 'cloud_sync'
+          || consent.data.documentVersion !== CLOUD_SYNC_DOCUMENT_VERSION) {
+          throw failure('INVALID_INPUT')
+        }
+        const store = currentUserData()
+        if (JSON.stringify(store.account.getConsent('cloud_sync')) === JSON.stringify(consent.data)) return
+        store.outbox.recordWithConsent({
+          id: randomUUID(), kind: 'privacy.consent', entityId: consent.data.documentVersion,
+          baseRevision: 0, occurredAt: consent.data.consentedAt, payload: consent.data,
+        })
+        queueUserDataFlush()
+      },
+      previewLegacyImport: async () => {
+        const session = await requireAuthenticatedSession()
+        return legacyUserDataImporter.preview(session.user.id)
+      },
+      importLegacyData: async (input) => {
+        const session = await requireAuthenticatedSession()
+        const confirmation = legacyImportRequestSchema.safeParse(input)
+        const store = currentUserData()
+        const storedCloudConsent = store.account.getConsent('cloud_sync')
+        if (!confirmation.success
+          || confirmation.data.cloudSyncConsent.documentVersion !== CLOUD_SYNC_DOCUMENT_VERSION
+          || JSON.stringify(storedCloudConsent) !== JSON.stringify(confirmation.data.cloudSyncConsent)) {
+          throw failure('IMPORT_CONFIRMATION_REQUIRED')
+        }
+        if (confirmation.data.includeUnowned) {
+          const consent = confirmation.data.unownedImportConsent
+          if (!consent) throw failure('IMPORT_CONFIRMATION_REQUIRED')
+          if (JSON.stringify(store.account.getConsent('legacy_unowned_import'))
+            !== JSON.stringify(consent)) {
+            store.outbox.recordWithConsent({
+              id: randomUUID(), kind: 'privacy.consent', entityId: consent.documentVersion,
+              baseRevision: 0, occurredAt: consent.consentedAt, payload: consent,
+            })
+            await userDataSync.flush()
+          }
+        }
+        const selectionFingerprint = legacyUserDataImporter.selectionFingerprint(
+          session.user.id,
+          confirmation.data.includeUnowned,
+        )
+        const batchId = store.account.resolveLegacyImportBatch({
+          selectionFingerprint,
+          includeUnowned: confirmation.data.includeUnowned,
+          cloudConsentVersion: confirmation.data.cloudSyncConsent.documentVersion,
+          ...(confirmation.data.unownedImportConsent ? {
+            unownedConsentVersion: confirmation.data.unownedImportConsent.documentVersion,
+          } : {}),
+          candidateBatchId: `legacy-${randomUUID()}`,
+        })
+        const results = await legacyUserDataImporter.import(session.user.id, {
+          ...confirmation.data,
+          batchId,
+        })
+        await userDataSync.pull()
+        const pullStatus = userDataSync.status()
+        if (pullStatus.state !== 'idle') {
+          throw failure('errorCode' in pullStatus ? pullStatus.errorCode ?? 'INTERNAL_ERROR' : 'INTERNAL_ERROR')
+        }
+        return results
+      },
+      getAccountDataPreferences: async (): Promise<AccountDataPreferences> => {
+        await requireAuthenticatedSession()
+        const store = currentUserData()
+        let preferences = store.account.getPreferences()
+        if (!preferences) {
+          const response = await userDataSyncPort.call({ action: 'getUserDataPreferences' })
+          if (!response.ok) throw failure(response.error.code)
+          const parsed = accountDataPreferencesRecordSchema.safeParse(response.data)
+          if (!parsed.success) throw failure('INTERNAL_ERROR')
+          store.account.projectPreferences(parsed.data)
+          preferences = parsed.data
+        }
+        return accountDataPreferencesSchema.parse({
+          timezone: preferences.timezone,
+          displayCurrency: preferences.displayCurrency,
+        })
+      },
+      updateAccountDataPreferences: async (input) => {
+        await requireAuthenticatedSession()
+        const preferences = accountDataPreferencesSchema.safeParse(input)
+        if (!preferences.success) throw failure('INVALID_INPUT')
+        try {
+          new Intl.DateTimeFormat('en-US', { timeZone: preferences.data.timezone }).format()
+        } catch {
+          throw failure('INVALID_INPUT')
+        }
+        const store = currentUserData()
+        const current = store.account.getPreferences()
+        const occurredAt = new Date().toISOString()
+        store.outbox.recordWithPreferences({
+          id: randomUUID(), kind: 'preferences.update', entityId: 'account-preferences',
+          baseRevision: current?.revision ?? 0, occurredAt, payload: preferences.data,
+        })
+        queueUserDataFlush()
+        return preferences.data
+      },
+      getRemoteUsage: async () => {
+        await requireAuthenticatedSession()
+        const store = currentUserData()
+        let storedPreferences = store.account.getPreferences()
+        if (!storedPreferences) {
+          const preferencesResponse = await userDataSyncPort.call({
+            action: 'getUserDataPreferences',
+          })
+          if (!preferencesResponse.ok) throw failure(preferencesResponse.error.code)
+          const parsed = accountDataPreferencesRecordSchema.safeParse(preferencesResponse.data)
+          if (!parsed.success) throw failure('INTERNAL_ERROR')
+          store.account.projectPreferences(parsed.data)
+          storedPreferences = parsed.data
+        }
+        const preferences = storedPreferences
+          ? accountDataPreferencesSchema.parse({
+              timezone: storedPreferences.timezone,
+              displayCurrency: storedPreferences.displayCurrency,
+            })
+          : accountDataPreferencesSchema.parse(accountDataPreferencesDefaults)
+        const endedAt = new Date()
+        const startedAt = startOfMonthInTimeZone(endedAt, preferences.timezone)
+        const response = await userDataSyncPort.call({
+          action: 'getUsageSnapshot',
+          startedAt: startedAt.toISOString(),
+          endedAt: endedAt.toISOString(),
+        })
+        if (!response.ok) throw failure(response.error.code)
+        if (!('estimatedCostUsd' in response.data)) throw failure('INTERNAL_ERROR')
+        const checkpoint = store.sync.getCheckpoint()
+        return remoteUsageSnapshotSchema.parse({
+          startedAt: response.data.startedAt,
+          endedAt: response.data.endedAt,
+          inputTokens: response.data.inputTokens,
+          outputTokens: response.data.outputTokens,
+          totalTokens: response.data.inputTokens + response.data.outputTokens,
+          confirmedPlatformCost: null,
+          pendingCount: store.outbox.countPending('usage.record'),
+          byokEstimatedCostUsd: response.data.estimatedCostUsd,
+          byokEstimatedCount: response.data.estimatedCount,
+          byokUnavailableCount: response.data.unavailableCount,
+          timezone: preferences.timezone,
+          displayCurrency: preferences.displayCurrency,
+          ...(checkpoint ? { lastSyncAt: new Date(checkpoint.updatedAt).toISOString() } : {}),
+        })
       },
       clearLocalData: async (scope) => {
         await maintenance.runExclusive(
@@ -1713,12 +2392,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             || activeExecutions.size > 0
             || agent.hasActiveRuns()
             || mediaGeneration.hasActiveRuns()
-            || database.mediaGenerationJobs.listActive().length > 0
+            || chatDatabase.mediaGenerationJobs.listActive().length > 0
             || executions.hasActiveExecutions()
             || browser.hasActiveContexts(),
           async () => {
             if (scope === 'conversations' || scope === 'all') {
-              await mediaLifecycle.clearConversations()
+              await currentMediaLifecycle().clearConversations()
             }
             if (scope === 'executions' || scope === 'all') {
               database.clearLocalData('executions')
@@ -1753,26 +2432,78 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
   }
 
+  const gateUserDataService = <Service extends object>(service: Service): Service => new Proxy(
+    service,
+    {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver)
+        if (typeof value !== 'function') return value
+        return (...args: unknown[]) => userDataAdmission.run(
+          () => Reflect.apply(value, target, args),
+        )
+      },
+    },
+  )
+  const services: DesktopIpcServices = {
+    ...ungatedServices,
+    chat: gateUserDataService(ungatedServices.chat),
+    media: gateUserDataService(ungatedServices.media),
+    executions: gateUserDataService(ungatedServices.executions),
+    settings: {
+      ...ungatedServices.settings,
+      getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),
+      recordPrivacyConsent: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.recordPrivacyConsent(input),
+      ),
+      previewLegacyImport: () => userDataAdmission.run(
+        ungatedServices.settings.previewLegacyImport,
+      ),
+      importLegacyData: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.importLegacyData(input),
+      ),
+      getAccountDataPreferences: () => userDataAdmission.run(
+        ungatedServices.settings.getAccountDataPreferences,
+      ),
+      updateAccountDataPreferences: (input) => userDataAdmission.run(
+        () => ungatedServices.settings.updateAccountDataPreferences(input),
+      ),
+      getRemoteUsage: () => userDataAdmission.run(ungatedServices.settings.getRemoteUsage),
+      clearLocalData: (scope) => userDataAdmission.run(
+        () => ungatedServices.settings.clearLocalData(scope),
+      ),
+      clearBrowserData: () => userDataAdmission.run(ungatedServices.settings.clearBrowserData),
+    },
+  }
+
   let closePromise: Promise<void> | undefined
   return {
     services,
     mediaAssets: {
-      resolveReadyAsset: async (assetId: string) => {
+      resolveReadyAsset: (assetId: string) => userDataAdmission.run(async () => {
         const session = await auth.requireSession()
-        const record = database.mediaAssets.get(assetId)
-        if (record) requireOwnedConversation(record.conversationId, session.user.id)
+        const record = chatDatabase.mediaAssets.get(assetId)
+        if (!record) throw failure('NOT_FOUND')
+        requireOwnedConversation(record.conversationId, session.user.id)
         return media.resolveReadyAsset(assetId)
-      },
+      }),
     },
     recover: async () => {
       if (closePromise) throw failure('CONFLICT')
+      runtimeRecovered = true
       await options.networkProxy.initialize(settings.get().proxy)
-      await mediaLifecycle.recover()
       database.recoverInterrupted()
-      providerUsageReconciliationLoop.start()
+      const session = await auth.getSession()
+      if (session) {
+        await bindUserData(session)
+        chatDatabase.conversations.failInterruptedTitleGenerations()
+        chatDatabase.messages.upgradeLegacyApprovals()
+        chatDatabase.messages.invalidatePendingAgentApprovals()
+        chatDatabase.messages.failInterruptedMediaGenerations()
+        chatDatabase.providerUsage.recoverPending(Date.now())
+        await videoJobs.recover()
+      }
       await removeInterruptedRuntimeDirectories(options.paths.temporary)
       await projects.recoverRemovalJournals()
-      await videoJobs.recover()
     },
     close: () => {
       if (closePromise) return closePromise
@@ -1784,9 +2515,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         ): Promise<void> => {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
         }
+        await capture('admission-drain', () => userDataAdmission.stopAndDrain())
         await capture('admission-drain', () => maintenance.stopAndDrain())
         const reconciliationStopped = Promise.resolve()
-          .then(() => providerUsageReconciliationLoop.stop())
+          .then(() => pauseUserReconciliation())
           .catch((error: unknown) => { recordFailure(error, 'reconciliation-stop') })
         const cancellations = [...activeRequests].flatMap((requestId) => [
           { source: 'agent-cancel' as const, operation: () => agent.cancel(requestId) },
@@ -1822,6 +2554,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         })
         await capture('browser-shutdown', () => browser.shutdown())
         await reconciliationStopped
+        await capture('sync-pause', () => userDataSync.pause())
+        await capture('user-cache-close', () => {
+          userDataStores.close()
+          boundUserId = undefined
+        })
         await capture('database-close', () => { database.close() })
         const terminalFailure = failureRecorder.select()
         if (terminalFailure !== undefined) throw terminalFailure.error

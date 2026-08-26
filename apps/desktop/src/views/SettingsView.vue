@@ -140,9 +140,10 @@
 
       <BillingUsagePanel
         :usage="settings.tokenUsage"
+        :remote-usage="settings.remoteUsage"
         :loading="settings.tokenUsageLoading"
         :error="settings.tokenUsageError"
-        @refresh="settings.loadTokenUsage"
+        @refresh="refreshUsage"
       />
 
       <section
@@ -261,6 +262,43 @@
         class="settings-section danger-zone"
       >
         <header><div><h2>本地数据</h2><p>清理操作不可撤销，不会删除工作流开发项目。</p></div></header>
+        <div class="settings-grid cloud-data-controls">
+          <label>账户时区<el-input
+            data-testid="account-timezone"
+            :model-value="settings.accountDataPreferences?.timezone"
+            @change="saveTimezone"
+          /></label>
+          <label>消费显示币种<el-select
+            data-testid="account-display-currency"
+            :model-value="settings.accountDataPreferences?.displayCurrency"
+            @change="saveDisplayCurrency"
+          ><el-option
+            label="人民币 (CNY)"
+            value="CNY"
+          /><el-option
+            label="美元 (USD)"
+            value="USD"
+          /></el-select></label>
+        </div>
+        <div class="legacy-import-control">
+          <div>
+            <strong>迁移本机历史会话</strong>
+            <small>当前账户 {{ settings.legacyImportPreview?.ownedCount ?? 0 }} 条；未归属 {{ settings.legacyImportPreview?.unownedCount ?? 0 }} 条。其他账户的会话不会显示或上传。</small>
+          </div>
+          <el-button
+            data-testid="legacy-import-button"
+            @click="confirmLegacyImport"
+          >
+            确认并迁移
+          </el-button>
+        </div>
+        <p
+          v-if="settings.cloudDataError"
+          class="field-message"
+          role="alert"
+        >
+          {{ settings.cloudDataError }}
+        </p>
         <dl><dt>数据目录</dt><dd>{{ settings.settings?.dataDirectory }}</dd><dt>日志目录</dt><dd>{{ settings.settings?.logDirectory }}</dd></dl>
         <div class="danger-actions">
           <el-button @click="confirmClear('conversations')">
@@ -539,8 +577,69 @@ onMounted(async () => {
       ? settings.refreshGrants()
       : !settings.loading ? settings.load() : Promise.resolve(),
     settings.loadTokenUsage(),
+    settings.loadCloudData(),
   ])
 })
+async function refreshUsage() {
+  await Promise.all([settings.loadTokenUsage(), settings.loadCloudData()])
+}
+function saveTimezone(value: unknown) {
+  if (typeof value !== 'string' || !settings.accountDataPreferences) return
+  void settings.updateAccountDataPreferences({
+    ...settings.accountDataPreferences,
+    timezone: value,
+  })
+}
+function saveDisplayCurrency(value: unknown) {
+  if ((value !== 'CNY' && value !== 'USD') || !settings.accountDataPreferences) return
+  void settings.updateAccountDataPreferences({
+    ...settings.accountDataPreferences,
+    displayCurrency: value,
+  })
+}
+async function confirmLegacyImport() {
+  const preview = settings.legacyImportPreview
+  const clientVersion = settings.appInfo?.version
+  if (!preview || !clientVersion) return
+  try {
+    await ElMessageBox.confirm(
+      '开启云同步后，新会话和确认迁移的历史会话会保存到当前 AutoForge 账户。',
+      '开启账户云同步',
+      { type: 'warning', confirmButtonText: '同意并继续', cancelButtonText: '取消' },
+    )
+    if (preview.requiresUnownedConfirmation) {
+      await ElMessageBox.confirm(
+        '这些未归属的本机会话可能由其他本机使用者创建。确认后会将它们迁移到当前账户。',
+        '确认迁移未归属会话',
+        { type: 'warning', confirmButtonText: '确认迁移', cancelButtonText: '取消' },
+      )
+    }
+    const consentedAt = new Date().toISOString()
+    const cloudSyncConsent = {
+      purpose: 'cloud_sync' as const,
+      documentVersion: 'cloud-sync-2026-08',
+      consentedAt,
+      clientVersion,
+    }
+    await window.autoForge.settings.recordPrivacyConsent(cloudSyncConsent)
+    await window.autoForge.settings.importLegacyData({
+      includeUnowned: preview.requiresUnownedConfirmation,
+      cloudSyncConsent,
+      ...(preview.requiresUnownedConfirmation ? {
+        unownedImportConsent: {
+          purpose: 'legacy_unowned_import' as const,
+          documentVersion: 'legacy-unowned-import-2026-08',
+          consentedAt,
+          clientVersion,
+        },
+      } : {}),
+    })
+    ElMessage.success('历史会话迁移完成')
+    await settings.loadCloudData()
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') settings.cloudDataError = '历史会话迁移失败'
+  }
+}
 async function changeProvider(provider: ModelProviderId) {
   const previous = settings.activeProvider
   await settings.switchProvider(provider)

@@ -31,6 +31,18 @@
         <div v-if="settings.error" class="af-error" role="alert">
           {{ settings.error }}
         </div>
+        <button
+          v-if="
+            chat.previousMessageCursorByConversation[
+              chat.selectedConversationId
+            ]
+          "
+          class="older-messages"
+          type="button"
+          @click="loadOlderMessages"
+        >
+          加载更早消息
+        </button>
         <div
           v-if="!chat.messages.length && !chat.isAwaitingResponse"
           class="chat-empty"
@@ -141,13 +153,17 @@ function padTimePart(value: number): string {
 
 function messageTimeParts(createdAt: string) {
   const created = new Date(createdAt);
-  const time = `${padTimePart(created.getHours())}:${padTimePart(created.getMinutes())}`;
+  const time = `${padTimePart(created.getHours())}:${padTimePart(
+    created.getMinutes()
+  )}`;
   return { created, time };
 }
 
 function messageTimeTitle(createdAt: string): string {
   const { created, time } = messageTimeParts(createdAt);
-  return `${created.getFullYear()}年${created.getMonth() + 1}月${created.getDate()}日 ${time}`;
+  return `${created.getFullYear()}年${
+    created.getMonth() + 1
+  }月${created.getDate()}日 ${time}`;
 }
 
 function messageTimeLabel(createdAt: string): string {
@@ -171,6 +187,16 @@ function updateScrollFollowing() {
   shouldFollowLatest.value = distanceFromBottom <= BOTTOM_FOLLOW_THRESHOLD_PX;
 }
 
+async function loadOlderMessages() {
+  const messages = messagesRef.value;
+  const previousHeight = messages?.scrollHeight ?? 0;
+  const previousTop = messages?.scrollTop ?? 0;
+  await chat.loadOlderMessages(chat.selectedConversationId);
+  await nextTick();
+  if (messages)
+    messages.scrollTop = previousTop + messages.scrollHeight - previousHeight;
+}
+
 async function scrollToLatest(force = false) {
   if (force) shouldFollowLatest.value = true;
   await nextTick();
@@ -184,7 +210,7 @@ watch(
   () => {
     void scrollToLatest(true);
   },
-  { flush: "post" },
+  { flush: "post" }
 );
 
 watch(
@@ -192,7 +218,7 @@ watch(
   () => {
     void scrollToLatest();
   },
-  { flush: "post" },
+  { flush: "post" }
 );
 
 type ConcreteOutput = Exclude<OutputType, "auto">;
@@ -210,7 +236,7 @@ const defaultModels = computed<Partial<Record<ConcreteOutput, string>>>(() => {
   return Object.fromEntries(
     (["text", "image", "audio", "video"] as const)
       .map((output) => [output, providerDefaultFor(output)])
-      .filter(([, model]) => model),
+      .filter(([, model]) => model)
   );
 });
 const defaultModel = computed(() => {
@@ -229,7 +255,7 @@ async function refreshModels() {
 }
 async function submit(
   input: Omit<ChatSendInput, "conversationId">,
-  acknowledge: ChatSendAcknowledgement,
+  acknowledge: ChatSendAcknowledgement
 ) {
   const sending = chat.send(input);
   void scrollToLatest(true);

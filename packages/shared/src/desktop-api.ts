@@ -76,7 +76,8 @@ function nonEmptyUniqueArraySchema<T extends z.ZodType>(schema: T) {
   })
 }
 
-const modalitySchema = z.enum(['text', 'image', 'audio', 'video'])
+export const providerUsageModalitySchema = z.enum(['text', 'image', 'audio', 'video'])
+export type ProviderUsageModality = z.infer<typeof providerUsageModalitySchema>
 
 export const authAccountSchema = z.string().trim().regex(/^[A-Za-z0-9_]{5,24}$/)
 export const authPhoneSchema = z.string().trim().regex(/^1[3-9]\d{9}$/)
@@ -134,6 +135,18 @@ export const authOtpVerificationSchema = z.object({
   code: authOtpCodeSchema,
 }).strict()
 export type AuthOtpVerification = z.infer<typeof authOtpVerificationSchema>
+
+export const logoutRequestSchema = z.union([
+  z.object({ discardPending: z.literal(true) }).strict(),
+  z.object({ preservePending: z.literal(true) }).strict(),
+]).optional()
+export type LogoutRequest = z.infer<typeof logoutRequestSchema>
+export const logoutResultSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('logged_out') }).strict(),
+  z.object({ status: z.literal('pending_sync'), pendingCount: z.number().int().positive().max(10_000) }).strict(),
+  z.object({ status: z.literal('sync_timeout') }).strict(),
+])
+export type LogoutResult = z.infer<typeof logoutResultSchema>
 
 export const profileGenderSchema = z.enum(['male', 'female', 'other', 'prefer_not_to_say'])
 export type ProfileGender = z.infer<typeof profileGenderSchema>
@@ -346,14 +359,75 @@ export const conversationGenerationPreferencesSchema = z.object({
 }).strict()
 export type ConversationGenerationPreferences = z.infer<typeof conversationGenerationPreferencesSchema>
 
+export const syncStateSchema = z.enum(['synced', 'pending', 'syncing', 'failed'])
+export type SyncState = z.infer<typeof syncStateSchema>
+
+export const opaqueCursorSchema = z.string().min(16).max(2048)
+
+export interface CursorPage<T> {
+  items: T[]
+  nextCursor?: string
+  previousCursor?: string
+}
+
+export const conversationTitleStateSchema = z.enum([
+  'pending',
+  'generating',
+  'ai_named',
+  'user_named',
+  'failed',
+])
+
 export const conversationSummarySchema = z.object({
   id: identifierSchema,
   title: nonEmptyStringSchema,
+  titleState: conversationTitleStateSchema,
+  revision: z.number().int().nonnegative(),
+  syncState: syncStateSchema,
+  syncWarningSince: timestampSchema.optional(),
   createdAt: timestampSchema,
-  updatedAt: timestampSchema,
+  lastActivityAt: timestampSchema,
+  metadataUpdatedAt: timestampSchema,
 }).strict()
 
 export type ConversationSummary = z.infer<typeof conversationSummarySchema>
+
+export const conversationPageSchema = z.object({
+  items: z.array(conversationSummarySchema).max(50),
+  nextCursor: opaqueCursorSchema.optional(),
+  syncWarningSince: timestampSchema.optional(),
+}).strict()
+export type ConversationPage = z.infer<typeof conversationPageSchema>
+
+export const conversationCreateMutationPayloadSchema = z.object({
+  title: nonEmptyStringSchema,
+  titleState: conversationTitleStateSchema,
+  createdAt: timestampSchema,
+  lastActivityAt: timestampSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+export type ConversationCreateMutationPayload = z.infer<typeof conversationCreateMutationPayloadSchema>
+
+export const conversationRenameMutationPayloadSchema = z.object({
+  title: nonEmptyStringSchema,
+  titleState: conversationTitleStateSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+export type ConversationRenameMutationPayload = z.infer<typeof conversationRenameMutationPayloadSchema>
+
+export const conversationPreferencesMutationPayloadSchema = z.object({
+  preferences: conversationGenerationPreferencesSchema,
+  metadataUpdatedAt: timestampSchema,
+}).strict()
+export type ConversationPreferencesMutationPayload = z.infer<
+  typeof conversationPreferencesMutationPayloadSchema
+>
+
+export const conversationDeleteMutationPayloadSchema = z.object({}).strict()
+export type ConversationDeleteMutationPayload = z.infer<typeof conversationDeleteMutationPayloadSchema>
+
+export const conversationRestoreMutationPayloadSchema = z.object({}).strict()
+export type ConversationRestoreMutationPayload = z.infer<typeof conversationRestoreMutationPayloadSchema>
 
 export const chatMessageSchema = z.object({
   id: identifierSchema,
@@ -365,6 +439,151 @@ export const chatMessageSchema = z.object({
 }).strict()
 
 export interface ChatMessage extends Omit<z.infer<typeof chatMessageSchema>, 'blocks'> { blocks: ChatBlock[] }
+
+export const messagePageSchema = z.object({
+  items: z.array(chatMessageSchema).max(100),
+  previousCursor: opaqueCursorSchema.optional(),
+}).strict()
+export type MessagePage = Omit<z.infer<typeof messagePageSchema>, 'items'> & { items: ChatMessage[] }
+
+export const messageAppendMutationPayloadSchema = chatMessageSchema
+export type MessageAppendMutationPayload = z.infer<typeof messageAppendMutationPayloadSchema>
+
+export const syncMutationKindSchema = z.enum([
+  'conversation.create',
+  'conversation.rename',
+  'conversation.preferences',
+  'conversation.delete',
+  'conversation.restore',
+  'message.append',
+  'legacy.import',
+  'privacy.consent',
+  'preferences.update',
+  'usage.record',
+])
+export type SyncMutationKind = z.infer<typeof syncMutationKindSchema>
+
+export const syncMutationStatusSchema = z.enum(['applied', 'duplicate', 'conflict', 'rejected'])
+export type SyncMutationStatus = z.infer<typeof syncMutationStatusSchema>
+
+const syncMutationResultBaseShape = {
+  id: identifierSchema,
+}
+
+export const syncMutationResultSchema = z.discriminatedUnion('status', [
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('applied'),
+    revision: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('duplicate'),
+    revision: z.number().int().nonnegative(),
+  }).strict(),
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('conflict'),
+    errorCode: appErrorCodeSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationResultBaseShape,
+    status: z.literal('rejected'),
+    errorCode: appErrorCodeSchema,
+  }).strict(),
+])
+export type SyncMutationResult = z.infer<typeof syncMutationResultSchema>
+
+export const legacyImportPreviewSchema = z.object({
+  ownedCount: z.number().int().nonnegative(),
+  unownedCount: z.number().int().nonnegative(),
+  requiresUnownedConfirmation: z.boolean(),
+}).strict().superRefine((preview, context) => {
+  if (preview.requiresUnownedConfirmation !== (preview.unownedCount > 0)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['requiresUnownedConfirmation'],
+      message: 'Unowned history requires explicit import confirmation',
+    })
+  }
+})
+export type LegacyImportPreview = z.infer<typeof legacyImportPreviewSchema>
+
+export const privacyConsentPurposeSchema = z.enum(['cloud_sync', 'legacy_unowned_import'])
+export type PrivacyConsentPurpose = z.infer<typeof privacyConsentPurposeSchema>
+
+export const privacyConsentSchema = z.object({
+  purpose: privacyConsentPurposeSchema,
+  documentVersion: nonEmptyStringSchema.max(128),
+  consentedAt: timestampSchema,
+  clientVersion: nonEmptyStringSchema.max(64),
+}).strict()
+export type PrivacyConsent = z.infer<typeof privacyConsentSchema>
+
+export const legacyImportConfirmRequestSchema = z.object({
+  batchId: identifierSchema,
+  includeUnowned: z.boolean(),
+  cloudSyncConsent: privacyConsentSchema,
+  unownedImportConsent: privacyConsentSchema.optional(),
+}).strict().superRefine((request, context) => {
+  if (request.cloudSyncConsent.purpose !== 'cloud_sync') {
+    context.addIssue({
+      code: 'custom',
+      path: ['cloudSyncConsent', 'purpose'],
+      message: 'Cloud sync consent is required separately from legacy import consent',
+    })
+  }
+  if (request.includeUnowned && request.unownedImportConsent?.purpose !== 'legacy_unowned_import') {
+    context.addIssue({
+      code: 'custom',
+      path: ['unownedImportConsent'],
+      message: 'Importing unowned history requires separate confirmation',
+    })
+  }
+  if (!request.includeUnowned && request.unownedImportConsent !== undefined) {
+    context.addIssue({
+      code: 'custom',
+      path: ['unownedImportConsent'],
+      message: 'Unowned import consent must accompany an unowned import',
+    })
+  }
+})
+export type LegacyImportConfirmRequest = z.infer<typeof legacyImportConfirmRequestSchema>
+
+export const legacyImportRequestSchema = z.object({
+  includeUnowned: z.boolean(),
+  cloudSyncConsent: privacyConsentSchema,
+  unownedImportConsent: privacyConsentSchema.optional(),
+}).strict().superRefine((request, context) => {
+  if (request.cloudSyncConsent.purpose !== 'cloud_sync') {
+    context.addIssue({
+      code: 'custom', path: ['cloudSyncConsent', 'purpose'],
+      message: 'Cloud sync consent is required separately from legacy import consent',
+    })
+  }
+  if (request.includeUnowned && request.unownedImportConsent?.purpose !== 'legacy_unowned_import') {
+    context.addIssue({
+      code: 'custom', path: ['unownedImportConsent'],
+      message: 'Importing unowned history requires separate confirmation',
+    })
+  }
+  if (!request.includeUnowned && request.unownedImportConsent !== undefined) {
+    context.addIssue({
+      code: 'custom', path: ['unownedImportConsent'],
+      message: 'Unowned import consent must accompany an unowned import',
+    })
+  }
+})
+export type LegacyImportRequest = z.infer<typeof legacyImportRequestSchema>
+
+export const legacyImportResultSchema = z.object({
+  batchId: identifierSchema,
+  status: z.enum(['applied', 'duplicate', 'rejected']),
+  importedConversations: z.number().int().nonnegative().optional(),
+  importedMessages: z.number().int().nonnegative().optional(),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict()
+export type LegacyImportResult = z.infer<typeof legacyImportResultSchema>
 
 export const chatSendInputSchema = z.object({
   conversationId: identifierSchema,
@@ -646,6 +865,23 @@ export type PermissionGrant = z.infer<typeof permissionGrantSchema>
 export const modelProviderIdSchema = z.enum(['deepseek', 'openrouter'])
 export type ModelProviderId = z.infer<typeof modelProviderIdSchema>
 
+export const accountDataPreferencesDefaults = {
+  timezone: 'Asia/Shanghai',
+  displayCurrency: 'CNY',
+} as const
+
+export const accountDataPreferencesSchema = z.object({
+  timezone: nonEmptyStringSchema.max(128).default(accountDataPreferencesDefaults.timezone),
+  displayCurrency: z.enum(['CNY', 'USD']).default(accountDataPreferencesDefaults.displayCurrency),
+}).strict()
+export type AccountDataPreferences = z.infer<typeof accountDataPreferencesSchema>
+
+export const accountDataPreferencesRecordSchema = accountDataPreferencesSchema.extend({
+  revision: z.number().int().nonnegative(),
+  updatedAt: timestampSchema,
+}).strict()
+export type AccountDataPreferencesRecord = z.infer<typeof accountDataPreferencesRecordSchema>
+
 export const providerDefaultModelsSchema = z.object({
   deepseek: z.object({ text: nonEmptyStringSchema }).strict(),
   openrouter: z.object({
@@ -692,8 +928,8 @@ export const modelInfoSchema = z.object({
   contextLength: z.number().int().positive().optional(),
   inputCostPerMillion: z.number().nonnegative().optional(),
   outputCostPerMillion: z.number().nonnegative().optional(),
-  inputModalities: z.array(modalitySchema),
-  outputModalities: z.array(modalitySchema),
+  inputModalities: z.array(providerUsageModalitySchema),
+  outputModalities: z.array(providerUsageModalitySchema),
   supportsTools: z.boolean(),
   generation: z.object({
     image: z.object({
@@ -732,6 +968,276 @@ const tokenUsageShape = {
   outputTokens: safeTokenCountSchema,
   totalTokens: safeTokenCountSchema,
 }
+
+export const remoteUsageStatusSchema = z.enum([
+  'pending',
+  'reported',
+  'calculated',
+  'estimated',
+  'unavailable',
+])
+export type RemoteUsageStatus = z.infer<typeof remoteUsageStatusSchema>
+
+const byokUsageEventShape = {
+  id: identifierSchema,
+  operationId: identifierSchema,
+  purpose: nonEmptyStringSchema.max(64),
+  credentialOwner: z.literal('user'),
+  billable: z.literal(false),
+  provider: modelProviderIdSchema,
+  model: nonEmptyStringSchema,
+  modality: providerUsageModalitySchema,
+  inputTokens: safeTokenCountSchema.optional(),
+  outputTokens: safeTokenCountSchema.optional(),
+  occurredAt: timestampSchema,
+}
+
+export const byokUsageEventSchema = z.discriminatedUnion('costStatus', [
+  z.object({
+    ...byokUsageEventShape,
+    costStatus: z.literal('estimated'),
+    estimatedCostUsd: usdDecimalSchema,
+  }).strict(),
+  z.object({
+    ...byokUsageEventShape,
+    costStatus: z.literal('unavailable'),
+  }).strict(),
+])
+export type ByokUsageEvent = z.infer<typeof byokUsageEventSchema>
+
+export const remoteUsageSnapshotSchema = z.object({
+  startedAt: timestampSchema,
+  endedAt: timestampSchema,
+  inputTokens: safeTokenCountSchema,
+  outputTokens: safeTokenCountSchema,
+  totalTokens: safeTokenCountSchema,
+  confirmedPlatformCost: z.object({
+    amount: usdDecimalSchema,
+    currency: z.enum(['CNY', 'USD']),
+  }).strict().nullable(),
+  pendingCount: safeTokenCountSchema,
+  byokEstimatedCostUsd: usdDecimalSchema,
+  byokEstimatedCount: safeTokenCountSchema,
+  byokUnavailableCount: safeTokenCountSchema,
+  timezone: nonEmptyStringSchema.max(128),
+  displayCurrency: z.enum(['CNY', 'USD']),
+  lastSyncAt: timestampSchema.optional(),
+}).strict().superRefine((snapshot, context) => {
+  if (snapshot.totalTokens !== snapshot.inputTokens + snapshot.outputTokens) {
+    context.addIssue({ code: 'custom', path: ['totalTokens'], message: 'Token totals must match' })
+  }
+})
+export type RemoteUsageSnapshot = z.infer<typeof remoteUsageSnapshotSchema>
+
+const syncMutationBaseShape = {
+  id: identifierSchema,
+  entityId: identifierSchema,
+  baseRevision: z.number().int().nonnegative(),
+  occurredAt: timestampSchema,
+}
+
+export const syncMutationSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.create'),
+    payload: conversationCreateMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.rename'),
+    payload: conversationRenameMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.preferences'),
+    payload: conversationPreferencesMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.delete'),
+    payload: conversationDeleteMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('conversation.restore'),
+    payload: conversationRestoreMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('message.append'),
+    payload: messageAppendMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('legacy.import'),
+    payload: legacyImportConfirmRequestSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('privacy.consent'),
+    payload: privacyConsentSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('preferences.update'),
+    payload: accountDataPreferencesSchema,
+  }).strict(),
+  z.object({
+    ...syncMutationBaseShape,
+    kind: z.literal('usage.record'),
+    payload: byokUsageEventSchema,
+  }).strict(),
+]).superRefine((mutation, context) => {
+  let payloadEntityId: string | undefined
+  switch (mutation.kind) {
+    case 'message.append':
+    case 'usage.record':
+      payloadEntityId = mutation.payload.id
+      break
+    case 'legacy.import':
+      payloadEntityId = mutation.payload.batchId
+      break
+    case 'privacy.consent':
+      payloadEntityId = mutation.payload.documentVersion
+      break
+  }
+  if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
+    context.addIssue({
+      code: 'custom',
+      path: ['entityId'],
+      message: 'Mutation entity identity does not match its payload.',
+    })
+  }
+})
+export type SyncMutation = z.infer<typeof syncMutationSchema>
+
+export const storedLegacyImportReceiptPayloadSchema = z.object({
+  batchId: identifierSchema,
+  includeUnowned: z.boolean(),
+}).strict()
+export type StoredLegacyImportReceiptPayload = z.infer<typeof storedLegacyImportReceiptPayloadSchema>
+
+const pulledMutationBaseShape = {
+  id: identifierSchema,
+  entityId: identifierSchema,
+  baseRevision: z.number().int().nonnegative(),
+  resultRevision: z.number().int().nonnegative().nullable(),
+  receivedAt: timestampSchema,
+}
+
+const ordinaryPulledMutationSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.create'),
+    payload: conversationCreateMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.rename'),
+    payload: conversationRenameMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.preferences'),
+    payload: conversationPreferencesMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.delete'),
+    payload: conversationDeleteMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('conversation.restore'),
+    payload: conversationRestoreMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('message.append'),
+    payload: messageAppendMutationPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('legacy.import'),
+    payload: storedLegacyImportReceiptPayloadSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('privacy.consent'),
+    payload: privacyConsentSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('preferences.update'),
+    payload: accountDataPreferencesSchema,
+  }).strict(),
+  z.object({
+    ...pulledMutationBaseShape,
+    kind: z.literal('usage.record'),
+    payload: byokUsageEventSchema,
+  }).strict(),
+]).superRefine((mutation, context) => {
+  let payloadEntityId: string | undefined
+  switch (mutation.kind) {
+    case 'message.append':
+    case 'usage.record':
+      payloadEntityId = mutation.payload.id
+      break
+    case 'legacy.import':
+      payloadEntityId = mutation.payload.batchId
+      break
+    case 'privacy.consent':
+      payloadEntityId = mutation.payload.documentVersion
+      break
+  }
+  if (payloadEntityId !== undefined && mutation.entityId !== payloadEntityId) {
+    context.addIssue({
+      code: 'custom',
+      path: ['entityId'],
+      message: 'Mutation entity identity does not match its payload.',
+    })
+  }
+})
+
+const compactedPulledMutationBaseShape = {
+  ...pulledMutationBaseShape,
+  compacted: z.literal(true),
+}
+
+export const compactedPulledMutationSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.create'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.rename'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.preferences'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.delete'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('conversation.restore'),
+  }).strict(),
+  z.object({
+    ...compactedPulledMutationBaseShape,
+    kind: z.literal('message.append'),
+    conversationId: identifierSchema,
+  }).strict(),
+])
+export type CompactedPulledMutation = z.infer<typeof compactedPulledMutationSchema>
+
+export const pulledMutationSchema = z.union([
+  ordinaryPulledMutationSchema,
+  compactedPulledMutationSchema,
+])
+export type PulledMutation = z.infer<typeof pulledMutationSchema>
 
 export const modelTokenUsageSchema = z.object({
   provider: modelProviderIdSchema,
@@ -906,6 +1412,7 @@ export const ipcChannels = {
   chatCreateConversation: 'chat:create-conversation',
   chatRenameConversation: 'chat:rename-conversation',
   chatDeleteConversation: 'chat:delete-conversation',
+  chatRetrySync: 'chat:retry-sync',
   chatSend: 'chat:send',
   chatCancel: 'chat:cancel',
   chatTakeOverBrowser: 'chat:take-over-browser',
@@ -951,6 +1458,12 @@ export const ipcChannels = {
   settingsValidateProviderCredential: 'settings:validate-provider-credential',
   settingsListProviderModels: 'settings:list-provider-models',
   settingsGetTokenUsage: 'settings:get-token-usage',
+  settingsRecordPrivacyConsent: 'settings:record-privacy-consent',
+  settingsPreviewLegacyImport: 'settings:preview-legacy-import',
+  settingsImportLegacyData: 'settings:import-legacy-data',
+  settingsGetAccountDataPreferences: 'settings:get-account-data-preferences',
+  settingsUpdateAccountDataPreferences: 'settings:update-account-data-preferences',
+  settingsGetRemoteUsage: 'settings:get-remote-usage',
   settingsClearLocalData: 'settings:clear-local-data',
   settingsClearBrowserData: 'settings:clear-browser-data',
   systemOpenExternal: 'system:open-external',
@@ -960,12 +1473,25 @@ export const ipcChannels = {
 export type IpcChannel = (typeof ipcChannels)[keyof typeof ipcChannels]
 
 export const createConversationRequestSchema = z.undefined()
-export const listMessagesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const listConversationsRequestSchema = z.object({
+  limit: z.literal(50),
+  cursor: opaqueCursorSchema.optional(),
+}).strict()
+export type ListConversationsRequest = z.infer<typeof listConversationsRequestSchema>
+export const listMessagesRequestSchema = z.object({
+  conversationId: identifierSchema,
+  limit: z.literal(100),
+  cursor: opaqueCursorSchema.optional(),
+}).strict()
+export type ListMessagesRequest = z.infer<typeof listMessagesRequestSchema>
 export const renameConversationRequestSchema = z.object({
   conversationId: identifierSchema,
   title: nonEmptyStringSchema,
 }).strict()
 export const deleteConversationRequestSchema = z.object({ conversationId: identifierSchema }).strict()
+export const retryConversationSyncRequestSchema = z.object({
+  conversationId: identifierSchema.optional(),
+}).strict()
 export const cancelChatRequestSchema = z.object({ requestId: identifierSchema }).strict()
 export const generationPreferencesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const updateGenerationPreferencesRequestSchema = generationPreferencesRequestSchema.extend({
@@ -1050,17 +1576,18 @@ export const ipcRequestSchemas = {
   [ipcChannels.authVerifyOtp]: authOtpVerificationSchema,
   [ipcChannels.authCancelOtp]: z.object({ challengeId: identifierSchema }).strict(),
   [ipcChannels.authLoginWithPassword]: authCredentialsSchema,
-  [ipcChannels.authLogout]: z.undefined(),
+  [ipcChannels.authLogout]: logoutRequestSchema,
   [ipcChannels.userAdminList]: userAdminListRequestSchema,
   [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleRequestSchema,
   [ipcChannels.profileGet]: z.undefined(),
   [ipcChannels.profileUpdate]: userProfileUpdateSchema,
   [ipcChannels.profilePickAndUploadAvatar]: z.undefined(),
-  [ipcChannels.chatListConversations]: z.undefined(),
+  [ipcChannels.chatListConversations]: listConversationsRequestSchema,
   [ipcChannels.chatListMessages]: listMessagesRequestSchema,
   [ipcChannels.chatCreateConversation]: createConversationRequestSchema,
   [ipcChannels.chatRenameConversation]: renameConversationRequestSchema,
   [ipcChannels.chatDeleteConversation]: deleteConversationRequestSchema,
+  [ipcChannels.chatRetrySync]: retryConversationSyncRequestSchema,
   [ipcChannels.chatSend]: chatSendInputSchema,
   [ipcChannels.chatCancel]: cancelChatRequestSchema,
   [ipcChannels.chatTakeOverBrowser]: takeOverBrowserRequestSchema,
@@ -1104,6 +1631,12 @@ export const ipcRequestSchemas = {
   [ipcChannels.settingsValidateProviderCredential]: providerRequestSchema,
   [ipcChannels.settingsListProviderModels]: listProviderModelsRequestSchema,
   [ipcChannels.settingsGetTokenUsage]: z.undefined(),
+  [ipcChannels.settingsRecordPrivacyConsent]: privacyConsentSchema,
+  [ipcChannels.settingsPreviewLegacyImport]: z.undefined(),
+  [ipcChannels.settingsImportLegacyData]: legacyImportRequestSchema,
+  [ipcChannels.settingsGetAccountDataPreferences]: z.undefined(),
+  [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
+  [ipcChannels.settingsGetRemoteUsage]: z.undefined(),
   [ipcChannels.settingsClearLocalData]: clearLocalDataRequestSchema,
   [ipcChannels.settingsClearBrowserData]: z.undefined(),
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
@@ -1120,17 +1653,18 @@ export const ipcResponseSchemas = {
   [ipcChannels.authVerifyOtp]: authSessionSchema,
   [ipcChannels.authCancelOtp]: voidResponseSchema,
   [ipcChannels.authLoginWithPassword]: authSessionSchema,
-  [ipcChannels.authLogout]: voidResponseSchema,
+  [ipcChannels.authLogout]: logoutResultSchema,
   [ipcChannels.userAdminList]: userAdminListResponseSchema,
   [ipcChannels.userAdminUpdateRole]: userAdminUpdateRoleResponseSchema,
   [ipcChannels.profileGet]: userProfileSchema,
   [ipcChannels.profileUpdate]: userProfileSchema,
   [ipcChannels.profilePickAndUploadAvatar]: profileAvatarUploadResultSchema.nullable(),
-  [ipcChannels.chatListConversations]: z.array(conversationSummarySchema),
-  [ipcChannels.chatListMessages]: z.array(chatMessageSchema),
+  [ipcChannels.chatListConversations]: conversationPageSchema,
+  [ipcChannels.chatListMessages]: messagePageSchema,
   [ipcChannels.chatCreateConversation]: conversationSummarySchema,
   [ipcChannels.chatRenameConversation]: conversationSummarySchema,
   [ipcChannels.chatDeleteConversation]: voidResponseSchema,
+  [ipcChannels.chatRetrySync]: voidResponseSchema,
   [ipcChannels.chatSend]: requestIdResponseSchema,
   [ipcChannels.chatCancel]: voidResponseSchema,
   [ipcChannels.chatTakeOverBrowser]: voidResponseSchema,
@@ -1174,6 +1708,12 @@ export const ipcResponseSchemas = {
   [ipcChannels.settingsValidateProviderCredential]: providerCredentialStatusSchema,
   [ipcChannels.settingsListProviderModels]: z.array(modelInfoSchema),
   [ipcChannels.settingsGetTokenUsage]: tokenUsageSnapshotSchema,
+  [ipcChannels.settingsRecordPrivacyConsent]: voidResponseSchema,
+  [ipcChannels.settingsPreviewLegacyImport]: legacyImportPreviewSchema,
+  [ipcChannels.settingsImportLegacyData]: z.array(legacyImportResultSchema),
+  [ipcChannels.settingsGetAccountDataPreferences]: accountDataPreferencesSchema,
+  [ipcChannels.settingsUpdateAccountDataPreferences]: accountDataPreferencesSchema,
+  [ipcChannels.settingsGetRemoteUsage]: remoteUsageSnapshotSchema,
   [ipcChannels.settingsClearLocalData]: voidResponseSchema,
   [ipcChannels.settingsClearBrowserData]: voidResponseSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
@@ -1188,7 +1728,7 @@ export interface DesktopAPI {
     verifyOtp(input: AuthOtpVerification): Promise<AuthSession>
     cancelOtp(challengeId: string): Promise<void>
     loginWithPassword(input: AuthCredentials): Promise<AuthSession>
-    logout(): Promise<void>
+    logout(input?: LogoutRequest): Promise<LogoutResult>
   }
   profile: {
     get(): Promise<UserProfile>
@@ -1200,11 +1740,12 @@ export interface DesktopAPI {
     updateRole(input: UserAdminUpdateRoleRequest): Promise<UserAdminUpdateRoleResponse>
   }
   chat: {
-    listConversations(): Promise<ConversationSummary[]>
-    listMessages(conversationId: string): Promise<ChatMessage[]>
+    listConversations(input: ListConversationsRequest): Promise<ConversationPage>
+    listMessages(input: ListMessagesRequest): Promise<MessagePage>
     createConversation(): Promise<ConversationSummary>
     renameConversation(conversationId: string, title: string): Promise<ConversationSummary>
     deleteConversation(conversationId: string): Promise<void>
+    retrySync(conversationId?: string): Promise<void>
     send(input: ChatSendInput): Promise<{ requestId: string }>
     cancel(requestId: string): Promise<void>
     takeOverBrowser(input: TakeOverBrowserRequest): Promise<void>
@@ -1265,6 +1806,12 @@ export interface DesktopAPI {
     validateProviderCredential(provider: ModelProviderId): Promise<ProviderCredentialStatus>
     listProviderModels(provider: ModelProviderId, refresh?: boolean): Promise<ModelInfo[]>
     getTokenUsage(): Promise<TokenUsageSnapshot>
+    recordPrivacyConsent(input: PrivacyConsent): Promise<void>
+    previewLegacyImport(): Promise<LegacyImportPreview>
+    importLegacyData(input: LegacyImportRequest): Promise<LegacyImportResult[]>
+    getAccountDataPreferences(): Promise<AccountDataPreferences>
+    updateAccountDataPreferences(input: AccountDataPreferences): Promise<AccountDataPreferences>
+    getRemoteUsage(): Promise<RemoteUsageSnapshot>
     clearLocalData(scope: 'conversations' | 'executions' | 'all'): Promise<void>
     clearBrowserData(): Promise<void>
   }

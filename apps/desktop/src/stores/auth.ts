@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { hasBusinessCapability, type AuthCredentials, type AuthOtpChallenge, type AuthOtpRequest, type AuthSession } from '@autoforge/shared'
 import { displayError, getDesktopApi } from '../services/desktop-api'
 import { useChatStore } from './chat'
+import { useExecutionStore } from './execution'
 
 const restorePromises = new WeakMap<object, Promise<void>>()
 const otpGenerations = new WeakMap<object, number>()
@@ -53,6 +54,16 @@ function finishRestoring(store: { restoring: boolean }): void {
   store.restoring = count > 0
 }
 
+function replaceSession(store: { session: AuthSession | null }, session: AuthSession | null): void {
+  const previousUserId = store.session?.user.id
+  const nextUserId = session?.user.id
+  if (previousUserId !== undefined && previousUserId !== nextUserId) {
+    useChatStore().resetLocalData()
+    useExecutionStore().resetLocalData()
+  }
+  store.session = session
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     session: null as AuthSession | null,
@@ -61,6 +72,7 @@ export const useAuthStore = defineStore('auth', {
     submitting: false,
     challenge: null as AuthOtpChallenge | null,
     sendingOtp: false,
+    pendingLogoutCount: 0,
     error: '',
   }),
   getters: {
@@ -79,11 +91,11 @@ export const useAuthStore = defineStore('auth', {
         try {
           const session = await getDesktopApi().auth.getSession()
           if (generation !== sessionGeneration(this)) return
-          this.session = session
+          replaceSession(this, session)
           this.initialized = true
         } catch (error) {
           if (generation !== sessionGeneration(this)) return
-          this.session = null
+          replaceSession(this, null)
           this.initialized = true
           this.error = displayError(error, '登录状态恢复失败')
         } finally {
@@ -148,22 +160,30 @@ export const useAuthStore = defineStore('auth', {
         if (generation !== otpGeneration(this) || sessionOwner !== sessionGeneration(this)) {
           const cleanupOwner = sessionGeneration(this)
           try {
-            await getDesktopApi().auth.logout()
+            const result = await getDesktopApi().auth.logout({ preservePending: true })
+            if (result.status !== 'logged_out') {
+              if (cleanupOwner === sessionGeneration(this)) {
+                replaceSession(this, session)
+                this.initialized = true
+                this.error = '同步仍在进行，请稍后重试退出登录'
+              }
+              return undefined
+            }
           } catch {
             if (cleanupOwner === sessionGeneration(this)) {
-              this.session = session
+              replaceSession(this, session)
               this.initialized = true
               this.error = '退出登录失败'
             }
             return undefined
           }
           nextSessionGeneration(this)
-          this.session = null
+          replaceSession(this, null)
           this.initialized = true
           this.error = ''
           return undefined
         }
-        this.session = session
+        replaceSession(this, session)
         this.initialized = true
         return session
       } catch (error) {
@@ -202,7 +222,7 @@ export const useAuthStore = defineStore('auth', {
       try {
         const session = await getDesktopApi().auth.loginWithPassword(credentials)
         if (sessionOwner !== sessionGeneration(this)) return undefined
-        this.session = session
+        replaceSession(this, session)
         this.initialized = true
         return session
       } catch (error) {
@@ -214,18 +234,28 @@ export const useAuthStore = defineStore('auth', {
         finishSubmitting(this)
       }
     },
-    async logout(): Promise<boolean> {
+    async logout(discardPending = false): Promise<boolean> {
       startSubmitting(this)
       this.error = ''
       await this.cancelOtp()
       const sessionOwner = nextSessionGeneration(this)
       try {
-        await getDesktopApi().auth.logout()
+        const result = await getDesktopApi().auth.logout(
+          discardPending ? { discardPending: true } : undefined,
+        )
+        if (result.status === 'pending_sync') {
+          this.pendingLogoutCount = result.pendingCount
+          return false
+        }
+        if (result.status === 'sync_timeout') {
+          this.error = '同步仍在进行，请稍后重试退出登录'
+          return false
+        }
         nextSessionGeneration(this)
-        this.session = null
+        replaceSession(this, null)
         this.initialized = true
+        this.pendingLogoutCount = 0
         this.error = ''
-        useChatStore().resetLocalData()
         return true
       } catch (error) {
         if (sessionOwner === sessionGeneration(this)) {
@@ -241,7 +271,7 @@ export const useAuthStore = defineStore('auth', {
       const sessionOwner = sessionGeneration(this)
       try {
         const session = await getDesktopApi().auth.refreshAuthorization()
-        if (sessionOwner === sessionGeneration(this)) this.session = session
+        if (sessionOwner === sessionGeneration(this)) replaceSession(this, session)
       } catch (error) {
         if (sessionOwner !== sessionGeneration(this) || !this.session) return
         this.session = {

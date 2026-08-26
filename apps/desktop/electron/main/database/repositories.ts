@@ -11,6 +11,7 @@ import {
   runtimeCapabilityPermissionSchema,
   runtimeCapabilityScopeSchema,
   type AppErrorCode,
+  type ByokUsageEvent,
   type ChatBlock,
   type ConversationGenerationPreferences,
   type MediaKind,
@@ -197,6 +198,7 @@ export interface ProviderUsageRepository {
   listReconcilable(now: number): ProviderUsageEvent[]
   recordReconcileFailure(operationKey: string, nextReconcileAt?: number): ProviderUsageEvent
   summarize(input: ProviderUsageQueryRecord): ProviderCostSnapshotRecord
+  recordByokUsage?(event: ByokUsageEvent): void
 }
 
 export interface ModelTokenUsageRecord {
@@ -279,6 +281,7 @@ export interface WorkflowFile {
 
 export interface Execution {
   id: string
+  ownerUserId?: string
   workflowId: string
   workflowVersion: string
   chatRunId?: string
@@ -756,14 +759,17 @@ export interface AppRepositories {
   installedWorkflows: { insert(value: InstalledWorkflow, files: WorkflowFile[]): InstalledWorkflow; upsert(value: InstalledWorkflow): InstalledWorkflow; get(workflowId: string, version: string): InstalledWorkflow | undefined; list(): InstalledWorkflow[]; setEnabled(workflowId: string, version: string, enabled: boolean): void; delete(workflowId: string, version: string): void }
   workflowFiles: { insert(value: WorkflowFile): WorkflowFile; list(workflowId: string, workflowVersion: string): WorkflowFile[] }
   executions: {
-    insert(value: Pick<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'> & Partial<Omit<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'>>): Execution
+    insert(value: Pick<Execution, 'id' | 'status' | 'workflowId' | 'workflowVersion'> & { ownerUserId: string } & Partial<Omit<Execution, 'id' | 'ownerUserId' | 'status' | 'workflowId' | 'workflowVersion'>>): Execution
     get(id: string): Execution | undefined
     list(): Execution[]
     update(id: string, value: Partial<Omit<Execution, 'id' | 'workflowId' | 'workflowVersion' | 'createdAt'>>): Execution | undefined
+    getForUser(id: string, ownerUserId: string): Execution | undefined
+    listForUser(ownerUserId: string): Execution[]
+    updateForUser(id: string, ownerUserId: string, value: Partial<Omit<Execution, 'id' | 'ownerUserId' | 'workflowId' | 'workflowVersion' | 'createdAt'>>): Execution | undefined
     markInterrupted(): number
   }
-  executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[] }
-  executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[] }
+  executionSteps: { insert(value: ExecutionStep): ExecutionStep; list(executionId: string): ExecutionStep[]; listForUser(executionId: string, ownerUserId: string): ExecutionStep[] }
+  executionLogs: { insert(value: ExecutionLogInput): ExecutionLog; list(executionId: string): ExecutionLog[]; listForUser(executionId: string, ownerUserId: string): ExecutionLog[] }
   permissionGrants: { upsert(value: PermissionGrant): PermissionGrant; get(workflowId: string, workflowVersion: string, capability: string, scopeHash: string): PermissionGrant | undefined; list(): PermissionGrant[]; delete(id: string): void }
   browserTabBindings: {
     insert(value: BrowserTabBinding): BrowserTabBinding
@@ -792,7 +798,7 @@ const chatRunColumns = 'id, conversation_id AS conversationId, request_id AS req
 const providerUsageColumns = 'id, operation_key AS operationKey, user_id AS userId, provider, api_key_fingerprint AS apiKeyFingerprint, request_id AS requestId, chat_run_id AS chatRunId, generation_id AS generationId, provider_job_id AS providerJobId, model, modality, status, input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, reconcile_attempts AS reconcileAttempts, next_reconcile_at AS nextReconcileAt, started_at AS startedAt, ended_at AS endedAt'
 const projectColumns = 'id, name, root_path AS rootPath, manifest_json AS manifestJson, status, build_hash AS buildHash, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt'
 const installedWorkflowColumns = 'workflow_id AS workflowId, version, name, description, author, category, manifest_json AS manifestJson, install_path AS installPath, enabled, integrity_status AS integrityStatus, source, installed_at AS installedAt, updated_at AS updatedAt'
-const executionColumns = 'id, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
+const executionColumns = 'id, owner_user_id AS ownerUserId, workflow_id AS workflowId, workflow_version AS workflowVersion, chat_run_id AS chatRunId, status, input_json AS inputJson, result_json AS resultJson, error_code AS errorCode, created_at AS createdAt, started_at AS startedAt, ended_at AS endedAt'
 const browserTabBindingColumns = 'id, tab_id AS tabId, user_id AS userId, conversation_id AS conversationId, chat_run_id AS chatRunId, execution_id AS executionId, workflow_id AS workflowId, workflow_version AS workflowVersion, source, build_hash AS buildHash, security_fingerprint AS securityFingerprint, permission_matrix_json AS permissionMatrixJson, status, terminal_reason AS terminalReason, created_at AS createdAt, ended_at AS endedAt'
 const browserActionAuditColumns = 'id, binding_id AS bindingId, chat_run_id AS chatRunId, sequence, origin, action, target_summary AS targetSummary, risk, outcome, error_code AS errorCode, created_at AS createdAt'
 
@@ -1496,7 +1502,12 @@ function installedWorkflowFromRow(row: Query): InstalledWorkflow {
 }
 
 function executionFromRow(row: Query): Execution {
-  return { ...row, input: parse(row.inputJson as string), result: parse(row.resultJson as string | null) } as Execution
+  return {
+    ...row,
+    ownerUserId: row.ownerUserId === null ? undefined : row.ownerUserId,
+    input: parse(row.inputJson as string),
+    result: parse(row.resultJson as string | null),
+  } as Execution
 }
 
 function permissionFromRow(row: Query): PermissionGrant {
@@ -1986,6 +1997,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       reconcileInterrupted(endedAt) {
         return transaction(database, () => {
           const preservedRequestIds: string[] = []
+          const failedRequestIds = new Set<string>()
           const rows = many<Query>(
             database,
             `SELECT ${mediaGenerationJobColumns}
@@ -2008,7 +2020,9 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
             try {
               job = mediaGenerationJobFromRow(row)
             } catch {
-              failJob.run({ id: row.id as string, endedAt })
+              const id = row.id as string
+              failJob.run({ id, endedAt })
+              failedRequestIds.add(id)
               continue
             }
             if (resumableVideoAssociation(database, job)) {
@@ -2016,6 +2030,33 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
               continue
             }
             failJob.run({ id: job.id, endedAt })
+            failedRequestIds.add(job.id)
+          }
+          for (const requestId of failedRequestIds) {
+            database.prepare(`
+              UPDATE chat_runs
+              SET status = 'failed', error_code = 'INTERNAL_ERROR', ended_at = @endedAt
+              WHERE request_id = @requestId AND status = 'running'
+            `).run({ requestId, endedAt })
+          }
+          for (const row of many<Query>(database, 'SELECT id, blocks_json AS blocksJson FROM messages')) {
+            let blocks: ChatBlock[]
+            try {
+              blocks = chatBlockSchema.array().parse(parse(row.blocksJson as string))
+            } catch {
+              continue
+            }
+            let changed = false
+            for (const block of blocks) {
+              if (block.type !== 'media_generation' || !failedRequestIds.has(block.jobId)) continue
+              block.status = 'failed'
+              block.errorCode = 'MEDIA_GENERATION_FAILED'
+              changed = true
+            }
+            if (changed) {
+              database.prepare('UPDATE messages SET blocks_json = @blocksJson WHERE id = @id')
+                .run({ id: row.id, blocksJson: JSON.stringify(blocks) })
+            }
           }
           return preservedRequestIds
         })
@@ -2598,11 +2639,13 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
       insert(value) {
         const createdAt = value.createdAt ?? now()
         const input = value.input ?? {}
-        transaction(database, () => database.prepare('INSERT INTO executions (id, workflow_id, workflow_version, chat_run_id, status, input_json, result_json, error_code, created_at, started_at, ended_at) VALUES (@id, @workflowId, @workflowVersion, @chatRunId, @status, @inputJson, @resultJson, @errorCode, @createdAt, @startedAt, @endedAt)').run({ ...value, inputJson: JSON.stringify(input), resultJson: value.result === undefined ? null : JSON.stringify(value.result), chatRunId: value.chatRunId ?? null, errorCode: value.errorCode ?? null, createdAt, startedAt: value.startedAt ?? null, endedAt: value.endedAt ?? null }))
+        transaction(database, () => database.prepare('INSERT INTO executions (id, owner_user_id, workflow_id, workflow_version, chat_run_id, status, input_json, result_json, error_code, created_at, started_at, ended_at) VALUES (@id, @ownerUserId, @workflowId, @workflowVersion, @chatRunId, @status, @inputJson, @resultJson, @errorCode, @createdAt, @startedAt, @endedAt)').run({ ...value, inputJson: JSON.stringify(input), resultJson: value.result === undefined ? null : JSON.stringify(value.result), chatRunId: value.chatRunId ?? null, errorCode: value.errorCode ?? null, createdAt, startedAt: value.startedAt ?? null, endedAt: value.endedAt ?? null }))
         return { ...value, input, createdAt } as Execution
       },
       get: (id) => { const row = one<Query>(database, `SELECT ${executionColumns} FROM executions WHERE id = @id`, { id }); return row && executionFromRow(row) },
       list: () => many<Query>(database, `SELECT ${executionColumns} FROM executions ORDER BY created_at DESC, id`).map(executionFromRow),
+      getForUser: (id, ownerUserId) => { const row = one<Query>(database, `SELECT ${executionColumns} FROM executions WHERE id = @id AND owner_user_id = @ownerUserId`, { id, ownerUserId }); return row && executionFromRow(row) },
+      listForUser: (ownerUserId) => many<Query>(database, `SELECT ${executionColumns} FROM executions WHERE owner_user_id = @ownerUserId ORDER BY created_at DESC, id`, { ownerUserId }).map(executionFromRow),
       update(id, value) {
         transaction(database, () => database.prepare('UPDATE executions SET chat_run_id = COALESCE(@chatRunId, chat_run_id), status = COALESCE(@status, status), input_json = COALESCE(@inputJson, input_json), result_json = COALESCE(@resultJson, result_json), error_code = COALESCE(@errorCode, error_code), started_at = COALESCE(@startedAt, started_at), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id').run({
           id, chatRunId: null, status: null, errorCode: null, startedAt: null, endedAt: null, ...value,
@@ -2612,11 +2655,21 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         const row = one<Query>(database, `SELECT ${executionColumns} FROM executions WHERE id = @id`, { id })
         return row && executionFromRow(row)
       },
+      updateForUser(id, ownerUserId, value) {
+        transaction(database, () => database.prepare('UPDATE executions SET chat_run_id = COALESCE(@chatRunId, chat_run_id), status = COALESCE(@status, status), input_json = COALESCE(@inputJson, input_json), result_json = COALESCE(@resultJson, result_json), error_code = COALESCE(@errorCode, error_code), started_at = COALESCE(@startedAt, started_at), ended_at = COALESCE(@endedAt, ended_at) WHERE id = @id AND owner_user_id = @ownerUserId').run({
+          id, ownerUserId, chatRunId: null, status: null, errorCode: null, startedAt: null, endedAt: null, ...value,
+          inputJson: value.input === undefined ? null : JSON.stringify(value.input),
+          resultJson: value.result === undefined ? null : JSON.stringify(value.result),
+        }))
+        const row = one<Query>(database, `SELECT ${executionColumns} FROM executions WHERE id = @id AND owner_user_id = @ownerUserId`, { id, ownerUserId })
+        return row && executionFromRow(row)
+      },
       markInterrupted: () => transaction(database, () => database.prepare("UPDATE executions SET status = 'interrupted', error_code = 'INTERNAL_ERROR', ended_at = @endedAt WHERE status IN ('queued', 'awaiting_approval', 'running', 'pending', 'waiting_approval')").run({ endedAt: now() }).changes),
     },
     executionSteps: {
       insert(value) { transaction(database, () => database.prepare('INSERT INTO execution_steps (id, execution_id, sequence, name, status, percent, started_at, ended_at) VALUES (@id, @executionId, @sequence, @name, @status, @percent, @startedAt, @endedAt)').run(value)); return value },
       list: (executionId) => many<ExecutionStep>(database, 'SELECT id, execution_id AS executionId, sequence, name, status, percent, started_at AS startedAt, ended_at AS endedAt FROM execution_steps WHERE execution_id = @executionId ORDER BY sequence', { executionId }),
+      listForUser: (executionId, ownerUserId) => many<ExecutionStep>(database, 'SELECT step.id, step.execution_id AS executionId, step.sequence, step.name, step.status, step.percent, step.started_at AS startedAt, step.ended_at AS endedAt FROM execution_steps step JOIN executions execution ON execution.id = step.execution_id WHERE step.execution_id = @executionId AND execution.owner_user_id = @ownerUserId ORDER BY step.sequence', { executionId, ownerUserId }),
     },
     executionLogs: {
       insert(value) {
@@ -2634,6 +2687,7 @@ export function createRepositories(database: SqliteDatabase): AppRepositories {
         return log
       },
       list: (executionId) => many<Query>(database, 'SELECT id, execution_id AS executionId, sequence, level, message, metadata_json AS metadataJson, created_at AS createdAt FROM execution_logs WHERE execution_id = @executionId ORDER BY sequence', { executionId }).map((row) => ({ ...row, metadata: parse(row.metadataJson as string | null) } as ExecutionLog)),
+      listForUser: (executionId, ownerUserId) => many<Query>(database, 'SELECT log.id, log.execution_id AS executionId, log.sequence, log.level, log.message, log.metadata_json AS metadataJson, log.created_at AS createdAt FROM execution_logs log JOIN executions execution ON execution.id = log.execution_id WHERE log.execution_id = @executionId AND execution.owner_user_id = @ownerUserId ORDER BY log.sequence', { executionId, ownerUserId }).map((row) => ({ ...row, metadata: parse(row.metadataJson as string | null) } as ExecutionLog)),
     },
     permissionGrants: {
       upsert(value) {
