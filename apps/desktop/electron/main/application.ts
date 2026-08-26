@@ -2513,6 +2513,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     chat: gateUserDataService(ungatedServices.chat),
     media: gateUserDataService(ungatedServices.media),
     executions: gateUserDataService(ungatedServices.executions),
+    knowledge: gateUserDataService(ungatedServices.knowledge),
     settings: {
       ...ungatedServices.settings,
       getTokenUsage: () => userDataAdmission.run(ungatedServices.settings.getTokenUsage),

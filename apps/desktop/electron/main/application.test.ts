@@ -1347,6 +1347,49 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('gates in-flight knowledge work during an authenticated identity switch and fails closed before storage exists', async () => {
+    // Catches knowledge operations that bypass UserDataAdmissionGate and race a user-data identity transition.
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-admission-race-'))
+    directories.push(root)
+    const started = deferred<void>()
+    const release = deferred<void>()
+    const runtime = createApplicationRuntime(options(root))
+    await authenticate(runtime, 'KnowledgeAlice')
+    await authenticate(runtime, 'KnowledgeBobby')
+    await runtime.services.auth.loginWithPassword({ account: 'KnowledgeAlice', password: 'password' })
+    const owner = { userId: 'test_user_knowledgealice' }
+
+    await expect(runtime.services.knowledge.getAvailability(owner)).resolves.toEqual({
+      encryption: { available: false, reason: 'encryption_unavailable' },
+      parser: { available: false, reason: 'parser_unavailable' },
+      cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+      embedding: { available: false, reason: 'embedding_unavailable' },
+      entitlement: { available: false, reason: 'entitlement_unavailable' },
+      beta: { available: false, reason: 'beta_disabled' },
+      cloud: { available: false, reason: 'cloud_disabled' },
+    })
+    await expect(runtime.services.knowledge.list(owner)).rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+
+    runtime.services.knowledge.list = vi.fn(async () => {
+      started.resolve()
+      await release.promise
+      return []
+    })
+    const listing = runtime.services.knowledge.list(owner)
+    await started.promise
+    let switched = false
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'KnowledgeBobby', password: 'password',
+    }).then((session) => { switched = true; return session })
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+
+    expect(switched).toBe(false)
+    release.resolve()
+    await expect(listing).resolves.toEqual([])
+    await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_knowledgebobby' } })
+    await runtime.close()
+  })
+
   it('drains an A legacy import before an authenticated A-to-B switch', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-cloud-data-import-race-'))
     directories.push(root)
