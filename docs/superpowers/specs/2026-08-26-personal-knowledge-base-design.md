@@ -1,7 +1,7 @@
 # Personal Knowledge Base Design
 
-**Date:** 2026-08-26  
-**Status:** Approved for implementation  
+**Date:** 2026-08-26
+**Status:** Approved for implementation
 **Scope:** Personal knowledge bases only; enterprise/team knowledge bases are explicitly deferred.
 
 ## 1. Product outcome
