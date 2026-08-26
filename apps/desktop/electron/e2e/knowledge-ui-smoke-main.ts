@@ -1,4 +1,4 @@
-import { writeFile } from 'node:fs/promises'
+import { access, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -10,7 +10,13 @@ import {
   safeStorage,
   session,
 } from 'electron'
-import type { AuthSession, KnowledgeDocument, KnowledgeSelection } from '@autoforge/shared'
+import type {
+  AuthSession,
+  ChatMessage,
+  KnowledgeCitationReference,
+  KnowledgeDocument,
+  KnowledgeSelection,
+} from '@autoforge/shared'
 import { registerDesktopIpc, type DesktopIpcServices } from '../main/ipc/register-ipc.js'
 import { KnowledgeService } from '../main/knowledge/knowledge-service.js'
 import { createElectronParserSupervisor } from '../main/knowledge/parser-supervisor.js'
@@ -26,6 +32,7 @@ const smokeRoot = process.env.AUTOFORGE_KNOWLEDGE_SMOKE_ROOT
 if (!smokeRoot) throw new Error('Parent-owned knowledge smoke workspace is required')
 const userData: string = smokeRoot
 const sourceFile = join(userData, 'smoke-source.txt')
+const exportFile = join(userData, 'knowledge-export.zip')
 app.setPath('userData', userData)
 protocol.registerSchemesAsPrivileged([{
   scheme: 'autoforge-media',
@@ -42,6 +49,8 @@ let mainWindow: BrowserWindow | null = null
 let disposeIpc: (() => void) | undefined
 let knowledge: KnowledgeService | undefined
 let importAcknowledgement: KnowledgeDocument | undefined
+let chatMessages: ChatMessage[] = []
+let expectedCitation: KnowledgeCitationReference | undefined
 const calls: string[] = []
 
 function trackedKnowledge(service: KnowledgeService): KnowledgeService {
@@ -58,6 +67,36 @@ function trackedKnowledge(service: KnowledgeService): KnowledgeService {
         return async (...args: Parameters<KnowledgeService['updateConversationSelection']>) => {
           calls.push('updateConversationSelection')
           return target.updateConversationSelection(...args)
+        }
+      }
+      if (property === 'searchSnapshot') {
+        return async (...args: Parameters<KnowledgeService['searchSnapshot']>) => {
+          calls.push('searchSnapshot')
+          return target.searchSnapshot(...args)
+        }
+      }
+      if (property === 'previewCitation') {
+        return async (...args: Parameters<KnowledgeService['previewCitation']>) => {
+          calls.push('previewCitation')
+          return target.previewCitation(...args)
+        }
+      }
+      if (property === 'exportBase') {
+        return async (...args: Parameters<KnowledgeService['exportBase']>) => {
+          calls.push('exportBase')
+          return target.exportBase(...args)
+        }
+      }
+      if (property === 'recycleDocument') {
+        return async (...args: Parameters<KnowledgeService['recycleDocument']>) => {
+          calls.push('recycleDocument')
+          return target.recycleDocument(...args)
+        }
+      }
+      if (property === 'purgeDocument') {
+        return async (...args: Parameters<KnowledgeService['purgeDocument']>) => {
+          calls.push('purgeDocument')
+          return target.purgeDocument(...args)
         }
       }
       const value = Reflect.get(target, property, receiver) as unknown
@@ -81,6 +120,18 @@ function generationPreferences() {
 function createServices(service: KnowledgeService): DesktopIpcServices {
   return {
     knowledgeAdmission: { run: async <T>(operation: () => Promise<T>) => operation() },
+    previewKnowledgeCitation: async (
+      candidateOwner: Parameters<DesktopIpcServices['previewKnowledgeCitation']>[0],
+      input: Parameters<DesktopIpcServices['previewKnowledgeCitation']>[1],
+    ) => {
+      if (candidateOwner.userId !== owner.userId
+        || input.conversationId !== conversationId
+        || input.messageId !== 'message_knowledge'
+        || input.blockId !== 'block_knowledge'
+        || input.citationIndex !== 0
+        || !expectedCitation) throw new Error('Controlled smoke citation scope is invalid')
+      return service.previewCitation(candidateOwner, expectedCitation)
+    },
     auth: {
       getSession: async () => sessionSnapshot,
       refreshAuthorization: async () => sessionSnapshot,
@@ -94,7 +145,7 @@ function createServices(service: KnowledgeService): DesktopIpcServices {
         id: conversationId, title: '知识偏好验证',
         createdAt: '2026-08-26T00:00:00.000Z', updatedAt: '2026-08-26T00:00:00.000Z',
       }],
-      listMessages: async () => [],
+      listMessages: async () => chatMessages,
       getGenerationPreferences: async () => generationPreferences(),
     },
     userAdmin: {},
@@ -115,7 +166,7 @@ function createServices(service: KnowledgeService): DesktopIpcServices {
         provider: 'deepseek', configured: false, validation: 'unchecked',
       }),
     },
-    knowledge: trackedKnowledge(service),
+    knowledge: service,
     system: { getAppInfo: async () => ({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopIpcServices
 }
@@ -161,19 +212,21 @@ async function run(): Promise<void> {
       },
       createParser: () => createElectronParserSupervisor(parserWorkerFile, parserPreloadFile),
       chooseImportFile: async () => sourceFile,
-      chooseExportPath: async () => undefined,
+      chooseExportPath: async () => exportFile,
       ownsConversation: async (candidate, candidateConversationId) => (
         candidate.userId === owner.userId && candidateConversationId === conversationId
       ),
       entitlement: {
         getEntitlement: async () => ({
           tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+          knowledgeToolEnabled: true, killSwitchEnabled: false,
         }),
       },
       platform: process.platform,
       arch: process.arch,
       runtimeAvailable: true,
     })
+    const ipcKnowledge = trackedKnowledge(knowledge)
     process.stderr.write('knowledge-ui-smoke: service-created\n')
     const target = { kind: 'production' as const, filePath: rendererFile }
     const created = await createSecureWindow({
@@ -187,7 +240,7 @@ async function run(): Promise<void> {
         mainWindow = window as BrowserWindow
         disposeIpc = registerDesktopIpc({
           ipcMain,
-          services: createServices(knowledge!),
+          services: createServices(ipcKnowledge),
           getMainWindow: () => mainWindow,
           rendererTarget: target,
         })
@@ -234,6 +287,21 @@ async function run(): Promise<void> {
     }, 'Main-persisted strict conversation selection', 10_000)
     process.stderr.write('knowledge-ui-smoke: selection-persisted\n')
 
+    const searchSnapshot = await ipcKnowledge.captureSearchSnapshot(owner, conversationId)
+    const searchOutcome = await ipcKnowledge.searchSnapshot(owner, searchSnapshot, 'Electron knowledge')
+    const evidence = searchOutcome.results[0]
+    if (!evidence) throw new Error('Real local chat retrieval returned no evidence')
+    expectedCitation = evidence.citation
+    chatMessages = [{
+      id: 'message_knowledge', conversationId, role: 'assistant',
+      blocks: [{
+        type: 'knowledge_answer', blockId: 'block_knowledge', mode: 'strict',
+        claims: [{ text: evidence.snippet, support: 'knowledge', citations: [evidence.citation] }],
+      }],
+      createdAt: '2026-08-26T00:00:01.000Z',
+    }]
+    process.stderr.write('knowledge-ui-smoke: local-retrieval-completed\n')
+
     await mainWindow.reload()
     await waitFor(
       () => rendererMatches(`document.querySelector('[data-testid="knowledge-base-${knowledgeBaseId}"]')?.getAttribute('aria-checked') === 'true'
@@ -243,19 +311,57 @@ async function run(): Promise<void> {
       'selection restored through built preload and validated IPC after Renderer reload',
     )
     process.stderr.write('knowledge-ui-smoke: selection-restored\n')
-    const visible = await mainWindow.webContents.executeJavaScript(`({
-      selectedBase: document.querySelector('[data-testid="knowledge-base-${knowledgeBaseId}"]')?.textContent,
-      strict: document.querySelector('[data-testid="knowledge-mode-strict"]')?.getAttribute('aria-checked'),
-    })`)
-    if (!calls.includes('importDocument') || calls.filter((call) => call === 'updateConversationSelection').length < 2) {
+    await waitFor(
+      () => rendererMatches(`document.querySelector('[data-testid="knowledge-answer"]') !== null
+        && document.querySelector('[data-testid="knowledge-citation-0"]') !== null`),
+      'visible grounded chat answer and citation',
+    )
+    await mainWindow.webContents.executeJavaScript(`document.querySelector('[data-testid="knowledge-citation-0"]')?.click(); true`)
+    await waitFor(
+      () => rendererMatches(`document.querySelector('[data-testid="knowledge-citation-preview"] blockquote')?.textContent?.includes('Electron knowledge') === true`),
+      'controlled citation preview through Renderer, Preload, IPC, Main, and encrypted source',
+    )
+    process.stderr.write('knowledge-ui-smoke: citation-preview-visible\n')
+
+    await mainWindow.webContents.executeJavaScript(`window.autoForge.knowledge.exportBase(${JSON.stringify(knowledgeBaseId)})`)
+    await access(exportFile)
+    process.stderr.write('knowledge-ui-smoke: export-completed\n')
+    const availability = await mainWindow.webContents.executeJavaScript(`window.autoForge.knowledge.getFeatureAvailability()`)
+    if (availability.local.available !== true
+      || availability.cloud.available !== false
+      || !availability.cloud.reasons.includes('kill_switch_enabled')) {
+      throw new Error(`Cloud-disabled degradation was not fail-closed: ${JSON.stringify(availability)}`)
+    }
+    const documentId = importAcknowledgement.id
+    await mainWindow.webContents.executeJavaScript(`window.autoForge.knowledge.recycleDocument(${JSON.stringify(documentId)})`)
+    await mainWindow.webContents.executeJavaScript(`window.autoForge.knowledge.purgeDocument(${JSON.stringify(documentId)})`)
+    if ((await knowledge.listDocuments(owner, knowledgeBaseId)).length !== 0) {
+      throw new Error('Permanent delete retained the smoke document')
+    }
+    await mainWindow.loadFile(rendererFile, { hash: '/knowledge' })
+    await waitFor(
+      () => rendererMatches(`document.body.innerText.includes('还没有文件')`),
+      'visible empty library after recycle and permanent delete',
+    )
+    process.stderr.write('knowledge-ui-smoke: delete-visible\n')
+    const requiredFullFlowCalls = [
+      'importDocument', 'updateConversationSelection', 'searchSnapshot',
+      'previewCitation', 'exportBase', 'recycleDocument', 'purgeDocument',
+    ]
+    if (requiredFullFlowCalls.some(call => !calls.includes(call))
+      || calls.filter((call) => call === 'updateConversationSelection').length < 2) {
       throw new Error(`IPC mutation path incomplete: ${JSON.stringify(calls)}`)
     }
     process.stdout.write(`${JSON.stringify({
       ok: true,
-      importAcknowledgement,
-      persistedSelection: await knowledge.getConversationSelection(owner, conversationId),
+      importedStatus: importAcknowledgement.status,
+      persistedSelectionCount: (await knowledge.getConversationSelection(owner, conversationId)).knowledgeBaseIds.length,
+      persistedKnowledgeMode: (await knowledge.getConversationSelection(owner, conversationId)).knowledgeMode,
       calls,
-      visible,
+      citationPreview: 'available',
+      exportCompleted: true,
+      deleteCompleted: true,
+      cloudAvailable: availability.cloud.available,
     })}\n`)
     await writeFile(join(userData, '.knowledge-smoke-complete'), 'ok')
   } catch (error) {

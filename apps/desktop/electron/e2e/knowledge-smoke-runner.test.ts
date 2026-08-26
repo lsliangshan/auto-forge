@@ -1,11 +1,12 @@
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { afterEach, expect, it } from 'vitest'
 
 const directories: string[] = []
+const desktopDirectory = fileURLToPath(new URL('../../', import.meta.url))
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map(directory => rm(directory, { recursive: true, force: true })))
@@ -32,7 +33,7 @@ it('kills the timed-out smoke process tree and removes the parent-owned plaintex
     process.on('SIGTERM', () => {})
     setInterval(() => {}, 1000)
   `)
-  const runnerUrl = pathToFileURL(join(process.cwd(), 'scripts', 'knowledge-smoke-runner.mjs')).href
+  const runnerUrl = pathToFileURL(join(desktopDirectory, 'scripts', 'knowledge-smoke-runner.mjs')).href
   const runner = await import(runnerUrl) as {
     runKnowledgeSmoke(options: {
       executable: string
@@ -68,12 +69,12 @@ it('kills the timed-out smoke process tree and removes the parent-owned plaintex
 })
 
 it('contains a real KnowledgeService parser probe and its descendants in the parent-owned timeout root', async () => {
-  const fixtureDirectory = await mkdtemp(join(process.cwd(), '.autoforge-smoke-real-probe-'))
+  const fixtureDirectory = await mkdtemp(join(desktopDirectory, '.autoforge-smoke-real-probe-'))
   directories.push(fixtureDirectory)
   const childSource = join(fixtureDirectory, 'real-probe-child.ts')
   const childEntry = join(fixtureDirectory, 'real-probe-child.mjs')
   const observationPath = join(fixtureDirectory, 'probe-observation.json')
-  const knowledgeServicePath = join(process.cwd(), 'electron', 'main', 'knowledge', 'knowledge-service.ts')
+  const knowledgeServicePath = join(desktopDirectory, 'electron', 'main', 'knowledge', 'knowledge-service.ts')
   const descendantSource = `
     import { writeFileSync } from 'node:fs'
     const probeDirectory = process.argv[2]
@@ -145,7 +146,7 @@ it('contains a real KnowledgeService parser probe and its descendants in the par
     entryPoints: [childSource], outfile: childEntry, bundle: true,
     platform: 'node', format: 'esm', packages: 'external',
   })
-  const runnerUrl = pathToFileURL(join(process.cwd(), 'scripts', 'knowledge-smoke-runner.mjs')).href
+  const runnerUrl = pathToFileURL(join(desktopDirectory, 'scripts', 'knowledge-smoke-runner.mjs')).href
   const runner = await import(runnerUrl) as {
     runKnowledgeSmoke(options: {
       executable: string
@@ -217,7 +218,7 @@ it('rejects a clean child exit without the explicit completed-smoke marker', asy
   directories.push(fixtureDirectory)
   const childEntry = join(fixtureDirectory, 'early-exit.mjs')
   await writeFile(childEntry, 'process.exit(0)\n')
-  const runnerUrl = pathToFileURL(join(process.cwd(), 'scripts', 'knowledge-smoke-runner.mjs')).href
+  const runnerUrl = pathToFileURL(join(desktopDirectory, 'scripts', 'knowledge-smoke-runner.mjs')).href
   const runner = await import(runnerUrl) as {
     runKnowledgeSmoke(options: {
       executable: string
