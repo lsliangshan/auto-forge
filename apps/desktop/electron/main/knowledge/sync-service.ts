@@ -218,6 +218,13 @@ export class KnowledgeSyncService {
       }
     }
 
+    const outstandingLease = this.database.prepare(`
+      SELECT 1 FROM cloud_sync_mutations
+      WHERE knowledge_base_id = ? AND state = 'leased' LIMIT 1
+    `).get(knowledgeBaseId)
+    if (outstandingLease) {
+      return { status: 'paused', processed, conflicts }
+    }
     await this.pull(knowledgeBaseId, epoch)
     if (!this.isActive(knowledgeBaseId, epoch)) {
       return { status: 'paused', processed, conflicts }
@@ -468,22 +475,21 @@ export class KnowledgeSyncService {
 
   async cleanupOrphans(knowledgeBaseId: string): Promise<void> {
     const rows = this.database.prepare(`
-      SELECT storage_reference AS storageReference
+      SELECT storage_reference AS storageReference, request_id AS requestId
       FROM cloud_sync_orphans WHERE knowledge_base_id = ?
       ORDER BY created_at LIMIT 100
-    `).all(knowledgeBaseId) as Array<{ storageReference: string }>
-    if (rows.length === 0) return
-    const references = rows.map(row => row.storageReference)
-    await this.remote.cleanupOrphans({
-      requestId: this.dependencies.id(),
-      knowledgeBaseId,
-      storageReferences: references,
-    })
-    const placeholders = references.map(() => '?').join(', ')
-    this.database.prepare(`
-      DELETE FROM cloud_sync_orphans
-      WHERE knowledge_base_id = ? AND storage_reference IN (${placeholders})
-    `).run(knowledgeBaseId, ...references)
+    `).all(knowledgeBaseId) as Array<{ storageReference: string; requestId: string }>
+    for (const row of rows) {
+      await this.remote.cleanupOrphans({
+        requestId: row.requestId,
+        knowledgeBaseId,
+        storageReferences: [row.storageReference],
+      })
+      this.database.prepare(`
+        DELETE FROM cloud_sync_orphans
+        WHERE knowledge_base_id = ? AND storage_reference = ? AND request_id = ?
+      `).run(knowledgeBaseId, row.storageReference, row.requestId)
+    }
   }
 
   private claimMutation(knowledgeBaseId: string): MutationRow | undefined {

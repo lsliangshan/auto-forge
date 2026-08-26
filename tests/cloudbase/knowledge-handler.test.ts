@@ -169,6 +169,86 @@ describe('CloudBase knowledge function', () => {
 })
 
 describe('CloudBase knowledge migration contract', () => {
+  it('replays a persisted conflict receipt only for the original mutation input', async () => {
+    const sql = await readFile(
+      new URL('../../cloudbase/knowledge/migrations/0001_personal_knowledge.sql', import.meta.url),
+      'utf8',
+    )
+    const pushMutation = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_push_mutation[\s\S]*?\n\$\$;/,
+    )?.[0]
+
+    expect(pushMutation).toBeDefined()
+    expect(sql).toContain('input_hash char(32) NOT NULL')
+    expect(sql).toContain('response jsonb NOT NULL')
+    expect(pushMutation).toContain('SELECT * INTO existing_conflict FROM public.knowledge_conflicts')
+    expect(pushMutation).toContain('existing_conflict.input_hash <> fingerprint')
+    expect(pushMutation).toContain('RETURN existing_conflict.response')
+    expect(pushMutation).toContain('input_hash, response')
+  })
+
+  it('reserves orphan cleanup so upload verification and deletion cannot both win', async () => {
+    const sql = await readFile(
+      new URL('../../cloudbase/knowledge/migrations/0001_personal_knowledge.sql', import.meta.url),
+      'utf8',
+    )
+    const verifyUpload = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_verify_upload[\s\S]*?\n\$\$;/,
+    )?.[0]
+    const prepareCleanup = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_prepare_orphan_cleanup[\s\S]*?\n\$\$;/,
+    )?.[0]
+    const completeCleanup = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_complete_orphan_cleanup[\s\S]*?\n\$\$;/,
+    )?.[0]
+
+    expect(sql).toContain("'cleanup_reserved'")
+    expect(prepareCleanup).toContain("SET state = 'cleanup_reserved'")
+    expect(prepareCleanup).toContain('cleanup_request_id = p_request_id')
+    expect(prepareCleanup).toContain('RETURNING object.storage_reference')
+    expect(prepareCleanup).toContain('RETURN request_row.response')
+    expect(verifyUpload).toContain("object.state IN ('authorized', 'uploaded')")
+    expect(verifyUpload).toContain("IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT'")
+    expect(completeCleanup).toContain("object.state = 'cleanup_reserved'")
+    expect(completeCleanup).toContain('object.cleanup_request_id = p_request_id')
+    expect(completeCleanup).toContain("SET state = 'deleted'")
+  })
+
+  it('rejects cross-document version and block tuples inside one knowledge base', async () => {
+    const sql = await readFile(
+      new URL('../../cloudbase/knowledge/migrations/0001_personal_knowledge.sql', import.meta.url),
+      'utf8',
+    )
+    const versions = sql.match(
+      /CREATE TABLE IF NOT EXISTS public\.knowledge_versions \([\s\S]*?\n\);/,
+    )?.[0]
+    const blocks = sql.match(
+      /CREATE TABLE IF NOT EXISTS public\.knowledge_blocks \([\s\S]*?\n\);/,
+    )?.[0]
+    const chunks = sql.match(
+      /CREATE TABLE IF NOT EXISTS public\.knowledge_chunks \([\s\S]*?\n\);/,
+    )?.[0]
+
+    expect(versions).toContain('UNIQUE(owner_id, knowledge_base_id, document_id, id)')
+    expect(blocks).toContain('UNIQUE(owner_id, knowledge_base_id, version_id, id)')
+    expect(chunks).toContain(
+      'FOREIGN KEY(owner_id, knowledge_base_id, document_id, version_id)',
+    )
+    expect(chunks).toContain(
+      'REFERENCES public.knowledge_versions(owner_id, knowledge_base_id, document_id, id)',
+    )
+    expect(chunks).toContain('FOREIGN KEY(owner_id, knowledge_base_id, version_id, block_id)')
+    expect(chunks).toContain(
+      'REFERENCES public.knowledge_blocks(owner_id, knowledge_base_id, version_id, id)',
+    )
+    expect(sql).toContain(
+      'FOREIGN KEY(owner_id, knowledge_base_id, id, active_version_id)',
+    )
+    expect(sql).toContain(
+      'REFERENCES public.knowledge_versions(owner_id, knowledge_base_id, document_id, id)',
+    )
+  })
+
   it('ships matching versioned migration and rollback artifacts with owner RLS', async () => {
     const featureSql = await readFile(
       new URL('../../cloudbase/knowledge/migrations/0001_personal_knowledge.sql', import.meta.url), 'utf8',

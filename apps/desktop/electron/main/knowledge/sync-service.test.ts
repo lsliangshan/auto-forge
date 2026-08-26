@@ -5,7 +5,11 @@ import { KnowledgeSyncService, type CloudKnowledgeRemote } from './sync-service.
 
 const databases: Database.Database[] = []
 
-function fixture(overrides: Partial<CloudKnowledgeRemote> = {}, online = true) {
+function fixture(
+  overrides: Partial<CloudKnowledgeRemote> = {},
+  online = true,
+  dependencyOverrides: { id?: () => string } = {},
+) {
   const database = new Database(':memory:')
   databases.push(database)
   configureKnowledgeConnection(database)
@@ -38,7 +42,7 @@ function fixture(overrides: Partial<CloudKnowledgeRemote> = {}, online = true) {
   const replaceRemoteSnapshot = vi.fn().mockResolvedValue(undefined)
   const service = new KnowledgeSyncService(database, remote, {
     now: () => 1_000,
-    id: () => 'lease_1',
+    id: dependencyOverrides.id ?? (() => 'lease_1'),
     isOnline: () => online,
     applyRemoteChange,
     replaceRemoteSnapshot,
@@ -260,6 +264,30 @@ describe('KnowledgeSyncService', () => {
       .toEqual({ count: 0 })
   })
 
+  it('reuses the durable orphan cleanup request after a lost response', async () => {
+    const transient = Object.assign(new Error('response lost'), {
+      code: 'TRANSIENT_FAILURE', retryable: true,
+    })
+    const cleanupOrphans = vi.fn()
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValueOnce({ removed: 1 })
+    let generated = 0
+    const { database, service } = fixture({ cleanupOrphans }, true, {
+      id: () => `generated_${generated += 1}`,
+    })
+    service.recordOrphan('kb_1', 'storage/object_retry')
+
+    await expect(service.cleanupOrphans('kb_1')).rejects.toMatchObject({
+      code: 'TRANSIENT_FAILURE',
+    })
+    await expect(service.cleanupOrphans('kb_1')).resolves.toBeUndefined()
+    expect(cleanupOrphans).toHaveBeenCalledTimes(2)
+    expect(cleanupOrphans.mock.calls[0]?.[0].requestId).toBe('cleanup:storage/object_retry')
+    expect(cleanupOrphans.mock.calls[1]?.[0].requestId).toBe('cleanup:storage/object_retry')
+    expect(database.prepare('SELECT count(*) AS count FROM cloud_sync_orphans').get())
+      .toEqual({ count: 0 })
+  })
+
   it('rejects every late remote result from a synchronization invalidated by cancellation', async () => {
     let resolvePush!: (value: {
       mutationId: string; status: 'applied'; sequence: number; revision: string
@@ -392,6 +420,34 @@ describe('KnowledgeSyncService', () => {
     expect(database.prepare(
       'SELECT state FROM cloud_sync_mutations WHERE id = ?',
     ).get('mutation_pause')).toEqual({ state: 'leased' })
+  })
+
+  it('does not report synced when resumed before an invalidated lease expires', async () => {
+    let resolvePush!: (value: {
+      mutationId: string; status: 'applied'; sequence: number; revision: string
+    }) => void
+    const pushMutation = vi.fn().mockReturnValue(new Promise(resolve => { resolvePush = resolve }))
+    const { database, remote, service } = fixture({ pushMutation })
+    service.enqueue({
+      mutationId: 'mutation_resume', knowledgeBaseId: 'kb_1', entityKind: 'document',
+      entityId: 'document_1', operation: 'upsert', baseRevision: null, payload: {},
+    })
+
+    const interrupted = service.synchronize('kb_1')
+    await vi.waitFor(() => expect(pushMutation).toHaveBeenCalledOnce())
+    service.pause('kb_1')
+    resolvePush({ mutationId: 'mutation_resume', status: 'applied', sequence: 1, revision: 'r1' })
+    await expect(interrupted).resolves.toEqual({ status: 'paused', processed: 0, conflicts: 0 })
+
+    service.resume('kb_1')
+    await expect(service.synchronize('kb_1')).resolves.toEqual({
+      status: 'paused', processed: 0, conflicts: 0,
+    })
+    expect(service.getState('kb_1').mode).toBe('syncing')
+    expect(remote.pullChanges).not.toHaveBeenCalled()
+    expect(database.prepare(
+      'SELECT state, attempt FROM cloud_sync_mutations WHERE id = ?',
+    ).get('mutation_resume')).toEqual({ state: 'leased', attempt: 1 })
   })
 
   it('persists conversion identity and waits for verified cloud purge before local-only', async () => {

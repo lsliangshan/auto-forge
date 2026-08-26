@@ -23,9 +23,13 @@ CREATE TABLE IF NOT EXISTS public.knowledge_objects (
   storage_reference varchar(512) NOT NULL UNIQUE,
   byte_size bigint NOT NULL CHECK (byte_size > 0 AND byte_size <= 536870912),
   sha256 char(64) NOT NULL CHECK (sha256 ~ '^[a-f0-9]{64}$'),
-  state varchar(32) NOT NULL CHECK (state IN ('authorized', 'uploaded', 'verified', 'orphaned', 'deleted')),
+  state varchar(32) NOT NULL CHECK (state IN (
+    'authorized', 'uploaded', 'verified', 'orphaned', 'cleanup_reserved', 'deleted'
+  )),
   created_at timestamptz NOT NULL DEFAULT now(),
   verified_at timestamptz,
+  cleanup_request_id varchar(128),
+  cleanup_reserved_at timestamptz,
   deleted_at timestamptz,
   UNIQUE(owner_id, knowledge_base_id, id),
   FOREIGN KEY(owner_id, knowledge_base_id)
@@ -65,6 +69,7 @@ CREATE TABLE IF NOT EXISTS public.knowledge_versions (
   created_at timestamptz NOT NULL DEFAULT now(),
   ready_at timestamptz,
   UNIQUE(owner_id, knowledge_base_id, id),
+  UNIQUE(owner_id, knowledge_base_id, document_id, id),
   UNIQUE(owner_id, knowledge_base_id, document_id, version_number),
   FOREIGN KEY(owner_id, knowledge_base_id)
     REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE,
@@ -104,6 +109,7 @@ CREATE TABLE IF NOT EXISTS public.knowledge_blocks (
   coordinates jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(owner_id, knowledge_base_id, id),
+  UNIQUE(owner_id, knowledge_base_id, version_id, id),
   UNIQUE(owner_id, knowledge_base_id, version_id, ordinal),
   FOREIGN KEY(owner_id, knowledge_base_id)
     REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE,
@@ -128,10 +134,12 @@ CREATE TABLE IF NOT EXISTS public.knowledge_chunks (
     REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE,
   FOREIGN KEY(owner_id, knowledge_base_id, document_id)
     REFERENCES public.knowledge_documents(owner_id, knowledge_base_id, id) ON DELETE CASCADE,
-  FOREIGN KEY(owner_id, knowledge_base_id, version_id)
-    REFERENCES public.knowledge_versions(owner_id, knowledge_base_id, id) ON DELETE CASCADE,
-  FOREIGN KEY(owner_id, knowledge_base_id, block_id)
-    REFERENCES public.knowledge_blocks(owner_id, knowledge_base_id, id) ON DELETE CASCADE
+  FOREIGN KEY(owner_id, knowledge_base_id, document_id, version_id)
+    REFERENCES public.knowledge_versions(owner_id, knowledge_base_id, document_id, id)
+      ON DELETE CASCADE,
+  FOREIGN KEY(owner_id, knowledge_base_id, version_id, block_id)
+    REFERENCES public.knowledge_blocks(owner_id, knowledge_base_id, version_id, id)
+      ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS knowledge_chunks_owner_base_version
   ON public.knowledge_chunks(owner_id, knowledge_base_id, version_id);
@@ -156,8 +164,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS knowledge_one_published_generation
 ALTER TABLE public.knowledge_documents
   DROP CONSTRAINT IF EXISTS knowledge_documents_active_version_owner_fk,
   ADD CONSTRAINT knowledge_documents_active_version_owner_fk
-  FOREIGN KEY(owner_id, knowledge_base_id, active_version_id)
-  REFERENCES public.knowledge_versions(owner_id, knowledge_base_id, id)
+  FOREIGN KEY(owner_id, knowledge_base_id, id, active_version_id)
+  REFERENCES public.knowledge_versions(owner_id, knowledge_base_id, document_id, id)
   ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE public.knowledge_bases
   DROP CONSTRAINT IF EXISTS knowledge_bases_published_generation_owner_fk,
@@ -253,6 +261,8 @@ CREATE TABLE IF NOT EXISTS public.knowledge_conflicts (
   remote_revision varchar(128) NOT NULL,
   local_payload jsonb NOT NULL,
   remote_payload jsonb NOT NULL,
+  input_hash char(32) NOT NULL,
+  response jsonb NOT NULL,
   state varchar(16) NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'resolved')),
   created_at timestamptz NOT NULL DEFAULT now(),
   resolved_at timestamptz,
@@ -618,10 +628,13 @@ BEGIN
   END IF;
   UPDATE public.knowledge_upload_authorizations SET consumed_at = clock_timestamp()
     WHERE upload_ticket = p_upload_ticket;
-  UPDATE public.knowledge_objects SET state = 'verified', verified_at = clock_timestamp()
-    WHERE id = authorization.object_id AND owner_id = owner
-      AND knowledge_base_id = authorization.knowledge_base_id
+  UPDATE public.knowledge_objects AS object
+    SET state = 'verified', verified_at = clock_timestamp()
+    WHERE object.id = authorization.object_id AND object.owner_id = owner
+      AND object.knowledge_base_id = authorization.knowledge_base_id
+      AND object.state IN ('authorized', 'uploaded')
     RETURNING * INTO object;
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object(
     'objectId', object.id, 'storageReference', object.storage_reference, 'verified', true
   );
@@ -642,9 +655,11 @@ DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   head public.knowledge_entity_heads%ROWTYPE;
   existing public.knowledge_changes%ROWTYPE;
+  existing_conflict public.knowledge_conflicts%ROWTYPE;
   next_sequence bigint;
   next_revision varchar := p_mutation_id;
   conflict_kind varchar;
+  response jsonb;
   fingerprint char(32) := md5(concat_ws(
     ':', p_knowledge_base_id, p_entity_kind, p_entity_id, p_operation,
     COALESCE(p_base_revision, ''), p_payload::text
@@ -663,6 +678,14 @@ BEGIN
       'sequence', existing.sequence, 'revision', existing.revision
     );
   END IF;
+  SELECT * INTO existing_conflict FROM public.knowledge_conflicts
+    WHERE owner_id = owner AND mutation_id = p_mutation_id;
+  IF FOUND THEN
+    IF existing_conflict.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN existing_conflict.response;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM public.knowledge_bases
     WHERE id = p_knowledge_base_id AND owner_id = owner AND deleted_at IS NULL) THEN
     RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001';
@@ -676,20 +699,22 @@ BEGIN
   IF FOUND AND p_entity_kind <> 'metadata' AND p_base_revision IS DISTINCT FROM head.revision THEN
     conflict_kind := CASE WHEN p_operation = 'delete' AND NOT head.deleted
       THEN 'delete_vs_update' ELSE 'content' END;
-    INSERT INTO public.knowledge_conflicts(
-      owner_id, knowledge_base_id, mutation_id, entity_kind, entity_id, conflict_kind,
-      local_revision, remote_revision, local_payload, remote_payload
-    ) VALUES (
-      owner, p_knowledge_base_id, p_mutation_id, p_entity_kind, p_entity_id, conflict_kind,
-      COALESCE(p_base_revision, p_mutation_id), head.revision, p_payload, head.payload
-    );
-    RETURN jsonb_build_object(
+    response := jsonb_build_object(
       'mutationId', p_mutation_id, 'status', 'conflict', 'conflictKind', conflict_kind,
       'localRevision', COALESCE(p_base_revision, p_mutation_id),
       'remoteRevision', head.revision,
       'sequence', COALESCE((SELECT max(sequence) FROM public.knowledge_changes
         WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id), 0)
     );
+    INSERT INTO public.knowledge_conflicts(
+      owner_id, knowledge_base_id, mutation_id, entity_kind, entity_id, conflict_kind,
+      local_revision, remote_revision, local_payload, remote_payload, input_hash, response
+    ) VALUES (
+      owner, p_knowledge_base_id, p_mutation_id, p_entity_kind, p_entity_id, conflict_kind,
+      COALESCE(p_base_revision, p_mutation_id), head.revision, p_payload, head.payload,
+      fingerprint, response
+    );
+    RETURN response;
   END IF;
   INSERT INTO public.knowledge_entity_heads(
     owner_id, knowledge_base_id, entity_kind, entity_id, revision, payload, deleted, updated_at
@@ -977,18 +1002,39 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  request_row public.knowledge_requests%ROWTYPE;
+  fingerprint char(32) := md5(concat_ws(
+    ':', p_knowledge_base_id, p_storage_references::text
+  ));
   references_to_delete jsonb;
+  response jsonb;
 BEGIN
-  SELECT COALESCE(jsonb_agg(object.storage_reference), '[]'::jsonb)
-    INTO references_to_delete
-    FROM public.knowledge_objects object
-    WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
-      AND object.state IN ('authorized', 'orphaned')
-      AND object.storage_reference IN (SELECT jsonb_array_elements_text(p_storage_references))
-      AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
-        WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
-          AND version.source_object_id = object.id);
-  RETURN jsonb_build_object('storageReferences', references_to_delete);
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id;
+  IF FOUND THEN
+    IF request_row.action <> 'orphan_cleanup' OR request_row.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN request_row.response;
+  END IF;
+  WITH reserved AS (
+    UPDATE public.knowledge_objects AS object
+      SET state = 'cleanup_reserved', cleanup_request_id = p_request_id,
+        cleanup_reserved_at = clock_timestamp()
+      WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
+        AND object.state IN ('authorized', 'orphaned')
+        AND object.storage_reference IN (SELECT jsonb_array_elements_text(p_storage_references))
+        AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
+          WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
+            AND version.source_object_id = object.id)
+      RETURNING object.storage_reference
+  ) SELECT COALESCE(jsonb_agg(storage_reference ORDER BY storage_reference), '[]'::jsonb)
+      INTO references_to_delete FROM reserved;
+  response := jsonb_build_object('storageReferences', references_to_delete);
+  INSERT INTO public.knowledge_requests(owner_id, request_id, action, input_hash, response)
+    VALUES (owner, p_request_id, 'orphan_cleanup', fingerprint, response);
+  RETURN response;
 END;
 $$;
 
@@ -1005,9 +1051,11 @@ DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   removed integer;
 BEGIN
-  DELETE FROM public.knowledge_objects object
+  UPDATE public.knowledge_objects AS object
+    SET state = 'deleted', deleted_at = clock_timestamp()
     WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
-      AND object.state IN ('authorized', 'orphaned')
+      AND object.state = 'cleanup_reserved'
+      AND object.cleanup_request_id = p_request_id
       AND object.storage_reference IN (SELECT jsonb_array_elements_text(p_storage_references))
       AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
         WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
