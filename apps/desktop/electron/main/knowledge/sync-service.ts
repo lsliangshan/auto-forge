@@ -433,15 +433,25 @@ export class KnowledgeSyncService {
   }
 
   async cancelMutation(mutationId: string): Promise<void> {
-    const row = this.database.prepare(`
-      SELECT state FROM cloud_sync_mutations WHERE id = ?
-    `).get(mutationId) as { state: string } | undefined
-    if (!row || ['completed', 'cancelled', 'failed', 'conflict'].includes(row.state)) return
-    this.database.prepare(`
-      UPDATE cloud_sync_mutations
-      SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE id = ? AND state NOT IN ('completed', 'cancelled', 'failed', 'conflict')
-    `).run(this.dependencies.now(), mutationId)
+    this.database.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT knowledge_base_id AS knowledgeBaseId, state
+        FROM cloud_sync_mutations WHERE id = ?
+      `).get(mutationId) as { knowledgeBaseId: string; state: string } | undefined
+      if (!row || ['completed', 'cancelled', 'failed', 'conflict'].includes(row.state)) return
+      const control = row.state === 'leased' ? this.getControl(row.knowledgeBaseId) : undefined
+      const now = this.dependencies.now()
+      const cancelled = this.database.prepare(`
+        UPDATE cloud_sync_mutations
+        SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND state NOT IN ('completed', 'cancelled', 'failed', 'conflict')
+      `).run(now, mutationId)
+      if (cancelled.changes !== 1 || !control) return
+      this.database.prepare(`
+        UPDATE cloud_sync_states SET epoch = epoch + 1, updated_at = ?
+        WHERE knowledge_base_id = ? AND epoch = ?
+      `).run(now, row.knowledgeBaseId, control.epoch)
+    })()
   }
 
   async cancelRemoteJob(jobId: string): Promise<void> {

@@ -260,12 +260,19 @@ describe('KnowledgeSyncService', () => {
       .toEqual({ count: 0 })
   })
 
-  it('keeps an in-flight local cancellation authoritative after a late remote result', async () => {
+  it('rejects every late remote result from a synchronization invalidated by cancellation', async () => {
     let resolvePush!: (value: {
       mutationId: string; status: 'applied'; sequence: number; revision: string
     }) => void
     const pushMutation = vi.fn().mockReturnValue(new Promise(resolve => { resolvePush = resolve }))
-    const { database, service } = fixture({ pushMutation })
+    const pullChanges = vi.fn().mockResolvedValue({
+      kind: 'incremental', nextSequence: 1, hasMore: false,
+      changes: [{
+        sequence: 1, entityKind: 'document', entityId: 'document_1', operation: 'upsert',
+        revision: 'r1', payload: { versionId: 'remote_after_cancel' },
+      }],
+    })
+    const { database, service, applyRemoteChange } = fixture({ pushMutation, pullChanges })
     service.enqueue({
       mutationId: 'mutation_late', knowledgeBaseId: 'kb_1', entityKind: 'document',
       entityId: 'document_1', operation: 'upsert', baseRevision: null, payload: {},
@@ -275,10 +282,15 @@ describe('KnowledgeSyncService', () => {
     await service.cancelMutation('mutation_late')
     resolvePush({ mutationId: 'mutation_late', status: 'applied', sequence: 1, revision: 'r1' })
 
-    await expect(running).resolves.toMatchObject({ processed: 0 })
+    await expect(running).resolves.toMatchObject({ processed: 0, conflicts: 0 })
+    expect(pullChanges).not.toHaveBeenCalled()
+    expect(applyRemoteChange).not.toHaveBeenCalled()
     expect(database.prepare(
       'SELECT state FROM cloud_sync_mutations WHERE id = ?',
     ).get('mutation_late')).toEqual({ state: 'cancelled' })
+    expect(database.prepare(
+      'SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?',
+    ).get('kb_1')).toBeUndefined()
   })
 
   it('pulls every incremental page without skipping the 1001st change', async () => {
