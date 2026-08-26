@@ -218,3 +218,43 @@ The controller-owned `progress.md` remains dirty and is excluded from this task'
 - The synthetic local metrics are intentionally not written into the approved design thresholds or production evidence. No spec safety limit was changed.
 - macOS notarization remains an external packaging gate because the local directory package had no notarization options.
 - The known unrelated context-summary billing test remains exactly the recorded `CONTEXT_LIMIT_EXCEEDED` baseline and was neither hidden nor attributed to knowledge code.
+
+## Fix round 2: exclude smoke code from production packages
+
+The prior smoke command wrote an executable bundle under `out/e2e`. Because the production builder admitted `out/**`, a stale copy could enter `app.asar` with the smoke-only approved release evidence and signing key. No production admission path opened, but the package boundary was incorrect.
+
+### TDD RED / GREEN
+
+RED, after adding a stale smoke entry containing only non-sensitive marker text to a temporary package fixture and applying electron-builder's real `app-builder-lib` `FileMatcher` to the repository configuration:
+
+```text
+pnpm exec vitest run apps/desktop/electron/main/package-content.test.ts
+```
+
+Result: 1/1 failed. The actual builder filter included both `out/main/index.js` and `out/e2e/knowledge-ui-smoke-main.js`.
+
+Production/support changes were then kept narrow:
+
+- the smoke bundle now writes to disposable `.e2e/main`, outside every production `out/**` input;
+- the runner loads that new location;
+- electron-builder explicitly excludes `out/e2e/**`, so a stale prior bundle cannot be admitted.
+
+GREEN: the identical command passed 1/1. The real builder matcher admitted only the benign production entry, and the selected input bytes contained neither the all-true evidence marker nor `smoke-only-key`.
+
+### Round-2 verification
+
+- `node apps/desktop/scripts/run-vitest-electron.mjs run apps/desktop/electron/e2e/knowledge-smoke-runner.test.ts apps/desktop/electron/main/database/native-packaging.test.ts apps/desktop/electron/main/build-config.test.ts apps/desktop/electron/main/package-content.test.ts`: 4 files, 14/14 passed. The smoke-runner timeout diagnostics were expected negative-case output.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui`: exited 0 after rebuilding Main/Preload/Renderer/workers and bundling only to `.e2e/main`; the real Renderer -> Application -> Agent -> durable citation preview/export/delete lifecycle returned the same seven boolean success fields, including `cloudAvailableAfterKill:false`. No external service was available or contacted.
+- `pnpm typecheck`: all four typed workspace projects passed.
+- `pnpm lint --quiet`: exit 0.
+- Actual `pnpm dist:dir` package inspection used `@electron/asar` after creating a current macOS arm64 directory package. The stale workspace `out/e2e/knowledge-ui-smoke-main.js` remained present as the regression condition, while all 25,236 `app.asar` entries contained zero `e2e`, `.e2e`, or `knowledge-ui-smoke` matches and the archive contained no `smoke-only-key` bytes. This is package-content proof, not cross-platform execution proof.
+
+Round-2 files changed:
+
+- `apps/desktop/electron-builder.yml`
+- `apps/desktop/package.json`
+- `apps/desktop/scripts/run-knowledge-ui-smoke.mjs`
+- `apps/desktop/electron/main/package-content.test.ts`
+- this report
+
+The controller-owned `progress.md` remains dirty and excluded. No real CloudBase, TokenHub, provider, production entitlement key, or other external infrastructure was accessed. macOS x64, Windows x64, staging CloudBase/RLS/concurrency, real provider disclosure, KMS key rotation, internal telemetry review, and notarization remain external release gates.

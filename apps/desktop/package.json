@@ -12,7 +12,7 @@
     "pretest": "pnpm prepare:native-electron",
     "test": "node scripts/run-vitest-electron.mjs run --config vitest.config.ts && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts",
     "verify:knowledge-local": "node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/release-gates.test.ts electron/main/knowledge/release-evaluation.test.ts electron/main/knowledge/release-harness.test.ts electron/main/knowledge/encrypted-database.test.ts electron/main/knowledge/local-retriever.test.ts electron/main/knowledge/parser-worker.test.ts electron/main/agent/agent-orchestrator.test.ts",
-    "smoke:knowledge-ui": "pnpm prepare:native-electron && pnpm build && tsup electron/e2e/knowledge-ui-smoke-main.ts --format esm --platform node --out-dir out/e2e --clean false --external electron && node scripts/run-knowledge-ui-smoke.mjs",
+    "smoke:knowledge-ui": "pnpm prepare:native-electron && pnpm build && tsup electron/e2e/knowledge-ui-smoke-main.ts --format esm --platform node --out-dir .e2e/main --clean false --external electron && node scripts/run-knowledge-ui-smoke.mjs",
     "prepare:native-electron": "install-electron && node scripts/prepare-native-electron.mjs",
     "verify:packaged-native": "node scripts/verify-packaged-native.mjs",
     "dist:dir": "pnpm prepare:native-electron && electron-builder --dir --config electron-builder.yml && pnpm verify:packaged-native"

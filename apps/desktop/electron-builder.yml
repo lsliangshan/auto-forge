@@ -8,6 +8,7 @@ win:
   icon: resources/branding/autoforge-logo.ico
 files:
   - out/**
+  - '!out/e2e/**'
 extraResources:
   - from: resources/migrations
     to: migrations
