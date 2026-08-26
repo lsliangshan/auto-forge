@@ -193,17 +193,12 @@ export class SafeStorageKnowledgeEntitlementCache implements KnowledgeEntitlemen
     ownerHash: string,
     record: KnowledgeEntitlementCacheRecord,
   ): KnowledgeEntitlementEnrollmentWatermark {
-    const acceptedEnvelopeHash = createHash('sha256').update(JSON.stringify({
-      version: record.envelope.version,
-      payload: JSON.parse(canonicalPayloadBytes(record.envelope.payload).toString()),
-      signature: record.envelope.signature,
-    })).digest('hex')
     return parseEnrollmentWatermark({
       version: 1,
       ownerHash,
       maxIssuedAt: record.maxIssuedAt,
       maxObservedAt: record.maxObservedAt,
-      acceptedEnvelopeHash,
+      acceptedEnvelopeHash: canonicalEnvelopeHash(record.envelope),
     })
   }
 
@@ -248,6 +243,26 @@ function canonicalPayloadBytes(payload: KnowledgeEntitlementEnvelope['payload'])
   }))
 }
 
+function canonicalEnvelopeHash(
+  envelope: KnowledgeEntitlementEnvelope,
+  payloadBytes = canonicalPayloadBytes(envelope.payload),
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    version: envelope.version,
+    payload: JSON.parse(payloadBytes.toString()),
+    signature: envelope.signature,
+  })).digest('hex')
+}
+
+interface AuthenticatedKnowledgeEntitlementEnvelope {
+  readonly envelope: KnowledgeEntitlementEnvelope
+  readonly canonicalPayload: Buffer
+  readonly envelopeHash: string
+  readonly issuedAt: number
+  readonly snapshotExpiresAt: number
+  readonly membershipExpiresAt: number
+}
+
 function failClosedEntitlement(): KnowledgeEntitlementState & {
   knowledgeToolEnabled: false
   killSwitchEnabled: true
@@ -265,17 +280,22 @@ export class KnowledgeEntitlementVerifier {
   }) {}
 
   verify(userId: string, input: unknown): VerifiedKnowledgeEntitlementState {
+    return this.evaluate(this.authenticate(userId, input))
+  }
+
+  authenticate(userId: string, input: unknown): AuthenticatedKnowledgeEntitlementEnvelope {
     const parsed = envelopeSchema.safeParse(input)
     if (!parsed.success) verificationFailure('invalid_envelope')
     const envelope = parsed.data
     if (envelope.payload.userId !== userId) verificationFailure('wrong_user')
     const trustedKey = this.options.trustedKeys[envelope.payload.keyId]
     if (!trustedKey) verificationFailure('untrusted_key')
+    const canonicalPayload = canonicalPayloadBytes(envelope.payload)
     let valid = false
     try {
       valid = verify(
         null,
-        canonicalPayloadBytes(envelope.payload),
+        canonicalPayload,
         createPublicKey(trustedKey),
         Buffer.from(envelope.signature, 'base64url'),
       )
@@ -284,7 +304,6 @@ export class KnowledgeEntitlementVerifier {
     }
     if (!valid) verificationFailure('invalid_signature')
 
-    const now = this.options.now?.() ?? Date.now()
     const issuedAt = Date.parse(envelope.payload.issuedAt)
     const snapshotExpiresAt = Date.parse(envelope.payload.snapshotExpiresAt)
     const membershipExpiresAt = Date.parse(envelope.payload.membershipExpiresAt)
@@ -295,6 +314,22 @@ export class KnowledgeEntitlementVerifier {
       || (!free && terminal && membershipExpiresAt > issuedAt)) {
       verificationFailure('invalid_time_order')
     }
+    return Object.freeze({
+      envelope,
+      canonicalPayload,
+      envelopeHash: canonicalEnvelopeHash(envelope, canonicalPayload),
+      issuedAt,
+      snapshotExpiresAt,
+      membershipExpiresAt,
+    })
+  }
+
+  evaluate(
+    authenticated: AuthenticatedKnowledgeEntitlementEnvelope,
+    now = this.options.now?.() ?? Date.now(),
+  ): VerifiedKnowledgeEntitlementState {
+    const { envelope, issuedAt, snapshotExpiresAt, membershipExpiresAt } = authenticated
+    const free = envelope.payload.tier === 'free'
     if (issuedAt - now > CLOCK_SKEW_MS) verificationFailure('issued_in_future')
 
     if (free) {
@@ -440,58 +475,73 @@ export class KnowledgeEntitlementAuthority {
       return failed()
     }
 
-    let cachedState: VerifiedKnowledgeEntitlementState | undefined
+    let cachedAuthenticated: AuthenticatedKnowledgeEntitlementEnvelope | undefined
     if (cached) {
       try {
-        cachedState = this.verifier.verify(owner.userId, cached.envelope)
+        cachedAuthenticated = this.verifier.authenticate(owner.userId, cached.envelope)
       } catch {
         this.failedOwners.add(owner.userId)
         return failed()
       }
     }
 
-    let fetched: KnowledgeEntitlementEnvelope | undefined
-    let fetchedState: VerifiedKnowledgeEntitlementState | undefined
+    let fetchedAuthenticated: AuthenticatedKnowledgeEntitlementEnvelope | undefined
     if (this.options.fetchEnvelope) {
       try {
-        const candidate = envelopeSchema.parse(await this.options.fetchEnvelope(owner))
-        fetchedState = this.verifier.verify(owner.userId, candidate)
-        fetched = candidate
+        fetchedAuthenticated = this.verifier.authenticate(
+          owner.userId,
+          await this.options.fetchEnvelope(owner),
+        )
       } catch { /* Offline, malformed, or untrusted input may only fall back to verified cache. */ }
     }
 
-    const fetchedIssuedAt = fetched === undefined ? undefined : Date.parse(fetched.payload.issuedAt)
+    const fetchedIssuedAt = fetchedAuthenticated?.issuedAt
     const maximumIssuedAt = cached === undefined ? Number.NEGATIVE_INFINITY : Date.parse(cached.maxIssuedAt)
-    const cachedIssuedAt = cached === undefined
-      ? Number.NEGATIVE_INFINITY
-      : Date.parse(cached.envelope.payload.issuedAt)
-    const fetchedMatchesCache = fetched !== undefined
-      && cachedState !== undefined
-      && fetched.signature === cached!.envelope.signature
-      && canonicalPayloadBytes(fetched.payload).equals(canonicalPayloadBytes(cached!.envelope.payload))
+    const cachedIssuedAt = cachedAuthenticated?.issuedAt ?? Number.NEGATIVE_INFINITY
+    const fetchedMatchesCache = fetchedAuthenticated !== undefined
+      && cachedAuthenticated !== undefined
+      && fetchedAuthenticated.envelopeHash === cachedAuthenticated.envelopeHash
+      && fetchedAuthenticated.envelope.signature === cachedAuthenticated.envelope.signature
+      && fetchedAuthenticated.canonicalPayload.equals(cachedAuthenticated.canonicalPayload)
     const fetchedEquivocates = fetchedIssuedAt !== undefined
-      && cached !== undefined
+      && cachedAuthenticated !== undefined
       && !fetchedMatchesCache
       && (fetchedIssuedAt === maximumIssuedAt || fetchedIssuedAt === cachedIssuedAt)
     if (fetchedEquivocates) {
       this.failedOwners.add(owner.userId)
       return failed()
     }
-    const fetchedMayStartOrContinue = fetchedState?.status !== 'offline_grace' || fetchedMatchesCache
+
+    let cachedState: VerifiedKnowledgeEntitlementState | undefined
+    if (cachedAuthenticated) {
+      try {
+        cachedState = this.verifier.evaluate(cachedAuthenticated, now)
+      } catch {
+        this.failedOwners.add(owner.userId)
+        return failed()
+      }
+    }
+    let fetchedState: VerifiedKnowledgeEntitlementState | undefined
+    if (fetchedAuthenticated) {
+      try { fetchedState = this.verifier.evaluate(fetchedAuthenticated, now) } catch {
+        /* A temporally denied authenticated fetch may only fall back after equivocation was excluded. */
+      }
+    }
+    const fetchedMayStartOrContinue = fetchedState !== undefined
+      && (fetchedState.status !== 'offline_grace' || fetchedMatchesCache)
     const fetchedIsMonotonic = fetchedIssuedAt !== undefined && (
       fetchedIssuedAt > maximumIssuedAt
       || (fetchedIssuedAt === maximumIssuedAt && fetchedMatchesCache)
     )
     const accepted = fetchedMayStartOrContinue && fetchedIsMonotonic
-      ? fetched
-      : cachedState === undefined ? undefined : cached!.envelope
-    if (!accepted) return failed()
+      ? fetchedAuthenticated
+      : cachedState === undefined ? undefined : cachedAuthenticated
+    const state = accepted === fetchedAuthenticated ? fetchedState : cachedState
+    if (!accepted || !state) return failed()
 
-    let state: VerifiedKnowledgeEntitlementState
-    try { state = this.verifier.verify(owner.userId, accepted) } catch { return failed() }
     const record: KnowledgeEntitlementCacheRecord = {
-      envelope: accepted,
-      maxIssuedAt: new Date(Math.max(maximumIssuedAt, Date.parse(accepted.payload.issuedAt))).toISOString(),
+      envelope: accepted.envelope,
+      maxIssuedAt: new Date(Math.max(maximumIssuedAt, accepted.issuedAt)).toISOString(),
       maxObservedAt: new Date(Math.max(
         cached === undefined ? Number.NEGATIVE_INFINITY : Date.parse(cached.maxObservedAt), now,
       )).toISOString(),
@@ -502,6 +552,6 @@ export class KnowledgeEntitlementAuthority {
       this.failedOwners.add(owner.userId)
       return failed()
     }
-    return { entitlement: state, fingerprint: accepted.signature }
+    return { entitlement: state, fingerprint: accepted.envelopeHash }
   }
 }

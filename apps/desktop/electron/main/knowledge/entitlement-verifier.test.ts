@@ -357,6 +357,106 @@ describe('KnowledgeEntitlementAuthority', () => {
     expect(stored.values.get(owner.userId)?.envelope).toEqual(ACTIVE_ENVELOPE)
   })
 
+  it.each([
+    ['kill snapshot one millisecond stale', '2026-08-26T01:00:00.001Z', signedEnvelope({
+      killSwitchEnabled: true,
+    })],
+    ['free snapshot beyond its grace while cached member remains in grace', '2026-08-29T00:00:00.001Z', signedEnvelope({
+      tier: 'free',
+      entitlements: [],
+      snapshotExpiresAt: ACTIVE_PAYLOAD.issuedAt,
+      membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt,
+      membershipStatus: 'active',
+    })],
+  ] as const)('authenticates same-issued signed %s before current-time denial', async (_label, deniedAt, equivocated) => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    let now = Date.parse('2026-08-26T00:30:00.000Z')
+    let fetched = ACTIVE_ENVELOPE
+    let fetches = 0
+    const write = vi.spyOn(stored, 'write')
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => { fetches += 1; return fetched },
+      now: () => now,
+    })
+    const active = await authority.getAuthorizationSnapshot(owner)
+
+    now = Date.parse(deniedAt)
+    fetched = equivocated
+    const failed = await authority.getAuthorizationSnapshot(owner)
+    expect(failed.entitlement).toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    expect(failed.revision).toBeGreaterThan(active.revision)
+    expect(authority.isAuthorizationSnapshotCurrentNow(owner, active)).toBe(false)
+
+    fetched = ACTIVE_ENVELOPE
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    fetched = signedEnvelope({ issuedAt: '2026-08-25T23:59:59.000Z' })
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    fetched = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-29T01:10:00.000Z',
+    })
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    expect(fetches).toBe(2)
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(stored.values.get(owner.userId)?.envelope).toEqual(ACTIVE_ENVELOPE)
+  })
+
+  it('does not poison an owner for invalid-signature same-issued input after the snapshot boundary', async () => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    let now = Date.parse('2026-08-26T00:30:00.000Z')
+    let fetched = ACTIVE_ENVELOPE
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => fetched,
+      now: () => now,
+    })
+    const active = await authority.getAuthorizationSnapshot(owner)
+
+    now = Date.parse('2026-08-26T01:00:00.001Z')
+    fetched = { ...signedEnvelope({ killSwitchEnabled: true }), signature: ACTIVE_SIGNATURE }
+    const ignored = await authority.getAuthorizationSnapshot(owner)
+    expect(ignored.revision).toBeGreaterThan(active.revision)
+    expect(ignored.entitlement).toMatchObject({
+      tier: 'member', status: 'offline_grace', killSwitchEnabled: false,
+    })
+
+    fetched = ACTIVE_ENVELOPE
+    const replayed = await authority.getAuthorizationSnapshot(owner)
+    expect(replayed).toEqual(ignored)
+  })
+
+  it('authenticates an identical temporally expired signed replay without treating it as equivocation', async () => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    let now = Date.parse('2026-08-26T00:30:00.000Z')
+    const killed = signedEnvelope({ killSwitchEnabled: true })
+    let fetches = 0
+    const write = vi.spyOn(stored, 'write')
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => { fetches += 1; return killed },
+      now: () => now,
+    })
+    await expect(authority.getEntitlement(owner)).resolves.toMatchObject({
+      tier: 'member', status: 'active', killSwitchEnabled: true,
+    })
+
+    now = Date.parse('2026-08-26T01:00:00.001Z')
+    await expect(authority.getEntitlement(owner)).resolves.toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    expect(fetches).toBe(2)
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(stored.values.get(owner.userId)?.envelope).toEqual(killed)
+  })
+
   it('keeps an identical same-issued signed replay idempotent', async () => {
     const owner = { userId: 'alice' }
     const stored = cache()

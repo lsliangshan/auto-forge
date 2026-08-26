@@ -232,3 +232,26 @@
 - No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified. Production trusted keys and Cloud Function signer remain absent, so beta/cloud/new Agent knowledge admission remain closed.
 - Rechecked the acceptance order: equivocation detection occurs only after strict schema and signature verification, before offline-grace acceptance and before the cache write. Malformed/untrusted/offline input preserves the existing verified-cache fallback; exact replay remains idempotent; strictly newer ordinary authority remains accepted unless that owner has already entered the deliberately sticky error state.
 - Round 4 assessment before prohibited external gates: Critical 0, Important 0, Minor 0.
+
+## Fix Round 5/5: authenticate equivocation before temporal denial
+
+### Finding resolved
+
+- Split `KnowledgeEntitlementVerifier` into module-private authenticated-candidate construction and current-time evaluation while preserving the public `verify()` contract as their composition. Static authentication covers strict schema/canonical grammar, exact owner, build-time trusted key, Ed25519 signature, canonical payload bytes, exact signature, SHA-256 envelope identity, and structural tier/time ordering. It deliberately does not apply future-issued, snapshot-expiry, offline-grace, or membership-current-time policy.
+- `KnowledgeEntitlementAuthority` now authenticates both cached and fetched envelopes before any current-time evaluation or cache fallback. A same-issued non-identical authenticated candidate therefore reaches equivocation comparison even when a signed kill snapshot is one millisecond stale or a signed free snapshot's shorter grace is already invalid. Equivocation becomes sticky owner-local fail-closed, advances the authorization revision, and performs zero additional cache/watermark writes.
+- Only after authenticated identities do not conflict does the authority evaluate both candidates at one captured current time. Invalid schema/owner/key/signature input never becomes authenticated equivocation and retains normal verified-cache fallback. An exact identical replay after the boundary is authenticated and compared idempotently, then receives the existing temporal denial or offline-grace behavior.
+
+### Exact RED/GREEN evidence
+
+- Focused RED after all literal cases were present: 3 failed / 1 passed / 41 skipped. Stale signed kill and grace-invalid signed free incorrectly returned cached member offline-grace with beta/cloud/tool enabled; the identical expired replay returned before fetching/authenticating its second signed identity. The invalid-signature same-issued case already passed as the required non-poisoning control.
+- Focused GREEN: 4/4 with 41 skipped. Full verifier: 45/45. Verifier + KnowledgeService: 108/108.
+- Electron Main/Application/IPC/Preload: 16 files, 412 passed / exactly 1 failed (413 total). The sole failure remains the unrelated context-summary billing baseline; its emitted block and final failed status both contain exactly `CONTEXT_LIMIT_EXCEEDED`.
+- `pnpm typecheck`: all four typed workspace projects passed. `pnpm lint --quiet`: exit 0.
+- `pnpm build`: shared/workflow packages, Electron Main, Preload, Renderer, parser worker, and workflow worker passed.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui`: rebuilt Main, Preload, Renderer and workers, then passed the real Electron Renderer -> Preload -> IPC -> Main -> parser -> encrypted persistence/restart path with `{"ok":true}`.
+
+### External gates and final self-review
+
+- No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified. Production trusted keys and Cloud Function signer remain absent; beta/cloud/new Agent knowledge admission stay closed.
+- Rechecked that unauthenticated input never leaves Main or participates in identity comparison; only the module-private authenticated candidate reaches authority logic. Canonical payload/signature/hash all agree for exact replay, while any authenticated same-issued difference fails before cache mutation. Existing restart-required sticky recovery policy is unchanged.
+- Round 5 final assessment before prohibited external gates: Critical 0, Important 0, Minor 0.
