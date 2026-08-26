@@ -261,3 +261,63 @@ Tests  1 passed | 19 skipped (20)
 - Outstanding leased mutations prevent both pull and the `synced` CAS, while per-base promise serialization, pause/cancel epochs, lease reclaim, terminal third attempts, and retry classification remain intact.
 - Renderer trust boundaries, Main/server ownership, service-role isolation, and `kill_switch_enabled` were not changed.
 - No CloudBase service, emulator, or pre-production database was available or accessed. PostgreSQL concurrency and FK enforcement still require the existing disposable pre-production deployment gate; the unrelated `CONTEXT_LIMIT_EXCEEDED` baseline remains unchanged.
+
+## Fix Round 4
+
+### What changed
+
+- Replaced the raw `cleanup:${storageReference}` cleanup identity with `cleanup:v1:<sha256>`, a deterministic 75-character request ID derived from the full storage reference.
+- Kept the request ID in the existing `cloud_sync_orphans` row and reused it unchanged for each retry, including after reconstructing the sync service over the same durable database state.
+- Added a 512-character storage-reference regression that passes the generated request through the real `CloudBaseKnowledgeClient` validator and a mocked function port. It proves the persisted and sent ID is accepted by the 128-character contract, contains no raw storage path, is stable for the same reference, and differs for another reference.
+- Left the one-object-per-request cleanup reservation and local delete CAS unchanged. No API, SQL, or storage-reference limits were widened.
+
+### TDD RED
+
+Working directory: `apps/desktop`.
+
+Command:
+
+`node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/sync-service.test.ts -t "uses an accepted private durable cleanup identity for a long storage reference"`
+
+Relevant output before the production change:
+
+```text
+FAIL  |desktop-node| electron/main/knowledge/sync-service.test.ts > KnowledgeSyncService > uses an accepted private durable cleanup identity for a long storage reference
+AssertionError: expected 'cleanup:private/storage/sssssssssssss…' to match /^cleanup:v1:[a-f0-9]{64}$/
+Test Files  1 failed (1)
+Tests  1 failed | 20 skipped (21)
+```
+
+This was the intended failure: a valid maximum-length storage reference was copied into the durable cleanup request ID, exceeding the client/API limit and exposing the reference in the identifier.
+
+### TDD GREEN
+
+The same focused command passed after the production change:
+
+```text
+Test Files  1 passed (1)
+Tests  1 passed | 20 skipped (21)
+```
+
+### Final verification
+
+- Focused long-reference regression: 1/1 passed.
+- `node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/sync-service.test.ts`: 21/21 passed.
+- `node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/*.test.ts`: 118/118 passed.
+- `pnpm --filter @autoforge/desktop typecheck`: passed.
+- `pnpm exec eslint apps/desktop/electron/main/knowledge/sync-service.ts apps/desktop/electron/main/knowledge/sync-service.test.ts`: passed.
+- `git diff --check`: passed.
+
+### Files changed
+
+- `apps/desktop/electron/main/knowledge/sync-service.ts`
+- `apps/desktop/electron/main/knowledge/sync-service.test.ts`
+- `.superpowers/sdd/2026-08-26-personal-knowledge-base/task-6-report.md`
+
+### Self-review
+
+- The SHA-256 digest provides a fixed-length, deterministic, collision-resistant per-reference identity; the `cleanup:v1:` namespace makes its purpose and format explicit without embedding the storage reference.
+- The request is still persisted before any remote call and is replayed byte-for-byte after a lost response or service restart. Each remote request still reserves and completes exactly one storage object.
+- Cleanup success still deletes the local row only when knowledge base, storage reference, and persisted request ID all match, preserving the existing CAS behavior.
+- Renderer trust boundaries, Main/server ownership, API and SQL length limits, cleanup reservation semantics, and `kill_switch_enabled` were not changed.
+- No real CloudBase service was accessed or mutated. The existing emulator/pre-production deployment gate and unrelated `CONTEXT_LIMIT_EXCEEDED` baseline remain unchanged.

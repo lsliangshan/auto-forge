@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3-multiple-ciphers'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { CloudBaseKnowledgeClient } from './cloudbase-knowledge-client.js'
 import { configureKnowledgeConnection, initializeKnowledgeSchema } from './knowledge-schema.js'
 import { KnowledgeSyncService, type CloudKnowledgeRemote } from './sync-service.js'
 
@@ -40,14 +41,15 @@ function fixture(
   }
   const applyRemoteChange = vi.fn().mockResolvedValue(undefined)
   const replaceRemoteSnapshot = vi.fn().mockResolvedValue(undefined)
-  const service = new KnowledgeSyncService(database, remote, {
+  const dependencies = {
     now: () => 1_000,
     id: dependencyOverrides.id ?? (() => 'lease_1'),
     isOnline: () => online,
     applyRemoteChange,
     replaceRemoteSnapshot,
-  })
-  return { database, remote, service, applyRemoteChange, replaceRemoteSnapshot }
+  }
+  const service = new KnowledgeSyncService(database, remote, dependencies)
+  return { database, remote, service, dependencies, applyRemoteChange, replaceRemoteSnapshot }
 }
 
 afterEach(() => {
@@ -264,26 +266,56 @@ describe('KnowledgeSyncService', () => {
       .toEqual({ count: 0 })
   })
 
-  it('reuses the durable orphan cleanup request after a lost response', async () => {
-    const transient = Object.assign(new Error('response lost'), {
-      code: 'TRANSIENT_FAILURE', retryable: true,
-    })
-    const cleanupOrphans = vi.fn()
-      .mockRejectedValueOnce(transient)
-      .mockResolvedValueOnce({ removed: 1 })
+  it('uses an accepted private durable cleanup identity for a long storage reference', async () => {
+    const storageReference = `private/storage/${'s'.repeat(496)}`
+    const otherStorageReference = `private/storage/${'t'.repeat(496)}`
+    const callFunction = vi.fn()
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({ result: { ok: true, data: { removed: 1 } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+    const cleanupOrphans = vi.fn(input => client.cleanupOrphans(input))
     let generated = 0
-    const { database, service } = fixture({ cleanupOrphans }, true, {
+    const { database, remote, service, dependencies } = fixture({ cleanupOrphans }, true, {
       id: () => `generated_${generated += 1}`,
     })
-    service.recordOrphan('kb_1', 'storage/object_retry')
+    service.recordOrphan('kb_1', storageReference)
+    const persisted = database.prepare(`
+      SELECT request_id AS requestId FROM cloud_sync_orphans WHERE storage_reference = ?
+    `).get(storageReference) as { requestId: string }
+
+    expect(storageReference).toHaveLength(512)
+    expect(persisted.requestId).toMatch(/^cleanup:v1:[a-f0-9]{64}$/)
+    expect(persisted.requestId.length).toBeLessThanOrEqual(128)
+    expect(persisted.requestId).not.toContain('private/storage')
+
+    const independent = fixture({}, true, { id: () => 'different_generated_id' })
+    independent.service.recordOrphan('kb_1', storageReference)
+    independent.service.recordOrphan('kb_1', otherStorageReference)
+    const independentRows = independent.database.prepare(`
+      SELECT storage_reference AS storageReference, request_id AS requestId
+      FROM cloud_sync_orphans ORDER BY storage_reference
+    `).all() as Array<{ storageReference: string; requestId: string }>
+    expect(independentRows[0]).toEqual({ storageReference, requestId: persisted.requestId })
+    expect(independentRows[1]?.storageReference).toBe(otherStorageReference)
+    expect(independentRows[1]?.requestId).not.toBe(persisted.requestId)
 
     await expect(service.cleanupOrphans('kb_1')).rejects.toMatchObject({
       code: 'TRANSIENT_FAILURE',
     })
-    await expect(service.cleanupOrphans('kb_1')).resolves.toBeUndefined()
+    const restarted = new KnowledgeSyncService(database, remote, dependencies)
+    await expect(restarted.cleanupOrphans('kb_1')).resolves.toBeUndefined()
     expect(cleanupOrphans).toHaveBeenCalledTimes(2)
-    expect(cleanupOrphans.mock.calls[0]?.[0].requestId).toBe('cleanup:storage/object_retry')
-    expect(cleanupOrphans.mock.calls[1]?.[0].requestId).toBe('cleanup:storage/object_retry')
+    expect(cleanupOrphans.mock.calls.map(([input]) => input.requestId))
+      .toEqual([persisted.requestId, persisted.requestId])
+    const sentCleanup = {
+      name: 'autoforge-knowledge',
+      data: {
+        action: 'cleanupOrphans', requestId: persisted.requestId, knowledgeBaseId: 'kb_1',
+        storageReferences: [storageReference],
+      },
+    }
+    expect(callFunction).toHaveBeenNthCalledWith(1, sentCleanup)
+    expect(callFunction).toHaveBeenNthCalledWith(2, sentCleanup)
     expect(database.prepare('SELECT count(*) AS count FROM cloud_sync_orphans').get())
       .toEqual({ count: 0 })
   })

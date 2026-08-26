@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type Database from 'better-sqlite3-multiple-ciphers'
 import type {
   CloudKnowledgeChange,
@@ -109,6 +110,10 @@ function encodePayload(value: Record<string, unknown>): string {
   try { encoded = JSON.stringify(value) } catch { throw syncError('INVALID_INPUT') }
   if (Buffer.byteLength(encoded, 'utf8') > 64 * 1_024) throw syncError('INVALID_INPUT')
   return encoded
+}
+
+function orphanCleanupRequestId(storageReference: string): string {
+  return `cleanup:v1:${createHash('sha256').update(storageReference, 'utf8').digest('hex')}`
 }
 
 export class KnowledgeSyncService {
@@ -470,7 +475,10 @@ export class KnowledgeSyncService {
       INSERT OR IGNORE INTO cloud_sync_orphans (
         storage_reference, knowledge_base_id, request_id, created_at
       ) VALUES (?, ?, ?, ?)
-    `).run(storageReference, knowledgeBaseId, `cleanup:${storageReference}`, this.dependencies.now())
+    `).run(
+      storageReference, knowledgeBaseId, orphanCleanupRequestId(storageReference),
+      this.dependencies.now(),
+    )
   }
 
   async cleanupOrphans(knowledgeBaseId: string): Promise<void> {
