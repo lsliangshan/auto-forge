@@ -209,3 +209,26 @@
 - Moved synced cached fallback computation before final post-remote authorization and returns only its already-computed result after the final server/CAS segment; no synced evidence is loaded after that validation.
 - Found and fixed one preserved Round 1 issue during final self-review: `killSwitchEnabled` had incorrectly bypassed snapshot expiry for member local authority. Literal boundary coverage now proves exact-expiry denial without granting offline grace.
 - Round 3 assessment before prohibited external gates: Critical 0, Important 0, Minor 0.
+
+## Fix Round 4/5: signed equivocation fails closed
+
+### Finding resolved
+
+- A schema-valid, signature-valid envelope with the same `issuedAt` as the cached envelope or independent maximum watermark is now compared byte-for-byte by canonical payload and signature. Any non-identical value is signed equivocation, not an ordinary rollback: the owner enters sticky process-lifetime fail-closed state before any cache write, the authorization revision advances, and cached member authority cannot be reused.
+- Literal revoked, kill-switch, canonical free, and different membership-horizon envelopes exercise the same-issued branch. Each returns authoritative free local quota with beta/cloud/new knowledge-tool admission denied, invalidates the captured member authorization, leaves the cache/write boundary unchanged, and refuses identical, strictly newer, or older recovery attempts in the same process. Restart or an explicit future recovery design is required; no implicit unstick path was added.
+- Exact canonical replay remains idempotent and retains the same authorization revision. Failure remains isolated per owner; an unaffected second owner continues with active signed member authority.
+
+### Exact RED/GREEN evidence
+
+- Focused same-issued review RED: 5 failed / 3 passed / 34 skipped. The four signed equivocation variants and owner-isolation case all incorrectly returned the cached member state with beta/cloud/tool enabled.
+- Focused GREEN: 7 passed / 34 skipped. This includes four equivocation variants, owner isolation, identical replay idempotency, and the existing independent cache-watermark equivocation case.
+- Verifier + KnowledgeService: 104/104.
+- Electron Main/Application/IPC/Preload: 16 files, 408 passed / exactly 1 failed (409 total). The sole failure remains the unrelated context-summary billing baseline; its emitted block and final failed status both contain exactly `CONTEXT_LIMIT_EXCEEDED`.
+- `pnpm typecheck`: all four typed workspace projects passed. `pnpm lint --quiet`: exit 0.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui`: rebuilt Main, Preload, Renderer and workers, then passed the real Electron Renderer -> Preload -> IPC -> Main -> parser -> encrypted persistence/restart path with `{"ok":true}`.
+
+### External gates and self-review
+
+- No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified. Production trusted keys and Cloud Function signer remain absent, so beta/cloud/new Agent knowledge admission remain closed.
+- Rechecked the acceptance order: equivocation detection occurs only after strict schema and signature verification, before offline-grace acceptance and before the cache write. Malformed/untrusted/offline input preserves the existing verified-cache fallback; exact replay remains idempotent; strictly newer ordinary authority remains accepted unless that owner has already entered the deliberately sticky error state.
+- Round 4 assessment before prohibited external gates: Critical 0, Important 0, Minor 0.

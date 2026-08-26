@@ -462,10 +462,21 @@ export class KnowledgeEntitlementAuthority {
 
     const fetchedIssuedAt = fetched === undefined ? undefined : Date.parse(fetched.payload.issuedAt)
     const maximumIssuedAt = cached === undefined ? Number.NEGATIVE_INFINITY : Date.parse(cached.maxIssuedAt)
+    const cachedIssuedAt = cached === undefined
+      ? Number.NEGATIVE_INFINITY
+      : Date.parse(cached.envelope.payload.issuedAt)
     const fetchedMatchesCache = fetched !== undefined
       && cachedState !== undefined
       && fetched.signature === cached!.envelope.signature
       && canonicalPayloadBytes(fetched.payload).equals(canonicalPayloadBytes(cached!.envelope.payload))
+    const fetchedEquivocates = fetchedIssuedAt !== undefined
+      && cached !== undefined
+      && !fetchedMatchesCache
+      && (fetchedIssuedAt === maximumIssuedAt || fetchedIssuedAt === cachedIssuedAt)
+    if (fetchedEquivocates) {
+      this.failedOwners.add(owner.userId)
+      return failed()
+    }
     const fetchedMayStartOrContinue = fetchedState?.status !== 'offline_grace' || fetchedMatchesCache
     const fetchedIsMonotonic = fetchedIssuedAt !== undefined && (
       fetchedIssuedAt > maximumIssuedAt

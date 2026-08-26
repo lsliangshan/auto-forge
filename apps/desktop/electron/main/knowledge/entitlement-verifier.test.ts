@@ -301,24 +301,106 @@ describe('KnowledgeEntitlementAuthority', () => {
     })
   })
 
-  it('rejects a different valid envelope replayed at the same issuedAt instead of extending membership', async () => {
+  it.each([
+    ['revoked', signedEnvelope({
+      membershipStatus: 'revoked',
+      membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt,
+    })],
+    ['kill switch', signedEnvelope({ killSwitchEnabled: true })],
+    ['free tier', signedEnvelope({
+      tier: 'free',
+      entitlements: [],
+      membershipStatus: 'active',
+      membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt,
+    })],
+    ['different membership horizon', signedEnvelope({
+      membershipExpiresAt: '2026-10-26T00:00:00.000Z',
+    })],
+  ] as const)('sticks fail closed after same-issued signed %s equivocation', async (_label, equivocated) => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    stored.values.set(owner.userId, {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:00:00.000Z',
+    })
+    const write = vi.spyOn(stored, 'write')
+    let fetched = ACTIVE_ENVELOPE
+    let fetches = 0
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => { fetches += 1; return fetched },
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    })
+    const active = await authority.getAuthorizationSnapshot(owner)
+
+    fetched = equivocated
+    const failed = await authority.getAuthorizationSnapshot(owner)
+    expect(failed.entitlement).toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    expect(failed.revision).toBeGreaterThan(active.revision)
+    expect(authority.isAuthorizationSnapshotCurrentNow(owner, active)).toBe(false)
+
+    fetched = ACTIVE_ENVELOPE
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    fetched = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-26T01:10:00.000Z',
+    })
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    fetched = signedEnvelope({ issuedAt: '2026-08-25T23:59:59.000Z' })
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    expect(fetches).toBe(2)
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(stored.values.get(owner.userId)?.envelope).toEqual(ACTIVE_ENVELOPE)
+  })
+
+  it('keeps an identical same-issued signed replay idempotent', async () => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    stored.values.set(owner.userId, {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:00:00.000Z',
+    })
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => ACTIVE_ENVELOPE,
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    })
+
+    const first = await authority.getAuthorizationSnapshot(owner)
+    const second = await authority.getAuthorizationSnapshot(owner)
+    expect(second).toEqual(first)
+    expect(second.entitlement).toMatchObject({ tier: 'member', status: 'active' })
+  })
+
+  it('isolates same-issued equivocation failure to its owner', async () => {
     const stored = cache()
     stored.values.set('alice', {
       envelope: ACTIVE_ENVELOPE,
       maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
       maxObservedAt: '2026-08-26T00:00:00.000Z',
     })
-    const equivocated = signedEnvelope({ membershipExpiresAt: '2026-10-26T00:00:00.000Z' })
+    const bobEnvelope = signedEnvelope({ userId: 'bob' })
+    let aliceFetch = ACTIVE_ENVELOPE
     const authority = new KnowledgeEntitlementAuthority({
       trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
-      fetchEnvelope: async () => equivocated,
+      fetchEnvelope: owner => Promise.resolve(owner.userId === 'alice' ? aliceFetch : bobEnvelope),
       now: () => Date.parse('2026-08-26T00:30:00.000Z'),
     })
+    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({ tier: 'member' })
 
-    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
-      membershipExpiresAt: ACTIVE_PAYLOAD.membershipExpiresAt,
+    aliceFetch = signedEnvelope({ killSwitchEnabled: true })
+    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
     })
-    expect(stored.values.get('alice')?.envelope).toEqual(ACTIVE_ENVELOPE)
+    await expect(authority.getEntitlement({ userId: 'bob' })).resolves.toMatchObject({
+      tier: 'member', status: 'active', killSwitchEnabled: false,
+    })
   })
 
   it('does not replace a cached active envelope with tampered, older-key-rotation, or rollback input', async () => {
