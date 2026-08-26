@@ -101,6 +101,29 @@ describe('CloudBaseUserDataPort', () => {
     expect(JSON.stringify(callFunction.mock.calls)).not.toContain('userId')
   })
 
+  it('records only legacy-import transport metadata when the remote rejects a batch', async () => {
+    const diagnostics = vi.fn()
+    const port = new CloudBaseUserDataPort({
+      callFunction: vi.fn().mockResolvedValue({
+        result: { ok: false, error: { code: 'INVALID_INPUT' } },
+      }),
+    }, undefined, diagnostics)
+
+    await expect(port.call({
+      action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'device-a', batchId: 'batch_1-0',
+      includeUnowned: false, conversations: [], messages: [], cloudSyncConsent: {
+        purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+        consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+      },
+    })).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'importLegacyBatch', stage: 'remote_error', code: 'INVALID_INPUT',
+      conversationCount: 0, messageCount: 0,
+    }))
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('cloud-sync-2026-08')
+  })
+
   it('rejects oversized or secret-bearing dedicated action payloads before transport', async () => {
     const callFunction = vi.fn()
     const port = new CloudBaseUserDataPort({ callFunction })

@@ -133,6 +133,34 @@ function withinRequestLimit(value) {
   }
 }
 
+function parseEnvelopePayload(value) {
+  if (isRecord(value)) return value
+  if (typeof value !== 'string' || value.length > maximumRequestBytes) return undefined
+  try {
+    const parsed = JSON.parse(value)
+    return isRecord(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// CloudBase gateways use different event shells for SDK and HTTP-routed function
+// calls. Only extract a JSON object from known payload fields; every nested action
+// still goes through the same strict validation below.
+function unwrapFunctionEvent(rawEvent) {
+  if (!isRecord(rawEvent)) return rawEvent
+  for (const key of ['data', 'body', 'request_data']) {
+    if (!Object.hasOwn(rawEvent, key)) continue
+    const payload = parseEnvelopePayload(rawEvent[key])
+    if (payload) return payload
+  }
+  if (typeof rawEvent.action === 'string' && Object.hasOwn(rawEvent, 'tcbContext')) {
+    const { tcbContext: _tcbContext, ...payload } = rawEvent
+    return payload
+  }
+  return rawEvent
+}
+
 function cloneValidatedJson(value) {
   return JSON.parse(JSON.stringify(value))
 }
@@ -952,6 +980,10 @@ function invalid() {
   return { ok: false, error: { code: 'INVALID_INPUT' } }
 }
 
+function invalidLegacyImport(stage) {
+  return { ok: false, error: { code: 'INVALID_INPUT', stage } }
+}
+
 function upgradeRequired() {
   return { ok: false, error: { code: 'UPGRADE_REQUIRED' } }
 }
@@ -965,7 +997,8 @@ function createUserDataHandler({ rpc }) {
     const uid = callerUid(context)
     if (!uid) return { ok: false, error: { code: 'AUTH_REQUIRED' } }
     if (!isRecord(rawEvent) || !withinRequestLimit(rawEvent)) return invalid()
-    const event = rawEvent
+    const event = unwrapFunctionEvent(rawEvent)
+    if (!withinRequestLimit(event)) return invalid()
 
     try {
       if (event.action === 'syncPush') {
@@ -1049,23 +1082,34 @@ function createUserDataHandler({ rpc }) {
             'conversations', 'messages', 'cloudSyncConsent',
           ],
           ['unownedImportConsent'],
-        )) return invalid()
+        )) {
+          return invalidLegacyImport('shape')
+        }
         if (!protocolIsCurrent(event)) return upgradeRequired()
-        if (!identifier(event.deviceId)
-          || !identifier(event.batchId)
-          || typeof event.includeUnowned !== 'boolean'
+        if (!identifier(event.deviceId) || !identifier(event.batchId)) {
+          return invalidLegacyImport('identifier')
+        }
+        if (typeof event.includeUnowned !== 'boolean'
           || !Array.isArray(event.conversations)
           || !Array.isArray(event.messages)
-          || event.conversations.length + event.messages.length > maximumBatchItems
-          || !event.conversations.every(validateLegacyConversation)
-          || !event.messages.every((message) => validateMessage(message, true))
-          || !validateConsent(event.cloudSyncConsent, 'cloud_sync')
+          || event.conversations.length + event.messages.length > maximumBatchItems) {
+          return invalidLegacyImport('batch')
+        }
+        if (!event.conversations.every(validateLegacyConversation)) {
+          return invalidLegacyImport('conversation')
+        }
+        if (!event.messages.every((message) => validateMessage(message, true))) {
+          return invalidLegacyImport('message')
+        }
+        if (!validateConsent(event.cloudSyncConsent, 'cloud_sync')
           || (event.includeUnowned
             ? !validateConsent(event.unownedImportConsent, 'legacy_unowned_import')
-            : event.unownedImportConsent !== undefined)
-          || (!event.includeUnowned && [
-            ...event.conversations, ...event.messages,
-          ].some((item) => item.sourceUnowned === true))) return invalid()
+            : event.unownedImportConsent !== undefined)) {
+          return invalidLegacyImport('consent')
+        }
+        if (!event.includeUnowned && [
+          ...event.conversations, ...event.messages,
+        ].some((item) => item.sourceUnowned === true)) return invalidLegacyImport('unowned')
         return { ok: true, data: await rpc('autoforge_import_legacy_batch', {
           p_caller_user_id: uid,
           p_protocol_version: event.protocolVersion,
@@ -1130,7 +1174,11 @@ function createUserDataHandler({ rpc }) {
 
       return invalid()
     } catch (error) {
-      return { ok: false, error: { code: safeErrorCode(error) } }
+      const code = safeErrorCode(error)
+      if (event.action === 'importLegacyBatch') {
+        return { ok: false, error: { code, stage: 'rpc' } }
+      }
+      return { ok: false, error: { code } }
     }
   }
 }

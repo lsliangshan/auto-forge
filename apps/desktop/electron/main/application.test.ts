@@ -1143,6 +1143,54 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('does not report a legacy import failure when an earlier sync pull was already quarantined', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-legacy-import-quarantine-'))
+    directories.push(root)
+    openAppDatabase(join(root, 'autoforge.sqlite')).close()
+    const seeded = new Database(join(root, 'autoforge.sqlite'))
+    seeded.prepare(`
+      INSERT INTO conversations(id, title, title_state, user_id, created_at, updated_at)
+      VALUES ('legacy_quarantine', 'Legacy quarantine', 'user_named', NULL, 1, 1)
+    `).run()
+    seeded.close()
+    const userDataSyncPort = {
+      call: vi.fn(async (input: CloudBaseUserDataCall) => {
+        if (input.action === 'syncPull') {
+          return { ok: false as const, error: { code: 'INVALID_INPUT' as const } }
+        }
+        if (input.action === 'importLegacyBatch') {
+          return {
+            ok: true as const,
+            data: { batchId: input.batchId, status: 'applied' as const,
+              importedConversations: input.conversations.length,
+              importedMessages: input.messages.length },
+          }
+        }
+        if (input.action === 'syncPush') {
+          return { ok: true as const, data: { results: [], cursor: 'quarantine_push' } }
+        }
+        throw toSafeAppError({ code: 'INTERNAL_ERROR' })
+      }),
+    }
+    const runtime = createApplicationRuntime(options(root, { userDataSyncPort }))
+    try {
+      await authenticate(runtime, 'LegacyQuarantine')
+      await expect(runtime.services.settings.importLegacyData({
+        includeUnowned: true,
+        cloudSyncConsent: {
+          purpose: 'cloud_sync', documentVersion: 'cloud-sync-2026-08',
+          consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+        },
+        unownedImportConsent: {
+          purpose: 'legacy_unowned_import', documentVersion: 'legacy-unowned-import-2026-08',
+          consentedAt: '2026-08-25T00:00:00.000Z', clientVersion: '0.1.0',
+        },
+      })).resolves.toEqual([expect.objectContaining({ status: 'applied' })])
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('uses saved IANA timezone month bounds and consecutive public preference revisions', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-usage-timezone-'))

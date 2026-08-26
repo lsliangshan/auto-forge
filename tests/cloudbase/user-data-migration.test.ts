@@ -127,6 +127,13 @@ describe('CloudBase user data migration', () => {
     expect(syncPush).not.toMatch(/SQLERRM|CONSTRAINT_NAME|PG_EXCEPTION_DETAIL|GET STACKED DIAGNOSTICS/)
   })
 
+  it('resolves sync-push identifiers to PL/pgSQL variables when column names overlap', async () => {
+    const canonical = await readFile(canonicalUrl, 'utf8')
+    const syncPush = extractFunction(canonical, 'autoforge_sync_push')
+
+    expect(syncPush).toContain('#variable_conflict use_variable')
+  })
+
   it('rejects a duplicate message id unless every immutable field matches', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const syncPush = extractFunction(canonical, 'autoforge_sync_push')
@@ -194,7 +201,7 @@ describe('CloudBase user data migration', () => {
     )
   })
 
-  it('validates legacy devices before idempotency and hashes the complete batch', async () => {
+  it('validates legacy devices before stable-batch idempotency', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const legacyImport = extractFunction(canonical, 'autoforge_import_legacy_batch')
     const deviceCheck = legacyImport.indexOf('device_row.revoked_at IS NOT NULL')
@@ -202,15 +209,11 @@ describe('CloudBase user data migration', () => {
 
     expect(deviceCheck).toBeGreaterThan(-1)
     expect(duplicateCheck).toBeGreaterThan(deviceCheck)
-    expect(legacyImport).toContain('legacy_request_hash := md5(jsonb_build_object(')
-    expect(legacyImport).toContain("'conversations', p_conversations")
-    expect(legacyImport).toContain("'messages', p_messages")
-    expect(legacyImport).toContain("'cloudSyncConsent', p_cloud_sync_consent")
-    expect(legacyImport).toContain("'unownedImportConsent', p_unowned_import_consent")
-    expect(legacyImport).toContain('receipt.request_hash = legacy_request_hash')
-    expect(legacyImport).not.toContain(
-      "md5(p_batch_id || ':' || jsonb_array_length(p_conversations)::text",
+    expect(legacyImport).toContain(
+      '-- Consent metadata is renewed for each confirmation, so it must not turn',
     )
+    expect(legacyImport).toContain("IF receipt.kind = 'legacy.import' THEN")
+    expect(legacyImport).not.toContain('receipt.request_hash = legacy_request_hash')
   })
 
   it('projects accepted legacy rows through ordered deterministic sync receipts', async () => {
@@ -233,8 +236,8 @@ describe('CloudBase user data migration', () => {
     expect(messageLoop).toBeGreaterThan(conversationReceipt)
     expect(messageReceipt).toBeGreaterThan(messageLoop)
     expect(reducedReceipt).toBeGreaterThan(messageReceipt)
-    expect(legacyImport).toContain("p_batch_id || ':conversation:' || item->>'id'")
-    expect(legacyImport).toContain("p_batch_id || ':message:' || item->>'id'")
+    expect(legacyImport).toContain("p_batch_id || ':conversation:' || (item->>'id')")
+    expect(legacyImport).toContain("p_batch_id || ':message:' || (item->>'id')")
     expect(legacyImport).toContain(
       "'title', item->>'title', 'titleState', item->>'titleState'",
     )

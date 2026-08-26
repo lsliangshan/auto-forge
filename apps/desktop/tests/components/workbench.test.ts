@@ -268,6 +268,53 @@ describe('workbench', () => {
     expect(api.settings.importLegacyData).not.toHaveBeenCalled()
   })
 
+  it('keeps account preferences and legacy migration usable when remote usage fails', async () => {
+    const api = createApi()
+    let preferences: Awaited<ReturnType<DesktopAPI['settings']['getAccountDataPreferences']>> = {
+      timezone: 'Asia/Shanghai',
+      displayCurrency: 'CNY',
+    }
+    vi.mocked(api.settings.getRemoteUsage).mockRejectedValue({ code: 'INTERNAL_ERROR' })
+    vi.mocked(api.settings.getAccountDataPreferences).mockImplementation(async () => preferences)
+    vi.mocked(api.settings.updateAccountDataPreferences).mockImplementation(async (input) => {
+      preferences = input
+      return preferences
+    })
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const { wrapper } = await mountApp('/settings', api)
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="account-timezone"]').text())
+      .toContain('中国上海'))
+    const currency = wrapper.findComponent('[data-testid="account-display-currency"]')
+    expect(currency.props('modelValue')).toBe('CNY')
+
+    currency.vm.$emit('change', 'USD')
+    await vi.waitFor(() => expect(api.settings.updateAccountDataPreferences).toHaveBeenCalledWith({
+      timezone: 'Asia/Shanghai',
+      displayCurrency: 'USD',
+    }))
+    await vi.waitFor(() => expect(currency.props('modelValue')).toBe('USD'))
+
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.importLegacyData).toHaveBeenCalledOnce())
+    expect(wrapper.find('#data [role="alert"]').exists()).toBe(false)
+    expect(wrapper.get('#billing [role="alert"]').text()).toContain('操作失败，请稍后重试')
+  })
+
+  it('shows the migration error code when legacy import is rejected', async () => {
+    const api = createApi()
+    vi.mocked(api.settings.importLegacyData).mockRejectedValue({ code: 'AUTH_REQUIRED' })
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+    const { wrapper } = await mountApp('/settings', api)
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="legacy-import-button"]').attributes('disabled'))
+      .toBeUndefined())
+    await wrapper.get('[data-testid="legacy-import-button"]').trigger('click')
+    await vi.waitFor(() => expect(api.settings.importLegacyData).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(wrapper.get('#data [role="alert"]').text())
+      .toContain('历史会话迁移失败：请先登录'))
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
     setActivePinia(createPinia())
@@ -556,7 +603,7 @@ describe('workbench', () => {
     expect(store.nextConversationCursor).toBeUndefined()
   })
 
-  it('shows every sync state without exposing owner data and offers a targeted retry', async () => {
+  it('hides completed sync state while preserving actionable states and targeted retry', async () => {
     const api = createApi()
     const failed = { ...conversationSummary('failed-conversation', '2026-07-20T00:00:00.000Z', 'failed'), title: '需重试' }
     vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [
@@ -570,13 +617,43 @@ describe('workbench', () => {
     await vi.waitFor(() => expect(new Set(wrapper
       .findAll('[data-testid="conversation-sync-status"]')
       .map((status) => status.attributes('aria-label')))).toEqual(new Set([
-      '同步失败', '等待同步', '正在同步', '同步完成',
+      '同步失败', '等待同步', '正在同步',
     ])))
+    const syncedConversation = wrapper.findAll('.conversation-select')
+      .find((row) => row.text().includes('synced-conversation'))
+    expect(syncedConversation).toBeDefined()
+    expect(syncedConversation?.find('[data-testid="conversation-sync-status"]').exists()).toBe(false)
     const retry = wrapper.get('[data-testid="retry-conversation-sync"]')
     expect(retry.attributes('aria-label')).toContain('需重试')
+    const store = useChatStore()
+    store.retryingSyncByConversation['failed-conversation'] = true
+    await wrapper.vm.$nextTick()
+    expect(retry.attributes('disabled')).toBeDefined()
+    expect(retry.attributes('aria-busy')).toBe('true')
+    expect(retry.get('.el-icon').classes()).toContain('is-loading')
+    delete store.retryingSyncByConversation['failed-conversation']
+    await wrapper.vm.$nextTick()
     await retry.trigger('click')
     await vi.waitFor(() => expect(api.chat.retrySync).toHaveBeenCalledWith('failed-conversation'))
     expect(wrapper.html()).not.toContain('userId')
+  })
+
+  it('reports when a targeted sync retry finishes without recovering', async () => {
+    const api = createApi()
+    const failed = {
+      ...conversationSummary('failed-conversation', '2026-07-20T00:00:00.000Z', 'failed'),
+      title: '需重试',
+    }
+    vi.mocked(api.chat.listConversations).mockResolvedValue({ items: [failed] })
+    const { wrapper } = await mountApp('/chat', api)
+
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="retry-conversation-sync"]').exists())
+      .toBe(true))
+    await wrapper.get('[data-testid="retry-conversation-sync"]').trigger('click')
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="sync-retry-error"]').text())
+      .toContain('同步重试未成功'))
+    expect(api.chat.listConversations).toHaveBeenCalledTimes(2)
   })
 
   it('shows an actionable durable sync warning and clears it after recovery', async () => {

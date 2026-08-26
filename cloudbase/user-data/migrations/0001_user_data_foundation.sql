@@ -261,6 +261,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
+#variable_conflict use_variable
 DECLARE
   auth_user_id bigint;
   mutation_record record;
@@ -1108,8 +1109,10 @@ BEGIN
     AND stored_receipt.mutation_id = p_batch_id
   FOR UPDATE;
   IF FOUND THEN
-    IF receipt.kind = 'legacy.import'
-      AND receipt.request_hash = legacy_request_hash THEN
+    -- The batch id is derived from the selected local-history fingerprint.
+    -- Consent metadata is renewed for each confirmation, so it must not turn
+    -- a completed batch retry into a conflict.
+    IF receipt.kind = 'legacy.import' THEN
       RETURN jsonb_build_object('batchId', p_batch_id, 'status', 'duplicate');
     END IF;
     RETURN jsonb_build_object(
@@ -1153,7 +1156,7 @@ BEGIN
     imported_conversations := imported_conversations + inserted_count;
     IF inserted_count = 1 THEN
       conversation_mutation_id := 'legacy-conversation:' || md5(
-        p_batch_id || ':conversation:' || item->>'id'
+        p_batch_id || ':conversation:' || (item->>'id')
       );
       row_mutation_payload := jsonb_build_object(
         'id', conversation_mutation_id,
@@ -1223,7 +1226,7 @@ BEGIN
       WHERE owner_user_id = auth_user_id
         AND id = item->>'conversationId';
       message_mutation_id := 'legacy-message:' || md5(
-        p_batch_id || ':message:' || item->>'id'
+        p_batch_id || ':message:' || (item->>'id')
       );
       row_mutation_payload := jsonb_build_object(
         'id', message_mutation_id,

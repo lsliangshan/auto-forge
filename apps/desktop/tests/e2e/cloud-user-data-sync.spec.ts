@@ -76,14 +76,16 @@ async function createNamedConversation(profile: LaunchedProfile, title: string):
   }
   const id = await command<string>(profile.app, 'selectedConversation')
   await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
-  await expect(profile.page.getByRole('status', { name: '同步完成' }).last()).toBeVisible()
+  await expect(profile.page.getByRole('button', { name: '新会话', exact: true })).toBeVisible()
+  await expect(profile.page.getByRole('status', { name: '同步完成' })).toHaveCount(0)
   await profile.page.getByRole('button', { name: '重命名新会话' }).click()
   const dialog = profile.page.getByRole('dialog', { name: '重命名会话' })
   await dialog.getByRole('textbox').fill(title)
   await dialog.getByRole('button', { name: '保存' }).click()
   await expect(profile.page.getByText(title, { exact: true })).toBeVisible()
   await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
-  await expect(profile.page.getByRole('status', { name: '同步完成' }).last()).toBeVisible()
+  await expect(profile.page.getByRole('button', { name: title, exact: true })).toBeVisible()
+  await expect(profile.page.getByRole('status', { name: '同步完成' })).toHaveCount(0)
   return id
 }
 
@@ -182,13 +184,13 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     const profile = await launchProfile(fixture)
     profiles.push(profile)
 
-    await expect(profile.page.getByRole('button', { name: /^分页会话 \d{2} 同步完成$/u })).toHaveCount(50)
+    await expect(profile.page.getByRole('button', { name: /^分页会话 \d{2}$/u })).toHaveCount(50)
     await profile.page.getByRole('button', { name: '加载更多会话' }).click()
-    await expect(profile.page.getByRole('button', { name: /^分页会话 \d{2} 同步完成$/u })).toHaveCount(55)
+    await expect(profile.page.getByRole('button', { name: /^分页会话 \d{2}$/u })).toHaveCount(55)
     await expect(profile.page.getByRole('button', { name: '加载更多会话' })).toHaveCount(0)
   })
 
-  test('replays an offline outbox and changes the visible sync state to complete', async () => {
+  test('replays an offline outbox and removes the visible sync indicator after completion', async () => {
     const profile = await launchProfile(fixture)
     profiles.push(profile)
     await grantCloudSync(fixture, profile)
@@ -203,7 +205,8 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     await expect.poll(() => fixture.snapshot('alice')).toMatchObject({
       conversations: [expect.objectContaining({ title: '新会话', deleted: false })],
     })
-    await expect(row.getByRole('status', { name: '同步完成' })).toBeVisible()
+    await expect(profile.page.getByRole('button', { name: '新会话', exact: true })).toBeVisible()
+    await expect(profile.page.getByRole('status', { name: '同步完成' })).toHaveCount(0)
   })
 
   test('retries an ambiguous push as a duplicate without duplicating the conversation', async () => {
@@ -220,7 +223,8 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     })
     await expect.poll(async () => (await fixture.snapshot('alice')).duplicateMutationCount)
       .toBeGreaterThan(0)
-    await expect(profile.page.getByRole('status', { name: '同步完成' }).last()).toBeVisible()
+    await expect(profile.page.getByRole('button', { name: '新会话', exact: true })).toBeVisible()
+    await expect(profile.page.getByRole('status', { name: '同步完成' })).toHaveCount(0)
     expect((await fixture.snapshot('alice')).conversations).toHaveLength(1)
   })
 

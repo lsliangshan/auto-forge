@@ -35,6 +35,16 @@ const userDataErrorCodeSchema = z.enum([
 ])
 export type UserDataErrorCode = z.infer<typeof userDataErrorCodeSchema>
 
+export interface UserDataCallDiagnostic {
+  action: string | undefined
+  stage: 'local_validation_failed' | 'function_invocation_failed' | 'remote_error' | 'response_validation_failed'
+  code: UserDataErrorCode
+  bytes?: number
+  conversationCount?: number
+  messageCount?: number
+  remoteStage?: string
+}
+
 const syncPushCallSchema = z.object({
   action: z.literal('syncPush'),
   protocolVersion: protocolVersionSchema,
@@ -165,7 +175,10 @@ export type UserDataFunctionResponse =
 const functionResponseSchema = z.object({ result: z.unknown() }).passthrough()
 const errorEnvelopeSchema = z.object({
   ok: z.literal(false),
-  error: z.object({ code: userDataErrorCodeSchema }).strict(),
+  error: z.object({
+    code: userDataErrorCodeSchema,
+    stage: z.string().regex(/^(?:shape(?:_[a-z_]{1,80})?|identifier|batch|conversation|message|consent|unowned|rpc)$/).optional(),
+  }).strict(),
 }).strict()
 
 function invocationError(error: unknown): AppError {
@@ -208,9 +221,19 @@ export class CloudBaseUserDataPort {
   constructor(
     private readonly functions: CloudBaseFunctionPort,
     private readonly functionName = 'autoforge-user-data',
+    private readonly onDiagnostic?: (diagnostic: UserDataCallDiagnostic) => void,
   ) {}
 
   async call(input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> {
+    try {
+      return await this.callValidated(input)
+    } catch (error) {
+      this.diagnose(input, 'local_validation_failed', toSafeAppError(error).code)
+      throw error
+    }
+  }
+
+  private async callValidated(input: CloudBaseUserDataCall): Promise<UserDataFunctionResponse> {
     if (!userDataCallFitsWireLimit(input)) {
       throw toSafeAppError({ code: 'INVALID_INPUT' })
     }
@@ -264,13 +287,22 @@ export class CloudBaseUserDataPort {
         data: parsedInput.data,
       })
     } catch (error) {
-      throw invocationError(error)
+      const safeError = invocationError(error)
+      this.diagnose(input, 'function_invocation_failed', safeError.code)
+      throw safeError
     }
 
     const response = functionResponseSchema.safeParse(raw)
-    if (!response.success) throw malformedResponse()
+    if (!response.success) {
+      const error = malformedResponse()
+      this.diagnose(input, 'response_validation_failed', error.code)
+      throw error
+    }
     const failed = errorEnvelopeSchema.safeParse(response.data.result)
-    if (failed.success) return failed.data
+    if (failed.success) {
+      this.diagnose(input, 'remote_error', failed.data.error.code, failed.data.error.stage)
+      return failed.data
+    }
 
     const dataSchema = parsedInput.data.action === 'syncPush'
       ? syncPushDataSchema
@@ -283,7 +315,40 @@ export class CloudBaseUserDataPort {
             : remoteUsageDataSchema
     const succeeded = z.object({ ok: z.literal(true), data: dataSchema }).strict()
       .safeParse(response.data.result)
-    if (!succeeded.success) throw malformedResponse()
+    if (!succeeded.success) {
+      const error = malformedResponse()
+      this.diagnose(input, 'response_validation_failed', error.code)
+      throw error
+    }
     return succeeded.data as UserDataFunctionResponse
+  }
+
+  private diagnose(
+    input: unknown,
+    stage: UserDataCallDiagnostic['stage'],
+    code: UserDataErrorCode,
+    remoteStage?: UserDataCallDiagnostic['remoteStage'],
+  ): void {
+    if (!isRecord(input)) {
+      this.onDiagnostic?.({ action: undefined, stage, code })
+      return
+    }
+    const action = typeof input.action === 'string' ? input.action : undefined
+    if (action !== 'importLegacyBatch') return
+    let bytes: number | undefined
+    try {
+      bytes = serializedUserDataCallBytes(input)
+    } catch {
+      // The stage and code still identify this failure without serializing user content.
+    }
+    this.onDiagnostic?.({
+      action,
+      stage,
+      code,
+      ...(bytes === undefined ? {} : { bytes }),
+      ...(Array.isArray(input.conversations) ? { conversationCount: input.conversations.length } : {}),
+      ...(Array.isArray(input.messages) ? { messageCount: input.messages.length } : {}),
+      ...(remoteStage === undefined ? {} : { remoteStage }),
+    })
   }
 }

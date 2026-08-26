@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { appendFile, copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   accountDataPreferencesDefaults,
@@ -149,6 +149,32 @@ type ApplicationFailureSource =
   | 'database-close'
 
 const CLOUD_SYNC_DOCUMENT_VERSION = 'cloud-sync-2026-08'
+const LEGACY_IMPORT_DIAGNOSTIC_LOG = 'legacy-import.jsonl'
+
+type LegacyImportDiagnostic = {
+  stage: string
+  code?: string
+  includeUnowned?: boolean
+  confirmationValid?: boolean
+  storedConsentMatches?: boolean
+  syncState?: string
+  syncErrorCode?: string
+  action?: string
+  bytes?: number
+  conversationCount?: number
+  messageCount?: number
+}
+
+function createLegacyImportDiagnosticLog(directory: string): (diagnostic: LegacyImportDiagnostic) => void {
+  let tail = Promise.resolve()
+  return (diagnostic) => {
+    tail = tail.then(async () => {
+      const line = `${JSON.stringify({ occurredAt: new Date().toISOString(), ...diagnostic })}\n`
+      await mkdir(directory, { recursive: true })
+      await appendFile(join(directory, LEGACY_IMPORT_DIAGNOSTIC_LOG), line, 'utf8')
+    }).catch(() => undefined)
+  }
+}
 
 interface ApplicationFailureRecord {
   error: unknown
@@ -698,11 +724,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     roleService,
   )
+  const logLegacyImportDiagnostic = createLegacyImportDiagnosticLog(options.paths.logs)
   const userDataStores = options.userDataStores
     ?? new UserDataStoreManager(join(options.paths.data, 'user-caches'))
   const userDataSyncPort = options.userDataSyncPort
     ?? (cloudBasePorts
-      ? new CloudBaseUserDataPort(cloudBasePorts.functions)
+      ? new CloudBaseUserDataPort(cloudBasePorts.functions, undefined, logLegacyImportDiagnostic)
       : { call: async () => { throw failure('SERVICE_UNAVAILABLE') } })
   let notifyConversationChanges: (conversationIds: readonly string[]) => void = () => undefined
   let notifySyncWarning: (
@@ -2261,9 +2288,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const confirmation = legacyImportRequestSchema.safeParse(input)
         const store = currentUserData()
         const storedCloudConsent = store.account.getConsent('cloud_sync')
+        const storedConsentMatches = confirmation.success
+          && JSON.stringify(storedCloudConsent) === JSON.stringify(confirmation.data.cloudSyncConsent)
+        logLegacyImportDiagnostic({
+          stage: 'handler_received',
+          confirmationValid: confirmation.success,
+          ...(confirmation.success ? { includeUnowned: confirmation.data.includeUnowned } : {}),
+          storedConsentMatches,
+        })
         if (!confirmation.success
           || confirmation.data.cloudSyncConsent.documentVersion !== CLOUD_SYNC_DOCUMENT_VERSION
-          || JSON.stringify(storedCloudConsent) !== JSON.stringify(confirmation.data.cloudSyncConsent)) {
+          || !storedConsentMatches) {
+          logLegacyImportDiagnostic({ stage: 'handler_confirmation_rejected' })
           throw failure('IMPORT_CONFIRMATION_REQUIRED')
         }
         if (confirmation.data.includeUnowned) {
@@ -2278,6 +2314,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             await userDataSync.flush()
           }
         }
+        const syncStatusBeforeImport = userDataSync.status()
         const selectionFingerprint = legacyUserDataImporter.selectionFingerprint(
           session.user.id,
           confirmation.data.includeUnowned,
@@ -2291,15 +2328,40 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           } : {}),
           candidateBatchId: `legacy-${randomUUID()}`,
         })
-        const results = await legacyUserDataImporter.import(session.user.id, {
-          ...confirmation.data,
-          batchId,
-        })
+        let results
+        try {
+          results = await legacyUserDataImporter.import(session.user.id, {
+            ...confirmation.data,
+            batchId,
+          })
+        } catch (error) {
+          logLegacyImportDiagnostic({
+            stage: 'importer_failed',
+            code: toSafeAppError(error).code,
+            syncState: userDataSync.status().state,
+            ...('errorCode' in userDataSync.status() && userDataSync.status().errorCode
+              ? { syncErrorCode: userDataSync.status().errorCode }
+              : {}),
+          })
+          throw error
+        }
         await userDataSync.pull()
         const pullStatus = userDataSync.status()
-        if (pullStatus.state !== 'idle') {
+        // A prior background-sync quarantine must not turn a successful import into a false failure.
+        const pullWasAlreadyQuarantined = syncStatusBeforeImport.state === 'quarantined'
+          && pullStatus.state === 'quarantined'
+          && syncStatusBeforeImport.errorCode === pullStatus.errorCode
+        if (pullStatus.state !== 'idle' && !pullWasAlreadyQuarantined) {
+          logLegacyImportDiagnostic({
+            stage: 'post_import_pull_failed',
+            syncState: pullStatus.state,
+            ...('errorCode' in pullStatus && pullStatus.errorCode
+              ? { syncErrorCode: pullStatus.errorCode }
+              : {}),
+          })
           throw failure('errorCode' in pullStatus ? pullStatus.errorCode ?? 'INTERNAL_ERROR' : 'INTERNAL_ERROR')
         }
+        logLegacyImportDiagnostic({ stage: 'handler_succeeded' })
         return results
       },
       getAccountDataPreferences: async (): Promise<AccountDataPreferences> => {

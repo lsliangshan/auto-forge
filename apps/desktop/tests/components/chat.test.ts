@@ -2450,6 +2450,25 @@ describe('chat interactions', () => {
     expect(api.chat.listConversations).not.toHaveBeenCalled()
   })
 
+  it('tracks a targeted sync retry while in flight and deduplicates repeated requests', async () => {
+    const { api } = createEventApi()
+    const retry = deferred<void>()
+    vi.mocked(api.chat.retrySync).mockReturnValue(retry.promise)
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+
+    const first = store.retrySync('conv_1')
+    const second = store.retrySync('conv_1')
+    await Promise.resolve()
+
+    expect(api.chat.retrySync).toHaveBeenCalledOnce()
+    expect(store.retryingSyncByConversation).toEqual({ conv_1: true })
+
+    retry.resolve()
+    await Promise.all([first, second])
+    expect(store.retryingSyncByConversation).toEqual({})
+  })
+
   it('rehydrates selected generation preferences after a converged metadata event', async () => {
     const { api, emitChat } = createEventApi()
     const stalePreferences = deferred<ConversationGenerationPreferences>()

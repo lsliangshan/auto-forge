@@ -142,7 +142,7 @@
         :usage="settings.tokenUsage"
         :remote-usage="settings.remoteUsage"
         :loading="settings.tokenUsageLoading"
-        :error="settings.tokenUsageError"
+        :error="settings.tokenUsageError || settings.remoteUsageError"
         @refresh="refreshUsage"
       />
 
@@ -259,59 +259,78 @@
 
       <section
         id="data"
-        class="settings-section danger-zone"
+        class="settings-section data-section"
       >
-        <header><div><h2>本地数据</h2><p>清理操作不可撤销，不会删除工作流开发项目。</p></div></header>
-        <div class="settings-grid cloud-data-controls">
-          <label>账户时区<el-input
-            data-testid="account-timezone"
-            :model-value="settings.accountDataPreferences?.timezone"
-            @change="saveTimezone"
-          /></label>
-          <label>消费显示币种<el-select
-            data-testid="account-display-currency"
-            :model-value="settings.accountDataPreferences?.displayCurrency"
-            @change="saveDisplayCurrency"
-          ><el-option
-            label="人民币 (CNY)"
-            value="CNY"
-          /><el-option
-            label="美元 (USD)"
-            value="USD"
-          /></el-select></label>
-        </div>
-        <div class="legacy-import-control">
-          <div>
-            <strong>迁移本机历史会话</strong>
-            <small>当前账户 {{ settings.legacyImportPreview?.ownedCount ?? 0 }} 条；未归属 {{ settings.legacyImportPreview?.unownedCount ?? 0 }} 条。其他账户的会话不会显示或上传。</small>
+        <header><div><h2>本地数据</h2><p>管理账户偏好、历史会话迁移与本机存储。</p></div></header>
+        <div class="cloud-data-panel">
+          <div class="settings-grid cloud-data-controls">
+            <div class="account-preference">
+              <span class="preference-label">账户时区</span>
+              <div
+                class="fixed-preference"
+                data-testid="account-timezone"
+              >
+                <el-icon><Clock /></el-icon>
+                <div><strong>中国上海</strong><small>Asia/Shanghai · UTC+08:00</small></div>
+              </div>
+            </div>
+            <label>消费显示币种<el-select
+              data-testid="account-display-currency"
+              :model-value="settings.accountDataPreferences?.displayCurrency"
+              placeholder="选择显示币种"
+              @change="saveDisplayCurrency"
+            ><el-option
+              label="人民币 (CNY)"
+              value="CNY"
+            /><el-option
+              label="美元 (USD)"
+              value="USD"
+            /></el-select></label>
           </div>
-          <el-button
-            data-testid="legacy-import-button"
-            @click="confirmLegacyImport"
+          <div class="legacy-import-control">
+            <div>
+              <strong>迁移本机历史会话</strong>
+              <small v-if="settings.legacyImportPreview">当前账户 {{ settings.legacyImportPreview.ownedCount }} 条；未归属 {{ settings.legacyImportPreview.unownedCount }} 条。其他账户的会话不会显示或上传。</small>
+              <small v-else>正在读取可迁移的本机会话…</small>
+            </div>
+            <el-button
+              type="primary"
+              plain
+              data-testid="legacy-import-button"
+              :loading="legacyImporting"
+              :disabled="!canImportLegacyData"
+              @click="confirmLegacyImport"
+            >
+              {{ hasLegacyData ? '确认并迁移' : '暂无可迁移会话' }}
+            </el-button>
+          </div>
+          <p
+            v-if="settings.cloudDataError"
+            class="field-message cloud-data-error"
+            role="alert"
           >
-            确认并迁移
-          </el-button>
+            {{ settings.cloudDataError }}
+          </p>
         </div>
-        <p
-          v-if="settings.cloudDataError"
-          class="field-message"
-          role="alert"
-        >
-          {{ settings.cloudDataError }}
-        </p>
-        <dl><dt>数据目录</dt><dd>{{ settings.settings?.dataDirectory }}</dd><dt>日志目录</dt><dd>{{ settings.settings?.logDirectory }}</dd></dl>
-        <div class="danger-actions">
-          <el-button @click="confirmClear('conversations')">
-            清除会话
-          </el-button><el-button @click="confirmClear('executions')">
-            清除执行记录
-          </el-button><el-button
-            type="danger"
-            plain
-            @click="confirmClear('all')"
-          >
-            清除会话与执行记录
-          </el-button>
+        <div class="local-storage-block">
+          <div class="local-storage-heading">
+            <strong>本机存储</strong>
+            <small>清理操作不可撤销，不会删除工作流开发项目。</small>
+          </div>
+          <dl><dt>数据目录</dt><dd>{{ settings.settings?.dataDirectory }}</dd><dt>日志目录</dt><dd>{{ settings.settings?.logDirectory }}</dd></dl>
+          <div class="danger-actions">
+            <el-button @click="confirmClear('conversations')">
+              清除会话
+            </el-button><el-button @click="confirmClear('executions')">
+              清除执行记录
+            </el-button><el-button
+              type="danger"
+              plain
+              @click="confirmClear('all')"
+            >
+              清除会话与执行记录
+            </el-button>
+          </div>
         </div>
         <div class="browser-data-action">
           <div><strong>浏览器站点数据</strong><small>仅清除 AutoForge 浏览器中的 Cookie、缓存和站点数据，不会删除会话与执行记录。</small></div>
@@ -481,7 +500,7 @@
 </template>
 
 <script setup lang="ts">
-import { Refresh } from '@element-plus/icons-vue'
+import { Clock, Refresh } from '@element-plus/icons-vue'
 import {
   normalizeProxySettings,
   parseProxyBypassText,
@@ -493,10 +512,12 @@ import {
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import BillingUsagePanel from '../components/settings/BillingUsagePanel.vue'
+import { displayError } from '../services/desktop-api'
 import { useSettingsStore } from '../stores/settings'
 
 const settings = useSettingsStore()
 const apiKey = ref('')
+const legacyImporting = ref(false)
 const selectedProvider = ref<ModelProviderId>('deepseek')
 type ProxyDraft = {
   enabled: ProxySettings['enabled']
@@ -558,6 +579,11 @@ const credentialLabel = computed(() => {
 const credentialTone = computed(() => settings.credential?.validation === 'valid'
   ? 'success'
   : settings.credential?.configured ? 'warning' : '')
+const hasLegacyData = computed(() => Boolean(settings.legacyImportPreview
+  && settings.legacyImportPreview.ownedCount + settings.legacyImportPreview.unownedCount > 0))
+const canImportLegacyData = computed(() => Boolean(
+  hasLegacyData.value && settings.appInfo?.version && !legacyImporting.value,
+))
 watch(() => settings.activeProvider, (value) => { selectedProvider.value = value }, { immediate: true })
 function applyProxyDraft(proxy: ProxySettings) {
   proxyDraft.enabled = proxy.enabled
@@ -583,24 +609,19 @@ onMounted(async () => {
 async function refreshUsage() {
   await Promise.all([settings.loadTokenUsage(), settings.loadCloudData()])
 }
-function saveTimezone(value: unknown) {
-  if (typeof value !== 'string' || !settings.accountDataPreferences) return
-  void settings.updateAccountDataPreferences({
-    ...settings.accountDataPreferences,
-    timezone: value,
-  })
-}
 function saveDisplayCurrency(value: unknown) {
-  if ((value !== 'CNY' && value !== 'USD') || !settings.accountDataPreferences) return
+  if (value !== 'CNY' && value !== 'USD') return
   void settings.updateAccountDataPreferences({
-    ...settings.accountDataPreferences,
+    timezone: 'Asia/Shanghai',
     displayCurrency: value,
   })
 }
 async function confirmLegacyImport() {
   const preview = settings.legacyImportPreview
   const clientVersion = settings.appInfo?.version
-  if (!preview || !clientVersion) return
+  if (!preview || !clientVersion || !hasLegacyData.value) return
+  legacyImporting.value = true
+  settings.cloudDataError = ''
   try {
     await ElMessageBox.confirm(
       '开启云同步后，新会话和确认迁移的历史会话会保存到当前 AutoForge 账户。',
@@ -637,7 +658,11 @@ async function confirmLegacyImport() {
     ElMessage.success('历史会话迁移完成')
     await settings.loadCloudData()
   } catch (error) {
-    if (error !== 'cancel' && error !== 'close') settings.cloudDataError = '历史会话迁移失败'
+    if (error !== 'cancel' && error !== 'close') {
+      settings.cloudDataError = `历史会话迁移失败：${displayError(error)}`
+    }
+  } finally {
+    legacyImporting.value = false
   }
 }
 async function changeProvider(provider: ModelProviderId) {
@@ -798,6 +823,7 @@ const scopeValues = (scope: PermissionGrant['scope']): string[] => {
 .settings-form { display: grid; gap: 8px; padding-top: 14px; }.settings-form > label, .settings-grid > label, .model-field > label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }.settings-form small, .field-message { margin: 0; color: var(--af-text-muted); font-size: 11px; }.settings-form > .el-button { justify-self: start; }.model-field { display: grid; gap: 8px; }
 .proxy-validation-error { color: var(--af-danger); }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding-top: 15px; }.settings-grid label:not(.switch-row) { display: grid; gap: 7px; }.switch-row { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--af-border); padding: 8px 0; }.model-id { float: right; margin-left: 18px; color: var(--af-text-muted); }
-.danger-zone { border-color: var(--af-danger-border); }.danger-zone dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.danger-zone dt { color: var(--af-text-muted); }.danger-zone dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }.browser-data-action { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; border-top: 1px solid var(--af-danger-border); padding-top: 15px; }.browser-data-action > div { display: grid; gap: 4px; }.browser-data-action small { color: var(--af-text-muted); font-size: 11px; line-height: 1.5; }
+.cloud-data-panel { margin-top: 15px; border: 1px solid var(--af-border); background: var(--af-surface-muted); }.cloud-data-controls { padding: 14px; }.account-preference { display: grid; gap: 7px; }.preference-label { color: var(--af-text-muted); font-size: 11px; font-weight: 700; }.fixed-preference { display: flex; min-height: 30px; align-items: center; gap: 10px; border: 1px solid var(--af-border); border-radius: 4px; padding: 0 11px; color: var(--af-graphite); background: var(--af-surface); }.fixed-preference .el-icon { color: var(--el-color-primary); }.fixed-preference > div { display: flex; min-width: 0; align-items: baseline; gap: 8px; }.fixed-preference strong { font-size: 12px; }.fixed-preference small { color: var(--af-text-muted); font-size: 10px; }.legacy-import-control { display: flex; align-items: center; justify-content: space-between; gap: 18px; border-top: 1px solid var(--af-border); padding: 13px 14px; background: var(--af-surface); }.legacy-import-control > div, .local-storage-heading { display: grid; gap: 4px; }.legacy-import-control small, .local-storage-heading small { color: var(--af-text-muted); font-size: 11px; line-height: 1.5; }.cloud-data-error { margin: 0; border-top: 1px solid var(--af-danger-border); padding: 9px 14px; color: var(--af-danger); background: var(--af-surface); }.local-storage-block { margin-top: 18px; border-top: 1px solid var(--af-border); padding-top: 15px; }.data-section dl { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 7px 12px; font-size: 12px; }.data-section dt { color: var(--af-text-muted); }.data-section dd { margin: 0; overflow-wrap: anywhere; }.danger-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; }.browser-data-action { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; border-top: 1px solid var(--af-danger-border); padding-top: 15px; }.browser-data-action > div { display: grid; gap: 4px; }.browser-data-action small { color: var(--af-text-muted); font-size: 11px; line-height: 1.5; }
+@media (max-width: 720px) { .cloud-data-controls { grid-template-columns: 1fr; }.fixed-preference > div { align-items: flex-start; flex-direction: column; gap: 2px; }.legacy-import-control, .browser-data-action { align-items: stretch; flex-direction: column; }.legacy-import-control .el-button, .browser-data-action .el-button { align-self: flex-start; } }
 .grant-list { margin-top: 12px; }.grant-view-tabs :deep(.el-tabs__header) { margin-bottom: 10px; }.grant-filter-bar { display: flex; align-items: end; justify-content: space-between; gap: 16px; border: 1px solid var(--af-border); border-bottom: 0; padding: 10px 12px; background: var(--af-surface-muted); }.grant-filter-bar label { display: grid; width: min(360px, 65%); gap: 5px; color: var(--af-text-muted); font-size: 10px; font-weight: 700; }.grant-result-count { flex: none; padding-bottom: 7px; color: var(--af-text-muted); font-size: 10px; }.grant-table-wrap { overflow-x: auto; border: 1px solid var(--af-border); }.grant-table { width: 100%; min-width: 680px; border-collapse: collapse; table-layout: fixed; background: var(--af-surface); }.grant-table th { padding: 8px 10px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 10px; font-weight: 700; text-align: left; }.grant-table th:last-child { width: 58px; text-align: right; }.grant-table td { border-top: 1px solid var(--af-border); padding: 10px; vertical-align: middle; }.grant-workflow-cell, .grant-capability-cell { width: 23%; }.grant-scope-cell { width: auto; }.grant-action-cell { width: 58px; text-align: right; }.grant-workflow-value, .grant-capability-value { display: grid; gap: 3px; }.grant-workflow-value strong, .grant-capability-value strong { overflow-wrap: anywhere; color: var(--af-graphite); font-size: 11px; }.grant-workflow-value span, .grant-capability-value code { color: var(--af-text-muted); font-family: ui-monospace, monospace; font-size: 10px; }.grant-scope-values { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }.grant-scope-values code { max-width: 100%; overflow-wrap: anywhere; border: 1px solid var(--af-border); border-radius: 4px; padding: 3px 6px; color: var(--af-text); background: var(--af-surface-muted); font-size: 10px; }.app-info { display: grid; grid-template-columns: 60px 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 12px; }.app-info dt { color: var(--af-text-muted); }.app-info dd { margin: 0; }
 </style>

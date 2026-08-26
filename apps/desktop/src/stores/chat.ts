@@ -272,6 +272,9 @@ export const useChatStore = defineStore('chat', {
     conversations: [] as ConversationSummary[],
     nextConversationCursor: undefined as string | undefined,
     syncWarningSince: undefined as string | undefined,
+    retryingSyncByConversation: {} as Record<string, true>,
+    retryingAllSync: false,
+    syncRetryError: '' as string,
     selectedConversationId: '' as string,
     messagesByConversation: {} as Record<string, UiChatMessage[]>,
     previousMessageCursorByConversation: {} as Record<string, string | undefined>,
@@ -333,6 +336,9 @@ export const useChatStore = defineStore('chat', {
       this.conversations = []
       this.nextConversationCursor = undefined
       this.syncWarningSince = undefined
+      this.retryingSyncByConversation = {}
+      this.retryingAllSync = false
+      this.syncRetryError = ''
       this.selectedConversationId = ''
       this.messagesByConversation = {}
       this.previousMessageCursorByConversation = {}
@@ -634,11 +640,29 @@ export const useChatStore = defineStore('chat', {
       }
     },
     async retrySync(conversationId?: string) {
+      if (conversationId === undefined) {
+        if (this.retryingAllSync) return
+        this.retryingAllSync = true
+      } else {
+        if (this.retryingSyncByConversation[conversationId]) return
+        this.retryingSyncByConversation[conversationId] = true
+      }
+      this.syncRetryError = ''
       try {
         await getDesktopApi().chat.retrySync(conversationId)
         await this.loadConversations(false, true)
+        const retryStillFailed = conversationId === undefined
+          ? this.conversations.some(({ syncState }) => syncState === 'failed')
+          : this.conversations.find(({ id }) => id === conversationId)?.syncState === 'failed'
+        if (retryStillFailed) this.syncRetryError = '同步重试未成功，请稍后重试'
       } catch (error) {
-        this.error = displayError(error, '同步重试失败')
+        this.syncRetryError = displayError(error, '同步重试失败')
+      } finally {
+        if (conversationId === undefined) {
+          this.retryingAllSync = false
+        } else {
+          delete this.retryingSyncByConversation[conversationId]
+        }
       }
     },
     async loadGenerationPreferences(conversationId: string) {

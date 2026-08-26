@@ -100,6 +100,41 @@ function mockRpcResponse(
 }
 
 describe('CloudBase user data function', () => {
+  it.each([
+    { label: 'data object', envelope: (payload: unknown) => ({ data: payload }) },
+    { label: 'body JSON', envelope: (payload: unknown) => ({ body: JSON.stringify(payload) }) },
+    { label: 'request_data JSON', envelope: (payload: unknown) => ({ request_data: JSON.stringify(payload) }) },
+    { label: 'direct data with TCB context', envelope: (payload: object) => ({ ...payload, tcbContext: 'platform metadata' }) },
+  ])('unwraps the CloudBase $label envelope before strict action validation', async ({ envelope }) => {
+    const rpc = vi.fn().mockResolvedValue({
+      batchId: 'batch_1', status: 'applied', importedConversations: 0, importedMessages: 0,
+    })
+    const handler = createUserDataHandler({ rpc })
+
+    await expect(handler(envelope({
+      action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'dev_1', batchId: 'batch_1',
+      includeUnowned: false, conversations: [], messages: [], cloudSyncConsent: consent,
+    }), authenticatedContext)).resolves.toEqual({
+      ok: true,
+      data: { batchId: 'batch_1', status: 'applied', importedConversations: 0, importedMessages: 0 },
+    })
+    expect(rpc).toHaveBeenCalledWith('autoforge_import_legacy_batch', expect.objectContaining({
+      p_batch_id: 'batch_1',
+    }))
+  })
+
+  it('labels legacy-import validation failures without returning user content', async () => {
+    const handler = createUserDataHandler({ rpc: vi.fn() })
+
+    await expect(handler({
+      action: 'importLegacyBatch', protocolVersion: 1, deviceId: 'dev_1', batchId: 'batch_1',
+      includeUnowned: false, conversations: [{ id: 'conv_1' }], messages: [], cloudSyncConsent: consent,
+    }, authenticatedContext)).resolves.toEqual({
+      ok: false, error: { code: 'INVALID_INPUT', stage: 'conversation' },
+    })
+  })
+
+
   it('uses a CommonJS entry compatible with the CloudBase index.main loader', async () => {
     const packageJson = JSON.parse(await readFile(
       new URL('../../cloudbase/user-data/function/package.json', import.meta.url),
@@ -409,7 +444,7 @@ describe('CloudBase user data function', () => {
     ]
 
     for (const event of validEvents) {
-      await expect(handler({ ...event, unexpected: true }, authenticatedContext)).resolves.toEqual({
+      await expect(handler({ ...event, unexpected: true }, authenticatedContext)).resolves.toMatchObject({
         ok: false, error: { code: 'INVALID_INPUT' },
       })
     }
@@ -514,7 +549,9 @@ describe('CloudBase user data function', () => {
     await expect(malformedHandler({
       action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1',
       mutations: [approvalMutation('https://foo..bar/*')],
-    }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    }, authenticatedContext)).resolves.toEqual({
+      ok: false, error: { code: 'INVALID_INPUT' },
+    })
     expect(malformedRpc).not.toHaveBeenCalled()
 
     const uppercaseRpc = vi.fn().mockResolvedValue({
@@ -617,7 +654,9 @@ describe('CloudBase user data function', () => {
         id: `message_${index}`, conversationId: 'conv_1', role: 'user', blocks: [], createdAt: occurredAt,
       })),
       cloudSyncConsent: consent,
-    }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    }, authenticatedContext)).resolves.toEqual({
+      ok: false, error: { code: 'INVALID_INPUT', stage: 'batch' },
+    })
     await expect(handler({
       action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1',
       mutations: [{
