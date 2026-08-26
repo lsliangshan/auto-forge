@@ -6987,7 +6987,7 @@ describe('Agent knowledge grounding', () => {
         knowledgeBaseId: `bounded_kb_${number}`,
         documentId: `bounded_document_${number}`,
         versionId: `bounded_version_${number}`,
-        snippet: `${sentence}${'资'.repeat(4_000 - sentence.length)}`,
+        snippet: `${sentence}😀${'资'.repeat(4_000 - sentence.length - 2)}`,
         citation: {
           ...groundedEvidence.citation,
           documentId: `bounded_document_${number}`,
@@ -7056,6 +7056,9 @@ describe('Agent knowledge grounding', () => {
     expect(firstExchange.content).toContain('bounded_evidence_1')
     expect(firstExchange.content).toContain('bounded_evidence_4')
     expect(firstExchange.content).not.toContain('bounded_evidence_5')
+    expect(firstExchange.content).toContain('"snippetTruncated":true')
+    expect(firstExchange.content).toContain('😀')
+    expect(firstExchange.content).not.toContain('�')
     expect(secondExchange.content).toContain('bounded_evidence_5')
     expect(secondExchange.content).toContain('bounded_evidence_8')
     expect(secondExchange.content).not.toContain('bounded_evidence_1')
@@ -7084,6 +7087,128 @@ describe('Agent knowledge grounding', () => {
 
     expect(result).toMatchObject({ status: 'failed', error: { code: 'CONTEXT_LIMIT_EXCEEDED' } })
     expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a cited claim when the provider received an empty snippet for that evidence id', async () => {
+    const claim = '隐藏的完整句子不得用于支持。'
+    const dependencies = harness([
+      knowledgeSearchTurn('empty_visible_search', '查资料'),
+      groundedAnswerTurn('empty_visible_answer_1', [{
+        text: claim, support: 'knowledge', citationIds: ['empty_visible_evidence'],
+      }]),
+      groundedAnswerTurn('empty_visible_answer_2', [{
+        text: claim, support: 'knowledge', citationIds: ['empty_visible_evidence'],
+      }]),
+    ])
+    dependencies.workflows.list = async () => []
+    dependencies.history.prepare.mockImplementation(async input => historyLeavingRequestBudget(input, 233))
+    const providerStream = vi.mocked(dependencies.providerInstances.openrouter.stream)
+    const observedRequests: ModelStreamRequest[] = []
+    dependencies.providerInstances.openrouter.stream = vi.fn((request: ModelStreamRequest) => {
+      observedRequests.push({ ...request, messages: structuredClone(request.messages) })
+      return providerStream(request)
+    })
+    const knowledge = attachKnowledge(dependencies, {
+      results: [{
+        ...groundedEvidence,
+        evidenceId: 'empty_visible_evidence',
+        snippet: claim.repeat(200),
+      }],
+    })
+
+    const result = await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'empty_visible_support', content: claim,
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot, { contextLength: 20_000 }))
+
+    const evidenceMessage = observedRequests[1]!.messages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'empty_visible_search'
+    )) as Extract<ModelMessage, { role: 'tool' }>
+    expect(evidenceMessage.content).toContain('"snippet":""')
+    expect(evidenceMessage.content).toContain('"snippetTruncated":true')
+    expect(result).toMatchObject({ status: 'failed', error: { code: 'CONTEXT_LIMIT_EXCEEDED' } })
+    expect(JSON.stringify(finalBlocks(dependencies))).not.toContain(claim)
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects support that exists only beyond the exact prefix sent to the provider', async () => {
+    const claim = '后缀中的完整句子不得用于支持。'
+    const evidence = {
+      ...groundedEvidence,
+      evidenceId: 'hidden_suffix_evidence',
+      snippet: `${'前'.repeat(2_000)}。${claim}`,
+    }
+    const dependencies = harness([
+      knowledgeSearchTurn('hidden_suffix_search', '查后缀'),
+      groundedAnswerTurn('hidden_suffix_answer_1', [{
+        text: claim, support: 'knowledge', citationIds: [evidence.evidenceId],
+      }]),
+      groundedAnswerTurn('hidden_suffix_answer_2', [{
+        text: claim, support: 'knowledge', citationIds: [evidence.evidenceId],
+      }]),
+    ])
+    dependencies.workflows.list = async () => []
+    dependencies.history.prepare.mockImplementation(async input => historyLeavingRequestBudget(input, 650))
+    const providerStream = vi.mocked(dependencies.providerInstances.openrouter.stream)
+    const observedRequests: ModelStreamRequest[] = []
+    dependencies.providerInstances.openrouter.stream = vi.fn((request: ModelStreamRequest) => {
+      observedRequests.push({ ...request, messages: structuredClone(request.messages) })
+      return providerStream(request)
+    })
+    const knowledge = attachKnowledge(dependencies, { results: [evidence] })
+
+    const result = await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'hidden_suffix_support', content: claim,
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot, { contextLength: 20_000 }))
+
+    const evidenceMessage = observedRequests[1]!.messages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'hidden_suffix_search'
+    )) as Extract<ModelMessage, { role: 'tool' }>
+    expect(evidenceMessage.content).toContain('"snippetTruncated":true')
+    expect(evidenceMessage.content).not.toContain(claim)
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(JSON.stringify(finalBlocks(dependencies))).not.toContain(claim)
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledTimes(3)
+  })
+
+  it('accepts an exact supporting sentence that remains visible after prefix trimming', async () => {
+    const claim = '可见的完整句子可以用于支持。'
+    const evidence = {
+      ...groundedEvidence,
+      evidenceId: 'visible_prefix_evidence',
+      snippet: `${claim}${'后'.repeat(2_000)}`,
+    }
+    const dependencies = harness([
+      knowledgeSearchTurn('visible_prefix_search', '查可见句子'),
+      groundedAnswerTurn('visible_prefix_answer', [{
+        text: claim, support: 'knowledge', citationIds: [evidence.evidenceId],
+      }]),
+    ])
+    dependencies.workflows.list = async () => []
+    dependencies.history.prepare.mockImplementation(async input => historyLeavingRequestBudget(input, 650))
+    const providerStream = vi.mocked(dependencies.providerInstances.openrouter.stream)
+    const observedRequests: ModelStreamRequest[] = []
+    dependencies.providerInstances.openrouter.stream = vi.fn((request: ModelStreamRequest) => {
+      observedRequests.push({ ...request, messages: structuredClone(request.messages) })
+      return providerStream(request)
+    })
+    const knowledge = attachKnowledge(dependencies, { results: [evidence] })
+
+    const result = await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'visible_prefix_support', content: '查可见句子',
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot, { contextLength: 20_000 }))
+
+    const evidenceMessage = observedRequests[1]!.messages.find((message) => (
+      message.role === 'tool' && message.tool_call_id === 'visible_prefix_search'
+    )) as Extract<ModelMessage, { role: 'tool' }>
+    expect(evidenceMessage.content).toContain('"snippetTruncated":true')
+    expect(evidenceMessage.content).toContain(claim)
+    expect(result).toMatchObject({ status: 'completed' })
+    expect(finalBlocks(dependencies)).toContainEqual(expect.objectContaining({
+      type: 'knowledge_answer', claims: [expect.objectContaining({ text: claim })],
+    }))
   })
 
   it('delimits prompt-injection text as untrusted evidence without changing tools or policy', async () => {
