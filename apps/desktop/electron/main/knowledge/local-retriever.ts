@@ -7,7 +7,7 @@ import type {
 
 export type LocalKnowledgeSearchOutcome = KnowledgeSearchOutcome
 
-interface ChunkRow {
+export interface KnowledgeChunkRow {
   id: string
   knowledgeBaseId: string
   documentId: string
@@ -21,7 +21,7 @@ function literalMatch(query: string): string {
   return `"${query.replaceAll('"', '""')}"`
 }
 
-function citation(row: ChunkRow): KnowledgeCitationReference {
+export function citationForKnowledgeChunk(row: KnowledgeChunkRow): KnowledgeCitationReference {
   const coordinate = JSON.parse(row.coordinatesJson) as Record<string, unknown>
   const common = { evidenceId: row.id, documentId: row.documentId, versionId: row.versionId }
   switch (coordinate.kind) {
@@ -57,7 +57,7 @@ function citation(row: ChunkRow): KnowledgeCitationReference {
   }
 }
 
-function toResults(rows: ChunkRow[]): KnowledgeSearchResult[] {
+function toResults(rows: KnowledgeChunkRow[]): KnowledgeSearchResult[] {
   return rows.map((row, index) => ({
     evidenceId: row.id,
     knowledgeBaseId: row.knowledgeBaseId,
@@ -65,7 +65,7 @@ function toResults(rows: ChunkRow[]): KnowledgeSearchResult[] {
     versionId: row.versionId,
     snippet: row.body,
     score: 1 / (index + 1),
-    citation: citation(row),
+    citation: citationForKnowledgeChunk(row),
   }))
 }
 
@@ -88,7 +88,7 @@ export class LocalKnowledgeRetriever {
         AND document_versions.status = 'ready'
         AND knowledge_bases.status = 'active'
     `
-    let rows: ChunkRow[]
+    let rows: KnowledgeChunkRow[]
     if (characterCount === 2) {
       rows = this.database.prepare(`
         SELECT kb_chunks.id, kb_chunks.knowledge_base_id AS knowledgeBaseId,
@@ -100,7 +100,7 @@ export class LocalKnowledgeRetriever {
           AND instr(kb_chunks.body, ?) > 0
         ORDER BY documents.updated_at DESC, kb_chunks.ordinal ASC
         LIMIT ?
-      `).all(...knowledgeBaseIds, query, this.resultLimit) as ChunkRow[]
+      `).all(...knowledgeBaseIds, query, this.resultLimit) as KnowledgeChunkRow[]
     } else {
       rows = this.database.prepare(`
         SELECT kb_chunks.id, kb_chunks.knowledge_base_id AS knowledgeBaseId,
@@ -113,7 +113,43 @@ export class LocalKnowledgeRetriever {
           AND kb_chunks_fts MATCH ?
         ORDER BY bm25(kb_chunks_fts), documents.updated_at DESC
         LIMIT ?
-      `).all(...knowledgeBaseIds, literalMatch(query), this.resultLimit) as ChunkRow[]
+      `).all(...knowledgeBaseIds, literalMatch(query), this.resultLimit) as KnowledgeChunkRow[]
+    }
+    return { kind: 'results', results: toResults(rows) }
+  }
+
+  async searchVersions(versionIds: readonly string[], rawQuery: string): Promise<LocalKnowledgeSearchOutcome> {
+    const query = rawQuery.trim()
+    const characterCount = Array.from(query).length
+    if (characterCount <= 1) return { kind: 'ask_for_detail', results: [] }
+    if (versionIds.length === 0) return { kind: 'results', results: [] }
+    const placeholders = versionIds.map(() => '?').join(', ')
+    let rows: KnowledgeChunkRow[]
+    if (characterCount === 2) {
+      rows = this.database.prepare(`
+        SELECT kb_chunks.id, kb_chunks.knowledge_base_id AS knowledgeBaseId,
+          kb_chunks.document_id AS documentId, kb_chunks.version_id AS versionId,
+          kb_chunks.block_id AS blockId, kb_chunks.body,
+          kb_chunks.coordinates_json AS coordinatesJson
+        FROM kb_chunks
+        WHERE kb_chunks.version_id IN (${placeholders})
+          AND instr(kb_chunks.body, ?) > 0
+        ORDER BY kb_chunks.version_id, kb_chunks.ordinal, kb_chunks.id
+        LIMIT ?
+      `).all(...versionIds, query, this.resultLimit) as KnowledgeChunkRow[]
+    } else {
+      rows = this.database.prepare(`
+        SELECT kb_chunks.id, kb_chunks.knowledge_base_id AS knowledgeBaseId,
+          kb_chunks.document_id AS documentId, kb_chunks.version_id AS versionId,
+          kb_chunks.block_id AS blockId, kb_chunks.body,
+          kb_chunks.coordinates_json AS coordinatesJson
+        FROM kb_chunks_fts
+        JOIN kb_chunks ON kb_chunks.rowid = kb_chunks_fts.rowid
+        WHERE kb_chunks.version_id IN (${placeholders})
+          AND kb_chunks_fts MATCH ?
+        ORDER BY bm25(kb_chunks_fts), kb_chunks.version_id, kb_chunks.id
+        LIMIT ?
+      `).all(...versionIds, literalMatch(query), this.resultLimit) as KnowledgeChunkRow[]
     }
     return { kind: 'results', results: toResults(rows) }
   }

@@ -77,6 +77,44 @@ export const knowledgeSearchOutcomeSchema = z.discriminatedUnion('kind', [
 ])
 export type KnowledgeSearchOutcome = z.infer<typeof knowledgeSearchOutcomeSchema>
 
+export const knowledgeCitationPreviewRequestSchema = z.object({
+  conversationId: identifierSchema,
+  messageId: identifierSchema,
+  blockId: identifierSchema,
+  citationIndex: z.number().int().nonnegative().max(7),
+}).strict()
+export type KnowledgeCitationPreviewRequest = z.infer<typeof knowledgeCitationPreviewRequestSchema>
+
+const knowledgeCitationExcerptSchema = z.string().trim().min(1).max(1_000)
+export const knowledgeCitationPreviewSchema = z.union([
+  z.object({ status: z.literal('unavailable') }).strict(),
+  z.object({
+    status: z.literal('available'), kind: z.literal('pdf'), excerpt: knowledgeCitationExcerptSchema,
+    page: z.number().int().positive(), startOffset: z.number().int().nonnegative(),
+    endOffset: z.number().int().positive(),
+  }).strict().refine(({ startOffset, endOffset }) => endOffset > startOffset, {
+    path: ['endOffset'], message: 'PDF preview end must follow its start',
+  }),
+  z.object({
+    status: z.literal('available'), kind: z.literal('docx'), excerpt: knowledgeCitationExcerptSchema,
+    headingPath: z.array(nonEmptyStringSchema.max(200)).max(20), paragraphId: identifierSchema,
+  }).strict(),
+  z.object({
+    status: z.literal('available'), kind: z.enum(['markdown', 'html']),
+    excerpt: knowledgeCitationExcerptSchema, nodeId: identifierSchema,
+  }).strict(),
+  z.object({
+    status: z.literal('available'), kind: z.literal('txt'), excerpt: knowledgeCitationExcerptSchema,
+    startLine: z.number().int().positive(), endLine: z.number().int().positive(),
+    startColumn: z.number().int().nonnegative(), endColumn: z.number().int().nonnegative(),
+  }).strict().superRefine(({ startLine, endLine, startColumn, endColumn }, context) => {
+    if (endLine < startLine || (endLine === startLine && endColumn <= startColumn)) {
+      context.addIssue({ code: 'custom', path: ['endColumn'], message: 'TXT preview end must follow its start' })
+    }
+  }),
+])
+export type KnowledgeCitationPreview = z.infer<typeof knowledgeCitationPreviewSchema>
+
 export const knowledgeEntitlementStateSchema = z.object({
   tier: z.enum(['free', 'member']),
   status: z.enum(['active', 'offline_grace', 'expired', 'unavailable']),
@@ -1056,6 +1094,7 @@ export const ipcChannels = {
   chatListBrowserAudit: 'chat:list-browser-audit',
   chatGetGenerationPreferences: 'chat:get-generation-preferences',
   chatUpdateGenerationPreferences: 'chat:update-generation-preferences',
+  chatDecideKnowledgeConsent: 'chat:decide-knowledge-consent',
   chatEvent: 'chat:event',
   mediaPickFiles: 'media:pick-files',
   mediaImportDroppedFiles: 'media:import-dropped-files',
@@ -1115,6 +1154,7 @@ export const ipcChannels = {
   knowledgeGetEntitlement: 'knowledge:get-entitlement',
   knowledgeGetConsent: 'knowledge:get-consent',
   knowledgeSetEmbeddingConsent: 'knowledge:set-embedding-consent',
+  knowledgePreviewCitation: 'knowledge:preview-citation',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
 } as const
@@ -1129,6 +1169,11 @@ export const renameConversationRequestSchema = z.object({
 }).strict()
 export const deleteConversationRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const cancelChatRequestSchema = z.object({ requestId: identifierSchema }).strict()
+export const decideKnowledgeConsentRequestSchema = z.object({
+  requestId: identifierSchema,
+  decision: z.enum(['grant', 'deny']),
+}).strict()
+export type DecideKnowledgeConsentRequest = z.infer<typeof decideKnowledgeConsentRequestSchema>
 export const generationPreferencesRequestSchema = z.object({ conversationId: identifierSchema }).strict()
 export const updateGenerationPreferencesRequestSchema = generationPreferencesRequestSchema.extend({
   preferences: conversationGenerationPreferencesSchema,
@@ -1243,6 +1288,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.chatListBrowserAudit]: listBrowserAuditRequestSchema,
   [ipcChannels.chatGetGenerationPreferences]: generationPreferencesRequestSchema,
   [ipcChannels.chatUpdateGenerationPreferences]: updateGenerationPreferencesRequestSchema,
+  [ipcChannels.chatDecideKnowledgeConsent]: decideKnowledgeConsentRequestSchema,
   [ipcChannels.mediaPickFiles]: mediaImportContextSchema,
   [ipcChannels.mediaImportDroppedFiles]: importDroppedFilesRequestSchema,
   [ipcChannels.mediaImportClipboardImage]: mediaImportContextSchema,
@@ -1300,6 +1346,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
   [ipcChannels.knowledgeGetConsent]: z.undefined(),
   [ipcChannels.knowledgeSetEmbeddingConsent]: knowledgeSetEmbeddingConsentRequestSchema,
+  [ipcChannels.knowledgePreviewCitation]: knowledgeCitationPreviewRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
@@ -1331,6 +1378,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.chatListBrowserAudit]: z.array(browserActionAuditEntrySchema),
   [ipcChannels.chatGetGenerationPreferences]: conversationGenerationPreferencesSchema,
   [ipcChannels.chatUpdateGenerationPreferences]: conversationGenerationPreferencesSchema,
+  [ipcChannels.chatDecideKnowledgeConsent]: voidResponseSchema,
   [ipcChannels.mediaPickFiles]: z.array(mediaAssetSchema),
   [ipcChannels.mediaImportDroppedFiles]: z.array(mediaAssetSchema),
   [ipcChannels.mediaImportClipboardImage]: z.array(mediaAssetSchema),
@@ -1388,6 +1436,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.knowledgeSetEmbeddingConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgePreviewCitation]: knowledgeCitationPreviewSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
@@ -1426,6 +1475,7 @@ export interface DesktopAPI {
       conversationId: string,
       preferences: ConversationGenerationPreferences,
     ): Promise<ConversationGenerationPreferences>
+    decideKnowledgeConsent(input: DecideKnowledgeConsentRequest): Promise<void>
     onEvent(listener: (event: ChatEvent) => void): () => void
   }
   media: {
@@ -1499,6 +1549,7 @@ export interface DesktopAPI {
     getEntitlement(): Promise<KnowledgeEntitlementState>
     getConsent(): Promise<KnowledgeConsentState>
     setEmbeddingConsent(status: 'granted' | 'denied' | 'revoked'): Promise<KnowledgeConsentState>
+    previewCitation(input: KnowledgeCitationPreviewRequest): Promise<KnowledgeCitationPreview>
   }
   system: {
     openExternal(url: string): Promise<void>

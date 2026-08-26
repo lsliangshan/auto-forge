@@ -69,6 +69,7 @@ function services(): DesktopIpcServices {
     knowledgeAdmission: {
       run: <T>(operation: () => Promise<T>) => operation(),
     },
+    previewKnowledgeCitation: vi.fn().mockResolvedValue({ status: 'unavailable' }),
     userAdmin: {
       list: vi.fn().mockResolvedValue({ items: [], page: 1, pageSize: 20, total: 0 }),
       updateRole: vi.fn().mockResolvedValue({
@@ -88,6 +89,7 @@ function services(): DesktopIpcServices {
       deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'request_1' }),
       cancel: vi.fn(),
+      decideKnowledgeConsent: vi.fn().mockResolvedValue(undefined),
       takeOverBrowser: vi.fn(),
       listBrowserAudit: vi.fn().mockResolvedValue([]),
       getGenerationPreferences: vi.fn(),
@@ -277,6 +279,27 @@ describe('registerDesktopIpc', () => {
       .rejects.toMatchObject({ code: 'INVALID_INPUT' })
     await expect(app.invoke(ipcChannels.userAdminUpdateRole, {
       requestId: 'request_2', targetUserId: 'user_2', newRole: 'support_operator', expectedVersion: 2,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+  })
+
+  it('guards provider-consent decisions and resolves citation previews only from persisted positions', async () => {
+    const app = harness()
+    const decision = { requestId: 'request_knowledge', decision: 'grant' as const }
+    const preview = {
+      conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: 'block_1', citationIndex: 0,
+    }
+
+    await expect(app.invoke(ipcChannels.chatDecideKnowledgeConsent, decision)).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.knowledgePreviewCitation, preview)).resolves.toEqual({ status: 'unavailable' })
+
+    expect(app.dependencies.chat.decideKnowledgeConsent).toHaveBeenCalledWith(decision)
+    expect(app.dependencies.previewKnowledgeCitation).toHaveBeenCalledWith({ userId: 'user_1' }, preview)
+    await expect(app.invoke(ipcChannels.chatDecideKnowledgeConsent, {
+      ...decision, provider: 'deepseek', knowledgeBaseIds: ['kb_other'],
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    await expect(app.invoke(ipcChannels.knowledgePreviewCitation, {
+      ...preview, documentId: 'document_other', path: '/private/source.txt',
     })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
   })
 

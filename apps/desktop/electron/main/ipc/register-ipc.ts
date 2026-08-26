@@ -7,6 +7,8 @@ import {
   type AuthSession,
   type DesktopAPI,
   type KnowledgeBase,
+  type KnowledgeCitationPreview,
+  type KnowledgeCitationPreviewRequest,
   type KnowledgeConsentState,
   type KnowledgeDocument,
   type KnowledgeEntitlementState,
@@ -50,6 +52,10 @@ export interface DesktopIpcServices {
   knowledgeAdmission: {
     run<T>(operation: () => Promise<T>): Promise<T>
   }
+  previewKnowledgeCitation(
+    owner: KnowledgeOwner,
+    input: KnowledgeCitationPreviewRequest,
+  ): Promise<KnowledgeCitationPreview>
   userAdmin: DesktopAPI['userAdmin']
   profile: DesktopAPI['profile']
   chat: Omit<DesktopAPI['chat'], 'onEvent'>
@@ -205,6 +211,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   register(ipcChannels.chatDeleteConversation, (input) => options.services.chat.deleteConversation(input.conversationId))
   register(ipcChannels.chatSend, (input) => options.services.chat.send(input))
   register(ipcChannels.chatCancel, (input) => options.services.chat.cancel(input.requestId))
+  register(ipcChannels.chatDecideKnowledgeConsent, (input) => (
+    options.services.chat.decideKnowledgeConsent(input)
+  ))
   register(ipcChannels.chatTakeOverBrowser, (input) => options.services.chat.takeOverBrowser(input))
   register(ipcChannels.chatListBrowserAudit, (input) => options.services.chat.listBrowserAudit(input.bindingId))
   register(ipcChannels.chatGetGenerationPreferences, (input) => options.services.chat.getGenerationPreferences(input.conversationId))
@@ -269,6 +278,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     owner,
     input.conversationId,
     input.query,
+  ))
+  registerKnowledge(ipcChannels.knowledgePreviewCitation, (owner, input) => (
+    options.services.previewKnowledgeCitation(owner, input)
   ))
   registerKnowledge(ipcChannels.knowledgeGetFeatureAvailability, (owner) => options.services.knowledge.getFeatureAvailability(owner))
   registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))

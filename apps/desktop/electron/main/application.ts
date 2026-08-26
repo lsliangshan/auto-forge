@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import {
   chatBlockSchema,
   conversationGenerationPreferencesSchema,
+  decideKnowledgeConsentRequestSchema,
+  knowledgeChatProviderConsentStateSchema,
   openExternalRequestSchema,
   toSafeAppError,
   type AppError,
@@ -12,6 +14,7 @@ import {
   type AuthSession,
   type ChatBlock,
   type ChatEvent,
+  type KnowledgeChatProviderConsentState,
   type DeveloperProject,
   type ExecutionDetail,
   type ExecutionEvent,
@@ -968,6 +971,33 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     }
   }
   const conversationContext = createConversationContextManager(database)
+  const knowledgeConsentKey = (userId: string, provider: ModelProviderId) => (
+    `knowledge.chat-provider-consent:${userId}:${provider}`
+  )
+  const getKnowledgeChatProviderConsent = async (
+    userId: string,
+    provider: ModelProviderId,
+  ): Promise<KnowledgeChatProviderConsentState> => {
+    const stored = database.appSettings.get(knowledgeConsentKey(userId, provider))?.value
+    const parsed = knowledgeChatProviderConsentStateSchema.safeParse(stored)
+    return parsed.success && parsed.data.provider === provider
+      ? parsed.data
+      : { provider, status: 'unknown' }
+  }
+  const setKnowledgeChatProviderConsent = (
+    userId: string,
+    provider: ModelProviderId,
+    status: 'granted' | 'denied',
+  ): KnowledgeChatProviderConsentState => {
+    const value: KnowledgeChatProviderConsentState = {
+      provider, status, updatedAt: new Date().toISOString(),
+    }
+    database.appSettings.set(knowledgeConsentKey(userId, provider), value)
+    return value
+  }
+  // Assigned after Agent construction so its callbacks can close over the same service instance.
+  // eslint-disable-next-line prefer-const
+  let knowledge!: KnowledgeService
   const agent = new AgentOrchestrator({
     workflows: registry,
     persistence: createAgentPersistence(database),
@@ -988,6 +1018,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     browserContinuation: {
       catalog: browserContinuationCatalog,
       executor: browserContinuationExecutor,
+    },
+    knowledge: {
+      search: (owner, snapshot, query) => knowledge.searchSnapshot(owner, snapshot, query),
+      getChatProviderConsent: (owner, provider) => (
+        getKnowledgeChatProviderConsent(owner.userId, provider)
+      ),
     },
   })
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
@@ -1135,7 +1171,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
   }
-  const knowledge = new KnowledgeService({
+  knowledge = new KnowledgeService({
     rootDirectory: options.paths.data,
     safeStorage: options.safeStorage,
     createParser: options.createKnowledgeParser ?? (async () => {
@@ -1148,9 +1184,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     ),
     entitlement: options.knowledgeEntitlement,
     cloud: knowledgeCloud,
-    getChatProviderConsent: async () => ({
-      provider: settings.get().activeProvider, status: 'unknown',
-    }),
+    getChatProviderConsent: owner => getKnowledgeChatProviderConsent(
+      owner.userId, settings.get().activeProvider,
+    ),
     platform: options.knowledgePlatform,
     arch: options.knowledgeArch,
     runtimeAvailable: options.createKnowledgeParser !== undefined,
@@ -1162,9 +1198,32 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (current) await resetBrowserIdentity(current.user.id)
   }
 
+  const previewKnowledgeCitation: DesktopIpcServices['previewKnowledgeCitation'] = async (
+    owner,
+    input,
+  ) => {
+    requireOwnedConversation(input.conversationId, owner.userId)
+    const message = database.messages.get(input.messageId)
+    if (!message
+      || message.conversationId !== input.conversationId
+      || message.role !== 'assistant') throw failure('NOT_FOUND')
+    const block = chatBlockSchema.array().parse(message.blocks).find((candidate) => (
+      candidate.type === 'knowledge_answer' && candidate.blockId === input.blockId
+    ))
+    if (block?.type !== 'knowledge_answer') throw failure('NOT_FOUND')
+    const citations = block.claims.flatMap(({ citations: claimCitations }) => claimCitations)
+      .filter((citation, index, all) => (
+        all.findIndex(({ evidenceId }) => evidenceId === citation.evidenceId) === index
+      ))
+    const citation = citations[input.citationIndex]
+    if (!citation) throw failure('NOT_FOUND')
+    return knowledge.previewCitation(owner, citation)
+  }
+
   let settingsUpdateTail = Promise.resolve()
   const services: DesktopIpcServices = {
     knowledgeAdmission,
+    previewKnowledgeCitation,
     auth: {
       getSession: () => knowledgeAdmission.transition(async () => {
         await knowledge.close()
@@ -1320,6 +1379,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           if ('selectionRequired' in route || 'modelRequired' in route) {
             throw failure('INVALID_INPUT')
           }
+          const knowledgeSnapshot = route.outputType === 'text' && route.supportsTools
+            ? await knowledgeAdmission.run(async () => {
+                try {
+                  return await knowledge.captureSearchSnapshot(
+                    { userId: session.user.id }, input.conversationId,
+                  )
+                } catch (error) {
+                  if (toSafeAppError(error).code !== 'SERVICE_UNAVAILABLE') throw error
+                  return Object.freeze({ selected: false, knowledgeMode: 'mixed' as const })
+                }
+              })
+            : undefined
           const requestId = randomUUID()
           const titleModel = snapshot.defaultModels[providerSnapshot.providerId].text
           conversationTitleContexts.set(requestId, {
@@ -1372,6 +1443,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 providerSnapshot,
                 provider: route.provider,
                 model: route.model,
+                ...(knowledgeSnapshot === undefined ? {} : { knowledgeSnapshot }),
                 ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
                 requestId,
               })
@@ -1413,6 +1485,21 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           agent.cancel(requestId),
           mediaGeneration.cancel(requestId),
         ])
+      },
+      decideKnowledgeConsent: async (input) => {
+        const parsed = decideKnowledgeConsentRequestSchema.safeParse(input)
+        if (!parsed.success) throw failure('INVALID_INPUT')
+        const session = await auth.requireSession()
+        const run = database.chatRuns.getByRequestId(parsed.data.requestId)
+        if (!run || run.userId !== session.user.id || !run.provider) throw failure('NOT_FOUND')
+        requireOwnedConversation(run.conversationId, session.user.id)
+        const result = await agent.resumeKnowledgeConsent(parsed.data)
+        if (result.status === 'failed') throw result.error ?? failure('INTERNAL_ERROR')
+        setKnowledgeChatProviderConsent(
+          session.user.id,
+          run.provider,
+          parsed.data.decision === 'grant' ? 'granted' : 'denied',
+        )
       },
       takeOverBrowser: async (input) => {
         const session = await auth.requireSession()

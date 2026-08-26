@@ -860,6 +860,7 @@ export const useChatStore = defineStore('chat', {
       if (existingIndex >= 0) {
         if (event.block.type === 'approval'
           || event.block.type === 'browser_status'
+          || event.block.type === 'knowledge_status'
           || event.block.type === 'workflow_status'
           || event.block.type === 'workflow_provenance') {
           message.blocks[existingIndex] = { ...event.block, id }

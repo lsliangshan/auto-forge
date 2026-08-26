@@ -208,6 +208,88 @@ describe('cross-process contracts', () => {
     })).toMatchObject({ embedding: { status: 'granted' } })
   })
 
+  it('persists grounded answers and search status without snippets, names, or paths', () => {
+    const citation = {
+      evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
+      kind: 'pdf' as const, page: 2, startOffset: 4, endOffset: 18,
+    }
+    expect(chatBlockSchema.parse({
+      type: 'knowledge_status', blockId: 'knowledge_status_1', requestId: 'request_1',
+      state: 'completed', searchIndex: 1, searchLimit: 3, resultCount: 1,
+    })).toMatchObject({ type: 'knowledge_status', state: 'completed', searchLimit: 3 })
+    expect(chatBlockSchema.parse({
+      type: 'knowledge_answer', blockId: 'knowledge_answer_1', mode: 'strict',
+      claims: [{ text: '材料要求包含身份证明。', support: 'knowledge', citations: [citation] }],
+    })).toMatchObject({ type: 'knowledge_answer', claims: [{ citations: [citation] }] })
+
+    for (const privateField of [
+      { snippet: 'hidden source chunk' },
+      { filename: 'policy.pdf' },
+      { path: '/private/policy.pdf' },
+      { url: 'https://signed.example/source' },
+    ]) {
+      expect(chatBlockSchema.safeParse({
+        type: 'knowledge_answer', blockId: 'knowledge_answer_1', mode: 'strict',
+        claims: [{
+          text: '材料要求包含身份证明。', support: 'knowledge', citations: [citation], ...privateField,
+        }],
+      }).success).toBe(false)
+    }
+    expect(chatBlockSchema.safeParse({
+      type: 'knowledge_answer', blockId: 'knowledge_answer_1', mode: 'strict',
+      claims: [{ text: '这是模型常识。', support: 'general', citations: [] }],
+    }).success).toBe(false)
+    expect(chatBlockSchema.parse({
+      type: 'knowledge_answer', blockId: 'knowledge_answer_2', mode: 'mixed',
+      claims: [{ text: '这是通用知识。', support: 'general', citations: [] }],
+    })).toMatchObject({ mode: 'mixed', claims: [{ support: 'general' }] })
+  })
+
+  it('accepts only persisted citation positions and request-bound provider consent from Renderer', () => {
+    const channels = ipcChannels as typeof ipcChannels & {
+      knowledgePreviewCitation: string
+      chatDecideKnowledgeConsent: string
+    }
+    const requests = ipcRequestSchemas as Record<string, { parse(value: unknown): unknown; safeParse(value: unknown): { success: boolean } }>
+    const responses = ipcResponseSchemas as Record<string, { parse(value: unknown): unknown }>
+
+    expect(channels.knowledgePreviewCitation).toBe('knowledge:preview-citation')
+    expect(requests[channels.knowledgePreviewCitation]!.parse({
+      conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: 'knowledge_answer_1', citationIndex: 0,
+    })).toEqual({
+      conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: 'knowledge_answer_1', citationIndex: 0,
+    })
+    for (const input of [
+      { conversationId: 'conversation_1', messageId: 'message_1', blockId: 'knowledge_answer_1', citationIndex: 0, documentId: 'document_other' },
+      { conversationId: 'conversation_1', messageId: 'message_1', blockId: 'knowledge_answer_1', citationIndex: 0, path: '/private/source' },
+      { documentId: 'document_1', versionId: 'version_1', citationIndex: 0 },
+    ]) expect(requests[channels.knowledgePreviewCitation]!.safeParse(input).success).toBe(false)
+    expect(responses[channels.knowledgePreviewCitation]!.parse({
+      status: 'available', kind: 'txt', excerpt: '受控预览',
+      startLine: 8, endLine: 9, startColumn: 2, endColumn: 6,
+    })).toMatchObject({ status: 'available', kind: 'txt', startLine: 8 })
+    for (const preview of [
+      { status: 'available', kind: 'pdf', excerpt: 'PDF preview', page: 2, startOffset: 4, endOffset: 18 },
+      { status: 'available', kind: 'docx', excerpt: 'DOCX preview', headingPath: ['Section'], paragraphId: 'paragraph_1' },
+      { status: 'available', kind: 'markdown', excerpt: 'Markdown preview', nodeId: 'heading_1' },
+      { status: 'available', kind: 'html', excerpt: 'HTML preview', nodeId: 'section_1' },
+    ]) expect(responses[channels.knowledgePreviewCitation]!.parse(preview)).toEqual(preview)
+    expect(responses[channels.knowledgePreviewCitation]!.parse({ status: 'unavailable' }))
+      .toEqual({ status: 'unavailable' })
+
+    expect(channels.chatDecideKnowledgeConsent).toBe('chat:decide-knowledge-consent')
+    expect(requests[channels.chatDecideKnowledgeConsent]!.parse({
+      requestId: 'request_1', decision: 'grant',
+    })).toEqual({ requestId: 'request_1', decision: 'grant' })
+    for (const input of [
+      { requestId: 'request_1', decision: 'grant', provider: 'openrouter' },
+      { requestId: 'request_1', decision: 'deny', userId: 'user_other' },
+      { requestId: 'request_1', decision: 'unknown' },
+    ]) expect(requests[channels.chatDecideKnowledgeConsent]!.safeParse(input).success).toBe(false)
+  })
+
   it('validates CloudBase username, password, phone, email, and OTP inputs', () => {
     expect(authCredentialsSchema.parse({ account: '  Alice_1  ', password: '密码密码密码密码' }))
       .toEqual({ account: 'Alice_1', password: '密码密码密码密码' })

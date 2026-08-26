@@ -155,6 +155,59 @@ export const browserStatusBlockSchema = z.object({
   errorCode: appErrorCodeSchema.optional(),
 }).strict()
 
+export const knowledgeStatusBlockSchema = z.object({
+  type: z.literal('knowledge_status'),
+  blockId: identifierSchema,
+  requestId: identifierSchema,
+  state: z.enum([
+    'searching', 'completed', 'no_results', 'awaiting_consent',
+    'consent_denied', 'failed', 'cancelled',
+  ]),
+  searchIndex: z.number().int().positive().max(3),
+  searchLimit: z.literal(3),
+  resultCount: z.number().int().nonnegative().max(8),
+  provider: z.enum(['openrouter', 'deepseek']).optional(),
+}).strict().superRefine(({ state, provider }, context) => {
+  const needsProvider = state === 'awaiting_consent' || state === 'consent_denied'
+  if (needsProvider !== (provider !== undefined)) {
+    context.addIssue({
+      code: 'custom', path: ['provider'],
+      message: 'Knowledge disclosure states require exactly one chat provider',
+    })
+  }
+})
+
+export const knowledgeAnswerClaimSchema = z.object({
+  text: nonEmptyStringSchema.max(4_000),
+  support: z.enum(['knowledge', 'general']),
+  citations: z.array(knowledgeCitationReferenceSchema).max(8),
+}).strict().superRefine(({ support, citations }, context) => {
+  if (support === 'knowledge' && citations.length === 0) {
+    context.addIssue({ code: 'custom', path: ['citations'], message: 'Knowledge claims require a citation' })
+  }
+  if (support === 'general' && citations.length > 0) {
+    context.addIssue({ code: 'custom', path: ['citations'], message: 'General claims cannot cite knowledge evidence' })
+  }
+})
+
+export const knowledgeAnswerBlockSchema = z.object({
+  type: z.literal('knowledge_answer'),
+  blockId: identifierSchema,
+  mode: z.enum(['mixed', 'strict']),
+  claims: z.array(knowledgeAnswerClaimSchema).min(1).max(50),
+}).strict().superRefine(({ mode, claims }, context) => {
+  if (mode === 'strict' && claims.some(({ support }) => support !== 'knowledge')) {
+    context.addIssue({
+      code: 'custom', path: ['claims'],
+      message: 'Strict knowledge answers cannot contain unsupported general claims',
+    })
+  }
+  const citations = claims.flatMap(({ citations: claimCitations }) => claimCitations)
+  if (new Set(citations.map(({ evidenceId }) => evidenceId)).size > 8) {
+    context.addIssue({ code: 'custom', path: ['claims'], message: 'Knowledge answers can reference at most eight evidence items' })
+  }
+})
+
 export const chatBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string() }).strict(),
   z.object({ type: z.literal('reasoning_status'), label: z.string().trim().min(1) }).strict(),
@@ -245,6 +298,8 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     message: z.string().trim().min(1),
   }).strict(),
   browserStatusBlockSchema,
+  knowledgeStatusBlockSchema,
+  knowledgeAnswerBlockSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
 ])
@@ -270,7 +325,7 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     conversationId: identifierSchema,
     messageId: identifierSchema,
     blockId: identifierSchema,
-    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema]),
+    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema, knowledgeStatusBlockSchema]),
   }).strict(),
   z.object({
     type: z.literal('conversation_title_updated'),

@@ -66,15 +66,15 @@ describe('WorkflowToolLoop', () => {
     expect(loop.beginDecision()).toEqual({ kind: 'decision', decisionIndex: 1 })
   })
 
-  it('allows browser continuation decisions beyond the ordinary ten-decision limit', () => {
+  it('keeps browser continuation inside the total ten-decision limit', () => {
     const loop = new WorkflowToolLoop({ now: () => 0 })
 
     for (let index = 1; index <= 10; index += 1) {
       expect(loop.beginDecision()).toEqual({ kind: 'decision', decisionIndex: index })
     }
     expect(loop.beginDecision()).toEqual({ kind: 'failed', code: 'TOOL_CALL_LIMIT' })
-    expect(loop.beginDecision({ browserContinuationActive: true })).toEqual({
-      kind: 'decision', decisionIndex: 11,
+    expect(loop.beginDecision()).toEqual({
+      kind: 'failed', code: 'TOOL_CALL_LIMIT',
     })
   })
 

@@ -4,6 +4,8 @@ import type {
   KnowledgeDocument,
   KnowledgeEntitlementState,
   KnowledgeFeatureAvailability,
+  KnowledgeCitationPreview,
+  KnowledgeCitationReference,
   KnowledgeSelection,
   KnowledgeSearchOutcome,
   KnowledgeVersion,
@@ -12,6 +14,12 @@ import type {
 /** Main-only authenticated ownership context; never crosses preload or IPC. */
 export interface KnowledgeOwner {
   readonly userId: string
+}
+
+/** Opaque Main-created scope token. Selected base/version identities remain service-private. */
+export interface KnowledgeSearchSnapshot {
+  readonly selected: boolean
+  readonly knowledgeMode: 'mixed' | 'strict'
 }
 
 /** Persistence seam for the encrypted per-owner knowledge store. */
@@ -34,6 +42,16 @@ export interface KnowledgePersistence {
     selection: KnowledgeSelection,
   ): Promise<KnowledgeSelection>
   search(owner: KnowledgeOwner, conversationId: string, query: string): Promise<KnowledgeSearchOutcome>
+  captureSearchSnapshot(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSearchSnapshot>
+  searchSnapshot(
+    owner: KnowledgeOwner,
+    snapshot: KnowledgeSearchSnapshot,
+    query: string,
+  ): Promise<KnowledgeSearchOutcome>
+  previewCitation(
+    owner: KnowledgeOwner,
+    citation: KnowledgeCitationReference,
+  ): Promise<KnowledgeCitationPreview>
   getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability>
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
   getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>

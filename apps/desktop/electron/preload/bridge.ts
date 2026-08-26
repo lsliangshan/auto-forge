@@ -80,6 +80,9 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       deleteConversation: (conversationId) => invoke(ipcRenderer, ipcChannels.chatDeleteConversation, { conversationId }),
       send: (input) => invoke(ipcRenderer, ipcChannels.chatSend, input),
       cancel: (requestId) => invoke(ipcRenderer, ipcChannels.chatCancel, { requestId }),
+      decideKnowledgeConsent: (input) => invoke(
+        ipcRenderer, ipcChannels.chatDecideKnowledgeConsent, input,
+      ),
       takeOverBrowser: (input) => invoke(ipcRenderer, ipcChannels.chatTakeOverBrowser, input),
       listBrowserAudit: (bindingId) => invoke(ipcRenderer, ipcChannels.chatListBrowserAudit, { bindingId }),
       getGenerationPreferences: (conversationId) => invoke(ipcRenderer, ipcChannels.chatGetGenerationPreferences, { conversationId }),
@@ -171,6 +174,9 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
         ipcRenderer,
         ipcChannels.knowledgeSearch,
         { conversationId, query },
+      ),
+      previewCitation: (input) => invoke(
+        ipcRenderer, ipcChannels.knowledgePreviewCitation, input,
       ),
       getFeatureAvailability: () => invoke(ipcRenderer, ipcChannels.knowledgeGetFeatureAvailability),
       getEntitlement: () => invoke(ipcRenderer, ipcChannels.knowledgeGetEntitlement),

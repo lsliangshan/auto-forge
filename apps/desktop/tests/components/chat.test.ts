@@ -67,6 +67,37 @@ function browserStatusBlock(
   }
 }
 
+function knowledgeStatusBlock(
+  state: Extract<ChatBlock, { type: 'knowledge_status' }>['state'],
+  overrides: Partial<Extract<ChatBlock, { type: 'knowledge_status' }>> = {},
+) {
+  return {
+    id: 'message_1:knowledge_status_1',
+    type: 'knowledge_status' as const,
+    blockId: 'knowledge_status_1', requestId: 'request_1', state,
+    searchIndex: 1, searchLimit: 3 as const, resultCount: state === 'searching' ? 0 : 1,
+    ...overrides,
+  }
+}
+
+function knowledgeAnswerBlock() {
+  return {
+    id: 'message_1:knowledge_answer_1',
+    type: 'knowledge_answer' as const,
+    blockId: 'knowledge_answer_1', mode: 'mixed' as const,
+    claims: [
+      {
+        text: '申请材料应当包含身份证明。', support: 'knowledge' as const,
+        citations: [{
+          evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
+          kind: 'pdf' as const, page: 2, startOffset: 4, endOffset: 18,
+        }],
+      },
+      { text: '建议提前准备复印件。', support: 'general' as const, citations: [] },
+    ],
+  }
+}
+
 function workflowProvenanceBlock(
   entries: Extract<ChatBlock, { type: 'workflow_provenance' }>['entries'],
 ) {
@@ -160,6 +191,8 @@ function createEventApi() {
   const chatUnsubscribe = vi.fn()
   const executionUnsubscribe = vi.fn()
   const decide = vi.fn<(input: ApprovalDecision) => Promise<void>>().mockResolvedValue(undefined)
+  const decideKnowledgeConsent = vi.fn().mockResolvedValue(undefined)
+  const previewCitation = vi.fn().mockResolvedValue({ status: 'unavailable' })
   const api = {
     auth: {
       getSession: vi.fn().mockResolvedValue(null), sendOtp: vi.fn(), verifyOtp: vi.fn(),
@@ -176,6 +209,7 @@ function createEventApi() {
       listMessages: vi.fn().mockResolvedValue([]),
       renameConversation: vi.fn(), deleteConversation: vi.fn(),
       send: vi.fn().mockResolvedValue({ requestId: 'req_1' }), cancel: vi.fn(),
+      decideKnowledgeConsent,
       takeOverBrowser: vi.fn().mockResolvedValue(undefined),
       listBrowserAudit: vi.fn().mockResolvedValue([]),
       getGenerationPreferences: vi.fn().mockResolvedValue(generationPreferences()),
@@ -200,11 +234,38 @@ function createEventApi() {
       get: vi.fn(), update: vi.fn(), saveProviderApiKey: vi.fn(), clearProviderApiKey: vi.fn(),
       validateProviderCredential: vi.fn(), listProviderModels: vi.fn(), clearLocalData: vi.fn(),
     },
+    knowledge: {
+      listBases: vi.fn().mockResolvedValue([]), createBase: vi.fn(),
+      listDocuments: vi.fn().mockResolvedValue([]), listVersions: vi.fn().mockResolvedValue([]),
+      importDocument: vi.fn(), replaceDocument: vi.fn(), recycleDocument: vi.fn(), purgeDocument: vi.fn(),
+      recycleBase: vi.fn(), purgeBase: vi.fn(), exportBase: vi.fn(),
+      getConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
+      updateConversationSelection: vi.fn(async (_conversationId, selection) => selection),
+      search: vi.fn().mockResolvedValue({ kind: 'ask_for_detail', results: [] }),
+      previewCitation,
+      getFeatureAvailability: vi.fn().mockResolvedValue({
+        local: { available: false, reasons: ['runtime_unavailable'] },
+        cloud: { available: false, reasons: ['runtime_unavailable'] },
+      }),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      }),
+      getConsent: vi.fn().mockResolvedValue({
+        chatProvider: { provider: 'openrouter', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou', model: 'kinfra-text-embedding-0.6b',
+          dimensions: 1024, status: 'unknown', retrievalByBase: [],
+        },
+      }),
+      setEmbeddingConsent: vi.fn(),
+    },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
   return {
     api,
     decide,
+    decideKnowledgeConsent,
+    previewCitation,
     chatUnsubscribe,
     executionUnsubscribe,
     emitChat: (event: ChatEvent) => chatListener?.(event),
@@ -574,6 +635,104 @@ describe('chat interactions', () => {
     expect(wrapper.get('strong').text()).toBe('重点')
     expect(wrapper.findAll('li').map((item) => item.text())).toEqual(['第一项', '第二项'])
     expect(wrapper.get('p code').text()).toBe('pnpm test')
+  })
+
+  it('renders authoritative knowledge-search status and provider-scoped consent actions', async () => {
+    const { api, decideKnowledgeConsent } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: { block: knowledgeStatusBlock('awaiting_consent', { provider: 'openrouter' }) },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const card = wrapper.get('[data-testid="knowledge-status"]')
+    expect(card.classes()).toContain('af-operation-card')
+    expect(card.get('[data-testid="knowledge-status-badge"]').text()).toBe('等待授权')
+    expect(card.text()).toContain('第 1 次检索 · 上限 3 次')
+    expect(card.text()).toContain('已找到 1 条证据')
+    expect(card.text()).toContain('OpenRouter')
+
+    await card.get('[data-testid="grant-knowledge-consent"]').trigger('click')
+    await flushPromises()
+    expect(decideKnowledgeConsent).toHaveBeenCalledWith({ requestId: 'request_1', decision: 'grant' })
+    expect(card.get('[data-testid="grant-knowledge-consent"]').attributes('disabled')).toBeDefined()
+    expect(card.get('[data-testid="deny-knowledge-consent"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('keeps citations beside claims, labels general knowledge, and opens a controlled source preview', async () => {
+    const { api, previewCitation } = createEventApi()
+    previewCitation.mockResolvedValueOnce({
+      status: 'available', kind: 'pdf', excerpt: '身份证明', page: 2,
+      startOffset: 4, endOffset: 18,
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: knowledgeAnswerBlock(),
+        conversationId: 'conversation_1', messageId: 'message_1',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    const claims = wrapper.findAll('[data-testid="knowledge-claim"]')
+    expect(claims).toHaveLength(2)
+    expect(claims[0]!.text().replace(/\s+/g, ' ')).toContain('申请材料应当包含身份证明。 [1]')
+    expect(claims[1]!.text()).toContain('通用知识（未由知识库支持）')
+    expect(wrapper.get('[data-testid="knowledge-sources-summary"]').text()).toContain('来源 1')
+
+    await claims[0]!.get('[data-testid="knowledge-citation-0"]').trigger('click')
+    await flushPromises()
+    expect(previewCitation).toHaveBeenCalledWith({
+      conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: 'knowledge_answer_1', citationIndex: 0,
+    })
+    expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('PDF 第 2 页')
+    expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('身份证明')
+  })
+
+  it('renders a deleted or purged citation source as unavailable without exposing a path', async () => {
+    const { api, previewCitation } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const wrapper = mount(MessageBlock, {
+      props: {
+        block: knowledgeAnswerBlock(),
+        conversationId: 'conversation_1', messageId: 'message_1',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('[data-testid="knowledge-source-0"]').trigger('click')
+    await flushPromises()
+
+    expect(previewCitation).toHaveBeenCalledOnce()
+    expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('来源已不可用')
+    expect(wrapper.text()).not.toMatch(/\/Users\/|file:\/\/|https?:\/\//i)
+  })
+
+  it('renders both the DOCX heading and paragraph from the controlled preview contract', async () => {
+    const { api, previewCitation } = createEventApi()
+    previewCitation.mockResolvedValueOnce({
+      status: 'available', kind: 'docx', excerpt: '申请条件',
+      headingPath: ['第一章', '申请条件'], paragraphId: 'paragraph_8',
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const answer = knowledgeAnswerBlock()
+    answer.claims[0]!.citations = [{
+      evidenceId: 'evidence_docx', documentId: 'document_docx', versionId: 'version_docx',
+      kind: 'docx', headingPath: ['第一章', '申请条件'], paragraphId: 'paragraph_8',
+    }]
+    const wrapper = mount(MessageBlock, {
+      props: { block: answer, conversationId: 'conversation_1', messageId: 'message_1' },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('[data-testid="knowledge-source-0"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-source-0"]').text()).toContain('第一章 › 申请条件')
+    expect(wrapper.get('[data-testid="knowledge-source-0"]').text()).toContain('paragraph_8')
+    expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('第一章 › 申请条件')
+    expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('paragraph_8')
   })
 
   it('escapes raw HTML instead of creating live chat elements', () => {
@@ -2578,6 +2737,26 @@ describe('chat interactions', () => {
       expect.objectContaining({
         id: 'assistant_1:workflow_provenance_1', blockId: 'workflow_provenance_1',
         entries: [expect.objectContaining({ status: 'completed' })],
+      }),
+    ])
+  })
+
+  it('replaces live knowledge-search status by its Main-owned block id', () => {
+    const { api, emitChat } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const store = useChatStore()
+    store.ensureSubscriptions()
+    const { id: searchingId, ...searching } = knowledgeStatusBlock('searching')
+    const { id: completedId, ...completed } = knowledgeStatusBlock('completed')
+    void searchingId; void completedId
+
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: searching })
+    emitChat({ type: 'block', conversationId: 'conv_1', messageId: 'assistant_1', block: completed })
+
+    expect(store.messagesByConversation.conv_1?.[0]?.blocks).toEqual([
+      expect.objectContaining({
+        id: 'assistant_1:knowledge_status_1', blockId: 'knowledge_status_1',
+        type: 'knowledge_status', state: 'completed', resultCount: 1,
       }),
     ])
   })

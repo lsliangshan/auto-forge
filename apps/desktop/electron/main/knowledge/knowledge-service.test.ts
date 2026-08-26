@@ -4,7 +4,13 @@ import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { KnowledgeEntitlementState, KnowledgeSearchResult } from '@autoforge/shared'
+import type {
+  KnowledgeCitationPreview,
+  KnowledgeCitationReference,
+  KnowledgeEntitlementState,
+  KnowledgeSearchOutcome,
+  KnowledgeSearchResult,
+} from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
 import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
@@ -55,6 +61,27 @@ interface TargetKnowledgeCloudPort {
 type TargetEmbeddingConsent = Awaited<ReturnType<TargetKnowledgeCloudPort['getEmbeddingConsent']>>
 type TargetCloudEntitlement = Awaited<ReturnType<TargetKnowledgeCloudPort['getEntitlement']>>
 type TargetCloudSearch = Awaited<ReturnType<TargetKnowledgeCloudPort['searchPublished']>>
+
+interface TargetSearchSnapshot {
+  readonly selected: boolean
+  readonly knowledgeMode: 'mixed' | 'strict'
+}
+
+interface TargetSnapshotKnowledgeService {
+  captureSearchSnapshot(
+    owner: { userId: string },
+    conversationId: string,
+  ): Promise<TargetSearchSnapshot>
+  searchSnapshot(
+    owner: { userId: string },
+    snapshot: TargetSearchSnapshot,
+    query: string,
+  ): Promise<KnowledgeSearchOutcome>
+  previewCitation(
+    owner: { userId: string },
+    citation: KnowledgeCitationReference,
+  ): Promise<KnowledgeCitationPreview>
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -222,6 +249,63 @@ afterEach(async () => {
 })
 
 describe('KnowledgeService lifecycle', () => {
+  it('captures immutable selection and ready-version scope for the whole Agent turn', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'policy-old.txt', '旧版政策明确要求提前申请'))
+    const document = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    const target = app.service as unknown as TargetSnapshotKnowledgeService
+
+    const snapshot = await target.captureSearchSnapshot(owner, 'conversation_1')
+    app.picks.push(await writeSource(app.rootDirectory, 'policy-new.txt', '新版政策改为线上提交'))
+    await app.service.replaceDocument(owner, document!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.name).toBe('policy-new.txt')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [], knowledgeMode: 'mixed',
+    })
+
+    expect(snapshot).toMatchObject({ selected: true, knowledgeMode: 'strict' })
+    await expect(target.searchSnapshot(owner, snapshot, '旧版政策')).resolves.toMatchObject({
+      kind: 'results', results: [expect.objectContaining({ versionId: expect.any(String) })],
+    })
+    await expect(target.searchSnapshot(owner, snapshot, '新版政策')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    await expect(app.service.search(owner, 'conversation_1', '旧版政策')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    await app.service.close()
+  })
+
+  it('resolves an exact citation in Main and makes recycled sources unavailable', async () => {
+    const app = await fixture()
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'preview.txt', '第一行受控预览文本'))
+    const document = await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'mixed',
+    })
+    const evidence = (await app.service.search(owner, 'conversation_1', '受控预览')).results[0]!
+    const target = app.service as unknown as TargetSnapshotKnowledgeService
+
+    await expect(target.previewCitation(owner, evidence.citation)).resolves.toEqual({
+      status: 'available', kind: 'txt', excerpt: '第一行受控预览文本',
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 9,
+    })
+    await app.service.recycleDocument(owner, document!.id)
+    await expect(target.previewCitation(owner, evidence.citation)).resolves.toEqual({
+      status: 'unavailable',
+    })
+    await app.service.close()
+  })
+
   it('uses only authoritative synced selection for cloud hybrid search and keeps closed gates local', async () => {
     const cloudGate = {
       tier: 'member' as const,

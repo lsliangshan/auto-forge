@@ -1,4 +1,5 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -8,6 +9,9 @@ import {
   type AppErrorCode,
   type KnowledgeBase,
   type KnowledgeChatProviderConsentState,
+  knowledgeCitationReferenceSchema,
+  type KnowledgeCitationPreview,
+  type KnowledgeCitationReference,
   type KnowledgeConsentState,
   type KnowledgeDocument,
   type KnowledgeEmbeddingConsentState,
@@ -27,14 +31,23 @@ import {
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeExportService } from './export-service.js'
 import { KnowledgeKeyStore } from './key-store.js'
-import { LocalKnowledgeRetriever, type LocalKnowledgeSearchOutcome } from './local-retriever.js'
+import {
+  citationForKnowledgeChunk,
+  LocalKnowledgeRetriever,
+  type KnowledgeChunkRow,
+  type LocalKnowledgeSearchOutcome,
+} from './local-retriever.js'
 import {
   CLOUD_RETRIEVAL_TOP_K,
   CloudRetriever,
   type CloudHybridRetrievalPort,
 } from './cloud-retriever.js'
 import { KnowledgeOrphanCleanupService } from './orphan-cleanup-service.js'
-import type { KnowledgeOwner, KnowledgePersistence } from './knowledge-types.js'
+import type {
+  KnowledgeOwner,
+  KnowledgePersistence,
+  KnowledgeSearchSnapshot,
+} from './knowledge-types.js'
 import type { ParserFormat } from './parser-protocol.js'
 import { KnowledgePurgeService } from './purge-service.js'
 import {
@@ -105,6 +118,18 @@ interface DocumentRow {
   status: 'pending' | 'processing' | 'ready' | 'failed' | 'recycled'
   versionCount: number
   updatedAt: number
+}
+
+interface CapturedSearchScope {
+  readonly ownerId: string
+  readonly conversationId: string
+  readonly epoch: number
+  readonly allVersionIds: readonly string[]
+  readonly localVersionIds: readonly string[]
+  readonly cloud?: {
+    readonly retriever: CloudRetriever
+    readonly snapshot: Awaited<ReturnType<CloudRetriever['captureSnapshot']>>
+  }
 }
 
 function failure(code: AppErrorCode): never {
@@ -268,6 +293,8 @@ export class KnowledgeService implements KnowledgePersistence {
   private opening: Promise<OpenKnowledgeSession> | undefined
   private closePromise: Promise<void> | undefined
   private closing = false
+  private searchSnapshotEpoch = 0
+  private readonly searchSnapshots = new WeakMap<KnowledgeSearchSnapshot, CapturedSearchScope>()
   private readonly mutations = new Set<Promise<unknown>>()
   private readonly imports = new KnowledgeImportRuntime({
     now: () => this.now(),
@@ -566,6 +593,151 @@ export class KnowledgeService implements KnowledgePersistence {
     return { kind: 'results', results: mergeRankedResults(localResults, cloudResults) }
   }
 
+  async captureSearchSnapshot(
+    owner: KnowledgeOwner,
+    conversationId: string,
+  ): Promise<KnowledgeSearchSnapshot> {
+    const session = await this.ensureSession(owner)
+    const selection = await this.getConversationSelection(owner, conversationId)
+    const snapshot = Object.freeze({
+      selected: selection.knowledgeBaseIds.length > 0,
+      knowledgeMode: selection.knowledgeMode,
+    })
+    if (selection.knowledgeBaseIds.length === 0) {
+      this.searchSnapshots.set(snapshot, {
+        ownerId: owner.userId, conversationId, epoch: this.searchSnapshotEpoch,
+        allVersionIds: Object.freeze([]), localVersionIds: Object.freeze([]),
+      })
+      return snapshot
+    }
+
+    const placeholders = selection.knowledgeBaseIds.map(() => '?').join(', ')
+    const versionRows = session.opened.database.prepare(`
+      SELECT documents.knowledge_base_id AS knowledgeBaseId,
+        documents.active_version_id AS versionId
+      FROM documents
+      JOIN document_versions ON document_versions.id = documents.active_version_id
+      WHERE documents.knowledge_base_id IN (${placeholders})
+        AND documents.status <> 'recycled'
+        AND document_versions.status = 'ready'
+      ORDER BY documents.knowledge_base_id, documents.id
+    `).all(...selection.knowledgeBaseIds) as Array<{ knowledgeBaseId: string; versionId: string }>
+    const syncedRows = session.opened.database.prepare(`
+      SELECT cloud_sync_states.knowledge_base_id AS knowledgeBaseId
+      FROM cloud_sync_states
+      WHERE cloud_sync_states.knowledge_base_id IN (${placeholders})
+        AND cloud_sync_states.mode = 'synced'
+        AND cloud_sync_states.published_generation_id IS NOT NULL
+      ORDER BY cloud_sync_states.knowledge_base_id
+    `).all(...selection.knowledgeBaseIds) as Array<{ knowledgeBaseId: string }>
+    const syncedIds = new Set(syncedRows.map(({ knowledgeBaseId }) => knowledgeBaseId))
+    let cloud: CapturedSearchScope['cloud']
+    if (syncedIds.size > 0 && this.options.cloud && await this.cloudRetrievalEnabled()) {
+      try {
+        const retriever = new CloudRetriever(this.options.cloud)
+        cloud = {
+          retriever,
+          snapshot: await retriever.captureSnapshot(
+            selection.knowledgeBaseIds.filter(id => syncedIds.has(id)),
+          ),
+        }
+      } catch {
+        cloud = undefined
+      }
+    }
+    const allVersionIds = Object.freeze(versionRows.map(({ versionId }) => versionId))
+    const localVersionIds = Object.freeze(versionRows
+      .filter(({ knowledgeBaseId }) => cloud === undefined || !syncedIds.has(knowledgeBaseId))
+      .map(({ versionId }) => versionId))
+    this.searchSnapshots.set(snapshot, {
+      ownerId: owner.userId,
+      conversationId,
+      epoch: this.searchSnapshotEpoch,
+      allVersionIds,
+      localVersionIds,
+      ...(cloud === undefined ? {} : { cloud }),
+    })
+    return snapshot
+  }
+
+  async searchSnapshot(
+    owner: KnowledgeOwner,
+    snapshot: KnowledgeSearchSnapshot,
+    rawQuery: string,
+  ): Promise<LocalKnowledgeSearchOutcome> {
+    const scope = this.searchSnapshots.get(snapshot)
+    if (!scope
+      || scope.ownerId !== owner.userId
+      || scope.epoch !== this.searchSnapshotEpoch) failure('INVALID_INPUT')
+    const session = await this.ensureSession(owner)
+    const query = rawQuery.trim()
+    if (Array.from(query).length <= 1) return { kind: 'ask_for_detail', results: [] }
+    if (!snapshot.selected) return { kind: 'results', results: [] }
+    const local = new LocalKnowledgeRetriever(session.opened.database)
+    if (!scope.cloud) return local.searchVersions(scope.allVersionIds, query)
+    const localResults = scope.localVersionIds.length === 0
+      ? []
+      : (await local.searchVersions(scope.localVersionIds, query)).results
+    try {
+      const cloudResults = (await scope.cloud.retriever.search(scope.cloud.snapshot, query)).results
+      return { kind: 'results', results: mergeRankedResults(localResults, cloudResults) }
+    } catch {
+      return local.searchVersions(scope.allVersionIds, query)
+    }
+  }
+
+  async previewCitation(
+    owner: KnowledgeOwner,
+    rawCitation: KnowledgeCitationReference,
+  ): Promise<KnowledgeCitationPreview> {
+    const parsed = knowledgeCitationReferenceSchema.safeParse(rawCitation)
+    if (!parsed.success) failure('INVALID_INPUT')
+    const session = await this.ensureSession(owner)
+    const row = session.opened.database.prepare(`
+      SELECT kb_chunks.id, kb_chunks.knowledge_base_id AS knowledgeBaseId,
+        kb_chunks.document_id AS documentId, kb_chunks.version_id AS versionId,
+        kb_chunks.block_id AS blockId, kb_chunks.body,
+        kb_chunks.coordinates_json AS coordinatesJson
+      FROM kb_chunks
+      JOIN documents ON documents.id = kb_chunks.document_id
+      JOIN knowledge_bases ON knowledge_bases.id = kb_chunks.knowledge_base_id
+      WHERE kb_chunks.id = ?
+        AND kb_chunks.document_id = ?
+        AND kb_chunks.version_id = ?
+        AND documents.status <> 'recycled'
+        AND knowledge_bases.status <> 'recycled'
+    `).get(
+      parsed.data.evidenceId,
+      parsed.data.documentId,
+      parsed.data.versionId,
+    ) as KnowledgeChunkRow | undefined
+    if (!row) return { status: 'unavailable' }
+    const citation = citationForKnowledgeChunk(row)
+    if (!isDeepStrictEqual(citation, parsed.data)) return { status: 'unavailable' }
+    const excerpt = row.body.trim().slice(0, 1_000)
+    if (!excerpt) return { status: 'unavailable' }
+    if (citation.kind === 'pdf') {
+      return {
+        status: 'available', excerpt, kind: citation.kind, page: citation.page,
+        startOffset: citation.startOffset, endOffset: citation.endOffset,
+      }
+    }
+    if (citation.kind === 'docx') {
+      return {
+        status: 'available', excerpt, kind: citation.kind,
+        headingPath: citation.headingPath, paragraphId: citation.paragraphId,
+      }
+    }
+    if (citation.kind === 'txt') {
+      return {
+        status: 'available', excerpt, kind: citation.kind,
+        startLine: citation.startLine, endLine: citation.endLine,
+        startColumn: citation.startColumn, endColumn: citation.endColumn,
+      }
+    }
+    return { status: 'available', excerpt, kind: citation.kind, nodeId: citation.nodeId }
+  }
+
   async getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability> {
     const reasons = await this.preflightAvailability()
     if (reasons.length === 0) {
@@ -678,6 +850,7 @@ export class KnowledgeService implements KnowledgePersistence {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise
     this.closing = true
+    this.searchSnapshotEpoch += 1
     const initialSession = this.session
     const pendingOpening = this.opening
     const operation = (async () => {

@@ -34,11 +34,11 @@ export class WorkflowToolLoop {
     this.startedAt = options.now()
   }
 
-  beginDecision(options: { browserContinuationActive?: boolean } = {}):
+  beginDecision():
     | { kind: 'decision'; decisionIndex: number }
     | LoopFailure {
     if (this.activeExpired()) return { kind: 'failed', code: 'MODEL_PROVIDER_TIMEOUT' }
-    if (this.decisions >= MAX_MODEL_DECISIONS && !options.browserContinuationActive) {
+    if (this.decisions >= MAX_MODEL_DECISIONS) {
       return { kind: 'failed', code: 'TOOL_CALL_LIMIT' }
     }
     this.decisions += 1

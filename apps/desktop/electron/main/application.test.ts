@@ -61,7 +61,7 @@ import {
 import { SecretStore } from './security/secret-store.js'
 import { readEncryptedObjectSnapshot } from './knowledge/encrypted-object-store.js'
 import type { CloudBaseFunctionPort } from './knowledge/cloudbase-knowledge-client.js'
-import type { KnowledgeParserPort } from './knowledge/knowledge-service.js'
+import { KnowledgeService, type KnowledgeParserPort } from './knowledge/knowledge-service.js'
 import { DEFAULT_PARSER_LIMITS } from './knowledge/parser-protocol.js'
 import { parseEncryptedDocument } from './knowledge/parser-worker.js'
 import { SettingsService } from './settings/settings-service.js'
@@ -754,6 +754,144 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('captures one Main-owned knowledge snapshot only for a tool-capable text route', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-agent-snapshot-'))
+    directories.push(root)
+    const knowledgeSnapshot = Object.freeze({ selected: true, knowledgeMode: 'strict' as const })
+    const capture = vi.spyOn(KnowledgeService.prototype, 'captureSearchSnapshot')
+      .mockResolvedValue(knowledgeSnapshot)
+    const agentRuns: Parameters<AgentOrchestrator['run']>[0][] = []
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockImplementation(async (input) => {
+      agentRuns.push(input)
+      return { requestId: input.requestId!, status: 'completed' }
+    })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [
+        { ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true },
+        modelInfo('openrouter/plain', 'Plain'),
+        imageModelInfo('openrouter/image'),
+      ]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      generateImage: vi.fn(async () => ({ outputs: [] })),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    const session = await authenticate(runtime, 'KnowledgeAgentSnapshot')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const toolConversation = await runtime.services.chat.createConversation()
+    const plainConversation = await runtime.services.chat.createConversation()
+    const imageConversation = await runtime.services.chat.createConversation()
+
+    await runtime.services.chat.send({
+      ...chatInput(toolConversation.id, '查我的资料'), model: 'openrouter/tools', outputType: 'text',
+    })
+    await runtime.services.chat.send({
+      ...chatInput(plainConversation.id, '普通回答'), model: 'openrouter/plain', outputType: 'text',
+    })
+    await runtime.services.chat.send({
+      ...chatInput(imageConversation.id, '生成图片'), model: 'openrouter/image', outputType: 'image',
+    })
+    await vi.waitFor(() => expect(agentRuns).toHaveLength(2))
+
+    expect(capture).toHaveBeenCalledOnce()
+    expect(capture).toHaveBeenCalledWith({ userId: session.user.id }, toolConversation.id)
+    expect(agentRuns[0]?.knowledgeSnapshot).toBe(knowledgeSnapshot)
+    expect(agentRuns[1]?.knowledgeSnapshot).toBeUndefined()
+    await runtime.close()
+  })
+
+  it('persists snippet-disclosure consent per authenticated chat provider and requires it again after switching', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-provider-consent-'))
+    directories.push(root)
+    const resume = vi.spyOn(AgentOrchestrator.prototype, 'resumeKnowledgeConsent')
+      .mockImplementation(async ({ requestId }) => requestId === 'request_forged'
+        ? { requestId, status: 'failed', error: { code: 'CONFLICT', message: 'Conflict.' } }
+        : { requestId, status: 'completed' })
+    const runtime = createApplicationRuntime(options(root))
+    const session = await authenticate(runtime, 'KnowledgeProviderConsent')
+    const conversation = await runtime.services.chat.createConversation()
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.chatRuns.insert({
+      id: 'run_openrouter', conversationId: conversation.id, requestId: 'request_openrouter',
+      userId: session.user.id, provider: 'openrouter', model: 'model', status: 'running', startedAt: 1,
+    })
+    database.chatRuns.insert({
+      id: 'run_deepseek', conversationId: conversation.id, requestId: 'request_deepseek',
+      userId: session.user.id, provider: 'deepseek', model: 'model', status: 'running', startedAt: 2,
+    })
+    database.chatRuns.insert({
+      id: 'run_forged', conversationId: conversation.id, requestId: 'request_forged',
+      userId: session.user.id, provider: 'deepseek', model: 'model', status: 'completed', startedAt: 3,
+    })
+    database.close()
+
+    await expect(runtime.services.chat.decideKnowledgeConsent({
+      requestId: 'request_forged', decision: 'grant',
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+    await runtime.services.settings.update({ activeProvider: 'deepseek' })
+    await expect(runtime.services.knowledge.getConsent({ userId: session.user.id })).resolves.toMatchObject({
+      chatProvider: { provider: 'deepseek', status: 'unknown' },
+    })
+    await runtime.services.chat.decideKnowledgeConsent({
+      requestId: 'request_openrouter', decision: 'grant',
+    })
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    await expect(runtime.services.knowledge.getConsent({ userId: session.user.id })).resolves.toMatchObject({
+      chatProvider: { provider: 'openrouter', status: 'granted' },
+    })
+    await runtime.services.settings.update({ activeProvider: 'deepseek' })
+    await expect(runtime.services.knowledge.getConsent({ userId: session.user.id })).resolves.toMatchObject({
+      chatProvider: { provider: 'deepseek', status: 'unknown' },
+    })
+    await runtime.services.chat.decideKnowledgeConsent({
+      requestId: 'request_deepseek', decision: 'deny',
+    })
+    await expect(runtime.services.knowledge.getConsent({ userId: session.user.id })).resolves.toMatchObject({
+      chatProvider: { provider: 'deepseek', status: 'denied' },
+    })
+    expect(resume).toHaveBeenCalledTimes(3)
+    await runtime.close()
+  })
+
+  it('resolves citation previews from an owned persisted message position instead of Renderer references', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-citation-preview-'))
+    directories.push(root)
+    const preview = vi.spyOn(KnowledgeService.prototype, 'previewCitation').mockResolvedValue({
+      status: 'available', kind: 'pdf', excerpt: '身份证明', page: 2,
+      startOffset: 4, endOffset: 18,
+    })
+    const runtime = createApplicationRuntime(options(root))
+    const session = await authenticate(runtime, 'KnowledgeCitationPreview')
+    const conversation = await runtime.services.chat.createConversation()
+    const citation = {
+      evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
+      kind: 'pdf' as const, page: 2, startOffset: 4, endOffset: 18,
+    }
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.messages.insert({
+      id: 'message_knowledge', conversationId: conversation.id, role: 'assistant', createdAt: 1,
+      blocks: [{
+        type: 'knowledge_answer', blockId: 'block_knowledge', mode: 'strict',
+        claims: [{ text: '需要身份证明。', support: 'knowledge', citations: [citation] }],
+      }],
+    })
+    database.close()
+
+    await expect(runtime.services.previewKnowledgeCitation(
+      { userId: session.user.id },
+      { conversationId: conversation.id, messageId: 'message_knowledge', blockId: 'block_knowledge', citationIndex: 0 },
+    )).resolves.toMatchObject({ status: 'available', kind: 'pdf', page: 2 })
+    expect(preview).toHaveBeenCalledWith({ userId: session.user.id }, citation)
+    await expect(runtime.services.previewKnowledgeCitation(
+      { userId: session.user.id },
+      { conversationId: conversation.id, messageId: 'message_knowledge', blockId: 'other_block', citationIndex: 0 },
+    )).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await runtime.close()
+  })
+
   it('wires embedding consent to the authenticated CloudBase client with a Main-owned request id', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-'))
     directories.push(root)

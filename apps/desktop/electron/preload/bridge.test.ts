@@ -130,7 +130,7 @@ describe('preload desktop bridge', () => {
       'listBases', 'createBase', 'listDocuments', 'listVersions', 'importDocument',
       'replaceDocument', 'recycleDocument', 'purgeDocument', 'recycleBase', 'purgeBase',
       'exportBase', 'getConversationSelection', 'updateConversationSelection', 'search',
-      'getFeatureAvailability', 'getEntitlement', 'getConsent', 'setEmbeddingConsent',
+      'previewCitation', 'getFeatureAvailability', 'getEntitlement', 'getConsent', 'setEmbeddingConsent',
     ])
     expect(app.api.knowledge).not.toHaveProperty('invoke')
   })
@@ -154,6 +154,25 @@ describe('preload desktop bridge', () => {
     })
     expect(app.api).not.toHaveProperty('invoke')
     expect(app.api).not.toHaveProperty('ipcRenderer')
+  })
+
+  it('maps knowledge consent and citation preview through fixed position-only channels', async () => {
+    const app = harness()
+    const decision = { requestId: 'request_1', decision: 'deny' as const }
+    const preview = {
+      conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: 'block_1', citationIndex: 0,
+    }
+
+    await app.api.chat.decideKnowledgeConsent(decision)
+    await app.api.knowledge.previewCitation(preview)
+
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(
+      1, ipcChannels.chatDecideKnowledgeConsent, decision,
+    )
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(
+      2, ipcChannels.knowledgePreviewCitation, preview,
+    )
   })
 
   it('uses provider-aware credential channels without exposing generic transport', async () => {

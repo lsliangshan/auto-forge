@@ -33,6 +33,16 @@
       v-else-if="block.type === 'browser_status'"
       :block="block"
     />
+    <KnowledgeStatusCard
+      v-else-if="block.type === 'knowledge_status'"
+      :block="block"
+    />
+    <KnowledgeAnswer
+      v-else-if="block.type === 'knowledge_answer'"
+      :block="block"
+      :conversation-id="conversationId"
+      :message-id="messageId"
+    />
     <WorkflowProvenance
       v-else-if="block.type === 'workflow_provenance'"
       :block="block"
@@ -78,13 +88,19 @@ import { displayError } from '../../services/desktop-api'
 import ApprovalCard from './ApprovalCard.vue'
 import BrowserStatusCard from './BrowserStatusCard.vue'
 import ExecutionCard from './ExecutionCard.vue'
+import KnowledgeAnswer from './KnowledgeAnswer.vue'
+import KnowledgeStatusCard from './KnowledgeStatusCard.vue'
 import { renderMarkdown } from './markdown'
 import MediaBlock from './MediaBlock.vue'
 import MediaGenerationBlock from './MediaGenerationBlock.vue'
 import WorkflowProvenance from './WorkflowProvenance.vue'
 import WorkflowStatusCard from './WorkflowStatusCard.vue'
 
-const props = defineProps<{ block: UiChatBlock }>()
+const props = withDefaults(defineProps<{
+  block: UiChatBlock
+  conversationId?: string
+  messageId?: string
+}>(), { conversationId: '', messageId: '' })
 const messageErrorText = computed(() => props.block.type === 'error'
   ? displayError({ code: props.block.code }, props.block.message)
   : '')

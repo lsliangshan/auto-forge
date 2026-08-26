@@ -72,6 +72,8 @@
                 v-for="block in message.blocks"
                 :key="block.id"
                 :block="block"
+                :conversation-id="chat.selectedConversationId"
+                :message-id="message.id"
               />
             </div>
           </div>

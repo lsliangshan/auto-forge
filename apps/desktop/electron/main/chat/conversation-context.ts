@@ -82,6 +82,21 @@ function unexpectedBlock(block: never): never {
   throw new Error(`Historical block type is invalid: ${String(block)}`)
 }
 
+function serializeKnowledgeCitation(
+  citation: Extract<ChatBlock, { type: 'knowledge_answer' }>['claims'][number]['citations'][number],
+): string {
+  const coordinate = citation.kind === 'pdf'
+    ? `PDF 第 ${citation.page} 页; 字符 ${citation.startOffset}-${citation.endOffset}`
+    : citation.kind === 'docx'
+      ? `DOCX 标题 ${citation.headingPath.join(' > ') || '正文'}; 段落 ${citation.paragraphId}`
+      : citation.kind === 'markdown' || citation.kind === 'html'
+        ? `${citation.kind.toUpperCase()} 节点 ${citation.nodeId}`
+        : citation.kind === 'txt'
+          ? `TXT 行 ${citation.startLine}-${citation.endLine}; 字符 ${citation.startColumn}-${citation.endColumn}`
+          : ''
+  return `${citation.documentId}@${citation.versionId}; ${coordinate}`
+}
+
 function serializeBlock(block: ChatBlock): string[] {
   switch (block.type) {
     case 'text':
@@ -104,6 +119,14 @@ function serializeBlock(block: ChatBlock): string[] {
       ))
     case 'browser_status':
       return [`[浏览器页面: ${block.siteLabel}; 来源: ${block.origin}; 操作: ${block.actionSummary ?? '无'}; 状态: ${block.state}]`]
+    case 'knowledge_status':
+      return [`[知识库检索: ${block.state}; 检索: ${block.searchIndex}/${block.searchLimit}; 结果: ${block.resultCount}]`]
+    case 'knowledge_answer':
+      return block.claims.map((claim) => {
+        const citations = claim.citations.map(serializeKnowledgeCitation)
+        return `[知识库声明; 模式: ${block.mode}; 支持: ${claim.support}] ${claim.text}`
+          + (citations.length === 0 ? '' : ` [引用: ${citations.join(' | ')}]`)
+      })
     case 'workflow_execution':
       return [`[工作流执行: ${block.executionId}]`]
     case 'execution_result':
