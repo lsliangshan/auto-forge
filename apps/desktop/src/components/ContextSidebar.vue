@@ -124,6 +124,13 @@
           :disabled="!knowledge.canRecycle || knowledge.operationPending"
           @click="recycleKnowledgeBase"
         >回收</el-button>
+        <el-button
+          data-testid="knowledge-purge-base"
+          size="small"
+          type="danger"
+          :disabled="!knowledge.canRecycle || knowledge.operationPending"
+          @click="purgeKnowledgeBase"
+        >永久删除</el-button>
       </div>
     </template>
 
@@ -305,6 +312,16 @@ async function recycleKnowledgeBase() {
       type: 'warning', confirmButtonText: '确认回收', cancelButtonText: '取消',
     })
     await knowledge.recycleSelectedBase()
+  } catch { /* Cancellation does not mutate knowledge state. */ }
+}
+async function purgeKnowledgeBase() {
+  const base = knowledge.selectedBase
+  if (!base) return
+  try {
+    await ElMessageBox.confirm(`确认永久删除知识库“${base.name}”及其文件？此操作无法恢复。`, '永久删除知识库', {
+      type: 'error', confirmButtonText: '永久删除', cancelButtonText: '取消',
+    })
+    await knowledge.purgeSelectedBase()
   } catch { /* Cancellation does not mutate knowledge state. */ }
 }
 const conversationSearch = ref('')

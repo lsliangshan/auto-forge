@@ -69,6 +69,32 @@ describe('CloudBase knowledge function', () => {
     })
   })
 
+  it('fails signed entitlement issuance closed without a configured signer', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      membershipExpiresAt: '2026-09-26T00:00:00.000Z', killSwitchEnabled: false,
+    })
+    const handler = createKnowledgeHandler({ rpc })
+    await expect(handler({ action: 'getEntitlement' }, context)).resolves.toEqual({
+      ok: false, error: { code: 'ENTITLEMENT_REQUIRED' },
+    })
+  })
+
+  it('signs getEntitlement only with runtime owner and the server database row', async () => {
+    const record = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      membershipExpiresAt: '2026-09-26T00:00:00.000Z', killSwitchEnabled: false,
+    }
+    const rpc = vi.fn().mockResolvedValue(record)
+    const entitlementSigner = vi.fn().mockResolvedValue({ version: 1, signature: 'signed' })
+    const handler = createKnowledgeHandler({ rpc, entitlementSigner })
+    await expect(handler({
+      action: 'getEntitlement', userId: 'attacker', keyId: 'attacker-key',
+      issuedAt: '2099-01-01T00:00:00.000Z', betaEnabled: false,
+    }, context)).resolves.toEqual({ ok: true, data: { version: 1, signature: 'signed' } })
+    expect(entitlementSigner).toHaveBeenCalledWith('2089908515857502208', record)
+  })
+
   it('rejects missing identity and invalid or oversized business input', async () => {
     const rpc = vi.fn()
     const handler = createKnowledgeHandler({ rpc })

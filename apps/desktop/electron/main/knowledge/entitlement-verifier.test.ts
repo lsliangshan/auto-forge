@@ -1,5 +1,5 @@
 import { createPrivateKey, sign } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -99,8 +99,8 @@ describe('KnowledgeEntitlementVerifier', () => {
   it('never grants grace to signed expired, revoked, kill-switched, or membership-expired state', () => {
     const now = '2026-08-26T02:00:00.000Z'
     for (const [envelope, expectedStatus] of [
-      [signedEnvelope({ membershipStatus: 'expired' }), 'expired'],
-      [signedEnvelope({ membershipStatus: 'revoked' }), 'expired'],
+      [signedEnvelope({ membershipStatus: 'expired', membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt }), 'expired'],
+      [signedEnvelope({ membershipStatus: 'revoked', membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt }), 'expired'],
       [signedEnvelope({ killSwitchEnabled: true }), 'active'],
       [signedEnvelope({ membershipExpiresAt: '2026-08-26T02:00:00.000Z' }), 'expired'],
     ] as const) {
@@ -116,6 +116,43 @@ describe('KnowledgeEntitlementVerifier', () => {
     expect(verifier('2026-08-26T00:00:00.000Z').verify('alice', future).status).toBe('active')
     expect(() => verifier('2026-08-25T23:59:59.999Z').verify('alice', future))
       .toThrow('issued_in_future')
+  })
+
+  it('rejects surrounding user whitespace and a non-canonical base64url signature encoding', () => {
+    const whitespace = signedEnvelope({ userId: ' alice ' })
+    expect(() => verifier('2026-08-26T00:30:00.000Z').verify('alice', whitespace))
+      .toThrow('invalid_envelope')
+
+    const nonCanonicalSignature = `${ACTIVE_SIGNATURE.slice(0, -1)}x`
+    expect(Buffer.from(nonCanonicalSignature, 'base64url')).toEqual(Buffer.from(ACTIVE_SIGNATURE, 'base64url'))
+    expect(() => verifier('2026-08-26T00:30:00.000Z').verify('alice', {
+      ...ACTIVE_ENVELOPE,
+      signature: nonCanonicalSignature,
+    })).toThrow('invalid_envelope')
+  })
+
+  it('requires active membership to end after issuance and terminal membership to end no later than issuance', () => {
+    expect(() => verifier('2026-08-26T00:30:00.000Z').verify('alice', signedEnvelope({
+      membershipStatus: 'active',
+      membershipExpiresAt: ACTIVE_PAYLOAD.issuedAt,
+    }))).toThrow('invalid_time_order')
+    expect(() => verifier('2026-08-26T00:30:00.000Z').verify('alice', signedEnvelope({
+      membershipStatus: 'expired',
+      membershipExpiresAt: '2026-08-27T00:00:00.000Z',
+    }))).toThrow('invalid_time_order')
+  })
+
+  it('anchors early revocation windows to its signed terminal timestamp', () => {
+    const revoked = signedEnvelope({
+      issuedAt: '2026-08-26T00:00:00.000Z',
+      snapshotExpiresAt: '2026-08-27T00:00:00.000Z',
+      membershipExpiresAt: '2026-08-25T12:00:00.000Z',
+      membershipStatus: 'revoked',
+    })
+    expect(verifier('2026-09-24T11:59:59.999Z').verify('alice', revoked).lifecycle.phase)
+      .toBe('download_window')
+    expect(verifier('2026-09-24T12:00:00.000Z').verify('alice', revoked).lifecycle.phase)
+      .toBe('recycle_window')
   })
 
   it.each([
@@ -226,10 +263,117 @@ describe('KnowledgeEntitlementAuthority', () => {
     await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
       knowledgeToolEnabled: false, killSwitchEnabled: true,
     })
+    now += 2
+    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+  })
+
+  it('serializes refresh and commit per user so a slow older grant cannot overwrite a newer kill switch', async () => {
+    const stored = cache()
+    let releaseOlder!: (value: KnowledgeEntitlementEnvelope) => void
+    const older = new Promise<KnowledgeEntitlementEnvelope>(resolve => { releaseOlder = resolve })
+    const kill = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-27T00:10:00.000Z',
+      killSwitchEnabled: true,
+    })
+    let calls = 0
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => (++calls === 1 ? older : kill),
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    })
+
+    const slowGrant = authority.getEntitlement({ userId: 'alice' })
+    await vi.waitFor(() => expect(calls).toBe(1))
+    const revoke = authority.getEntitlement({ userId: 'alice' })
+    await new Promise(resolve => setImmediate(resolve))
+    releaseOlder(ACTIVE_ENVELOPE)
+
+    await expect(slowGrant).resolves.toMatchObject({ killSwitchEnabled: false })
+    await expect(revoke).resolves.toMatchObject({ killSwitchEnabled: true })
+    expect(stored.values.get('alice')?.envelope).toEqual(kill)
+  })
+
+  it('does not let one owner refresh block another owner', async () => {
+    const stored = cache()
+    let releaseAlice!: (value: KnowledgeEntitlementEnvelope) => void
+    const alice = new Promise<KnowledgeEntitlementEnvelope>(resolve => { releaseAlice = resolve })
+    const bobEnvelope = signedEnvelope({ userId: 'bob' })
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: owner => owner.userId === 'alice' ? alice : Promise.resolve(bobEnvelope),
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    })
+
+    const pendingAlice = authority.getEntitlement({ userId: 'alice' })
+    await expect(authority.getEntitlement({ userId: 'bob' })).resolves.toMatchObject({ tier: 'member' })
+    releaseAlice(ACTIVE_ENVELOPE)
+    await expect(pendingAlice).resolves.toMatchObject({ tier: 'member' })
+  })
+
+  it('keeps an owner fail-closed after a newer kill switch cannot be committed', async () => {
+    const stored = cache()
+    stored.values.set('alice', {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:00:00.000Z',
+    })
+    const kill = signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-27T00:10:00.000Z',
+      killSwitchEnabled: true,
+    })
+    let writes = 0
+    stored.write = async (userId, record) => {
+      writes += 1
+      if (writes === 1) throw new Error('disk unavailable')
+      stored.values.set(userId, record)
+    }
+    const fetchEnvelope = vi.fn().mockResolvedValueOnce(kill).mockResolvedValue(ACTIVE_ENVELOPE)
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored, fetchEnvelope,
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    })
+
+    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    expect(fetchEnvelope).toHaveBeenCalledTimes(1)
   })
 })
 
 describe('SafeStorageKnowledgeEntitlementCache', () => {
+  it('durably enrolls the owner before the first encrypted record so a failed first write cannot re-bootstrap', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-order-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async () => { throw new Error('injected encryption failure') },
+      decrypt: async () => { throw new Error('not reached') },
+    }
+    const cache = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+    await expect(cache.write('alice', {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })).rejects.toThrow('injected encryption failure')
+    expect(await readdir(directory)).toEqual([expect.stringMatching(/\.enrolled$/)])
+
+    const restarted = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache,
+      fetchEnvelope: async () => ACTIVE_ENVELOPE,
+      now: () => Date.parse('2026-08-26T00:31:00.000Z'),
+    })
+    await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+  })
+
   it('persists one encrypted owner-scoped record and reloads it after restart without cross-user bleed', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-'))
     directories.push(directory)
@@ -245,14 +389,78 @@ describe('SafeStorageKnowledgeEntitlementCache', () => {
     }
     const first = new SafeStorageKnowledgeEntitlementCache(directory, storage)
     await first.write('alice', record)
-    const files = await import('node:fs/promises').then(({ readdir }) => readdir(directory))
-    expect(files).toHaveLength(1)
-    const disk = await readFile(join(directory, files[0]!), 'utf8')
+    const files = await readdir(directory)
+    expect(files).toHaveLength(2)
+    const recordFile = files.find(file => file.endsWith('.json'))!
+    const disk = await readFile(join(directory, recordFile), 'utf8')
     expect(disk).not.toContain('alice')
     expect(disk).not.toContain(ACTIVE_PAYLOAD.membershipExpiresAt)
 
     const restarted = new SafeStorageKnowledgeEntitlementCache(directory, storage)
     await expect(restarted.read('alice')).resolves.toEqual(record)
     await expect(restarted.read('bob')).resolves.toBeUndefined()
+  })
+
+  it.each(['deleted', 'corrupt'] as const)(
+    'fails closed after an enrolled owner cache is %s and does not accept a replayed old grant',
+    async damage => {
+      const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-damage-'))
+      directories.push(directory)
+      const storage: SafeStoragePort = {
+        isAvailable: async () => true,
+        encrypt: async value => Buffer.from(`wrapped:${value}`),
+        decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+      }
+      const cache = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+      await cache.write('alice', {
+        envelope: ACTIVE_ENVELOPE,
+        maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+        maxObservedAt: '2026-08-26T00:30:00.000Z',
+      })
+      const recordFile = (await readdir(directory)).find(file => file.endsWith('.json'))!
+      if (damage === 'deleted') await unlink(join(directory, recordFile))
+      else await writeFile(join(directory, recordFile), '{not-json')
+
+      const restarted = new KnowledgeEntitlementAuthority({
+        trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache,
+        fetchEnvelope: async () => ACTIVE_ENVELOPE,
+        now: () => Date.parse('2026-08-26T00:31:00.000Z'),
+      })
+      await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toEqual({
+        tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+        knowledgeToolEnabled: false, killSwitchEnabled: true,
+      })
+    },
+  )
+
+  it('isolates enrollment watermarks so a new owner can bootstrap when another owner cache is missing', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'autoforge-entitlement-cache-owners-'))
+    directories.push(directory)
+    const storage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async value => Buffer.from(`wrapped:${value}`),
+      decrypt: async value => ({ value: value.toString().slice('wrapped:'.length), shouldReEncrypt: false }),
+    }
+    const cache = new SafeStorageKnowledgeEntitlementCache(directory, storage)
+    await cache.write('alice', {
+      envelope: ACTIVE_ENVELOPE,
+      maxIssuedAt: ACTIVE_PAYLOAD.issuedAt,
+      maxObservedAt: '2026-08-26T00:30:00.000Z',
+    })
+    const recordFile = (await readdir(directory)).find(file => file.endsWith('.json'))!
+    await unlink(join(directory, recordFile))
+    const bobEnvelope = signedEnvelope({ userId: 'bob' })
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache,
+      fetchEnvelope: owner => Promise.resolve(owner.userId === 'bob' ? bobEnvelope : ACTIVE_ENVELOPE),
+      now: () => Date.parse('2026-08-26T00:31:00.000Z'),
+    })
+
+    await expect(authority.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    await expect(authority.getEntitlement({ userId: 'bob' })).resolves.toMatchObject({
+      tier: 'member', killSwitchEnabled: false,
+    })
   })
 })

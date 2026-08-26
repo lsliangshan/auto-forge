@@ -133,6 +133,12 @@
           :disabled="!knowledge.canRecycle || knowledge.operationPending"
           @click="recycleDocument"
         >移入回收站</el-button>
+        <el-button
+          data-testid="knowledge-purge-document"
+          type="danger"
+          :disabled="!knowledge.canRecycle || knowledge.operationPending"
+          @click="purgeDocument"
+        >立即永久删除</el-button>
       </div>
     </footer>
   </section>
@@ -151,7 +157,7 @@ const lifecycleMessage = computed(() => {
   const lifecycle = knowledge.entitlement?.lifecycle
   if (!lifecycle) return ''
   if (lifecycle.phase === 'download_window') {
-    return `云端内容可下载或转换至 ${new Date(lifecycle.downloadUntil).toLocaleDateString('zh-CN')}`
+    return `云端下载/转换尚未开放，需完成预发布外部门禁；本地缓存仍可导出（窗口截至 ${new Date(lifecycle.downloadUntil).toLocaleDateString('zh-CN')}）`
   }
   if (lifecycle.phase === 'recycle_window') return '云端内容处于回收期，可继续管理本地缓存'
   if (lifecycle.phase === 'purge_eligible') return '云端内容已具备清理资格'
@@ -173,6 +179,17 @@ async function recycleDocument() {
       type: 'warning', confirmButtonText: '确认回收', cancelButtonText: '取消',
     })
     await knowledge.recycleSelectedDocument()
+  } catch { /* Cancellation does not mutate knowledge state. */ }
+}
+
+async function purgeDocument() {
+  const document = knowledge.selectedDocument
+  if (!document) return
+  try {
+    await ElMessageBox.confirm(`确认永久删除“${document.name}”？此操作无法恢复。`, '永久删除文件', {
+      type: 'error', confirmButtonText: '永久删除', cancelButtonText: '取消',
+    })
+    await knowledge.purgeSelectedDocument()
   } catch { /* Cancellation does not mutate knowledge state. */ }
 }
 

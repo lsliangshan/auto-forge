@@ -565,7 +565,7 @@ async function probeEmbeddingDrift({
 }
 
 function createKnowledgeHandler({
-  rpc, storage, embeddings, logger, now = Date.now,
+  rpc, storage, embeddings, entitlementSigner, logger, now = Date.now,
   embeddingTimeoutMs = EMBEDDING_SEND_TIMEOUT_MS,
   releaseTimeoutMs = EMBEDDING_RELEASE_TIMEOUT_MS,
 }) {
@@ -607,6 +607,10 @@ function createKnowledgeHandler({
           embeddingTimeoutMs: boundedEmbeddingTimeoutMs,
           releaseTimeoutMs: boundedReleaseTimeoutMs,
         }) }
+      }
+      if (event.action === 'getEntitlement') {
+        if (typeof entitlementSigner !== 'function') throw { code: 'ENTITLEMENT_REQUIRED' }
+        return { ok: true, data: await entitlementSigner(uid, data) }
       }
       if (event.action === 'authorizeUpload') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }

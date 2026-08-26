@@ -11,7 +11,7 @@
 - Persisted exact lifecycle boundaries: `[expiry, +30d)` download/convert window, `[+30d, +60d)` recycle window, and `>= +60d` purge eligibility. Local cached export, recycle, purge, and immediate deletion remain available throughout. No claim is made that logical purge erases physical SSD remnants or third-party backups.
 - Closed all cloud surfaces on a signed/server kill switch: cloud search, captured cloud-snapshot search, embedding-consent reads/mutations, and new Agent knowledge tool admission. An already-captured authorized local-only immutable snapshot can finish; it performs no new provider/cloud disclosure. Local management/export/delete remains visible and enabled.
 - Wired the downgrade choice through Application/KnowledgeService, authenticated IPC, strict shared schemas, Preload, Pinia, and UI. Renderer state remains advisory; Main revalidates owner, entitlement, membership epoch, base, file, version, locality, and current lifecycle.
-- Added a minimal deployable server envelope adapter that accepts only an injected `signCanonical(bytes, keyId)` private KMS signer. It is deliberately not connected to the Cloud Function entry because no approved KMS signer, public key, TokenHub credential, or pre-production CloudBase exists.
+- Added a minimal deployable server envelope adapter that accepts only an injected `signCanonical(bytes, deploymentKeyId)` private KMS signer. The authenticated `get_entitlement` handler has a fail-closed injection seam, while the production entry deliberately provides no signer because no approved KMS signer, public key, TokenHub credential, or pre-production CloudBase exists.
 
 ## Exact RED evidence
 
@@ -75,7 +75,7 @@
 
 - No real CloudBase, PostgreSQL, PG Storage, TokenHub, provider, KMS, or production key was accessed or modified.
 - No approved production Ed25519 public key or private KMS signer exists. Production trusted keys remain `{}`; beta, cloud, and new Agent knowledge admission therefore remain closed while local non-member management stays usable.
-- The server signing adapter is not wired into the Cloud Function entry. Pre-production must supply an audited KMS signer, embed the matching build-time public-key allowlist, exercise rotation/revocation/clock behavior, and prove signed fetch/cache behavior before enabling any gate.
+- The server signing adapter is wired only as an injected, fail-closed authenticated handler seam; the production Cloud Function entry provides no signer. Pre-production must supply an audited KMS signer, embed the matching build-time public-key allowlist, exercise rotation/revocation/clock behavior, and prove signed fetch/cache behavior before enabling any gate.
 - Remote download/convert, scheduled recycle, remote purge eligibility, physical object deletion, PostgreSQL/RLS, and third-party backup retention require an isolated pre-production environment. This task persists and enforces the exact local state/window contract but does not claim those external operations ran.
 - Logical purge does not claim forensic erasure from SSD wear-leveling, snapshots, logs outside the defined payload-free contract, or third-party backups.
 
@@ -86,3 +86,45 @@
 - Verified production-empty trust never accepts the legacy unsigned CloudBase entitlement as a grant. The existing unsigned server response is consulted only as an additional denial while an injected/signed Main state already authorizes cloud use.
 - Kept Task 8 workflow/browser policies, immutable version scope, provider disclosure contract, and 5/3/10/8 budgets unchanged.
 - No Critical or Important issue remains in the Task 9 scope. The unrelated `CONTEXT_LIMIT_EXCEEDED` baseline and prohibited external release gates remain explicitly open concerns.
+
+## Fix Round 1/5: entitlement lifecycle hardening
+
+### Review findings resolved
+
+- Serialized fetch/verify/commit with a per-user authority tail. Different owners still proceed independently, but a slow older active refresh can no longer overwrite or re-enable a newer revoked/kill state. Verification, cache, and clock failures become sticky for that owner for the process lifetime.
+- Added a separate owner-enrollment watermark. The marker is durably written before the first encrypted record, so a crash can leave only the safer marker-without-record state. Once enrolled, missing, corrupt, undecryptable, or schema-invalid cache state fails closed and cannot bootstrap from a replayed older active envelope. Owner markers and failure state do not bleed across users.
+- Reconciled unverifiable/free authority against retained paid data. A never-member installation retains the normal one-local-base/one-active-file mode; retained data above that quota instead becomes read-only/non-searchable, clears conversation scope, and requires an exact ready, non-recycled, local-only selection. The selection persists over restart and direct search/replace cannot bypass it.
+- Made every legacy unsigned server field additional-denial only: member tier, active/offline-grace status, beta enabled, cloud enabled where applicable, and kill disabled are all required. An unsigned response never grants capability.
+- Removed synced-cache disclosure after kill. Captured or direct synced/cloud scope never falls back to cached `allVersionIds`; only versions captured from bases that were local-only may complete. Every remote await is followed by a current gate check, including rejection fallback and snapshot capture.
+- Hardened the signer boundary. Runtime auth supplies the owner, a strict database record supplies membership/status/flags, and frozen deployment configuration supplies key id, TTL, and time. Caller-shaped payloads, owners, flags, key ids, and timestamps are rejected. No configured signer means fail closed.
+- Enforced terminal chronology: active membership expires strictly after issue, while expired/revoked membership terminates no later than issue. The 30-day download/convert and 60-day purge-eligibility boundaries anchor to that signed terminal timestamp, including early revocation.
+- Added confirmed immediate document and base purge actions through Store -> Preload -> IPC -> Main, using the existing strict purge requests. Kill switch does not hide local management/export/delete/purge. Cloud download/convert is explicitly unavailable pending the external pre-production gate; the UI no longer promises an unassembled production operation.
+- Canonical grammar now rejects surrounding user-id whitespace and requires a canonical base64url signature that decodes and round-trips exactly to 64 bytes. `createBase` now uses one serialized authoritative entitlement decision, so expiry during an earlier await cannot commit a base.
+
+### Exact RED/GREEN evidence
+
+- Verifier/cache initial review slice: RED 9 failed / 18 passed; GREEN 28 passed. It covers same-owner active-versus-kill ordering, different-owner concurrency, sticky write/clock failures, canonical user/signature grammar, terminal chronology, deletion/corruption/replay, restart, and owner isolation.
+- Enrollment crash ordering: RED 1 failed / 27 skipped; GREEN in the 28-test verifier/cache suite. The injected marker-to-record failure leaves the marker present and missing record fail-closed after restart.
+- Sticky rollback recovery: RED 1 failed / 27 skipped; GREEN in the 28-test verifier/cache suite.
+- KnowledgeService lifecycle/denial/race review slice: RED 9 failed / 42 skipped; GREEN 9 passed. It covers retained-paid fail-closed selection, never-member 1/1 usability, restart enforcement, direct replacement/search, unsigned server denial matrix, synced-cache kill scope, and the `createBase` expiry race.
+- First broad KnowledgeService rerun exposed one idempotent-selection regression (1 failed / 78 passed); the exact-match idempotency rule was corrected and the focused rerun passed 2/2.
+- Final remote-await self-review slice first reproduced cached synced search after a kill, then reproduced a captured synced snapshot returning selected after the switch. Each behavior was literal RED in sequence; the final test passed 1/1 with 51 skipped.
+- Server signer adapter: RED 0/4 because the hardened factory was absent; GREEN 4/4. Authenticated handler injection: RED 0/2; GREEN 2/2, with the full handler suite 42/42.
+- Renderer reachability/truth slice: RED 2 failed / 43 skipped; GREEN 2/2. The full Renderer knowledge suite passed 45/45.
+
+### Final verification
+
+- Electron Main/Application/IPC/Preload combined runner: 16 files, 384 passed / exactly 1 failed (385 total). The sole failure is the pre-existing Application context-summary billing baseline; both the emitted block and failed status contain exactly `CONTEXT_LIMIT_EXCEEDED`.
+- Renderer knowledge: 45/45. Shared contracts: 81/81. CloudBase knowledge handler: 42/42. Server signer: 4/4.
+- `pnpm typecheck`: all four workspace projects passed.
+- `pnpm lint --quiet`: exit 0.
+- `pnpm build`: Main, Preload, Renderer, workers, shared, and workflow packages passed.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui`: real Electron Renderer -> Preload -> IPC -> Main -> parser -> encrypted persistence passed with `{"ok":true}`, visible import acknowledgement, ready document, selector, persisted strict selection, and restart restore.
+- Diff self-review found and fixed the two additional remote-await gate variants above. Final Task 9 Fix Round 1 assessment: Critical 0, Important 0, Minor 0.
+
+### External gates unchanged
+
+- No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified.
+- Production build-time trusted keys remain empty; beta, cloud, and new Agent knowledge admission remain closed. The free local 1-base/1-file management surface remains authoritative and usable.
+- The authenticated signer seam has no production signer. Remote conversion/download remains explicitly unavailable until an owner-scoped pre-production cloud client, approved KMS signer/public key, and release-gate evidence exist.
+- Logical purge does not claim physical SSD, snapshot, log, or third-party backup erasure.

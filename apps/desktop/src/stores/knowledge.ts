@@ -385,6 +385,17 @@ export const useKnowledgeStore = defineStore('knowledge', {
         this.selectedDocumentId = ''
       })
     },
+    async purgeSelectedDocument() {
+      const document = this.selectedDocument
+      if (!document || this.operationPending || !this.canRecycle) return
+      await this.runOperation('永久删除文件失败', async (isCurrent) => {
+        await getDesktopApi().knowledge.purgeDocument(document.id)
+        if (!isCurrent()) return
+        this.documentsByBase[document.knowledgeBaseId] = this.documents
+          .filter(({ id }) => id !== document.id)
+        this.selectedDocumentId = ''
+      })
+    },
     async exportSelectedBase() {
       if (!this.selectedBaseId || this.operationPending || !this.canExport) return
       await this.runOperation('导出知识库失败', async () =>
@@ -395,6 +406,19 @@ export const useKnowledgeStore = defineStore('knowledge', {
       if (!baseId || this.operationPending || !this.canRecycle) return
       await this.runOperation('移入回收站失败', async (isCurrent) => {
         await getDesktopApi().knowledge.recycleBase(baseId)
+        if (!isCurrent()) return
+        this.bases = this.bases.filter(({ id }) => id !== baseId)
+        delete this.documentsByBase[baseId]
+        this.selectedBaseId = this.bases[0]?.id ?? ''
+        this.selectedDocumentId = ''
+        if (this.selectedBaseId) await this.loadDocuments(this.selectedBaseId)
+      })
+    },
+    async purgeSelectedBase() {
+      const baseId = this.selectedBaseId
+      if (!baseId || this.operationPending || !this.canRecycle) return
+      await this.runOperation('永久删除知识库失败', async (isCurrent) => {
+        await getDesktopApi().knowledge.purgeBase(baseId)
         if (!isCurrent()) return
         this.bases = this.bases.filter(({ id }) => id !== baseId)
         delete this.documentsByBase[baseId]

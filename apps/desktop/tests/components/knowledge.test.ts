@@ -547,7 +547,7 @@ describe('knowledge Store boundary', () => {
   })
 
   it.each([
-    ['download_window', '云端内容可下载或转换至 2026/9/25'],
+    ['download_window', '云端下载/转换尚未开放，需完成预发布外部门禁；本地缓存仍可导出'],
     ['recycle_window', '云端内容处于回收期，可继续管理本地缓存'],
     ['purge_eligible', '云端内容已具备清理资格'],
   ] as const)('shows the signed %s membership lifecycle boundary', async (phase, message) => {
@@ -566,6 +566,7 @@ describe('knowledge Store boundary', () => {
     const { wrapper } = await mountKnowledge(api)
 
     expect(wrapper.text()).toContain(message)
+    if (phase === 'download_window') expect(wrapper.text()).not.toContain('云端内容可下载或转换至')
   })
 
   it('enforces the free one-library and one-active-file quota before invoking Main', async () => {
@@ -621,6 +622,22 @@ describe('knowledge three-pane workspace', () => {
     await wrapper.get('[data-testid="knowledge-recycle-document"]').trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-testid="knowledge-document-document_1"]').exists()).toBe(false)
+  })
+
+  it('exposes confirmed immediate purge actions for the selected document and base', async () => {
+    const { api, wrapper } = await mountKnowledge()
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    const confirm = vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue('confirm')
+
+    await wrapper.get('[data-testid="knowledge-purge-document"]').trigger('click')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('无法恢复'), '永久删除文件', expect.any(Object))
+    expect(api.knowledge.purgeDocument).toHaveBeenCalledWith('document_1')
+
+    await wrapper.get('[data-testid="knowledge-purge-base"]').trigger('click')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('无法恢复'), '永久删除知识库', expect.any(Object))
+    expect(api.knowledge.purgeBase).toHaveBeenCalledWith('kb_local')
   })
 
   it('exposes labeled listbox selection and non-blocking background refresh state', async () => {

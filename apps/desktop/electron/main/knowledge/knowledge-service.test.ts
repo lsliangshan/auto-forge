@@ -15,7 +15,12 @@ import type { SafeStoragePort } from '../security/secret-store.js'
 import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeKeyStore, removeFileDurably } from './key-store.js'
-import { KnowledgeService, type KnowledgeParserPort, type KnowledgeServiceOptions } from './knowledge-service.js'
+import {
+  KnowledgeService,
+  type KnowledgeEntitlementPort,
+  type KnowledgeParserPort,
+  type KnowledgeServiceOptions,
+} from './knowledge-service.js'
 import { DEFAULT_PARSER_LIMITS, type ParserResponse } from './parser-protocol.js'
 import { parseEncryptedDocument } from './parser-worker.js'
 
@@ -145,6 +150,7 @@ class InProcessParser implements KnowledgeParserPort {
 
 async function fixture(options: {
   entitlement?: KnowledgeEntitlementState
+  entitlementPort?: KnowledgeEntitlementPort
   cloud?: TargetKnowledgeCloudPort
   ownsConversation?: (userId: string, conversationId: string) => boolean
   unlinkKnowledgeObject?: (path: string) => Promise<void>
@@ -171,7 +177,7 @@ async function fixture(options: {
       },
       chooseImportFile: async () => picks.shift(),
       chooseExportPath: async () => exports.shift(),
-      entitlement: {
+      entitlement: options.entitlementPort ?? {
         getEntitlement: async () => options.entitlement ?? {
           tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
         },
@@ -335,6 +341,133 @@ describe('KnowledgeService lifecycle', () => {
     await app.service.close()
   })
 
+  it.each([
+    ['free tier', { tier: 'free' as const }],
+    ['expired status', { status: 'expired' as const }],
+    ['revoked-like unavailable status', { status: 'unavailable' as const }],
+    ['beta disabled', { betaEnabled: false }],
+    ['cloud disabled for synced scope', { cloudEnabled: false }],
+    ['kill switch', { killSwitchEnabled: true }],
+  ])('treats legacy server %s as an additional denial for synced search, consent, and Agent admission', async (_label, denial) => {
+    const server = {
+      tier: 'member' as const,
+      status: 'active' as const,
+      betaEnabled: true,
+      cloudEnabled: true,
+      killSwitchEnabled: false,
+      version: 1,
+      validUntil: null,
+      ...denial,
+    }
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({ ...server })),
+      getEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'granted', retrievalByBase: [],
+      })),
+      setEmbeddingConsent: vi.fn(),
+      capturePublishedSnapshot: vi.fn(async ({ knowledgeBaseIds }: Parameters<TargetKnowledgeCloudPort['capturePublishedSnapshot']>[0]) => knowledgeBaseIds.map(
+        knowledgeBaseId => ({ knowledgeBaseId, generationId: 'generation_1' }),
+      )),
+      searchPublished: vi.fn(async (): Promise<TargetCloudSearch> => ({
+        mode: 'keyword_only', degradationReason: null, results: [],
+      })),
+    }
+    const app = await fixture({
+      entitlement: {
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        knowledgeToolEnabled: true, killSwitchEnabled: false,
+      },
+      cloud,
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'server-denied.txt', '服务端拒绝后不可泄露'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    const opened = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    opened.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base!.id)
+    opened.close()
+
+    await expect(app.service.captureSearchSnapshot(owner, 'conversation_1')).resolves.toEqual({
+      selected: false, knowledgeMode: 'strict',
+    })
+    await expect(app.service.search(owner, 'conversation_1', '不可泄露')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    await expect(app.service.getConsent(owner)).resolves.toMatchObject({
+      embedding: { status: 'unknown', retrievalByBase: [] },
+    })
+    expect(cloud.capturePublishedSnapshot).not.toHaveBeenCalled()
+    expect(cloud.searchPublished).not.toHaveBeenCalled()
+    expect(cloud.getEmbeddingConsent).not.toHaveBeenCalled()
+    await app.service.close()
+  })
+
+  it('rechecks the server kill switch after remote search and snapshot awaits without synced-cache fallback', async () => {
+    let killSwitchEnabled = false
+    let killDuringCapture = false
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        killSwitchEnabled, version: 1, validUntil: null,
+      })),
+      getEmbeddingConsent: vi.fn(), setEmbeddingConsent: vi.fn(),
+      capturePublishedSnapshot: vi.fn(async ({ knowledgeBaseIds }: Parameters<TargetKnowledgeCloudPort['capturePublishedSnapshot']>[0]) => {
+        if (killDuringCapture) killSwitchEnabled = true
+        return knowledgeBaseIds.map(knowledgeBaseId => ({ knowledgeBaseId, generationId: 'generation_1' }))
+      }),
+      searchPublished: vi.fn(async () => {
+        killSwitchEnabled = true
+        throw new Error('remote closed after kill')
+      }),
+    }
+    const app = await fixture({
+      entitlement: {
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        knowledgeToolEnabled: true, killSwitchEnabled: false,
+      },
+      cloud,
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'late-kill.txt', '远程等待后不可回退同步缓存'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    const opened = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    opened.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base!.id)
+    opened.close()
+
+    await expect(app.service.search(owner, 'conversation_1', '同步缓存')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    killSwitchEnabled = false
+    killDuringCapture = true
+    await expect(app.service.captureSearchSnapshot(owner, 'conversation_1')).resolves.toEqual({
+      selected: false, knowledgeMode: 'strict',
+    })
+    await app.service.close()
+  })
+
   it('resolves an exact citation in Main and makes recycled sources unavailable', async () => {
     const app = await fixture()
     const owner = { userId: 'alice' }
@@ -463,11 +596,11 @@ describe('KnowledgeService lifecycle', () => {
       betaEnabled: false, cloudEnabled: false,
       knowledgeToolEnabled: false, killSwitchEnabled: true,
     })
-    await expect(app.service.searchSnapshot(owner, captured, '本地关键词回退')).resolves.toMatchObject({
-      kind: 'results', results: [expect.objectContaining({ knowledgeBaseId: base!.id })],
+    await expect(app.service.searchSnapshot(owner, captured, '本地关键词回退')).resolves.toEqual({
+      kind: 'results', results: [],
     })
-    await expect(app.service.search(owner, 'conversation_1', '本地关键词回退')).resolves.toMatchObject({
-      kind: 'results', results: [expect.objectContaining({ knowledgeBaseId: base!.id })],
+    await expect(app.service.search(owner, 'conversation_1', '本地关键词回退')).resolves.toEqual({
+      kind: 'results', results: [],
     })
     await expect(app.service.setEmbeddingConsent(owner, 'revoked'))
       .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
@@ -1030,6 +1163,85 @@ describe('KnowledgeService lifecycle', () => {
       expect.objectContaining({ id: retained!.id, readOnly: false }),
       expect.objectContaining({ name: 'late-after-expiry.txt', status: 'failed', readOnly: true }),
     ]))
+    await app.service.close()
+  })
+
+  it('fails closed retained paid data into a durable exact selection without blocking a never-member 1/1 library', async () => {
+    const entitlement: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+      knowledgeToolEnabled: true, killSwitchEnabled: false,
+    }
+    const app = await fixture({ entitlement })
+    const owner = { userId: 'alice' }
+    const [firstBase] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'paid-first.txt', '第一个付费文件'))
+    const firstDocument = await app.service.importDocument(owner, firstBase!.id)
+    const secondBase = await app.service.createBase(owner, '第二个付费库')
+    app.picks.push(await writeSource(app.rootDirectory, 'paid-second.txt', '第二个付费文件'))
+    await app.service.importDocument(owner, secondBase.id)
+    await expect.poll(async () => (await app.service.listBases(owner)).every(base => base.searchable)).toBe(true)
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [firstBase!.id, secondBase.id], knowledgeMode: 'strict',
+    })
+
+    Object.assign(entitlement, {
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    await expect(app.service.listBases(owner)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: firstBase!.id, status: 'read_only', searchable: false }),
+      expect.objectContaining({ id: secondBase.id, status: 'read_only', searchable: false }),
+    ]))
+    await expect(app.service.getEntitlement(owner)).resolves.toMatchObject({
+      lifecycle: { phase: 'active', requiresSelection: true },
+    })
+    await expect(app.service.getConversationSelection(owner, 'conversation_1')).resolves.toEqual({
+      knowledgeBaseIds: [], knowledgeMode: 'strict',
+    })
+    await expect(app.service.search(owner, 'conversation_1', '付费文件')).resolves.toEqual({
+      kind: 'results', results: [],
+    })
+    await expect(app.service.replaceDocument(owner, firstDocument!.id))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+
+    await expect(app.service.chooseDowngradeSelection(owner, {
+      knowledgeBaseId: firstBase!.id, documentId: firstDocument!.id,
+    })).resolves.toMatchObject({ lifecycle: { phase: 'active', requiresSelection: false } })
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [firstBase!.id], knowledgeMode: 'strict',
+    })
+    await expect(app.service.search(owner, 'conversation_1', '第一个付费文件')).resolves.toMatchObject({
+      kind: 'results', results: [expect.objectContaining({ documentId: firstDocument!.id })],
+    })
+    await app.service.close()
+    const restarted = app.createService()
+    await expect(restarted.listBases(owner)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: firstBase!.id, status: 'ready', searchable: true }),
+      expect.objectContaining({ id: secondBase.id, status: 'read_only', searchable: false }),
+    ]))
+    await restarted.close()
+
+    const neverMember = await fixture({ entitlement: {
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    } })
+    const [freeBase] = await neverMember.service.listBases(owner)
+    neverMember.picks.push(await writeSource(neverMember.rootDirectory, 'free.txt', '免费文件'))
+    const freeDocument = await neverMember.service.importDocument(owner, freeBase!.id)
+    await expect.poll(async () => (await neverMember.service.listDocuments(owner, freeBase!.id))[0]?.status)
+      .toBe('ready')
+    neverMember.picks.push(await writeSource(neverMember.rootDirectory, 'free-replaced.txt', '免费替换'))
+    await expect(neverMember.service.replaceDocument(owner, freeDocument!.id)).resolves.toBeDefined()
+    await neverMember.service.close()
+  })
+
+  it('uses one serialized authoritative entitlement decision when creating a base', async () => {
+    const getEntitlement = vi.fn(async (): Promise<KnowledgeEntitlementState> => ({
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+    }))
+    const app = await fixture({ entitlementPort: { getEntitlement } })
+    await expect(app.service.createBase({ userId: 'alice' }, '单次判定')).resolves.toBeDefined()
+    expect(getEntitlement).toHaveBeenCalledTimes(1)
     await app.service.close()
   })
 
