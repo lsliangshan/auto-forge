@@ -3,8 +3,8 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import type { KnowledgeEntitlementState } from '@autoforge/shared'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { KnowledgeEntitlementState, KnowledgeSearchResult } from '@autoforge/shared'
 import type { SafeStoragePort } from '../security/secret-store.js'
 import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './encrypted-object-store.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
@@ -14,6 +14,47 @@ import { DEFAULT_PARSER_LIMITS, type ParserResponse } from './parser-protocol.js
 import { parseEncryptedDocument } from './parser-worker.js'
 
 const directories: string[] = []
+
+interface TargetKnowledgeCloudPort {
+  getEntitlement(): Promise<KnowledgeEntitlementState & {
+    killSwitchEnabled: boolean
+    version: number
+    validUntil: string | null
+  }>
+  getEmbeddingConsent(): Promise<{
+    processor: 'tokenhub'
+    processingRegion: 'Guangzhou'
+    model: 'kinfra-text-embedding-0.6b'
+    dimensions: 1024
+    status: 'unknown' | 'granted' | 'denied' | 'revoked'
+    retrievalByBase: Array<{
+      knowledgeBaseId: string
+      retrievalMode: 'hybrid' | 'keyword_only' | 'reindexing'
+    }>
+    updatedAt?: string
+  }>
+  setEmbeddingConsent(input: {
+    requestId: string
+    status: 'granted' | 'denied' | 'revoked'
+  }): ReturnType<TargetKnowledgeCloudPort['getEmbeddingConsent']>
+  capturePublishedSnapshot(input: { knowledgeBaseIds: string[] }): Promise<Array<{
+    knowledgeBaseId: string
+    generationId: string
+  }>>
+  searchPublished(input: {
+    query: string
+    generationSnapshot: Array<{ knowledgeBaseId: string; generationId: string }>
+    topK: number
+  }): Promise<{
+    mode: 'hybrid' | 'keyword_only'
+    degradationReason: null | 'consent_unavailable' | 'provider_unavailable' | 'model_deprecated' | 'small_index_limit'
+    results: Array<{ generationId: string; evidence: KnowledgeSearchResult }>
+  }>
+}
+
+type TargetEmbeddingConsent = Awaited<ReturnType<TargetKnowledgeCloudPort['getEmbeddingConsent']>>
+type TargetCloudEntitlement = Awaited<ReturnType<TargetKnowledgeCloudPort['getEntitlement']>>
+type TargetCloudSearch = Awaited<ReturnType<TargetKnowledgeCloudPort['searchPublished']>>
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -77,6 +118,7 @@ class InProcessParser implements KnowledgeParserPort {
 
 async function fixture(options: {
   entitlement?: KnowledgeEntitlementState
+  cloud?: TargetKnowledgeCloudPort
   ownsConversation?: (userId: string, conversationId: string) => boolean
   unlinkKnowledgeObject?: (path: string) => Promise<void>
   vacuumKnowledgeDatabase?: (database: OpenedUserKnowledgeDatabase['database']) => void
@@ -106,6 +148,8 @@ async function fixture(options: {
           tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
         },
       },
+      cloud: options.cloud,
+      getChatProviderConsent: async () => ({ provider: 'openrouter' as const, status: 'unknown' as const }),
       ownsConversation: async (owner, conversationId) => (
         options.ownsConversation?.(owner.userId, conversationId) ?? true
       ),
@@ -178,6 +222,140 @@ afterEach(async () => {
 })
 
 describe('KnowledgeService lifecycle', () => {
+  it('uses only authoritative synced selection for cloud hybrid search and keeps closed gates local', async () => {
+    const cloudGate = {
+      tier: 'member' as const,
+      status: 'active' as const,
+      betaEnabled: true,
+      cloudEnabled: true,
+      killSwitchEnabled: false,
+      version: 1,
+      validUntil: null,
+    }
+    const remoteEvidence: KnowledgeSearchResult = {
+      evidenceId: 'evidence_cloud', knowledgeBaseId: 'placeholder',
+      documentId: 'document_cloud', versionId: 'version_cloud',
+      snippet: 'Published cloud result.', score: 0.75,
+      citation: {
+        evidenceId: 'evidence_cloud', documentId: 'document_cloud', versionId: 'version_cloud',
+        kind: 'markdown', nodeId: 'node_cloud',
+      },
+    }
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({ ...cloudGate })),
+      getEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'granted',
+        retrievalByBase: [{ knowledgeBaseId: 'placeholder', retrievalMode: 'hybrid' }],
+      })),
+      setEmbeddingConsent: vi.fn(async ({ status }: Parameters<TargetKnowledgeCloudPort['setEmbeddingConsent']>[0]): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status,
+        retrievalByBase: [{
+          knowledgeBaseId: 'placeholder',
+          retrievalMode: status === 'granted' ? 'reindexing' : 'keyword_only',
+        }],
+      })),
+      capturePublishedSnapshot: vi.fn(async ({ knowledgeBaseIds }: Parameters<TargetKnowledgeCloudPort['capturePublishedSnapshot']>[0]) => knowledgeBaseIds.map(
+        knowledgeBaseId => ({ knowledgeBaseId, generationId: 'generation_published' }),
+      )),
+      searchPublished: vi.fn(async ({ generationSnapshot }: Parameters<TargetKnowledgeCloudPort['searchPublished']>[0]): Promise<TargetCloudSearch> => ({
+        mode: 'hybrid', degradationReason: null,
+        results: [{
+          generationId: generationSnapshot[0]!.generationId,
+          evidence: { ...remoteEvidence, knowledgeBaseId: generationSnapshot[0]!.knowledgeBaseId },
+        }],
+      })),
+    }
+    const app = await fixture({
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true },
+      cloud,
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'published.txt', '本地关键词回退内容'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+    await expect(app.service.search(owner, 'conversation_1', '本地关键词回退')).resolves.toMatchObject({
+      kind: 'results', results: [expect.objectContaining({ knowledgeBaseId: base!.id })],
+    })
+    expect(cloud.getEntitlement).not.toHaveBeenCalled()
+    expect(cloud.capturePublishedSnapshot).not.toHaveBeenCalled()
+    const opened = await openUserKnowledgeDatabase({
+      rootDirectory: app.rootDirectory, userId: owner.userId, safeStorage: app.storage,
+    })
+    opened.database.prepare(`
+      INSERT INTO cloud_sync_states(
+        knowledge_base_id, mode, published_generation_id, epoch, updated_at
+      ) VALUES (?, 'synced', 'generation_published', 1, 1)
+    `).run(base!.id)
+    opened.close()
+
+    await expect(app.service.listBases(owner)).resolves.toEqual([
+      expect.objectContaining({ id: base!.id, kind: 'cloud' }),
+    ])
+    await expect(app.service.search(owner, 'conversation_1', '云端命中')).resolves.toEqual({
+      kind: 'results',
+      results: [expect.objectContaining({ evidenceId: 'evidence_cloud', knowledgeBaseId: base!.id })],
+    })
+    expect(cloud.capturePublishedSnapshot).toHaveBeenCalledWith({ knowledgeBaseIds: [base!.id] })
+    expect(cloud.searchPublished).toHaveBeenCalledWith(expect.objectContaining({
+      query: '云端命中', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: base!.id, generationId: 'generation_published' }],
+    }))
+
+    cloudGate.killSwitchEnabled = true
+    await expect(app.service.search(owner, 'conversation_1', '本地关键词回退')).resolves.toMatchObject({
+      kind: 'results', results: [expect.objectContaining({ knowledgeBaseId: base!.id })],
+    })
+    expect(cloud.searchPublished).toHaveBeenCalledTimes(1)
+    await app.service.close()
+  })
+
+  it('keeps Main-owned TokenHub consent separate and generates the mutation request id', async () => {
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        killSwitchEnabled: false, version: 1, validUntil: null,
+      })),
+      getEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'denied',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_a', retrievalMode: 'keyword_only' }],
+      })),
+      setEmbeddingConsent: vi.fn(async ({ status }: Parameters<TargetKnowledgeCloudPort['setEmbeddingConsent']>[0]): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status,
+        retrievalByBase: [{ knowledgeBaseId: 'kb_a', retrievalMode: 'reindexing' }],
+      })),
+      capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({ cloud })
+    const owner = { userId: 'alice' }
+
+    await expect(app.service.getConsent(owner)).resolves.toMatchObject({
+      chatProvider: { provider: 'openrouter' },
+      embedding: {
+        status: 'denied',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_a', retrievalMode: 'keyword_only' }],
+      },
+    })
+    await expect(app.service.setEmbeddingConsent(owner, 'granted')).resolves.toMatchObject({
+      embedding: { status: 'granted' },
+    })
+    expect(cloud.setEmbeddingConsent).toHaveBeenCalledWith({
+      requestId: expect.stringMatching(/^[-\w]+$/), status: 'granted',
+    })
+    await app.service.close()
+  })
+
   it('enables local storage only on the verified darwin arm64 runtime gate', async () => {
     const app = await fixture()
     const availability = await app.service.getFeatureAvailability({ userId: 'alice' })
@@ -211,6 +389,27 @@ describe('KnowledgeService lifecycle', () => {
     })
     await expect(unavailable.listBases({ userId: 'alice' }))
       .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+  })
+
+  it('keeps cloud availability fail-closed when any authoritative server gate is closed', async () => {
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({
+        tier: 'member', status: 'active', betaEnabled: false, cloudEnabled: true,
+        killSwitchEnabled: false, version: 1, validUntil: null,
+      })),
+      getEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'unknown', retrievalByBase: [],
+      })),
+      setEmbeddingConsent: vi.fn(), capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({ cloud })
+
+    await expect(app.service.getFeatureAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+    })
+    await app.service.close()
   })
 
   it('maps real encrypted-storage, FTS, and parser probe failures to scoped unavailable reasons', async () => {

@@ -262,8 +262,9 @@ const knowledgeRetrievalStatus = computed(() => {
       : '本地处理已暂停，仅已发布版本可检索'
   }
   if (base.kind === 'local') return '仅本地关键词检索'
-  if (knowledge.consent?.embedding.retrievalMode === 'hybrid') return '已同步 · 混合检索'
-  if (knowledge.consent?.embedding.retrievalMode === 'reindexing') return '已同步 · 向量重建中，暂用关键词检索'
+  const retrievalMode = knowledge.embeddingRetrievalMode(base.id)
+  if (retrievalMode === 'hybrid') return '已同步 · 混合检索'
+  if (retrievalMode === 'reindexing') return '已同步 · 向量重建中，暂用关键词检索'
   return '关键词检索'
 })
 const versionStatusLabel = (status: string) => ({ staging: '处理中', ready: '已就绪', failed: '失败', retired: '已退役' })[status] ?? status

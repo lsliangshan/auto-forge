@@ -109,6 +109,10 @@ import {
   type KnowledgeParserPort,
 } from './knowledge/knowledge-service.js'
 import { KnowledgeAdmissionGate } from './knowledge/knowledge-admission.js'
+import {
+  CloudBaseKnowledgeClient,
+  type CloudBaseFunctionPort,
+} from './knowledge/cloudbase-knowledge-client.js'
 
 export interface ApplicationPaths {
   database: string
@@ -217,6 +221,8 @@ export interface ApplicationRuntimeOptions {
   chooseKnowledgeFile?: () => Promise<string | undefined>
   chooseKnowledgeExportPath?: (defaultName: string) => Promise<string | undefined>
   knowledgeEntitlement?: KnowledgeEntitlementPort
+  /** @internal Deterministic Function adapter for CloudBase boundary tests. */
+  knowledgeCloudFunctions?: CloudBaseFunctionPort
   knowledgePlatform?: NodeJS.Platform
   knowledgeArch?: string
 }
@@ -608,6 +614,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     ?? new CloudBaseAuthService(cloudBasePorts!.auth, secretStore)
   const roleService = options.roleService
     ?? (cloudBasePorts ? new CloudBaseRoleService(cloudBasePorts.functions) : undefined)
+  const knowledgeCloudFunctions = options.knowledgeCloudFunctions ?? cloudBasePorts?.functions
+  const knowledgeCloud = knowledgeCloudFunctions
+    ? new CloudBaseKnowledgeClient(knowledgeCloudFunctions)
+    : undefined
   const auth = observeAuthService(
     baseAuthService,
     {
@@ -1137,13 +1147,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       database.conversations.get(conversationId)?.userId === owner.userId
     ),
     entitlement: options.knowledgeEntitlement,
-    getConsent: async () => ({
-      chatProvider: { provider: (await settings.get()).activeProvider, status: 'unknown' },
-      embedding: {
-        processor: 'tokenhub', processingRegion: 'Guangzhou',
-        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-        status: 'unknown', retrievalMode: 'keyword_only',
-      },
+    cloud: knowledgeCloud,
+    getChatProviderConsent: async () => ({
+      provider: settings.get().activeProvider, status: 'unknown',
     }),
     platform: options.knowledgePlatform,
     arch: options.knowledgeArch,

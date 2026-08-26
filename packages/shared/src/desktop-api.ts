@@ -92,18 +92,33 @@ export const knowledgeChatProviderConsentStateSchema = z.object({
 }).strict()
 export type KnowledgeChatProviderConsentState = z.infer<typeof knowledgeChatProviderConsentStateSchema>
 
+export const knowledgeEmbeddingBaseRetrievalStateSchema = z.object({
+  knowledgeBaseId: identifierSchema,
+  retrievalMode: z.enum(['hybrid', 'keyword_only', 'reindexing']),
+}).strict()
+export type KnowledgeEmbeddingBaseRetrievalState = z.infer<typeof knowledgeEmbeddingBaseRetrievalStateSchema>
+
 export const knowledgeEmbeddingConsentStateSchema = z.object({
   processor: z.literal('tokenhub'),
   processingRegion: z.literal('Guangzhou'),
   model: z.literal('kinfra-text-embedding-0.6b'),
   dimensions: z.literal(1024),
   status: z.enum(['unknown', 'granted', 'denied', 'revoked']),
-  retrievalMode: z.enum(['hybrid', 'keyword_only', 'reindexing']),
+  retrievalByBase: z.array(knowledgeEmbeddingBaseRetrievalStateSchema).max(1_000),
   updatedAt: timestampSchema.optional(),
-}).strict().superRefine(({ status, retrievalMode }, context) => {
-  if (status !== 'granted' && retrievalMode !== 'keyword_only') {
+}).strict().superRefine(({ status, retrievalByBase }, context) => {
+  if (new Set(retrievalByBase.map(({ knowledgeBaseId }) => knowledgeBaseId)).size
+    !== retrievalByBase.length) {
     context.addIssue({
-      code: 'custom', path: ['retrievalMode'],
+      code: 'custom', path: ['retrievalByBase'],
+      message: 'Knowledge base retrieval states must be unique',
+    })
+  }
+  if (status !== 'granted' && retrievalByBase.some(({ retrievalMode }) => (
+    retrievalMode !== 'keyword_only'
+  ))) {
+    context.addIssue({
+      code: 'custom', path: ['retrievalByBase'],
       message: 'Embedding retrieval requires granted TokenHub consent',
     })
   }
@@ -1099,6 +1114,7 @@ export const ipcChannels = {
   knowledgeGetFeatureAvailability: 'knowledge:get-feature-availability',
   knowledgeGetEntitlement: 'knowledge:get-entitlement',
   knowledgeGetConsent: 'knowledge:get-consent',
+  knowledgeSetEmbeddingConsent: 'knowledge:set-embedding-consent',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
 } as const
@@ -1182,6 +1198,10 @@ export const updateKnowledgeConversationSelectionRequestSchema = knowledgeConver
 export const knowledgeSearchRequestSchema = knowledgeConversationSelectionRequestSchema.extend({
   query: localKnowledgeSearchRequestSchema.shape.query,
 }).strict()
+export const knowledgeSetEmbeddingConsentRequestSchema = z.object({
+  status: z.enum(['granted', 'denied', 'revoked']),
+}).strict()
+export type KnowledgeSetEmbeddingConsentRequest = z.infer<typeof knowledgeSetEmbeddingConsentRequestSchema>
 export const openExternalRequestSchema = z.object({
   url: z.string().superRefine((value, context) => {
     try {
@@ -1279,6 +1299,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeGetFeatureAvailability]: z.undefined(),
   [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
   [ipcChannels.knowledgeGetConsent]: z.undefined(),
+  [ipcChannels.knowledgeSetEmbeddingConsent]: knowledgeSetEmbeddingConsentRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
@@ -1366,6 +1387,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeGetFeatureAvailability]: knowledgeFeatureAvailabilitySchema,
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeSetEmbeddingConsent]: knowledgeConsentStateSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
@@ -1476,6 +1498,7 @@ export interface DesktopAPI {
     getFeatureAvailability(): Promise<KnowledgeFeatureAvailability>
     getEntitlement(): Promise<KnowledgeEntitlementState>
     getConsent(): Promise<KnowledgeConsentState>
+    setEmbeddingConsent(status: 'granted' | 'denied' | 'revoked'): Promise<KnowledgeConsentState>
   }
   system: {
     openExternal(url: string): Promise<void>

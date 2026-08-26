@@ -154,13 +154,26 @@ describe('cross-process contracts', () => {
       embedding: {
         processor: 'tokenhub', processingRegion: 'Guangzhou',
         model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-        status: 'revoked', retrievalMode: 'keyword_only',
+        status: 'revoked',
+        retrievalByBase: [
+          { knowledgeBaseId: 'kb_alpha', retrievalMode: 'keyword_only' },
+          { knowledgeBaseId: 'kb_beta', retrievalMode: 'keyword_only' },
+        ],
         updatedAt: '2026-08-26T00:00:00.000Z',
       },
     } as const
     expect(knowledgeConsentStateSchema.parse(consent)).toEqual(consent)
     expect(knowledgeEmbeddingConsentStateSchema.safeParse({
-      ...consent.embedding, status: 'denied', retrievalMode: 'hybrid',
+      ...consent.embedding,
+      status: 'denied',
+      retrievalByBase: [{ knowledgeBaseId: 'kb_alpha', retrievalMode: 'hybrid' }],
+    }).success).toBe(false)
+    expect(knowledgeEmbeddingConsentStateSchema.safeParse({
+      ...consent.embedding,
+      retrievalByBase: [
+        { knowledgeBaseId: 'kb_alpha', retrievalMode: 'keyword_only' },
+        { knowledgeBaseId: 'kb_alpha', retrievalMode: 'keyword_only' },
+      ],
     }).success).toBe(false)
     expect(knowledgeConsentStateSchema.safeParse({
       provider: 'openrouter', status: 'granted',
@@ -168,6 +181,31 @@ describe('cross-process contracts', () => {
     expect(knowledgeConsentStateSchema.safeParse({
       ...consent, embedding: { ...consent.embedding, dimensions: 1536 },
     }).success).toBe(false)
+  })
+
+  it('exposes only a strict embedding-consent decision across Renderer IPC', () => {
+    expect(ipcChannels.knowledgeSetEmbeddingConsent).toBe('knowledge:set-embedding-consent')
+    expect(ipcRequestSchemas[ipcChannels.knowledgeSetEmbeddingConsent].parse({ status: 'granted' }))
+      .toEqual({ status: 'granted' })
+    for (const input of [
+      { status: 'unknown' },
+      { status: 'granted', userId: 'other_user' },
+      { status: 'revoked', requestId: 'renderer_request' },
+      { status: 'denied', knowledgeBaseId: 'kb_other' },
+      { status: 'revoked', generationId: 'generation_other' },
+    ]) {
+      expect(ipcRequestSchemas[ipcChannels.knowledgeSetEmbeddingConsent].safeParse(input).success)
+        .toBe(false)
+    }
+    expect(ipcResponseSchemas[ipcChannels.knowledgeSetEmbeddingConsent].parse({
+      chatProvider: { provider: 'openrouter', status: 'unknown' },
+      embedding: {
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'granted',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'reindexing' }],
+      },
+    })).toMatchObject({ embedding: { status: 'granted' } })
   })
 
   it('validates CloudBase username, password, phone, email, and OTP inputs', () => {

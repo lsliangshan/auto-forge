@@ -197,12 +197,16 @@ describe('CloudBaseKnowledgeClient', () => {
       .mockResolvedValueOnce({ result: { ok: true, data: {
         processor: 'tokenhub', processingRegion: 'Guangzhou',
         model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-        status: 'granted', retrievalMode: 'hybrid', updatedAt: '2026-08-26T00:00:00.000Z',
+        status: 'granted',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'hybrid' }],
+        updatedAt: '2026-08-26T00:00:00.000Z',
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: {
         processor: 'tokenhub', processingRegion: 'Guangzhou',
         model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-        status: 'revoked', retrievalMode: 'keyword_only', updatedAt: '2026-08-26T00:01:00.000Z',
+        status: 'revoked',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'keyword_only' }],
+        updatedAt: '2026-08-26T00:01:00.000Z',
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: [
         { knowledgeBaseId: 'kb_1', generationId: 'generation_live' },
@@ -215,7 +219,10 @@ describe('CloudBaseKnowledgeClient', () => {
 
     await expect(client.getEmbeddingConsent()).resolves.toMatchObject({ status: 'granted' })
     await expect(client.setEmbeddingConsent({ requestId: 'consent_1', status: 'revoked' }))
-      .resolves.toMatchObject({ status: 'revoked', retrievalMode: 'keyword_only' })
+      .resolves.toMatchObject({
+        status: 'revoked',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'keyword_only' }],
+      })
     const snapshot = await client.capturePublishedSnapshot({ knowledgeBaseIds: ['kb_1'] })
     await expect(client.searchPublished({
       query: 'release policy', generationSnapshot: snapshot, topK: 8,

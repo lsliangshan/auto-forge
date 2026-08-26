@@ -15,6 +15,12 @@ import {
 
 const context = { auth: { uid: '2089908515857502208' } }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 describe('CloudBase knowledge function', () => {
   const candidate = (chunkId: string, generationId = 'generation_live') => ({
     chunkId, generationId,
@@ -294,6 +300,106 @@ describe('CloudBase knowledge function', () => {
     expect(embeddings.embed).not.toHaveBeenCalled()
   })
 
+  it('does not begin a late query embedding send after revocation has returned', async () => {
+    const searchPrepared = deferred<void>()
+    const releaseSearch = deferred<void>()
+    let consent: 'granted' | 'revoked' = 'granted'
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') {
+        searchPrepared.resolve()
+        await releaseSearch.promise
+        return {
+          embeddingConsentStatus: 'granted', vectorEligible: true,
+          keywordCandidates: [candidate('keyword')], vectorRows: [],
+        }
+      }
+      if (name === 'autoforge_knowledge_set_embedding_consent') {
+        consent = 'revoked'
+        return {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: EMBEDDING_MODEL, dimensions: 1024, status: 'revoked',
+          retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'keyword_only' }],
+        }
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        if (consent !== 'granted') throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
+        return { leaseToken: 'lease_query', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockResolvedValue({
+      model: EMBEDDING_MODEL, dimensions: 1024, vectors: [Array(1024).fill(0.25)],
+    }) }
+    const handler = createKnowledgeHandler({ rpc, embeddings })
+
+    const searching = handler({
+      action: 'searchPublished', query: 'QUERY_DISCLOSURE_SENTINEL', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+    }, context)
+    await searchPrepared.promise
+    await expect(handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_query', status: 'revoked',
+    }, context)).resolves.toMatchObject({ ok: true, data: { status: 'revoked' } })
+    releaseSearch.resolve()
+
+    await expect(searching).resolves.toMatchObject({ ok: true, data: {
+      mode: 'keyword_only', degradationReason: 'consent_unavailable',
+    } })
+    expect(embeddings.embed).not.toHaveBeenCalled()
+  })
+
+  it('does not begin a late chunk embedding send after revocation has returned', async () => {
+    const buildPrepared = deferred<void>()
+    const releaseBuild = deferred<void>()
+    let consent: 'granted' | 'revoked' = 'granted'
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_prepare_embedding_generation') {
+        buildPrepared.resolve()
+        await releaseBuild.promise
+        return {
+          consentStatus: 'granted', generationId: 'generation_shadow',
+          chunks: [{ chunkId: 'chunk_1', body: 'CHUNK_DISCLOSURE_SENTINEL' }],
+        }
+      }
+      if (name === 'autoforge_knowledge_set_embedding_consent') {
+        consent = 'revoked'
+        return {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: EMBEDDING_MODEL, dimensions: 1024, status: 'revoked',
+          retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'keyword_only' }],
+        }
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        if (consent !== 'granted') throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
+        return { leaseToken: 'lease_build', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      if (name === 'autoforge_knowledge_fail_embedding_generation') return { failed: true }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockResolvedValue({
+      model: EMBEDDING_MODEL, dimensions: 1024,
+      vectors: [Array(1024).fill(0.25), Array(1024).fill(0.25)],
+    }) }
+    const handler = createKnowledgeHandler({ rpc, embeddings })
+
+    const building = handler({
+      action: 'buildEmbeddingGeneration', requestId: 'build_late', knowledgeBaseId: 'kb_1',
+      generationId: 'generation_shadow', expectedPublishedGenerationId: 'generation_live',
+    }, context)
+    await buildPrepared.promise
+    await expect(handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_build', status: 'revoked',
+    }, context)).resolves.toMatchObject({ ok: true, data: { status: 'revoked' } })
+    releaseBuild.resolve()
+
+    await expect(building).resolves.toEqual({
+      ok: false, error: { code: 'EMBEDDING_CONSENT_REQUIRED' },
+    })
+    expect(embeddings.embed).not.toHaveBeenCalled()
+  })
+
   it('keeps the last published generation live and degrades on embedding outage or deprecation', async () => {
     const embeddings = {
       embed: vi.fn().mockRejectedValue(Object.assign(new Error('provider payload'), {
@@ -301,10 +407,17 @@ describe('CloudBase knowledge function', () => {
       })),
     }
     const info = vi.fn()
-    const rpc = vi.fn().mockResolvedValue({
-      embeddingConsentStatus: 'granted',
-      keywordCandidates: [candidate('published')],
-      vectorRows: [{ candidate: candidate('vector'), embedding: Array(1024).fill(0.5) }],
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted',
+        keywordCandidates: [candidate('published')],
+        vectorRows: [{ candidate: candidate('vector'), embedding: Array(1024).fill(0.5) }],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_query_outage', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      throw new Error(`unexpected ${name}`)
     })
     const handler = createKnowledgeHandler({ rpc, embeddings, logger: { info } })
     const query = 'OUTAGE_QUERY_SENTINEL'
@@ -348,6 +461,10 @@ describe('CloudBase knowledge function', () => {
         consentStatus: 'granted', generationId: 'generation_shadow',
         chunks: [{ chunkId: 'chunk_1', body: 'INDEX_BODY_SENTINEL' }],
       }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_build', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
       if (name === 'autoforge_knowledge_complete_embedding_generation') {
         return { generationId: 'generation_shadow', status: 'ready' }
       }
@@ -372,7 +489,9 @@ describe('CloudBase knowledge function', () => {
       generationId: 'generation_shadow', previousGenerationId: 'generation_live',
     } })
     expect(order).toEqual([
-      'autoforge_knowledge_prepare_embedding_generation', 'tokenhub',
+      'autoforge_knowledge_prepare_embedding_generation',
+      'autoforge_knowledge_begin_embedding_send', 'tokenhub',
+      'autoforge_knowledge_complete_embedding_send',
       'autoforge_knowledge_complete_embedding_generation',
       'autoforge_knowledge_publish_generation',
     ])
@@ -383,8 +502,13 @@ describe('CloudBase knowledge function', () => {
     const probeVector = Array(1024).fill(0.125)
     const rpc = vi.fn().mockImplementation(async (name: string) => {
       if (name === 'autoforge_knowledge_get_embedding_consent') return {
-        status: 'granted', retrievalMode: 'hybrid',
+        status: 'granted',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'hybrid' }],
       }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_drift', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
       if (name === 'autoforge_knowledge_prepare_drift_generation') return {
         drifted: false, publishedGenerationId: 'generation_live',
       }
@@ -416,6 +540,10 @@ describe('CloudBase knowledge function', () => {
         consentStatus: 'granted', generationId: 'generation_shadow',
         chunks: [{ chunkId: 'chunk_1', body: 'body' }],
       }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_invalid', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
       if (name === 'autoforge_knowledge_fail_embedding_generation') return { failed: true }
       throw new Error(`unexpected ${name}`)
     })
@@ -449,6 +577,10 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_prepare_embedding_generation') return {
         consentStatus: 'granted', generationId: 'generation_shadow', chunks: [],
       }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_publish_race', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
       if (name === 'autoforge_knowledge_complete_embedding_generation') return {
         generationId: 'generation_shadow', status: 'ready',
       }
@@ -491,6 +623,40 @@ describe('CloudBase knowledge migration contract', () => {
     expect(consent).not.toContain('DELETE FROM public.knowledge_generation_chunks')
     expect(consent).toContain("kind, entity_id, state")
     expect(consent).toContain("'embedding_reindex'")
+  })
+
+  it('serializes TokenHub send admission with revocation and drains admitted sends', async () => {
+    const sql = await readFile(
+      new URL('../../cloudbase/knowledge/migrations/0001_personal_knowledge.sql', import.meta.url),
+      'utf8',
+    )
+    const beginSend = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_begin_embedding_send[\s\S]*?\n\$\$;/,
+    )?.[0]
+    const completeSend = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_complete_embedding_send[\s\S]*?\n\$\$;/,
+    )?.[0]
+    const setConsent = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_set_embedding_consent[\s\S]*?\n\$\$;/,
+    )?.[0]
+
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.knowledge_embedding_send_leases')
+    expect(sql).toContain('authorization_epoch bigint NOT NULL DEFAULT 0')
+    expect(beginSend).toContain('FOR UPDATE')
+    expect(beginSend).toContain("consent.status <> 'granted'")
+    expect(beginSend).toContain('consent.authorization_epoch')
+    expect(beginSend).toContain('INSERT INTO public.knowledge_embedding_send_leases')
+    expect(completeSend).toContain('DELETE FROM public.knowledge_embedding_send_leases')
+    expect(setConsent).toContain('authorization_epoch =')
+    expect(setConsent).toContain('WHILE EXISTS')
+    expect(setConsent).toContain('public.knowledge_embedding_send_leases')
+    expect(setConsent).toContain('PERFORM pg_sleep')
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) FROM PUBLIC, anon, authenticated',
+    )
+    expect(sql).toContain(
+      'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) TO service_role',
+    )
   })
 
   it('keeps drift builds isolated and retains the previous published generation for seven days', async () => {
@@ -677,7 +843,8 @@ describe('CloudBase knowledge migration contract', () => {
     for (const table of [
       'knowledge_bases', 'knowledge_objects', 'knowledge_documents', 'knowledge_versions',
       'knowledge_parser_runs', 'knowledge_blocks', 'knowledge_chunks', 'knowledge_index_generations',
-      'knowledge_embedding_consents', 'knowledge_generation_chunks', 'knowledge_chunk_embeddings',
+      'knowledge_embedding_consents', 'knowledge_embedding_send_leases',
+      'knowledge_generation_chunks', 'knowledge_chunk_embeddings',
       'knowledge_jobs', 'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
       'knowledge_sync_floors', 'knowledge_upload_authorizations', 'knowledge_entitlements',
     ]) {

@@ -170,11 +170,27 @@ CREATE TABLE IF NOT EXISTS public.knowledge_embedding_consents (
   owner_id bigint PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   status varchar(16) NOT NULL DEFAULT 'unknown'
     CHECK (status IN ('unknown', 'granted', 'denied', 'revoked')),
+  authorization_epoch bigint NOT NULL DEFAULT 0 CHECK (authorization_epoch >= 0),
   processor varchar(32) NOT NULL DEFAULT 'tokenhub' CHECK (processor = 'tokenhub'),
   processing_region varchar(32) NOT NULL DEFAULT 'Guangzhou'
     CHECK (processing_region = 'Guangzhou'),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE public.knowledge_embedding_consents
+  ADD COLUMN IF NOT EXISTS authorization_epoch bigint NOT NULL DEFAULT 0
+    CHECK (authorization_epoch >= 0);
+
+CREATE TABLE IF NOT EXISTS public.knowledge_embedding_send_leases (
+  lease_token varchar(128) PRIMARY KEY,
+  owner_id bigint NOT NULL REFERENCES public.knowledge_embedding_consents(owner_id)
+    ON DELETE CASCADE,
+  consent_epoch bigint NOT NULL CHECK (consent_epoch >= 0),
+  purpose varchar(16) NOT NULL CHECK (purpose IN ('query', 'index', 'drift')),
+  admitted_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(owner_id, lease_token)
+);
+CREATE INDEX IF NOT EXISTS knowledge_embedding_send_leases_owner_epoch
+  ON public.knowledge_embedding_send_leases(owner_id, consent_epoch);
 
 CREATE TABLE IF NOT EXISTS public.knowledge_generation_chunks (
   owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -491,6 +507,7 @@ BEGIN
     'knowledge_bases', 'knowledge_objects', 'knowledge_documents', 'knowledge_versions',
     'knowledge_parser_runs', 'knowledge_blocks', 'knowledge_chunks',
     'knowledge_index_generations', 'knowledge_embedding_consents',
+    'knowledge_embedding_send_leases',
     'knowledge_generation_chunks', 'knowledge_chunk_embeddings',
     'knowledge_jobs', 'knowledge_entity_heads',
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
@@ -1217,38 +1234,105 @@ AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   consent public.knowledge_embedding_consents%ROWTYPE;
-  retrieval_mode varchar := 'keyword_only';
+  retrieval_by_base jsonb;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
   INSERT INTO public.knowledge_embedding_consents(owner_id)
     VALUES (owner) ON CONFLICT DO NOTHING;
   SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
     WHERE owner_id = owner;
-  IF consent.status = 'granted' AND EXISTS (
-    SELECT 1
-    FROM public.knowledge_bases base
-    JOIN public.knowledge_chunk_embeddings embedding
-      ON embedding.owner_id = base.owner_id
-      AND embedding.knowledge_base_id = base.id
-      AND embedding.generation_id = base.published_generation_id
-    WHERE base.owner_id = owner AND base.deleted_at IS NULL
-  ) THEN
-    retrieval_mode := 'hybrid';
-  ELSIF consent.status = 'granted' AND EXISTS (
-    SELECT 1 FROM public.knowledge_jobs
-    WHERE owner_id = owner AND kind = 'embedding_reindex'
-      AND state IN ('queued', 'running', 'paused')
-  ) THEN
-    retrieval_mode := 'reindexing';
-  END IF;
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'knowledgeBaseId', base.id,
+    'retrievalMode', CASE
+      WHEN consent.status <> 'granted' THEN 'keyword_only'
+      WHEN EXISTS (
+        SELECT 1 FROM public.knowledge_chunk_embeddings embedding
+        WHERE embedding.owner_id = owner
+          AND embedding.knowledge_base_id = base.id
+          AND embedding.generation_id = base.published_generation_id
+      ) THEN 'hybrid'
+      WHEN EXISTS (
+        SELECT 1 FROM public.knowledge_jobs job
+        WHERE job.owner_id = owner AND job.knowledge_base_id = base.id
+          AND job.kind IN ('embedding_index', 'embedding_reindex')
+          AND job.state IN ('queued', 'running', 'paused')
+      ) THEN 'reindexing'
+      ELSE 'keyword_only'
+    END
+  ) ORDER BY base.id), '[]'::jsonb) INTO retrieval_by_base
+  FROM public.knowledge_bases base
+  WHERE base.owner_id = owner AND base.deleted_at IS NULL;
   RETURN jsonb_build_object(
     'processor', 'tokenhub', 'processingRegion', 'Guangzhou',
     'model', 'kinfra-text-embedding-0.6b', 'dimensions', 1024,
-    'status', consent.status, 'retrievalMode', retrieval_mode,
+    'status', consent.status, 'retrievalByBase', retrieval_by_base,
     'updatedAt', to_char(
       consent.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
     )
   );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_begin_embedding_send(
+  p_caller_user_id varchar, p_purpose varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  token varchar;
+BEGIN
+  IF p_purpose IS NULL OR p_purpose NOT IN ('query', 'index', 'drift') THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  INSERT INTO public.knowledge_embedding_consents(owner_id)
+    VALUES (owner) ON CONFLICT DO NOTHING;
+  SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner FOR UPDATE;
+  IF consent.status <> 'granted' THEN
+    RAISE EXCEPTION USING MESSAGE = 'EMBEDDING_CONSENT_REQUIRED', ERRCODE = 'P0001';
+  END IF;
+  token := 'lease_' || md5(
+    owner::text || ':' || clock_timestamp()::text || ':' || random()::text
+  ) || md5(clock_timestamp()::text || ':' || random()::text);
+  INSERT INTO public.knowledge_embedding_send_leases(
+    lease_token, owner_id, consent_epoch, purpose
+  ) VALUES (token, owner, consent.authorization_epoch, p_purpose);
+  RETURN jsonb_build_object(
+    'leaseToken', token, 'consentEpoch', consent.authorization_epoch
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_embedding_send(
+  p_caller_user_id varchar, p_lease_token varchar, p_consent_epoch bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  removed integer;
+BEGIN
+  IF p_lease_token IS NULL OR length(p_lease_token) = 0
+    OR p_consent_epoch IS NULL OR p_consent_epoch < 0 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  DELETE FROM public.knowledge_embedding_send_leases
+    WHERE owner_id = owner AND lease_token = p_lease_token
+      AND consent_epoch = p_consent_epoch;
+  GET DIAGNOSTICS removed = ROW_COUNT;
+  IF removed <> 1 THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('released', true);
 END;
 $$;
 
@@ -1263,9 +1347,11 @@ AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   previous_status varchar := 'unknown';
+  consent public.knowledge_embedding_consents%ROWTYPE;
   request_row public.knowledge_requests%ROWTYPE;
   fingerprint char(32) := md5(p_status);
   response jsonb;
+  retrieval_by_base jsonb;
 BEGIN
   IF p_status IS NULL OR NOT (p_status IN ('granted', 'denied', 'revoked')) THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
@@ -1282,14 +1368,25 @@ BEGIN
     END IF;
     RETURN request_row.response;
   END IF;
-  SELECT status INTO previous_status FROM public.knowledge_embedding_consents
+  INSERT INTO public.knowledge_embedding_consents(owner_id)
+    VALUES (owner) ON CONFLICT DO NOTHING;
+  SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
     WHERE owner_id = owner FOR UPDATE;
-  IF NOT FOUND THEN previous_status := 'unknown'; END IF;
-  INSERT INTO public.knowledge_embedding_consents(owner_id, status, updated_at)
-    VALUES (owner, p_status, clock_timestamp())
-  ON CONFLICT(owner_id) DO UPDATE SET
-    status = excluded.status, updated_at = excluded.updated_at;
+  previous_status := consent.status;
+  UPDATE public.knowledge_embedding_consents SET
+    status = p_status,
+    authorization_epoch = authorization_epoch + 1,
+    updated_at = clock_timestamp()
+    WHERE owner_id = owner
+    RETURNING * INTO STRICT consent;
   IF p_status IN ('denied', 'revoked') THEN
+    WHILE EXISTS (
+      SELECT 1 FROM public.knowledge_embedding_send_leases send
+      WHERE send.owner_id = owner
+        AND send.consent_epoch < consent.authorization_epoch
+    ) LOOP
+      PERFORM pg_sleep(0.01);
+    END LOOP;
     DELETE FROM public.knowledge_chunk_embeddings WHERE owner_id = owner;
   ELSIF p_status = 'granted' AND previous_status <> 'granted' THEN
     INSERT INTO public.knowledge_jobs(
@@ -1303,11 +1400,32 @@ BEGIN
     WHERE base.owner_id = owner AND base.deleted_at IS NULL
     ON CONFLICT(owner_id, request_id) DO NOTHING;
   END IF;
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'knowledgeBaseId', base.id,
+    'retrievalMode', CASE
+      WHEN p_status <> 'granted' THEN 'keyword_only'
+      WHEN EXISTS (
+        SELECT 1 FROM public.knowledge_chunk_embeddings embedding
+        WHERE embedding.owner_id = owner
+          AND embedding.knowledge_base_id = base.id
+          AND embedding.generation_id = base.published_generation_id
+      ) THEN 'hybrid'
+      WHEN EXISTS (
+        SELECT 1 FROM public.knowledge_jobs job
+        WHERE job.owner_id = owner AND job.knowledge_base_id = base.id
+          AND job.kind IN ('embedding_index', 'embedding_reindex')
+          AND job.state IN ('queued', 'running', 'paused')
+      ) THEN 'reindexing'
+      ELSE 'keyword_only'
+    END
+  ) ORDER BY base.id), '[]'::jsonb) INTO retrieval_by_base
+  FROM public.knowledge_bases base
+  WHERE base.owner_id = owner AND base.deleted_at IS NULL;
   response := jsonb_build_object(
     'processor', 'tokenhub', 'processingRegion', 'Guangzhou',
     'model', 'kinfra-text-embedding-0.6b', 'dimensions', 1024,
     'status', p_status,
-    'retrievalMode', CASE WHEN p_status = 'granted' THEN 'reindexing' ELSE 'keyword_only' END,
+    'retrievalByBase', retrieval_by_base,
     'updatedAt', to_char(
       clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
     )
@@ -1381,7 +1499,7 @@ DECLARE
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
   SELECT status INTO consent_status FROM public.knowledge_embedding_consents
-    WHERE owner_id = owner;
+    WHERE owner_id = owner FOR SHARE;
   IF consent_status IS DISTINCT FROM 'granted' THEN
     RAISE EXCEPTION USING MESSAGE = 'EMBEDDING_CONSENT_REQUIRED', ERRCODE = 'P0001';
   END IF;
@@ -1466,7 +1584,7 @@ DECLARE
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
   SELECT status INTO consent_status FROM public.knowledge_embedding_consents
-    WHERE owner_id = owner;
+    WHERE owner_id = owner FOR SHARE;
   IF consent_status IS DISTINCT FROM 'granted' THEN
     RAISE EXCEPTION USING MESSAGE = 'EMBEDDING_CONSENT_REQUIRED', ERRCODE = 'P0001';
   END IF;
@@ -1957,6 +2075,8 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(varcha
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_capture_published_snapshot(varchar, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_embedding_generation(varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated;
@@ -1975,6 +2095,7 @@ BEGIN
     'knowledge_bases', 'knowledge_objects', 'knowledge_documents', 'knowledge_versions',
     'knowledge_parser_runs', 'knowledge_blocks', 'knowledge_chunks',
     'knowledge_index_generations', 'knowledge_embedding_consents',
+    'knowledge_embedding_send_leases',
     'knowledge_generation_chunks', 'knowledge_chunk_embeddings',
     'knowledge_jobs', 'knowledge_entity_heads',
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
@@ -2005,6 +2126,8 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(var
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_capture_published_snapshot(varchar, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_prepare_embedding_generation(varchar, varchar, varchar, varchar, varchar, varchar, jsonb) TO service_role;

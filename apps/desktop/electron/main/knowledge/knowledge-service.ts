@@ -7,10 +7,13 @@ import {
   toSafeAppError,
   type AppErrorCode,
   type KnowledgeBase,
+  type KnowledgeChatProviderConsentState,
   type KnowledgeConsentState,
   type KnowledgeDocument,
+  type KnowledgeEmbeddingConsentState,
   type KnowledgeEntitlementState,
   type KnowledgeFeatureAvailability,
+  type KnowledgeSearchResult,
   type KnowledgeSelection,
   type KnowledgeVersion,
 } from '@autoforge/shared'
@@ -25,6 +28,11 @@ import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './e
 import { KnowledgeExportService } from './export-service.js'
 import { KnowledgeKeyStore } from './key-store.js'
 import { LocalKnowledgeRetriever, type LocalKnowledgeSearchOutcome } from './local-retriever.js'
+import {
+  CLOUD_RETRIEVAL_TOP_K,
+  CloudRetriever,
+  type CloudHybridRetrievalPort,
+} from './cloud-retriever.js'
 import { KnowledgeOrphanCleanupService } from './orphan-cleanup-service.js'
 import type { KnowledgeOwner, KnowledgePersistence } from './knowledge-types.js'
 import type { ParserFormat } from './parser-protocol.js'
@@ -47,6 +55,19 @@ export interface KnowledgeEntitlementPort {
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
 }
 
+export interface KnowledgeCloudPort extends CloudHybridRetrievalPort {
+  getEntitlement(): Promise<KnowledgeEntitlementState & {
+    killSwitchEnabled: boolean
+    version: number
+    validUntil: string | null
+  }>
+  getEmbeddingConsent(): Promise<KnowledgeEmbeddingConsentState>
+  setEmbeddingConsent(input: {
+    requestId: string
+    status: 'granted' | 'denied' | 'revoked'
+  }): Promise<KnowledgeEmbeddingConsentState>
+}
+
 interface OpenKnowledgeSession extends KnowledgeImportSession {
   readonly owner: KnowledgeOwner
 }
@@ -59,7 +80,10 @@ export interface KnowledgeServiceOptions {
   readonly chooseExportPath: (defaultName: string) => Promise<string | undefined>
   readonly ownsConversation: (owner: KnowledgeOwner, conversationId: string) => Promise<boolean>
   readonly entitlement?: KnowledgeEntitlementPort
-  readonly getConsent?: (owner: KnowledgeOwner) => Promise<KnowledgeConsentState>
+  readonly cloud?: KnowledgeCloudPort
+  readonly getChatProviderConsent?: (
+    owner: KnowledgeOwner,
+  ) => Promise<KnowledgeChatProviderConsentState>
   readonly now?: () => number
   readonly id?: () => string
   readonly platform?: NodeJS.Platform
@@ -196,9 +220,35 @@ const defaultEntitlement: KnowledgeEntitlementPort = {
   }),
 }
 
+const defaultEmbeddingConsent: KnowledgeEmbeddingConsentState = {
+  processor: 'tokenhub', processingRegion: 'Guangzhou',
+  model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+  status: 'unknown', retrievalByBase: [],
+}
+
 function hasMemberAccess(entitlement: KnowledgeEntitlementState): boolean {
   return entitlement.tier === 'member'
     && (entitlement.status === 'active' || entitlement.status === 'offline_grace')
+}
+
+function stableTextOrder(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function mergeRankedResults(
+  ...rankings: readonly KnowledgeSearchResult[][]
+): KnowledgeSearchResult[] {
+  const fused = new Map<string, { evidence: KnowledgeSearchResult; score: number }>()
+  for (const ranking of rankings) ranking.forEach((evidence, index) => {
+    const current = fused.get(evidence.evidenceId) ?? { evidence, score: 0 }
+    current.score += 1 / (60 + index + 1)
+    fused.set(evidence.evidenceId, current)
+  })
+  return [...fused.values()]
+    .sort((left, right) => right.score - left.score
+      || stableTextOrder(left.evidence.evidenceId, right.evidence.evidenceId))
+    .slice(0, CLOUD_RETRIEVAL_TOP_K)
+    .map(({ evidence, score }) => ({ ...evidence, score }))
 }
 
 const SEARCHABLE_BASE_PREDICATE = `
@@ -233,31 +283,36 @@ export class KnowledgeService implements KnowledgePersistence {
     const rows = session.opened.database.prepare(`
       SELECT knowledge_bases.id, knowledge_bases.name, knowledge_bases.status,
         knowledge_bases.updated_at AS updatedAt,
+        cloud_sync_states.mode AS syncMode,
         count(documents.id) AS documentCount,
         coalesce(sum(CASE WHEN documents.status IN ('pending', 'processing') THEN 1 ELSE 0 END), 0) AS processingCount,
         coalesce(sum(CASE WHEN documents.status = 'failed' THEN 1 ELSE 0 END), 0) AS failedCount,
         CASE WHEN ${SEARCHABLE_BASE_PREDICATE} THEN 1 ELSE 0 END AS searchable
       FROM knowledge_bases
       LEFT JOIN documents ON documents.knowledge_base_id = knowledge_bases.id
+      LEFT JOIN cloud_sync_states ON cloud_sync_states.knowledge_base_id = knowledge_bases.id
       GROUP BY knowledge_bases.id
       ORDER BY knowledge_bases.created_at, knowledge_bases.id
     `).all() as Array<{
       id: string; name: string; status: 'active' | 'read_only' | 'recycled'; updatedAt: number
       documentCount: number; processingCount: number; failedCount: number; searchable: number
+      syncMode: 'local_only' | 'syncing' | 'synced' | 'paused' | 'converting' | 'failed' | null
     }>
     return rows.map(row => ({
       id: row.id,
       name: row.name,
-      kind: 'local',
+      kind: row.syncMode && row.syncMode !== 'local_only' ? 'cloud' : 'local',
       status: row.status === 'recycled'
         ? 'recycled'
         : row.status === 'read_only'
           ? 'read_only'
-          : row.processingCount > 0
+          : row.processingCount > 0 || ['syncing', 'converting'].includes(row.syncMode ?? '')
             ? 'processing'
-            : row.failedCount > 0
+            : row.failedCount > 0 || row.syncMode === 'failed'
               ? 'failed'
-              : 'ready',
+              : row.syncMode === 'paused'
+                ? 'paused'
+                : 'ready',
       searchable: Boolean(row.searchable),
       documentCount: row.documentCount,
       updatedAt: iso(row.updatedAt),
@@ -474,7 +529,41 @@ export class KnowledgeService implements KnowledgePersistence {
   async search(owner: KnowledgeOwner, conversationId: string, query: string): Promise<LocalKnowledgeSearchOutcome> {
     const session = await this.ensureSession(owner)
     const selection = await this.getConversationSelection(owner, conversationId)
-    return new LocalKnowledgeRetriever(session.opened.database).search(selection.knowledgeBaseIds, query)
+    const normalizedQuery = query.trim()
+    if (Array.from(normalizedQuery).length <= 1) return { kind: 'ask_for_detail', results: [] }
+    if (selection.knowledgeBaseIds.length === 0) return { kind: 'results', results: [] }
+    const localRetriever = new LocalKnowledgeRetriever(session.opened.database)
+    const placeholders = selection.knowledgeBaseIds.map(() => '?').join(', ')
+    const synced = session.opened.database.prepare(`
+      SELECT cloud_sync_states.knowledge_base_id AS knowledgeBaseId
+      FROM cloud_sync_states
+      JOIN knowledge_bases ON knowledge_bases.id = cloud_sync_states.knowledge_base_id
+      WHERE cloud_sync_states.knowledge_base_id IN (${placeholders})
+        AND cloud_sync_states.mode = 'synced'
+        AND cloud_sync_states.published_generation_id IS NOT NULL
+        AND knowledge_bases.status = 'active'
+    `).all(...selection.knowledgeBaseIds) as Array<{ knowledgeBaseId: string }>
+    const syncedIds = new Set(synced.map(({ knowledgeBaseId }) => knowledgeBaseId))
+    const cloudIds = selection.knowledgeBaseIds.filter(id => syncedIds.has(id))
+    if (cloudIds.length === 0 || !this.options.cloud) {
+      return localRetriever.search(selection.knowledgeBaseIds, normalizedQuery)
+    }
+    if (!await this.cloudRetrievalEnabled()) {
+      return localRetriever.search(selection.knowledgeBaseIds, normalizedQuery)
+    }
+    const localIds = selection.knowledgeBaseIds.filter(id => !syncedIds.has(id))
+    const localResults = localIds.length === 0
+      ? []
+      : (await localRetriever.search(localIds, normalizedQuery)).results
+    let cloudResults: KnowledgeSearchResult[]
+    try {
+      const retriever = new CloudRetriever(this.options.cloud)
+      const snapshot = await retriever.captureSnapshot(cloudIds)
+      cloudResults = (await retriever.search(snapshot, normalizedQuery)).results
+    } catch {
+      cloudResults = (await localRetriever.search(cloudIds, normalizedQuery)).results
+    }
+    return { kind: 'results', results: mergeRankedResults(localResults, cloudResults) }
   }
 
   async getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability> {
@@ -510,26 +599,80 @@ export class KnowledgeService implements KnowledgePersistence {
         }
       }
     }
+    const cloudAvailable = await this.cloudRetrievalEnabled()
     return {
       local: { available: reasons.length === 0, reasons },
-      cloud: { available: false, reasons: ['kill_switch_enabled'] },
+      cloud: cloudAvailable
+        ? { available: true, reasons: [] }
+        : { available: false, reasons: ['kill_switch_enabled'] },
     }
   }
 
-  getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState> {
-    return (this.options.entitlement ?? defaultEntitlement).getEntitlement(owner)
+  async getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState> {
+    this.assertOwner(owner)
+    if (this.options.entitlement) return this.options.entitlement.getEntitlement(owner)
+    if (!this.options.cloud) return defaultEntitlement.getEntitlement(owner)
+    try {
+      const entitlement = await this.options.cloud.getEntitlement()
+      return {
+        tier: entitlement.tier,
+        status: entitlement.status,
+        betaEnabled: entitlement.betaEnabled,
+        cloudEnabled: entitlement.cloudEnabled,
+      }
+    } catch {
+      return { tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false }
+    }
   }
 
-  getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState> {
-    return this.options.getConsent?.(owner)
-      ?? Promise.resolve({
-        chatProvider: { provider: 'deepseek', status: 'unknown' },
-        embedding: {
-          processor: 'tokenhub', processingRegion: 'Guangzhou',
-          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-          status: 'unknown', retrievalMode: 'keyword_only',
-        },
-      })
+  async getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState> {
+    this.assertOwner(owner)
+    const chatProvider = await (this.options.getChatProviderConsent?.(owner)
+      ?? Promise.resolve({ provider: 'deepseek' as const, status: 'unknown' as const }))
+    let embedding = defaultEmbeddingConsent
+    if (this.options.cloud) {
+      try { embedding = await this.options.cloud.getEmbeddingConsent() } catch {
+        embedding = defaultEmbeddingConsent
+      }
+    }
+    return { chatProvider, embedding }
+  }
+
+  async setEmbeddingConsent(
+    owner: KnowledgeOwner,
+    status: 'granted' | 'denied' | 'revoked',
+  ): Promise<KnowledgeConsentState> {
+    this.assertOwner(owner)
+    if (!this.options.cloud) failure('SERVICE_UNAVAILABLE')
+    if (status === 'granted' && !await this.cloudRetrievalEnabled()) failure('SERVICE_UNAVAILABLE')
+    let embedding: KnowledgeEmbeddingConsentState
+    try {
+      embedding = await this.options.cloud.setEmbeddingConsent({ requestId: this.id(), status })
+    } catch {
+      failure('SERVICE_UNAVAILABLE')
+    }
+    const chatProvider = await (this.options.getChatProviderConsent?.(owner)
+      ?? Promise.resolve({ provider: 'deepseek' as const, status: 'unknown' as const }))
+    return { chatProvider, embedding }
+  }
+
+  private assertOwner(owner: KnowledgeOwner): void {
+    if (!owner.userId.trim()) failure('AUTH_REQUIRED')
+    if (this.session && this.session.owner.userId !== owner.userId) failure('FORBIDDEN')
+  }
+
+  private async cloudRetrievalEnabled(): Promise<boolean> {
+    if (!this.options.cloud) return false
+    try {
+      const entitlement = await this.options.cloud.getEntitlement()
+      return !entitlement.killSwitchEnabled
+        && entitlement.tier === 'member'
+        && ['active', 'offline_grace'].includes(entitlement.status)
+        && entitlement.betaEnabled
+        && entitlement.cloudEnabled
+    } catch {
+      return false
+    }
   }
 
   close(): Promise<void> {

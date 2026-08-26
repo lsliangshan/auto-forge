@@ -60,6 +60,7 @@ import {
 } from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
 import { readEncryptedObjectSnapshot } from './knowledge/encrypted-object-store.js'
+import type { CloudBaseFunctionPort } from './knowledge/cloudbase-knowledge-client.js'
 import type { KnowledgeParserPort } from './knowledge/knowledge-service.js'
 import { DEFAULT_PARSER_LIMITS } from './knowledge/parser-protocol.js'
 import { parseEncryptedDocument } from './knowledge/parser-worker.js'
@@ -753,6 +754,65 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('wires embedding consent to the authenticated CloudBase client with a Main-owned request id', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-cloud-'))
+    directories.push(root)
+    const functions: CloudBaseFunctionPort = {
+      callFunction: vi.fn(async ({ data }) => {
+        if (data.action === 'getEntitlement') {
+          return { result: { ok: true, data: {
+            tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+            killSwitchEnabled: false, version: 1, validUntil: null,
+          } } }
+        }
+        if (data.action === 'getEmbeddingConsent') {
+          return { result: { ok: true, data: {
+            processor: 'tokenhub', processingRegion: 'Guangzhou',
+            model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+            status: 'denied',
+            retrievalByBase: [{ knowledgeBaseId: 'kb_cloud', retrievalMode: 'keyword_only' }],
+          } } }
+        }
+        if (data.action === 'setEmbeddingConsent') {
+          return { result: { ok: true, data: {
+            processor: 'tokenhub', processingRegion: 'Guangzhou',
+            model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+            status: data.status,
+            retrievalByBase: [{ knowledgeBaseId: 'kb_cloud', retrievalMode: 'reindexing' }],
+          } } }
+        }
+        throw new Error(`unexpected cloud action ${String(data.action)}`)
+      }),
+    }
+    const runtime = createApplicationRuntime(options(root, { knowledgeCloudFunctions: functions }))
+    const session = await authenticate(runtime, 'KnowledgeCloud')
+    const owner = { userId: session.user.id }
+
+    await expect(runtime.services.knowledge.getConsent(owner)).resolves.toMatchObject({
+      embedding: {
+        status: 'denied',
+        retrievalByBase: [{ knowledgeBaseId: 'kb_cloud', retrievalMode: 'keyword_only' }],
+      },
+    })
+    await expect(runtime.services.knowledge.setEmbeddingConsent(owner, 'granted')).resolves
+      .toMatchObject({ embedding: { status: 'granted' } })
+    expect(functions.callFunction).toHaveBeenNthCalledWith(1, {
+      name: 'autoforge-knowledge', data: { action: 'getEmbeddingConsent' },
+    })
+    const mutation = vi.mocked(functions.callFunction).mock.calls[2]?.[0]
+    expect(mutation).toEqual({
+      name: 'autoforge-knowledge',
+      data: {
+        action: 'setEmbeddingConsent', status: 'granted',
+        requestId: expect.stringMatching(/^[-\w]+$/),
+      },
+    })
+    expect(mutation?.data).not.toHaveProperty('userId')
+    expect(mutation?.data).not.toHaveProperty('knowledgeBaseId')
+    expect(mutation?.data).not.toHaveProperty('generationId')
+    await runtime.close()
+  })
+
   it('owns path-free knowledge import/search/export and closes parser scope before logout identity change', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-'))
     directories.push(root)

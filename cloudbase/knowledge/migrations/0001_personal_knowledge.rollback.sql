@@ -11,6 +11,8 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_embedding_generation(varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_capture_published_snapshot(varchar, jsonb) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, varchar) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) FROM service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) FROM service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_orphan_cleanup(varchar, varchar, varchar, jsonb) FROM service_role;
@@ -37,6 +39,8 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_embedding_generation
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_prepare_embedding_generation(varchar, varchar, varchar, varchar, varchar, varchar, jsonb);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_capture_published_snapshot(varchar, jsonb);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_set_embedding_consent(varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_embedding_send(varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_embedding_consent(varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_job(varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_orphan_cleanup(varchar, varchar, varchar, jsonb);
@@ -76,6 +80,7 @@ DROP TABLE IF EXISTS public.knowledge_entity_heads;
 DROP TABLE IF EXISTS public.knowledge_jobs;
 DROP TABLE IF EXISTS public.knowledge_chunk_embeddings;
 DROP TABLE IF EXISTS public.knowledge_generation_chunks;
+DROP TABLE IF EXISTS public.knowledge_embedding_send_leases;
 DROP TABLE IF EXISTS public.knowledge_embedding_consents;
 DROP TABLE IF EXISTS public.knowledge_index_generations;
 DROP TABLE IF EXISTS public.knowledge_chunks;

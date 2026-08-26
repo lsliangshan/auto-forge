@@ -103,6 +103,7 @@ describe('preload desktop bridge', () => {
     await app.api.knowledge.getFeatureAvailability()
     await app.api.knowledge.getEntitlement()
     await app.api.knowledge.getConsent()
+    await app.api.knowledge.setEmbeddingConsent('revoked')
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgeListBases, undefined)
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeCreateBase, { name: 'Policies' })
@@ -120,11 +121,16 @@ describe('preload desktop bridge', () => {
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(14, ipcChannels.knowledgeSearch, {
       conversationId: 'conversation_1', query: '北京政务',
     })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(
+      18,
+      ipcChannels.knowledgeSetEmbeddingConsent,
+      { status: 'revoked' },
+    )
     expect(Object.keys(app.api.knowledge)).toEqual([
       'listBases', 'createBase', 'listDocuments', 'listVersions', 'importDocument',
       'replaceDocument', 'recycleDocument', 'purgeDocument', 'recycleBase', 'purgeBase',
       'exportBase', 'getConversationSelection', 'updateConversationSelection', 'search',
-      'getFeatureAvailability', 'getEntitlement', 'getConsent',
+      'getFeatureAvailability', 'getEntitlement', 'getConsent', 'setEmbeddingConsent',
     ])
     expect(app.api.knowledge).not.toHaveProperty('invoke')
   })

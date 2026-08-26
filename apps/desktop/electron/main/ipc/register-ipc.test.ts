@@ -143,7 +143,15 @@ function services(): DesktopIpcServices {
         embedding: {
           processor: 'tokenhub', processingRegion: 'Guangzhou',
           model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-          status: 'unknown', retrievalMode: 'keyword_only',
+          status: 'unknown', retrievalByBase: [],
+        },
+      }),
+      setEmbeddingConsent: vi.fn().mockResolvedValue({
+        chatProvider: { provider: 'deepseek', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'revoked', retrievalByBase: [],
         },
       }),
     },
@@ -389,6 +397,7 @@ describe('registerDesktopIpc', () => {
     await app.invoke(ipcChannels.knowledgeGetFeatureAvailability)
     await app.invoke(ipcChannels.knowledgeGetEntitlement)
     await app.invoke(ipcChannels.knowledgeGetConsent)
+    await app.invoke(ipcChannels.knowledgeSetEmbeddingConsent, { status: 'revoked' })
 
     const owner = { userId: 'user_1' }
     expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
@@ -404,6 +413,7 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.knowledge.updateConversationSelection).toHaveBeenCalledWith(owner, 'conversation_1', selection)
     expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, 'conversation_1', '北京政务')
     expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.setEmbeddingConsent).toHaveBeenCalledWith(owner, 'revoked')
 
     for (const [channel, input] of [
       [ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1', userId: 'other_user' }],
@@ -414,6 +424,9 @@ describe('registerDesktopIpc', () => {
       [ipcChannels.knowledgeSearch, { conversationId: 'conversation_1', query: '北京', topK: 99 }],
       [ipcChannels.knowledgeSearch, { conversationId: 'conversation_1', query: '北京', knowledgeBaseIds: ['kb_other'] }],
       [ipcChannels.knowledgeGetFeatureAvailability, { path: '/private/knowledge.sqlite' }],
+      [ipcChannels.knowledgeSetEmbeddingConsent, { status: 'granted', userId: 'other_user' }],
+      [ipcChannels.knowledgeSetEmbeddingConsent, { status: 'revoked', requestId: 'renderer_request' }],
+      [ipcChannels.knowledgeSetEmbeddingConsent, { status: 'denied', generationId: 'generation_other' }],
     ] as const) {
       await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     }
@@ -443,6 +456,7 @@ describe('registerDesktopIpc', () => {
     await app.invoke(ipcChannels.knowledgeGetFeatureAvailability)
     await app.invoke(ipcChannels.knowledgeGetEntitlement)
     await app.invoke(ipcChannels.knowledgeGetConsent)
+    await app.invoke(ipcChannels.knowledgeSetEmbeddingConsent, { status: 'denied' })
 
     expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.createBase).toHaveBeenCalledWith(owner, 'Bob Base')
@@ -460,6 +474,7 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.getEntitlement).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.getConsent).toHaveBeenCalledWith(owner)
+    expect(app.dependencies.knowledge.setEmbeddingConsent).toHaveBeenCalledWith(owner, 'denied')
   })
 
   it('holds admission across authenticated owner derivation and the complete knowledge operation', async () => {

@@ -274,12 +274,41 @@ function safeLog(logger, event, fields) {
 }
 
 function degradationFor(error) {
+  if (isRecord(error) && error.code === 'EMBEDDING_CONSENT_REQUIRED') {
+    return 'consent_unavailable'
+  }
   return isRecord(error) && error.code === 'MODEL_DEPRECATED'
     ? 'model_deprecated'
     : 'provider_unavailable'
 }
 
-async function searchPublished({ event, data, embeddings, logger }) {
+async function withEmbeddingSendAuthorization({ uid, rpc, purpose, send }) {
+  const authorization = await rpc('autoforge_knowledge_begin_embedding_send', {
+    p_caller_user_id: uid,
+    p_purpose: purpose,
+  })
+  if (!isRecord(authorization)
+    || !nonEmptyString(authorization.leaseToken)
+    || !Number.isSafeInteger(authorization.consentEpoch)
+    || authorization.consentEpoch < 0) throw { code: 'INTERNAL_ERROR' }
+  let response
+  let sendFailure
+  try {
+    response = await send()
+  } catch (error) {
+    sendFailure = { error }
+  }
+  const completed = await rpc('autoforge_knowledge_complete_embedding_send', {
+    p_caller_user_id: uid,
+    p_lease_token: authorization.leaseToken,
+    p_consent_epoch: authorization.consentEpoch,
+  })
+  if (!isRecord(completed) || completed.released !== true) throw { code: 'INTERNAL_ERROR' }
+  if (sendFailure) throw sendFailure.error
+  return response
+}
+
+async function searchPublished({ event, data, uid, rpc, embeddings, logger }) {
   const allowedGenerations = new Map(
     event.generationSnapshot.map(item => [item.generationId, item.knowledgeBaseId]),
   )
@@ -303,8 +332,11 @@ async function searchPublished({ event, data, embeddings, logger }) {
   }
   try {
     if (!embeddings) throw { code: 'TRANSIENT_FAILURE' }
-    const response = await embeddings.embed({
-      model: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS, inputs: [event.query],
+    const response = await withEmbeddingSendAuthorization({
+      uid, rpc, purpose: 'query',
+      send: () => embeddings.embed({
+        model: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS, inputs: [event.query],
+      }),
     })
     const vectors = embeddingResponse(response, 1)
     if (!vectors) throw { code: 'EMBEDDING_MODEL_INVALID' }
@@ -349,10 +381,13 @@ async function buildEmbeddingGeneration({ event, data, uid, rpc, embeddings, log
       : [EMBEDDING_DRIFT_PROBE, ...data.chunks.map(chunk => chunk.body)]
     let vectors = []
     if (inputs.length > 0) {
-      const response = await embeddings.embed({
-        model: EMBEDDING_MODEL,
-        dimensions: EMBEDDING_DIMENSIONS,
-        inputs,
+      const response = await withEmbeddingSendAuthorization({
+        uid, rpc, purpose: 'index',
+        send: () => embeddings.embed({
+          model: EMBEDDING_MODEL,
+          dimensions: EMBEDDING_DIMENSIONS,
+          inputs,
+        }),
       })
       vectors = embeddingResponse(response, inputs.length)
     }
@@ -402,6 +437,8 @@ async function buildEmbeddingGeneration({ event, data, uid, rpc, embeddings, log
     if (ready) throw { code: safeErrorCode(error) }
     if (isRecord(error) && error.code === 'EMBEDDING_MODEL_INVALID') {
       failureCode = 'EMBEDDING_MODEL_INVALID'
+    } else if (isRecord(error) && error.code === 'EMBEDDING_CONSENT_REQUIRED') {
+      failureCode = 'EMBEDDING_CONSENT_REQUIRED'
     }
     try {
       await rpc('autoforge_knowledge_fail_embedding_generation', {
@@ -420,10 +457,13 @@ async function probeEmbeddingDrift({ event, data, uid, rpc, embeddings, logger }
     throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
   }
   if (!embeddings) throw { code: 'TRANSIENT_FAILURE' }
-  const response = await embeddings.embed({
-    model: EMBEDDING_MODEL,
-    dimensions: EMBEDDING_DIMENSIONS,
-    inputs: [EMBEDDING_DRIFT_PROBE],
+  const response = await withEmbeddingSendAuthorization({
+    uid, rpc, purpose: 'drift',
+    send: () => embeddings.embed({
+      model: EMBEDDING_MODEL,
+      dimensions: EMBEDDING_DIMENSIONS,
+      inputs: [EMBEDDING_DRIFT_PROBE],
+    }),
   })
   const vectors = embeddingResponse(response, 1)
   if (!vectors) throw { code: 'EMBEDDING_MODEL_INVALID' }
@@ -458,7 +498,9 @@ function createKnowledgeHandler({ rpc, storage, embeddings, logger }) {
     try {
       const data = await rpc(parsed[0], parsed[1])
       if (event.action === 'searchPublished') {
-        return { ok: true, data: await searchPublished({ event, data, embeddings, logger }) }
+        return { ok: true, data: await searchPublished({
+          event, data, uid, rpc, embeddings, logger,
+        }) }
       }
       if (event.action === 'buildEmbeddingGeneration') {
         return { ok: true, data: await buildEmbeddingGeneration({

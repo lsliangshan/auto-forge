@@ -175,6 +175,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       getFeatureAvailability: () => invoke(ipcRenderer, ipcChannels.knowledgeGetFeatureAvailability),
       getEntitlement: () => invoke(ipcRenderer, ipcChannels.knowledgeGetEntitlement),
       getConsent: () => invoke(ipcRenderer, ipcChannels.knowledgeGetConsent),
+      setEmbeddingConsent: (status) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeSetEmbeddingConsent,
+        { status },
+      ),
     },
     system: {
       openExternal: (url) => invoke(ipcRenderer, ipcChannels.systemOpenExternal, { url }),

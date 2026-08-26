@@ -102,7 +102,7 @@ function choiceFor(base: KnowledgeBase, missing = false): Choice {
     return { base, label: `${base.kind === 'cloud' ? '同步中' : '本地处理中'} · 已就绪版本可用`, disabled: false }
   }
   if (base.kind === 'local') return { base, label: '仅本地 · 关键词检索', disabled: false }
-  const retrievalMode = knowledge.consent?.embedding.retrievalMode
+  const retrievalMode = knowledge.embeddingRetrievalMode(base.id)
   return {
     base,
     label: retrievalMode === 'hybrid'

@@ -114,17 +114,25 @@ const beginSyncSchema = z.object({
   generationId: identifier,
   status: z.literal('staging'),
 }).strict()
+const embeddingBaseRetrievalSchema = z.object({
+  knowledgeBaseId: identifier,
+  retrievalMode: z.enum(['hybrid', 'keyword_only', 'reindexing']),
+}).strict()
 const embeddingConsentSchema = z.object({
   processor: z.literal('tokenhub'),
   processingRegion: z.literal('Guangzhou'),
   model: z.literal('kinfra-text-embedding-0.6b'),
   dimensions: z.literal(1024),
   status: z.enum(['unknown', 'granted', 'denied', 'revoked']),
-  retrievalMode: z.enum(['hybrid', 'keyword_only', 'reindexing']),
+  retrievalByBase: z.array(embeddingBaseRetrievalSchema).max(1_000).refine(
+    states => new Set(states.map(({ knowledgeBaseId }) => knowledgeBaseId)).size === states.length,
+    { message: 'Knowledge base retrieval states must be unique' },
+  ),
   updatedAt: z.string().datetime().optional(),
-}).strict().superRefine(({ status, retrievalMode }, context) => {
-  if (status !== 'granted' && retrievalMode !== 'keyword_only') {
-    context.addIssue({ code: 'custom', path: ['retrievalMode'], message: 'Consent is required' })
+}).strict().superRefine(({ status, retrievalByBase }, context) => {
+  if (status !== 'granted'
+    && retrievalByBase.some(({ retrievalMode }) => retrievalMode !== 'keyword_only')) {
+    context.addIssue({ code: 'custom', path: ['retrievalByBase'], message: 'Consent is required' })
   }
 })
 const publishedGenerationSchema = z.object({

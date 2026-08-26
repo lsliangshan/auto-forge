@@ -86,6 +86,10 @@ export interface DesktopIpcServices {
     getFeatureAvailability(owner: KnowledgeOwner): Promise<KnowledgeFeatureAvailability>
     getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
     getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>
+    setEmbeddingConsent(
+      owner: KnowledgeOwner,
+      status: 'granted' | 'denied' | 'revoked',
+    ): Promise<KnowledgeConsentState>
   }
   system: DesktopAPI['system']
 }
@@ -269,6 +273,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   registerKnowledge(ipcChannels.knowledgeGetFeatureAvailability, (owner) => options.services.knowledge.getFeatureAvailability(owner))
   registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))
   registerKnowledge(ipcChannels.knowledgeGetConsent, (owner) => options.services.knowledge.getConsent(owner))
+  registerKnowledge(ipcChannels.knowledgeSetEmbeddingConsent, (owner, input) => (
+    options.services.knowledge.setEmbeddingConsent(owner, input.status)
+  ))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 

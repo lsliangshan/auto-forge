@@ -113,6 +113,13 @@ export const useKnowledgeStore = defineStore('knowledge', {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
       return scopeAvailable(base, state.availability, state.entitlement)
     },
+    embeddingRetrievalMode(state) {
+      return (knowledgeBaseId: string): 'hybrid' | 'keyword_only' | 'reindexing' => (
+        state.consent?.embedding.retrievalByBase.find(
+          state => state.knowledgeBaseId === knowledgeBaseId,
+        )?.retrievalMode ?? 'keyword_only'
+      )
+    },
   },
   actions: {
     reset() {
@@ -308,6 +315,13 @@ export const useKnowledgeStore = defineStore('knowledge', {
         this.selectedBaseId = created.id
         this.selectedDocumentId = ''
         this.documentsByBase[created.id] = []
+      })
+    },
+    async setEmbeddingConsent(status: 'granted' | 'denied' | 'revoked') {
+      if (this.operationPending) return
+      await this.runOperation('TokenHub 授权更新失败', async (isCurrent) => {
+        const consent = await getDesktopApi().knowledge.setEmbeddingConsent(status)
+        if (isCurrent()) this.consent = consent
       })
     },
     upsertDocument(document: KnowledgeDocument) {

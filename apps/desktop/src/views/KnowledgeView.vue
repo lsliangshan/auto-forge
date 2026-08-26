@@ -10,6 +10,35 @@
         <strong>{{ knowledge.selectedBase?.name ?? '未选择知识库' }}</strong>
       </div>
       <div class="toolbar-actions">
+        <div
+          v-if="knowledge.selectedBase?.kind === 'cloud'"
+          class="embedding-consent-controls"
+        >
+          <small>混合检索会将片段和查询发送至 TokenHub（广州）处理</small>
+          <span>
+            <el-button
+              v-if="knowledge.consent?.embedding.status === 'unknown'"
+              data-testid="knowledge-embedding-deny"
+              size="small"
+              :disabled="knowledge.operationPending"
+              @click="knowledge.setEmbeddingConsent('denied')"
+            >不同意</el-button>
+            <el-button
+              v-if="knowledge.consent?.embedding.status !== 'granted'"
+              data-testid="knowledge-embedding-grant"
+              size="small"
+              :disabled="knowledge.operationPending || !knowledge.availability?.cloud.available"
+              @click="knowledge.setEmbeddingConsent('granted')"
+            >同意并启用</el-button>
+            <el-button
+              v-else
+              data-testid="knowledge-embedding-revoke"
+              size="small"
+              :disabled="knowledge.operationPending"
+              @click="knowledge.setEmbeddingConsent('revoked')"
+            >撤回授权</el-button>
+          </span>
+        </div>
         <el-button
           data-testid="knowledge-import"
           type="primary"
@@ -124,7 +153,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .knowledge-view { display: flex; min-height: 100%; flex-direction: column; }
 .knowledge-toolbar { display: flex; min-height: 66px; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--af-border); padding: 12px 18px; background: var(--af-surface); }
-.knowledge-toolbar > div:first-child { display: grid; gap: 3px; }.knowledge-toolbar strong { font-size: 14px; }.toolbar-actions { display: flex; gap: 8px; }
+.knowledge-toolbar > div:first-child { display: grid; gap: 3px; }.knowledge-toolbar strong { font-size: 14px; }.toolbar-actions { display: flex; align-items: center; gap: 8px; }.embedding-consent-controls { display: grid; max-width: 290px; gap: 3px; color: var(--af-text-muted); font-size: 10px; text-align: right; }.embedding-consent-controls > span { display: flex; justify-content: flex-end; gap: 4px; }
 .knowledge-state { display: grid; min-height: 240px; flex: 1; place-content: center; color: var(--af-text-muted); text-align: center; }.knowledge-state p { margin: 0 0 6px; color: var(--af-text); }.knowledge-state.error { color: var(--af-danger); }
 .document-list { min-height: 0; flex: 1; padding: 12px 18px; overflow: auto; }
 .document-row { display: grid; width: 100%; grid-template-columns: 34px minmax(0, 1fr) auto 150px; align-items: center; gap: 10px; border: 1px solid transparent; border-bottom-color: var(--af-border); padding: 12px 10px; color: var(--af-text); background: transparent; cursor: pointer; text-align: left; }

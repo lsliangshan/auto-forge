@@ -7,6 +7,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import type {
   DesktopAPI,
   KnowledgeBase,
+  KnowledgeConsentState,
   KnowledgeDocument,
   KnowledgeEntitlementState,
   KnowledgeFeatureAvailability,
@@ -52,6 +53,7 @@ function createApi(input: {
   featureAvailability?: KnowledgeFeatureAvailability
   entitlement?: KnowledgeEntitlementState
   selection?: KnowledgeSelection
+  consent?: KnowledgeConsentState
 } = {}): DesktopAPI {
   const bases = input.bases ?? [localBase]
   const documents = input.documents ?? [readyDocument]
@@ -95,14 +97,23 @@ function createApi(input: {
       search: vi.fn(),
       getFeatureAvailability: vi.fn().mockResolvedValue(input.featureAvailability ?? available),
       getEntitlement: vi.fn().mockResolvedValue(input.entitlement ?? free),
-      getConsent: vi.fn().mockResolvedValue({
+      getConsent: vi.fn().mockResolvedValue(input.consent ?? {
         chatProvider: { provider: 'openrouter', status: 'denied' },
         embedding: {
           processor: 'tokenhub', processingRegion: 'Guangzhou',
           model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-          status: 'revoked', retrievalMode: 'keyword_only',
+          status: 'revoked', retrievalByBase: [],
         },
       }),
+      setEmbeddingConsent: vi.fn().mockImplementation(async (status) => ({
+        chatProvider: { provider: 'openrouter', status: 'denied' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status,
+          retrievalByBase: [],
+        },
+      })),
     },
     system: { getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
@@ -183,7 +194,7 @@ describe('knowledge Store boundary', () => {
       embedding: {
         processor: 'tokenhub', processingRegion: 'Guangzhou',
         model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
-        status: 'revoked', retrievalMode: 'keyword_only',
+        status: 'revoked', retrievalByBase: [],
       },
     }
 
@@ -605,6 +616,70 @@ describe('knowledge three-pane workspace', () => {
     expect(inspector).not.toContain('OpenRouter（广州）')
   })
 
+  it('offers the separate grant, deny, and revoke lifecycle without caller-controlled scope', async () => {
+    const cloudBase = { ...localBase, id: 'kb_cloud', kind: 'cloud' as const }
+    const api = createApi({
+      bases: [cloudBase], documents: [{ ...readyDocument, knowledgeBaseId: cloudBase.id }],
+      featureAvailability: {
+        local: { available: true, reasons: [] }, cloud: { available: true, reasons: [] },
+      },
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true },
+      consent: {
+        chatProvider: { provider: 'openrouter', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'unknown', retrievalByBase: [{
+            knowledgeBaseId: cloudBase.id, retrievalMode: 'keyword_only',
+          }],
+        },
+      },
+    })
+    vi.mocked(api.knowledge.setEmbeddingConsent)
+      .mockResolvedValueOnce({
+        chatProvider: { provider: 'openrouter', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'denied', retrievalByBase: [{
+            knowledgeBaseId: cloudBase.id, retrievalMode: 'keyword_only',
+          }],
+        },
+      })
+      .mockResolvedValueOnce({
+        chatProvider: { provider: 'openrouter', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'granted', retrievalByBase: [{
+            knowledgeBaseId: cloudBase.id, retrievalMode: 'reindexing',
+          }],
+        },
+      })
+      .mockResolvedValueOnce({
+        chatProvider: { provider: 'openrouter', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'revoked', retrievalByBase: [{
+            knowledgeBaseId: cloudBase.id, retrievalMode: 'keyword_only',
+          }],
+        },
+      })
+    const { wrapper } = await mountKnowledge(api)
+
+    await wrapper.get('[data-testid="knowledge-embedding-deny"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="knowledge-embedding-grant"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="knowledge-embedding-revoke"]').trigger('click')
+    await flushPromises()
+
+    expect(api.knowledge.setEmbeddingConsent).toHaveBeenNthCalledWith(1, 'denied')
+    expect(api.knowledge.setEmbeddingConsent).toHaveBeenNthCalledWith(2, 'granted')
+    expect(api.knowledge.setEmbeddingConsent).toHaveBeenNthCalledWith(3, 'revoked')
+  })
+
   it('marks a deleted document as deleted and non-retrievable even when a ready version remains', async () => {
     const api = createApi({
       bases: [localBase],
@@ -621,6 +696,38 @@ describe('knowledge three-pane workspace', () => {
 })
 
 describe('conversation knowledge preferences', () => {
+  it('renders retrieval mode per cloud base instead of borrowing another base index state', async () => {
+    const hybrid = { ...localBase, id: 'kb_hybrid', name: '混合库', kind: 'cloud' as const }
+    const keyword = { ...localBase, id: 'kb_keyword', name: '关键词库', kind: 'cloud' as const }
+    const api = createApi({
+      bases: [hybrid, keyword],
+      featureAvailability: {
+        local: { available: true, reasons: [] }, cloud: { available: true, reasons: [] },
+      },
+      entitlement: { tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true },
+      consent: {
+        chatProvider: { provider: 'openrouter', status: 'unknown' },
+        embedding: {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+          status: 'granted',
+          retrievalByBase: [
+            { knowledgeBaseId: hybrid.id, retrievalMode: 'hybrid' },
+            { knowledgeBaseId: keyword.id, retrievalMode: 'keyword_only' },
+          ],
+        },
+      },
+    })
+    const { wrapper } = await mountComposer(api)
+
+    expect(wrapper.get('[data-testid="knowledge-base-kb_hybrid"]').text())
+      .toContain('混合检索')
+    expect(wrapper.get('[data-testid="knowledge-base-kb_keyword"]').text())
+      .toContain('关键词检索')
+    expect(wrapper.get('[data-testid="knowledge-base-kb_keyword"]').text())
+      .not.toContain('混合检索')
+  })
+
   it('loads and persists zero-or-more bases plus strict or mixed mode per conversation', async () => {
     const api = createApi({ selection: { knowledgeBaseIds: ['kb_local'], knowledgeMode: 'strict' } })
     const { chat, wrapper } = await mountComposer(api)
