@@ -299,6 +299,8 @@ describe('KnowledgeService lifecycle', () => {
       status: 'available', kind: 'txt', excerpt: '第一行受控预览文本',
       startLine: 1, endLine: 1, startColumn: 0, endColumn: 9,
     })
+    expect(evidence.citation.kind).toBe('txt')
+    if (evidence.citation.kind !== 'txt') throw new Error('Expected TXT citation')
     await expect(target.previewCitation(owner, {
       ...evidence.citation,
       startColumn: 1,

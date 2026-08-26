@@ -7009,12 +7009,14 @@ describe('Agent knowledge grounding', () => {
     ))).toBe(false)
   })
 
-  it('accepts a conservative paraphrase supported by the cited current-turn snippet', async () => {
+  it('repairs then refuses a non-contiguous paraphrase of the cited current-turn snippet', async () => {
+    const paraphrase = {
+      text: '申请材料包含身份证明。', support: 'knowledge' as const, citationIds: ['evidence_1'],
+    }
     const dependencies = harness([
       knowledgeSearchTurn('paraphrase_search', '申请材料'),
-      groundedAnswerTurn('paraphrase_answer', [{
-        text: '申请材料包含身份证明。', support: 'knowledge', citationIds: ['evidence_1'],
-      }]),
+      groundedAnswerTurn('paraphrase_first', [paraphrase]),
+      groundedAnswerTurn('paraphrase_second', [paraphrase]),
     ])
     dependencies.workflows.list = async () => []
     const knowledge = attachKnowledge(dependencies)
@@ -7024,11 +7026,90 @@ describe('Agent knowledge grounding', () => {
       provider: 'openrouter', model: 'model',
     }, knowledge.snapshot))
 
-    expect(finalBlocks(dependencies)).toContainEqual(expect.objectContaining({
-      type: 'knowledge_answer', claims: [expect.objectContaining({
-        text: '申请材料包含身份证明。', support: 'knowledge',
-      })],
-    }))
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledTimes(3)
+    const text = finalBlocks(dependencies)
+      .filter((block): block is Extract<ChatBlock, { type: 'text' }> => block.type === 'text')
+      .map(block => block.text).join('')
+    expect(text).toContain('无法')
+    expect(JSON.stringify(finalBlocks(dependencies))).not.toContain(paraphrase.text)
+  })
+
+  it.each([
+    {
+      name: 'opposite object in one clause',
+      claim: '申请材料不需要身份证明。',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: '申请材料不需要护照，但需要身份证明。',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'number borrowed from an unrelated clause',
+      claim: '申请费用为20元。',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: '申请费用为10元，办理时限为20天。',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'polarity assembled across snippets',
+      claim: '申请材料不需要身份证明。',
+      evidence: [
+        { ...groundedEvidence, snippet: '申请材料不需要护照。' },
+        {
+          ...groundedEvidence,
+          evidenceId: 'evidence_2', documentId: 'document_2', versionId: 'version_2',
+          snippet: '申请材料需要身份证明。',
+          citation: {
+            ...groundedEvidence.citation,
+            documentId: 'document_2', versionId: 'version_2',
+          },
+        },
+      ],
+      citationIds: ['evidence_1', 'evidence_2'],
+    },
+    {
+      name: 'Latin lexical-token prefix',
+      claim: 'The plan is safe.',
+      evidence: [{ ...groundedEvidence, snippet: 'The plan is safely archived.' }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'two ASCII-period clauses',
+      claim: 'The fee is 10 USD. The deadline is 20 days.',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: 'The fee is 10 USD. The deadline is 20 days.',
+      }],
+      citationIds: ['evidence_1'],
+    },
+  ])('repairs exactly once then refuses support with $name', async ({
+    claim, evidence, citationIds,
+  }) => {
+    const unsupportedClaim = {
+      text: claim, support: 'knowledge' as const, citationIds,
+    }
+    const dependencies = harness([
+      knowledgeSearchTurn('relation_search', '申请要求'),
+      groundedAnswerTurn('relation_first', [unsupportedClaim]),
+      groundedAnswerTurn('relation_second', [unsupportedClaim]),
+    ])
+    dependencies.workflows.list = async () => []
+    const knowledge = attachKnowledge(dependencies, { results: evidence })
+
+    await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'relation_blind_support', content: '严格查申请要求',
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot))
+
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledTimes(3)
+    const text = finalBlocks(dependencies)
+      .filter((block): block is Extract<ChatBlock, { type: 'text' }> => block.type === 'text')
+      .map(block => block.text).join('')
+    expect(text).toContain('无法')
+    expect(JSON.stringify(finalBlocks(dependencies))).not.toContain(claim)
   })
 
   it('repairs then refuses a contradictory material claim even with a valid current-turn id', async () => {

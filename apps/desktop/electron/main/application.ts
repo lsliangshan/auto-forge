@@ -844,6 +844,8 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const activeRequests = new Set<string>()
   const activeChatWork = new Map<string, {
     conversationId: string
+    userId: string
+    kind: 'agent' | 'media'
     promise: Promise<AgentRunResult | void>
   }>()
   const activeConversationTitleWork = new Map<string, {
@@ -869,9 +871,14 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     activeRequests.delete(requestId)
     activeChatWork.delete(requestId)
   }
+  const releaseAgentChatWork = (requestId: string): void => {
+    if (activeChatWork.get(requestId)?.kind === 'agent') releaseChatWork(requestId)
+  }
   const trackChatWork = (
     requestId: string,
     conversationId: string,
+    userId: string,
+    kind: 'agent' | 'media',
     operation: () => Promise<AgentRunResult>,
   ): void => {
     activeRequests.add(requestId)
@@ -886,7 +893,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         recordFailure(error, 'background-chat')
         releaseChatWork(requestId)
       })
-    activeChatWork.set(requestId, { conversationId, promise })
+    activeChatWork.set(requestId, { conversationId, userId, kind, promise })
   }
   const emitExecution = (event: ExecutionEvent) => {
     if (event.type === 'status') {
@@ -918,7 +925,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const emitChat = (event: ChatEvent) => {
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
-      releaseChatWork(event.requestId)
+      releaseAgentChatWork(event.requestId)
       providerUsageReconciliationLoop.notifyUsageEnded()
     }
     const ownerId = database.conversations.get(event.conversationId)?.userId
@@ -1158,20 +1165,25 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await takeOverOwnedBrowser(current.run.requestId, current.binding.bindingId, session.user.id)
     },
   })
-  const cancelAgentRequestsForUser = async (userId: string): Promise<void> => {
-    const requestIds = [...activeRequests].filter((requestId) => (
-      database.chatRuns.getByRequestId(requestId)?.userId === userId
-    ))
-    const results = await Promise.allSettled(requestIds.map((requestId) => agent.cancel(requestId)))
+  const cancelChatRequestsForUser = async (userId: string): Promise<void> => {
+    const requests = [...activeChatWork.entries()].filter(([, work]) => work.userId === userId)
+    const results = await Promise.allSettled(requests.map(([requestId, work]) => (
+      work.kind === 'agent' ? agent.cancel(requestId) : mediaGeneration.cancel(requestId)
+    )))
+    const mediaDrains: Array<Promise<AgentRunResult | void>> = []
     results.forEach((result, index) => {
-      if (result.status === 'fulfilled') releaseChatWork(requestIds[index]!)
+      if (result.status !== 'fulfilled') return
+      const [requestId, work] = requests[index]!
+      if (work.kind === 'agent') releaseAgentChatWork(requestId)
+      else mediaDrains.push(work.promise)
     })
+    await Promise.all(mediaDrains)
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
     if (failed) throw failed.reason
   }
   const resetBrowserIdentity = async (userId: string): Promise<void> => {
     const failures: unknown[] = []
-    try { await cancelAgentRequestsForUser(userId) } catch (error) { failures.push(error) }
+    try { await cancelChatRequestsForUser(userId) } catch (error) { failures.push(error) }
     try { await browserContinuations.revokeUser(userId, 'CANCELLED') } catch (error) { failures.push(error) }
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
@@ -1330,8 +1342,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           async () => {
             const requests = [...activeChatWork.entries()]
               .filter(([, work]) => work.conversationId === conversationId)
-            await Promise.all(requests.map(([requestId]) => agent.cancel(requestId)))
-            for (const [requestId] of requests) releaseChatWork(requestId)
+            const cancellations = await Promise.allSettled(requests.map(([requestId, work]) => (
+              work.kind === 'agent' ? agent.cancel(requestId) : mediaGeneration.cancel(requestId)
+            )))
+            cancellations.forEach((result, index) => {
+              if (result.status === 'fulfilled' && requests[index]![1].kind === 'agent') {
+                releaseAgentChatWork(requests[index]![0])
+              }
+            })
+            const failed = cancellations.find(
+              (result): result is PromiseRejectedResult => result.status === 'rejected',
+            )
+            if (failed) throw failed.reason
             await Promise.all(requests.map(([, work]) => work.promise))
             const titleRequests = [...activeConversationTitleWork.values()]
               .filter((work) => work.conversationId === conversationId)
@@ -1434,7 +1456,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                     dataBase64,
                   })),
                 ]
-            trackChatWork(requestId, input.conversationId, async () => {
+            trackChatWork(requestId, input.conversationId, session.user.id, 'agent', async () => {
               return agent.run({
                 conversationId: input.conversationId,
                 content: input.content,
@@ -1457,11 +1479,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
               })
             })
           } else if (route.outputType === 'image') {
-            trackChatWork(requestId, input.conversationId, async () => {
+            trackChatWork(requestId, input.conversationId, session.user.id, 'media', async () => {
               return mediaGeneration.runImage(generationInput)
             })
           } else if (route.outputType === 'audio') {
-            trackChatWork(requestId, input.conversationId, async () => {
+            trackChatWork(requestId, input.conversationId, session.user.id, 'media', async () => {
               return mediaGeneration.runAudio(generationInput)
             })
           } else {
@@ -1485,15 +1507,19 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       },
       cancel: async (requestId) => {
         const session = await auth.requireSession()
-        const conversationId = activeChatWork.get(requestId)?.conversationId
+        const work = activeChatWork.get(requestId)
+        const conversationId = work?.conversationId
           ?? database.chatRuns.getByRequestId(requestId)?.conversationId
         if (!conversationId) throw failure('NOT_FOUND')
         requireOwnedConversation(conversationId, session.user.id)
-        const [agentCancellation] = await Promise.allSettled([
-          agent.cancel(requestId),
-          mediaGeneration.cancel(requestId),
-        ])
-        if (agentCancellation?.status === 'fulfilled') releaseChatWork(requestId)
+        const cancellations = await Promise.allSettled(work
+          ? [work.kind === 'agent'
+              ? agent.cancel(requestId)
+              : mediaGeneration.cancel(requestId)]
+          : [agent.cancel(requestId), mediaGeneration.cancel(requestId)])
+        if (work?.kind === 'agent' && cancellations[0]?.status === 'fulfilled') {
+          releaseAgentChatWork(requestId)
+        }
       },
       decideKnowledgeConsent: async (input) => {
         const parsed = decideKnowledgeConsentRequestSchema.safeParse(input)
@@ -1504,7 +1530,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         requireOwnedConversation(run.conversationId, session.user.id)
         const result = await agent.resumeKnowledgeConsent(parsed.data)
         if (result.status === 'failed') throw result.error ?? failure('INTERNAL_ERROR')
-        if (['completed', 'cancelled'].includes(result.status)) releaseChatWork(parsed.data.requestId)
+        if (['completed', 'cancelled'].includes(result.status)) {
+          releaseAgentChatWork(parsed.data.requestId)
+        }
         setKnowledgeChatProviderConsent(
           session.user.id,
           run.provider,

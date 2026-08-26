@@ -134,3 +134,52 @@
 
 - The conservative support proof intentionally produces false negatives for abstractive paraphrases, especially non-extractive English claims. This is fail-closed by controller ruling; no second provider adjudicator or persisted support excerpt was introduced.
 - The single unrelated Application context-summary baseline failure and external release gates remain unchanged.
+
+## Fix Round 2: strict support and media lifecycle review
+
+### Implementation
+
+- Replaced the relation-blind joined-snippet overlap proof with a bounded Main-only extractive proof. A knowledge claim is accepted only when its exact normalized lexical-token sequence occurs contiguously inside one clause of one specifically cited current-turn snippet. NFC case folding and whitespace/punctuation token separation are the only normalization; lexical tokens, digits, polarity, order, clause boundaries, and snippet boundaries remain intact. The repair prompt now explicitly requires single-clause source wording, and the existing one-repair limit then fails closed.
+- Removed all CJK-bigram, global-number-set, global-negation, and multi-snippet aggregation heuristics. The validator never asks another provider, never persists its source material, and continues to emit only claim text plus durable document/version/coordinate citations.
+- Split Application chat-work ownership into immutable `agent` versus `media` entries carrying the captured user and conversation. Agent terminal events can release only Agent work. Media status events cannot release media work; only the actual `runImage`/`runAudio` promise reaching a terminal result or rejection does so.
+- Explicit cancellation, conversation deletion, and authentication identity transitions now dispatch the authoritative cancellation by work kind. A failed media cancellation leaves the request discoverable. A successful auth-transition media cancellation waits for the media promise to drain before identity changes. Shutdown still retries both cancellation surfaces defensively and drains its captured media promise before closing.
+- Preserved awaiting knowledge-consent deletion: a successful Agent cancellation can release the already-returned awaiting run, without reintroducing the media early-release race.
+
+### Exact RED evidence
+
+- Stable focused RED before either production edit:
+
+  `pnpm test apps/desktop/electron/main/agent/agent-orchestrator.test.ts apps/desktop/electron/main/application.test.ts -t 'non-contiguous paraphrase|support with|retains media tracking|failed auth-transition media' --reporter=dot`
+
+  Result: 2 files failed / 6 tests failed / 367 skipped in 1.51s. The non-contiguous paraphrase and all three required counterexamples were accepted after only two provider turns instead of repairing once and refusing. Explicit media-cancel failure made shutdown lose the run, and auth transition incorrectly succeeded instead of retaining the failed media cancellation for shutdown.
+- The media lifecycle tests do not use timeout expiry as a success condition. They race the explicit second-cancellation signal against `close()`, record whether shutdown is still waiting, always resolve the controlled media promise for deterministic cleanup, then assert that shutdown had retained and retried the work and could not close before terminal drain.
+- Self-review RED for the ruling's lexical/clause details:
+
+  `pnpm test apps/desktop/electron/main/agent/agent-orchestrator.test.ts -t 'Latin lexical-token prefix|two ASCII-period clauses' --reporter=dot`
+
+  Result: 1 file failed / 2 tests failed / 216 skipped. Separator removal treated `safe` as support from `safely`, and omission of ASCII period allowed two clauses to be joined. Both were prematurely accepted after two turns.
+- First typecheck after the slice failed with three test-only errors: the two new image-provider doubles omitted their required `stream` method, and a Fix Round 1 union spread needed an explicit TXT narrowing. Both local fixtures and the latent test narrowing were corrected without production broadening.
+
+### GREEN and verification
+
+- Initial strict/media/pending-consent focused rerun -> 2 files / 7 passed / 366 skipped.
+- Final strict proof focus, including direct extractive support, non-contiguous paraphrase refusal, both reviewer counterexamples, cross-snippet polarity, Latin lexical boundary, ASCII clause boundary, valid-ID contradiction, and numeric repair -> 1 file / 9 passed / 209 skipped.
+- Full Agent suite -> 218 passed.
+- Final full Agent + Application rerun -> 374 passed / exactly 1 preserved unrelated failure: `bills real context-summary streams through the Application-supplied provider snapshot` still returns `CONTEXT_LIMIT_EXCEEDED`.
+- Other Task 8 workflow/context/knowledge/IPC/Preload/shared/Renderer suites -> 10 files / 387 passed. Together with the Agent suite, 605 Task 8 tests outside the known Application baseline pass.
+- Final `pnpm typecheck` passed all four typed workspace projects. `pnpm lint` exited 0 with 0 errors / 459 existing warnings. `pnpm build` passed all package and Electron production targets. `git diff --check` is clean.
+- The real local Electron knowledge smoke rebuilt Main/Preload/Renderer/worker code, crossed Renderer -> Preload -> IPC -> Main -> parser -> persistence, restored strict selection, and ended with `{ "ok": true }`.
+
+### Files and self-review
+
+- Production: `apps/desktop/electron/main/agent/agent-orchestrator.ts` and `apps/desktop/electron/main/application.ts`.
+- Regressions: their two test files, plus an explicit TXT narrowing in `knowledge/knowledge-service.test.ts` so the existing coordinate-mismatch test remains type-safe.
+- Evidence: this report. Controller-owned `progress.md` remains dirty, untouched by this agent, and excluded from staging.
+- Re-read the complete Round 2 production/test diff against both scoped findings. The strict proof is deterministic and bounded by the existing eight evidence items and schema string limits, never joins clauses/snippets, and cannot leak snippets/support excerpts/evidence IDs to ChatBlocks, Renderer, or history. The media path no longer derives media release from an Agent no-op; failed cancellation remains discoverable and successful identity transition waits for terminal media drain.
+- Existing identity/system/workflow/browser/tool-unavailable policies, 5/3/10/8 limits, workflow-first visibility, one repair, text/tool-only knowledge gating, provider-scoped disclosure consent, cloud kill switches, privacy logging, and the unrelated context-limit behavior are unchanged.
+
+### External gates and concerns
+
+- No real provider, CloudBase, TokenHub, PostgreSQL, entitlement, beta, cloud, or kill-switch gate was accessed or enabled. Provider repair and support use deterministic doubles; the Electron smoke is local only.
+- Extractive single-clause validation intentionally refuses otherwise reasonable paraphrases and multi-clause summaries. This is the required fail-closed tradeoff; repair is directed to source wording and no provider adjudicator or durable support excerpt was added.
+- The sole unrelated Application context-summary baseline failure and the external release gates remain unchanged.

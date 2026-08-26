@@ -840,6 +840,125 @@ describe('createApplicationRuntime', () => {
     }
   })
 
+  it('retains media tracking after explicit cancellation fails until shutdown drains the media run', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-cancel-tracking-'))
+    directories.push(root)
+    const mediaRun = deferred<Awaited<ReturnType<MediaGenerationOrchestrator['runImage']>>>()
+    const secondCancellation = deferred<void>()
+    vi.spyOn(MediaGenerationOrchestrator.prototype, 'runImage')
+      .mockImplementation(() => mediaRun.promise)
+    vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockResolvedValue(undefined)
+    const cancellationError = new Error('media cancellation failed')
+    const mediaCancel = vi.spyOn(MediaGenerationOrchestrator.prototype, 'cancel')
+      .mockRejectedValueOnce(cancellationError)
+      .mockImplementationOnce(async () => { secondCancellation.resolve() })
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [imageModelInfo('openrouter/image')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      generateImage: vi.fn(async () => ({ outputs: [] })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      modelProviders: { openrouter: provider },
+    }))
+    await authenticate(runtime, 'MediaCancelTracking')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { image: 'openrouter/image' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const sent = await runtime.services.chat.send({
+      ...chatInput(conversation.id, 'generate until shutdown'), outputType: 'image',
+    })
+    await vi.waitFor(() => expect(MediaGenerationOrchestrator.prototype.runImage).toHaveBeenCalledOnce())
+
+    await runtime.services.chat.cancel(sent.requestId)
+    let closed = false
+    const closing = runtime.close().then(() => { closed = true })
+    await Promise.race([secondCancellation.promise, closing])
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    const retainedUntilShutdown = mediaCancel.mock.calls.length === 2 && !closed
+    mediaRun.resolve({ requestId: sent.requestId, status: 'cancelled' })
+    await closing
+
+    expect(retainedUntilShutdown).toBe(true)
+    expect(mediaCancel).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps failed auth-transition media work tracked for shutdown cancellation and drain', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-media-auth-tracking-'))
+    directories.push(root)
+    const mediaRun = deferred<Awaited<ReturnType<MediaGenerationOrchestrator['runImage']>>>()
+    const secondCancellation = deferred<void>()
+    vi.spyOn(MediaGenerationOrchestrator.prototype, 'runImage')
+      .mockImplementation(() => mediaRun.promise)
+    vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockResolvedValue(undefined)
+    const cancellationError = new Error('auth media cancellation failed')
+    const mediaCancel = vi.spyOn(MediaGenerationOrchestrator.prototype, 'cancel')
+      .mockRejectedValueOnce(cancellationError)
+      .mockImplementationOnce(async () => { secondCancellation.resolve() })
+    const authService = createTestAuthService()
+    const underlyingLogout = vi.spyOn(authService, 'logout')
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [imageModelInfo('openrouter/image')]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+      generateImage: vi.fn(async () => ({ outputs: [] })),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      authService,
+      modelProviders: { openrouter: provider },
+    }))
+    const session = await authenticate(runtime, 'MediaAuthTracking')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: {
+        deepseek: { text: 'deepseek-v4-flash' },
+        openrouter: { image: 'openrouter/image' },
+      },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const sent = await runtime.services.chat.send({
+      ...chatInput(conversation.id, 'generate across logout'), outputType: 'image',
+    })
+    await vi.waitFor(() => expect(MediaGenerationOrchestrator.prototype.runImage).toHaveBeenCalledOnce())
+    const database = openAppDatabase(join(root, 'autoforge.sqlite'))
+    database.chatRuns.insert({
+      id: 'run_media_auth_tracking', conversationId: conversation.id,
+      requestId: sent.requestId, userId: session.user.id,
+      provider: 'openrouter', model: 'openrouter/image', status: 'running', startedAt: 1,
+    })
+    database.close()
+
+    let logoutError: unknown
+    try {
+      await runtime.services.auth.logout()
+    } catch (error) {
+      logoutError = error
+    }
+    let closed = false
+    const closing = runtime.close().then(() => { closed = true })
+    await Promise.race([secondCancellation.promise, closing])
+    await new Promise<void>((resolve) => { setImmediate(resolve) })
+    const retainedUntilShutdown = mediaCancel.mock.calls.length === 2 && !closed
+    mediaRun.resolve({ requestId: sent.requestId, status: 'cancelled' })
+    await closing
+
+    expect(logoutError).toBe(cancellationError)
+    expect(underlyingLogout).not.toHaveBeenCalled()
+    expect(retainedUntilShutdown).toBe(true)
+    expect(mediaCancel).toHaveBeenCalledTimes(2)
+  })
+
   it('persists snippet-disclosure consent per authenticated chat provider and requires it again after switching', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-provider-consent-'))
     directories.push(root)
