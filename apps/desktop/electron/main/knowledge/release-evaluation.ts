@@ -93,7 +93,9 @@ export function evaluateGroundingCases(cases: readonly GroundingCase[]) {
       && testCase.outcome === 'answered'
       && supported.length > 0
       && supported.every(Boolean)
-    const noEvidenceCorrect = !testCase.expectedEvidence && testCase.outcome === 'refused'
+    const noEvidenceCorrect = !testCase.expectedEvidence
+      && testCase.outcome === 'refused'
+      && testCase.claims.length === 0
     if (testCase.expectedEvidence) {
       answeredEvidenceCases += 1
       if (grounded) groundedEvidenceCases += 1

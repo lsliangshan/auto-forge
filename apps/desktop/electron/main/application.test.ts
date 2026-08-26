@@ -62,6 +62,7 @@ import { SecretStore } from './security/secret-store.js'
 import { readEncryptedObjectSnapshot } from './knowledge/encrypted-object-store.js'
 import type { CloudBaseFunctionPort } from './knowledge/cloudbase-knowledge-client.js'
 import { KnowledgeService, type KnowledgeParserPort } from './knowledge/knowledge-service.js'
+import type { KnowledgeReleaseEvidence } from './knowledge/release-gates.js'
 import { DEFAULT_PARSER_LIMITS } from './knowledge/parser-protocol.js'
 import { parseEncryptedDocument } from './knowledge/parser-worker.js'
 import { SettingsService } from './settings/settings-service.js'
@@ -74,6 +75,23 @@ import {
 import { createWorkflowSourceSelectorVault } from './workflows/workflow-source-selector.js'
 
 const directories: string[] = []
+const COMPLETE_KNOWLEDGE_RELEASE_EVIDENCE: KnowledgeReleaseEvidence = {
+  approvedEvaluationCorpus: true,
+  approvedRecallAt8: 0.9,
+  approvedCitationSupportRate: 0.95,
+  approvedGroundedAnswerRate: 0.95,
+  approvedNoEvidenceRate: 0.95,
+  approvedProcessingSuccessRate: 0.99,
+  approvedPerformanceProfile: true,
+  cloudBasePreproduction: true,
+  cloudBaseAuthorization: true,
+  tokenHubConsentAndRevocation: true,
+  chatProviderDisclosure: true,
+  productionEntitlementKey: true,
+  productionEntitlementSigner: true,
+  internalTelemetryReview: true,
+  packagedNative: { darwinArm64: true, darwinX64: true, windowsX64: true },
+}
 const { recoveryProbe } = vi.hoisted(() => ({ recoveryProbe: vi.fn() }))
 
 vi.mock('./startup.js', async (importOriginal) => {
@@ -390,6 +408,7 @@ function options(
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
     authService,
+    knowledgeReleaseEvidence: COMPLETE_KNOWLEDGE_RELEASE_EVIDENCE,
     ...overrides,
   }
 }
@@ -754,6 +773,30 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('passes a Main-owned approved release assessment into entitlement admission', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-release-approved-'))
+    directories.push(root)
+    const runtimeOptions = options(root, {
+      knowledgeEntitlement: {
+        getEntitlement: async () => ({
+          tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+          knowledgeToolEnabled: true, killSwitchEnabled: false,
+        }),
+      },
+    })
+    Object.assign(runtimeOptions, {
+      knowledgeReleaseEvidence: COMPLETE_KNOWLEDGE_RELEASE_EVIDENCE,
+    })
+    const runtime = createApplicationRuntime(runtimeOptions)
+    const session = await authenticate(runtime, 'ReleaseApproved')
+
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id }))
+      .resolves.toMatchObject({
+        betaEnabled: true, cloudEnabled: true, knowledgeToolEnabled: true,
+      })
+    await runtime.close()
+  })
+
   it('keeps production-empty entitlement trust local-only while failing closed for beta cloud and Agent admission', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-entitlement-closed-'))
     directories.push(root)
@@ -764,6 +807,27 @@ describe('createApplicationRuntime', () => {
       tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
       knowledgeToolEnabled: false, killSwitchEnabled: true,
     })
+    await runtime.close()
+  })
+
+  it('keeps production release defaults closed with an otherwise valid member entitlement', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-release-closed-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeReleaseEvidence: undefined,
+      knowledgeEntitlement: {
+        getEntitlement: async () => ({
+          tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+          knowledgeToolEnabled: true, killSwitchEnabled: false,
+        }),
+      },
+    }))
+    const session = await authenticate(runtime, 'ReleaseClosed')
+
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id }))
+      .resolves.toMatchObject({
+        betaEnabled: false, cloudEnabled: false, knowledgeToolEnabled: false,
+      })
     await runtime.close()
   })
 

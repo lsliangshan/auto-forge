@@ -71,6 +71,24 @@ describe('knowledge local release evaluation', () => {
     expect(JSON.stringify(report)).not.toContain('第二句包含事实')
   })
 
+  it('rejects a no-evidence refusal that still makes a material claim', () => {
+    const report = evaluateGroundingCases([{
+      id: 'g-refusal-with-claim',
+      expectedEvidence: false,
+      evidence: [],
+      outcome: 'refused',
+      claims: [{ text: '未获证据支持的事实。', citationIds: [] }],
+    }])
+
+    expect(report.correctNoEvidenceCount).toBe(0)
+    expect(report.correctNoEvidenceRate).toBe(0)
+    expect(report.cases).toEqual([{
+      id: 'g-refusal-with-claim',
+      grounded: false,
+      noEvidenceCorrect: false,
+    }])
+  })
+
   it('measures supported processing outcomes and a nearest-rank p95', () => {
     expect(evaluateProcessingCases([
       { id: 'p1', supported: true, ready: true },

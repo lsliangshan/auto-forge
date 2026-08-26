@@ -12,6 +12,7 @@ Task 10 is implemented and verified on the current macOS arm64 host. Repository-
 - Added a real encrypted local harness. It creates two per-user cipher databases, inserts 10,000 generated chunks, runs real FTS5 retrieval, computes Recall@8 and p95, proves the other user returns zero results, scans encrypted artifacts before and after WAL checkpoint for a runtime-random sentinel, and independently evaluates exact Unicode-sentence grounding/no-evidence behavior.
 - The processing harness executes TXT, Markdown, HTML, a generated text-layer PDF, and the package's safe DOCX fixture through the real parsers. It does not count hard-coded success values.
 - Expanded the real Electron smoke across Renderer -> Preload -> validated IPC -> Main -> restricted parser -> encrypted persistence. It now covers durable import acknowledgement, ready publication, strict conversation selection, local chat retrieval, visible grounded citation, controlled source preview, ZIP export, recycle, immediate purge, visible empty state, and cloud-disabled degradation. Its stdout is payload-free.
+- The post-review smoke no longer constructs a `KnowledgeService`, assistant message, or citation resolver in test code. It registers `createApplicationRuntime(...).services`, sends from the rendered composer, traverses Application -> AgentOrchestrator -> deterministic provider double -> real local retrieval, intentionally submits one unsupported material claim, accepts the single repaired claim, verifies the durable assistant row, and invokes the Application-owned citation resolver through production IPC. The controlled Main entitlement and server kill state is then closed before asserting cloud degradation. The export assertion parses the ZIP end record, central directory, local headers, entry count, `manifest.json`, and the expected original entry.
 - Made smoke-runner tests independent of process cwd by anchoring their scripts/source paths at `import.meta.url`. This was required for the repository-root full test runner, while preserving the child-tree timeout and parent-owned plaintext cleanup checks.
 - Added privacy/data-flow disclosure and an explicit release-gate document covering CloudBase Shanghai, TokenHub Guangzhou, selected chat providers, purpose, consent, retention, export/delete, membership expiry, degraded modes, current-host evidence, and external gates.
 - Added `pnpm --filter @autoforge/desktop verify:knowledge-local` as the repeatable local security/relevance/grounding/processing/performance command.
@@ -86,6 +87,83 @@ node apps/desktop/scripts/run-vitest-electron.mjs run apps/desktop/electron/e2e/
 
 Passed 3/3 from the repository root. The test derives the desktop directory from `import.meta.url`; no production runner behavior changed.
 
+## Independent-review fix round 1/5
+
+The review reported Critical 0 / Important 3 / Minor 1. This round closes all four reported items without enabling a production gate.
+
+### Strict parsing and no-evidence scoring
+
+RED:
+
+```text
+pnpm exec vitest run apps/desktop/electron/main/knowledge/release-evaluation.test.ts apps/desktop/electron/main/knowledge/release-gates.test.ts
+```
+
+Result: 2 files failed; 6 failed / 7 passed. A refusal with one material claim incorrectly counted as correct; string `false`, rate `2`, incomplete packaged-platform evidence, and an unknown field were accepted or mapped to ordinary blockers; results were mutable.
+
+GREEN: the same command passed 13/13. `assessKnowledgeRelease(unknown)` now uses strict runtime schemas, finite `[0,1]` rates, complete strict nested platform evidence, strict top-level fields, an explicit immutable `malformed_release_evidence` blocker, and no throwing/release path for malformed input. No-evidence correctness now additionally requires zero material claims.
+
+### Production admission AND
+
+RED:
+
+```text
+pnpm exec vitest run apps/desktop/electron/main/knowledge/knowledge-service.test.ts -t "ANDs Main release admission"
+```
+
+Result: 1 failed / 63 skipped. An otherwise valid member exposed beta/cloud/knowledge-tool as true despite a closed release assessment.
+
+GREEN: the same command passed 1/1. The final version uses an actual Ed25519 Signer -> Verifier member envelope plus an authoritative server response. The server call occurs, but Main release admission independently denies knowledge-tool and cloud use and masks exposed entitlement capability flags.
+
+Application wiring RED:
+
+```text
+node apps/desktop/scripts/run-vitest-electron.mjs run apps/desktop/electron/main/application.test.ts -t "passes a Main-owned approved release assessment"
+```
+
+Result: 1 failed / 161 skipped; complete approved test evidence was not passed to KnowledgeService and all three capability flags remained false.
+
+GREEN:
+
+```text
+node apps/desktop/scripts/run-vitest-electron.mjs run apps/desktop/electron/main/application.test.ts -t "release (assessment|defaults)"
+```
+
+Result: 2 passed / 161 skipped. Application now assesses one Main-owned evidence object once and passes an immutable assessment to KnowledgeService. With the option absent, repository production evidence remains all false, and a valid member entitlement still cannot enable beta, cloud, or the knowledge tool. Test-only complete evidence can open the deterministic harness without changing production defaults.
+
+### Authentic Electron Application/Agent smoke
+
+RED:
+
+```text
+pnpm exec vitest run apps/desktop/electron/e2e/knowledge-ui-smoke-source.test.ts
+```
+
+Result: 1/1 failed because the smoke did not use `createApplicationRuntime`, contained a test-owned message list and citation resolver, and directly constructed KnowledgeService.
+
+GREEN: the same source-composition test passed 1/1 after those seams were removed. The real smoke then passed:
+
+```text
+pnpm --filter @autoforge/desktop smoke:knowledge-ui
+```
+
+It rebuilt production Main/Preload/Renderer/workers, loaded native modules under Electron 43.1.1, exited 0, and emitted only boolean lifecycle evidence:
+
+```json
+{"ok":true,"rendererChatSend":true,"applicationAgentRepair":true,"durableCitationPreview":true,"exportZipValidated":true,"deleteCompleted":true,"cloudAvailableAfterKill":false}
+```
+
+No real CloudBase or external provider was contacted. The cloud Function port and model provider were deterministic in-process doubles; the network port throws on every attempted fetch.
+
+### Fix-round verification
+
+- `pnpm --filter @autoforge/desktop verify:knowledge-local`: 7 files, 271/271 passed. Latest current-host synthetic measurement: 10,000 chunks / 40 samples / p95 0.801709 ms; Recall@8 20/20; cross-user count 0; encrypted sentinel matches 0; processing 5/5. This remains acceptance-ineligible synthetic evidence.
+- focused Application/Knowledge/release/smoke-source run: 5 files, 240 passed plus exactly the known unrelated context-summary `CONTEXT_LIMIT_EXCEEDED` failure in Application; no new failure.
+- `node apps/desktop/scripts/run-vitest-electron.mjs run apps/desktop/electron/main/agent/agent-orchestrator.test.ts -t "Agent knowledge grounding"`: 37/37 passed.
+- `pnpm typecheck`: all four typed workspace projects passed.
+- `pnpm lint --quiet`: exit 0.
+- `git diff --check`: exit 0.
+
 ## Measurements and verification
 
 Latest repository-root full test harness measurement:
@@ -119,6 +197,11 @@ Verification results:
 - `apps/desktop/electron/main/knowledge/release-harness.ts`
 - `apps/desktop/electron/main/knowledge/release-harness.test.ts`
 - `apps/desktop/electron/e2e/knowledge-ui-smoke-main.ts`
+- `apps/desktop/electron/e2e/knowledge-ui-smoke-source.test.ts`
+- `apps/desktop/electron/main/application.ts`
+- `apps/desktop/electron/main/application.test.ts`
+- `apps/desktop/electron/main/knowledge/knowledge-service.ts`
+- `apps/desktop/electron/main/knowledge/knowledge-service.test.ts`
 - `apps/desktop/electron/e2e/knowledge-smoke-runner.test.ts`
 - `apps/desktop/package.json`
 - `docs/knowledge/personal-knowledge-base-privacy.md`

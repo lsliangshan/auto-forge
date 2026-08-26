@@ -98,4 +98,28 @@ describe('knowledge release gates', () => {
       windowsX64: false,
     })
   })
+
+  it.each([
+    ['string boolean', { ...completeEvidence, cloudBasePreproduction: 'false' }],
+    ['out-of-range rate', { ...completeEvidence, approvedRecallAt8: 2 }],
+    ['incomplete packaged platform', {
+      ...completeEvidence,
+      packagedNative: { darwinArm64: true, darwinX64: true },
+    }],
+    ['unknown field', { ...completeEvidence, unreviewedOverride: true }],
+  ])('fails closed without throwing for malformed %s evidence', (_label, evidence) => {
+    expect(assessKnowledgeRelease(evidence)).toEqual({
+      betaEnabled: false,
+      cloudEnabled: false,
+      blockers: ['malformed_release_evidence'],
+    })
+  })
+
+  it('exposes immutable production evidence and release results', () => {
+    const result = assessKnowledgeRelease(completeEvidence)
+    expect(Object.isFrozen(PRODUCTION_KNOWLEDGE_RELEASE_EVIDENCE)).toBe(true)
+    expect(Object.isFrozen(PRODUCTION_KNOWLEDGE_RELEASE_EVIDENCE.packagedNative)).toBe(true)
+    expect(Object.isFrozen(result)).toBe(true)
+    expect(Object.isFrozen(result.blockers)).toBe(true)
+  })
 })

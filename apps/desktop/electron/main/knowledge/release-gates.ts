@@ -1,24 +1,29 @@
-export interface KnowledgeReleaseEvidence {
-  readonly approvedEvaluationCorpus: boolean
-  readonly approvedRecallAt8: number
-  readonly approvedCitationSupportRate: number
-  readonly approvedGroundedAnswerRate: number
-  readonly approvedNoEvidenceRate: number
-  readonly approvedProcessingSuccessRate: number
-  readonly approvedPerformanceProfile: boolean
-  readonly cloudBasePreproduction: boolean
-  readonly cloudBaseAuthorization: boolean
-  readonly tokenHubConsentAndRevocation: boolean
-  readonly chatProviderDisclosure: boolean
-  readonly productionEntitlementKey: boolean
-  readonly productionEntitlementSigner: boolean
-  readonly internalTelemetryReview: boolean
-  readonly packagedNative: {
-    readonly darwinArm64: boolean
-    readonly darwinX64: boolean
-    readonly windowsX64: boolean
-  }
-}
+import { z } from 'zod'
+
+const releaseRateSchema = z.number().finite().min(0).max(1)
+const knowledgeReleaseEvidenceSchema = z.object({
+  approvedEvaluationCorpus: z.boolean(),
+  approvedRecallAt8: releaseRateSchema,
+  approvedCitationSupportRate: releaseRateSchema,
+  approvedGroundedAnswerRate: releaseRateSchema,
+  approvedNoEvidenceRate: releaseRateSchema,
+  approvedProcessingSuccessRate: releaseRateSchema,
+  approvedPerformanceProfile: z.boolean(),
+  cloudBasePreproduction: z.boolean(),
+  cloudBaseAuthorization: z.boolean(),
+  tokenHubConsentAndRevocation: z.boolean(),
+  chatProviderDisclosure: z.boolean(),
+  productionEntitlementKey: z.boolean(),
+  productionEntitlementSigner: z.boolean(),
+  internalTelemetryReview: z.boolean(),
+  packagedNative: z.object({
+    darwinArm64: z.boolean(),
+    darwinX64: z.boolean(),
+    windowsX64: z.boolean(),
+  }).strict(),
+}).strict()
+
+export type KnowledgeReleaseEvidence = Readonly<z.infer<typeof knowledgeReleaseEvidenceSchema>>
 
 export interface KnowledgeReleaseAssessment {
   readonly betaEnabled: boolean
@@ -47,8 +52,13 @@ const REQUIRED_THRESHOLDS = [
 ] as const
 
 export function assessKnowledgeRelease(
-  evidence: KnowledgeReleaseEvidence,
+  input: unknown,
 ): KnowledgeReleaseAssessment {
+  const parsed = knowledgeReleaseEvidenceSchema.safeParse(input)
+  if (!parsed.success) {
+    return frozenAssessment(false, false, ['malformed_release_evidence'])
+  }
+  const evidence = parsed.data
   const blockers: string[] = []
   for (const [field, blocker] of REQUIRED_BOOLEAN_GATES) {
     if (!evidence[field]) blockers.push(blocker)
@@ -60,7 +70,19 @@ export function assessKnowledgeRelease(
   if (!evidence.packagedNative.darwinX64) blockers.push('packaged_native_darwin_x64')
   if (!evidence.packagedNative.windowsX64) blockers.push('packaged_native_windows_x64')
   const enabled = blockers.length === 0
-  return { betaEnabled: enabled, cloudEnabled: enabled, blockers }
+  return frozenAssessment(enabled, enabled, blockers)
+}
+
+function frozenAssessment(
+  betaEnabled: boolean,
+  cloudEnabled: boolean,
+  blockers: readonly string[],
+): KnowledgeReleaseAssessment {
+  return Object.freeze({
+    betaEnabled,
+    cloudEnabled,
+    blockers: Object.freeze([...blockers]),
+  })
 }
 
 /**

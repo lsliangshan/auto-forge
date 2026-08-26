@@ -51,6 +51,11 @@ import type {
 import type { ParserFormat } from './parser-protocol.js'
 import { KnowledgePurgeService } from './purge-service.js'
 import {
+  assessKnowledgeRelease,
+  PRODUCTION_KNOWLEDGE_RELEASE_EVIDENCE,
+  type KnowledgeReleaseAssessment,
+} from './release-gates.js'
+import {
   KnowledgeImportRuntime,
   serializeKnowledgeMutation,
   type KnowledgeImportSession,
@@ -129,6 +134,7 @@ export interface KnowledgeServiceOptions {
   readonly openKnowledgeDatabase?: typeof openUserKnowledgeDatabase
   readonly createObjectSnapshot?: typeof createEncryptedObjectSnapshot
   readonly removeKnowledgeObjectDurably?: (path: string) => Promise<void>
+  readonly releaseAssessment?: KnowledgeReleaseAssessment
 }
 
 interface DocumentRow {
@@ -329,8 +335,17 @@ export class KnowledgeService implements KnowledgePersistence {
     isClosing: () => this.closing,
     track: operation => { this.track(operation) },
   })
+  private readonly releaseAssessment: KnowledgeReleaseAssessment
 
-  constructor(private readonly options: KnowledgeServiceOptions) {}
+  constructor(private readonly options: KnowledgeServiceOptions) {
+    const assessment = options.releaseAssessment
+      ?? assessKnowledgeRelease(PRODUCTION_KNOWLEDGE_RELEASE_EVIDENCE)
+    this.releaseAssessment = Object.freeze({
+      betaEnabled: assessment.betaEnabled === true,
+      cloudEnabled: assessment.cloudEnabled === true,
+      blockers: Object.freeze([...assessment.blockers]),
+    })
+  }
 
   listBases(owner: KnowledgeOwner): Promise<KnowledgeBase[]> {
     return this.track((async () => {
@@ -989,11 +1004,11 @@ export class KnowledgeService implements KnowledgePersistence {
     }
     const session = this.session
     const localQuotaEntitlement = this.withLocalQuotaLifecycle(session, entitlement)
-    if (localQuotaEntitlement !== entitlement) return localQuotaEntitlement
+    if (localQuotaEntitlement !== entitlement) return this.applyReleaseAssessment(localQuotaEntitlement)
     if (entitlement.status !== 'expired'
       || !entitlement.lifecycle
       || !entitlement.membershipExpiresAt
-      || !session) return entitlement
+      || !session) return this.applyReleaseAssessment(entitlement)
     const retained = session.opened.database.prepare(`
       SELECT 1 FROM knowledge_membership_lifecycle
       JOIN documents ON documents.id = knowledge_membership_lifecycle.selected_document_id
@@ -1008,9 +1023,21 @@ export class KnowledgeService implements KnowledgePersistence {
         AND document_versions.status = 'ready'
         AND (cloud_sync_states.mode IS NULL OR cloud_sync_states.mode = 'local_only')
     `).get(Date.parse(entitlement.membershipExpiresAt))
-    return retained
+    return this.applyReleaseAssessment(retained
       ? { ...entitlement, lifecycle: { ...entitlement.lifecycle, requiresSelection: false } }
-      : entitlement
+      : entitlement)
+  }
+
+  private applyReleaseAssessment(entitlement: KnowledgeEntitlementState): KnowledgeEntitlementState {
+    return {
+      ...entitlement,
+      betaEnabled: entitlement.betaEnabled && this.releaseAssessment.betaEnabled,
+      cloudEnabled: entitlement.cloudEnabled && this.releaseAssessment.cloudEnabled,
+      ...('knowledgeToolEnabled' in entitlement ? {
+        knowledgeToolEnabled: entitlement.knowledgeToolEnabled === true
+          && this.releaseAssessment.betaEnabled,
+      } : {}),
+    }
   }
 
   async getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState> {
@@ -1070,6 +1097,9 @@ export class KnowledgeService implements KnowledgePersistence {
     if (this.options.entitlement?.getAuthorizationSnapshot) {
       return this.options.entitlement.getAuthorizationSnapshot(owner)
     }
+    if (this.options.entitlement) {
+      return { entitlement: await this.options.entitlement.getEntitlement(owner), revision: 0 }
+    }
     return { entitlement: await this.getEntitlement(owner), revision: 0 }
   }
 
@@ -1080,7 +1110,9 @@ export class KnowledgeService implements KnowledgePersistence {
     if (this.options.entitlement?.isAuthorizationSnapshotCurrent) {
       return this.options.entitlement.isAuthorizationSnapshotCurrent(owner, snapshot)
     }
-    const current = await this.getEntitlement(owner)
+    const current = this.options.entitlement
+      ? await this.options.entitlement.getEntitlement(owner)
+      : await this.getEntitlement(owner)
     return isDeepStrictEqual(current, snapshot.entitlement)
   }
 
@@ -1107,6 +1139,7 @@ export class KnowledgeService implements KnowledgePersistence {
         || !this.authorizationStillCurrentNow(owner, authorization)) return undefined
       const server = await this.options.cloud.getEntitlement()
       return this.serverAllowsCloud(server)
+        && this.releaseAssessment.cloudEnabled
         && this.authorizationStillCurrentNow(owner, authorization)
         ? { ...authorization, serverVersion: server.version }
         : undefined
@@ -1124,6 +1157,7 @@ export class KnowledgeService implements KnowledgePersistence {
     try {
       const server = await this.options.cloud.getEntitlement()
       return this.serverAllowsCloud(server)
+        && this.releaseAssessment.cloudEnabled
         && server.version === authorization.serverVersion
         && this.authorizationStillCurrentNow(owner, authorization)
     } catch {
@@ -1141,15 +1175,19 @@ export class KnowledgeService implements KnowledgePersistence {
     }
     if (!await this.authorizationStillCurrent(owner, authorization)
       || !this.authorizationStillCurrentNow(owner, authorization)) return undefined
-    if (!this.options.cloud) return authorization
+    if (!this.options.cloud) {
+      return this.releaseAssessment.betaEnabled ? authorization : undefined
+    }
     try {
       const server = await this.options.cloud.getEntitlement()
       return this.serverAllowsKnowledgeTool(server)
+        && this.releaseAssessment.betaEnabled
         && this.authorizationStillCurrentNow(owner, authorization)
         ? authorization : undefined
     } catch {
       // A still-valid signed local snapshot may remain usable offline; remote state can only deny.
-      return this.authorizationStillCurrentNow(owner, authorization) ? authorization : undefined
+      return this.releaseAssessment.betaEnabled
+        && this.authorizationStillCurrentNow(owner, authorization) ? authorization : undefined
     }
   }
 

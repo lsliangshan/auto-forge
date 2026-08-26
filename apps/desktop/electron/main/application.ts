@@ -122,6 +122,10 @@ import {
   CloudBaseKnowledgeClient,
   type CloudBaseFunctionPort,
 } from './knowledge/cloudbase-knowledge-client.js'
+import {
+  assessKnowledgeRelease,
+  PRODUCTION_KNOWLEDGE_RELEASE_EVIDENCE,
+} from './knowledge/release-gates.js'
 
 export interface ApplicationPaths {
   database: string
@@ -234,6 +238,8 @@ export interface ApplicationRuntimeOptions {
   knowledgeCloudFunctions?: CloudBaseFunctionPort
   knowledgePlatform?: NodeJS.Platform
   knowledgeArch?: string
+  /** @internal Audited release evidence injection for deterministic Main admission tests only. */
+  knowledgeReleaseEvidence?: unknown
 }
 
 interface ObservedAuthService extends AuthService {
@@ -627,6 +633,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const knowledgeCloud = knowledgeCloudFunctions
     ? new CloudBaseKnowledgeClient(knowledgeCloudFunctions)
     : undefined
+  const knowledgeReleaseAssessment = assessKnowledgeRelease(
+    options.knowledgeReleaseEvidence ?? PRODUCTION_KNOWLEDGE_RELEASE_EVIDENCE,
+  )
   const auth = observeAuthService(
     baseAuthService,
     {
@@ -1221,6 +1230,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     platform: options.knowledgePlatform,
     arch: options.knowledgeArch,
     runtimeAvailable: options.createKnowledgeParser !== undefined,
+    releaseAssessment: knowledgeReleaseAssessment,
   })
   const knowledgeAdmission = new KnowledgeAdmissionGate()
   const beforeAuthIdentityChange = async (): Promise<void> => {

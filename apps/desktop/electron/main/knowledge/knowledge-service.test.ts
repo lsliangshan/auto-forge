@@ -17,6 +17,7 @@ import { createEncryptedObjectSnapshot, readEncryptedObjectSnapshot } from './en
 import { KnowledgeEntitlementVerifier } from './entitlement-verifier.js'
 import { openUserKnowledgeDatabase, type OpenedUserKnowledgeDatabase } from './encrypted-database.js'
 import { KnowledgeKeyStore, removeFileDurably } from './key-store.js'
+import type { KnowledgeReleaseAssessment } from './release-gates.js'
 import {
   KnowledgeService,
   type KnowledgeEntitlementPort,
@@ -208,6 +209,7 @@ async function fixture(options: {
     provider: 'openrouter'
     status: 'unknown'
   }>
+  releaseAssessment?: KnowledgeReleaseAssessment
 } = {}) {
   const rootDirectory = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-service-'))
   directories.push(rootDirectory)
@@ -245,6 +247,9 @@ async function fixture(options: {
       createObjectSnapshot: options.createObjectSnapshot,
       removeKnowledgeObjectDurably: options.removeKnowledgeObjectDurably,
       now: options.now,
+      releaseAssessment: options.releaseAssessment ?? {
+        betaEnabled: true, cloudEnabled: true, blockers: [],
+      },
     }
     return new KnowledgeService(serviceOptions)
   }
@@ -374,6 +379,63 @@ describe('KnowledgeService lifecycle', () => {
     await expect(app.service.search(owner, 'conversation_1', '旧版政策')).resolves.toEqual({
       kind: 'results', results: [],
     })
+    await app.service.close()
+  })
+
+  it('ANDs Main release admission after valid member and server authorization', async () => {
+    const signer = createKnowledgeEntitlementSigner(Object.freeze({
+      keyId: 'test-key-1', snapshotTtlMs: 60 * 60 * 1_000,
+      now: () => Date.parse('2026-08-26T00:00:00.000Z'),
+      signCanonical: async (bytes: Buffer) => sign(null, bytes, ENTITLEMENT_PRIVATE_KEY),
+    }))
+    const envelope = await signer('alice', {
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      killSwitchEnabled: false, version: 1, validUntil: '2026-09-26T00:00:00.000Z',
+    })
+    const verifiedMember = new KnowledgeEntitlementVerifier({
+      trustedKeys: { 'test-key-1': ENTITLEMENT_PUBLIC_KEY },
+      now: () => Date.parse('2026-08-26T00:30:00.000Z'),
+    }).verify('alice', envelope)
+    const cloud: TargetKnowledgeCloudPort = {
+      getEntitlement: vi.fn(async (): Promise<TargetCloudEntitlement> => ({
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+        killSwitchEnabled: false, version: 1, validUntil: null,
+      })),
+      getEmbeddingConsent: vi.fn(async (): Promise<TargetEmbeddingConsent> => ({
+        processor: 'tokenhub', processingRegion: 'Guangzhou',
+        model: 'kinfra-text-embedding-0.6b', dimensions: 1024,
+        status: 'granted', retrievalByBase: [],
+      })),
+      setEmbeddingConsent: vi.fn(), capturePublishedSnapshot: vi.fn(), searchPublished: vi.fn(),
+    }
+    const app = await fixture({
+      entitlement: verifiedMember,
+      cloud,
+      releaseAssessment: {
+        betaEnabled: false,
+        cloudEnabled: false,
+        blockers: ['approved_evaluation_corpus'],
+      },
+    })
+    const owner = { userId: 'alice' }
+    const [base] = await app.service.listBases(owner)
+    app.picks.push(await writeSource(app.rootDirectory, 'release-gated.txt', '发布门禁内容'))
+    await app.service.importDocument(owner, base!.id)
+    await expect.poll(async () => (await app.service.listDocuments(owner, base!.id))[0]?.status).toBe('ready')
+    await app.service.updateConversationSelection(owner, 'conversation_1', {
+      knowledgeBaseIds: [base!.id], knowledgeMode: 'strict',
+    })
+
+    await expect(app.service.getEntitlement(owner)).resolves.toMatchObject({
+      betaEnabled: false, cloudEnabled: false, knowledgeToolEnabled: false,
+    })
+    await expect(app.service.captureSearchSnapshot(owner, 'conversation_1')).resolves.toEqual({
+      selected: false, knowledgeMode: 'strict',
+    })
+    await expect(app.service.setEmbeddingConsent(owner, 'granted'))
+      .rejects.toMatchObject({ code: 'SERVICE_UNAVAILABLE' })
+    expect(cloud.getEntitlement).toHaveBeenCalled()
+    expect(cloud.setEmbeddingConsent).not.toHaveBeenCalled()
     await app.service.close()
   })
 
