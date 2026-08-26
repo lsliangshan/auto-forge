@@ -90,10 +90,10 @@ export const knowledgeCitationPreviewSchema = z.union([
   z.object({ status: z.literal('unavailable') }).strict(),
   z.object({
     status: z.literal('available'), kind: z.literal('pdf'), excerpt: knowledgeCitationExcerptSchema,
-    page: z.number().int().positive(), startOffset: z.number().int().nonnegative(),
-    endOffset: z.number().int().positive(),
-  }).strict().refine(({ startOffset, endOffset }) => endOffset > startOffset, {
-    path: ['endOffset'], message: 'PDF preview end must follow its start',
+    page: z.number().int().positive(), itemStart: z.number().int().nonnegative(),
+    itemEnd: z.number().int().positive(),
+  }).strict().refine(({ itemStart, itemEnd }) => itemEnd > itemStart, {
+    path: ['itemEnd'], message: 'PDF preview end item must follow its start item',
   }),
   z.object({
     status: z.literal('available'), kind: z.literal('docx'), excerpt: knowledgeCitationExcerptSchema,

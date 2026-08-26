@@ -61,7 +61,7 @@ describe('LocalKnowledgeRetriever', () => {
     expect(outcome.kind).toBe('results')
     expect(outcome.results.map(result => result.evidenceId)).toEqual(['chunk_ready'])
     expect(outcome.results[0]?.citation).toEqual({
-      evidenceId: 'chunk_ready', documentId: 'doc_ready', versionId: 'version_ready',
+      documentId: 'doc_ready', versionId: 'version_ready',
       kind: 'txt', startLine: 1, endLine: 1, startColumn: 0, endColumn: 8,
     })
     opened.close()

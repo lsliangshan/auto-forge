@@ -152,7 +152,7 @@ const KNOWLEDGE_GROUNDING_POLICY = [
 
 const SINGLE_TOOL_REPAIR = '上一响应包含多个工具调用。一次只能调用一个工作流或浏览器工具；请重新决定，只返回一个工具调用或直接回答。'
 const FINAL_FROM_RESULTS = '本次运行已达到五次工作流执行上限。不要再调用工作流；如仍提供浏览器工具，只能按既有浏览器策略使用，否则请根据已有结果给出最终回答。'
-const KNOWLEDGE_CITATION_REPAIR = '上一知识库回答包含无效、缺失或不属于当前轮的引用。只能修复一次：请重新调用 knowledge_grounded_answer，并仅使用当前工具结果中的 evidenceId。'
+const KNOWLEDGE_CITATION_REPAIR = '上一知识库回答包含无效引用，或声明未被所引当前轮片段支持。只能修复一次：请重新调用 knowledge_grounded_answer，并仅使用当前工具结果中的 evidenceId，且声明必须由对应片段直接支持。'
 const STRICT_KNOWLEDGE_REFUSAL = '当前所选知识库没有足够的当前轮证据，因此无法按严格模式回答。请补充资料或换一种更具体的问法。'
 const KNOWLEDGE_SEARCH_LIMIT = 3
 const KNOWLEDGE_EVIDENCE_LIMIT = 8
@@ -163,6 +163,69 @@ const EXPLICIT_BROWSER_OPTOUT = /(?:不要|不准|禁止|请勿).{0,12}(?:调用
 const BROWSER_TOOL_NAMES = new Set<BrowserContinuationToolName>([
   'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
 ])
+
+const SUPPORT_NEGATION_MARKERS = [
+  '不', '无', '未', '否', '禁止', '不得', '无需', '不能', '没有',
+  'not', 'no', 'never', 'without',
+]
+
+function normalizedSupportText(value: string): string {
+  return value.normalize('NFKC').toLocaleLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, '')
+}
+
+function supportNumbers(value: string): Set<string> {
+  return new Set(value.normalize('NFKC').match(/\d+(?:[.,]\d+)?/g) ?? [])
+}
+
+function hasSupportNegation(value: string): boolean {
+  const normalized = value.normalize('NFKC').toLocaleLowerCase()
+  const latinWords = new Set(normalized.match(/\p{Script=Latin}+/gu) ?? [])
+  return SUPPORT_NEGATION_MARKERS.some(marker => (
+    /\p{Script=Latin}/u.test(marker) ? latinWords.has(marker) : normalized.includes(marker)
+  ))
+}
+
+function cjkBigrams(value: string): Set<string> {
+  const characters = [...value.normalize('NFKC')].filter(character => (
+    /\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Hangul}/u.test(character)
+  ))
+  return new Set(characters.slice(0, -1).map((character, index) => (
+    `${character}${characters[index + 1]}`
+  )))
+}
+
+function materialLatinTokens(value: string): Set<string> {
+  return new Set((value.normalize('NFKC').toLocaleLowerCase()
+    .match(/\p{Script=Latin}[\p{Script=Latin}\p{Number}_-]*/gu) ?? [])
+    .filter(token => token.length >= 3 && !['the', 'and', 'for', 'with'].includes(token)))
+}
+
+function claimSupportedByEvidence(
+  claim: string,
+  evidence: readonly KnowledgeSearchResult[],
+): boolean {
+  if (evidence.length === 0) return false
+  const support = evidence.map(item => item.snippet).join('\n')
+  const normalizedClaim = normalizedSupportText(claim)
+  const normalizedEvidence = normalizedSupportText(support)
+  if (normalizedClaim.length < 4 || normalizedEvidence.length === 0) return false
+
+  const claimNumbers = supportNumbers(claim)
+  const evidenceNumbers = supportNumbers(support)
+  if ([...claimNumbers].some(number => !evidenceNumbers.has(number))) return false
+  if (hasSupportNegation(claim) !== hasSupportNegation(support)) return false
+  if (normalizedEvidence.includes(normalizedClaim)) return true
+
+  const claimLatin = materialLatinTokens(claim)
+  const evidenceLatin = materialLatinTokens(support)
+  if ([...claimLatin].some(token => !evidenceLatin.has(token))) return false
+  const claimBigrams = cjkBigrams(claim)
+  if (claimBigrams.size < 4) return false
+  const evidenceBigrams = cjkBigrams(support)
+  const matchedBigrams = [...claimBigrams].filter(bigram => evidenceBigrams.has(bigram)).length
+  return matchedBigrams >= 4 && matchedBigrams / claimBigrams.size >= 0.72
+}
 
 const knowledgeSearchArgumentsSchema = z.object({
   query: z.string().trim().min(2).max(1_000),
@@ -1571,10 +1634,14 @@ export class AgentOrchestrator {
       || !this.dependencies.knowledge
       || active.browserStarted
       || active.pendingKnowledgeConsent) return false
-    const workflowFailed = active.blocks.some((block) => (
-      block.type === 'workflow_status' && (block.status === 'failed' || block.status === 'cancelled')
-    ))
-    if (workflowFailed) return false
+    const latestWorkflowStatuses = new Map<string, WorkflowStatusBlock['status']>()
+    for (const block of active.blocks) {
+      if (block.type !== 'workflow_status') continue
+      latestWorkflowStatuses.set([
+        block.workflowId, block.workflowVersion, block.source, block.buildHash ?? '',
+      ].join('\u0000'), block.status)
+    }
+    if ([...latestWorkflowStatuses.values()].some(status => status !== 'completed')) return false
     return active.workflows.size === 0
       || active.actualExecutions.some(({ status }) => status === 'completed')
   }
@@ -1667,9 +1734,25 @@ export class AgentOrchestrator {
       return this.drive(active)
     }
     if (active.knowledgeConsent === undefined) {
-      const consent = await knowledge.getChatProviderConsent(
-        { userId: active.userId }, active.providerSnapshot.providerId,
-      )
+      let consent: KnowledgeChatProviderConsentState
+      try {
+        consent = await knowledge.getChatProviderConsent(
+          { userId: active.userId }, active.providerSnapshot.providerId,
+        )
+      } catch {
+        if (active.terminal) return active.terminal
+        if (active.cancelled || active.controller.signal.aborted) {
+          this.updateKnowledgeStatus(active, statusBlockId, 'cancelled')
+          return this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
+        }
+        this.updateKnowledgeStatus(active, statusBlockId, 'failed')
+        return this.terminalize(active, 'failed', appFailure('INTERNAL_ERROR'))
+      }
+      if (active.terminal) return active.terminal
+      if (active.cancelled || active.controller.signal.aborted) {
+        this.updateKnowledgeStatus(active, statusBlockId, 'cancelled')
+        return this.terminalize(active, 'cancelled', appFailure('CANCELLED'), 'cancel')
+      }
       if (consent.provider !== active.providerSnapshot.providerId) {
         this.updateKnowledgeStatus(active, statusBlockId, 'failed')
         return this.terminalize(active, 'failed', appFailure('CONFLICT'))
@@ -1719,7 +1802,14 @@ export class AgentOrchestrator {
       (claim.support === 'general'
         ? claim.citationIds.length === 0 && mode === 'mixed'
         : claim.citationIds.length > 0
-          && claim.citationIds.every((id) => active.knowledgeEvidence.has(id)))
+          && claim.citationIds.every((id) => active.knowledgeEvidence.has(id))
+          && claimSupportedByEvidence(
+            claim.text,
+            claim.citationIds.flatMap((id) => {
+              const evidence = active.knowledgeEvidence.get(id)
+              return evidence ? [evidence] : []
+            }),
+          ))
     ))
     if (!block || !citationsValid || active.knowledgeEvidence.size === 0) {
       this.appendToolExchange(active, {

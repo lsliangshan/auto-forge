@@ -89,8 +89,8 @@ function knowledgeAnswerBlock() {
       {
         text: '申请材料应当包含身份证明。', support: 'knowledge' as const,
         citations: [{
-          evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
-          kind: 'pdf' as const, page: 2, startOffset: 4, endOffset: 18,
+          documentId: 'document_1', versionId: 'version_1',
+          kind: 'pdf' as const, page: 2, itemStart: 4, itemEnd: 18,
         }],
       },
       { text: '建议提前准备复印件。', support: 'general' as const, citations: [] },
@@ -663,7 +663,7 @@ describe('chat interactions', () => {
     const { api, previewCitation } = createEventApi()
     previewCitation.mockResolvedValueOnce({
       status: 'available', kind: 'pdf', excerpt: '身份证明', page: 2,
-      startOffset: 4, endOffset: 18,
+      itemStart: 4, itemEnd: 18,
     })
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const wrapper = mount(MessageBlock, {
@@ -687,7 +687,72 @@ describe('chat interactions', () => {
       blockId: 'knowledge_answer_1', citationIndex: 0,
     })
     expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('PDF 第 2 页')
+    expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('文本项 4-18')
     expect(wrapper.get('[data-testid="knowledge-citation-preview"]').text()).toContain('身份证明')
+  })
+
+  it('moves focus into the citation modal, closes it with Escape, and restores focus', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const wrapper = mount(MessageBlock, {
+      attachTo: host,
+      props: {
+        block: knowledgeAnswerBlock(),
+        conversationId: 'conversation_1', messageId: 'message_1',
+      },
+      global: { plugins: [ElementPlus] },
+    })
+
+    try {
+      const source = wrapper.get('[data-testid="knowledge-source-0"]')
+      ;(source.element as HTMLElement).focus()
+      await source.trigger('click')
+      await flushPromises()
+
+      const dialog = wrapper.get('[data-testid="knowledge-citation-preview"]')
+      expect(dialog.attributes('role')).toBe('dialog')
+      expect(dialog.attributes('aria-modal')).toBe('true')
+      expect(document.activeElement).toBe(dialog.element)
+
+      await dialog.trigger('keydown', { key: 'Escape' })
+      await flushPromises()
+      expect(wrapper.find('[data-testid="knowledge-citation-preview"]').exists()).toBe(false)
+      expect(document.activeElement).toBe(source.element)
+    } finally {
+      wrapper.unmount()
+      host.remove()
+    }
+  })
+
+  it('keeps durable source identities aligned with Main when identifier text contains delimiters', () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const answer = knowledgeAnswerBlock()
+    answer.claims = [
+      {
+        text: '来源一。', support: 'knowledge', citations: [{
+          documentId: 'document:a', versionId: 'version',
+          kind: 'pdf', page: 2, itemStart: 4, itemEnd: 18,
+        }],
+      },
+      {
+        text: '来源二。', support: 'knowledge', citations: [{
+          documentId: 'document', versionId: 'a:version',
+          kind: 'pdf', page: 2, itemStart: 4, itemEnd: 18,
+        }],
+      },
+    ]
+    const wrapper = mount(MessageBlock, {
+      props: { block: answer, conversationId: 'conversation_1', messageId: 'message_1' },
+      global: { plugins: [ElementPlus] },
+    })
+
+    expect(wrapper.get('[data-testid="knowledge-sources-summary"]').text()).toContain('来源 2')
+    expect(wrapper.findAll('[data-testid^="knowledge-citation-"]')
+      .filter(link => !link.attributes('data-testid')?.includes('preview'))
+      .map(link => link.text())).toEqual(['[1]', '[2]'])
   })
 
   it('renders a deleted or purged citation source as unavailable without exposing a path', async () => {
@@ -718,7 +783,7 @@ describe('chat interactions', () => {
     Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
     const answer = knowledgeAnswerBlock()
     answer.claims[0]!.citations = [{
-      evidenceId: 'evidence_docx', documentId: 'document_docx', versionId: 'version_docx',
+      documentId: 'document_docx', versionId: 'version_docx',
       kind: 'docx', headingPath: ['第一章', '申请条件'], paragraphId: 'paragraph_8',
     }]
     const wrapper = mount(MessageBlock, {

@@ -693,33 +693,35 @@ export class KnowledgeService implements KnowledgePersistence {
     const parsed = knowledgeCitationReferenceSchema.safeParse(rawCitation)
     if (!parsed.success) failure('INVALID_INPUT')
     const session = await this.ensureSession(owner)
-    const row = session.opened.database.prepare(`
-      SELECT kb_chunks.id, kb_chunks.knowledge_base_id AS knowledgeBaseId,
-        kb_chunks.document_id AS documentId, kb_chunks.version_id AS versionId,
-        kb_chunks.block_id AS blockId, kb_chunks.body,
-        kb_chunks.coordinates_json AS coordinatesJson
-      FROM kb_chunks
-      JOIN documents ON documents.id = kb_chunks.document_id
-      JOIN knowledge_bases ON knowledge_bases.id = kb_chunks.knowledge_base_id
-      WHERE kb_chunks.id = ?
-        AND kb_chunks.document_id = ?
-        AND kb_chunks.version_id = ?
+    const rows = session.opened.database.prepare(`
+      SELECT knowledge_blocks.id, knowledge_bases.id AS knowledgeBaseId,
+        documents.id AS documentId, document_versions.id AS versionId,
+        knowledge_blocks.id AS blockId, knowledge_blocks.text AS body,
+        knowledge_blocks.coordinates_json AS coordinatesJson
+      FROM knowledge_blocks
+      JOIN document_versions ON document_versions.id = knowledge_blocks.version_id
+      JOIN documents ON documents.id = document_versions.document_id
+      JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
+      WHERE documents.id = ?
+        AND document_versions.id = ?
         AND documents.status <> 'recycled'
         AND knowledge_bases.status <> 'recycled'
-    `).get(
-      parsed.data.evidenceId,
+    `).all(
       parsed.data.documentId,
       parsed.data.versionId,
-    ) as KnowledgeChunkRow | undefined
-    if (!row) return { status: 'unavailable' }
+    ) as KnowledgeChunkRow[]
+    const matches = rows.filter(row => (
+      isDeepStrictEqual(citationForKnowledgeChunk(row), parsed.data)
+    ))
+    if (matches.length !== 1) return { status: 'unavailable' }
+    const row = matches[0]!
     const citation = citationForKnowledgeChunk(row)
-    if (!isDeepStrictEqual(citation, parsed.data)) return { status: 'unavailable' }
     const excerpt = row.body.trim().slice(0, 1_000)
     if (!excerpt) return { status: 'unavailable' }
     if (citation.kind === 'pdf') {
       return {
         status: 'available', excerpt, kind: citation.kind, page: citation.page,
-        startOffset: citation.startOffset, endOffset: citation.endOffset,
+        itemStart: citation.itemStart, itemEnd: citation.itemEnd,
       }
     }
     if (citation.kind === 'docx') {

@@ -86,7 +86,7 @@ function serializeKnowledgeCitation(
   citation: Extract<ChatBlock, { type: 'knowledge_answer' }>['claims'][number]['citations'][number],
 ): string {
   const coordinate = citation.kind === 'pdf'
-    ? `PDF 第 ${citation.page} 页; 字符 ${citation.startOffset}-${citation.endOffset}`
+    ? `PDF 第 ${citation.page} 页; 文本项 ${citation.itemStart}-${citation.itemEnd}`
     : citation.kind === 'docx'
       ? `DOCX 标题 ${citation.headingPath.join(' > ') || '正文'}; 段落 ${citation.paragraphId}`
       : citation.kind === 'markdown' || citation.kind === 'html'

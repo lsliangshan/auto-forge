@@ -112,12 +112,13 @@ describe('cross-process contracts', () => {
     const result = {
       evidenceId: 'evidence_1', knowledgeBaseId: 'kb_1', documentId: 'document_1', versionId: 'version_1',
       snippet: 'A supported excerpt.', score: 0.75,
-      citation: { evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1', kind: 'pdf', page: 2, startOffset: 0, endOffset: 21 },
+      citation: { documentId: 'document_1', versionId: 'version_1', kind: 'pdf', page: 2, itemStart: 0, itemEnd: 21 },
     }
     expect(knowledgeSearchResultsSchema.parse([result])).toEqual([result])
     expect(knowledgeSearchResultsSchema.safeParse(Array.from({ length: 9 }, (_, index) => ({
       ...result, evidenceId: `evidence_${index}`,
-      citation: { ...result.citation, evidenceId: `evidence_${index}` },
+      citation: { ...result.citation, documentId: `document_${index}`, versionId: `version_${index}` },
+      documentId: `document_${index}`, versionId: `version_${index}`,
     }))).success).toBe(false)
     expect(knowledgeCitationReferenceSchema.safeParse({
       ...result.citation, page: 0,
@@ -125,6 +126,35 @@ describe('cross-process contracts', () => {
     expect(knowledgeCitationReferenceSchema.safeParse({
       ...result.citation, indexId: 'stale-index',
     }).success).toBe(false)
+  })
+
+  it('keeps evidence ids transient while durable answers and PDF previews use text-item coordinates', () => {
+    const durableCitation = {
+      documentId: 'document_1', versionId: 'version_1',
+      kind: 'pdf' as const, page: 2, itemStart: 4, itemEnd: 18,
+    }
+    const result = {
+      evidenceId: 'evidence_1', knowledgeBaseId: 'kb_1',
+      documentId: 'document_1', versionId: 'version_1',
+      snippet: 'A supported excerpt.', score: 0.75, citation: durableCitation,
+    }
+
+    expect(knowledgeSearchResultsSchema.parse([result])).toEqual([result])
+    expect(chatBlockSchema.parse({
+      type: 'knowledge_answer', blockId: 'knowledge_answer_durable', mode: 'strict',
+      claims: [{ text: 'A supported claim.', support: 'knowledge', citations: [durableCitation] }],
+    })).toMatchObject({ claims: [{ citations: [durableCitation] }] })
+    expect(chatBlockSchema.safeParse({
+      type: 'knowledge_answer', blockId: 'knowledge_answer_transient', mode: 'strict',
+      claims: [{
+        text: 'A supported claim.', support: 'knowledge',
+        citations: [{ ...durableCitation, evidenceId: 'evidence_must_not_persist' }],
+      }],
+    }).success).toBe(false)
+    expect(ipcResponseSchemas[ipcChannels.knowledgePreviewCitation].parse({
+      status: 'available', kind: 'pdf', excerpt: 'PDF preview', page: 2,
+      itemStart: 4, itemEnd: 18,
+    })).toMatchObject({ kind: 'pdf', itemStart: 4, itemEnd: 18 })
   })
 
   it('reports fail-closed feature availability and public entitlement state', () => {
@@ -210,8 +240,8 @@ describe('cross-process contracts', () => {
 
   it('persists grounded answers and search status without snippets, names, or paths', () => {
     const citation = {
-      evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
-      kind: 'pdf' as const, page: 2, startOffset: 4, endOffset: 18,
+      documentId: 'document_1', versionId: 'version_1',
+      kind: 'pdf' as const, page: 2, itemStart: 4, itemEnd: 18,
     }
     expect(chatBlockSchema.parse({
       type: 'knowledge_status', blockId: 'knowledge_status_1', requestId: 'request_1',
@@ -224,6 +254,7 @@ describe('cross-process contracts', () => {
 
     for (const privateField of [
       { snippet: 'hidden source chunk' },
+      { supportExcerpt: 'hidden support excerpt' },
       { filename: 'policy.pdf' },
       { path: '/private/policy.pdf' },
       { url: 'https://signed.example/source' },
@@ -271,7 +302,7 @@ describe('cross-process contracts', () => {
       startLine: 8, endLine: 9, startColumn: 2, endColumn: 6,
     })).toMatchObject({ status: 'available', kind: 'txt', startLine: 8 })
     for (const preview of [
-      { status: 'available', kind: 'pdf', excerpt: 'PDF preview', page: 2, startOffset: 4, endOffset: 18 },
+      { status: 'available', kind: 'pdf', excerpt: 'PDF preview', page: 2, itemStart: 4, itemEnd: 18 },
       { status: 'available', kind: 'docx', excerpt: 'DOCX preview', headingPath: ['Section'], paragraphId: 'paragraph_1' },
       { status: 'available', kind: 'markdown', excerpt: 'Markdown preview', nodeId: 'heading_1' },
       { status: 'available', kind: 'html', excerpt: 'HTML preview', nodeId: 'section_1' },

@@ -113,8 +113,8 @@ describe('conversation context primitives', () => {
         {
           type: 'knowledge_answer', blockId: 'knowledge_answer_private', mode: 'strict', claims: [{
             text: '申请材料应当包含身份证明。', support: 'knowledge', citations: [{
-              evidenceId: 'evidence_private', documentId: 'document_immutable', versionId: 'version_immutable',
-              kind: 'pdf', page: 2, startOffset: 4, endOffset: 18,
+              documentId: 'document_immutable', versionId: 'version_immutable',
+              kind: 'pdf', page: 2, itemStart: 4, itemEnd: 18,
             }],
           }],
         },
@@ -125,10 +125,10 @@ describe('conversation context primitives', () => {
       role: 'assistant',
       content: [
         '[知识库检索: completed; 检索: 1/3; 结果: 1]',
-        '[知识库声明; 模式: strict; 支持: knowledge] 申请材料应当包含身份证明。 [引用: document_immutable@version_immutable; PDF 第 2 页; 字符 4-18]',
+        '[知识库声明; 模式: strict; 支持: knowledge] 申请材料应当包含身份证明。 [引用: document_immutable@version_immutable; PDF 第 2 页; 文本项 4-18]',
       ].join('\n'),
     })
-    expect(JSON.stringify(serialized)).not.toMatch(/evidence_private|knowledge_.*private|request_private|snippet|filename|\/Users\/|file:\/\/|https?:\/\//i)
+    expect(JSON.stringify(serialized)).not.toMatch(/evidence|chunk|knowledge_.*private|request_private|snippet|filename|\/Users\/|file:\/\/|https?:\/\//i)
   })
 
   it('omits transient-only history and rejects unknown roles', () => {

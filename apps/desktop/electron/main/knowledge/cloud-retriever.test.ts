@@ -17,7 +17,7 @@ const evidence = {
   snippet: 'Release policy excerpt.',
   score: 0.5,
   citation: {
-    evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
+    documentId: 'document_1', versionId: 'version_1',
     kind: 'markdown' as const, nodeId: 'node_release',
   },
 }

@@ -803,6 +803,43 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it('keeps an awaiting knowledge-consent run associated so conversation deletion cancels it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-pending-knowledge-consent-'))
+    directories.push(root)
+    vi.spyOn(AgentOrchestrator.prototype, 'run').mockImplementation(async (input) => ({
+      requestId: input.requestId!, status: 'awaiting_approval',
+    }))
+    const cancel = vi.spyOn(AgentOrchestrator.prototype, 'cancel').mockResolvedValue(undefined)
+    const provider = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{
+        ...modelInfo('openrouter/tools', 'Tools'), supportsTools: true,
+      }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* () {
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, { modelProviders: { openrouter: provider } }))
+    await authenticate(runtime, 'PendingKnowledgeConsent')
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({ activeProvider: 'openrouter' })
+    const conversation = await runtime.services.chat.createConversation()
+
+    try {
+      const { requestId } = await runtime.services.chat.send({
+        ...chatInput(conversation.id, '查我的资料'),
+        model: 'openrouter/tools', outputType: 'text',
+      })
+      await vi.waitFor(() => expect(AgentOrchestrator.prototype.run).toHaveBeenCalledOnce())
+      await new Promise<void>((resolve) => { setImmediate(resolve) })
+      await runtime.services.chat.deleteConversation(conversation.id)
+
+      expect(cancel).toHaveBeenCalledWith(requestId)
+    } finally {
+      await runtime.close()
+    }
+  })
+
   it('persists snippet-disclosure consent per authenticated chat provider and requires it again after switching', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-provider-consent-'))
     directories.push(root)
@@ -861,14 +898,14 @@ describe('createApplicationRuntime', () => {
     directories.push(root)
     const preview = vi.spyOn(KnowledgeService.prototype, 'previewCitation').mockResolvedValue({
       status: 'available', kind: 'pdf', excerpt: '身份证明', page: 2,
-      startOffset: 4, endOffset: 18,
+      itemStart: 4, itemEnd: 18,
     })
     const runtime = createApplicationRuntime(options(root))
     const session = await authenticate(runtime, 'KnowledgeCitationPreview')
     const conversation = await runtime.services.chat.createConversation()
     const citation = {
-      evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
-      kind: 'pdf' as const, page: 2, startOffset: 4, endOffset: 18,
+      documentId: 'document_1', versionId: 'version_1',
+      kind: 'pdf' as const, page: 2, itemStart: 4, itemEnd: 18,
     }
     const database = openAppDatabase(join(root, 'autoforge.sqlite'))
     database.messages.insert({

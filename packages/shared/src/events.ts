@@ -16,9 +16,9 @@ const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('pdf'), page: z.number().int().positive(),
-    startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
-  }).strict().refine(({ startOffset, endOffset }) => endOffset > startOffset, {
-    message: 'PDF citation end offset must follow its start offset', path: ['endOffset'],
+    itemStart: z.number().int().nonnegative(), itemEnd: z.number().int().nonnegative(),
+  }).strict().refine(({ itemStart, itemEnd }) => itemEnd > itemStart, {
+    message: 'PDF citation end item must follow its start item', path: ['itemEnd'],
   }),
   z.object({
     kind: z.literal('docx'), headingPath: z.array(nonEmptyStringSchema.max(200)).max(20), paragraphId: identifierSchema,
@@ -35,7 +35,6 @@ const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
 ])
 
 export const knowledgeCitationReferenceSchema = z.object({
-  evidenceId: identifierSchema,
   documentId: identifierSchema,
   versionId: identifierSchema,
 }).strict().and(knowledgeCoordinateSchema)
@@ -49,8 +48,8 @@ export const knowledgeSearchResultSchema = z.object({
   snippet: z.string().trim().min(1).max(4_000),
   score: z.number().finite().min(0).max(1),
   citation: knowledgeCitationReferenceSchema,
-}).strict().superRefine(({ evidenceId, documentId, versionId, citation }, context) => {
-  if (citation.evidenceId !== evidenceId || citation.documentId !== documentId || citation.versionId !== versionId) {
+}).strict().superRefine(({ documentId, versionId, citation }, context) => {
+  if (citation.documentId !== documentId || citation.versionId !== versionId) {
     context.addIssue({ code: 'custom', path: ['citation'], message: 'Citation must reference this evidence item' })
   }
 })
@@ -203,7 +202,7 @@ export const knowledgeAnswerBlockSchema = z.object({
     })
   }
   const citations = claims.flatMap(({ citations: claimCitations }) => claimCitations)
-  if (new Set(citations.map(({ evidenceId }) => evidenceId)).size > 8) {
+  if (new Set(citations.map(citation => JSON.stringify(citation))).size > 8) {
     context.addIssue({ code: 'custom', path: ['claims'], message: 'Knowledge answers can reference at most eight evidence items' })
   }
 })

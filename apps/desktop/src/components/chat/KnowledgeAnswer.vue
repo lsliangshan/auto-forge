@@ -7,20 +7,20 @@
         {{ claim.citations.length ? ' ' : '' }}
         <button
           v-for="citation in claim.citations"
-          :key="citation.evidenceId"
+          :key="citationKey(citation)"
           type="button"
           class="citation-link"
-          :data-testid="`knowledge-citation-${citationIndex(citation.evidenceId)}`"
-          :aria-label="`查看来源 ${citationIndex(citation.evidenceId) + 1}`"
-          @click="openPreview(citationIndex(citation.evidenceId))"
-        >[{{ citationIndex(citation.evidenceId) + 1 }}]</button>
+          :data-testid="`knowledge-citation-${citationIndex(citation)}`"
+          :aria-label="`查看来源 ${citationIndex(citation) + 1}`"
+          @click="openPreview(citationIndex(citation))"
+        >[{{ citationIndex(citation) + 1 }}]</button>
       </li>
     </ol>
 
     <details class="knowledge-sources" open>
       <summary data-testid="knowledge-sources-summary">来源 {{ sources.length }}</summary>
       <ol>
-        <li v-for="(source, index) in sources" :key="source.evidenceId">
+        <li v-for="(source, index) in sources" :key="citationKey(source)">
           <button
             type="button"
             class="source-link"
@@ -33,10 +33,14 @@
 
     <aside
       v-if="previewOpen"
+      ref="previewDialog"
       class="citation-preview"
       data-testid="knowledge-citation-preview"
       role="dialog"
+      aria-modal="true"
       aria-label="知识库来源预览"
+      tabindex="-1"
+      @keydown.esc.stop.prevent="closePreview"
     >
       <header>
         <strong>来源 {{ activeCitationIndex + 1 }}</strong>
@@ -59,7 +63,7 @@ import type {
   KnowledgeCitationPreview,
   KnowledgeCitationReference,
 } from '@autoforge/shared'
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { displayError, getDesktopApi } from '../../services/desktop-api'
 
 type KnowledgeAnswerBlock = Extract<ChatBlock, { type: 'knowledge_answer' }>
@@ -71,17 +75,24 @@ const props = withDefaults(defineProps<{
 
 const sources = computed(() => props.block.claims.flatMap(({ citations }) => citations)
   .filter((citation, index, all) => (
-    all.findIndex(({ evidenceId }) => evidenceId === citation.evidenceId) === index
+    all.findIndex(candidate => citationKey(candidate) === citationKey(citation)) === index
   )))
+const previewDialog = ref<globalThis.HTMLElement>()
 const previewOpen = ref(false)
 const previewLoading = ref(false)
 const preview = ref<KnowledgeCitationPreview>()
 const previewError = ref('')
 const activeCitationIndex = ref(0)
 let previewGeneration = 0
+let previewReturnFocus: globalThis.HTMLElement | undefined
 
-function citationIndex(evidenceId: string): number {
-  return sources.value.findIndex((source) => source.evidenceId === evidenceId)
+function citationKey(citation: KnowledgeCitationReference): string {
+  return JSON.stringify(citation)
+}
+
+function citationIndex(citation: KnowledgeCitationReference): number {
+  const key = citationKey(citation)
+  return sources.value.findIndex(source => citationKey(source) === key)
 }
 
 function coordinateLabel(citation: KnowledgeCitationReference): string {
@@ -99,7 +110,7 @@ function coordinateLabel(citation: KnowledgeCitationReference): string {
 const previewCoordinateLabel = computed(() => {
   const value = preview.value
   if (!value || value.status !== 'available') return ''
-  if (value.kind === 'pdf') return `PDF 第 ${value.page} 页 · 字符 ${value.startOffset}-${value.endOffset}`
+  if (value.kind === 'pdf') return `PDF 第 ${value.page} 页 · 文本项 ${value.itemStart}-${value.itemEnd}`
   if (value.kind === 'docx') {
     const heading = value.headingPath.length ? value.headingPath.join(' › ') : '正文'
     return `DOCX ${heading} · 段落 ${value.paragraphId}`
@@ -115,11 +126,16 @@ const previewCoordinateLabel = computed(() => {
 async function openPreview(citationIndexValue: number) {
   if (citationIndexValue < 0 || !props.conversationId || !props.messageId) return
   const generation = ++previewGeneration
+  previewReturnFocus = globalThis.document.activeElement instanceof globalThis.HTMLElement
+    ? globalThis.document.activeElement
+    : undefined
   activeCitationIndex.value = citationIndexValue
   previewOpen.value = true
   previewLoading.value = true
   preview.value = undefined
   previewError.value = ''
+  await nextTick()
+  if (generation === previewGeneration) previewDialog.value?.focus()
   try {
     const result = await getDesktopApi().knowledge.previewCitation({
       conversationId: props.conversationId,
@@ -138,9 +154,12 @@ async function openPreview(citationIndexValue: number) {
 }
 
 function closePreview() {
+  const returnFocus = previewReturnFocus
+  previewReturnFocus = undefined
   previewGeneration += 1
   previewOpen.value = false
   previewLoading.value = false
+  if (returnFocus?.isConnected) void nextTick().then(() => { returnFocus.focus() })
 }
 
 watch(() => [props.conversationId, props.messageId, props.block.blockId], closePreview)

@@ -23,12 +23,12 @@ function literalMatch(query: string): string {
 
 export function citationForKnowledgeChunk(row: KnowledgeChunkRow): KnowledgeCitationReference {
   const coordinate = JSON.parse(row.coordinatesJson) as Record<string, unknown>
-  const common = { evidenceId: row.id, documentId: row.documentId, versionId: row.versionId }
+  const common = { documentId: row.documentId, versionId: row.versionId }
   switch (coordinate.kind) {
     case 'pdf': {
-      const startOffset = Number(coordinate.itemStart)
-      const endOffset = Math.max(Number(coordinate.itemEnd), startOffset + 1)
-      return { ...common, kind: 'pdf', page: Number(coordinate.page), startOffset, endOffset }
+      const itemStart = Number(coordinate.itemStart)
+      const itemEnd = Math.max(Number(coordinate.itemEnd), itemStart + 1)
+      return { ...common, kind: 'pdf', page: Number(coordinate.page), itemStart, itemEnd }
     }
     case 'docx':
       return {

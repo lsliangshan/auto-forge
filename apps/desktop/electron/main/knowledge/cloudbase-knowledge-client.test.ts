@@ -189,7 +189,7 @@ describe('CloudBaseKnowledgeClient', () => {
       evidenceId: 'evidence_1', knowledgeBaseId: 'kb_1', documentId: 'document_1',
       versionId: 'version_1', snippet: 'Published excerpt.', score: 0.5,
       citation: {
-        evidenceId: 'evidence_1', documentId: 'document_1', versionId: 'version_1',
+        documentId: 'document_1', versionId: 'version_1',
         kind: 'markdown', nodeId: 'node_release',
       },
     }

@@ -299,6 +299,10 @@ describe('KnowledgeService lifecycle', () => {
       status: 'available', kind: 'txt', excerpt: '第一行受控预览文本',
       startLine: 1, endLine: 1, startColumn: 0, endColumn: 9,
     })
+    await expect(target.previewCitation(owner, {
+      ...evidence.citation,
+      startColumn: 1,
+    })).resolves.toEqual({ status: 'unavailable' })
     await app.service.recycleDocument(owner, document!.id)
     await expect(target.previewCitation(owner, evidence.citation)).resolves.toEqual({
       status: 'unavailable',
@@ -321,7 +325,7 @@ describe('KnowledgeService lifecycle', () => {
       documentId: 'document_cloud', versionId: 'version_cloud',
       snippet: 'Published cloud result.', score: 0.75,
       citation: {
-        evidenceId: 'evidence_cloud', documentId: 'document_cloud', versionId: 'version_cloud',
+        documentId: 'document_cloud', versionId: 'version_cloud',
         kind: 'markdown', nodeId: 'node_cloud',
       },
     }

@@ -844,7 +844,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   const activeRequests = new Set<string>()
   const activeChatWork = new Map<string, {
     conversationId: string
-    promise: Promise<void>
+    promise: Promise<AgentRunResult | void>
   }>()
   const activeConversationTitleWork = new Map<string, {
     conversationId: string
@@ -865,6 +865,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     providerUsageReconciler,
     (error) => { recordFailure(error, 'reconciliation-stop') },
   )
+  const releaseChatWork = (requestId: string): void => {
+    activeRequests.delete(requestId)
+    activeChatWork.delete(requestId)
+  }
   const trackChatWork = (
     requestId: string,
     conversationId: string,
@@ -875,14 +879,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       .then(operation)
       .then((result) => {
         if (['completed', 'cancelled', 'failed'].includes(result.status)) {
-          activeRequests.delete(requestId)
+          releaseChatWork(requestId)
         }
+        return result
       }, (error: unknown) => {
         recordFailure(error, 'background-chat')
-        activeRequests.delete(requestId)
-      })
-      .finally(() => {
-        activeChatWork.delete(requestId)
+        releaseChatWork(requestId)
       })
     activeChatWork.set(requestId, { conversationId, promise })
   }
@@ -916,7 +918,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   })
   const emitChat = (event: ChatEvent) => {
     if (event.type === 'status' && ['completed', 'cancelled', 'failed'].includes(event.status)) {
-      activeRequests.delete(event.requestId)
+      releaseChatWork(event.requestId)
       providerUsageReconciliationLoop.notifyUsageEnded()
     }
     const ownerId = database.conversations.get(event.conversationId)?.userId
@@ -1161,6 +1163,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       database.chatRuns.getByRequestId(requestId)?.userId === userId
     ))
     const results = await Promise.allSettled(requestIds.map((requestId) => agent.cancel(requestId)))
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') releaseChatWork(requestIds[index]!)
+    })
     const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
     if (failed) throw failed.reason
   }
@@ -1213,7 +1218,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     if (block?.type !== 'knowledge_answer') throw failure('NOT_FOUND')
     const citations = block.claims.flatMap(({ citations: claimCitations }) => claimCitations)
       .filter((citation, index, all) => (
-        all.findIndex(({ evidenceId }) => evidenceId === citation.evidenceId) === index
+        all.findIndex(candidate => (
+          JSON.stringify(candidate) === JSON.stringify(citation)
+        )) === index
       ))
     const citation = citations[input.citationIndex]
     if (!citation) throw failure('NOT_FOUND')
@@ -1324,6 +1331,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
             const requests = [...activeChatWork.entries()]
               .filter(([, work]) => work.conversationId === conversationId)
             await Promise.all(requests.map(([requestId]) => agent.cancel(requestId)))
+            for (const [requestId] of requests) releaseChatWork(requestId)
             await Promise.all(requests.map(([, work]) => work.promise))
             const titleRequests = [...activeConversationTitleWork.values()]
               .filter((work) => work.conversationId === conversationId)
@@ -1481,10 +1489,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           ?? database.chatRuns.getByRequestId(requestId)?.conversationId
         if (!conversationId) throw failure('NOT_FOUND')
         requireOwnedConversation(conversationId, session.user.id)
-        await Promise.allSettled([
+        const [agentCancellation] = await Promise.allSettled([
           agent.cancel(requestId),
           mediaGeneration.cancel(requestId),
         ])
+        if (agentCancellation?.status === 'fulfilled') releaseChatWork(requestId)
       },
       decideKnowledgeConsent: async (input) => {
         const parsed = decideKnowledgeConsentRequestSchema.safeParse(input)
@@ -1495,6 +1504,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         requireOwnedConversation(run.conversationId, session.user.id)
         const result = await agent.resumeKnowledgeConsent(parsed.data)
         if (result.status === 'failed') throw result.error ?? failure('INTERNAL_ERROR')
+        if (['completed', 'cancelled'].includes(result.status)) releaseChatWork(parsed.data.requestId)
         setKnowledgeChatProviderConsent(
           session.user.id,
           run.provider,
@@ -1935,6 +1945,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         const reconciliationStopped = Promise.resolve()
           .then(() => providerUsageReconciliationLoop.stop())
           .catch((error: unknown) => { recordFailure(error, 'reconciliation-stop') })
+        const closingChatWork = [...activeChatWork.entries()]
         const cancellations = [...activeRequests].flatMap((requestId) => [
           { source: 'agent-cancel' as const, operation: () => agent.cancel(requestId) },
           { source: 'media-cancel' as const, operation: () => mediaGeneration.cancel(requestId) },
@@ -1947,10 +1958,11 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         })
         await capture('video-stop', () => videoJobs.stop())
         await capture('chat-drain', async () => {
-          const results = await Promise.allSettled([...activeChatWork.values()].map((work) => work.promise))
+          const results = await Promise.allSettled(closingChatWork.map(([, work]) => work.promise))
           for (const result of results) if (result.status === 'rejected') {
             recordFailure(result.reason, 'chat-drain')
           }
+          for (const [requestId] of closingChatWork) releaseChatWork(requestId)
           const titleWork = [...activeConversationTitleWork.values()]
           for (const work of titleWork) work.controller.abort()
           const titleResults = await Promise.allSettled(titleWork.map((work) => work.promise))
