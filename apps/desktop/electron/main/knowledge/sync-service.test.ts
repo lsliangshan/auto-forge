@@ -320,6 +320,71 @@ describe('KnowledgeSyncService', () => {
       .toEqual({ count: 0 })
   })
 
+  it('upgrades a pre-fix durable orphan identity before submission and restart retry', async () => {
+    const storageReference = `private/storage/${'s'.repeat(496)}`
+    const legacyRequestId = `cleanup:${storageReference}`
+    const expectedRequestId = 'cleanup:v1:d4d39cab9eb2e574cd9ed98376477419e0f21130e7492a709ca4a38fce33c5e3'
+    const callFunction = vi.fn()
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({ result: { ok: true, data: { removed: 1 } } })
+    const client = new CloudBaseKnowledgeClient({ callFunction })
+    const cleanupOrphans = vi.fn(input => client.cleanupOrphans(input))
+    const { database, remote, service, dependencies } = fixture({ cleanupOrphans })
+    database.prepare(`
+      INSERT INTO cloud_sync_orphans (
+        storage_reference, knowledge_base_id, request_id, created_at
+      ) VALUES (?, 'kb_1', ?, 1)
+    `).run(storageReference, legacyRequestId)
+
+    expect(storageReference).toHaveLength(512)
+    expect(legacyRequestId).toHaveLength(520)
+    await expect(service.cleanupOrphans('kb_1')).rejects.toMatchObject({
+      code: 'TRANSIENT_FAILURE',
+    })
+    expect(database.prepare(`
+      SELECT request_id AS requestId FROM cloud_sync_orphans WHERE storage_reference = ?
+    `).get(storageReference)).toEqual({ requestId: expectedRequestId })
+
+    const restarted = new KnowledgeSyncService(database, remote, dependencies)
+    await expect(restarted.cleanupOrphans('kb_1')).resolves.toBeUndefined()
+    expect(cleanupOrphans.mock.calls.map(([input]) => input.requestId))
+      .toEqual([expectedRequestId, expectedRequestId])
+    expect(callFunction).toHaveBeenNthCalledWith(1, {
+      name: 'autoforge-knowledge',
+      data: {
+        action: 'cleanupOrphans', requestId: expectedRequestId, knowledgeBaseId: 'kb_1',
+        storageReferences: [storageReference],
+      },
+    })
+    expect(callFunction).toHaveBeenNthCalledWith(2, {
+      name: 'autoforge-knowledge',
+      data: {
+        action: 'cleanupOrphans', requestId: expectedRequestId, knowledgeBaseId: 'kb_1',
+        storageReferences: [storageReference],
+      },
+    })
+    expect(database.prepare('SELECT count(*) AS count FROM cloud_sync_orphans').get())
+      .toEqual({ count: 0 })
+  })
+
+  it('fails closed for an unrelated durable orphan cleanup identity', async () => {
+    const cleanupOrphans = vi.fn().mockResolvedValue({ removed: 1 })
+    const { database, service } = fixture({ cleanupOrphans })
+    database.prepare(`
+      INSERT INTO cloud_sync_orphans (
+        storage_reference, knowledge_base_id, request_id, created_at
+      ) VALUES ('storage/object_corrupt', 'kb_1', 'request_from_unrelated_state', 1)
+    `).run()
+
+    await expect(service.cleanupOrphans('kb_1')).rejects.toMatchObject({
+      code: 'INVALID_INPUT', retryable: false,
+    })
+    expect(cleanupOrphans).not.toHaveBeenCalled()
+    expect(database.prepare(`
+      SELECT request_id AS requestId FROM cloud_sync_orphans WHERE storage_reference = ?
+    `).get('storage/object_corrupt')).toEqual({ requestId: 'request_from_unrelated_state' })
+  })
+
   it('rejects every late remote result from a synchronization invalidated by cancellation', async () => {
     let resolvePush!: (value: {
       mutationId: string; status: 'applied'; sequence: number; revision: string

@@ -321,3 +321,82 @@ Tests  1 passed | 20 skipped (21)
 - Cleanup success still deletes the local row only when knowledge base, storage reference, and persisted request ID all match, preserving the existing CAS behavior.
 - Renderer trust boundaries, Main/server ownership, API and SQL length limits, cleanup reservation semantics, and `kill_switch_enabled` were not changed.
 - No real CloudBase service was accessed or mutated. The existing emulator/pre-production deployment gate and unrelated `CONTEXT_LIMIT_EXCEEDED` baseline remain unchanged.
+
+## Fix Round 5
+
+### What changed
+
+- Added an upgrade compatibility path for durable orphan rows written before `e818adc`. `cleanupOrphans` now selects and validates the next batch inside one SQLite transaction, then rewrites only the exact legacy `cleanup:${storageReference}` identity to the existing deterministic `cleanup:v1:<sha256>` identity before any remote submission.
+- Leaves an already-correct v1 identity unchanged. Any other persisted identity fails closed with `INVALID_INPUT`; arbitrary request IDs are neither normalized nor submitted.
+- Persists the rewritten identity before the remote await, so a crash or lost response reuses the same private 75-character request after service reconstruction. The existing one-object request and post-response delete CAS remain unchanged.
+- Kept the 128-character client/API/SQL limit and the 512-character storage-reference limit unchanged.
+
+### TDD RED
+
+Working directory: `apps/desktop`.
+
+Command:
+
+`node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/sync-service.test.ts -t "upgrades a pre-fix durable orphan identity before submission and restart retry"`
+
+Relevant output before the production change:
+
+```text
+FAIL  |desktop-node| electron/main/knowledge/sync-service.test.ts > KnowledgeSyncService > upgrades a pre-fix durable orphan identity before submission and restart retry
+AssertionError: expected CloudKnowledgeError: INVALID_INPUT to match object { code: 'TRANSIENT_FAILURE' }
+Test Files  1 failed (1)
+Tests  1 failed | 22 skipped (23)
+```
+
+The manually inserted pre-fix row used a valid 512-character storage reference and its historical 520-character `cleanup:${storageReference}` request ID. The real `CloudBaseKnowledgeClient` rejected that stored ID before the mocked Function port could observe the simulated lost response.
+
+Fail-closed command:
+
+`node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/sync-service.test.ts -t "fails closed for an unrelated durable orphan cleanup identity"`
+
+Relevant RED output:
+
+```text
+AssertionError: promise resolved "undefined" instead of rejecting
+Test Files  1 failed (1)
+Tests  1 failed | 22 skipped (23)
+```
+
+Before the production change, an unrelated short request ID was accepted, submitted, and deleted instead of being rejected locally.
+
+### TDD GREEN
+
+Command:
+
+`node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/sync-service.test.ts -t "pre-fix durable|unrelated durable"`
+
+Relevant output:
+
+```text
+Test Files  1 passed (1)
+Tests  2 passed | 21 skipped (23)
+```
+
+The regression proves the legacy rewrite is committed before a lost response, remains byte-for-byte stable after service restart, passes the real client validator, and is reused for the successful retry. It also proves unrelated durable identities remain stored and never reach the remote.
+
+### Final verification
+
+- Focused legacy/fail-closed regressions: 2/2 passed.
+- `node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/sync-service.test.ts`: 23/23 passed.
+- `node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts electron/main/knowledge/*.test.ts`: 120/120 passed.
+- `pnpm --filter @autoforge/desktop typecheck`: passed.
+- `pnpm exec eslint apps/desktop/electron/main/knowledge/sync-service.ts apps/desktop/electron/main/knowledge/sync-service.test.ts`: passed.
+- `git diff --check`: passed.
+
+### Files changed
+
+- `apps/desktop/electron/main/knowledge/sync-service.ts`
+- `apps/desktop/electron/main/knowledge/sync-service.test.ts`
+- `.superpowers/sdd/2026-08-26-personal-knowledge-base/task-6-report.md`
+
+### Self-review
+
+- Migration recognition is exact: only `cleanup:${storageReference}` is eligible, and the accepted v1 identity must equal the SHA-256 identity derived from that row's full storage reference. A syntactically plausible but mismatched v1 ID therefore also fails closed.
+- Selection, validation, and every eligible request-ID update share one SQLite transaction. No remote call can occur until that transaction commits, and a malformed row rolls back the batch rather than leaving a partial migration.
+- The existing remote call still contains exactly one storage reference, and local deletion still compares knowledge base, storage reference, and the now-persisted request ID.
+- No CloudBase service, emulator, or pre-production database was accessed. `kill_switch_enabled`, the external deployment gate, and the unrelated `CONTEXT_LIMIT_EXCEEDED` baseline remain unchanged.

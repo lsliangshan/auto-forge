@@ -482,11 +482,27 @@ export class KnowledgeSyncService {
   }
 
   async cleanupOrphans(knowledgeBaseId: string): Promise<void> {
-    const rows = this.database.prepare(`
-      SELECT storage_reference AS storageReference, request_id AS requestId
-      FROM cloud_sync_orphans WHERE knowledge_base_id = ?
-      ORDER BY created_at LIMIT 100
-    `).all(knowledgeBaseId) as Array<{ storageReference: string; requestId: string }>
+    const rows = this.database.transaction(() => {
+      const selected = this.database.prepare(`
+        SELECT storage_reference AS storageReference, request_id AS requestId
+        FROM cloud_sync_orphans WHERE knowledge_base_id = ?
+        ORDER BY created_at LIMIT 100
+      `).all(knowledgeBaseId) as Array<{ storageReference: string; requestId: string }>
+      const update = this.database.prepare(`
+        UPDATE cloud_sync_orphans SET request_id = ?
+        WHERE knowledge_base_id = ? AND storage_reference = ? AND request_id = ?
+      `)
+      return selected.map(row => {
+        const requestId = orphanCleanupRequestId(row.storageReference)
+        if (row.requestId === requestId) return row
+        if (row.requestId !== `cleanup:${row.storageReference}`) throw syncError('INVALID_INPUT')
+        const updated = update.run(
+          requestId, knowledgeBaseId, row.storageReference, row.requestId,
+        )
+        if (updated.changes !== 1) throw syncError('CONFLICT')
+        return { ...row, requestId }
+      })
+    })()
     for (const row of rows) {
       await this.remote.cleanupOrphans({
         requestId: row.requestId,
