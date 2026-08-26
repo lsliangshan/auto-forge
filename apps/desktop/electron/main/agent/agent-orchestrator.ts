@@ -152,7 +152,7 @@ const KNOWLEDGE_GROUNDING_POLICY = [
 
 const SINGLE_TOOL_REPAIR = '上一响应包含多个工具调用。一次只能调用一个工作流或浏览器工具；请重新决定，只返回一个工具调用或直接回答。'
 const FINAL_FROM_RESULTS = '本次运行已达到五次工作流执行上限。不要再调用工作流；如仍提供浏览器工具，只能按既有浏览器策略使用，否则请根据已有结果给出最终回答。'
-const KNOWLEDGE_CITATION_REPAIR = '上一知识库回答包含无效引用，或声明未被所引当前轮片段支持。只能修复一次：请重新调用 knowledge_grounded_answer，并仅使用当前工具结果中的 evidenceId。每项知识库声明必须连续出现在一个所引片段的单个分句中；只能调整大小写、空白或标点，不得改写或拼接片段、分句。'
+const KNOWLEDGE_CITATION_REPAIR = '上一知识库回答包含无效引用，或声明未被所引当前轮片段支持。只能修复一次：请重新调用 knowledge_grounded_answer，并仅使用当前工具结果中的 evidenceId。每项知识库声明必须完整复制一个所引片段中的单个原文句子（包含原标点）；不得改写、截取或拼接片段和句子。'
 const STRICT_KNOWLEDGE_REFUSAL = '当前所选知识库没有足够的当前轮证据，因此无法按严格模式回答。请补充资料或换一种更具体的问法。'
 const KNOWLEDGE_SEARCH_LIMIT = 3
 const KNOWLEDGE_EVIDENCE_LIMIT = 8
@@ -164,17 +164,19 @@ const BROWSER_TOOL_NAMES = new Set<BrowserContinuationToolName>([
   'browser_session_inspect', 'browser_session_act', 'browser_session_handoff',
 ])
 
-const SUPPORT_CLAUSE_BOUNDARY = /[\r\n.!?。！？；;，,：:…]+/u
-const SUPPORT_LEXICAL_TOKEN = /\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|\p{Script=Hangul}|[\p{Letter}\p{Mark}]+|\p{Number}+/gu
-
-function normalizedSupportTokens(value: string): string[] {
-  return value.normalize('NFC').toLowerCase().match(SUPPORT_LEXICAL_TOKEN) ?? []
+function normalizedSupportSentence(value: string): string {
+  return value.normalize('NFC').toLowerCase().replace(/\p{White_Space}+/gu, ' ').trim()
 }
 
-function containsContiguousTokens(source: readonly string[], claim: readonly string[]): boolean {
-  if (claim.length > source.length) return false
-  return `\u0000${source.join('\u0000')}\u0000`
-    .includes(`\u0000${claim.join('\u0000')}\u0000`)
+function unicodeSentences(value: string): string[] | undefined {
+  try {
+    if (typeof Intl.Segmenter !== 'function') return undefined
+    return [...new Intl.Segmenter('und', { granularity: 'sentence' }).segment(value)]
+      .map(({ segment }) => normalizedSupportSentence(segment))
+      .filter(Boolean)
+  } catch {
+    return undefined
+  }
 }
 
 function claimSupportedByEvidence(
@@ -182,13 +184,9 @@ function claimSupportedByEvidence(
   evidence: readonly KnowledgeSearchResult[],
 ): boolean {
   if (evidence.length === 0) return false
-  const claimClauses = claim.split(SUPPORT_CLAUSE_BOUNDARY)
-    .map(normalizedSupportTokens)
-    .filter(clause => clause.length > 0)
-  if (claimClauses.length !== 1 || claimClauses[0]!.join('').length < 4) return false
-  return evidence.some(item => item.snippet.split(SUPPORT_CLAUSE_BOUNDARY)
-    .map(normalizedSupportTokens)
-    .some(clause => containsContiguousTokens(clause, claimClauses[0]!)))
+  const claimSentences = unicodeSentences(claim)
+  if (claimSentences?.length !== 1) return false
+  return evidence.some(item => unicodeSentences(item.snippet)?.includes(claimSentences[0]!) === true)
 }
 
 const knowledgeSearchArgumentsSchema = z.object({

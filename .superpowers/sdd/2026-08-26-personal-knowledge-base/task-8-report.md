@@ -183,3 +183,51 @@
 - No real provider, CloudBase, TokenHub, PostgreSQL, entitlement, beta, cloud, or kill-switch gate was accessed or enabled. Provider repair and support use deterministic doubles; the Electron smoke is local only.
 - Extractive single-clause validation intentionally refuses otherwise reasonable paraphrases and multi-clause summaries. This is the required fail-closed tradeoff; repair is directed to source wording and no provider adjudicator or durable support excerpt was added.
 - The sole unrelated Application context-summary baseline failure and the external release gates remain unchanged.
+
+## Fix Round 3: exact Unicode assertions and authentication admission
+
+### Implementation
+
+- Replaced substring/token containment with the controller-required whole-sentence assertion. Main now uses the runtime `Intl.Segmenter('und', { granularity: 'sentence' })`; a knowledge claim must segment into exactly one Unicode sentence, and one sentence from one specifically cited current-turn snippet must equal it after only NFC, case, and whitespace normalization. Punctuation, lexical tokens, digits, polarity, order, sentence boundaries, and snippet boundaries remain intact. Missing, throwing, or multi-sentence/ambiguous segmentation fails closed.
+- Tightened the single repair prompt to request one complete source sentence including its original punctuation. The existing one-repair limit remains authoritative; assertion mentions, denial wrappers, fullwidth/Arabic sentence boundaries, and multi-sentence claims repair once and then refuse. No snippet, support excerpt, or evidence ID is persisted or sent to Renderer/history.
+- Added one consistently nested identity-transition boundary: `MaintenanceGate` is acquired outside `KnowledgeAdmissionGate` for `verifyOtp`, `loginWithPassword`, and `logout`. A chat send that has entered `beginStart()` but has not registered therefore makes the identity transition return `CONFLICT` before cleanup or the underlying auth operation can run. Once send admission releases, a retry holds maintenance against new starts while the existing registered Agent/media work is cancelled; media work is drained before identity changes.
+- Kept the exclusive active-work predicate deliberately false for auth transitions. `MaintenanceGate` itself rejects pre-registration starts, while `beforeAuthIdentityChange()` remains able to cancel and drain already registered work inside the exclusive operation without deadlocking on its own active-work check. The nesting order is always Maintenance outer, KnowledgeAdmission inner.
+- Updated the existing ownership/fingerprint regression that previously switched identity during route preflight. It now verifies the required conflict and unchanged Alice identity, lets the admitted request finish, and only then logs out and continues as Bobby; its provider ownership/fingerprint assertions remain intact.
+
+### Exact RED evidence
+
+- Whole-sentence assertion RED before production changes:
+
+  `pnpm test apps/desktop/electron/main/agent/agent-orchestrator.test.ts -t 'exact .* sentence|proposition|fullwidth-period|Arabic-full-stop|multiple sentences|Unicode sentence segmentation' --reporter=dot`
+
+  Result: 1 file failed / 7 failed / 3 passed / 218 skipped. Both exact Chinese/English source sentences and the existing multi-sentence rejection were already green. The intended failures showed premature acceptance of both Chinese assertion-context counterexamples, the English `It is false that ...` wrapper, fullwidth `．` and Arabic `۔` cross-sentence composition, and missing/throwing `Intl.Segmenter`.
+- Authentication pre-registration RED before production changes:
+
+  `pnpm test apps/desktop/electron/main/application.test.ts -t 'rejects .* while a .* send is in async preflight' --reporter=dot`
+
+  Result: 1 file failed / 3 failed / 157 skipped. `logout` with image preflight, password login with text preflight, and OTP verification with text preflight all failed at the intended assertion because the first transition succeeded instead of returning `CONFLICT`.
+- The auth tests are deterministic and do not pass by timeout. Each waits for the controlled credential preflight to start, attempts and inspects the first transition, releases preflight, waits for the real Agent/media operation to register, retries, then asserts one underlying auth call, provider abort, cancelled persisted run, and final identity. Cleanup always drains any intentionally exposed stale work.
+- First post-slice `pnpm typecheck` had one test-only error: the indefinitely pending image-provider double inferred `Promise<unknown>`. The fixture was narrowed to `Promise<never>` and its focused behavior was rerun before typecheck passed; production code was not broadened.
+
+### GREEN and verification
+
+- Exact Unicode assertion focus -> 10 passed / 218 skipped. This covers direct Chinese and English positives, assertion/denial wrappers, fullwidth and Arabic sentence stops, a multi-sentence claim, and unavailable/throwing Segmenter fail-closed behavior.
+- Auth admission matrix -> 3 passed / 157 skipped. The ownership/fingerprint test plus that matrix -> 4 passed / 156 skipped.
+- Final combined assertion/auth/ownership focus on the report tree -> 2 files / 14 passed / 374 skipped; the following `git diff --check` was clean.
+- Full Agent suite -> 228 passed.
+- Full Application suite -> 159 passed / exactly 1 preserved failure: `bills real context-summary streams through the Application-supplied provider snapshot` still receives the unrelated `CONTEXT_LIMIT_EXCEEDED` baseline. An initial broader run exposed the now-invalid legacy preflight account-switch expectation plus that baseline; after aligning the legacy test with the new ruling, only the baseline remained.
+- Workflow loop, context, local/cloud knowledge, IPC, Preload, shared-contract, and Renderer chat suites -> 10 files / 387 passed.
+- `pnpm typecheck` passed all four typed workspace projects. `pnpm lint` exited 0 with 0 errors / 459 existing warnings. `pnpm build` passed all packages and Electron Main, Preload, Renderer, and worker targets. `git diff --check` is clean.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui` rebuilt the app and crossed the real local Electron Renderer -> Preload -> IPC -> Main -> parser -> persistence boundary, restored strict selection, and ended with `{ "ok": true }`.
+
+### Files, external gates, and self-review
+
+- Production changes are limited to `apps/desktop/electron/main/agent/agent-orchestrator.ts` and `apps/desktop/electron/main/application.ts`; regressions are in their adjacent test files. This report records the evidence. Controller-owned `progress.md` remains dirty, untouched by this agent, and excluded from staging.
+- Re-read the full Round 3 diff against all three review findings. The support proof has no substring, token-overlap, clause-joining, or cross-snippet path. The auth boundary closes both orderings of the session-read/start race, makes conflicts occur before consuming an OTP or changing identity, and permits registered-work cancellation/drain without reversing the gate order.
+- Existing assistant identity, workflow/browser/tool-unavailable policies, workflow-first routing, 5/3/10/8 budgets, one repair, text/tool-only knowledge gating, provider-scoped consent, immutable selection snapshots, privacy logging, and cloud kill switches are unchanged.
+- No real provider, CloudBase, TokenHub, PostgreSQL, entitlement, beta, cloud, or kill-switch gate was accessed or enabled. Provider assertion/repair remains exercised only with deterministic doubles; the Electron smoke is local only.
+
+### Remaining concerns
+
+- Exact whole-sentence assertion intentionally refuses paraphrases, excerpts, and multi-sentence summaries. This false-negative bias is the required fail-closed policy; repair requests extractive source wording and does not invoke another adjudicator.
+- The sole unrelated Application context-summary baseline failure and all prohibited external release gates remain unchanged.

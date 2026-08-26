@@ -7036,6 +7036,36 @@ describe('Agent knowledge grounding', () => {
 
   it.each([
     {
+      name: 'Chinese sentence',
+      claim: '申请材料应当包含身份证明。',
+    },
+    {
+      name: 'English sentence',
+      claim: 'The plan is safe.',
+    },
+  ])('accepts an exact $name from one cited current-turn snippet', async ({ claim }) => {
+    const evidence = { ...groundedEvidence, snippet: claim }
+    const dependencies = harness([
+      knowledgeSearchTurn('exact_sentence_search', 'exact sentence'),
+      groundedAnswerTurn('exact_sentence_answer', [{
+        text: claim, support: 'knowledge', citationIds: ['evidence_1'],
+      }]),
+    ])
+    dependencies.workflows.list = async () => []
+    const knowledge = attachKnowledge(dependencies, { results: [evidence] })
+
+    await new AgentOrchestrator(dependencies).run(groundedRunInput({
+      conversationId: 'exact_sentence_support', content: '严格查原文',
+      provider: 'openrouter', model: 'model',
+    }, knowledge.snapshot))
+
+    expect(finalBlocks(dependencies)).toContainEqual(expect.objectContaining({
+      type: 'knowledge_answer', claims: [expect.objectContaining({ text: claim })],
+    }))
+  })
+
+  it.each([
+    {
       name: 'opposite object in one clause',
       claim: '申请材料不需要身份证明。',
       evidence: [{
@@ -7085,6 +7115,60 @@ describe('Agent knowledge grounding', () => {
       }],
       citationIds: ['evidence_1'],
     },
+    {
+      name: 'proposition mentioned by a Chinese prohibition',
+      claim: '申请材料不需要身份证明。',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: '不能声称申请材料不需要身份证明。',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'proposition followed by a Chinese denial',
+      claim: '申请材料不需要身份证明。',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: '申请材料不需要身份证明的说法是错误的。',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'proposition embedded in an English denial',
+      claim: 'The plan is safe.',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: 'It is false that the plan is safe.',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'fullwidth-period sentence composition',
+      claim: '申请费用为10元办理时限为20天。',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: '申请费用为10元．办理时限为20天。',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'Arabic-full-stop sentence composition',
+      claim: '申请费用为10元办理时限为20天。',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: '申请费用为10元۔办理时限为20天。',
+      }],
+      citationIds: ['evidence_1'],
+    },
+    {
+      name: 'multiple sentences in one claim',
+      claim: 'The plan is safe. The permit is valid.',
+      evidence: [{
+        ...groundedEvidence,
+        snippet: 'The plan is safe. The permit is valid.',
+      }],
+      citationIds: ['evidence_1'],
+    },
   ])('repairs exactly once then refuses support with $name', async ({
     claim, evidence, citationIds,
   }) => {
@@ -7111,6 +7195,46 @@ describe('Agent knowledge grounding', () => {
     expect(text).toContain('无法')
     expect(JSON.stringify(finalBlocks(dependencies))).not.toContain(claim)
   })
+
+  it.each([
+    { mode: 'unavailable' },
+    { mode: 'throwing' },
+  ] as const)(
+    'fails closed when Unicode sentence segmentation is $mode',
+    async ({ mode }) => {
+      const claim = '申请材料应当包含身份证明。'
+      const dependencies = harness([
+        knowledgeSearchTurn('segmenter_failure_search', '申请材料'),
+        groundedAnswerTurn('segmenter_failure_first', [{
+          text: claim, support: 'knowledge', citationIds: ['evidence_1'],
+        }]),
+        groundedAnswerTurn('segmenter_failure_second', [{
+          text: claim, support: 'knowledge', citationIds: ['evidence_1'],
+        }]),
+      ])
+      dependencies.workflows.list = async () => []
+      const knowledge = attachKnowledge(dependencies)
+      const originalSegmenter = Object.getOwnPropertyDescriptor(Intl, 'Segmenter')!
+      Object.defineProperty(Intl, 'Segmenter', {
+        configurable: true,
+        writable: true,
+        value: mode === 'unavailable'
+          ? undefined
+          : function ThrowingSegmenter() { throw new Error('segmenter unavailable') },
+      })
+      try {
+        await new AgentOrchestrator(dependencies).run(groundedRunInput({
+          conversationId: 'segmenter_failure', content: '严格查申请材料',
+          provider: 'openrouter', model: 'model',
+        }, knowledge.snapshot))
+      } finally {
+        Object.defineProperty(Intl, 'Segmenter', originalSegmenter)
+      }
+
+      expect(vi.mocked(dependencies.providerInstances.openrouter.stream)).toHaveBeenCalledTimes(3)
+      expect(JSON.stringify(finalBlocks(dependencies))).not.toContain(claim)
+    },
+  )
 
   it('repairs then refuses a contradictory material claim even with a valid current-turn id', async () => {
     const contradictoryClaim = {

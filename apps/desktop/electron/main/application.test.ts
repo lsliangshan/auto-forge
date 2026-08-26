@@ -1288,6 +1288,153 @@ describe('createApplicationRuntime', () => {
     await runtime.close()
   })
 
+  it.each([
+    { transition: 'logout', outputType: 'image' },
+    { transition: 'login', outputType: 'text' },
+    { transition: 'verify', outputType: 'text' },
+  ] as const)(
+    'rejects $transition while a $outputType send is in async preflight, then cancels and drains it on retry',
+    async ({ transition, outputType }) => {
+      const root = await mkdtemp(join(tmpdir(), `autoforge-application-auth-${transition}-preflight-`))
+      directories.push(root)
+      const credentialStarted = deferred<void>()
+      const releaseCredential = deferred<void>()
+      const operationStarted = deferred<void>()
+      let operationAborted = false
+      const authService = createTestAuthService()
+      const model = outputType === 'image'
+        ? imageModelInfo('openrouter/image')
+        : modelInfo('openrouter/text', 'Text')
+      const provider: ModelProvider = {
+        listModels: vi.fn(async () => [model]),
+        validateCredential: vi.fn(async () => {
+          credentialStarted.resolve()
+          await releaseCredential.promise
+          return { valid: true }
+        }),
+        stream: vi.fn(async function* (request) {
+          if (outputType !== 'text') {
+            yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+            return
+          }
+          operationStarted.resolve()
+          await new Promise<void>((resolve) => {
+            const abort = () => {
+              operationAborted = true
+              resolve()
+            }
+            if (request.signal?.aborted) abort()
+            else request.signal?.addEventListener('abort', abort, { once: true })
+          })
+        }),
+        generateImage: vi.fn((request) => new Promise<never>((_, reject) => {
+          operationStarted.resolve()
+          const abort = () => {
+            operationAborted = true
+            reject(toSafeAppError({ code: 'CANCELLED' }))
+          }
+          if (request.signal?.aborted) abort()
+          else request.signal?.addEventListener('abort', abort, { once: true })
+        })),
+      }
+      const runtime = createApplicationRuntime(options(root, {
+        authService,
+        modelProviders: { openrouter: snapshotProvider('openrouter', provider) },
+      }))
+      const alice = await authenticate(runtime, 'AdmissionRaceAlice')
+      const bob = await authenticate(runtime, 'AdmissionRaceBobby')
+      await runtime.services.auth.loginWithPassword({
+        account: alice.user.account,
+        password: 'password',
+      })
+      const bobChallenge = await runtime.services.auth.sendOtp({
+        intent: 'login',
+        channel: 'email',
+        target: 'admissionracebobby@example.com',
+      })
+      let underlyingCalls = 0
+      let changeIdentity: () => Promise<unknown>
+      if (transition === 'logout') {
+        const original = authService.logout.bind(authService)
+        vi.spyOn(authService, 'logout').mockImplementation(async () => {
+          underlyingCalls += 1
+          return original()
+        })
+        changeIdentity = () => runtime.services.auth.logout()
+      } else if (transition === 'login') {
+        const original = authService.loginWithPassword.bind(authService)
+        vi.spyOn(authService, 'loginWithPassword').mockImplementation(async (input) => {
+          underlyingCalls += 1
+          return original(input)
+        })
+        changeIdentity = () => runtime.services.auth.loginWithPassword({
+          account: bob.user.account,
+          password: 'password',
+        })
+      } else {
+        const original = authService.verifyOtp.bind(authService)
+        vi.spyOn(authService, 'verifyOtp').mockImplementation(async (input) => {
+          underlyingCalls += 1
+          return original(input)
+        })
+        changeIdentity = () => runtime.services.auth.verifyOtp({
+          challengeId: bobChallenge.challengeId,
+          code: '123456',
+        })
+      }
+      await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+      await runtime.services.settings.update({
+        activeProvider: 'openrouter',
+        defaultModels: {
+          deepseek: { text: 'deepseek-v4-flash' },
+          openrouter: outputType === 'image'
+            ? { image: model.id }
+            : { text: model.id },
+        },
+      })
+      const conversation = await runtime.services.chat.createConversation()
+      const sending = runtime.services.chat.send({
+        ...chatInput(conversation.id, 'keep the original identity'),
+        outputType,
+      })
+      await credentialStarted.promise
+
+      let firstTransitionError: unknown
+      try {
+        await changeIdentity()
+      } catch (error) {
+        firstTransitionError = error
+      }
+      const identityAfterFirst = await authService.getSession()
+      releaseCredential.resolve()
+      const sent = await sending
+      await operationStarted.promise
+
+      let retryError: unknown
+      try {
+        await changeIdentity()
+      } catch (error) {
+        retryError = error
+      }
+      const finalIdentity = await authService.getSession()
+      const inspection = openAppDatabase(join(root, 'autoforge.sqlite'))
+      const runStatus = inspection.chatRuns.getByRequestId(sent.requestId)?.status
+      inspection.close()
+
+      try {
+        expect(firstTransitionError).toMatchObject({ code: 'CONFLICT' })
+        expect(identityAfterFirst?.user.id).toBe(alice.user.id)
+        expect(retryError).toBeUndefined()
+        expect(underlyingCalls).toBe(1)
+        expect(operationAborted).toBe(true)
+        expect(runStatus).toBe('cancelled')
+        expect(finalIdentity?.user.id).toBe(transition === 'logout' ? undefined : bob.user.id)
+      } finally {
+        await runtime.close()
+      }
+    },
+  )
+
   it('rejects selector-less resolution instead of using an id and version fallback', async () => {
     const vault = createWorkflowSourceSelectorVault()
     const installed = {
@@ -2136,8 +2283,8 @@ describe('createApplicationRuntime', () => {
 
     const sending = runtime.services.chat.send(chatInput(openRouterConversation.id, 'owned by Alice'))
     await vi.waitFor(() => expect(openrouter.listModels).toHaveBeenCalledTimes(1))
-    await runtime.services.auth.logout()
-    const bob = await authenticate(runtime, 'Bobby')
+    await expect(runtime.services.auth.logout()).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(runtime.services.auth.requireSession()).resolves.toEqual(alice)
     catalog.resolve([modelInfo('openai/gpt-4.1-mini', 'OpenRouter')])
     const openRouterRequest = await sending
     await vi.waitFor(() => {
@@ -2147,6 +2294,8 @@ describe('createApplicationRuntime', () => {
       inspection.close()
       expect(run).toEqual({ status: 'completed' })
     })
+    await runtime.services.auth.logout()
+    const bob = await authenticate(runtime, 'Bobby')
 
     await runtime.services.settings.update({ activeProvider: 'deepseek' })
     const deepSeekConversation = await runtime.services.chat.createConversation()

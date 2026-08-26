@@ -1214,6 +1214,12 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     const current = await auth.getSession()
     if (current) await resetBrowserIdentity(current.user.id)
   }
+  const transitionAuthIdentity = <T>(operation: () => Promise<T>): Promise<T> => (
+    maintenance.runExclusive(
+      () => false,
+      () => knowledgeAdmission.transition(operation),
+    )
+  )
 
   const previewKnowledgeCitation: DesktopIpcServices['previewKnowledgeCitation'] = async (
     owner,
@@ -1250,16 +1256,16 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }),
       refreshAuthorization: () => auth.refreshAuthorization(),
       sendOtp: (input) => auth.sendOtp(input),
-      verifyOtp: (input) => knowledgeAdmission.transition(async () => {
+      verifyOtp: (input) => transitionAuthIdentity(async () => {
         await beforeAuthIdentityChange()
         return auth.verifyOtp(input)
       }),
       cancelOtp: (challengeId) => auth.cancelOtp(challengeId),
-      loginWithPassword: (input) => knowledgeAdmission.transition(async () => {
+      loginWithPassword: (input) => transitionAuthIdentity(async () => {
         await beforeAuthIdentityChange()
         return auth.loginWithPassword(input)
       }),
-      logout: () => knowledgeAdmission.transition(async () => {
+      logout: () => transitionAuthIdentity(async () => {
         await beforeAuthIdentityChange()
         await auth.logout()
       }),
