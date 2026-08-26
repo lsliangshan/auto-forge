@@ -263,6 +263,114 @@ interface AuthenticatedKnowledgeEntitlementEnvelope {
   readonly membershipExpiresAt: number
 }
 
+interface KnowledgeEntitlementVerifierOptions {
+  readonly trustedKeys: Readonly<Record<string, string>>
+  readonly now?: () => number
+}
+
+function authenticateKnowledgeEntitlementEnvelope(
+  options: KnowledgeEntitlementVerifierOptions,
+  userId: string,
+  input: unknown,
+): AuthenticatedKnowledgeEntitlementEnvelope {
+  const parsed = envelopeSchema.safeParse(input)
+  if (!parsed.success) verificationFailure('invalid_envelope')
+  const envelope = parsed.data
+  if (envelope.payload.userId !== userId) verificationFailure('wrong_user')
+  const trustedKey = options.trustedKeys[envelope.payload.keyId]
+  if (!trustedKey) verificationFailure('untrusted_key')
+  const canonicalPayload = canonicalPayloadBytes(envelope.payload)
+  let valid = false
+  try {
+    valid = verify(
+      null,
+      canonicalPayload,
+      createPublicKey(trustedKey),
+      Buffer.from(envelope.signature, 'base64url'),
+    )
+  } catch {
+    verificationFailure('invalid_key')
+  }
+  if (!valid) verificationFailure('invalid_signature')
+
+  const issuedAt = Date.parse(envelope.payload.issuedAt)
+  const snapshotExpiresAt = Date.parse(envelope.payload.snapshotExpiresAt)
+  const membershipExpiresAt = Date.parse(envelope.payload.membershipExpiresAt)
+  const free = envelope.payload.tier === 'free'
+  const terminal = envelope.payload.membershipStatus !== 'active'
+  if (snapshotExpiresAt < issuedAt
+    || (!free && !terminal && membershipExpiresAt <= issuedAt)
+    || (!free && terminal && membershipExpiresAt > issuedAt)) {
+    verificationFailure('invalid_time_order')
+  }
+  return Object.freeze({
+    envelope,
+    canonicalPayload,
+    envelopeHash: canonicalEnvelopeHash(envelope, canonicalPayload),
+    issuedAt,
+    snapshotExpiresAt,
+    membershipExpiresAt,
+  })
+}
+
+function evaluateKnowledgeEntitlementEnvelope(
+  options: KnowledgeEntitlementVerifierOptions,
+  authenticated: AuthenticatedKnowledgeEntitlementEnvelope,
+  now = options.now?.() ?? Date.now(),
+): VerifiedKnowledgeEntitlementState {
+  const { envelope, issuedAt, snapshotExpiresAt, membershipExpiresAt } = authenticated
+  const free = envelope.payload.tier === 'free'
+  if (issuedAt - now > CLOCK_SKEW_MS) verificationFailure('issued_in_future')
+
+  if (free) {
+    if (now > snapshotExpiresAt + OFFLINE_GRACE_MS) verificationFailure('snapshot_expired')
+    return {
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: envelope.payload.killSwitchEnabled,
+    }
+  }
+
+  const downloadUntil = membershipExpiresAt + WINDOW_MS
+  const recycleUntil = downloadUntil + WINDOW_MS
+  const membershipEnded = envelope.payload.membershipStatus !== 'active' || now >= membershipExpiresAt
+  const killSwitchEnabled = envelope.payload.killSwitchEnabled
+  let status: VerifiedKnowledgeEntitlementState['status']
+  if (membershipEnded) status = 'expired'
+  else if (now <= snapshotExpiresAt) status = 'active'
+  else if (killSwitchEnabled) verificationFailure('snapshot_expired')
+  else if (now <= snapshotExpiresAt + OFFLINE_GRACE_MS) status = 'offline_grace'
+  else verificationFailure('snapshot_expired')
+
+  const phase: NonNullable<VerifiedKnowledgeEntitlementState['lifecycle']>['phase'] = !membershipEnded
+    ? 'active'
+    : now < downloadUntil
+      ? 'download_window'
+      : now < recycleUntil
+        ? 'recycle_window'
+        : 'purge_eligible'
+  const member = !membershipEnded
+  const betaEnabled = member
+    && !killSwitchEnabled
+    && envelope.payload.entitlements.includes('knowledge_base_beta')
+  const cloudEnabled = betaEnabled
+    && envelope.payload.entitlements.includes('knowledge_base_cloud')
+  return {
+    tier: 'member',
+    status,
+    betaEnabled,
+    cloudEnabled,
+    knowledgeToolEnabled: betaEnabled,
+    killSwitchEnabled,
+    membershipExpiresAt: envelope.payload.membershipExpiresAt,
+    lifecycle: {
+      phase,
+      requiresSelection: membershipEnded,
+      downloadUntil: new Date(downloadUntil).toISOString(),
+      recycleUntil: new Date(recycleUntil).toISOString(),
+    },
+  }
+}
+
 function failClosedEntitlement(): KnowledgeEntitlementState & {
   knowledgeToolEnabled: false
   killSwitchEnabled: true
@@ -274,116 +382,21 @@ function failClosedEntitlement(): KnowledgeEntitlementState & {
 }
 
 export class KnowledgeEntitlementVerifier {
-  constructor(private readonly options: {
-    readonly trustedKeys: Readonly<Record<string, string>>
-    readonly now?: () => number
-  }) {}
+  readonly #options: KnowledgeEntitlementVerifierOptions
+
+  constructor(options: KnowledgeEntitlementVerifierOptions) {
+    this.#options = options
+  }
 
   verify(userId: string, input: unknown): VerifiedKnowledgeEntitlementState {
-    return this.evaluate(this.authenticate(userId, input))
-  }
-
-  authenticate(userId: string, input: unknown): AuthenticatedKnowledgeEntitlementEnvelope {
-    const parsed = envelopeSchema.safeParse(input)
-    if (!parsed.success) verificationFailure('invalid_envelope')
-    const envelope = parsed.data
-    if (envelope.payload.userId !== userId) verificationFailure('wrong_user')
-    const trustedKey = this.options.trustedKeys[envelope.payload.keyId]
-    if (!trustedKey) verificationFailure('untrusted_key')
-    const canonicalPayload = canonicalPayloadBytes(envelope.payload)
-    let valid = false
-    try {
-      valid = verify(
-        null,
-        canonicalPayload,
-        createPublicKey(trustedKey),
-        Buffer.from(envelope.signature, 'base64url'),
-      )
-    } catch {
-      verificationFailure('invalid_key')
-    }
-    if (!valid) verificationFailure('invalid_signature')
-
-    const issuedAt = Date.parse(envelope.payload.issuedAt)
-    const snapshotExpiresAt = Date.parse(envelope.payload.snapshotExpiresAt)
-    const membershipExpiresAt = Date.parse(envelope.payload.membershipExpiresAt)
-    const free = envelope.payload.tier === 'free'
-    const terminal = envelope.payload.membershipStatus !== 'active'
-    if (snapshotExpiresAt < issuedAt
-      || (!free && !terminal && membershipExpiresAt <= issuedAt)
-      || (!free && terminal && membershipExpiresAt > issuedAt)) {
-      verificationFailure('invalid_time_order')
-    }
-    return Object.freeze({
-      envelope,
-      canonicalPayload,
-      envelopeHash: canonicalEnvelopeHash(envelope, canonicalPayload),
-      issuedAt,
-      snapshotExpiresAt,
-      membershipExpiresAt,
-    })
-  }
-
-  evaluate(
-    authenticated: AuthenticatedKnowledgeEntitlementEnvelope,
-    now = this.options.now?.() ?? Date.now(),
-  ): VerifiedKnowledgeEntitlementState {
-    const { envelope, issuedAt, snapshotExpiresAt, membershipExpiresAt } = authenticated
-    const free = envelope.payload.tier === 'free'
-    if (issuedAt - now > CLOCK_SKEW_MS) verificationFailure('issued_in_future')
-
-    if (free) {
-      if (now > snapshotExpiresAt + OFFLINE_GRACE_MS) verificationFailure('snapshot_expired')
-      return {
-        tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
-        knowledgeToolEnabled: false, killSwitchEnabled: envelope.payload.killSwitchEnabled,
-      }
-    }
-
-    const downloadUntil = membershipExpiresAt + WINDOW_MS
-    const recycleUntil = downloadUntil + WINDOW_MS
-    const membershipEnded = envelope.payload.membershipStatus !== 'active' || now >= membershipExpiresAt
-    const killSwitchEnabled = envelope.payload.killSwitchEnabled
-    let status: VerifiedKnowledgeEntitlementState['status']
-    if (membershipEnded) status = 'expired'
-    else if (now <= snapshotExpiresAt) status = 'active'
-    else if (killSwitchEnabled) verificationFailure('snapshot_expired')
-    else if (now <= snapshotExpiresAt + OFFLINE_GRACE_MS) status = 'offline_grace'
-    else verificationFailure('snapshot_expired')
-
-    const phase: NonNullable<VerifiedKnowledgeEntitlementState['lifecycle']>['phase'] = !membershipEnded
-      ? 'active'
-      : now < downloadUntil
-        ? 'download_window'
-        : now < recycleUntil
-          ? 'recycle_window'
-          : 'purge_eligible'
-    const member = !membershipEnded
-    const betaEnabled = member
-      && !killSwitchEnabled
-      && envelope.payload.entitlements.includes('knowledge_base_beta')
-    const cloudEnabled = betaEnabled
-      && envelope.payload.entitlements.includes('knowledge_base_cloud')
-    return {
-      tier: 'member',
-      status,
-      betaEnabled,
-      cloudEnabled,
-      knowledgeToolEnabled: betaEnabled,
-      killSwitchEnabled,
-      membershipExpiresAt: envelope.payload.membershipExpiresAt,
-      lifecycle: {
-        phase,
-        requiresSelection: membershipEnded,
-        downloadUntil: new Date(downloadUntil).toISOString(),
-        recycleUntil: new Date(recycleUntil).toISOString(),
-      },
-    }
+    return evaluateKnowledgeEntitlementEnvelope(
+      this.#options,
+      authenticateKnowledgeEntitlementEnvelope(this.#options, userId, input),
+    )
   }
 }
 
 export class KnowledgeEntitlementAuthority {
-  private readonly verifier: KnowledgeEntitlementVerifier
   private readonly ownerTails = new Map<string, Promise<void>>()
   private readonly failedOwners = new Set<string>()
   private readonly ownerAuthorizations = new Map<string, {
@@ -397,12 +410,7 @@ export class KnowledgeEntitlementAuthority {
     readonly cache: KnowledgeEntitlementEnvelopeCache
     readonly fetchEnvelope?: (owner: KnowledgeOwner) => Promise<unknown>
     readonly now?: () => number
-  }) {
-    this.verifier = new KnowledgeEntitlementVerifier({
-      trustedKeys: options.trustedKeys,
-      now: options.now,
-    })
-  }
+  }) {}
 
   async getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState> {
     return (await this.getAuthorizationSnapshot(owner)).entitlement
@@ -478,7 +486,11 @@ export class KnowledgeEntitlementAuthority {
     let cachedAuthenticated: AuthenticatedKnowledgeEntitlementEnvelope | undefined
     if (cached) {
       try {
-        cachedAuthenticated = this.verifier.authenticate(owner.userId, cached.envelope)
+        cachedAuthenticated = authenticateKnowledgeEntitlementEnvelope(
+          this.options,
+          owner.userId,
+          cached.envelope,
+        )
       } catch {
         this.failedOwners.add(owner.userId)
         return failed()
@@ -488,7 +500,8 @@ export class KnowledgeEntitlementAuthority {
     let fetchedAuthenticated: AuthenticatedKnowledgeEntitlementEnvelope | undefined
     if (this.options.fetchEnvelope) {
       try {
-        fetchedAuthenticated = this.verifier.authenticate(
+        fetchedAuthenticated = authenticateKnowledgeEntitlementEnvelope(
+          this.options,
           owner.userId,
           await this.options.fetchEnvelope(owner),
         )
@@ -515,7 +528,7 @@ export class KnowledgeEntitlementAuthority {
     let cachedState: VerifiedKnowledgeEntitlementState | undefined
     if (cachedAuthenticated) {
       try {
-        cachedState = this.verifier.evaluate(cachedAuthenticated, now)
+        cachedState = evaluateKnowledgeEntitlementEnvelope(this.options, cachedAuthenticated, now)
       } catch {
         this.failedOwners.add(owner.userId)
         return failed()
@@ -523,7 +536,13 @@ export class KnowledgeEntitlementAuthority {
     }
     let fetchedState: VerifiedKnowledgeEntitlementState | undefined
     if (fetchedAuthenticated) {
-      try { fetchedState = this.verifier.evaluate(fetchedAuthenticated, now) } catch {
+      try {
+        fetchedState = evaluateKnowledgeEntitlementEnvelope(this.options, fetchedAuthenticated, now)
+      } catch {
+        if (fetchedAuthenticated.issuedAt > maximumIssuedAt) {
+          this.failedOwners.add(owner.userId)
+          return failed()
+        }
         /* A temporally denied authenticated fetch may only fall back after equivocation was excluded. */
       }
     }

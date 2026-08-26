@@ -250,6 +250,17 @@ describe('KnowledgeEntitlementVerifier', () => {
     expect(PRODUCTION_KNOWLEDGE_ENTITLEMENT_TRUSTED_KEYS).toEqual({})
     expect(Object.isFrozen(PRODUCTION_KNOWLEDGE_ENTITLEMENT_TRUSTED_KEYS)).toBe(true)
   })
+
+  it('exposes only verify on the exported verifier surface', () => {
+    const instance = verifier('2026-08-26T00:30:00.000Z')
+    const typedSurface: Record<keyof KnowledgeEntitlementVerifier, true> = { verify: true }
+    expect(Object.getOwnPropertyNames(KnowledgeEntitlementVerifier.prototype).sort()).toEqual([
+      'constructor', 'verify',
+    ])
+    expect(typedSurface).toEqual({ verify: true })
+    expect((instance as unknown as { authenticate?: unknown }).authenticate).toBeUndefined()
+    expect((instance as unknown as { evaluate?: unknown }).evaluate).toBeUndefined()
+  })
 })
 
 describe('KnowledgeEntitlementAuthority', () => {
@@ -429,6 +440,95 @@ describe('KnowledgeEntitlementAuthority', () => {
     fetched = ACTIVE_ENVELOPE
     const replayed = await authority.getAuthorizationSnapshot(owner)
     expect(replayed).toEqual(ignored)
+  })
+
+  it.each([
+    ['stale kill', ACTIVE_ENVELOPE, '2026-08-26T01:10:00.001Z', signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-26T01:10:00.000Z',
+      killSwitchEnabled: true,
+    })],
+    ['future-issued active', ACTIVE_ENVELOPE, '2026-08-26T00:30:00.000Z', signedEnvelope({
+      issuedAt: '2026-08-26T00:40:00.000Z',
+      snapshotExpiresAt: '2026-08-26T01:40:00.000Z',
+    })],
+    ['grace-expired active', signedEnvelope({
+      snapshotExpiresAt: '2026-08-30T00:00:00.000Z',
+    }), '2026-08-29T00:10:00.001Z', signedEnvelope({
+      issuedAt: '2026-08-26T00:10:00.000Z',
+      snapshotExpiresAt: '2026-08-26T00:10:00.000Z',
+    })],
+  ] as const)('sticks fail closed instead of falling back for newer authenticated %s denial', async (
+    _label,
+    cachedEnvelope,
+    deniedAt,
+    denied,
+  ) => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    let now = Date.parse('2026-08-26T00:20:00.000Z')
+    let fetched = cachedEnvelope
+    let fetches = 0
+    const write = vi.spyOn(stored, 'write')
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => { fetches += 1; return fetched },
+      now: () => now,
+    })
+    const active = await authority.getAuthorizationSnapshot(owner)
+
+    now = Date.parse(deniedAt)
+    fetched = denied
+    const failed = await authority.getAuthorizationSnapshot(owner)
+    expect(failed.entitlement).toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    expect(failed.revision).toBeGreaterThan(active.revision)
+    expect(authority.isAuthorizationSnapshotCurrentNow(owner, active)).toBe(false)
+
+    fetched = ACTIVE_ENVELOPE
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    fetched = signedEnvelope({ issuedAt: '2026-08-25T23:59:59.000Z' })
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    fetched = signedEnvelope({
+      issuedAt: '2026-08-26T00:50:00.000Z',
+      snapshotExpiresAt: '2026-08-30T00:50:00.000Z',
+    })
+    await expect(authority.getEntitlement(owner)).resolves.toEqual(failed.entitlement)
+    expect(fetches).toBe(2)
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(stored.values.get(owner.userId)?.envelope).toEqual(cachedEnvelope)
+  })
+
+  it('keeps normal cache fallback for an invalid-signature newer envelope', async () => {
+    const owner = { userId: 'alice' }
+    const stored = cache()
+    let now = Date.parse('2026-08-26T00:20:00.000Z')
+    let fetched = ACTIVE_ENVELOPE
+    const authority = new KnowledgeEntitlementAuthority({
+      trustedKeys: { 'test-key-1': PUBLIC_KEY }, cache: stored,
+      fetchEnvelope: async () => fetched,
+      now: () => now,
+    })
+    await authority.getAuthorizationSnapshot(owner)
+
+    now = Date.parse('2026-08-26T01:10:00.001Z')
+    fetched = {
+      ...signedEnvelope({
+        issuedAt: '2026-08-26T00:10:00.000Z',
+        snapshotExpiresAt: '2026-08-26T01:10:00.000Z',
+        killSwitchEnabled: true,
+      }),
+      signature: ACTIVE_SIGNATURE,
+    }
+    const ignored = await authority.getAuthorizationSnapshot(owner)
+    expect(ignored.entitlement).toMatchObject({
+      tier: 'member', status: 'offline_grace', killSwitchEnabled: false,
+    })
+
+    fetched = ACTIVE_ENVELOPE
+    await expect(authority.getAuthorizationSnapshot(owner)).resolves.toEqual(ignored)
   })
 
   it('authenticates an identical temporally expired signed replay without treating it as equivocation', async () => {

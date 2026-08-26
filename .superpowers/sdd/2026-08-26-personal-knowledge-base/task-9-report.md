@@ -255,3 +255,25 @@
 - No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified. Production trusted keys and Cloud Function signer remain absent; beta/cloud/new Agent knowledge admission stay closed.
 - Rechecked that unauthenticated input never leaves Main or participates in identity comparison; only the module-private authenticated candidate reaches authority logic. Canonical payload/signature/hash all agree for exact replay, while any authenticated same-issued difference fails before cache mutation. Existing restart-required sticky recovery policy is unchanged.
 - Round 5 final assessment before prohibited external gates: Critical 0, Important 0, Minor 0.
+
+## Fix Round 5 final continuation: sealed verifier boundary and newer denial
+
+### Fix-diff regressions resolved
+
+- Moved authenticated-candidate construction and current-time evaluation to non-exported module functions. Their candidate type remains module-private. The exported `KnowledgeEntitlementVerifier` now has a JS-private `#options` slot and exposes exactly one prototype method, `verify`; no caller-visible method/property returns an authenticated envelope or canonical `Buffer`. A compile-time `keyof` surface assertion and runtime prototype/undefined-method assertions protect the boundary.
+- A fetched envelope that authenticates with `issuedAt > maxIssuedAt` is now authoritative over the older cache even when current-time evaluation denies it. Stale signed kill, future-issued active, and grace-expired active candidates all transition that owner to sticky fail-closed, advance the authorization revision, make zero additional cache/watermark writes, and cannot recover through later same/older/newer calls in the process. A newer invalid-signature envelope never authenticates and therefore retains normal verified-cache fallback.
+- Exact same-issued identity and temporal behavior from Round 5 remain unchanged: authenticated equivocation still fails before time evaluation; identical replay remains idempotent; invalid schema/owner/key/signature cannot poison as equivocation.
+
+### Exact RED/GREEN and final gates
+
+- Focused RED: 4 failed / 1 passed / 45 skipped. The public `authenticate`/`evaluate` methods were visible, and all three newer authenticated temporal-denial variants fell back to the older cached member grant. The invalid-signature newer control passed.
+- Focused GREEN: 5/5 with 45 skipped. Verifier + KnowledgeService: 113/113.
+- Electron Main/Application/IPC/Preload: 16 files, 417 passed / exactly 1 failed (418 total). The sole failure remains the unrelated context-summary billing baseline; emitted block and final failed status both contain exactly `CONTEXT_LIMIT_EXCEEDED`.
+- `pnpm typecheck`: all four typed workspace projects passed. Final `pnpm lint --quiet`: exit 0; its first run caught and removed a test-only constant-condition construct without production changes.
+- `pnpm build`: shared/workflow packages, Electron Main, Preload, Renderer, parser worker, and workflow worker passed.
+- `pnpm --filter @autoforge/desktop smoke:knowledge-ui`: real Electron Renderer -> Preload -> IPC -> Main -> parser -> encrypted persistence/restart passed with `{"ok":true}`. Electron emitted a non-fatal macOS `TASK_SUPPRESSION_POLICY` warning after the successful result and exited 0.
+
+### Cap rereview and external gates
+
+- Re-read the final continuation diff for public bypasses, unauthenticated poisoning, newer-authority fallback, same-issued identity behavior, cache writes, revision invalidation, owner-local stickiness, and recovery. No remaining Critical or Important finding was identified in this fix diff.
+- No real CloudBase, PostgreSQL, object storage, TokenHub, provider, KMS, or production key was accessed or modified. Production trusted keys and Cloud Function signer remain absent; beta/cloud/new Agent knowledge admission stay closed.
