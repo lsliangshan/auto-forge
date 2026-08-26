@@ -525,6 +525,103 @@ describe('CloudBase knowledge function', () => {
     expect(leaseState).toBe('released')
   })
 
+  it('crash-safe discards provider success when completion reports an expired deadline', async () => {
+    let now = Date.now()
+    const sendDeadlineMs = now + 30_000
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted', vectorEligible: true,
+        keywordCandidates: [candidate('keyword')],
+        vectorRows: [{
+          candidate: candidate('VECTOR_RESULT_MUST_BE_DISCARDED'),
+          embedding: Array(1024).fill(0.25),
+        }],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_expired_after_provider', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'expired' }
+      }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockImplementation(async () => {
+      now = sendDeadlineMs
+      return {
+        model: EMBEDDING_MODEL, dimensions: 1024,
+        vectors: [Array(1024).fill(0.25)],
+      }
+    }) }
+    const handler = createKnowledgeHandler({ rpc, embeddings, now: () => now })
+
+    const result = await handler({
+      action: 'searchPublished', query: 'deadline race', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+    }, context)
+
+    expect(result).toMatchObject({ ok: true, data: {
+      mode: 'keyword_only', degradationReason: 'provider_unavailable',
+      results: [{ chunkId: 'keyword' }],
+    } })
+    expect(JSON.stringify(result)).not.toContain('VECTOR_RESULT_MUST_BE_DISCARDED')
+  })
+
+  it('crash-safe never persists provider success when consent changes before completion', async () => {
+    const now = Date.now()
+    let consentEpoch = 1
+    let persisted = false
+    const vector = Array(1024).fill(0.25)
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_prepare_embedding_generation') return {
+        consentStatus: 'granted', generationId: 'generation_shadow',
+        chunks: [{ chunkId: 'chunk_1', body: 'REVOKED_VECTOR_MUST_NOT_PERSIST' }],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_revoked_after_provider', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: now + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return consentEpoch === 1
+          ? { released: true, state: 'released' }
+          : { released: true, state: 'expired' }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_generation') {
+        persisted = true
+        return { generationId: 'generation_shadow', status: 'ready' }
+      }
+      if (name === 'autoforge_knowledge_publish_generation') return {
+        generationId: 'generation_shadow', previousGenerationId: 'generation_live', sequence: 11,
+      }
+      if (name === 'autoforge_knowledge_fail_embedding_generation') return { failed: true }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockImplementation(async () => {
+      consentEpoch = 2
+      return { model: EMBEDDING_MODEL, dimensions: 1024, vectors: [vector, vector] }
+    }) }
+    const handler = createKnowledgeHandler({ rpc, embeddings, now: () => now })
+
+    await expect(handler({
+      action: 'buildEmbeddingGeneration', requestId: 'build_revoked_after_provider',
+      knowledgeBaseId: 'kb_1', generationId: 'generation_shadow',
+      expectedPublishedGenerationId: 'generation_live',
+    }, context)).resolves.toEqual({
+      ok: false, error: { code: 'TRANSIENT_FAILURE' },
+    })
+    expect(persisted).toBe(false)
+    expect(rpc).not.toHaveBeenCalledWith(
+      'autoforge_knowledge_complete_embedding_generation', expect.anything(),
+    )
+    expect(rpc).not.toHaveBeenCalledWith(
+      'autoforge_knowledge_publish_generation', expect.anything(),
+    )
+  })
+
   it('crash-safe release failure preserves the original provider error', async () => {
     const now = Date.now()
     let releaseCalls = 0
@@ -977,9 +1074,26 @@ describe('CloudBase knowledge migration contract', () => {
     expect(startSend).toContain("SET state = 'sending'")
     expect(startSend).toContain("interval '30 seconds'")
     expect(startSend).toContain("'sendDeadlineMs'")
-    expect(completeSend).toContain("state IN ('admitted', 'sending')")
-    expect(completeSend).toContain("'released', true")
-    expect(completeSend).not.toContain("MESSAGE = 'CONFLICT'")
+    expect(completeSend).toMatch(
+      /SELECT \* INTO consent FROM public\.knowledge_embedding_consents\s+WHERE owner_id = owner FOR UPDATE;/,
+    )
+    expect(completeSend).toMatch(
+      /SELECT \* INTO lease FROM public\.knowledge_embedding_send_leases\s+WHERE owner_id = owner AND lease_token = p_lease_token\s+AND consent_epoch = p_consent_epoch FOR UPDATE;/,
+    )
+    expect(completeSend).toContain("RETURN jsonb_build_object('released', false, 'state', 'missing')")
+    expect(completeSend).toContain("IF lease.state = 'released' THEN")
+    expect(completeSend).toContain("RETURN jsonb_build_object('released', true, 'state', 'released')")
+    expect(completeSend).toContain("IF lease.state = 'expired' THEN")
+    expect(completeSend).toContain("RETURN jsonb_build_object('released', false, 'state', 'expired')")
+    expect(completeSend).toContain("IF lease.state = 'admitted' THEN")
+    expect(completeSend).toContain("RETURN jsonb_build_object('released', false, 'state', 'admitted')")
+    expect(completeSend).toContain("consent.status <> 'granted'")
+    expect(completeSend).toContain('consent.authorization_epoch <> p_consent_epoch')
+    expect(completeSend).toContain("AND state = 'sending' AND expires_at > clock_timestamp()")
+    expect(completeSend).toContain("SET state = 'expired'")
+    expect(completeSend).not.toContain("state IN ('admitted', 'sending')")
+    expect(completeSend).not.toContain("lease_state varchar := 'released'")
+    expect(completeSend).not.toContain('COALESCE(lease_state')
     expect(setConsent).toContain('authorization_epoch =')
     expect(setConsent).toContain("state = 'admitted'")
     expect(setConsent).toContain("SET state = 'expired'")

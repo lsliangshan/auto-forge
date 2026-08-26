@@ -316,7 +316,7 @@ async function releaseEmbeddingSend({ uid, rpc, authorization, releaseTimeoutMs 
       )
       if (isRecord(completed)
         && completed.released === true
-        && (completed.state === 'released' || completed.state === 'expired')) return true
+        && completed.state === 'released') return true
     } catch { /* Retry once; the SQL transition is idempotent. */ }
   }
   return false

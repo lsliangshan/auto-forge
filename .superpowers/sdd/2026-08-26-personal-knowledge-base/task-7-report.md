@@ -248,3 +248,94 @@ Additional exact covering results:
 
 - Live PostgreSQL/CloudBase, TokenHub abort/timeout, clock alignment, Function transaction duration, RLS, and cleanup scheduling remain unverified release blockers under the ruling.
 - The unrelated Application context-summary suite retains exactly the required `CONTEXT_LIMIT_EXCEEDED` baseline failure.
+
+## Fix Round 3
+
+### Implementation
+
+- Tightened the Function completion boundary so a provider result is usable only when completion returns the exact pair `released: true` and `state: released`. An `expired`, admitted, missing, malformed, conflicted, or otherwise unconfirmed completion discards provider success and degrades/fails safely. Provider-error paths still preserve the original safe provider error when completion cannot be confirmed.
+- Replaced the broad SQL completion update with an exact consent-and-lease CAS. Completion now locks the owner consent row and the exact owner/token/epoch lease row, distinguishes existing `released`, `expired`, `admitted`, and missing rows, and never fabricates success for a missing or pruned lease.
+- Existing exact terminal `released` replay remains idempotently successful. Existing `expired` replay remains expired. An unexpired admitted lease is rejected as admitted; an expired or consent-invalid admitted lease is atomically expired. Wrong token and wrong epoch resolve as missing/non-success without mutating another lease.
+- A new release transition is possible only from exact `sending`, while consent is still granted at the same epoch and `expires_at > clock_timestamp()`. Consent/epoch mismatch atomically expires the sending lease. If the deadline crosses during completion, the guarded update loses and the same transaction expires the lease instead of restoring success.
+- Kept both forward migrations byte-identical. No schema/RBAC/rollback shape changed in this round, no live service was contacted, and no cloud/beta gate was opened.
+
+### Exact RED/GREEN evidence
+
+#### Intended RED before production changes
+
+Command:
+
+```text
+pnpm exec vitest run tests/cloudbase/knowledge-handler.test.ts --config vitest.config.ts -t "crash-safe"
+```
+
+Exact focused result:
+
+```text
+tests/cloudbase/knowledge-handler.test.ts (40 tests | 3 failed | 31 skipped)
+× crash-safe discards provider success when completion reports an expired deadline
+× crash-safe never persists provider success when consent changes before completion
+× defines the crash-safe finite-state send protocol and bounded revocation
+
+Test Files  1 failed (1)
+Tests       3 failed | 6 passed | 31 skipped (40)
+Duration    158ms
+```
+
+The first failure returned `mode: hybrid` and surfaced `VECTOR_RESULT_MUST_BE_DISCARDED` after the lease deadline. The second persisted and published `generation_shadow` after the consent epoch changed. The SQL contract failure showed no consent/lease completion locks and still contained the broad admitted-or-sending release plus `COALESCE(..., 'released')` missing-row fabrication.
+
+#### GREEN after the minimal fix
+
+The exact same focused command produced:
+
+```text
+Test Files  1 passed (1)
+Tests       9 passed | 31 skipped (40)
+Duration    146ms
+```
+
+Additional exact covering results:
+
+- `pnpm exec vitest run tests/cloudbase/knowledge-handler.test.ts tests/cloudbase/user-role-handler.test.ts --config vitest.config.ts` -> `2 passed`, `50 passed`.
+- `pnpm exec vitest run packages/shared/src/contracts.test.ts apps/desktop/electron/preload/bridge.test.ts apps/desktop/electron/main/ipc/register-ipc.test.ts apps/desktop/electron/main/knowledge/cloudbase-knowledge-client.test.ts tests/cloudbase/knowledge-handler.test.ts tests/cloudbase/user-role-handler.test.ts --config vitest.config.ts` -> `6 passed`, `185 passed`.
+- From `apps/desktop`, `node scripts/run-vitest-electron.mjs run electron/main/knowledge electron/main/application.test.ts --config vitest.node.config.ts` -> all 11 Main knowledge files passed; combined result `11 passed | 1 failed`, `281 passed | 1 failed`, with only the required `CONTEXT_LIMIT_EXCEEDED` Application baseline.
+- From `apps/desktop`, `node scripts/run-vitest-electron.mjs run tests/components/knowledge.test.ts --config vitest.config.ts` -> `1 passed`, `38 passed`.
+- `pnpm typecheck` -> all four typed workspace projects passed.
+- `pnpm lint` -> exit 0, `0 errors`, unchanged `422 warnings`.
+- `pnpm build` -> shared/workflow packages plus Electron Main, Preload, Renderer, and worker builds passed.
+- `node --check cloudbase/knowledge/function/knowledge-handler.js` -> exit 0.
+- Forward migration `cmp` -> exit 0; both SHA-256 values are `97652bdb1934ca74ad594433c465caf5a201a6b9e99e07d7268618f133943e94`.
+- `git diff --check` -> clean. Refined high-risk secret scan -> no matches.
+
+### Files changed
+
+- Function: `cloudbase/knowledge/function/knowledge-handler.js`.
+- Database: `cloudbase/knowledge/migrations/0001_personal_knowledge.sql` and byte-identical `cloudbase/migrations/20260826120000_personal_knowledge.sql`.
+- Tests: `tests/cloudbase/knowledge-handler.test.ts`.
+- Evidence: this appended Fix Round 3 section in `task-7-report.md`.
+
+### Verification
+
+- Deterministically verified provider success followed by deadline expiry returns keyword-only retrieval and removes the vector-only candidate from the result.
+- Deterministically verified provider success followed by a consent-epoch change never calls embedding-generation completion, never persists vectors, never publishes the shadow, and fails safely.
+- Tight SQL assertions cover exact owner/token/epoch lookup; missing/pruned and wrong-token/wrong-epoch non-success; admitted rejection/expiry; expired replay; exact released replay; granted/current consent; exact `sending`; and the unexpired deadline predicate. The prior broad state update and missing-row success default are explicitly forbidden.
+- Verified the existing provider-error/release-failure test still preserves `MODEL_DEPRECATED`, and lost-response replay still accepts an existing exact released lease.
+- Re-ran Function/migration/RBAC, shared/client/Preload/IPC, all Main knowledge, Application baseline, and UI knowledge boundaries. Task 7 introduced no new failure.
+
+### External gates
+
+- Real PostgreSQL parsing/execution and concurrent completion-versus-revocation scheduling remain external release gates because no approved CloudBase pre-production environment exists. Live testing must cover both lock orders: completion winning first and safely releasing, and revocation winning first so completion waits and then observes expiry/revocation.
+- If revocation owns the consent row first, completion cannot release while revocation drains; the repository remains bounded by the fixed 30-second sending deadline from Round 2. Live statement/Function timeout configuration must permit that safe bounded path.
+- TokenHub abort/runtime bounds, clock alignment, RLS/grants, vector deletion, and cleanup scheduling remain release blockers. Cloud/beta availability and the kill switch remain fail-closed.
+
+### Self-review
+
+- Re-read the complete Round 3 diff for fabricated missing success, admitted release, expired resurrection, wrong token/epoch mutation, consent races, deadline check/use races, idempotency loss, provider-error masking, vector persistence after revoke, payload-bearing logs, migration drift, and unrelated Task 1-5 changes.
+- Confirmed completion and revoke use the same consent-first lock order. If completion wins, revocation subsequently deletes vectors; if revocation wins, completion cannot report release and the fixed lease deadline bounds the wait.
+- Confirmed Function continuation is now strictly coupled to exact `released`; every other response is discarded. No Renderer/Main authority surface, log payload, RBAC grant, schema object, or rollback dependency changed.
+- Confirmed the controller-owned `progress.md` was not edited or staged by this fix. No real CloudBase or TokenHub call was made.
+
+### Concerns
+
+- Live SQL transaction, lock-order, TokenHub, clock, RLS, deletion, and timeout behavior remains unverified and must block release under the ruling.
+- The unrelated Application context-summary suite retains exactly the required `CONTEXT_LIMIT_EXCEEDED` baseline failure.

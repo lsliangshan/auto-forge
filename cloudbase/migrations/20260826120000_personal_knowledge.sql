@@ -1389,24 +1389,71 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
-  lease_state varchar := 'released';
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  lease public.knowledge_embedding_send_leases%ROWTYPE;
+  lease_state varchar;
 BEGIN
   IF p_lease_token IS NULL OR length(p_lease_token) = 0
     OR p_consent_epoch IS NULL OR p_consent_epoch < 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('released', false, 'state', 'missing');
+  END IF;
+  SELECT * INTO lease FROM public.knowledge_embedding_send_leases
+    WHERE owner_id = owner AND lease_token = p_lease_token
+      AND consent_epoch = p_consent_epoch FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('released', false, 'state', 'missing');
+  END IF;
+  IF lease.state = 'released' THEN
+    RETURN jsonb_build_object('released', true, 'state', 'released');
+  END IF;
+  IF lease.state = 'expired' THEN
+    RETURN jsonb_build_object('released', false, 'state', 'expired');
+  END IF;
+  IF lease.state = 'admitted' THEN
+    IF consent.status <> 'granted'
+      OR consent.authorization_epoch <> p_consent_epoch
+      OR lease.expires_at <= clock_timestamp() THEN
+      UPDATE public.knowledge_embedding_send_leases SET state = 'expired',
+        expires_at = least(expires_at, clock_timestamp()),
+        updated_at = clock_timestamp()
+        WHERE owner_id = owner AND lease_token = p_lease_token
+          AND consent_epoch = p_consent_epoch AND state = 'admitted';
+      RETURN jsonb_build_object('released', false, 'state', 'expired');
+    END IF;
+    RETURN jsonb_build_object('released', false, 'state', 'admitted');
+  END IF;
+  IF lease.state <> 'sending' THEN
+    RETURN jsonb_build_object('released', false, 'state', lease.state);
+  END IF;
+  IF consent.status <> 'granted'
+    OR consent.authorization_epoch <> p_consent_epoch THEN
+    UPDATE public.knowledge_embedding_send_leases SET state = 'expired',
+      expires_at = least(expires_at, clock_timestamp()),
+      updated_at = clock_timestamp()
+      WHERE owner_id = owner AND lease_token = p_lease_token
+        AND consent_epoch = p_consent_epoch AND state = 'sending';
+    RETURN jsonb_build_object('released', false, 'state', 'expired');
+  END IF;
   UPDATE public.knowledge_embedding_send_leases SET
     state = 'released', updated_at = clock_timestamp()
     WHERE owner_id = owner AND lease_token = p_lease_token
-      AND consent_epoch = p_consent_epoch AND state IN ('admitted', 'sending')
+      AND consent_epoch = p_consent_epoch
+      AND state = 'sending' AND expires_at > clock_timestamp()
     RETURNING state INTO lease_state;
   IF NOT FOUND THEN
-    SELECT state INTO lease_state FROM public.knowledge_embedding_send_leases
+    UPDATE public.knowledge_embedding_send_leases SET state = 'expired',
+      expires_at = least(expires_at, clock_timestamp()),
+      updated_at = clock_timestamp()
       WHERE owner_id = owner AND lease_token = p_lease_token
-        AND consent_epoch = p_consent_epoch;
-    lease_state := COALESCE(lease_state, 'released');
+        AND consent_epoch = p_consent_epoch AND state = 'sending';
+    RETURN jsonb_build_object('released', false, 'state', 'expired');
   END IF;
-  RETURN jsonb_build_object('released', true, 'state', lease_state);
+  RETURN jsonb_build_object('released', true, 'state', 'released');
 END;
 $$;
 
