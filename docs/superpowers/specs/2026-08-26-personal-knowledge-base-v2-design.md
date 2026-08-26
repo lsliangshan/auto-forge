@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-26
 
-**Status:** Approved for implementation
+**Status:** Review-ready; awaiting approval
 
 **Base:** `origin/v2@a2bd28dd4da10aec6aa68113484ba480991fc672`
 
@@ -85,7 +85,7 @@ A local manual update and a late remote update use the existing conversation rev
 
 The current leading system policy, `WORKFLOW_AGENT_POLICY`, tool-capable model checks, `workflowLaunchOnlyRequest`, browser continuation rules, `leadingMessages`, context budgeting/compression, Provider snapshot, and usage attribution remain intact.
 
-`knowledge_search` is a Main-owned evidence tool. The model supplies only a bounded `query` or `rewrite`. Main supplies owner, base scope, entitlement, consent, `topK`, and index snapshot. Per turn: workflow calls <= 5, knowledge searches <= 3, Agent decisions <= 10, and evidence items per search <= 8.
+`knowledge_search` is a Main-owned evidence tool. The model supplies only a bounded `query` or `rewrite`. Main supplies owner, base scope, entitlement, consent, `topK`, and index snapshot. Per turn: workflow calls <= 5, knowledge searches <= 3, Agent decisions <= 10, and at most eight evidence items total across all current-turn knowledge searches. The immutable current-turn evidence registry, Provider payload, citations, and persisted citation references all use that same total cap; a later search may replace or add to the registry only while the total remains at most eight.
 
 Evidence is wrapped as untrusted content and cannot change system policy, tool permissions, or routing. Context summaries may retain citation coordinates but must exclude hidden chunks, local paths, and signed URLs.
 

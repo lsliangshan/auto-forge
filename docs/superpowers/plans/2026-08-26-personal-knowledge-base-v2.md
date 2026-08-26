@@ -259,6 +259,8 @@
 - Modify: `apps/desktop/electron/main/chat/conversation-context.test.ts`
 - Modify: `apps/desktop/electron/main/application.ts`
 - Modify: `packages/shared/src/events.ts`
+- Modify: `apps/desktop/src/stores/chat.ts`
+- Modify: `apps/desktop/src/components/chat/MessageBlock.vue`
 - Create: `apps/desktop/src/components/chat/KnowledgeStatusCard.vue`
 - Create: `apps/desktop/src/components/chat/KnowledgeCitation.vue`
 - Create: `apps/desktop/src/components/chat/KnowledgeSourcePreview.vue`
@@ -268,11 +270,12 @@
 - Produces: Main-owned `knowledge_search({ query, rewrite? })`, immutable request evidence registry, Provider consent gate, citation validator/one repair attempt, strict/mixed final-answer policy, and citation previews.
 - Consumes: current workflow/browser catalog logic, Task 5 captured selection, Task 4/7 retrievers, current Provider/context/usage paths.
 
-- [ ] Add RED routing matrix tests for exact workflow only, KB only, workflow -> KB composite, later browser continuation, workflow denial/error/cancel, non-text output, no tool-capable model, and all 5/3/10/8 limits.
+- [ ] Add RED routing matrix tests for exact workflow only, KB only, workflow -> KB composite, later browser continuation, workflow denial/error/cancel, non-text output, no tool-capable model, workflow calls <= 5, knowledge searches <= 3, Agent decisions <= 10, and at most eight total evidence items in the immutable current-turn registry across all searches.
 - [ ] Add RED security tests proving model-provided IDs, owner, `topK`, SQL, path, generation, and prompt-injection evidence cannot alter Main scope or tools.
 - [ ] Add RED grounding tests for strict insufficient evidence, mixed labeling, Provider consent denial/switch, invalid citation, one repair success/failure, and source unavailable.
 - [ ] Implement knowledge catalog exposure only after workflow resolution while preserving `WORKFLOW_AGENT_POLICY`, `workflowLaunchOnlyRequest`, browser tools, leading messages, context budgets, Provider snapshots, and usage purposes.
-- [ ] Validate citations against current-turn evidence before persistence; send only minimum snippets after per-Provider consent.
+- [ ] Validate citations against the capped current-turn evidence registry before persistence; send only minimum snippets after per-Provider consent.
+- [ ] Extend `packages/shared/src/events.ts`, hydrate the new knowledge blocks in the existing `apps/desktop/src/stores/chat.ts` chat-event owner, and mount their views from `apps/desktop/src/components/chat/MessageBlock.vue`; keep persisted and live event blocks equivalent.
 - [ ] Run context-compression regressions proving hidden chunks/paths/signed URLs never enter summaries or Provider payloads.
 - [ ] Run real Electron select -> ask -> retrieve -> cite -> preview flow.
 - [ ] Complete two-stage review and commit `feat(knowledge): ground v2 chat with citations`.
