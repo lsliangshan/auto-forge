@@ -104,6 +104,7 @@ describe('preload desktop bridge', () => {
     await app.api.knowledge.getEntitlement()
     await app.api.knowledge.getConsent()
     await app.api.knowledge.setEmbeddingConsent('revoked')
+    await app.api.knowledge.chooseDowngradeSelection('kb_1', 'document_1')
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgeListBases, undefined)
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeCreateBase, { name: 'Policies' })
@@ -126,11 +127,16 @@ describe('preload desktop bridge', () => {
       ipcChannels.knowledgeSetEmbeddingConsent,
       { status: 'revoked' },
     )
+    expect(app.ipcRenderer.invoke).toHaveBeenCalledWith(
+      ipcChannels.knowledgeChooseDowngradeSelection,
+      { knowledgeBaseId: 'kb_1', documentId: 'document_1' },
+    )
     expect(Object.keys(app.api.knowledge)).toEqual([
       'listBases', 'createBase', 'listDocuments', 'listVersions', 'importDocument',
       'replaceDocument', 'recycleDocument', 'purgeDocument', 'recycleBase', 'purgeBase',
       'exportBase', 'getConversationSelection', 'updateConversationSelection', 'search',
       'previewCitation', 'getFeatureAvailability', 'getEntitlement', 'getConsent', 'setEmbeddingConsent',
+      'chooseDowngradeSelection',
     ])
     expect(app.api.knowledge).not.toHaveProperty('invoke')
   })

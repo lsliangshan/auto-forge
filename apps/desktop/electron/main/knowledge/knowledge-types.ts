@@ -35,6 +35,10 @@ export interface KnowledgePersistence {
   recycleBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void>
   purgeBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void>
   exportBase(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<void>
+  chooseDowngradeSelection(
+    owner: KnowledgeOwner,
+    selection: { knowledgeBaseId: string; documentId: string },
+  ): Promise<KnowledgeEntitlementState>
   getConversationSelection(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSelection>
   updateConversationSelection(
     owner: KnowledgeOwner,

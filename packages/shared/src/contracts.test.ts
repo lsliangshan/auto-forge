@@ -176,6 +176,26 @@ describe('cross-process contracts', () => {
     expect(knowledgeEntitlementStateSchema.parse({
       tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
     })).toMatchObject({ tier: 'free', status: 'active' })
+    expect(knowledgeEntitlementStateSchema.parse({
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      knowledgeToolEnabled: true, killSwitchEnabled: false,
+      membershipExpiresAt: '2026-09-26T00:00:00.000Z',
+      lifecycle: {
+        phase: 'active', requiresSelection: false,
+        downloadUntil: '2026-10-26T00:00:00.000Z',
+        recycleUntil: '2026-11-25T00:00:00.000Z',
+      },
+    })).toMatchObject({ knowledgeToolEnabled: true, lifecycle: { phase: 'active' } })
+    expect(knowledgeEntitlementStateSchema.safeParse({
+      tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+      knowledgeToolEnabled: true, killSwitchEnabled: true,
+    }).success).toBe(false)
+    expect(ipcRequestSchemas[ipcChannels.knowledgeChooseDowngradeSelection].parse({
+      knowledgeBaseId: 'kb_keep', documentId: 'document_keep',
+    })).toEqual({ knowledgeBaseId: 'kb_keep', documentId: 'document_keep' })
+    expect(ipcResponseSchemas[ipcChannels.knowledgeChooseDowngradeSelection].parse({
+      tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+    })).toMatchObject({ status: 'expired' })
   })
 
   it('keeps TokenHub embedding consent separate from chat-provider disclosure', () => {

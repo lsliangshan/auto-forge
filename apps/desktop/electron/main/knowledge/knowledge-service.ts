@@ -118,6 +118,7 @@ interface DocumentRow {
   status: 'pending' | 'processing' | 'ready' | 'failed' | 'recycled'
   versionCount: number
   updatedAt: number
+  readOnly: number
 }
 
 interface CapturedSearchScope {
@@ -155,6 +156,7 @@ function documentDto(row: DocumentRow): KnowledgeDocument {
     mimeType: row.mimeType,
     status: status[row.status],
     versionCount: row.versionCount,
+    readOnly: Boolean(row.readOnly),
     updatedAt: iso(row.updatedAt),
   }
 }
@@ -284,6 +286,11 @@ const SEARCHABLE_BASE_PREDICATE = `
       ON searchable_versions.id = searchable_documents.active_version_id
     WHERE searchable_documents.knowledge_base_id = knowledge_bases.id
       AND searchable_documents.status <> 'recycled'
+      AND coalesce((
+        SELECT knowledge_document_access.access
+        FROM knowledge_document_access
+        WHERE knowledge_document_access.document_id = searchable_documents.id
+      ), 'active') = 'active'
       AND searchable_versions.status = 'ready'
   )
 `
@@ -304,10 +311,12 @@ export class KnowledgeService implements KnowledgePersistence {
 
   constructor(private readonly options: KnowledgeServiceOptions) {}
 
-  async listBases(owner: KnowledgeOwner): Promise<KnowledgeBase[]> {
-    const session = await this.ensureSession(owner)
-    this.ensureDefaultBase(session)
-    const rows = session.opened.database.prepare(`
+  listBases(owner: KnowledgeOwner): Promise<KnowledgeBase[]> {
+    return this.track((async () => {
+      const session = await this.ensureSession(owner)
+      this.ensureDefaultBase(session)
+      await this.reconcileMembershipLifecycle(session, await this.getEntitlement(owner))
+      const rows = session.opened.database.prepare(`
       SELECT knowledge_bases.id, knowledge_bases.name, knowledge_bases.status,
         knowledge_bases.updated_at AS updatedAt,
         cloud_sync_states.mode AS syncMode,
@@ -325,25 +334,26 @@ export class KnowledgeService implements KnowledgePersistence {
       documentCount: number; processingCount: number; failedCount: number; searchable: number
       syncMode: 'local_only' | 'syncing' | 'synced' | 'paused' | 'converting' | 'failed' | null
     }>
-    return rows.map(row => ({
-      id: row.id,
-      name: row.name,
-      kind: row.syncMode && row.syncMode !== 'local_only' ? 'cloud' : 'local',
-      status: row.status === 'recycled'
-        ? 'recycled'
-        : row.status === 'read_only'
-          ? 'read_only'
-          : row.processingCount > 0 || ['syncing', 'converting'].includes(row.syncMode ?? '')
-            ? 'processing'
-            : row.failedCount > 0 || row.syncMode === 'failed'
-              ? 'failed'
-              : row.syncMode === 'paused'
-                ? 'paused'
-                : 'ready',
-      searchable: Boolean(row.searchable),
-      documentCount: row.documentCount,
-      updatedAt: iso(row.updatedAt),
-    }))
+      return rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        kind: row.syncMode && row.syncMode !== 'local_only' ? 'cloud' : 'local',
+        status: row.status === 'recycled'
+          ? 'recycled'
+          : row.status === 'read_only'
+            ? 'read_only'
+            : row.processingCount > 0 || ['syncing', 'converting'].includes(row.syncMode ?? '')
+              ? 'processing'
+              : row.failedCount > 0 || row.syncMode === 'failed'
+                ? 'failed'
+                : row.syncMode === 'paused'
+                  ? 'paused'
+                  : 'ready',
+        searchable: Boolean(row.searchable),
+        documentCount: row.documentCount,
+        updatedAt: iso(row.updatedAt),
+      }))
+    })())
   }
 
   async createBase(owner: KnowledgeOwner, rawName: string): Promise<KnowledgeBase> {
@@ -368,19 +378,24 @@ export class KnowledgeService implements KnowledgePersistence {
     return { id, name, kind: 'local', status: 'ready', searchable: false, documentCount: 0, updatedAt: iso(now) }
   }
 
-  async listDocuments(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument[]> {
-    const session = await this.ensureSession(owner)
-    this.requireBase(session, knowledgeBaseId)
-    return (session.opened.database.prepare(`
+  listDocuments(owner: KnowledgeOwner, knowledgeBaseId: string): Promise<KnowledgeDocument[]> {
+    return this.track((async () => {
+      const session = await this.ensureSession(owner)
+      await this.reconcileMembershipLifecycle(session, await this.getEntitlement(owner))
+      this.requireBase(session, knowledgeBaseId)
+      return (session.opened.database.prepare(`
       SELECT documents.id, documents.knowledge_base_id AS knowledgeBaseId,
         documents.name, documents.mime_type AS mimeType, documents.status,
-        count(document_versions.id) AS versionCount, documents.updated_at AS updatedAt
+        count(document_versions.id) AS versionCount, documents.updated_at AS updatedAt,
+        CASE WHEN knowledge_document_access.access = 'read_only' THEN 1 ELSE 0 END AS readOnly
       FROM documents
       JOIN document_versions ON document_versions.document_id = documents.id
+      LEFT JOIN knowledge_document_access ON knowledge_document_access.document_id = documents.id
       WHERE documents.knowledge_base_id = ?
       GROUP BY documents.id
       ORDER BY documents.updated_at DESC, documents.id
-    `).all(knowledgeBaseId) as DocumentRow[]).map(documentDto)
+      `).all(knowledgeBaseId) as DocumentRow[]).map(documentDto)
+    })())
   }
 
   async listVersions(owner: KnowledgeOwner, documentId: string): Promise<KnowledgeVersion[]> {
@@ -490,6 +505,71 @@ export class KnowledgeService implements KnowledgePersistence {
     }).exportBase(knowledgeBaseId, outputPath))
   }
 
+  async chooseDowngradeSelection(
+    owner: KnowledgeOwner,
+    selection: { knowledgeBaseId: string; documentId: string },
+  ): Promise<KnowledgeEntitlementState> {
+    const session = await this.ensureSession(owner)
+    const { entitlement, lifecycle, baseIds } = await this.mutate(session, async () => {
+      const currentEntitlement = await this.getEntitlement(owner)
+      const currentLifecycle = currentEntitlement.lifecycle
+      if (currentEntitlement.status !== 'expired'
+        || !currentLifecycle
+        || !currentEntitlement.membershipExpiresAt) failure('FORBIDDEN')
+      await this.reconcileMembershipLifecycle(session, currentEntitlement)
+      const row = session.opened.database.prepare(`
+        SELECT documents.id, documents.knowledge_base_id AS knowledgeBaseId,
+          documents.status, document_versions.status AS versionStatus,
+          cloud_sync_states.mode AS syncMode
+        FROM documents
+        JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
+        JOIN document_versions ON document_versions.id = documents.active_version_id
+        LEFT JOIN cloud_sync_states ON cloud_sync_states.knowledge_base_id = knowledge_bases.id
+        WHERE documents.id = ? AND documents.knowledge_base_id = ?
+      `).get(selection.documentId, selection.knowledgeBaseId) as {
+        id: string; knowledgeBaseId: string; status: string; versionStatus: string
+        syncMode: string | null
+      } | undefined
+      if (!row || row.status === 'recycled' || row.versionStatus !== 'ready') failure('NOT_FOUND')
+      if (row.syncMode !== null && row.syncMode !== 'local_only') failure('FORBIDDEN')
+      const now = this.now()
+      const allBaseIds = (session.opened.database.prepare(
+        "SELECT id FROM knowledge_bases WHERE status <> 'recycled'",
+      ).all() as Array<{ id: string }>).map(({ id }) => id)
+      session.opened.database.transaction(() => {
+        for (const id of allBaseIds) this.imports.cancelJobs(session, 'knowledge_base', id, now)
+        session.opened.database.prepare(`
+          UPDATE knowledge_bases SET status = CASE WHEN id = ? THEN 'active' ELSE 'read_only' END,
+            updated_at = ? WHERE status <> 'recycled'
+        `).run(selection.knowledgeBaseId, now)
+        session.opened.database.prepare(`
+          INSERT INTO knowledge_document_access (document_id, access, updated_at)
+          SELECT id, CASE WHEN id = ? THEN 'active' ELSE 'read_only' END, ?
+          FROM documents WHERE status <> 'recycled'
+          ON CONFLICT(document_id) DO UPDATE SET
+            access = excluded.access, updated_at = excluded.updated_at
+        `).run(selection.documentId, now)
+        session.opened.database.prepare(`
+          UPDATE knowledge_membership_lifecycle
+          SET selected_knowledge_base_id = ?, selected_document_id = ?, updated_at = ?
+          WHERE singleton = 1
+        `).run(selection.knowledgeBaseId, selection.documentId, now)
+        session.opened.database.prepare(`
+          DELETE FROM conversation_selection_bases
+          WHERE knowledge_base_id <> ?
+        `).run(selection.knowledgeBaseId)
+      })()
+      return { entitlement: currentEntitlement, lifecycle: currentLifecycle, baseIds: allBaseIds }
+    })
+    await Promise.all(baseIds.map(id => (
+      this.imports.abortAndDrainScope(session, 'knowledge_base', id)
+    )))
+    return {
+      ...entitlement,
+      lifecycle: { ...lifecycle, requiresSelection: false },
+    }
+  }
+
   async getConversationSelection(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSelection> {
     const session = await this.ensureSession(owner)
     await this.requireConversation(owner, conversationId)
@@ -498,7 +578,9 @@ export class KnowledgeService implements KnowledgePersistence {
     `).get(conversationId) as { knowledgeMode: 'mixed' | 'strict' } | undefined
     if (!selection) return { knowledgeBaseIds: [], knowledgeMode: 'mixed' }
     const entitlement = await this.getEntitlement(owner)
-    if (!['active', 'offline_grace'].includes(entitlement.status)) {
+    await this.reconcileMembershipLifecycle(session, entitlement)
+    const retained = this.retainedSelection(session)
+    if (!['active', 'offline_grace'].includes(entitlement.status) && !retained) {
       return { knowledgeBaseIds: [], knowledgeMode: selection.knowledgeMode }
     }
     const bases = session.opened.database.prepare(`
@@ -509,7 +591,11 @@ export class KnowledgeService implements KnowledgePersistence {
         AND ${SEARCHABLE_BASE_PREDICATE}
       ORDER BY conversation_selection_bases.ordinal
     `).all(conversationId) as Array<{ knowledgeBaseId: string }>
-    return { knowledgeBaseIds: bases.map(row => row.knowledgeBaseId), knowledgeMode: selection.knowledgeMode }
+    return {
+      knowledgeBaseIds: bases.map(row => row.knowledgeBaseId)
+        .filter(id => !retained || id === retained.knowledgeBaseId),
+      knowledgeMode: selection.knowledgeMode,
+    }
   }
 
   async updateConversationSelection(
@@ -525,7 +611,11 @@ export class KnowledgeService implements KnowledgePersistence {
     }
     if (selection.knowledgeBaseIds.length > 0) {
       const entitlement = await this.getEntitlement(owner)
-      if (!['active', 'offline_grace'].includes(entitlement.status)) failure('FORBIDDEN')
+      await this.reconcileMembershipLifecycle(session, entitlement)
+      const retained = this.retainedSelection(session)
+      if (!['active', 'offline_grace'].includes(entitlement.status)
+        && (selection.knowledgeBaseIds.length !== 1
+          || retained?.knowledgeBaseId !== selection.knowledgeBaseIds[0])) failure('FORBIDDEN')
       const placeholders = selection.knowledgeBaseIds.map(() => '?').join(', ')
       const count = session.opened.database.prepare(`
         SELECT count(*) AS count FROM knowledge_bases
@@ -575,7 +665,7 @@ export class KnowledgeService implements KnowledgePersistence {
     if (cloudIds.length === 0 || !this.options.cloud) {
       return localRetriever.search(selection.knowledgeBaseIds, normalizedQuery)
     }
-    if (!await this.cloudRetrievalEnabled()) {
+    if (!await this.cloudRetrievalEnabled(owner)) {
       return localRetriever.search(selection.knowledgeBaseIds, normalizedQuery)
     }
     const localIds = selection.knowledgeBaseIds.filter(id => !syncedIds.has(id))
@@ -599,6 +689,17 @@ export class KnowledgeService implements KnowledgePersistence {
   ): Promise<KnowledgeSearchSnapshot> {
     const session = await this.ensureSession(owner)
     const selection = await this.getConversationSelection(owner, conversationId)
+    const entitlement = await this.getEntitlement(owner)
+    if (entitlement.knowledgeToolEnabled !== true
+      || entitlement.killSwitchEnabled === true
+      || !await this.serverKnowledgeToolAdmissionEnabled()) {
+      const snapshot = Object.freeze({ selected: false, knowledgeMode: selection.knowledgeMode })
+      this.searchSnapshots.set(snapshot, {
+        ownerId: owner.userId, conversationId, epoch: this.searchSnapshotEpoch,
+        allVersionIds: Object.freeze([]), localVersionIds: Object.freeze([]),
+      })
+      return snapshot
+    }
     const snapshot = Object.freeze({
       selected: selection.knowledgeBaseIds.length > 0,
       knowledgeMode: selection.knowledgeMode,
@@ -619,6 +720,8 @@ export class KnowledgeService implements KnowledgePersistence {
       JOIN document_versions ON document_versions.id = documents.active_version_id
       WHERE documents.knowledge_base_id IN (${placeholders})
         AND documents.status <> 'recycled'
+        AND coalesce((SELECT access FROM knowledge_document_access
+          WHERE document_id = documents.id), 'active') = 'active'
         AND document_versions.status = 'ready'
       ORDER BY documents.knowledge_base_id, documents.id
     `).all(...selection.knowledgeBaseIds) as Array<{ knowledgeBaseId: string; versionId: string }>
@@ -632,7 +735,7 @@ export class KnowledgeService implements KnowledgePersistence {
     `).all(...selection.knowledgeBaseIds) as Array<{ knowledgeBaseId: string }>
     const syncedIds = new Set(syncedRows.map(({ knowledgeBaseId }) => knowledgeBaseId))
     let cloud: CapturedSearchScope['cloud']
-    if (syncedIds.size > 0 && this.options.cloud && await this.cloudRetrievalEnabled()) {
+    if (syncedIds.size > 0 && this.options.cloud && await this.cloudRetrievalEnabled(owner)) {
       try {
         const retriever = new CloudRetriever(this.options.cloud)
         cloud = {
@@ -675,6 +778,9 @@ export class KnowledgeService implements KnowledgePersistence {
     if (!snapshot.selected) return { kind: 'results', results: [] }
     const local = new LocalKnowledgeRetriever(session.opened.database)
     if (!scope.cloud) return local.searchVersions(scope.allVersionIds, query)
+    if (!await this.cloudRetrievalEnabled(owner)) {
+      return local.searchVersions(scope.allVersionIds, query)
+    }
     const localResults = scope.localVersionIds.length === 0
       ? []
       : (await local.searchVersions(scope.localVersionIds, query)).results
@@ -773,7 +879,7 @@ export class KnowledgeService implements KnowledgePersistence {
         }
       }
     }
-    const cloudAvailable = await this.cloudRetrievalEnabled()
+    const cloudAvailable = await this.cloudRetrievalEnabled(owner)
     return {
       local: { available: reasons.length === 0, reasons },
       cloud: cloudAvailable
@@ -784,19 +890,44 @@ export class KnowledgeService implements KnowledgePersistence {
 
   async getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState> {
     this.assertOwner(owner)
-    if (this.options.entitlement) return this.options.entitlement.getEntitlement(owner)
-    if (!this.options.cloud) return defaultEntitlement.getEntitlement(owner)
-    try {
-      const entitlement = await this.options.cloud.getEntitlement()
-      return {
-        tier: entitlement.tier,
-        status: entitlement.status,
-        betaEnabled: entitlement.betaEnabled,
-        cloudEnabled: entitlement.cloudEnabled,
+    let entitlement: KnowledgeEntitlementState
+    if (this.options.entitlement) entitlement = await this.options.entitlement.getEntitlement(owner)
+    else if (!this.options.cloud) entitlement = await defaultEntitlement.getEntitlement(owner)
+    else {
+      try {
+        const remote = await this.options.cloud.getEntitlement()
+        entitlement = {
+          tier: remote.tier,
+          status: remote.status,
+          betaEnabled: remote.betaEnabled,
+          cloudEnabled: remote.cloudEnabled,
+        }
+      } catch {
+        entitlement = { tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false }
       }
-    } catch {
-      return { tier: 'free', status: 'unavailable', betaEnabled: false, cloudEnabled: false }
     }
+    const session = this.session
+    if (entitlement.status !== 'expired'
+      || !entitlement.lifecycle
+      || !entitlement.membershipExpiresAt
+      || !session) return entitlement
+    const retained = session.opened.database.prepare(`
+      SELECT 1 FROM knowledge_membership_lifecycle
+      JOIN documents ON documents.id = knowledge_membership_lifecycle.selected_document_id
+      JOIN knowledge_bases ON knowledge_bases.id = knowledge_membership_lifecycle.selected_knowledge_base_id
+      JOIN document_versions ON document_versions.id = documents.active_version_id
+      LEFT JOIN cloud_sync_states ON cloud_sync_states.knowledge_base_id = knowledge_bases.id
+      WHERE knowledge_membership_lifecycle.singleton = 1
+        AND knowledge_membership_lifecycle.membership_expires_at = ?
+        AND documents.knowledge_base_id = knowledge_bases.id
+        AND documents.status <> 'recycled'
+        AND knowledge_bases.status <> 'recycled'
+        AND document_versions.status = 'ready'
+        AND (cloud_sync_states.mode IS NULL OR cloud_sync_states.mode = 'local_only')
+    `).get(Date.parse(entitlement.membershipExpiresAt))
+    return retained
+      ? { ...entitlement, lifecycle: { ...entitlement.lifecycle, requiresSelection: false } }
+      : entitlement
   }
 
   async getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState> {
@@ -804,7 +935,7 @@ export class KnowledgeService implements KnowledgePersistence {
     const chatProvider = await (this.options.getChatProviderConsent?.(owner)
       ?? Promise.resolve({ provider: 'deepseek' as const, status: 'unknown' as const }))
     let embedding = defaultEmbeddingConsent
-    if (this.options.cloud) {
+    if (this.options.cloud && await this.cloudRetrievalEnabled(owner)) {
       try { embedding = await this.options.cloud.getEmbeddingConsent() } catch {
         embedding = defaultEmbeddingConsent
       }
@@ -818,7 +949,7 @@ export class KnowledgeService implements KnowledgePersistence {
   ): Promise<KnowledgeConsentState> {
     this.assertOwner(owner)
     if (!this.options.cloud) failure('SERVICE_UNAVAILABLE')
-    if (status === 'granted' && !await this.cloudRetrievalEnabled()) failure('SERVICE_UNAVAILABLE')
+    if (!await this.cloudRetrievalEnabled(owner)) failure('SERVICE_UNAVAILABLE')
     let embedding: KnowledgeEmbeddingConsentState
     try {
       embedding = await this.options.cloud.setEmbeddingConsent({ requestId: this.id(), status })
@@ -835,17 +966,31 @@ export class KnowledgeService implements KnowledgePersistence {
     if (this.session && this.session.owner.userId !== owner.userId) failure('FORBIDDEN')
   }
 
-  private async cloudRetrievalEnabled(): Promise<boolean> {
+  private async cloudRetrievalEnabled(owner: KnowledgeOwner): Promise<boolean> {
     if (!this.options.cloud) return false
     try {
-      const entitlement = await this.options.cloud.getEntitlement()
-      return !entitlement.killSwitchEnabled
+      const entitlement = await this.getEntitlement(owner)
+      if (entitlement.killSwitchEnabled === true
+        || entitlement.tier !== 'member'
+        || !['active', 'offline_grace'].includes(entitlement.status)
+        || !entitlement.betaEnabled
+        || !entitlement.cloudEnabled) return false
+      const server = await this.options.cloud.getEntitlement()
+      return !server.killSwitchEnabled
         && entitlement.tier === 'member'
         && ['active', 'offline_grace'].includes(entitlement.status)
         && entitlement.betaEnabled
         && entitlement.cloudEnabled
     } catch {
       return false
+    }
+  }
+
+  private async serverKnowledgeToolAdmissionEnabled(): Promise<boolean> {
+    if (!this.options.cloud) return true
+    try { return !(await this.options.cloud.getEntitlement()).killSwitchEnabled } catch {
+      // A still-valid signed local snapshot may remain usable offline; remote state can only deny.
+      return true
     }
   }
 
@@ -1009,6 +1154,131 @@ export class KnowledgeService implements KnowledgePersistence {
     ).get(kind, targetId) !== undefined
   }
 
+  private retainedSelection(session: OpenKnowledgeSession): {
+    knowledgeBaseId: string
+    documentId: string
+  } | undefined {
+    const row = session.opened.database.prepare(`
+      SELECT selected_knowledge_base_id AS knowledgeBaseId,
+        selected_document_id AS documentId
+      FROM knowledge_membership_lifecycle WHERE singleton = 1
+    `).get() as { knowledgeBaseId: string | null; documentId: string | null } | undefined
+    return row?.knowledgeBaseId && row.documentId
+      ? { knowledgeBaseId: row.knowledgeBaseId, documentId: row.documentId }
+      : undefined
+  }
+
+  private async reconcileMembershipLifecycle(
+    session: OpenKnowledgeSession,
+    entitlement: KnowledgeEntitlementState,
+  ): Promise<void> {
+    const lifecycle = entitlement.lifecycle
+    const membershipExpiresAt = entitlement.membershipExpiresAt === undefined
+      ? Number.NaN
+      : Date.parse(entitlement.membershipExpiresAt)
+    if (entitlement.tier === 'member'
+      && ['active', 'offline_grace'].includes(entitlement.status)
+      && lifecycle?.phase === 'active') {
+      const existing = session.opened.database.prepare(
+        'SELECT 1 FROM knowledge_membership_lifecycle WHERE singleton = 1',
+      ).get()
+      if (!existing) return
+      const now = this.now()
+      session.opened.database.transaction(() => {
+        session.opened.database.prepare(
+          "UPDATE knowledge_bases SET status = 'active', updated_at = ? WHERE status = 'read_only'",
+        ).run(now)
+        session.opened.database.prepare('DELETE FROM knowledge_document_access').run()
+        session.opened.database.prepare(`
+          UPDATE knowledge_membership_lifecycle
+          SET phase = 'active', selected_knowledge_base_id = NULL,
+            selected_document_id = NULL, updated_at = ? WHERE singleton = 1
+        `).run(now)
+      })()
+      return
+    }
+    if (entitlement.status !== 'expired'
+      || !lifecycle
+      || lifecycle.phase === 'active'
+      || !Number.isFinite(membershipExpiresAt)) return
+
+    const downloadUntil = Date.parse(lifecycle.downloadUntil)
+    const recycleUntil = Date.parse(lifecycle.recycleUntil)
+    if (!(downloadUntil > membershipExpiresAt && recycleUntil > downloadUntil)) failure('INTERNAL_ERROR')
+    const now = this.now()
+    session.opened.database.transaction(() => {
+      const existing = session.opened.database.prepare(`
+        SELECT membership_expires_at AS membershipExpiresAt,
+          selected_knowledge_base_id AS knowledgeBaseId,
+          selected_document_id AS documentId
+        FROM knowledge_membership_lifecycle WHERE singleton = 1
+      `).get() as {
+        membershipExpiresAt: number; knowledgeBaseId: string | null; documentId: string | null
+      } | undefined
+      const sameExpiry = existing?.membershipExpiresAt === membershipExpiresAt
+      let knowledgeBaseId = sameExpiry ? existing?.knowledgeBaseId ?? null : null
+      let documentId = sameExpiry ? existing?.documentId ?? null : null
+      if (knowledgeBaseId && documentId) {
+        const selectionStillValid = session.opened.database.prepare(`
+          SELECT 1 FROM documents
+          JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
+          JOIN document_versions ON document_versions.id = documents.active_version_id
+          LEFT JOIN cloud_sync_states ON cloud_sync_states.knowledge_base_id = knowledge_bases.id
+          WHERE documents.id = ? AND documents.knowledge_base_id = ?
+            AND documents.status <> 'recycled'
+            AND knowledge_bases.status <> 'recycled'
+            AND document_versions.status = 'ready'
+            AND (cloud_sync_states.mode IS NULL OR cloud_sync_states.mode = 'local_only')
+        `).get(documentId, knowledgeBaseId)
+        if (!selectionStillValid) {
+          knowledgeBaseId = null
+          documentId = null
+        }
+      }
+      session.opened.database.prepare(`
+        INSERT INTO knowledge_membership_lifecycle
+          (singleton, membership_expires_at, download_until, recycle_until, phase,
+            selected_knowledge_base_id, selected_document_id, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          membership_expires_at = excluded.membership_expires_at,
+          download_until = excluded.download_until,
+          recycle_until = excluded.recycle_until,
+          phase = excluded.phase,
+          selected_knowledge_base_id = excluded.selected_knowledge_base_id,
+          selected_document_id = excluded.selected_document_id,
+          updated_at = excluded.updated_at
+      `).run(
+        membershipExpiresAt, downloadUntil, recycleUntil, lifecycle.phase,
+        knowledgeBaseId, documentId, now,
+      )
+      if (knowledgeBaseId && documentId) {
+        session.opened.database.prepare(`
+          UPDATE knowledge_bases SET status = CASE WHEN id = ? THEN 'active' ELSE 'read_only' END,
+            updated_at = ? WHERE status <> 'recycled'
+        `).run(knowledgeBaseId, now)
+        session.opened.database.prepare(`
+          INSERT INTO knowledge_document_access (document_id, access, updated_at)
+          SELECT id, CASE WHEN id = ? THEN 'active' ELSE 'read_only' END, ?
+          FROM documents WHERE status <> 'recycled'
+          ON CONFLICT(document_id) DO UPDATE SET
+            access = excluded.access, updated_at = excluded.updated_at
+        `).run(documentId, now)
+      } else {
+        session.opened.database.prepare(
+          "UPDATE knowledge_bases SET status = 'read_only', updated_at = ? WHERE status = 'active'",
+        ).run(now)
+        session.opened.database.prepare(`
+          INSERT INTO knowledge_document_access (document_id, access, updated_at)
+          SELECT id, 'read_only', ? FROM documents WHERE status <> 'recycled'
+          ON CONFLICT(document_id) DO UPDATE SET
+            access = excluded.access, updated_at = excluded.updated_at
+        `).run(now)
+        session.opened.database.prepare('DELETE FROM conversation_selection_bases').run()
+      }
+    })()
+  }
+
   private async requireConversation(owner: KnowledgeOwner, conversationId: string): Promise<void> {
     if (!await this.options.ownsConversation(owner, conversationId)) failure('NOT_FOUND')
   }
@@ -1022,7 +1292,6 @@ export class KnowledgeService implements KnowledgePersistence {
     if (!sourcePath) return undefined
     const source = sourceType(sourcePath)
     const contentHash = await hashStableKnowledgeSource(sourcePath)
-    const entitlement = await this.getEntitlement(owner)
     const documentId = target.documentId ?? this.id()
     const versionId = this.id()
     const objectId = this.id()
@@ -1038,30 +1307,33 @@ export class KnowledgeService implements KnowledgePersistence {
     let finishSnapshotTask: ((error?: unknown) => void) | undefined
     let snapshotTaskFailure: unknown
     try {
-      await this.mutate(session, () => session.opened.database.transaction(() => {
-        this.requireBase(session, target.knowledgeBaseId, true)
-        if (!target.documentId && !hasMemberAccess(entitlement)) {
-          const count = session.opened.database.prepare(`
-            SELECT count(*) AS count FROM documents
-            JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
-            WHERE documents.status <> 'recycled' AND knowledge_bases.status <> 'recycled'
-          `).get() as { count: number }
-          if (count.count >= 1) failure('CONFLICT')
-        }
-        if (target.documentId) {
-          const current = this.requireDocument(session, target.documentId, true)
-          if (current.knowledgeBaseId !== target.knowledgeBaseId) failure('NOT_FOUND')
-          versionNumber = (session.opened.database.prepare(`
-            SELECT coalesce(max(version_number), 0) + 1 AS number
-            FROM document_versions WHERE document_id = ?
-          `).get(documentId) as { number: number }).number
-        } else {
-          session.opened.database.prepare(`
-            INSERT INTO documents
-              (id, knowledge_base_id, name, mime_type, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'pending', ?, ?)
-          `).run(documentId, target.knowledgeBaseId, source.name, source.mimeType, now, now)
-        }
+      await this.mutate(session, async () => {
+        const entitlement = await this.getEntitlement(owner)
+        if (!['active', 'offline_grace'].includes(entitlement.status)) failure('FORBIDDEN')
+        return session.opened.database.transaction(() => {
+          this.requireBase(session, target.knowledgeBaseId, true)
+          if (!target.documentId && !hasMemberAccess(entitlement)) {
+            const count = session.opened.database.prepare(`
+              SELECT count(*) AS count FROM documents
+              JOIN knowledge_bases ON knowledge_bases.id = documents.knowledge_base_id
+              WHERE documents.status <> 'recycled' AND knowledge_bases.status <> 'recycled'
+            `).get() as { count: number }
+            if (count.count >= 1) failure('CONFLICT')
+          }
+          if (target.documentId) {
+            const current = this.requireDocument(session, target.documentId, true)
+            if (current.knowledgeBaseId !== target.knowledgeBaseId) failure('NOT_FOUND')
+            versionNumber = (session.opened.database.prepare(`
+              SELECT coalesce(max(version_number), 0) + 1 AS number
+              FROM document_versions WHERE document_id = ?
+            `).get(documentId) as { number: number }).number
+          } else {
+            session.opened.database.prepare(`
+              INSERT INTO documents
+                (id, knowledge_base_id, name, mime_type, status, created_at, updated_at)
+              VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            `).run(documentId, target.knowledgeBaseId, source.name, source.mimeType, now, now)
+          }
         const head = session.opened.database.prepare(`
           SELECT generation, authoritative_job_id AS jobId
           FROM document_import_heads WHERE document_id = ?
@@ -1113,7 +1385,8 @@ export class KnowledgeService implements KnowledgePersistence {
           jobId, documentId, knowledgeBaseId: target.knowledgeBaseId,
         })
         finishSnapshotTask = error => snapshotTask.complete(error)
-      })())
+        })()
+      })
     } catch (error) {
       finishSnapshotTask?.()
       throw error

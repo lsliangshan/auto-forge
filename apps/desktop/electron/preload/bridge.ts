@@ -186,6 +186,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
         ipcChannels.knowledgeSetEmbeddingConsent,
         { status },
       ),
+      chooseDowngradeSelection: (knowledgeBaseId, documentId) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeChooseDowngradeSelection,
+        { knowledgeBaseId, documentId },
+      ),
     },
     system: {
       openExternal: (url) => invoke(ipcRenderer, ipcChannels.systemOpenExternal, { url }),

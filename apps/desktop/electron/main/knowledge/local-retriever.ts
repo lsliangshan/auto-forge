@@ -84,6 +84,8 @@ export class LocalKnowledgeRetriever {
       JOIN knowledge_bases ON knowledge_bases.id = kb_chunks.knowledge_base_id
       WHERE kb_chunks.knowledge_base_id IN (${placeholders})
         AND documents.status <> 'recycled'
+        AND coalesce((SELECT access FROM knowledge_document_access
+          WHERE document_id = documents.id), 'active') = 'active'
         AND documents.active_version_id = kb_chunks.version_id
         AND document_versions.status = 'ready'
         AND knowledge_bases.status = 'active'

@@ -171,6 +171,12 @@ export class KnowledgeImportRuntime {
         SELECT version_id FROM local_import_jobs WHERE ${predicate}
       )
     `).run(id)
+    session.opened.database.prepare(`
+      UPDATE documents SET status = 'failed', updated_at = ?
+      WHERE active_version_id IS NULL AND id IN (
+        SELECT document_id FROM local_import_jobs WHERE ${predicate}
+      )
+    `).run(now, id)
     if (kind === 'document') {
       session.opened.database.prepare('DELETE FROM document_import_heads WHERE document_id = ?').run(id)
     } else {

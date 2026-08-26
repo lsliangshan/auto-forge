@@ -96,6 +96,10 @@ export interface DesktopIpcServices {
       owner: KnowledgeOwner,
       status: 'granted' | 'denied' | 'revoked',
     ): Promise<KnowledgeConsentState>
+    chooseDowngradeSelection(
+      owner: KnowledgeOwner,
+      selection: { knowledgeBaseId: string; documentId: string },
+    ): Promise<KnowledgeEntitlementState>
   }
   system: DesktopAPI['system']
 }
@@ -287,6 +291,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   registerKnowledge(ipcChannels.knowledgeGetConsent, (owner) => options.services.knowledge.getConsent(owner))
   registerKnowledge(ipcChannels.knowledgeSetEmbeddingConsent, (owner, input) => (
     options.services.knowledge.setEmbeddingConsent(owner, input.status)
+  ))
+  registerKnowledge(ipcChannels.knowledgeChooseDowngradeSelection, (owner, input) => (
+    options.services.knowledge.chooseDowngradeSelection(owner, input)
   ))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())

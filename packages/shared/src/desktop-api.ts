@@ -42,6 +42,7 @@ export const knowledgeDocumentSchema = z.object({
   name: nonEmptyStringSchema.max(500),
   mimeType: nonEmptyStringSchema.max(200),
   status: z.enum(['queued', 'copying', 'uploading', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted']),
+  readOnly: z.boolean().optional(),
   versionCount: z.number().int().positive(),
   updatedAt: timestampSchema,
 }).strict()
@@ -120,7 +121,33 @@ export const knowledgeEntitlementStateSchema = z.object({
   status: z.enum(['active', 'offline_grace', 'expired', 'unavailable']),
   betaEnabled: z.boolean(),
   cloudEnabled: z.boolean(),
-}).strict()
+  knowledgeToolEnabled: z.boolean().optional(),
+  killSwitchEnabled: z.boolean().optional(),
+  membershipExpiresAt: timestampSchema.optional(),
+  lifecycle: z.object({
+    phase: z.enum(['active', 'download_window', 'recycle_window', 'purge_eligible']),
+    requiresSelection: z.boolean(),
+    downloadUntil: timestampSchema,
+    recycleUntil: timestampSchema,
+  }).strict().optional(),
+}).strict().superRefine((state, context) => {
+  if (state.cloudEnabled && !state.betaEnabled) {
+    context.addIssue({ code: 'custom', path: ['cloudEnabled'], message: 'Cloud requires beta entitlement' })
+  }
+  if (state.knowledgeToolEnabled && (
+    !state.betaEnabled
+    || state.killSwitchEnabled === true
+    || !['active', 'offline_grace'].includes(state.status)
+  )) {
+    context.addIssue({ code: 'custom', path: ['knowledgeToolEnabled'], message: 'Knowledge tool admission is unavailable' })
+  }
+  if (state.killSwitchEnabled && (state.cloudEnabled || state.knowledgeToolEnabled)) {
+    context.addIssue({ code: 'custom', path: ['killSwitchEnabled'], message: 'Kill switch must fail closed' })
+  }
+  if (state.lifecycle && Date.parse(state.lifecycle.recycleUntil) <= Date.parse(state.lifecycle.downloadUntil)) {
+    context.addIssue({ code: 'custom', path: ['lifecycle'], message: 'Recycle window must follow download window' })
+  }
+})
 export type KnowledgeEntitlementState = z.infer<typeof knowledgeEntitlementStateSchema>
 
 export const knowledgeChatProviderConsentStateSchema = z.object({
@@ -1154,6 +1181,7 @@ export const ipcChannels = {
   knowledgeGetEntitlement: 'knowledge:get-entitlement',
   knowledgeGetConsent: 'knowledge:get-consent',
   knowledgeSetEmbeddingConsent: 'knowledge:set-embedding-consent',
+  knowledgeChooseDowngradeSelection: 'knowledge:choose-downgrade-selection',
   knowledgePreviewCitation: 'knowledge:preview-citation',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
@@ -1247,6 +1275,10 @@ export const knowledgeSetEmbeddingConsentRequestSchema = z.object({
   status: z.enum(['granted', 'denied', 'revoked']),
 }).strict()
 export type KnowledgeSetEmbeddingConsentRequest = z.infer<typeof knowledgeSetEmbeddingConsentRequestSchema>
+export const knowledgeDowngradeSelectionRequestSchema = z.object({
+  knowledgeBaseId: identifierSchema,
+  documentId: identifierSchema,
+}).strict()
 export const openExternalRequestSchema = z.object({
   url: z.string().superRefine((value, context) => {
     try {
@@ -1346,6 +1378,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
   [ipcChannels.knowledgeGetConsent]: z.undefined(),
   [ipcChannels.knowledgeSetEmbeddingConsent]: knowledgeSetEmbeddingConsentRequestSchema,
+  [ipcChannels.knowledgeChooseDowngradeSelection]: knowledgeDowngradeSelectionRequestSchema,
   [ipcChannels.knowledgePreviewCitation]: knowledgeCitationPreviewRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
@@ -1436,6 +1469,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.knowledgeSetEmbeddingConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeChooseDowngradeSelection]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgePreviewCitation]: knowledgeCitationPreviewSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
@@ -1549,6 +1583,10 @@ export interface DesktopAPI {
     getEntitlement(): Promise<KnowledgeEntitlementState>
     getConsent(): Promise<KnowledgeConsentState>
     setEmbeddingConsent(status: 'granted' | 'denied' | 'revoked'): Promise<KnowledgeConsentState>
+    chooseDowngradeSelection(
+      knowledgeBaseId: string,
+      documentId: string,
+    ): Promise<KnowledgeEntitlementState>
     previewCitation(input: KnowledgeCitationPreviewRequest): Promise<KnowledgeCitationPreview>
   }
   system: {

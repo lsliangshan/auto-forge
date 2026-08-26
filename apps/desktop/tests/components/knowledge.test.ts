@@ -114,6 +114,12 @@ function createApi(input: {
           retrievalByBase: [],
         },
       })),
+      chooseDowngradeSelection: vi.fn().mockImplementation(async () => ({
+        ...(input.entitlement ?? free),
+        lifecycle: input.entitlement?.lifecycle
+          ? { ...input.entitlement.lifecycle, requiresSelection: false }
+          : undefined,
+      })),
     },
     system: { getAppInfo: vi.fn().mockResolvedValue({ version: '0.1.0', platform: 'darwin' }) },
   } as unknown as DesktopAPI
@@ -467,6 +473,99 @@ describe('knowledge Store boundary', () => {
     expect(wrapper.get('[data-testid="knowledge-export"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('[data-testid="knowledge-recycle-document"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('[data-testid="inspector-panel"]').text()).toContain('不可检索（会员已过期）')
+  })
+
+  it('offers an explicit retained-file choice during downgrade and keeps export/delete visible', async () => {
+    const api = createApi({
+      entitlement: {
+        tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+        knowledgeToolEnabled: false, killSwitchEnabled: false,
+        membershipExpiresAt: '2026-08-26T00:00:00.000Z',
+        lifecycle: {
+          phase: 'download_window', requiresSelection: true,
+          downloadUntil: '2026-09-25T00:00:00.000Z',
+          recycleUntil: '2026-10-25T00:00:00.000Z',
+        },
+      },
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('请选择一个本地文件继续使用')
+    await wrapper.get('[data-testid="knowledge-keep-document"]').trigger('click')
+    await flushPromises()
+
+    expect(api.knowledge.chooseDowngradeSelection).toHaveBeenCalledWith('kb_local', 'document_1')
+    expect(wrapper.get('[data-testid="knowledge-export"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="knowledge-recycle-document"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('refreshes durable downgrade selection state after Main reconciles the restarted catalog', async () => {
+    const requiresSelection: KnowledgeEntitlementState = {
+      tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: false,
+      membershipExpiresAt: '2026-08-26T00:00:00.000Z',
+      lifecycle: {
+        phase: 'download_window', requiresSelection: true,
+        downloadUntil: '2026-09-25T00:00:00.000Z', recycleUntil: '2026-10-25T00:00:00.000Z',
+      },
+    }
+    const api = createApi({ entitlement: requiresSelection })
+    vi.mocked(api.knowledge.getEntitlement)
+      .mockResolvedValueOnce(requiresSelection)
+      .mockResolvedValueOnce({
+        ...requiresSelection,
+        lifecycle: { ...requiresSelection.lifecycle!, requiresSelection: false },
+      })
+
+    const { wrapper } = await mountKnowledge(api)
+
+    expect(api.knowledge.getEntitlement).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).not.toContain('请选择一个本地文件继续使用')
+  })
+
+  it('keeps cached cloud export and delete available when the signed kill switch disables cloud access', async () => {
+    const cloudBase = { ...localBase, id: 'kb_cloud', name: '云端知识库', kind: 'cloud' as const }
+    const api = createApi({
+      bases: [cloudBase],
+      documents: [{ ...readyDocument, knowledgeBaseId: cloudBase.id }],
+      entitlement: {
+        tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: false,
+        knowledgeToolEnabled: false, killSwitchEnabled: true,
+      },
+    })
+    const { wrapper } = await mountKnowledge(api)
+    await wrapper.get('[data-testid="knowledge-document-document_1"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('云端功能和新的 Agent 知识工具已暂停')
+    expect(wrapper.text()).toContain('本地管理、导出和删除仍可用')
+    expect(wrapper.get('[data-testid="knowledge-import"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="knowledge-export"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="knowledge-recycle-document"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it.each([
+    ['download_window', '云端内容可下载或转换至 2026/9/25'],
+    ['recycle_window', '云端内容处于回收期，可继续管理本地缓存'],
+    ['purge_eligible', '云端内容已具备清理资格'],
+  ] as const)('shows the signed %s membership lifecycle boundary', async (phase, message) => {
+    const api = createApi({
+      entitlement: {
+        tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+        knowledgeToolEnabled: false, killSwitchEnabled: false,
+        membershipExpiresAt: '2026-08-26T00:00:00.000Z',
+        lifecycle: {
+          phase, requiresSelection: true,
+          downloadUntil: '2026-09-25T00:00:00.000Z',
+          recycleUntil: '2026-10-25T00:00:00.000Z',
+        },
+      },
+    })
+    const { wrapper } = await mountKnowledge(api)
+
+    expect(wrapper.text()).toContain(message)
   })
 
   it('enforces the free one-library and one-active-file quota before invoking Main', async () => {

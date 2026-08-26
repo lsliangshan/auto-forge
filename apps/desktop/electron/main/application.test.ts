@@ -754,6 +754,19 @@ beforeEach(() => {
 })
 
 describe('createApplicationRuntime', () => {
+  it('keeps production-empty entitlement trust local-only while failing closed for beta cloud and Agent admission', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-entitlement-closed-'))
+    directories.push(root)
+    const runtime = createApplicationRuntime(options(root))
+    const session = await authenticate(runtime, 'EntitlementClosed')
+
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id })).resolves.toEqual({
+      tier: 'free', status: 'active', betaEnabled: false, cloudEnabled: false,
+      knowledgeToolEnabled: false, killSwitchEnabled: true,
+    })
+    await runtime.close()
+  })
+
   it('captures one Main-owned knowledge snapshot only for a tool-capable text route', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-agent-snapshot-'))
     directories.push(root)
@@ -1078,7 +1091,15 @@ describe('createApplicationRuntime', () => {
         throw new Error(`unexpected cloud action ${String(data.action)}`)
       }),
     }
-    const runtime = createApplicationRuntime(options(root, { knowledgeCloudFunctions: functions }))
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeCloudFunctions: functions,
+      knowledgeEntitlement: {
+        getEntitlement: async () => ({
+          tier: 'member', status: 'active', betaEnabled: true, cloudEnabled: true,
+          knowledgeToolEnabled: true, killSwitchEnabled: false,
+        }),
+      },
+    }))
     const session = await authenticate(runtime, 'KnowledgeCloud')
     const owner = { userId: session.user.id }
 
@@ -1091,9 +1112,12 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.services.knowledge.setEmbeddingConsent(owner, 'granted')).resolves
       .toMatchObject({ embedding: { status: 'granted' } })
     expect(functions.callFunction).toHaveBeenNthCalledWith(1, {
+      name: 'autoforge-knowledge', data: { action: 'getEntitlement' },
+    })
+    expect(functions.callFunction).toHaveBeenNthCalledWith(2, {
       name: 'autoforge-knowledge', data: { action: 'getEmbeddingConsent' },
     })
-    const mutation = vi.mocked(functions.callFunction).mock.calls[2]?.[0]
+    const mutation = vi.mocked(functions.callFunction).mock.calls[3]?.[0]
     expect(mutation).toEqual({
       name: 'autoforge-knowledge',
       data: {

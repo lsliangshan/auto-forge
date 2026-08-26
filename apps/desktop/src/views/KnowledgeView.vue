@@ -53,6 +53,32 @@
       </div>
     </header>
 
+    <div
+      v-if="knowledge.entitlement?.killSwitchEnabled"
+      class="downgrade-state"
+      role="status"
+    >
+      <span>云端功能和新的 Agent 知识工具已暂停；本地管理、导出和删除仍可用。</span>
+    </div>
+
+    <div
+      v-if="knowledge.entitlement?.lifecycle?.requiresSelection"
+      class="downgrade-state"
+      role="status"
+    >
+      <span>
+        会员已到期，请选择一个本地文件继续使用；其他内容将保持加密只读。
+        <small>{{ lifecycleMessage }}</small>
+      </span>
+      <el-button
+        data-testid="knowledge-keep-document"
+        size="small"
+        type="primary"
+        :disabled="!knowledge.selectedDocument || knowledge.operationPending"
+        @click="knowledge.chooseDowngradeSelection"
+      >保留当前文件</el-button>
+    </div>
+
     <div v-if="knowledge.error" class="knowledge-state error" role="alert">
       {{ knowledge.error }}
     </div>
@@ -116,11 +142,21 @@
 import type { KnowledgeDocument } from '@autoforge/shared'
 import { Document } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
-import { onBeforeUnmount, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { useKnowledgeStore } from '../stores/knowledge'
 
 const knowledge = useKnowledgeStore()
 let mounted = true
+const lifecycleMessage = computed(() => {
+  const lifecycle = knowledge.entitlement?.lifecycle
+  if (!lifecycle) return ''
+  if (lifecycle.phase === 'download_window') {
+    return `云端内容可下载或转换至 ${new Date(lifecycle.downloadUntil).toLocaleDateString('zh-CN')}`
+  }
+  if (lifecycle.phase === 'recycle_window') return '云端内容处于回收期，可继续管理本地缓存'
+  if (lifecycle.phase === 'purge_eligible') return '云端内容已具备清理资格'
+  return ''
+})
 const statusLabels: Record<KnowledgeDocument['status'], string> = {
   queued: '排队中', copying: '复制中', uploading: '上传中', parsing: '解析中',
   indexing: '索引中', ready: '已就绪', failed: '处理失败', paused: '已暂停', deleted: '已删除',
@@ -154,6 +190,8 @@ onBeforeUnmount(() => {
 .knowledge-view { display: flex; min-height: 100%; flex-direction: column; }
 .knowledge-toolbar { display: flex; min-height: 66px; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--af-border); padding: 12px 18px; background: var(--af-surface); }
 .knowledge-toolbar > div:first-child { display: grid; gap: 3px; }.knowledge-toolbar strong { font-size: 14px; }.toolbar-actions { display: flex; align-items: center; gap: 8px; }.embedding-consent-controls { display: grid; max-width: 290px; gap: 3px; color: var(--af-text-muted); font-size: 10px; text-align: right; }.embedding-consent-controls > span { display: flex; justify-content: flex-end; gap: 4px; }
+.downgrade-state { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-warning); padding: 9px 18px; color: var(--af-warning); background: rgb(216 144 24 / 8%); font-size: 12px; }
+.downgrade-state > span { display: grid; gap: 2px; }.downgrade-state small { color: var(--af-text-muted); }
 .knowledge-state { display: grid; min-height: 240px; flex: 1; place-content: center; color: var(--af-text-muted); text-align: center; }.knowledge-state p { margin: 0 0 6px; color: var(--af-text); }.knowledge-state.error { color: var(--af-danger); }
 .document-list { min-height: 0; flex: 1; padding: 12px 18px; overflow: auto; }
 .document-row { display: grid; width: 100%; grid-template-columns: 34px minmax(0, 1fr) auto 150px; align-items: center; gap: 10px; border: 1px solid transparent; border-bottom-color: var(--af-border); padding: 12px 10px; color: var(--af-text); background: transparent; cursor: pointer; text-align: left; }

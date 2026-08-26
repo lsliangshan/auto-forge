@@ -377,5 +377,25 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS tombstones_sequence ON tombstones(sequence);
     CREATE INDEX IF NOT EXISTS tombstones_expiry ON tombstones(expires_at);
+
+    CREATE TABLE IF NOT EXISTS knowledge_document_access (
+      document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+      access TEXT NOT NULL CHECK (access IN ('active', 'read_only')),
+      updated_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS knowledge_membership_lifecycle (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      membership_expires_at INTEGER NOT NULL,
+      download_until INTEGER NOT NULL,
+      recycle_until INTEGER NOT NULL,
+      phase TEXT NOT NULL CHECK (phase IN ('active', 'download_window', 'recycle_window', 'purge_eligible')),
+      selected_knowledge_base_id TEXT,
+      selected_document_id TEXT,
+      updated_at INTEGER NOT NULL,
+      CHECK ((selected_knowledge_base_id IS NULL) = (selected_document_id IS NULL)),
+      CHECK (download_until > membership_expires_at),
+      CHECK (recycle_until > download_until)
+    ) STRICT;
   `)
 }

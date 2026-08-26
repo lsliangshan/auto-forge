@@ -113,6 +113,11 @@ import {
 } from './knowledge/knowledge-service.js'
 import { KnowledgeAdmissionGate } from './knowledge/knowledge-admission.js'
 import {
+  KnowledgeEntitlementAuthority,
+  PRODUCTION_KNOWLEDGE_ENTITLEMENT_TRUSTED_KEYS,
+  SafeStorageKnowledgeEntitlementCache,
+} from './knowledge/entitlement-verifier.js'
+import {
   CloudBaseKnowledgeClient,
   type CloudBaseFunctionPort,
 } from './knowledge/cloudbase-knowledge-client.js'
@@ -1188,6 +1193,13 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     try { await browser.reset() } catch (error) { failures.push(error) }
     if (failures.length > 0) throw failures[0]
   }
+  const knowledgeEntitlement = options.knowledgeEntitlement ?? new KnowledgeEntitlementAuthority({
+    trustedKeys: PRODUCTION_KNOWLEDGE_ENTITLEMENT_TRUSTED_KEYS,
+    cache: new SafeStorageKnowledgeEntitlementCache(
+      join(options.paths.data, 'knowledge', 'entitlements'),
+      options.safeStorage,
+    ),
+  })
   knowledge = new KnowledgeService({
     rootDirectory: options.paths.data,
     safeStorage: options.safeStorage,
@@ -1199,7 +1211,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     ownsConversation: async (owner, conversationId) => (
       database.conversations.get(conversationId)?.userId === owner.userId
     ),
-    entitlement: options.knowledgeEntitlement,
+    entitlement: knowledgeEntitlement,
     cloud: knowledgeCloud,
     getChatProviderConsent: owner => getKnowledgeChatProviderConsent(
       owner.userId, settings.get().activeProvider,

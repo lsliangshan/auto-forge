@@ -107,11 +107,11 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     canRecycle(state): boolean {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
-      return scopeAvailable(base, state.availability, state.entitlement)
+      return Boolean(base && base.status !== 'recycled' && state.availability?.local.available)
     },
     canExport(state): boolean {
       const base = state.bases.find(({ id }) => id === state.selectedBaseId)
-      return scopeAvailable(base, state.availability, state.entitlement)
+      return Boolean(base && base.status !== 'recycled' && state.availability?.local.available)
     },
     embeddingRetrievalMode(state) {
       return (knowledgeBaseId: string): 'hybrid' | 'keyword_only' | 'reindexing' => (
@@ -176,6 +176,8 @@ export const useKnowledgeStore = defineStore('knowledge', {
         const bases = await api.listBases()
         if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.bases = bases
+        this.entitlement = await api.getEntitlement()
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         if (!bases.some(({ id }) => id === this.selectedBaseId)) {
           this.selectedBaseId = bases[0]?.id ?? ''
           this.selectedDocumentId = ''
@@ -211,6 +213,8 @@ export const useKnowledgeStore = defineStore('knowledge', {
         const bases = await api.listBases()
         if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.bases = bases
+        this.entitlement = await api.getEntitlement()
+        if (ownerEpoch !== this._ownerEpoch || version !== this._catalogVersion) return
         this.operationError = ''
       } catch (error) {
         if (ownerEpoch === this._ownerEpoch && version === this._catalogVersion) {
@@ -322,6 +326,21 @@ export const useKnowledgeStore = defineStore('knowledge', {
       await this.runOperation('TokenHub 授权更新失败', async (isCurrent) => {
         const consent = await getDesktopApi().knowledge.setEmbeddingConsent(status)
         if (isCurrent()) this.consent = consent
+      })
+    },
+    async chooseDowngradeSelection() {
+      const knowledgeBaseId = this.selectedBaseId
+      const documentId = this.selectedDocumentId
+      if (!knowledgeBaseId || !documentId || this.operationPending
+        || !this.entitlement?.lifecycle?.requiresSelection) return
+      await this.runOperation('保留文件选择失败', async (isCurrent) => {
+        const entitlement = await getDesktopApi().knowledge.chooseDowngradeSelection(
+          knowledgeBaseId,
+          documentId,
+        )
+        if (!isCurrent()) return
+        this.entitlement = entitlement
+        await this.refreshCatalog()
       })
     },
     upsertDocument(document: KnowledgeDocument) {

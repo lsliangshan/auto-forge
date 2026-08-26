@@ -132,6 +132,9 @@ function services(): DesktopIpcServices {
       recycleBase: vi.fn().mockResolvedValue(undefined),
       purgeBase: vi.fn().mockResolvedValue(undefined),
       exportBase: vi.fn().mockResolvedValue(undefined),
+      chooseDowngradeSelection: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false,
+      }),
       getConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
       updateConversationSelection: vi.fn().mockResolvedValue({ knowledgeBaseIds: [], knowledgeMode: 'mixed' }),
       search: vi.fn().mockResolvedValue({ kind: 'ask_for_detail', results: [] }),
@@ -421,6 +424,9 @@ describe('registerDesktopIpc', () => {
     await app.invoke(ipcChannels.knowledgeGetEntitlement)
     await app.invoke(ipcChannels.knowledgeGetConsent)
     await app.invoke(ipcChannels.knowledgeSetEmbeddingConsent, { status: 'revoked' })
+    await app.invoke(ipcChannels.knowledgeChooseDowngradeSelection, {
+      knowledgeBaseId: 'kb_1', documentId: 'document_1',
+    })
 
     const owner = { userId: 'user_1' }
     expect(app.dependencies.knowledge.listBases).toHaveBeenCalledWith(owner)
@@ -437,6 +443,9 @@ describe('registerDesktopIpc', () => {
     expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, 'conversation_1', '北京政务')
     expect(app.dependencies.knowledge.getFeatureAvailability).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.setEmbeddingConsent).toHaveBeenCalledWith(owner, 'revoked')
+    expect(app.dependencies.knowledge.chooseDowngradeSelection).toHaveBeenCalledWith(owner, {
+      knowledgeBaseId: 'kb_1', documentId: 'document_1',
+    })
 
     for (const [channel, input] of [
       [ipcChannels.knowledgeListDocuments, { knowledgeBaseId: 'kb_1', userId: 'other_user' }],
@@ -450,6 +459,9 @@ describe('registerDesktopIpc', () => {
       [ipcChannels.knowledgeSetEmbeddingConsent, { status: 'granted', userId: 'other_user' }],
       [ipcChannels.knowledgeSetEmbeddingConsent, { status: 'revoked', requestId: 'renderer_request' }],
       [ipcChannels.knowledgeSetEmbeddingConsent, { status: 'denied', generationId: 'generation_other' }],
+      [ipcChannels.knowledgeChooseDowngradeSelection, {
+        knowledgeBaseId: 'kb_1', documentId: 'document_1', userId: 'other_user',
+      }],
     ] as const) {
       await expect(app.invoke(channel, input)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
     }
