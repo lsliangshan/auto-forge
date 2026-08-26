@@ -21,6 +21,10 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+function after(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds))
+}
+
 describe('CloudBase knowledge function', () => {
   const candidate = (chunkId: string, generationId = 'generation_live') => ({
     chunkId, generationId,
@@ -202,19 +206,38 @@ describe('CloudBase knowledge function', () => {
     const embeddings = createTokenHubEmbeddingClient({
       baseUrl: 'https://tokenhub.example', apiKey: 'server-only', fetchImpl,
     })
+    const signal = new AbortController().signal
+    const sendDeadlineMs = Date.now() + 30_000
 
     await expect(embeddings.embed({
       model: EMBEDDING_MODEL, dimensions: 1024, inputs: ['server-approved input'],
+      signal, sendDeadlineMs,
     })).resolves.toEqual({ model: EMBEDDING_MODEL, dimensions: 1024, vectors: [vector] })
     expect(fetchImpl).toHaveBeenCalledWith('https://tokenhub.example/v1/embeddings', {
       method: 'POST',
       headers: { authorization: 'Bearer server-only', 'content-type': 'application/json' },
       body: JSON.stringify({ model: EMBEDDING_MODEL, input: ['server-approved input'] }),
+      signal,
     })
     await expect(embeddings.embed({
       model: 'caller-model', dimensions: 1536, inputs: ['blocked'],
     })).rejects.toMatchObject({ code: 'TRANSIENT_FAILURE' })
     expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('crash-safe adapter refuses an expired SQL send deadline before fetch', async () => {
+    const fetchImpl = vi.fn()
+    const embeddings = createTokenHubEmbeddingClient({
+      baseUrl: 'https://tokenhub.example', apiKey: 'server-only', fetchImpl,
+    })
+
+    await expect(embeddings.embed({
+      model: EMBEDDING_MODEL,
+      dimensions: 1024,
+      inputs: ['LATE_DISCLOSURE_SENTINEL'],
+      sendDeadlineMs: Date.now() - 1,
+    })).rejects.toMatchObject({ code: 'EMBEDDING_CONSENT_REQUIRED' })
+    expect(fetchImpl).not.toHaveBeenCalled()
   })
 
   it('restores TokenHub response order before vectors are associated with inputs', async () => {
@@ -232,6 +255,7 @@ describe('CloudBase knowledge function', () => {
 
     await expect(embeddings.embed({
       model: EMBEDDING_MODEL, dimensions: 1024, inputs: ['first', 'second'],
+      signal: new AbortController().signal, sendDeadlineMs: Date.now() + 30_000,
     })).resolves.toMatchObject({ vectors: [first, second] })
   })
 
@@ -249,6 +273,7 @@ describe('CloudBase knowledge function', () => {
 
     await expect(embeddings.embed({
       model: EMBEDDING_MODEL, dimensions: 1024, inputs: ['server-approved input'],
+      signal: new AbortController().signal, sendDeadlineMs: Date.now() + 30_000,
     })).rejects.toMatchObject({ code: 'EMBEDDING_MODEL_INVALID' })
   })
 
@@ -400,6 +425,268 @@ describe('CloudBase knowledge function', () => {
     expect(embeddings.embed).not.toHaveBeenCalled()
   })
 
+  it('crash-safe pre-send CAS blocks an admitted operation revoked before disclosure', async () => {
+    const startEntered = deferred<void>()
+    const releaseStart = deferred<void>()
+    let consent: 'granted' | 'revoked' = 'granted'
+    let epoch = 1
+    let leaseState: 'admitted' | 'expired' = 'admitted'
+    const now = Date.now()
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted', vectorEligible: true,
+        keywordCandidates: [candidate('keyword')], vectorRows: [],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_abandoned', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        startEntered.resolve()
+        await releaseStart.promise
+        if (consent !== 'granted' || epoch !== 1) {
+          leaseState = 'expired'
+          return { started: false, state: 'expired' }
+        }
+        return { started: true, state: 'sending', sendDeadlineMs: now + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_set_embedding_consent') {
+        consent = 'revoked'
+        epoch += 1
+        leaseState = 'expired'
+        return {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: EMBEDDING_MODEL, dimensions: 1024, status: 'revoked',
+          retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'keyword_only' }],
+        }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn() }
+    const handler = createKnowledgeHandler({ rpc, embeddings, now: () => now })
+
+    const searching = handler({
+      action: 'searchPublished', query: 'ABANDONED_QUERY_SENTINEL', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+    }, context)
+    await expect(Promise.race([
+      startEntered.promise.then(() => true),
+      after(100).then(() => false),
+    ])).resolves.toBe(true)
+    await expect(handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_abandoned', status: 'revoked',
+    }, context)).resolves.toMatchObject({ ok: true, data: { status: 'revoked' } })
+    releaseStart.resolve()
+
+    await expect(searching).resolves.toMatchObject({ ok: true, data: {
+      mode: 'keyword_only', degradationReason: 'consent_unavailable',
+    } })
+    expect(leaseState).toBe('expired')
+    expect(embeddings.embed).not.toHaveBeenCalled()
+  })
+
+  it('crash-safe release retries idempotent completion after a lost response', async () => {
+    const now = Date.now()
+    let releaseCalls = 0
+    let leaseState: 'sending' | 'released' = 'sending'
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted', vectorEligible: true,
+        keywordCandidates: [candidate('keyword')], vectorRows: [],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_response_lost', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: now + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        releaseCalls += 1
+        if (releaseCalls === 1) {
+          leaseState = 'released'
+          throw { code: 'TRANSIENT_FAILURE' }
+        }
+        return { released: true, state: leaseState }
+      }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockResolvedValue({
+      model: EMBEDDING_MODEL, dimensions: 1024, vectors: [Array(1024).fill(0.25)],
+    }) }
+    const handler = createKnowledgeHandler({ rpc, embeddings, now: () => now })
+
+    await expect(handler({
+      action: 'searchPublished', query: 'release retry', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+    }, context)).resolves.toMatchObject({ ok: true, data: {
+      mode: 'hybrid', degradationReason: null,
+    } })
+    expect(releaseCalls).toBe(2)
+    expect(leaseState).toBe('released')
+  })
+
+  it('crash-safe release failure preserves the original provider error', async () => {
+    const now = Date.now()
+    let releaseCalls = 0
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted', vectorEligible: true,
+        keywordCandidates: [candidate('keyword')], vectorRows: [],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_provider_failure', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: now + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        releaseCalls += 1
+        throw { code: 'TRANSIENT_FAILURE' }
+      }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockRejectedValue({ code: 'MODEL_DEPRECATED' }) }
+    const handler = createKnowledgeHandler({ rpc, embeddings, now: () => now })
+
+    await expect(handler({
+      action: 'searchPublished', query: 'provider failure', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+    }, context)).resolves.toMatchObject({ ok: true, data: {
+      mode: 'keyword_only', degradationReason: 'model_deprecated',
+    } })
+    expect(releaseCalls).toBe(2)
+  })
+
+  it('crash-safe timeout aborts a send and attempts release', async () => {
+    const now = Date.now()
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted', vectorEligible: true,
+        keywordCandidates: [candidate('keyword')], vectorRows: [],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        return { leaseToken: 'lease_timeout', consentEpoch: 1 }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: now + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'released' }
+      }
+      throw new Error(`unexpected ${name}`)
+    })
+    let sendSignal: AbortSignal | undefined
+    const embeddings = { embed: vi.fn(({ signal }: { signal: AbortSignal }) => {
+      sendSignal = signal
+      return new Promise(() => undefined)
+    }) }
+    const handler = createKnowledgeHandler({
+      rpc, embeddings, now: () => now, embeddingTimeoutMs: 5,
+    })
+    const outcome = await Promise.race([
+      handler({
+        action: 'searchPublished', query: 'timeout', topK: 8,
+        generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+      }, context),
+      after(100).then(() => ({ ok: false, error: { code: 'TEST_TIMEOUT' } })),
+    ])
+
+    expect(outcome).toMatchObject({ ok: true, data: {
+      mode: 'keyword_only', degradationReason: 'provider_unavailable',
+    } })
+    expect(rpc).toHaveBeenCalledWith('autoforge_knowledge_complete_embedding_send', {
+      p_caller_user_id: context.auth.uid,
+      p_lease_token: 'lease_timeout',
+      p_consent_epoch: 1,
+    })
+    expect(sendSignal?.aborted).toBe(true)
+  })
+
+  it('crash-safe revocation expires a stranded sending lease at its fixed deadline', async () => {
+    let now = Date.now()
+    let consent: 'granted' | 'revoked' = 'granted'
+    let epoch = 1
+    let leaseState: 'admitted' | 'sending' | 'released' | 'expired' = 'admitted'
+    let sendDeadlineMs = 0
+    let releaseFailures = 2
+    let vectorsDeleted = false
+    const deadlineReached = deferred<void>()
+    const info = vi.fn()
+    const rpc = vi.fn(async (name: string) => {
+      if (name === 'autoforge_knowledge_search_published') return {
+        embeddingConsentStatus: 'granted', vectorEligible: true,
+        keywordCandidates: [candidate('keyword')], vectorRows: [],
+      }
+      if (name === 'autoforge_knowledge_begin_embedding_send') {
+        if (consent !== 'granted') throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
+        leaseState = 'admitted'
+        return { leaseToken: 'lease_stranded', consentEpoch: epoch }
+      }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        if (consent !== 'granted' || epoch !== 1 || leaseState !== 'admitted') {
+          leaseState = 'expired'
+          return { started: false, state: 'expired' }
+        }
+        leaseState = 'sending'
+        sendDeadlineMs = now + 30_000
+        return { started: true, state: 'sending', sendDeadlineMs }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        if (releaseFailures > 0) {
+          releaseFailures -= 1
+          throw { code: 'TRANSIENT_FAILURE' }
+        }
+        leaseState = 'released'
+        return { released: true, state: leaseState }
+      }
+      if (name === 'autoforge_knowledge_set_embedding_consent') {
+        consent = 'revoked'
+        epoch += 1
+        if (leaseState === 'admitted') leaseState = 'expired'
+        if (leaseState === 'sending' && now < sendDeadlineMs) await deadlineReached.promise
+        if (leaseState === 'sending' && now >= sendDeadlineMs) leaseState = 'expired'
+        vectorsDeleted = true
+        return {
+          processor: 'tokenhub', processingRegion: 'Guangzhou',
+          model: EMBEDDING_MODEL, dimensions: 1024, status: 'revoked',
+          retrievalByBase: [{ knowledgeBaseId: 'kb_1', retrievalMode: 'keyword_only' }],
+        }
+      }
+      throw new Error(`unexpected ${name}`)
+    })
+    const embeddings = { embed: vi.fn().mockResolvedValue({
+      model: EMBEDDING_MODEL, dimensions: 1024, vectors: [Array(1024).fill(0.25)],
+    }) }
+    const handler = createKnowledgeHandler({
+      rpc, embeddings, logger: { info }, now: () => now,
+    })
+
+    await expect(handler({
+      action: 'searchPublished', query: 'STRANDED_QUERY_SENTINEL', topK: 8,
+      generationSnapshot: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_live' }],
+    }, context)).resolves.toMatchObject({ ok: true, data: {
+      mode: 'keyword_only', degradationReason: 'provider_unavailable',
+    } })
+    expect(leaseState).toBe('sending')
+    const revoking = handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_stranded', status: 'revoked',
+    }, context)
+    await Promise.resolve()
+    await expect(rpc('autoforge_knowledge_begin_embedding_send', {
+      p_caller_user_id: context.auth.uid, p_purpose: 'query',
+    })).rejects.toMatchObject({ code: 'EMBEDDING_CONSENT_REQUIRED' })
+    expect(vectorsDeleted).toBe(false)
+    now = sendDeadlineMs
+    deadlineReached.resolve()
+
+    await expect(revoking).resolves.toMatchObject({ ok: true, data: { status: 'revoked' } })
+    expect(leaseState).toBe('expired')
+    expect(vectorsDeleted).toBe(true)
+    const diagnostics = JSON.stringify(info.mock.calls)
+    expect(diagnostics).not.toContain('lease_stranded')
+    expect(diagnostics).not.toContain('STRANDED_QUERY_SENTINEL')
+  })
+
   it('keeps the last published generation live and degrades on embedding outage or deprecation', async () => {
     const embeddings = {
       embed: vi.fn().mockRejectedValue(Object.assign(new Error('provider payload'), {
@@ -416,7 +703,12 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_begin_embedding_send') {
         return { leaseToken: 'lease_query_outage', consentEpoch: 1 }
       }
-      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: Date.now() + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'released' }
+      }
       throw new Error(`unexpected ${name}`)
     })
     const handler = createKnowledgeHandler({ rpc, embeddings, logger: { info } })
@@ -464,7 +756,12 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_begin_embedding_send') {
         return { leaseToken: 'lease_build', consentEpoch: 1 }
       }
-      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: Date.now() + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'released' }
+      }
       if (name === 'autoforge_knowledge_complete_embedding_generation') {
         return { generationId: 'generation_shadow', status: 'ready' }
       }
@@ -490,7 +787,8 @@ describe('CloudBase knowledge function', () => {
     } })
     expect(order).toEqual([
       'autoforge_knowledge_prepare_embedding_generation',
-      'autoforge_knowledge_begin_embedding_send', 'tokenhub',
+      'autoforge_knowledge_begin_embedding_send',
+      'autoforge_knowledge_start_embedding_send', 'tokenhub',
       'autoforge_knowledge_complete_embedding_send',
       'autoforge_knowledge_complete_embedding_generation',
       'autoforge_knowledge_publish_generation',
@@ -508,7 +806,12 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_begin_embedding_send') {
         return { leaseToken: 'lease_drift', consentEpoch: 1 }
       }
-      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: Date.now() + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'released' }
+      }
       if (name === 'autoforge_knowledge_prepare_drift_generation') return {
         drifted: false, publishedGenerationId: 'generation_live',
       }
@@ -525,10 +828,11 @@ describe('CloudBase knowledge function', () => {
     }, context)).resolves.toEqual({ ok: true, data: {
       drifted: false, publishedGenerationId: 'generation_live',
     } })
-    expect(embeddings.embed).toHaveBeenCalledWith({
+    expect(embeddings.embed).toHaveBeenCalledWith(expect.objectContaining({
       model: EMBEDDING_MODEL, dimensions: 1024,
       inputs: ['autoforge:knowledge:embedding-drift-probe:v1'],
-    })
+      signal: expect.any(AbortSignal), sendDeadlineMs: expect.any(Number),
+    }))
     expect(rpc).not.toHaveBeenCalledWith(
       'autoforge_knowledge_publish_generation', expect.anything(),
     )
@@ -543,7 +847,12 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_begin_embedding_send') {
         return { leaseToken: 'lease_invalid', consentEpoch: 1 }
       }
-      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: Date.now() + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'released' }
+      }
       if (name === 'autoforge_knowledge_fail_embedding_generation') return { failed: true }
       throw new Error(`unexpected ${name}`)
     })
@@ -580,7 +889,12 @@ describe('CloudBase knowledge function', () => {
       if (name === 'autoforge_knowledge_begin_embedding_send') {
         return { leaseToken: 'lease_publish_race', consentEpoch: 1 }
       }
-      if (name === 'autoforge_knowledge_complete_embedding_send') return { released: true }
+      if (name === 'autoforge_knowledge_start_embedding_send') {
+        return { started: true, state: 'sending', sendDeadlineMs: Date.now() + 30_000 }
+      }
+      if (name === 'autoforge_knowledge_complete_embedding_send') {
+        return { released: true, state: 'released' }
+      }
       if (name === 'autoforge_knowledge_complete_embedding_generation') return {
         generationId: 'generation_shadow', status: 'ready',
       }
@@ -625,7 +939,7 @@ describe('CloudBase knowledge migration contract', () => {
     expect(consent).toContain("'embedding_reindex'")
   })
 
-  it('serializes TokenHub send admission with revocation and drains admitted sends', async () => {
+  it('defines the crash-safe finite-state send protocol and bounded revocation', async () => {
     const sql = await readFile(
       new URL('../../cloudbase/knowledge/migrations/0001_personal_knowledge.sql', import.meta.url),
       'utf8',
@@ -636,23 +950,54 @@ describe('CloudBase knowledge migration contract', () => {
     const completeSend = sql.match(
       /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_complete_embedding_send[\s\S]*?\n\$\$;/,
     )?.[0]
+    const startSend = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_start_embedding_send[\s\S]*?\n\$\$;/,
+    )?.[0]
     const setConsent = sql.match(
       /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_set_embedding_consent[\s\S]*?\n\$\$;/,
+    )?.[0]
+    const cleanup = sql.match(
+      /CREATE OR REPLACE FUNCTION public\.autoforge_knowledge_cleanup_retention[\s\S]*?\n\$\$;/,
     )?.[0]
 
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.knowledge_embedding_send_leases')
     expect(sql).toContain('authorization_epoch bigint NOT NULL DEFAULT 0')
+    expect(sql).toContain("state varchar(16) NOT NULL DEFAULT 'admitted'")
+    expect(sql).toContain("CHECK (state IN ('admitted', 'sending', 'released', 'expired'))")
+    expect(sql).toContain('expires_at timestamptz NOT NULL')
     expect(beginSend).toContain('FOR UPDATE')
     expect(beginSend).toContain("consent.status <> 'granted'")
     expect(beginSend).toContain('consent.authorization_epoch')
     expect(beginSend).toContain('INSERT INTO public.knowledge_embedding_send_leases')
-    expect(completeSend).toContain('DELETE FROM public.knowledge_embedding_send_leases')
+    expect(beginSend).toContain("interval '10 seconds'")
+    expect(startSend).toContain('FOR UPDATE')
+    expect(startSend).toContain("lease.state <> 'admitted'")
+    expect(startSend).toContain('lease.expires_at <= clock_timestamp()')
+    expect(startSend).toContain('consent.authorization_epoch <> p_consent_epoch')
+    expect(startSend).toContain("SET state = 'sending'")
+    expect(startSend).toContain("interval '30 seconds'")
+    expect(startSend).toContain("'sendDeadlineMs'")
+    expect(completeSend).toContain("state IN ('admitted', 'sending')")
+    expect(completeSend).toContain("'released', true")
+    expect(completeSend).not.toContain("MESSAGE = 'CONFLICT'")
     expect(setConsent).toContain('authorization_epoch =')
+    expect(setConsent).toContain("state = 'admitted'")
+    expect(setConsent).toContain("SET state = 'expired'")
     expect(setConsent).toContain('WHILE EXISTS')
+    expect(setConsent).toContain("send.state = 'sending'")
+    expect(setConsent).toContain('send.expires_at > clock_timestamp()')
     expect(setConsent).toContain('public.knowledge_embedding_send_leases')
     expect(setConsent).toContain('PERFORM pg_sleep')
+    expect(cleanup).toContain("state IN ('released', 'expired')")
+    expect(cleanup).toContain("interval '7 days'")
     expect(sql).toContain(
       'REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) FROM PUBLIC, anon, authenticated',
+    )
+    expect(sql).toContain(
+      'REVOKE ALL ON FUNCTION public.autoforge_knowledge_start_embedding_send(varchar, varchar, bigint) FROM PUBLIC, anon, authenticated',
+    )
+    expect(sql).toContain(
+      'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_start_embedding_send(varchar, varchar, bigint) TO service_role',
     )
     expect(sql).toContain(
       'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) TO service_role',
@@ -882,6 +1227,12 @@ describe('CloudBase knowledge migration contract', () => {
     expect(featureSql).toContain('FOREIGN KEY(owner_id, knowledge_base_id, document_id)')
     expect(featureSql).toContain('FOREIGN KEY(owner_id, knowledge_base_id, source_object_id)')
     expect(featureSql).not.toContain('ON ALL SEQUENCES IN SCHEMA public')
+    expect(rollback).toContain(
+      'REVOKE ALL ON FUNCTION public.autoforge_knowledge_start_embedding_send(varchar, varchar, bigint) FROM service_role',
+    )
+    expect(rollback).toContain(
+      'DROP FUNCTION IF EXISTS public.autoforge_knowledge_start_embedding_send(varchar, varchar, bigint)',
+    )
     for (const sequence of [
       'knowledge_changes_sequence_seq', 'knowledge_tombstones_id_seq',
       'knowledge_conflicts_id_seq',

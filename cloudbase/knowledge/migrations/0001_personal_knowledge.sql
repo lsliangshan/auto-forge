@@ -186,11 +186,21 @@ CREATE TABLE IF NOT EXISTS public.knowledge_embedding_send_leases (
     ON DELETE CASCADE,
   consent_epoch bigint NOT NULL CHECK (consent_epoch >= 0),
   purpose varchar(16) NOT NULL CHECK (purpose IN ('query', 'index', 'drift')),
+  state varchar(16) NOT NULL DEFAULT 'admitted'
+    CHECK (state IN ('admitted', 'sending', 'released', 'expired')),
+  expires_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   admitted_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(owner_id, lease_token)
 );
+ALTER TABLE public.knowledge_embedding_send_leases
+  ADD COLUMN IF NOT EXISTS state varchar(16) NOT NULL DEFAULT 'admitted'
+    CHECK (state IN ('admitted', 'sending', 'released', 'expired')),
+  ADD COLUMN IF NOT EXISTS expires_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+DROP INDEX IF EXISTS public.knowledge_embedding_send_leases_owner_epoch;
 CREATE INDEX IF NOT EXISTS knowledge_embedding_send_leases_owner_epoch
-  ON public.knowledge_embedding_send_leases(owner_id, consent_epoch);
+  ON public.knowledge_embedding_send_leases(owner_id, consent_epoch, state, expires_at);
 
 CREATE TABLE IF NOT EXISTS public.knowledge_generation_chunks (
   owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -1297,14 +1307,74 @@ BEGIN
   IF consent.status <> 'granted' THEN
     RAISE EXCEPTION USING MESSAGE = 'EMBEDDING_CONSENT_REQUIRED', ERRCODE = 'P0001';
   END IF;
+  UPDATE public.knowledge_embedding_send_leases SET
+    state = 'expired', updated_at = clock_timestamp()
+    WHERE owner_id = owner AND state IN ('admitted', 'sending')
+      AND expires_at <= clock_timestamp();
   token := 'lease_' || md5(
     owner::text || ':' || clock_timestamp()::text || ':' || random()::text
   ) || md5(clock_timestamp()::text || ':' || random()::text);
   INSERT INTO public.knowledge_embedding_send_leases(
-    lease_token, owner_id, consent_epoch, purpose
-  ) VALUES (token, owner, consent.authorization_epoch, p_purpose);
+    lease_token, owner_id, consent_epoch, purpose, state, expires_at, updated_at
+  ) VALUES (
+    token, owner, consent.authorization_epoch, p_purpose, 'admitted',
+    clock_timestamp() + interval '10 seconds', clock_timestamp()
+  );
   RETURN jsonb_build_object(
     'leaseToken', token, 'consentEpoch', consent.authorization_epoch
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_start_embedding_send(
+  p_caller_user_id varchar, p_lease_token varchar, p_consent_epoch bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  lease public.knowledge_embedding_send_leases%ROWTYPE;
+  deadline timestamptz;
+BEGIN
+  IF p_lease_token IS NULL OR length(p_lease_token) = 0
+    OR p_consent_epoch IS NULL OR p_consent_epoch < 0 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner FOR UPDATE;
+  SELECT * INTO lease FROM public.knowledge_embedding_send_leases
+    WHERE owner_id = owner AND lease_token = p_lease_token
+      AND consent_epoch = p_consent_epoch FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('started', false, 'state', 'expired');
+  END IF;
+  IF lease.state <> 'admitted' THEN
+    RETURN jsonb_build_object('started', false, 'state', lease.state);
+  END IF;
+  IF consent.status <> 'granted'
+    OR consent.authorization_epoch <> p_consent_epoch
+    OR lease.consent_epoch <> p_consent_epoch
+    OR lease.expires_at <= clock_timestamp() THEN
+    UPDATE public.knowledge_embedding_send_leases SET state = 'expired',
+      expires_at = least(expires_at, clock_timestamp()),
+      updated_at = clock_timestamp()
+      WHERE owner_id = owner AND lease_token = p_lease_token
+        AND consent_epoch = p_consent_epoch AND state = 'admitted';
+    RETURN jsonb_build_object('started', false, 'state', 'expired');
+  END IF;
+  deadline := clock_timestamp() + interval '30 seconds';
+  UPDATE public.knowledge_embedding_send_leases SET state = 'sending',
+    expires_at = deadline, updated_at = clock_timestamp()
+    WHERE owner_id = owner AND lease_token = p_lease_token
+      AND consent_epoch = p_consent_epoch AND state = 'admitted';
+  RETURN jsonb_build_object(
+    'started', true, 'state', 'sending',
+    'sendDeadlineMs', floor(extract(epoch FROM deadline) * 1000)::bigint
   );
 END;
 $$;
@@ -1319,20 +1389,24 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
-  removed integer;
+  lease_state varchar := 'released';
 BEGIN
   IF p_lease_token IS NULL OR length(p_lease_token) = 0
     OR p_consent_epoch IS NULL OR p_consent_epoch < 0 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
-  DELETE FROM public.knowledge_embedding_send_leases
+  UPDATE public.knowledge_embedding_send_leases SET
+    state = 'released', updated_at = clock_timestamp()
     WHERE owner_id = owner AND lease_token = p_lease_token
-      AND consent_epoch = p_consent_epoch;
-  GET DIAGNOSTICS removed = ROW_COUNT;
-  IF removed <> 1 THEN
-    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+      AND consent_epoch = p_consent_epoch AND state IN ('admitted', 'sending')
+    RETURNING state INTO lease_state;
+  IF NOT FOUND THEN
+    SELECT state INTO lease_state FROM public.knowledge_embedding_send_leases
+      WHERE owner_id = owner AND lease_token = p_lease_token
+        AND consent_epoch = p_consent_epoch;
+    lease_state := COALESCE(lease_state, 'released');
   END IF;
-  RETURN jsonb_build_object('released', true);
+  RETURN jsonb_build_object('released', true, 'state', lease_state);
 END;
 $$;
 
@@ -1380,13 +1454,32 @@ BEGIN
     WHERE owner_id = owner
     RETURNING * INTO STRICT consent;
   IF p_status IN ('denied', 'revoked') THEN
+    UPDATE public.knowledge_embedding_send_leases SET state = 'expired',
+      expires_at = least(expires_at, clock_timestamp()),
+      updated_at = clock_timestamp()
+      WHERE owner_id = owner AND consent_epoch < consent.authorization_epoch
+        AND state = 'admitted';
+    UPDATE public.knowledge_embedding_send_leases SET
+      state = 'expired', updated_at = clock_timestamp()
+      WHERE owner_id = owner AND consent_epoch < consent.authorization_epoch
+        AND state = 'sending' AND expires_at <= clock_timestamp();
     WHILE EXISTS (
       SELECT 1 FROM public.knowledge_embedding_send_leases send
       WHERE send.owner_id = owner
         AND send.consent_epoch < consent.authorization_epoch
+        AND send.state = 'sending'
+        AND send.expires_at > clock_timestamp()
     ) LOOP
       PERFORM pg_sleep(0.01);
+      UPDATE public.knowledge_embedding_send_leases SET
+        state = 'expired', updated_at = clock_timestamp()
+        WHERE owner_id = owner AND consent_epoch < consent.authorization_epoch
+          AND state = 'sending' AND expires_at <= clock_timestamp();
     END LOOP;
+    UPDATE public.knowledge_embedding_send_leases SET
+      state = 'expired', updated_at = clock_timestamp()
+      WHERE owner_id = owner AND consent_epoch < consent.authorization_epoch
+        AND state = 'sending';
     DELETE FROM public.knowledge_chunk_embeddings WHERE owner_id = owner;
   ELSIF p_status = 'granted' AND previous_status <> 'granted' THEN
     INSERT INTO public.knowledge_jobs(
@@ -1998,6 +2091,7 @@ DECLARE
   pruned_changes integer := 0;
   pruned_tombstones integer := 0;
   pruned_generations integer := 0;
+  pruned_embedding_send_leases integer := 0;
 BEGIN
   IF p_worker_id IS NULL OR length(p_worker_id) = 0 OR p_limit NOT BETWEEN 1 AND 10000 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
@@ -2047,9 +2141,17 @@ BEGIN
       ORDER BY retired.retain_until LIMIT p_limit
     );
   GET DIAGNOSTICS pruned_generations = ROW_COUNT;
+  DELETE FROM public.knowledge_embedding_send_leases WHERE lease_token IN (
+    SELECT lease_token FROM public.knowledge_embedding_send_leases
+    WHERE state IN ('released', 'expired')
+      AND updated_at <= clock_timestamp() - interval '7 days'
+    ORDER BY updated_at LIMIT p_limit
+  );
+  GET DIAGNOSTICS pruned_embedding_send_leases = ROW_COUNT;
   RETURN jsonb_build_object(
     'prunedChanges', pruned_changes, 'prunedTombstones', pruned_tombstones,
-    'prunedGenerations', pruned_generations
+    'prunedGenerations', pruned_generations,
+    'prunedEmbeddingSendLeases', pruned_embedding_send_leases
   );
 END;
 $$;
@@ -2076,6 +2178,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) FROM
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_start_embedding_send(varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_capture_published_snapshot(varchar, jsonb) FROM PUBLIC, anon, authenticated;
@@ -2127,6 +2230,7 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_job(varchar, varchar) T
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_embedding_send(varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_start_embedding_send(varchar, varchar, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_send(varchar, varchar, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_capture_published_snapshot(varchar, jsonb) TO service_role;

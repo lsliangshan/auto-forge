@@ -1,4 +1,4 @@
-/* global Buffer, fetch, module, require */
+/* global AbortController, Buffer, clearTimeout, fetch, module, require, setTimeout */
 
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
@@ -30,6 +30,10 @@ const {
   reciprocalRankFusion,
   validEmbedding,
 } = require('./hybrid-retrieval.js')
+
+const EMBEDDING_SEND_TIMEOUT_MS = 20_000
+const EMBEDDING_RELEASE_TIMEOUT_MS = 2_000
+const EMBEDDING_RELEASE_ATTEMPTS = 2
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -282,7 +286,45 @@ function degradationFor(error) {
     : 'provider_unavailable'
 }
 
-async function withEmbeddingSendAuthorization({ uid, rpc, purpose, send }) {
+async function withTimeout(promise, timeoutMs, onTimeout) {
+  let timeout
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          try { onTimeout?.() } catch { /* Timeout remains authoritative. */ }
+          reject({ code: 'TRANSIENT_FAILURE' })
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function releaseEmbeddingSend({ uid, rpc, authorization, releaseTimeoutMs }) {
+  for (let attempt = 0; attempt < EMBEDDING_RELEASE_ATTEMPTS; attempt += 1) {
+    try {
+      const completed = await withTimeout(
+        rpc('autoforge_knowledge_complete_embedding_send', {
+          p_caller_user_id: uid,
+          p_lease_token: authorization.leaseToken,
+          p_consent_epoch: authorization.consentEpoch,
+        }),
+        releaseTimeoutMs,
+      )
+      if (isRecord(completed)
+        && completed.released === true
+        && (completed.state === 'released' || completed.state === 'expired')) return true
+    } catch { /* Retry once; the SQL transition is idempotent. */ }
+  }
+  return false
+}
+
+async function withEmbeddingSendAuthorization({
+  uid, rpc, purpose, send, now, embeddingTimeoutMs, releaseTimeoutMs,
+}) {
   const authorization = await rpc('autoforge_knowledge_begin_embedding_send', {
     p_caller_user_id: uid,
     p_purpose: purpose,
@@ -291,24 +333,46 @@ async function withEmbeddingSendAuthorization({ uid, rpc, purpose, send }) {
     || !nonEmptyString(authorization.leaseToken)
     || !Number.isSafeInteger(authorization.consentEpoch)
     || authorization.consentEpoch < 0) throw { code: 'INTERNAL_ERROR' }
-  let response
-  let sendFailure
-  try {
-    response = await send()
-  } catch (error) {
-    sendFailure = { error }
-  }
-  const completed = await rpc('autoforge_knowledge_complete_embedding_send', {
+  const started = await rpc('autoforge_knowledge_start_embedding_send', {
     p_caller_user_id: uid,
     p_lease_token: authorization.leaseToken,
     p_consent_epoch: authorization.consentEpoch,
   })
-  if (!isRecord(completed) || completed.released !== true) throw { code: 'INTERNAL_ERROR' }
-  if (sendFailure) throw sendFailure.error
+  if (isRecord(started) && started.started === false) {
+    throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
+  }
+  if (!isRecord(started)
+    || started.started !== true
+    || started.state !== 'sending'
+    || !Number.isSafeInteger(started.sendDeadlineMs)
+    || started.sendDeadlineMs <= now()) throw { code: 'INTERNAL_ERROR' }
+  const controller = new AbortController()
+  const timeoutMs = Math.min(embeddingTimeoutMs, started.sendDeadlineMs - now())
+  let response
+  let sendError
+  try {
+    response = await withTimeout(
+      Promise.resolve().then(() => {
+        if (started.sendDeadlineMs <= now()) throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
+        return send(controller.signal, started.sendDeadlineMs)
+      }),
+      timeoutMs,
+      () => controller.abort(),
+    )
+  } catch (error) {
+    sendError = error
+  }
+  const released = await releaseEmbeddingSend({
+    uid, rpc, authorization, releaseTimeoutMs,
+  })
+  if (sendError) throw sendError
+  if (!released) throw { code: 'TRANSIENT_FAILURE' }
   return response
 }
 
-async function searchPublished({ event, data, uid, rpc, embeddings, logger }) {
+async function searchPublished({
+  event, data, uid, rpc, embeddings, logger, now, embeddingTimeoutMs, releaseTimeoutMs,
+}) {
   const allowedGenerations = new Map(
     event.generationSnapshot.map(item => [item.generationId, item.knowledgeBaseId]),
   )
@@ -334,8 +398,10 @@ async function searchPublished({ event, data, uid, rpc, embeddings, logger }) {
     if (!embeddings) throw { code: 'TRANSIENT_FAILURE' }
     const response = await withEmbeddingSendAuthorization({
       uid, rpc, purpose: 'query',
-      send: () => embeddings.embed({
+      now, embeddingTimeoutMs, releaseTimeoutMs,
+      send: (signal, sendDeadlineMs) => embeddings.embed({
         model: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS, inputs: [event.query],
+        signal, sendDeadlineMs,
       }),
     })
     const vectors = embeddingResponse(response, 1)
@@ -360,7 +426,9 @@ async function searchPublished({ event, data, uid, rpc, embeddings, logger }) {
   }
 }
 
-async function buildEmbeddingGeneration({ event, data, uid, rpc, embeddings, logger }) {
+async function buildEmbeddingGeneration({
+  event, data, uid, rpc, embeddings, logger, now, embeddingTimeoutMs, releaseTimeoutMs,
+}) {
   if (!isRecord(data) || data.consentStatus !== 'granted'
     || data.generationId !== event.generationId
     || !Array.isArray(data.chunks)
@@ -383,10 +451,13 @@ async function buildEmbeddingGeneration({ event, data, uid, rpc, embeddings, log
     if (inputs.length > 0) {
       const response = await withEmbeddingSendAuthorization({
         uid, rpc, purpose: 'index',
-        send: () => embeddings.embed({
+        now, embeddingTimeoutMs, releaseTimeoutMs,
+        send: (signal, sendDeadlineMs) => embeddings.embed({
           model: EMBEDDING_MODEL,
           dimensions: EMBEDDING_DIMENSIONS,
           inputs,
+          signal,
+          sendDeadlineMs,
         }),
       })
       vectors = embeddingResponse(response, inputs.length)
@@ -452,17 +523,22 @@ async function buildEmbeddingGeneration({ event, data, uid, rpc, embeddings, log
   }
 }
 
-async function probeEmbeddingDrift({ event, data, uid, rpc, embeddings, logger }) {
+async function probeEmbeddingDrift({
+  event, data, uid, rpc, embeddings, logger, now, embeddingTimeoutMs, releaseTimeoutMs,
+}) {
   if (!isRecord(data) || data.status !== 'granted') {
     throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
   }
   if (!embeddings) throw { code: 'TRANSIENT_FAILURE' }
   const response = await withEmbeddingSendAuthorization({
     uid, rpc, purpose: 'drift',
-    send: () => embeddings.embed({
+    now, embeddingTimeoutMs, releaseTimeoutMs,
+    send: (signal, sendDeadlineMs) => embeddings.embed({
       model: EMBEDDING_MODEL,
       dimensions: EMBEDDING_DIMENSIONS,
       inputs: [EMBEDDING_DRIFT_PROBE],
+      signal,
+      sendDeadlineMs,
     }),
   })
   const vectors = embeddingResponse(response, 1)
@@ -483,12 +559,26 @@ async function probeEmbeddingDrift({ event, data, uid, rpc, embeddings, logger }
   const published = await buildEmbeddingGeneration({
     event,
     data: { ...prepared, consentStatus: 'granted', probeVector: vectors[0] },
-    uid, rpc, embeddings, logger,
+    uid, rpc, embeddings, logger, now, embeddingTimeoutMs, releaseTimeoutMs,
   })
   return { drifted: true, ...published }
 }
 
-function createKnowledgeHandler({ rpc, storage, embeddings, logger }) {
+function createKnowledgeHandler({
+  rpc, storage, embeddings, logger, now = Date.now,
+  embeddingTimeoutMs = EMBEDDING_SEND_TIMEOUT_MS,
+  releaseTimeoutMs = EMBEDDING_RELEASE_TIMEOUT_MS,
+}) {
+  const boundedEmbeddingTimeoutMs = Math.min(
+    Number.isFinite(embeddingTimeoutMs) && embeddingTimeoutMs > 0
+      ? embeddingTimeoutMs : EMBEDDING_SEND_TIMEOUT_MS,
+    EMBEDDING_SEND_TIMEOUT_MS,
+  )
+  const boundedReleaseTimeoutMs = Math.min(
+    Number.isFinite(releaseTimeoutMs) && releaseTimeoutMs > 0
+      ? releaseTimeoutMs : EMBEDDING_RELEASE_TIMEOUT_MS,
+    EMBEDDING_RELEASE_TIMEOUT_MS,
+  )
   return async (rawEvent, context) => {
     const uid = callerUid(context)
     if (!uid) return { ok: false, error: { code: 'AUTH_REQUIRED' } }
@@ -499,17 +589,23 @@ function createKnowledgeHandler({ rpc, storage, embeddings, logger }) {
       const data = await rpc(parsed[0], parsed[1])
       if (event.action === 'searchPublished') {
         return { ok: true, data: await searchPublished({
-          event, data, uid, rpc, embeddings, logger,
+          event, data, uid, rpc, embeddings, logger, now,
+          embeddingTimeoutMs: boundedEmbeddingTimeoutMs,
+          releaseTimeoutMs: boundedReleaseTimeoutMs,
         }) }
       }
       if (event.action === 'buildEmbeddingGeneration') {
         return { ok: true, data: await buildEmbeddingGeneration({
-          event, data, uid, rpc, embeddings, logger,
+          event, data, uid, rpc, embeddings, logger, now,
+          embeddingTimeoutMs: boundedEmbeddingTimeoutMs,
+          releaseTimeoutMs: boundedReleaseTimeoutMs,
         }) }
       }
       if (event.action === 'probeEmbeddingDrift') {
         return { ok: true, data: await probeEmbeddingDrift({
-          event, data, uid, rpc, embeddings, logger,
+          event, data, uid, rpc, embeddings, logger, now,
+          embeddingTimeoutMs: boundedEmbeddingTimeoutMs,
+          releaseTimeoutMs: boundedReleaseTimeoutMs,
         }) }
       }
       if (event.action === 'authorizeUpload') {
@@ -550,19 +646,26 @@ function createKnowledgeHandler({ rpc, storage, embeddings, logger }) {
 function createTokenHubEmbeddingClient({ baseUrl, apiKey, fetchImpl = fetch }) {
   const normalizedBaseUrl = typeof baseUrl === 'string' ? baseUrl.replace(/\/$/, '') : ''
   return {
-    async embed({ model, dimensions, inputs }) {
+    async embed({ model, dimensions, inputs, signal, sendDeadlineMs }) {
       if (!normalizedBaseUrl || !apiKey
         || model !== EMBEDDING_MODEL
         || dimensions !== EMBEDDING_DIMENSIONS
         || !Array.isArray(inputs) || inputs.length < 1) throw { code: 'TRANSIENT_FAILURE' }
+      if (!Number.isSafeInteger(sendDeadlineMs) || sendDeadlineMs <= Date.now()) {
+        throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
+      }
+      if (!signal || signal.aborted) throw { code: 'TRANSIENT_FAILURE' }
       let response
       try {
+        if (sendDeadlineMs <= Date.now()) throw { code: 'EMBEDDING_CONSENT_REQUIRED' }
         response = await fetchImpl(`${normalizedBaseUrl}/v1/embeddings`, {
           method: 'POST',
           headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
           body: JSON.stringify({ model: EMBEDDING_MODEL, input: inputs }),
+          signal,
         })
-      } catch {
+      } catch (error) {
+        if (isRecord(error) && error.code === 'EMBEDDING_CONSENT_REQUIRED') throw error
         throw { code: 'TRANSIENT_FAILURE' }
       }
       const body = await response.json().catch(() => undefined)

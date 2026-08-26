@@ -151,3 +151,100 @@
 - Live embedding/vector/RLS/concurrency behavior remains unverified and blocks release under the task ruling.
 - The durable-lease crash-recovery procedure must be designed and exercised before enabling TokenHub sends.
 - The unrelated Application context-summary test still fails only with the required `CONTEXT_LIMIT_EXCEEDED` baseline.
+
+## Fix Round 2
+
+### Implementation
+
+- Replaced the unbounded admitted-send row with a durable finite-state lease: `admitted -> sending -> released | expired`. Admission expires after 10 seconds; the immediate pre-send CAS re-locks consent and the lease, verifies granted consent plus the current epoch/token/state/deadline, and creates one fixed, non-extendable 30-second sending deadline. Stale, expired, released, or old-epoch leases cannot transition to send.
+- Made Function-side disclosure bounded and fail-closed. TokenHub work starts only after the SQL transition, has a 20-second abort timeout capped by the SQL deadline, and the TokenHub adapter refuses an already-expired server deadline before calling `fetch`. Query text, chunk text, lease tokens, and raw provider payloads are not logged.
+- Made completion idempotent and retry-safe. Function attempts release twice, with each attempt bounded to two seconds. A lost response can be retried after the SQL state is already terminal. If the provider failed, that original safe provider error remains authoritative even when release also fails; if the provider succeeded but release cannot be confirmed, no vector result proceeds to storage/search and the operation degrades safely.
+- Made revocation crash-recoverable without an indefinite wait. The consent row lock advances the epoch and closes admission first, immediately expires old admitted leases, waits only for genuinely sending old leases until their immutable deadlines, expires them, then deletes vectors. A Function crash or lost release response therefore delays revocation by at most the remaining fixed sending lease instead of stranding consent forever.
+- Added seven-day cleanup for terminal send leases, service-role-only RBAC for the new start transition, coherent rollback entries, and byte-identical canonical/versioned migrations. No live service was contacted and no cloud/beta gate was opened.
+
+### Exact RED/GREEN evidence
+
+#### Intended RED before production changes
+
+Command:
+
+```text
+pnpm exec vitest run tests/cloudbase/knowledge-handler.test.ts --config vitest.config.ts -t "crash-safe"
+```
+
+Exact focused result:
+
+```text
+tests/cloudbase/knowledge-handler.test.ts (38 tests | 7 failed | 31 skipped)
+× crash-safe adapter refuses an expired SQL send deadline before fetch
+× crash-safe pre-send CAS blocks an admitted operation revoked before disclosure
+× crash-safe release retries idempotent completion after a lost response
+× crash-safe release failure preserves the original provider error
+× crash-safe timeout aborts a send and attempts release
+× crash-safe revocation expires a stranded sending lease at its fixed deadline
+× defines the crash-safe finite-state send protocol and bounded revocation
+
+Test Files  1 failed (1)
+Tests       7 failed | 31 skipped (38)
+Duration    363ms
+```
+
+The failures showed the intended missing behavior: the adapter fetched past an expired deadline; no start CAS was called; one-shot completion changed hybrid success to `provider_unavailable`; release failure masked `MODEL_DEPRECATED`; a hung provider hit the test timeout; the stranded lease remained `admitted`; and the migration had no finite-state/expiry contract.
+
+#### GREEN after the minimal fix
+
+The exact same focused command produced:
+
+```text
+Test Files  1 passed (1)
+Tests       7 passed | 31 skipped (38)
+Duration    143ms
+```
+
+Additional exact covering results:
+
+- `pnpm exec vitest run tests/cloudbase/knowledge-handler.test.ts --config vitest.config.ts` -> `1 passed`, `38 passed`.
+- `pnpm exec vitest run packages/shared/src/contracts.test.ts apps/desktop/electron/preload/bridge.test.ts apps/desktop/electron/main/ipc/register-ipc.test.ts apps/desktop/electron/main/knowledge/cloudbase-knowledge-client.test.ts tests/cloudbase/knowledge-handler.test.ts tests/cloudbase/user-role-handler.test.ts --config vitest.config.ts` -> `6 passed`, `183 passed`.
+- From `apps/desktop`, `node scripts/run-vitest-electron.mjs run electron/main/knowledge electron/main/application.test.ts --config vitest.node.config.ts` -> all 11 Main knowledge files passed; combined result `11 passed | 1 failed`, `281 passed | 1 failed`, with only the required `CONTEXT_LIMIT_EXCEEDED` Application baseline.
+- From `apps/desktop`, `node scripts/run-vitest-electron.mjs run tests/components/knowledge.test.ts --config vitest.config.ts` -> `1 passed`, `38 passed`.
+- From `apps/desktop`, `pnpm test` -> Renderer `10 passed`, `382 passed`; Node `91 passed | 1 failed`, `2410 passed | 1 failed`, with only the same required `CONTEXT_LIMIT_EXCEEDED` baseline.
+- `pnpm typecheck` -> all four typed workspace projects passed.
+- `pnpm lint` -> exit 0, `0 errors`, unchanged `422 warnings`.
+- `pnpm build` -> shared/workflow packages plus Electron Main, Preload, Renderer, and worker builds passed.
+- `node --check cloudbase/knowledge/function/knowledge-handler.js` and `node --check cloudbase/knowledge/function/index.js` -> exit 0.
+- Forward migration `cmp` -> exit 0; both SHA-256 values are `cbe4a9f1157233a0c15ad3d5c57cadd9f3a9d8fd5e112dff7945cba8090c8d73`.
+- `git diff --check` -> clean. Refined high-risk secret scan -> no matches.
+
+### Files changed
+
+- Function: `cloudbase/knowledge/function/knowledge-handler.js`.
+- Database: `cloudbase/knowledge/migrations/0001_personal_knowledge.sql`, `cloudbase/migrations/20260826120000_personal_knowledge.sql`, and `cloudbase/knowledge/migrations/0001_personal_knowledge.rollback.sql`.
+- Tests: `tests/cloudbase/knowledge-handler.test.ts`.
+- Evidence: this appended Fix Round 2 section in `task-7-report.md`.
+
+### Verification
+
+- Deterministic deferred/interleaving tests cover an admitted operation revoked before disclosure, fixed-deadline recovery of a stranded sending operation, denial of new admission while revocation drains, vector deletion only after the drain, idempotent replay after a lost completion response, two failed release attempts, original-provider-error preservation, timeout abort, and adapter refusal after expiry.
+- SQL contract tests cover the four states, 10-second admitted expiry, immediate current-consent/epoch/token/state/deadline CAS, non-extendable 30-second sending deadline, idempotent terminal completion, admitted cancellation, sending-only bounded revocation wait, seven-day terminal pruning, service-role RBAC, rollback, RLS table inclusion, and exact migration equality.
+- Re-ran shared, Preload/IPC, Application, KnowledgeService/CloudRetriever/cloud client, Function/migration/RBAC, all Main knowledge, and UI knowledge boundaries. Task 7 changes introduced no new failure.
+- Reviewed logs and diagnostics: production logging still contains only mode/reason/count/model/dimension/opaque generation metadata. It does not contain lease tokens, query/chunk/document text, filenames, paths, URLs, credentials, or provider payloads.
+
+### External gates and bounded assumptions
+
+- Repository safety bounds are internal implementation limits, not public performance guarantees: admitted leases are 10 seconds, sending leases are fixed at 30 seconds, TokenHub work times out and aborts at 20 seconds, and two release RPC attempts are each capped at two seconds. Terminal leases are retained for seven days before trusted-worker cleanup.
+- Live validation must prove CloudBase/PostgreSQL permits the revocation transaction to wait through the maximum remaining 30-second sending deadline, `clock_timestamp()` and Function host clocks are sufficiently aligned for the returned epoch-millisecond deadline, and deployed statement/Function timeouts do not abort the safe drain prematurely.
+- Live validation must prove the TokenHub transport honors `AbortSignal` and infrastructure bounds an already-started request within the fixed sending lease. If transport ignores abort, repository code still prevents late result persistence, but the vendor/runtime bound is required before enabling disclosure.
+- Real migration parsing/execution, lock/CAS interleavings, crash/termination recovery, RLS/grants, vector deletion, cleanup scheduling, and TokenHub behavior remain external release gates because no approved pre-production environment or credential exists.
+- Cloud/beta availability remains fail-closed and the kill switch remains enabled.
+
+### Self-review
+
+- Re-read the complete Round 2 production/test/migration diff for indefinite waits, lease extension, late sends, release-error masking, vector persistence after revoke, owner/policy injection, payload-bearing logs, RBAC/RLS omissions, migration drift, rollback ordering, and unrelated Task 1-5 changes.
+- Confirmed every continuation after a provider success requires confirmed terminal release; an unconfirmed release leaves SQL recovery authoritative and prevents vector use. Confirmed provider failure remains authoritative over release failure.
+- Confirmed revoke/start/begin serialize on the consent row; completion remains able to transition a sending lease while revocation waits; no code path extends a sending deadline; expired/old-epoch starts fail closed.
+- Confirmed the controller-owned `progress.md` was not edited or staged by this fix. No real CloudBase or TokenHub call was made.
+
+### Concerns
+
+- Live PostgreSQL/CloudBase, TokenHub abort/timeout, clock alignment, Function transaction duration, RLS, and cleanup scheduling remain unverified release blockers under the ruling.
+- The unrelated Application context-summary suite retains exactly the required `CONTEXT_LIMIT_EXCEEDED` baseline failure.
