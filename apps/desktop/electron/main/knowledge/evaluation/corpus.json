@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "thresholds": {
+    "recallAt8": 0.9,
+    "citationSupport": 0.95,
+    "grounding": 0.95,
+    "noEvidence": 0.95,
+    "supportedDocumentSuccess": 0.99
+  },
+  "supportCases": [
+    { "id": "zh-copula-project", "evidence": "该项目为国家级示范项目。", "claim": "该项目是国家级示范项目。" },
+    { "id": "zh-copula-product", "evidence": "交付产品是智能知识管理平台。", "claim": "交付产品为智能知识管理平台。" },
+    { "id": "zh-location-city", "evidence": "项目位于上海市浦东新区。", "claim": "项目地点是上海市浦东新区。" },
+    { "id": "zh-location-district", "evidence": "数据中心地点为北京市海淀区。", "claim": "数据中心位于北京市海淀区。" },
+    { "id": "zh-signature", "evidence": "协议由双方签署之日起生效。", "claim": "双方签订协议后，协议即开始起效。" },
+    { "id": "zh-color", "evidence": "设备外壳颜色为深蓝色。", "claim": "设备外壳颜色是深蓝色。" },
+    { "id": "zh-organization", "evidence": "报告由华南创新研究院发布。", "claim": "华南创新研究院发布了该报告。" },
+    { "id": "zh-date", "evidence": "合同于 2026-08-01 生效。", "claim": "合同生效日期为 2026-08-01。" },
+    { "id": "en-effective", "evidence": "The agreement takes effect when both parties sign it.", "claim": "The contract becomes effective when both parties sign it." },
+    { "id": "en-permission", "evidence": "The agreement allows early termination.", "claim": "The contract permits early termination." }
+  ],
+  "groundingCases": [
+    { "id": "zh-project-single", "evidence": "该智慧园区重点改造项目将持续提升公共服务能力并按年度稳定运营。", "claim": "该智慧园区重点改造工程将持续提升公共服务能力并按年度稳定运营。" },
+    { "id": "zh-product-single", "evidence": "本次最终交付产品为星河智能知识管理平台企业标准版本并提供长期维护。", "claim": "本次最终交付产品为星海智能知识管理平台企业标准版本并提供长期维护。" },
+    { "id": "zh-color-single", "evidence": "该核心设备外壳必须采用深红色防腐涂层并保持其余技术参数不变。", "claim": "该核心设备外壳必须采用深蓝色防腐涂层并保持其余技术参数不变。" },
+    { "id": "zh-entity-single", "evidence": "本年度综合评估报告由华南创新研究院负责发布并承担后续解释工作。", "claim": "本年度综合评估报告由华北创新研究院负责发布并承担后续解释工作。" },
+    { "id": "zh-company-single", "evidence": "本项目长期技术服务供应商为北京星火科技有限公司并负责全国支持。", "claim": "本项目长期技术服务供应商为北京星海科技有限公司并负责全国支持。" },
+    { "id": "zh-location-single", "evidence": "该重点示范项目的主要实施地点位于杭州市西湖区并持续运营。", "claim": "该重点示范项目的主要实施地点位于杭州市西湖县并持续运营。" },
+    { "id": "zh-model-single", "evidence": "生产环境统一采用 AF-KB-8A 型号设备并执行标准维护方案。", "claim": "生产环境统一采用 AF-KB-8B 型号设备并执行标准维护方案。" },
+    { "id": "zh-role", "evidence": "甲方应在 7 日内付款。", "claim": "乙方应在 7 日内付款。" },
+    { "id": "zh-date", "evidence": "合同于 2026-08-01 生效。", "claim": "合同于 2026-08-02 生效。" },
+    { "id": "zh-currency", "evidence": "服务费为 100 美元。", "claim": "服务费为 100 人民币。" },
+    { "id": "zh-jurisdiction", "evidence": "本合同适用中国法律。", "claim": "本合同适用英国法律。" },
+    { "id": "zh-permission", "evidence": "合同允许提前解除。", "claim": "合同不得提前解除。" },
+    { "id": "zh-number-substring", "evidence": "合同期限为 17 日。", "claim": "合同期限为 7 日。" },
+    { "id": "zh-unrelated", "evidence": "合同经双方签字后生效。", "claim": "月球由奶酪构成。" },
+    { "id": "en-entity", "evidence": "Acme permits early termination.", "claim": "Globex permits early termination." },
+    { "id": "en-polarity", "evidence": "The contract is effective on signature.", "claim": "The contract is not effective on signature." },
+    { "id": "en-permission", "evidence": "The contract permits early termination.", "claim": "The contract prohibits early termination." },
+    { "id": "en-number", "evidence": "Payment is due within 17 days.", "claim": "Payment is due within 7 days." },
+    { "id": "en-currency", "evidence": "The service fee is USD 100.", "claim": "The service fee is EUR 100." },
+    { "id": "en-location", "evidence": "The office is located in Shanghai.", "claim": "The office is located in Beijing." }
+  ],
+  "noEvidenceCases": [
+    "项目是否已经交付？",
+    "合同何时生效？",
+    "供应商是谁？",
+    "设备应采用什么颜色？",
+    "服务费是多少？",
+    "适用哪一国法律？",
+    "数据中心位于哪里？",
+    "报告由谁发布？",
+    "是否允许提前解除？",
+    "付款期限是多少天？"
+  ],
+  "retrievalCases": [
+    { "id": "retrieval-01", "query": "阿尔法合同条款", "body": "阿尔法合同条款规定双方签署后生效。" },
+    { "id": "retrieval-02", "query": "贝塔设备颜色", "body": "贝塔设备颜色必须采用深蓝色。" },
+    { "id": "retrieval-03", "query": "伽马付款期限", "body": "伽马付款期限为十七日。" },
+    { "id": "retrieval-04", "query": "德尔塔服务费用", "body": "德尔塔服务费用为一百美元。" },
+    { "id": "retrieval-05", "query": "星河实施地点", "body": "星河实施地点位于上海市浦东新区。" },
+    { "id": "retrieval-06", "query": "晨光报告由", "body": "晨光报告由华南创新研究院发布。" },
+    { "id": "retrieval-07", "query": "远山协议允许", "body": "远山协议允许提前解除。" },
+    { "id": "retrieval-08", "query": "海风合同适用", "body": "海风合同适用中国法律。" },
+    { "id": "retrieval-09", "query": "云杉交付产品", "body": "云杉交付产品为知识管理平台。" },
+    { "id": "retrieval-10", "query": "青石设备维护", "body": "青石设备维护周期为十二个月。" }
+  ],
+  "supportedDocumentTemplates": [
+    { "mediaType": "application/pdf", "label": "PDF" },
+    { "mediaType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "label": "DOCX" },
+    { "mediaType": "text/plain", "label": "TXT" },
+    { "mediaType": "text/markdown", "label": "Markdown" },
+    { "mediaType": "text/html", "label": "HTML" }
+  ],
+  "samplesPerDocumentTemplate": 20
+}

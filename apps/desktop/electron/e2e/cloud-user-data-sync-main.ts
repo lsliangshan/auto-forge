@@ -18,6 +18,7 @@ import {
   knowledgeEventSchema,
   toSafeAppError,
   type AuthSession,
+  type KnowledgeEntitlementState,
 } from '@autoforge/shared'
 import { createApplicationRuntime, type ApplicationModelProviderPort } from '../main/application.js'
 import type { AuthService } from '../main/auth/auth-service.js'
@@ -34,6 +35,7 @@ import type { NetworkProxyPort } from '../main/network/network-proxy-service.js'
 import { createSecureWindow } from '../main/window.js'
 import { KnowledgeStoreFactory } from '../main/knowledge/encrypted-database.js'
 import { createLocalKnowledgeService } from '../main/knowledge/knowledge-service.js'
+import { CloudKnowledgeRetriever, fixedCloudEmbeddingConfiguration } from '../main/knowledge/cloud-retriever.js'
 import type { ModelStreamRequest } from '../main/chat/model-provider.js'
 
 type FixtureUser = 'alice' | 'bob'
@@ -52,6 +54,7 @@ function fixtureUser(value: string): FixtureUser {
 const desktopRoot = requiredEnvironment('AUTOFORGE_E2E_DESKTOP_ROOT')
 const userData = requiredEnvironment('AUTOFORGE_E2E_USER_DATA')
 const fixtureOrigin = new URL(requiredEnvironment('AUTOFORGE_E2E_USER_DATA_FIXTURE')).origin
+const knowledgeReleaseSmoke = process.env.AUTOFORGE_E2E_KNOWLEDGE_RELEASE === '1'
 const databasePath = join(userData, 'autoforge.sqlite')
 const password = 'password-e2e'
 
@@ -227,6 +230,20 @@ const deterministicProvider: ApplicationModelProviderPort = {
   },
 }
 
+const deterministicDeepseekProvider: ApplicationModelProviderPort = {
+  ...deterministicProvider,
+  async listModels() {
+    return [{
+      id: 'deepseek-chat', name: 'E2E DeepSeek',
+      inputModalities: ['text'], outputModalities: ['text'], supportsTools: true,
+      generation: {},
+    }]
+  },
+  async acquireSnapshot() {
+    return { providerId: 'deepseek', provider: deterministicDeepseekProvider, apiKeyFingerprint: 'e2e-deepseek' }
+  },
+}
+
 const networkProxy: NetworkProxyPort = {
   async initialize() { /* local-only */ },
   async transition() { /* local-only */ },
@@ -245,6 +262,11 @@ let mainWindow: BrowserWindow | null = null
 let runtime: ReturnType<typeof createApplicationRuntime> | undefined
 let disposeIpc: (() => void) | undefined
 let userDataStores: UserDataStoreManager | undefined
+let e2eKnowledgeNow = Date.parse('2026-08-28T00:00:00.000Z')
+const e2eKnowledgeEntitlement: KnowledgeEntitlementState = {
+  tier: 'member', status: 'active', localEnabled: true, betaEnabled: true, cloudEnabled: true,
+  expiresAt: '2026-08-29T00:00:00.000Z', graceEndsAt: '2026-08-31T00:00:00.000Z',
+}
 
 function emit(channel: string, value: unknown): void {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
@@ -331,6 +353,46 @@ async function dispatch(name: string, input: Record<string, unknown>): Promise<u
     }
   }
   if (name === 'providerRequestCount') return providerRequestCount
+  if (name === 'knowledgeAvailability') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return runtime.services.knowledge.getAvailability({ userId: session.user.id })
+  }
+  if (name === 'knowledgeEntitlement') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return runtime.services.knowledge.getEntitlement({ userId: session.user.id })
+  }
+  if (name === 'expireKnowledgeEntitlement') {
+    e2eKnowledgeNow = Date.parse('2026-09-01T00:00:00.001Z')
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return runtime.services.knowledge.getEntitlement({ userId: session.user.id })
+  }
+  if (name === 'embeddingRefusal') {
+    return new CloudKnowledgeRetriever({
+      async search() {
+        return {
+          generationState: 'published',
+          generations: [{ knowledgeBaseId: 'e2e-base', generationId: 'generation-1', previousGenerationId: null }],
+          strategy: 'keyword_only_consent',
+          embedding: fixedCloudEmbeddingConfiguration,
+          keywordCandidates: [],
+          vectorCandidates: [],
+          driftProbeRequired: false,
+        }
+      },
+    }).search('本机拒绝嵌入', ['e2e-base'])
+  }
+  if (name === 'switchKnowledgeProvider') {
+    const settings = await runtime.services.settings.update({ activeProvider: 'deepseek' })
+    return settings.activeProvider
+  }
+  if (name === 'deepseekKnowledgeConsent') {
+    const session = await runtime.services.auth.getSession()
+    if (!session) throw new Error('Knowledge release smoke session is unavailable')
+    return runtime.services.knowledge.getConsent({ userId: session.user.id }, 'deepseek')
+  }
   throw new Error(`Unknown cloud user-data E2E command: ${name}`)
 }
 
@@ -364,7 +426,12 @@ async function initialize(): Promise<void> {
       terminateAll: async () => undefined,
     }),
     saveExport: async () => undefined,
-    isMember: () => false,
+    isMember: () => knowledgeReleaseSmoke,
+    ...(knowledgeReleaseSmoke ? {
+      entitlement: () => e2eKnowledgeEntitlement,
+      now: () => e2eKnowledgeNow,
+      cloudKillSwitchEnabled: () => true,
+    } : {}),
     emit: event => {
       const parsed = knowledgeEventSchema.safeParse(event)
       if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
@@ -405,7 +472,7 @@ async function initialize(): Promise<void> {
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
     knowledgeService,
-    modelProviders: { openrouter: deterministicProvider },
+    modelProviders: { openrouter: deterministicProvider, deepseek: deterministicDeepseekProvider },
     chooseProjectDirectory: async () => undefined,
     chooseMediaFiles: async () => [],
     chooseAvatarFile: async () => undefined,
@@ -425,6 +492,7 @@ async function initialize(): Promise<void> {
     appInfo: { version: '0.1.0-e2e', platform: process.platform === 'win32' ? 'win32' : 'darwin' },
   })
   await runtime.services.settings.saveProviderApiKey('openrouter', 'e2e-openrouter-key')
+  await runtime.services.settings.saveProviderApiKey('deepseek', 'e2e-deepseek-key')
   await runtime.services.settings.update({
     activeProvider: 'openrouter',
     defaultModels: {

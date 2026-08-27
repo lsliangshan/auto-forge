@@ -190,7 +190,11 @@ function canonicalSupportText(value: string): string {
     .replace(/^(?:(?:但是|但|然而|不过|而且|并且|同时|以及|且|所以|因此)|\b(?:and|or|but|however|while|whereas|although|though|yet|also|moreover)\b)\s*/iu, '')
     .replace(/(?:签订|签字)/gu, '签署')
     .replace(/(?:开始起效|开始生效|起效)/gu, '生效')
+    .replace(/生效日期/gu, '生效')
     .replace(/(?:协定|契约)/gu, '协议')
+    .replace(/(?:地点(?:为|是)|位于)/gu, '位置')
+    .replace(/[为是]/gu, '')
+    .replace(/(?:负责发布|发布了)/gu, '发布')
     .replace(/\b(?:agreement|accord)\b/giu, 'contract')
     .replace(/\b(?:takes? effect|comes? into force|becomes? effective)\b/giu, 'effective')
     .replace(/\b(?:allows?|authori[sz]es?)\b/giu, 'permits')
@@ -284,17 +288,16 @@ function cjkMaterialText(value: string): string {
   return value
     .replace(/(?:之日起|即可)/gu, '')
     .replace(/[^一-鿿]/gu, '')
-    .replace(/[由于在的了着后即经则将为和与及]/gu, '')
+    .replace(/[该由于在的了着后即经则将为和与及]/gu, '')
 }
 
 function cjkMaterialTokens(value: string): string[] {
   const characters = [...cjkMaterialText(value)]
   if (characters.length <= 2) return characters.length === 0 ? [] : [characters.join('')]
   const tokens: string[] = []
-  for (let index = 0; index + 1 < characters.length; index += 2) {
+  for (let index = 0; index + 1 < characters.length; index += 1) {
     tokens.push(`${characters[index]}${characters[index + 1]}`)
   }
-  if (characters.length % 2 === 1) tokens.push(`${characters.at(-2)}${characters.at(-1)}`)
   return [...new Set(tokens)]
 }
 
@@ -314,13 +317,15 @@ function hasHighCoverage(tokens: readonly string[], evidence: string): boolean {
   return matched >= Math.min(2, tokens.length) && matched / tokens.length >= 0.8
 }
 
-function hasConsecutiveUnsupportedCjkFragment(claim: string, evidence: string): boolean {
-  const characters = [...cjkMaterialText(claim)]
-  let consecutiveMisses = 0
-  for (let index = 0; index + 1 < characters.length; index += 1) {
-    const gram = `${characters[index]}${characters[index + 1]}`
-    consecutiveMisses = evidence.includes(gram) ? 0 : consecutiveMisses + 1
-    if (consecutiveMisses >= 2) return true
+function hasUnsupportedCjkCharacter(claim: string, evidence: string): boolean {
+  const available = new Map<string, number>()
+  for (const character of cjkMaterialText(evidence)) {
+    available.set(character, (available.get(character) ?? 0) + 1)
+  }
+  for (const character of cjkMaterialText(claim)) {
+    const remaining = available.get(character) ?? 0
+    if (remaining === 0) return true
+    available.set(character, remaining - 1)
   }
   return false
 }
@@ -346,8 +351,8 @@ function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
   if (cjkTokens.length > 0) {
     const cjkEvidence = cjkMaterialText(normalizedEvidence)
     const matched = cjkTokens.filter(token => cjkEvidence.includes(token)).length
-    if (matched < Math.min(2, cjkTokens.length) || matched / cjkTokens.length < 0.9) return false
-    if (hasConsecutiveUnsupportedCjkFragment(normalizedClaim, cjkEvidence)) return false
+    if (matched < Math.min(2, cjkTokens.length) || matched / cjkTokens.length < 0.6) return false
+    if (hasUnsupportedCjkCharacter(normalizedClaim, cjkEvidence)) return false
   }
   if (latinTokens.length > 0 && !hasHighCoverage(latinTokens, normalizedEvidence)) return false
   return true

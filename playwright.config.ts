@@ -2,7 +2,7 @@ import { defineConfig } from '@playwright/test'
 
 export default defineConfig({
   testDir: './apps/desktop/tests/e2e',
-  testMatch: ['browser-continuation.spec.ts', 'cloud-user-data-sync.spec.ts'],
+  testMatch: ['browser-continuation.spec.ts', 'cloud-user-data-sync.spec.ts', 'knowledge-smoke.spec.ts'],
   fullyParallel: false,
   workers: 1,
   timeout: 30_000,
