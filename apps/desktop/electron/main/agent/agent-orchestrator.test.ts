@@ -6878,4 +6878,71 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(terminal).toContain('依据不足')
     expect(terminal).not.toContain('模型猜测')
   })
+
+  it('treats an uncertain uploaded-document workflow composite as knowledge-required', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '已运行搜索，然后用模型猜测合同结论。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies, { keepWorkflows: true })
+
+    await new AgentOrchestrator(dependencies).run(
+      knowledgeRunInput('运行百度搜索，再结合我上传的合同回答何时生效'),
+    )
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('依据不足')
+    expect(terminal).not.toContain('模型猜测')
+  })
+
+  it('does not let a browser read bypass strict composite knowledge retrieval', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'composite_browser_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '读取有效期并根据合同回答' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '网页已读取，合同结论由模型猜测。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+    attachBrowserContinuation(dependencies)
+
+    await new AgentOrchestrator(dependencies).run(Object.assign(textRunInput({
+      conversationId: 'browser_conversation', content: '读取证件有效期，再结合我上传的合同回答',
+      provider: 'openrouter', model: 'model',
+    }), { knowledgeSelection: selectedKnowledge }))
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('依据不足')
+    expect(terminal).not.toContain('模型猜测')
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0].tools
+      ?.map(tool => tool.function.name)).toContain('knowledge_search')
+  })
+
+  it('preserves an exact single browser-only read with a strict selection', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'pure_browser_inspect',
+        name: 'browser_session_inspect', arguments: { bindingId: 'binding_1', intent: '只读取证件有效期' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+    attachBrowserContinuation(dependencies)
+
+    await new AgentOrchestrator(dependencies).run(Object.assign(textRunInput({
+      conversationId: 'browser_conversation', content: '只读取证件有效期',
+      provider: 'openrouter', model: 'model',
+    }), { knowledgeSelection: selectedKnowledge }))
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('无法从已绑定网页中唯一确认')
+    expect(terminal).not.toContain('依据不足')
+    expect(vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls[0]?.[0].tools
+      ?.map(tool => tool.function.name)).not.toContain('knowledge_search')
+  })
 })

@@ -4,6 +4,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopAPI } from '@autoforge/shared'
 import MessageBlock from '../../src/components/chat/MessageBlock.vue'
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 describe('knowledge grounding blocks', () => {
   afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
 
@@ -93,6 +103,66 @@ describe('knowledge grounding blocks', () => {
     expect(wrapper.get('[data-testid="knowledge-consent-error"]').attributes('aria-live')).toBe('polite')
     expect(wrapper.text()).toContain('无法读取当前授权状态')
     expect(wrapper.text()).not.toContain('/etc/private')
+  })
+
+  it('does not let an older consent read overwrite a completed grant', async () => {
+    const oldRead = deferred<{ provider: 'deepseek'; status: 'unknown' }>()
+    const setConsent = vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'granted' })
+    window.autoForge = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, executions: {}, settings: {},
+      knowledge: {
+        getConsent: vi.fn(() => oldRead.promise), setConsent, revokeConsent: vi.fn(),
+      },
+    } as unknown as DesktopAPI
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message:status', type: 'knowledge_status', blockId: 'status', status: 'consent_required',
+        searchIndex: 1, searchLimit: 3, evidenceCount: 1, provider: 'deepseek',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+
+    await wrapper.get('[data-testid="grant-knowledge-consent"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('已授权，请重新发送问题')
+    oldRead.resolve({ provider: 'deepseek', status: 'unknown' })
+    await flushPromises()
+    expect(wrapper.find('[data-testid="revoke-knowledge-consent"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="grant-knowledge-consent"]').exists()).toBe(false)
+  })
+
+  it('keeps a switched Provider isolated from an older pending grant', async () => {
+    const grant = deferred<{ provider: 'deepseek'; status: 'granted' }>()
+    const getConsent = vi.fn()
+      .mockResolvedValueOnce({ provider: 'deepseek', status: 'unknown' })
+      .mockResolvedValueOnce({ provider: 'openrouter', status: 'unknown' })
+    const setConsent = vi.fn(() => grant.promise)
+    window.autoForge = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, executions: {}, settings: {},
+      knowledge: { getConsent, setConsent, revokeConsent: vi.fn() },
+    } as unknown as DesktopAPI
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message:status', type: 'knowledge_status', blockId: 'status', status: 'consent_required',
+        searchIndex: 1, searchLimit: 3, evidenceCount: 1, provider: 'deepseek',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+    await flushPromises()
+    await wrapper.get('[data-testid="grant-knowledge-consent"]').trigger('click')
+    expect(setConsent).toHaveBeenCalledWith('deepseek', 'granted')
+
+    await wrapper.setProps({ block: {
+      id: 'message:status', type: 'knowledge_status', blockId: 'status', status: 'consent_required',
+      searchIndex: 1, searchLimit: 3, evidenceCount: 1, provider: 'openrouter',
+    } })
+    await flushPromises()
+    grant.resolve({ provider: 'deepseek', status: 'granted' })
+    await flushPromises()
+
+    expect(getConsent).toHaveBeenLastCalledWith('openrouter')
+    expect(wrapper.find('[data-testid="grant-knowledge-consent"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('已授权，请重新发送问题')
   })
 
   it('fails a missing source closed without exposing stale preview text', async () => {

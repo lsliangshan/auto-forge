@@ -56,7 +56,7 @@ describe('CurrentTurnKnowledgeEvidence', () => {
   it('builds a bounded untrusted Provider envelope without owner, path, URL, or generation fields', () => {
     const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
     registry.add([evidence(0, {
-      snippet: '正文 https://signed.example/object?token=private /Users/alice/private.txt /etc/passwd /opt/autoforge \\\\server\\share\\secret.txt C:\\Users\\alice\\private.txt',
+      snippet: '正文 https://signed.example/object?token=private /Users/alice/private.txt 路径/etc/passwd 路径/secret,path=/opt/autoforge,source:/Users/bob/private \\\\server\\share\\secret.txt C:\\Users\\alice\\private.txt 比例 10/2 and/or docs/readme 章节/介绍 每秒/次',
       citation: {
         evidenceId: 'evidence:0', documentId: 'document_0', versionId: 'version_0',
         coordinate: { kind: 'docx', headingPath: ['https://signed.example/title'], paragraph: 1 },
@@ -73,6 +73,9 @@ describe('CurrentTurnKnowledgeEvidence', () => {
     expect(envelope).not.toContain('/etc/passwd')
     expect(envelope).not.toContain('/opt/autoforge')
     expect(envelope).not.toContain('server\\share')
+    expect(envelope).not.toContain('/Users/bob')
+    expect(envelope).not.toContain('/secret')
+    expect(envelope).toContain('比例 10/2 and/or docs/readme 章节/介绍 每秒/次')
     expect(envelope).not.toContain('C:\\Users')
     expect(envelope).not.toMatch(/owner|userId|https?:|generation/iu)
     expect(new TextEncoder().encode(envelope).byteLength).toBeLessThanOrEqual(40 * 1024)
@@ -138,6 +141,42 @@ describe('knowledge tool and answer validation', () => {
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
       text: '【知识库依据】合同经双方签字后生效\n【一般信息】但月球由奶酪构成。',
+    })
+  })
+
+  it('propagates sentence-final markers and rejects polarity or modality contradictions', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    expect(validateKnowledgeAnswer(
+      '合同经双方签字后生效，并且月球由奶酪构成。[[kb:evidence:0]]',
+      [contract], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+
+    const permission = evidence(1, { snippet: '合同允许提前解除。' })
+    expect(validateKnowledgeAnswer(
+      '合同不得提前解除。[[kb:evidence:1]]', [permission], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+
+    const optionalSeal = evidence(2, { snippet: '合同不需要盖章即可生效。' })
+    expect(validateKnowledgeAnswer(
+      '合同需要盖章即可生效。[[kb:evidence:2]]', [optionalSeal], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+    expect(validateKnowledgeAnswer(
+      '合同需要盖章即可生效。[[kb:evidence:2]]', [optionalSeal], 'strict', 1,
+    )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
+
+    const payer = evidence(3, { snippet: '甲方应在 7 日内付款。' })
+    expect(validateKnowledgeAnswer(
+      '乙方应在 7 日内付款。[[kb:evidence:3]]', [payer], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+  })
+
+  it('accepts a bounded true synonym match with the same polarity and entities', () => {
+    const contract = evidence(0, { snippet: '协议由双方签署之日起生效。' })
+    expect(validateKnowledgeAnswer(
+      '双方签订协议后，协议即开始起效。[[kb:evidence:0]]', [contract], 'strict', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: '双方签订协议后，协议即开始起效。',
     })
   })
 

@@ -172,7 +172,7 @@ describe('local knowledge service', () => {
         : { name: '合同-v2.txt', mimeType: 'text/plain', bytes: Buffer.from('合同经盖章后生效。') }],
       createParser: () => ({
         parse: async () => parsedText(parse++ === 0
-          ? '合同经双方签字后生效。 /etc/private /opt/autoforge \\\\server\\share\\secret.txt'
+          ? '合同经双方签字后生效。 路径/etc/private,path=/opt/autoforge,source:/Users/alice/secret \\\\server\\share\\secret.txt 比例 10/2 and/or docs/readme 每秒/次'
           : '合同经盖章后生效。'),
         terminateAll: async () => undefined,
       }),
@@ -206,7 +206,8 @@ describe('local knowledge service', () => {
       versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
     })
     expect(preview).toMatchObject({ kind: 'available', preview: expect.stringContaining('合同') })
-    expect(JSON.stringify(preview)).not.toMatch(/\/etc\/private|\/opt\/autoforge|server\\share/u)
+    expect(JSON.stringify(preview)).not.toMatch(/\/etc\/private|\/opt\/autoforge|\/Users\/alice|server\\share/u)
+    expect(JSON.stringify(preview)).toContain('比例 10/2 and/or docs/readme 每秒/次')
     const [replacement] = await service.pickImportFiles({ userId: 'alice' })
     await service.replaceDocument({ userId: 'alice' }, document!.id, replacement!.id)
     await vi.waitFor(async () => {

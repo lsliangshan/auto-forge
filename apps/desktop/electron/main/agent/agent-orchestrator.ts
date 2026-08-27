@@ -703,13 +703,32 @@ function workflowLaunchOnlyRequest(
   return matches.length === 1
 }
 
+function pureWorkflowOnlyRequest(
+  content: string,
+  candidates: readonly WorkflowCandidate[],
+): boolean {
+  const trusted = content.normalize('NFKC').trim()
+  if (/[，,；;\n]/u.test(trusted)
+    || /(?:然后|之后|后再|再|结合|根据|同时|并且|以及|知识库|资料库|文档库|我上传的)/u.test(trusted)) return false
+  return workflowLaunchOnlyRequest(content, candidates) || candidates.filter(({ workflow }) => (
+    workflow.activationExamples.some(example => example.normalize('NFKC').trim() === trusted)
+  )).length === 1
+}
+
 function workflowExecutionRequested(content: string, candidates: readonly WorkflowCandidate[]): boolean {
   if (!/(?:使用|运行|执行|启动|打开|查询|办理|\b(?:use|run|execute|launch|open|search)\b)/iu.test(content)) return false
   return candidates.length === 1 && content.includes(candidates[0]!.workflow.name)
 }
 
-function knowledgeAnswerRequested(content: string): boolean {
-  return /(?:知识库|资料库|文档库|合同库|根据[^\n。！？]{0,24}(?:文档|资料|依据|库)|引用[^\n。！？]{0,12}(?:文档|资料|依据)|\bknowledge\s+base\b|\bbased\s+on\s+(?:the\s+)?(?:documents?|knowledge|sources?)\b|\bcite\s+(?:the\s+)?(?:documents?|sources?)\b)/iu.test(content)
+function pureBrowserOnlyRequest(
+  content: string,
+  catalog: BrowserContinuationCatalogSnapshot,
+): boolean {
+  if (catalog.bindings.size === 0) return false
+  const request = content.normalize('NFKC').trim().replace(/[。！？.!?]+$/gu, '').trim()
+  if (!request || /[，,；;\n]/u.test(request)) return false
+  if (/(?:然后|之后|后再|再|结合|根据|同时|并且|以及|知识库|资料库|文档库|我上传的|\b(?:then|and\s+then|also|based\s+on|knowledge\s+base)\b)/iu.test(request)) return false
+  return /^(?:(?:请|请帮我|帮我))?(?:只)?(?:读取|查看|检查|打开|点击|填写|输入|选择|勾选|展开|\b(?:read|inspect|view|check|open|click|fill|select|expand)\b).+$/iu.test(request)
 }
 
 function trustedRequestNamesTarget(request: string, target: BrowserSemanticNode): boolean {
@@ -988,8 +1007,12 @@ export class AgentOrchestrator {
           active.browserPolicyAdded = false
           active.knowledgeEligible = false
           active.knowledgeRequired = false
+        } else if (pureWorkflowOnlyRequest(input.content, candidates)) {
+          active.knowledgeRequired = false
+        } else if (candidates.length === 0 && pureBrowserOnlyRequest(input.content, active.browserCatalog)) {
+          active.knowledgeEligible = false
+          active.knowledgeRequired = false
         }
-        if (candidates.length > 0 && !knowledgeAnswerRequested(input.content)) active.knowledgeRequired = false
         active.knowledgeToolAllowed = active.knowledgeEligible && candidates.length === 0
       }
       if (!workflowToolsAllowed) active.knowledgeToolAllowed = active.knowledgeEligible
@@ -2131,7 +2154,7 @@ export class AgentOrchestrator {
     if (active.knowledgeSelection.baseIds.length === 0) return { kind: 'answer', text: answer }
     const allEvidence = active.knowledgeEvidence.snapshot()
     if (active.knowledgeSearches === 0 && allEvidence.length === 0) {
-      if (!active.knowledgeRequired || active.browserRead) return { kind: 'answer', text: answer }
+      if (!active.knowledgeRequired) return { kind: 'answer', text: answer }
       this.setKnowledgeStatus(active, 'insufficient', 0)
       return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }
     }

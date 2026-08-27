@@ -133,11 +133,21 @@ function splitKnowledgeClaims(answer: string): string[] {
       joinedMarkers[joinedMarkers.length - 1] += sentence
     } else joinedMarkers.push(sentence)
   }
-  return joinedMarkers.flatMap(sentence => sentence
-    .split(/[，,](?=(?:但是|但|然而|不过|而且|并且|同时|以及|且|并))/gu)
-    .flatMap(part => part.split(/(?=(?:但是|但|然而|不过|而且|并且|同时|以及)|\b(?=(?:but|however|while|and)\b))/giu))
-    .map(part => part.trim())
-    .filter(Boolean))
+  return joinedMarkers.flatMap((sentence) => {
+    const trailing = sentence.match(/((?:\s*\[\[kb:[^\]\r\n]{1,512}\]\])+\s*)([。！？.!?]?)$/u)
+    const propagatedMarker = trailing?.[1]?.trim() ?? ''
+    const withoutTrailing = trailing?.index === undefined
+      ? sentence
+      : `${sentence.slice(0, trailing.index)}${trailing[2] ?? ''}`
+    return withoutTrailing
+      .split(/[，,；;](?=(?:但是|但|然而|不过|而且|并且|同时|以及|且))/gu)
+      .flatMap(part => part.split(/(?=(?:但是|但|然而|不过|而且|并且|同时|以及|且)|\b(?=(?:but|however|while|and)\b))/giu))
+      .map(part => part.trim())
+      .filter(Boolean)
+      .map(claim => propagatedMarker && !/\[\[kb:[^\]\r\n]{1,512}\]\]/u.test(claim)
+        ? `${claim}${propagatedMarker}`
+        : claim)
+  })
 }
 
 function normalizedSupportText(value: string): string {
@@ -146,6 +156,55 @@ function normalizedSupportText(value: string): string {
     .normalize('NFKC')
     .toLowerCase()
     .slice(0, 4_000)
+}
+
+function canonicalSupportText(value: string): string {
+  return normalizedSupportText(value)
+    .replace(/(?:签订|签字)/gu, '签署')
+    .replace(/(?:开始起效|开始生效|起效)/gu, '生效')
+    .replace(/(?:协定|契约)/gu, '协议')
+}
+
+function supportConcepts(value: string): Set<string> {
+  const concepts = [
+    '协议', '合同', '双方', '甲方', '乙方', '签署', '生效', '盖章', '提前', '解除', '终止',
+    '允许', '需要', '无需', '不需要', '不得', '不能', '禁止',
+  ]
+  return new Set(concepts.filter(concept => value.includes(concept)))
+}
+
+interface ClaimPolarity {
+  negated: boolean
+  required: boolean
+  notRequired: boolean
+  prohibited: boolean
+  permitted: boolean
+}
+
+function claimPolarity(value: string): ClaimPolarity {
+  return {
+    negated: /(?:尚未|未|没有|并非|否|无(?!需|须)|不(?!需要|必|用|得|能|可|允许|过|经))/u.test(value),
+    required: /(?:必须|需要|应当|务必|须要)/u.test(value),
+    notRequired: /(?:无需|无须|不需要|不必|不用)/u.test(value),
+    prohibited: /(?:不得|不能|不可|禁止|不允许)/u.test(value),
+    permitted: /(?:允许|可以)/u.test(value),
+  }
+}
+
+function polarityCompatible(claim: string, evidence: string): boolean {
+  const claimValue = claimPolarity(claim)
+  const evidenceValue = claimPolarity(evidence)
+  if (claimValue.negated !== evidenceValue.negated && (claimValue.negated || evidenceValue.negated)) return false
+  if (claimValue.required && evidenceValue.notRequired || claimValue.notRequired && evidenceValue.required) return false
+  if (claimValue.prohibited && evidenceValue.permitted || claimValue.permitted && evidenceValue.prohibited) return false
+  return true
+}
+
+function entitiesCompatible(claim: string, evidence: string): boolean {
+  const roles = ['甲方', '乙方', '丙方', '买方', '卖方', '出租方', '承租方']
+  if (roles.some(role => claim.includes(role) && !evidence.includes(role))) return false
+  const quotedEntities = [...claim.matchAll(/[“"]([^”"\r\n]{2,64})[”"]/gu)].map(match => match[1]!)
+  return quotedEntities.every(entity => evidence.includes(entity))
 }
 
 function cjkBigrams(value: string): Set<string> {
@@ -159,8 +218,10 @@ function cjkBigrams(value: string): Set<string> {
 }
 
 function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
-  const normalizedClaim = normalizedSupportText(claim)
-  const normalizedEvidence = normalizedSupportText(sanitizeKnowledgeSnippet(evidence.snippet))
+  const normalizedClaim = canonicalSupportText(claim)
+  const normalizedEvidence = canonicalSupportText(sanitizeKnowledgeSnippet(evidence.snippet))
+  if (!polarityCompatible(normalizedClaim, normalizedEvidence)) return false
+  if (!entitiesCompatible(normalizedClaim, normalizedEvidence)) return false
   const claimNumbers = normalizedClaim.match(/\d+(?:[./:-]\d+)*/gu) ?? []
   if (claimNumbers.some(number => !normalizedEvidence.includes(number))) return false
 
@@ -177,7 +238,13 @@ function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
     .filter(term => !ignored.has(term) && !/^\d+$/u.test(term))
   const matchedTerms = claimTerms.filter(term => normalizedEvidence.includes(term)).length
   const termSupported = claimTerms.length > 0 && matchedTerms / claimTerms.length >= 0.5
-  return cjkSupported || termSupported
+  const claimConcepts = supportConcepts(normalizedClaim)
+  const evidenceConcepts = supportConcepts(normalizedEvidence)
+  const matchedConcepts = [...claimConcepts].filter(concept => evidenceConcepts.has(concept)).length
+  const conceptSupported = claimConcepts.size >= 2
+    && matchedConcepts >= 2
+    && matchedConcepts / claimConcepts.size >= 0.5
+  return cjkSupported || termSupported || conceptSupported
 }
 
 export function formatValidatedKnowledgeAnswer(
