@@ -8,6 +8,8 @@
     "predev": "pnpm prepare:native-electron",
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build && tsup electron/workers/workflow-runner.ts --format cjs --platform node --out-dir out/workers --clean false",
+    "build:knowledge-parser-smoke": "pnpm build && tsup electron/e2e/knowledge-parser-smoke-main.ts --format esm --platform node --out-dir out/e2e --external electron",
+    "package:knowledge-parser-smoke": "pnpm build:knowledge-parser-smoke && electron-builder --dir --config.directories.output=dist-parser-smoke --config.extraMetadata.main=out/e2e/knowledge-parser-smoke-main.js --config.mac.identity=null",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && vue-tsc --noEmit -p tsconfig.web.json",
     "pretest": "pnpm prepare:native-electron",
     "test": "node scripts/run-vitest-electron.mjs run --config vitest.config.ts && node scripts/run-vitest-electron.mjs run --config vitest.node.config.ts",

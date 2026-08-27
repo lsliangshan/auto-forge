@@ -122,6 +122,16 @@ export type ParserResponse = z.infer<typeof parserResponseSchema>
 export type ParserErrorCode = z.infer<typeof parserErrorCodeSchema>
 export type ParserBlock = z.infer<typeof blockSchema>
 export type ParsedDocument = z.infer<typeof documentSchema>
+export const PARSER_RESPONSE_CHUNK_BYTES = 64 * 1024
+
+export interface ParserResponseChunk {
+  readonly version: 1
+  readonly type: 'response-chunk'
+  readonly index: number
+  readonly totalChunks: number
+  readonly totalBytes: number
+  readonly bytes: ArrayBufferView
+}
 
 export function parseParserRequest(value: unknown): ParserRequest {
   const parsed = parserRequestSchema.safeParse(value)
@@ -155,10 +165,13 @@ function responseMatchesContext(response: ParserResponse, context: ParserRespons
   if (document.mediaType !== context.mediaType) return false
   if (document.text.length > context.limits.maxTextChars) return false
   if (document.blocks.length > context.limits.maxBlocks) return false
+  if (document.text !== document.blocks.map(block => block.text).join('\n')) return false
 
   let blockTextChars = 0
   let metadataChars = 0
   let textCursor = 0
+  let previousLine = 0
+  let previousPage = 0
   const ids = new Set<string>()
   for (const [blockIndex, block] of document.blocks.entries()) {
     if (ids.has(block.id) || !coordinateMatchesMediaType(block, context.mediaType)) return false
@@ -166,30 +179,100 @@ function responseMatchesContext(response: ParserResponse, context: ParserRespons
     blockTextChars += block.text.length
     metadataChars += block.id.length
     if (blockTextChars > context.limits.maxTextChars) return false
-    const textPosition = document.text.indexOf(block.text, textCursor)
-    if (textPosition < textCursor) return false
-    textCursor = textPosition + block.text.length
-
     const coordinate = block.coordinate
     if (coordinate.kind === 'pdf') {
-      if (coordinate.page > context.limits.maxPages || coordinate.itemStart > coordinate.itemEnd) return false
+      if (
+        coordinate.page > context.limits.maxPages
+        || coordinate.page <= previousPage
+        || coordinate.itemStart > coordinate.itemEnd
+        || block.id !== `page-${coordinate.page}`
+      ) return false
+      previousPage = coordinate.page
     } else if (coordinate.kind === 'txt') {
       if (
-        coordinate.lineStart > coordinate.lineEnd
+        coordinate.lineStart !== coordinate.lineEnd
+        || coordinate.lineStart <= previousLine
         || coordinate.charStart > coordinate.charEnd
+        || coordinate.charStart !== textCursor
         || coordinate.charEnd > document.text.length
         || document.text.slice(coordinate.charStart, coordinate.charEnd) !== block.text
+        || block.id !== `line-${coordinate.lineStart}`
       ) return false
+      previousLine = coordinate.lineStart
     } else if (coordinate.kind === 'docx') {
+      const paragraphId = `p-${blockIndex + 1}`
+      if (coordinate.paragraphId !== paragraphId || block.id !== paragraphId) return false
       metadataChars += coordinate.paragraphId.length
         + coordinate.headingPath.reduce((total, part) => total + part.length, 0)
     } else {
-      if (coordinate.blockIndex !== blockIndex) return false
+      const prefix = coordinate.kind === 'markdown' ? 'md' : 'html'
+      if (coordinate.blockIndex !== blockIndex || block.id !== `${prefix}-${blockIndex + 1}`) return false
       metadataChars += coordinate.path.reduce((total, part) => total + part.length, 0)
     }
+    textCursor += block.text.length + (blockIndex < document.blocks.length - 1 ? 1 : 0)
     if (metadataChars > context.limits.maxResponseBytes) return false
   }
   return true
+}
+
+export function parseParserResponseBytes(
+  value: unknown,
+  context: ParserResponseContext,
+): ParserResponse {
+  const bytes = value instanceof ArrayBuffer || ArrayBuffer.isView(value) ? value : undefined
+  if (!bytes || bytes.byteLength > context.limits.maxResponseBytes) {
+    throw new Error('Knowledge parser protocol is invalid')
+  }
+  let decoded: unknown
+  try {
+    const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    decoded = JSON.parse(json)
+  } catch {
+    throw new Error('Knowledge parser protocol is invalid')
+  }
+  try {
+    return parseParserResponse(decoded, context)
+  } catch {
+    throw new Error('Knowledge parser protocol is invalid')
+  }
+}
+
+export function parseParserResponseChunk(value: unknown, maxResponseBytes: number): ParserResponseChunk {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Knowledge parser protocol is invalid')
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  if (Object.keys(descriptors).sort().join(',') !== 'bytes,index,totalBytes,totalChunks,type,version') {
+    throw new Error('Knowledge parser protocol is invalid')
+  }
+  const field = (name: keyof ParserResponseChunk): unknown => {
+    const descriptor = descriptors[name]
+    if (!descriptor || descriptor.get || descriptor.set) throw new Error('Knowledge parser protocol is invalid')
+    return descriptor.value
+  }
+  const version = field('version')
+  const type = field('type')
+  const index = field('index')
+  const totalChunks = field('totalChunks')
+  const totalBytes = field('totalBytes')
+  const bytes = field('bytes')
+  if (
+    version !== 1
+    || type !== 'response-chunk'
+    || !Number.isSafeInteger(index)
+    || !Number.isSafeInteger(totalChunks)
+    || !Number.isSafeInteger(totalBytes)
+    || (index as number) < 0
+    || (totalChunks as number) < 1
+    || (index as number) >= (totalChunks as number)
+    || (totalBytes as number) < 1
+    || (totalBytes as number) > maxResponseBytes
+    || !ArrayBuffer.isView(bytes)
+    || bytes.byteLength < 1
+    || bytes.byteLength > PARSER_RESPONSE_CHUNK_BYTES
+    || (totalChunks as number) !== Math.ceil((totalBytes as number) / PARSER_RESPONSE_CHUNK_BYTES)
+  ) throw new Error('Knowledge parser protocol is invalid')
+  return { version: 1, type: 'response-chunk', index, totalChunks, totalBytes, bytes } as ParserResponseChunk
 }
 
 export function parseParserResponse(value: unknown, context?: ParserResponseContext): ParserResponse {

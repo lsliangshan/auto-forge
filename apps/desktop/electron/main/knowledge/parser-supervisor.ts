@@ -1,11 +1,14 @@
 import type { EventEmitter } from 'node:events'
 import { createCipheriv, randomBytes, randomUUID } from 'node:crypto'
 import { stat } from 'node:fs/promises'
+import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_PARSER_LIMITS,
   PARSER_MEDIA_TYPES,
   parseParserRequest,
-  parseParserResponse,
+  parseParserResponseBytes,
+  parseParserResponseChunk,
   type ParsedDocument,
   type ParserErrorCode,
   type ParserLimits,
@@ -45,6 +48,7 @@ interface ParserSession extends EventEmitter {
   setPermissionRequestHandler(
     handler: (contents: unknown, permission: string, callback: (allowed: boolean) => void) => void,
   ): void
+  setPermissionCheckHandler(handler: (contents: unknown, permission: string) => boolean): void
   clearStorageData(): Promise<void>
   closeAllConnections(): Promise<void>
 }
@@ -87,6 +91,19 @@ function clearArrayBuffer(value: ArrayBuffer | undefined): void {
 
 function fail(code: ParserErrorCode): never {
   throw new ParserFailure(code)
+}
+
+function isAllowedParserAsset(url: string, workerHtmlPath: string): boolean {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'file:') return false
+    const assetRoot = resolve(dirname(workerHtmlPath), '../..')
+    const candidate = fileURLToPath(parsed)
+    const pathFromRoot = relative(assetRoot, candidate)
+    return pathFromRoot === '' || (!pathFromRoot.startsWith('..') && !isAbsolute(pathFromRoot))
+  } catch {
+    return false
+  }
 }
 
 function validatedLimits(input: ParserStartInput): ParserLimits {
@@ -152,6 +169,14 @@ export class ParserSupervisor {
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined
     let memoryTimer: ReturnType<typeof setInterval> | undefined
     let abortListener: (() => void) | undefined
+    let deadlinePromise: Promise<never> | undefined
+    let operationStopPromise: Promise<never> | undefined
+    let rejectDeadline: ((error: ParserFailure) => void) | undefined
+    let rejectOperation: ((error: ParserFailure) => void) | undefined
+    let terminalCode: ParserErrorCode | undefined
+    let cancelResponse: ((code: ParserErrorCode) => void) | undefined
+    let deadlineAt = Number.POSITIVE_INFINITY
+    let expireDeadline: (() => void) | undefined
     const cancelled = () => job.cancelled || this.state !== 'open' || input.signal?.aborted === true
 
     try {
@@ -163,30 +188,84 @@ export class ParserSupervisor {
         fail('PARSER_UNSUPPORTED_FORMAT')
       }
       const limits = validatedLimits(input)
-      if (cancelled()) fail('PARSER_CANCELLED')
+      deadlinePromise = new Promise<never>((_resolve, reject) => { rejectDeadline = reject })
+      operationStopPromise = new Promise<never>((_resolve, reject) => { rejectOperation = reject })
+      let deadlineExpired = false
+      deadlineAt = performance.now() + limits.timeoutMs
+      expireDeadline = () => {
+        if (deadlineExpired) return
+        deadlineExpired = true
+        const error = new ParserFailure('PARSER_TIMEOUT')
+        if (!terminalCode) {
+          terminalCode = 'PARSER_TIMEOUT'
+          cancelResponse?.('PARSER_TIMEOUT')
+          rejectOperation?.(error)
+        }
+        rejectDeadline?.(error)
+      }
+      const stopOperation = (code: ParserErrorCode) => {
+        if (code === 'PARSER_TIMEOUT') {
+          expireDeadline?.()
+          return
+        }
+        if (terminalCode) return
+        terminalCode = code
+        const error = new ParserFailure(code)
+        cancelResponse?.(code)
+        rejectOperation?.(error)
+      }
+      abortListener = () => stopOperation('PARSER_CANCELLED')
+      job.cancelActive = abortListener
+      input.signal?.addEventListener('abort', abortListener, { once: true })
+      timeoutTimer = setTimeout(expireDeadline, limits.timeoutMs)
+      const ensureWithinDeadline = () => {
+        if (performance.now() >= deadlineAt) expireDeadline?.()
+      }
+      const withinOperation = <T>(operation: Promise<T>): Promise<T> => Promise.race([
+        operation,
+        operationStopPromise!,
+      ])
+      if (cancelled()) abortListener()
 
       try {
-        cleartext = await this.dependencies.resolveObject(input.objectHandle)
+        const brokerResult = Promise.resolve()
+          .then(() => this.dependencies.resolveObject(input.objectHandle))
+          .then((bytes) => {
+            if (terminalCode || cancelled()) {
+              bytes.fill(0)
+              throw new ParserFailure(terminalCode ?? 'PARSER_CANCELLED')
+            }
+            return bytes
+          })
+        cleartext = await withinOperation(brokerResult)
+        ensureWithinDeadline()
       } catch {
         if (cancelled()) fail('PARSER_CANCELLED')
+        if (terminalCode) fail(terminalCode)
         fail('PARSER_MALFORMED_DOCUMENT')
       }
+      if (terminalCode) fail(terminalCode)
       if (cancelled()) fail('PARSER_CANCELLED')
       if (!(cleartext instanceof Uint8Array)) fail('PARSER_INTERNAL_ERROR')
       if (cleartext.byteLength > limits.maxFileBytes) fail('PARSER_LIMIT_EXCEEDED')
       encryptedSnapshot = sealSnapshot(cleartext, input.oneTimeKey)
+      ensureWithinDeadline()
       cleartext.fill(0)
       cleartext = undefined
+      if (terminalCode) fail(terminalCode)
       if (encryptedSnapshot.byteLength > limits.maxEncryptedBytes) fail('PARSER_LIMIT_EXCEEDED')
 
       try {
         const partition = this.dependencies.partitionId()
         parserSession = this.dependencies.createSession(partition)
         parserSession.webRequest.onBeforeRequest(
-          { urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*', 'ftp://*/*'] },
-          (_details, callback) => callback({ cancel: true }),
+          { urls: ['<all_urls>'] },
+          (details, callback) => callback({
+            cancel: !isAllowedParserAsset(details.url, this.dependencies.workerHtmlPath),
+          }),
         )
         parserSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+        parserSession.setPermissionCheckHandler(() => false)
         parserSession.on('will-download', (event: { preventDefault(): void }) => event.preventDefault())
         parserWindow = this.dependencies.createWindow({
           show: false,
@@ -212,10 +291,16 @@ export class ParserSupervisor {
       } catch {
         fail('PARSER_INTERNAL_ERROR')
       }
+      ensureWithinDeadline()
+      if (terminalCode) fail(terminalCode)
       if (cancelled()) fail('PARSER_CANCELLED')
 
-      const response = await new Promise<ParserResponse>((resolve, reject) => {
+      const response = await withinOperation(new Promise<ParserResponse>((resolve, reject) => {
         let settled = false
+        let responseBuffer: Uint8Array | undefined
+        let responseOffset = 0
+        let responseChunks = 0
+        let responseChunkCount = 0
         const request = {
           version: 1,
           type: 'parse',
@@ -228,21 +313,12 @@ export class ParserSupervisor {
         const settle = (operation: () => void) => {
           if (settled) return
           settled = true
-          if (timeoutTimer) clearTimeout(timeoutTimer)
           if (memoryTimer) clearInterval(memoryTimer)
-          if (abortListener) input.signal?.removeEventListener('abort', abortListener)
-          job.cancelActive = undefined
+          responseBuffer?.fill(0)
           operation()
         }
         const rejectCode = (code: ParserErrorCode) => settle(() => reject(new ParserFailure(code)))
-        abortListener = () => rejectCode('PARSER_CANCELLED')
-        job.cancelActive = abortListener
-        if (cancelled()) {
-          abortListener()
-          return
-        }
-
-        timeoutTimer = setTimeout(() => rejectCode('PARSER_TIMEOUT'), limits.timeoutMs)
+        cancelResponse = rejectCode
         let checkingMemory = false
         memoryTimer = setInterval(() => {
           if (checkingMemory || settled || !parserWindow) return
@@ -254,11 +330,47 @@ export class ParserSupervisor {
             .catch(() => rejectCode('PARSER_INTERNAL_ERROR'))
             .finally(() => { checkingMemory = false })
         }, 25)
-        input.signal?.addEventListener('abort', abortListener, { once: true })
         port2?.on('message', (event: { data: unknown }) => {
+          ensureWithinDeadline()
+          if (settled || terminalCode) return
+          let chunk
+          try {
+            chunk = parseParserResponseChunk(event.data, limits.maxResponseBytes)
+          } catch {
+            rejectCode('PARSER_PROTOCOL_INVALID')
+            return
+          }
+          if (!responseBuffer) {
+            responseBuffer = new Uint8Array(chunk.totalBytes)
+            responseChunkCount = chunk.totalChunks
+          }
+          if (
+            chunk.index !== responseChunks
+            || chunk.totalChunks !== responseChunkCount
+            || chunk.totalBytes !== responseBuffer.byteLength
+            || responseOffset + chunk.bytes.byteLength > responseBuffer.byteLength
+          ) {
+            new Uint8Array(chunk.bytes.buffer, chunk.bytes.byteOffset, chunk.bytes.byteLength).fill(0)
+            rejectCode('PARSER_PROTOCOL_INVALID')
+            return
+          }
+          const incomingBytes = new Uint8Array(
+            chunk.bytes.buffer,
+            chunk.bytes.byteOffset,
+            chunk.bytes.byteLength,
+          )
+          responseBuffer.set(incomingBytes, responseOffset)
+          incomingBytes.fill(0)
+          responseOffset += chunk.bytes.byteLength
+          responseChunks += 1
+          if (responseChunks < responseChunkCount) return
+          if (responseOffset !== responseBuffer.byteLength) {
+            rejectCode('PARSER_PROTOCOL_INVALID')
+            return
+          }
           let parsed: ParserResponse
           try {
-            parsed = parseParserResponse(event.data, {
+            parsed = parseParserResponseBytes(responseBuffer, {
               jobId: request.jobId,
               mediaType: input.mediaType,
               limits,
@@ -266,6 +378,8 @@ export class ParserSupervisor {
           } catch {
             rejectCode('PARSER_PROTOCOL_INVALID')
             return
+          } finally {
+            responseBuffer.fill(0)
           }
           if (parsed.type === 'error') rejectCode(parsed.code)
           else settle(() => resolve(parsed))
@@ -275,7 +389,8 @@ export class ParserSupervisor {
         parserWindow?.webContents.on('unresponsive', () => rejectCode('PARSER_INTERNAL_ERROR'))
 
         parserWindow?.webContents.once('did-finish-load', () => {
-          if (settled || cancelled() || !encryptedSnapshot || !parserWindow || !port1) return
+          ensureWithinDeadline()
+          if (settled || terminalCode || cancelled() || !encryptedSnapshot || !parserWindow || !port1) return
           try {
             request.encryptedSnapshot = Uint8Array.from(encryptedSnapshot).buffer
             request.oneTimeKey = Uint8Array.from(input.oneTimeKey).buffer
@@ -284,6 +399,9 @@ export class ParserSupervisor {
             parserWindow.webContents.postMessage('knowledge-parser:request', request, [port1])
           } catch {
             rejectCode('PARSER_INTERNAL_ERROR')
+          } finally {
+            clearArrayBuffer(request.encryptedSnapshot)
+            clearArrayBuffer(request.oneTimeKey)
           }
         })
         try {
@@ -292,16 +410,14 @@ export class ParserSupervisor {
         } catch {
           rejectCode('PARSER_INTERNAL_ERROR')
         }
-      })
+      }))
       if (response.type === 'error') fail(response.code)
       return response.document
     } catch (error) {
       if (error instanceof ParserFailure) throw error
       throw new ParserFailure('PARSER_INTERNAL_ERROR')
     } finally {
-      if (timeoutTimer) clearTimeout(timeoutTimer)
       if (memoryTimer) clearInterval(memoryTimer)
-      if (abortListener) input.signal?.removeEventListener('abort', abortListener)
       input.oneTimeKey.fill(0)
       cleartext?.fill(0)
       encryptedSnapshot?.fill(0)
@@ -321,15 +437,28 @@ export class ParserSupervisor {
         cleanup.push(() => parserSession?.closeAllConnections())
         cleanup.push(() => parserSession?.clearStorageData())
       }
-      await Promise.all(cleanup.map(async (operation) => {
+      const cleanupPromise = Promise.allSettled(cleanup.map(async (operation) => {
         try {
           await operation()
         } catch {
           // Cleanup is best effort, but every independent action is attempted.
         }
       }))
+      if (performance.now() >= deadlineAt) expireDeadline?.()
+      let cleanupTimedOut = false
+      try {
+        if (deadlinePromise) await Promise.race([cleanupPromise, deadlinePromise])
+        else await cleanupPromise
+      } catch (error) {
+        cleanupTimedOut = error instanceof ParserFailure && error.code === 'PARSER_TIMEOUT'
+      }
+      if (timeoutTimer) clearTimeout(timeoutTimer)
+      if (abortListener) input.signal?.removeEventListener('abort', abortListener)
+      job.cancelActive = undefined
+      cancelResponse = undefined
       this.jobs.delete(job)
       job.drain()
+      if (cleanupTimedOut) throw new ParserFailure('PARSER_TIMEOUT')
     }
   }
 

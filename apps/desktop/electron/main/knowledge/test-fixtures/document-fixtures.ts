@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { deflateSync } from 'node:zlib'
+import { brotliCompressSync, deflateSync } from 'node:zlib'
 
 function crc32(bytes: Uint8Array): number {
   let value = 0xffffffff
@@ -24,7 +24,10 @@ function u32(value: number): Buffer {
   return output
 }
 
-export function storedZip(entries: ReadonlyArray<{ name: string; contents: string }>): Buffer {
+export function storedZip(
+  entries: ReadonlyArray<{ name: string; contents: string }>,
+  useDataDescriptor = false,
+): Buffer {
   const localParts: Buffer[] = []
   const centralParts: Buffer[] = []
   let localOffset = 0
@@ -32,16 +35,22 @@ export function storedZip(entries: ReadonlyArray<{ name: string; contents: strin
     const name = Buffer.from(entry.name, 'utf8')
     const contents = Buffer.from(entry.contents, 'utf8')
     const checksum = crc32(contents)
+    const flags = useDataDescriptor ? 0x8 : 0
     const local = Buffer.concat([
       Buffer.from('504b0304', 'hex'),
-      u16(20), u16(0), u16(0), u16(0), u16(0),
-      u32(checksum), u32(contents.length), u32(contents.length),
+      u16(20), u16(flags), u16(0), u16(0), u16(0),
+      u32(useDataDescriptor ? 0 : checksum),
+      u32(useDataDescriptor ? 0 : contents.length),
+      u32(useDataDescriptor ? 0 : contents.length),
       u16(name.length), u16(0), name, contents,
+      ...(useDataDescriptor
+        ? [Buffer.from('504b0708', 'hex'), u32(checksum), u32(contents.length), u32(contents.length)]
+        : []),
     ])
     localParts.push(local)
     centralParts.push(Buffer.concat([
       Buffer.from('504b0102', 'hex'),
-      u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u16(20), u16(20), u16(flags), u16(0), u16(0), u16(0),
       u32(checksum), u32(contents.length), u32(contents.length),
       u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(localOffset), name,
     ]))
@@ -57,7 +66,11 @@ export function storedZip(entries: ReadonlyArray<{ name: string; contents: strin
   ])
 }
 
-export function minimalDocx(extraCharacters = 0): Buffer {
+export function minimalDocx(
+  extraCharacters = 0,
+  extraEntryName?: string,
+  useDataDescriptor = false,
+): Buffer {
   return storedZip([
     {
       name: '[Content_Types].xml',
@@ -71,7 +84,8 @@ export function minimalDocx(extraCharacters = 0): Buffer {
       name: 'word/document.xml',
       contents: `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>DOCX heading</w:t></w:r></w:p><w:p><w:r><w:t>DOCX paragraph${'x'.repeat(extraCharacters)}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
     },
-  ])
+    ...(extraEntryName ? [{ name: extraEntryName, contents: 'ignored extra entry' }] : []),
+  ], useDataDescriptor)
 }
 
 export function minimalPdf(pageTexts: ReadonlyArray<string | undefined>): Buffer {
@@ -117,6 +131,34 @@ export function compressedPdf(text: string): Buffer {
     ]),
   ]
   const parts = [Buffer.from('%PDF-1.4\n')]
+  const offsets: number[] = []
+  let length = parts[0]!.length
+  objects.forEach((object, index) => {
+    offsets.push(length)
+    const entry = Buffer.concat([Buffer.from(`${index + 1} 0 obj\n`), object, Buffer.from('\nendobj\n')])
+    parts.push(entry)
+    length += entry.length
+  })
+  parts.push(Buffer.from(`xref\n0 6\n0000000000 65535 f \n${offsets.map(offset => `${String(offset).padStart(10, '0')} 00000 n \n`).join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${length}\n%%EOF\n`))
+  return Buffer.concat(parts)
+}
+
+export function brotliPdf(text: string, malformed = false): Buffer {
+  const encoded = malformed
+    ? Buffer.from('not-valid-brotli', 'ascii')
+    : brotliCompressSync(Buffer.from(`BT /F1 12 Tf 72 720 Td (${text}) Tj ET`, 'ascii'))
+  const objects = [
+    Buffer.from('<< /Type /Catalog /Pages 2 0 R >>'),
+    Buffer.from('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+    Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>'),
+    Buffer.from('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'),
+    Buffer.concat([
+      Buffer.from(`<< /Filter /BrotliDecode /Length ${encoded.length} >>\nstream\n`),
+      encoded,
+      Buffer.from('\nendstream'),
+    ]),
+  ]
+  const parts = [Buffer.from('%PDF-1.7\n')]
   const offsets: number[] = []
   let length = parts[0]!.length
   objects.forEach((object, index) => {

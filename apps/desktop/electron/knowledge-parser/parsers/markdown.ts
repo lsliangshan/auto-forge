@@ -15,6 +15,7 @@ const ACTIVE_HTML = new Set([
   'script', 'style', 'noscript', 'template', 'iframe', 'frame', 'object', 'embed',
   'svg', 'math', 'canvas', 'audio', 'video', 'source', 'link', 'meta', 'base', 'form',
 ])
+const VOID_ACTIVE_HTML = new Set(['frame', 'embed', 'source', 'link', 'meta', 'base'])
 
 interface ActiveHtmlState {
   readonly depths: Map<string, number>
@@ -54,7 +55,7 @@ function consumeHtml(value: string, state: ActiveHtmlState): void {
     if (tag && ACTIVE_HTML.has(tag)) {
       if (boundary.startsWith('/')) {
         state.depths.set(tag, Math.max(0, (state.depths.get(tag) ?? 0) - 1))
-      } else if (!boundary.endsWith('/')) {
+      } else if (!VOID_ACTIVE_HTML.has(tag)) {
         state.depths.set(tag, (state.depths.get(tag) ?? 0) + 1)
       }
     }

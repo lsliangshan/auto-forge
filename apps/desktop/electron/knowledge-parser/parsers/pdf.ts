@@ -7,9 +7,10 @@ if (typeof window !== 'undefined') GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
 export async function parsePdf(bytes: Uint8Array, limits: ParserLimits): Promise<ParsedDocument> {
   let task: ReturnType<typeof getDocument> | undefined
+  const pdfBytes = bytes.slice()
   try {
     task = getDocument({
-      data: bytes.slice(),
+      data: pdfBytes,
       maxDecodedStreamBytes: limits.maxExpandedBytes,
       disableFontFace: true,
       useSystemFonts: false,
@@ -52,5 +53,6 @@ export async function parsePdf(bytes: Uint8Array, limits: ParserLimits): Promise
     throw new DocumentParserError('PARSER_MALFORMED_DOCUMENT')
   } finally {
     await task?.destroy().catch(() => undefined)
+    if (pdfBytes.byteLength > 0) pdfBytes.fill(0)
   }
 }

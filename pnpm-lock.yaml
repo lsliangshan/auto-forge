@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   https-proxy-agent@9.1.0: ab0dbb663ef3a858ccd77d0dd42cf0117cf91c40486f7f3f50bf10f856c53fde
-  pdfjs-dist@6.2.108: a8349a9e2c8fa44fb3bebbf9413db0844bb8acfd6844353b1a90d16440f5ceb8
+  pdfjs-dist@6.2.108: 300a91943f139ae0afe567ccec3c0cc680c7ad18723539876b779ade69537929
   socks@2.8.9: a367c5254cc0ae6d0a73ed765e66221b7da663f4d6578bbbc7652171945f58f2
 
 importers:
@@ -105,7 +105,7 @@ importers:
         version: 8.0.1
       pdfjs-dist:
         specifier: 6.2.108
-        version: 6.2.108(patch_hash=a8349a9e2c8fa44fb3bebbf9413db0844bb8acfd6844353b1a90d16440f5ceb8)
+        version: 6.2.108(patch_hash=300a91943f139ae0afe567ccec3c0cc680c7ad18723539876b779ade69537929)
       pinia:
         specifier: 4.0.2
         version: 4.0.2(@vue/devtools-api@8.1.5)(typescript@6.0.3)(vue@3.5.40(typescript@6.0.3))
@@ -6953,7 +6953,7 @@ snapshots:
     dependencies:
       through: 2.3.8
 
-  pdfjs-dist@6.2.108(patch_hash=a8349a9e2c8fa44fb3bebbf9413db0844bb8acfd6844353b1a90d16440f5ceb8):
+  pdfjs-dist@6.2.108(patch_hash=300a91943f139ae0afe567ccec3c0cc680c7ad18723539876b779ade69537929):
     optionalDependencies:
       '@napi-rs/canvas': 1.0.8
 

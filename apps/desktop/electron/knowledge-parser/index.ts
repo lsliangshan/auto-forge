@@ -1,5 +1,6 @@
 import {
   parseParserRequest,
+  PARSER_RESPONSE_CHUNK_BYTES,
   type ParsedDocument,
   type ParserMediaType,
   type ParserResponse,
@@ -9,6 +10,15 @@ import { DocumentParserError, enforceDocument } from './parsers/shared.js'
 const SNAPSHOT_MAGIC = new TextEncoder().encode('AFKBSNP1')
 const NONCE_BYTES = 12
 const TAG_BYTES = 16
+
+function clearUnparsedRequestBuffers(input: unknown): void {
+  if (typeof input !== 'object' || input === null) return
+  const descriptors = Object.getOwnPropertyDescriptors(input)
+  for (const name of ['encryptedSnapshot', 'oneTimeKey']) {
+    const value = descriptors[name]?.value
+    if (value instanceof ArrayBuffer) new Uint8Array(value).fill(0)
+  }
+}
 
 async function decryptSnapshot(envelope: ArrayBuffer, oneTimeKey: ArrayBuffer): Promise<Uint8Array> {
   const bytes = new Uint8Array(envelope)
@@ -57,6 +67,7 @@ export async function parseEncryptedDocument(input: unknown): Promise<ParserResp
     request = parseParserRequest(input)
     jobId = request.jobId
   } catch {
+    clearUnparsedRequestBuffers(input)
     return { version: 1, type: 'error', jobId, code: 'PARSER_PROTOCOL_INVALID' }
   }
   if (request.encryptedSnapshot.byteLength > request.limits.maxEncryptedBytes) {
@@ -91,7 +102,22 @@ if (typeof window !== 'undefined') {
     const port = event.ports[0]
     if (!port) return
     void parseEncryptedDocument(event.data).then((response) => {
-      port.postMessage(response)
+      const encoded = new TextEncoder().encode(JSON.stringify(response))
+      const totalChunks = Math.ceil(encoded.byteLength / PARSER_RESPONSE_CHUNK_BYTES)
+      for (let index = 0; index < totalChunks; index += 1) {
+        const start = index * PARSER_RESPONSE_CHUNK_BYTES
+        const bytes = encoded.slice(start, start + PARSER_RESPONSE_CHUNK_BYTES)
+        port.postMessage({
+          version: 1,
+          type: 'response-chunk',
+          index,
+          totalChunks,
+          totalBytes: encoded.byteLength,
+          bytes,
+        })
+        bytes.fill(0)
+      }
+      encoded.fill(0)
       port.close()
     })
   }, { once: true })

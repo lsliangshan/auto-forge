@@ -177,4 +177,69 @@ describe('knowledge parser protocol', () => {
       limits: DEFAULT_PARSER_LIMITS,
     })).toThrow(/protocol/i)
   })
+
+  it('rejects uncoordinated text and unstable or repeated format coordinates', () => {
+    const context = {
+      jobId: 'job-1',
+      mediaType: 'text/plain' as const,
+      limits: DEFAULT_PARSER_LIMITS,
+    }
+    const block = (id: string, text: string, line: number, start: number) => ({
+      id,
+      text,
+      coordinate: {
+        kind: 'txt' as const,
+        lineStart: line,
+        lineEnd: line,
+        charStart: start,
+        charEnd: start + text.length,
+      },
+    })
+    for (const document of [
+      { mediaType: 'text/plain', text: 'prefix\na', blocks: [block('line-1', 'a', 1, 7)] },
+      { mediaType: 'text/plain', text: 'a\nsuffix', blocks: [block('line-1', 'a', 1, 0)] },
+      {
+        mediaType: 'text/plain',
+        text: 'a\nb',
+        blocks: [block('line-2', 'a', 2, 0), block('line-1', 'b', 1, 2)],
+      },
+    ]) {
+      expect(() => parseParserResponse({ version: 1, type: 'result', jobId: 'job-1', document }, context))
+        .toThrow(/protocol/i)
+    }
+
+    const pdfContext = { ...context, mediaType: 'application/pdf' as const }
+    expect(() => parseParserResponse({
+      version: 1,
+      type: 'result',
+      jobId: 'job-1',
+      document: {
+        mediaType: 'application/pdf',
+        text: 'later\nearlier',
+        blocks: [
+          { id: 'page-2', text: 'later', coordinate: { kind: 'pdf', page: 2, itemStart: 0, itemEnd: 1 } },
+          { id: 'page-1', text: 'earlier', coordinate: { kind: 'pdf', page: 1, itemStart: 0, itemEnd: 1 } },
+        ],
+      },
+    }, pdfContext)).toThrow(/protocol/i)
+
+    const docxContext = {
+      ...context,
+      mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' as const,
+    }
+    expect(() => parseParserResponse({
+      version: 1,
+      type: 'result',
+      jobId: 'job-1',
+      document: {
+        mediaType: docxContext.mediaType,
+        text: 'a',
+        blocks: [{
+          id: 'p-9',
+          text: 'a',
+          coordinate: { kind: 'docx', paragraphId: 'p-9', headingPath: [] },
+        }],
+      },
+    }, docxContext)).toThrow(/protocol/i)
+  })
 })
