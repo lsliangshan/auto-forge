@@ -85,6 +85,8 @@ const generationPreferences = {
     audio: { format: 'mp3' },
     video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
   },
+  knowledgeBaseIds: ['base_personal'],
+  knowledgeMode: 'strict' as const,
 }
 
 function cachePath(root: string, userId: string): string {
@@ -273,6 +275,57 @@ describe('UserDataStoreManager', () => {
     expect(remote.conversations.get(conversationId)).toMatchObject({ generationPreferences })
     expect(projectedConversation(remote, conversationId)).toMatchObject({ revision: 2, syncState: 'synced' })
     remoteManager.close()
+  })
+
+  it('keeps a manual knowledge selection when an older remote preference pull arrives late', () => {
+    const manager = new UserDataStoreManager(temporaryRoot())
+    const store = manager.open('cloud-alice')
+    const conversationId = 'knowledge_selection_conversation'
+    const create = createConversationMutation('knowledge_selection_create', conversationId)
+    store.outbox.recordWithConversation(create)
+
+    const remotePreferences = {
+      ...generationPreferences,
+      knowledgeBaseIds: [] as string[],
+      knowledgeMode: 'mixed' as const,
+    }
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_knowledge_remote_before_local_1',
+      mutations: [pulledMutation(create, 1), pulledMutation({
+        id: 'knowledge_remote_preferences',
+        kind: 'conversation.preferences',
+        entityId: conversationId,
+        baseRevision: 1,
+        occurredAt: '2026-08-24T00:01:00.000Z',
+        payload: { preferences: remotePreferences, metadataUpdatedAt: '2026-08-24T00:01:00.000Z' },
+      }, 2)],
+    }, Date.now())
+
+    const manual = { ...generationPreferences, knowledgeBaseIds: ['base_personal'] }
+    expect(store.conversations.updateGenerationPreferences(conversationId, manual))
+      .toMatchObject({ generationPreferences: manual })
+
+    store.sync.applyRemotePage({
+      protocolVersion: 1,
+      cursor: 'cursor_knowledge_late_remote_pull_1',
+      mutations: [pulledMutation({
+        id: 'knowledge_remote_preferences',
+        kind: 'conversation.preferences',
+        entityId: conversationId,
+        baseRevision: 1,
+        occurredAt: '2026-08-24T00:01:00.000Z',
+        payload: { preferences: remotePreferences, metadataUpdatedAt: '2026-08-24T00:01:00.000Z' },
+      }, 2)],
+    }, Date.now())
+
+    expect(store.conversations.get(conversationId)).toMatchObject({ generationPreferences: manual })
+    expect(store.outbox.list(10)).toContainEqual(expect.objectContaining({
+      kind: 'conversation.preferences',
+      baseRevision: 2,
+      payload: expect.objectContaining({ preferences: manual }),
+    }))
+    manager.close()
   })
 
   it('advances optimistic conversation revisions for dependent offline mutations', () => {

@@ -347,6 +347,8 @@ describe('CloudBase user data function', () => {
               durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false,
             },
           },
+          knowledgeBaseIds: ['base_personal'],
+          knowledgeMode: 'strict',
         },
         metadataUpdatedAt: occurredAt,
       },
@@ -388,6 +390,38 @@ describe('CloudBase user data function', () => {
       action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1', mutations: [invalid],
     }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
     expect(rpc).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects malformed or renderer-authority knowledge preference fields before RPC', async () => {
+    const rpc = vi.fn()
+    const handler = createUserDataHandler({ rpc })
+    const valid = {
+      id: 'knowledge_preferences_mutation', entityId: 'conv_1', baseRevision: 1,
+      occurredAt, kind: 'conversation.preferences',
+      payload: {
+        preferences: {
+          outputType: 'auto', models: {},
+          generation: {
+            image: { count: 1, resolution: '1K', aspectRatio: 'auto', format: 'png' },
+            audio: { format: 'mp3' },
+            video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
+          },
+          knowledgeBaseIds: ['base_personal'], knowledgeMode: 'mixed',
+        },
+        metadataUpdatedAt: occurredAt,
+      },
+    }
+    for (const preferences of [
+      { ...valid.payload.preferences, knowledgeBaseIds: ['base_personal', 'base_personal'] },
+      { ...valid.payload.preferences, knowledgeMode: 'enterprise' },
+      { ...valid.payload.preferences, knowledgeBaseIds: ['base_personal'], ownerUserId: 'forged' },
+    ]) {
+      await expect(handler({
+        action: 'syncPush', protocolVersion: 1, deviceId: 'dev_1',
+        mutations: [{ ...valid, payload: { ...valid.payload, preferences } }],
+      }, authenticatedContext)).resolves.toEqual({ ok: false, error: { code: 'INVALID_INPUT' } })
+    }
+    expect(rpc).not.toHaveBeenCalled()
   })
 
   it('rejects extra action and nested union keys before calling RPC', async () => {

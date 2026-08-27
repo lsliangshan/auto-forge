@@ -875,6 +875,13 @@ function applyRemoteMutation(
       const current = remoteConversation(database, ownerUserId, mutation.entityId)
       if (current === undefined) throw new UserDataConsistencyError()
       const storedPreferences = parseConversationGenerationPreferences(current)
+      const pendingManualUpdate = database.prepare(`
+        SELECT 1 FROM outbox_mutations
+        WHERE kind = 'conversation.preferences' AND entity_id = @entityId
+          AND base_revision >= @baseRevision
+        LIMIT 1
+      `).get({ entityId: mutation.entityId, baseRevision: mutation.baseRevision })
+      if (pendingManualUpdate !== undefined && current.revision >= revision) break
       if (current.revision === revision) {
         if (
           !isDeepStrictEqual(storedPreferences, mutation.payload.preferences)

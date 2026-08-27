@@ -455,7 +455,17 @@ export const conversationGenerationPreferencesSchema = z.object({
     video: nonEmptyStringSchema.optional(),
   }).strict(),
   generation: generationOptionsSchema,
-}).strict()
+  knowledgeBaseIds: knowledgeSelectionSchema.shape.baseIds.optional(),
+  knowledgeMode: knowledgeSelectionSchema.shape.mode.optional(),
+}).strict().superRefine((preferences, context) => {
+  if ((preferences.knowledgeBaseIds === undefined) !== (preferences.knowledgeMode === undefined)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['knowledgeBaseIds'],
+      message: 'Knowledge selection fields must be supplied together',
+    })
+  }
+})
 export type ConversationGenerationPreferences = z.infer<typeof conversationGenerationPreferencesSchema>
 
 export const syncStateSchema = z.enum(['synced', 'pending', 'syncing', 'failed'])

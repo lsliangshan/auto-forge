@@ -155,7 +155,8 @@ function unwrapFunctionEvent(rawEvent) {
     if (payload) return payload
   }
   if (typeof rawEvent.action === 'string' && Object.hasOwn(rawEvent, 'tcbContext')) {
-    const { tcbContext: _tcbContext, ...payload } = rawEvent
+    const payload = { ...rawEvent }
+    delete payload.tcbContext
     return payload
   }
   return rawEvent
@@ -532,11 +533,23 @@ function validateStoredLegacyReceipt(value) {
 }
 
 function validateGenerationPreferences(value) {
-  if (!hasStrictShape(value, ['outputType', 'models', 'generation'])
+  if (!hasStrictShape(
+    value,
+    ['outputType', 'models', 'generation'],
+    ['knowledgeBaseIds', 'knowledgeMode'],
+  )
     || !['auto', 'text', 'image', 'audio', 'video'].includes(value.outputType)
     || !hasStrictShape(value.models, [], ['text', 'image', 'audio', 'video'])
     || !Object.values(value.models).every((model) => nonEmptyString(model))
-    || !hasStrictShape(value.generation, ['image', 'audio', 'video'])) return false
+    || !hasStrictShape(value.generation, ['image', 'audio', 'video'])
+    || ((value.knowledgeBaseIds === undefined) !== (value.knowledgeMode === undefined))
+    || (value.knowledgeBaseIds !== undefined && (
+      !Array.isArray(value.knowledgeBaseIds)
+      || value.knowledgeBaseIds.length > 32
+      || !value.knowledgeBaseIds.every(identifier)
+      || new Set(value.knowledgeBaseIds).size !== value.knowledgeBaseIds.length
+      || !['mixed', 'strict'].includes(value.knowledgeMode)
+    ))) return false
   const { image, audio, video } = value.generation
   return hasStrictShape(image, ['count', 'resolution', 'aspectRatio', 'format'])
     && image.count === 1

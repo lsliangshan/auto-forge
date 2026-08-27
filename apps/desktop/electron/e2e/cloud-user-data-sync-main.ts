@@ -15,6 +15,7 @@ import {
   chatEventSchema,
   executionEventSchema,
   ipcChannels,
+  knowledgeEventSchema,
   toSafeAppError,
   type AuthSession,
 } from '@autoforge/shared'
@@ -31,6 +32,8 @@ import { registerDesktopIpc } from '../main/ipc/register-ipc.js'
 import { createMediaProtocolHandler } from '../main/media/media-protocol.js'
 import type { NetworkProxyPort } from '../main/network/network-proxy-service.js'
 import { createSecureWindow } from '../main/window.js'
+import { KnowledgeStoreFactory } from '../main/knowledge/encrypted-database.js'
+import { createLocalKnowledgeService } from '../main/knowledge/knowledge-service.js'
 
 type FixtureUser = 'alice' | 'bob'
 
@@ -163,6 +166,7 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspacePort {
       return { x: 0, y: 0, width: 1, height: 1, viewportWidth: 1, viewportHeight: 1 }
     },
     async captureNodeScreenshot() { return '' },
+    async capturePageScreenshot() { return '' },
     onPageInvalidated() { return () => undefined },
   }
 }
@@ -280,6 +284,38 @@ async function initialize(): Promise<void> {
   await mkdir(userData, { recursive: true })
   if (process.env.AUTOFORGE_E2E_SEED_LEGACY === '1') seedLegacyData()
   const authService = testAuthService(fixtureUser(requiredEnvironment('AUTOFORGE_E2E_USER')))
+  const safeStoragePort = {
+    isAvailable: async () => true,
+    encrypt: async (value: string) => Buffer.from(value, 'utf8'),
+    decrypt: async (value: Buffer) => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+  }
+  const knowledgeStoreFactory = new KnowledgeStoreFactory(join(userData, 'knowledge'), safeStoragePort)
+  const knowledgeService = createLocalKnowledgeService({
+    openStore: ownerId => knowledgeStoreFactory.open(ownerId),
+    selectImportFiles: async () => [{
+      name: 'e2e-guide.txt',
+      mimeType: 'text/plain',
+      bytes: Buffer.from('AutoForge knowledge smoke'),
+    }],
+    createParser: async () => ({
+      parse: async () => ({
+        mediaType: 'text/plain',
+        text: 'AutoForge knowledge smoke',
+        blocks: [{
+          id: 'e2e-block-1',
+          text: 'AutoForge knowledge smoke',
+          coordinate: { kind: 'txt', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 25 },
+        }],
+      }),
+      terminateAll: async () => undefined,
+    }),
+    saveExport: async () => undefined,
+    isMember: () => false,
+    emit: event => {
+      const parsed = knowledgeEventSchema.safeParse(event)
+      if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
+    },
+  })
   userDataStores = new UserDataStoreManager(join(userData, 'user-caches'))
   const cloudPort = new CloudBaseUserDataPort({
     async callFunction(input) {
@@ -308,16 +344,13 @@ async function initialize(): Promise<void> {
       workflowRunner: join(desktopRoot, 'out/workers/workflow-runner.cjs'),
       temporary: join(userData, 'temporary'),
     },
-    safeStorage: {
-      isAvailable: async () => true,
-      encrypt: async (value) => Buffer.from(value, 'utf8'),
-      decrypt: async (value) => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
-    },
+    safeStorage: safeStoragePort,
     authService,
     userDataStores,
     userDataSyncPort: cloudPort,
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
+    knowledgeService,
     chooseProjectDirectory: async () => undefined,
     chooseMediaFiles: async () => [],
     chooseAvatarFile: async () => undefined,

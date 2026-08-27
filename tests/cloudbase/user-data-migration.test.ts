@@ -401,6 +401,27 @@ describe('CloudBase user data migration', () => {
     )
   })
 
+  it('ships mirrored data-preserving knowledge preference migrations', async () => {
+    const numbered = await readFile(new URL(
+      '../../cloudbase/user-data/migrations/0002_conversation_knowledge_preferences.sql', import.meta.url,
+    ), 'utf8')
+    const canonicalKnowledge = await readFile(new URL(
+      '../../cloudbase/migrations/20260826220000_conversation_knowledge_preferences.sql', import.meta.url,
+    ), 'utf8')
+    const rollback = await readFile(new URL(
+      '../../cloudbase/user-data/migrations/0002_conversation_knowledge_preferences.rollback.sql', import.meta.url,
+    ), 'utf8')
+
+    expect(numbered).toBe(canonicalKnowledge)
+    expect(numbered).toMatch(/^-- Personal knowledge selection/)
+    expect(numbered).not.toMatch(/^\+/m)
+    expect(numbered).toContain('knowledgeBaseIds')
+    expect(numbered).toContain('knowledgeMode')
+    expect(numbered).toContain('CREATE OR REPLACE FUNCTION autoforge_sync_push')
+    expect(rollback).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i)
+    expect(rollback).not.toMatch(/^\+/m)
+  })
+
   it('replays a post-purge stale conflict verbatim after a lost response', async () => {
     const canonical = await readFile(canonicalUrl, 'utf8')
     const syncPush = extractFunction(canonical, 'autoforge_sync_push')

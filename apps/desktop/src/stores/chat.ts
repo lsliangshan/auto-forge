@@ -43,6 +43,8 @@ function defaultGenerationPreferences(): ConversationGenerationPreferences {
       audio: { format: 'mp3' },
       video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
     },
+    knowledgeBaseIds: [],
+    knowledgeMode: 'mixed',
   }
 }
 
@@ -61,6 +63,8 @@ function copyGenerationPreferences(
     outputType: preferences.outputType,
     models: { ...preferences.models },
     generation: copyGenerationOptions(preferences.generation),
+    knowledgeBaseIds: [...(preferences.knowledgeBaseIds ?? [])],
+    knowledgeMode: preferences.knowledgeMode ?? 'mixed',
   }
 }
 
@@ -680,7 +684,7 @@ export const useChatStore = defineStore('chat', {
           || epoch !== this._stateEpoch
           || this.selectedConversationId !== conversationId
           || version !== this._preferenceVersions[conversationId]) return
-        this.preferencesByConversation[conversationId] = preferences
+        this.preferencesByConversation[conversationId] = copyGenerationPreferences(preferences)
       } catch (error) {
         if (dataGeneration === this._dataGeneration
           && this._preferenceLoadRequests[conversationId] === requestToken

@@ -19,10 +19,12 @@ import {
 } from '@autoforge/shared'
 import ApprovalCard from '../../src/components/chat/ApprovalCard.vue'
 import ChatComposer from '../../src/components/chat/ChatComposer.vue'
+import KnowledgeSelector from '../../src/components/knowledge/KnowledgeSelector.vue'
 import MessageBlock from '../../src/components/chat/MessageBlock.vue'
 import { displayError } from '../../src/services/desktop-api'
 import { useChatStore } from '../../src/stores/chat'
 import { useExecutionStore } from '../../src/stores/execution'
+import { useKnowledgeStore } from '../../src/stores/knowledge'
 import { useSettingsStore } from '../../src/stores/settings'
 import ChatView from '../../src/views/ChatView.vue'
 
@@ -114,6 +116,8 @@ function generationPreferences(
       audio: { format: 'mp3' },
       video: { durationSeconds: 5, resolution: '720p', aspectRatio: 'auto', generateAudio: false },
     },
+    knowledgeBaseIds: [],
+    knowledgeMode: 'mixed',
     ...overrides,
   }
 }
@@ -630,6 +634,52 @@ describe('chat history pagination', () => {
 
     newPage.resolve({ items: [] })
     await newRequest
+  })
+})
+
+describe('conversation knowledge selection', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+  afterEach(() => Reflect.deleteProperty(window, 'autoForge'))
+
+  it('saves selection through the existing versioned conversation preference update', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.selectedConversationId = 'conversation_knowledge'
+    chat.preferencesByConversation.conversation_knowledge = generationPreferences({
+      knowledgeBaseIds: [], knowledgeMode: 'mixed',
+    })
+    const knowledge = useKnowledgeStore()
+    knowledge.bases = [{
+      id: 'base_personal', name: '个人资料', kind: 'local', status: 'ready', searchable: true,
+      documentCount: 1, updatedAt: '2026-08-27T00:00:00.000Z',
+    }]
+    const wrapper = mount(KnowledgeSelector, { props: { disabled: false } })
+    await wrapper.vm.$nextTick()
+    knowledge.bases = [{
+      id: 'base_personal', name: '个人资料', kind: 'local', status: 'ready', searchable: true,
+      documentCount: 1, updatedAt: '2026-08-27T00:00:00.000Z',
+    }]
+    await wrapper.vm.$nextTick()
+
+    await wrapper.get('[data-testid="knowledge-select-base_personal"]').trigger('change')
+    await vi.waitFor(() => expect(api.chat.updateGenerationPreferences).toHaveBeenCalledWith(
+      'conversation_knowledge',
+      expect.objectContaining({ knowledgeBaseIds: ['base_personal'], knowledgeMode: 'mixed' }),
+    ))
+  })
+
+  it('normalizes a new conversation without a knowledge selection', async () => {
+    const { api } = createEventApi()
+    vi.mocked(api.chat.createConversation).mockResolvedValue(
+      conversationSummary('conversation_new', '2026-08-27T00:00:00.000Z'),
+    )
+    vi.mocked(api.chat.getGenerationPreferences).mockResolvedValue(generationPreferences())
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    await chat.createConversation()
+
+    expect(chat.preferences).toMatchObject({ knowledgeBaseIds: [], knowledgeMode: 'mixed' })
   })
 })
 

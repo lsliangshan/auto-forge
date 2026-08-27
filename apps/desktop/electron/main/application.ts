@@ -415,6 +415,8 @@ const defaultGenerationPreferences = conversationGenerationPreferencesSchema.par
   outputType: 'auto',
   models: {},
   generation: { image: { count: 1 }, audio: {}, video: {} },
+  knowledgeBaseIds: [],
+  knowledgeMode: 'mixed',
 })
 
 export class MaintenanceGate {

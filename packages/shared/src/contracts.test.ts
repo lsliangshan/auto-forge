@@ -17,6 +17,7 @@ import {
   chatSendInputSchema,
   byokUsageEventSchema,
   conversationPageSchema,
+  conversationGenerationPreferencesSchema,
   conversationSummarySchema,
   executionEventSchema,
   generationOptionsSchema,
@@ -1800,6 +1801,29 @@ describe('cross-process contracts', () => {
     expect(knowledgeSelectionSchema.parse({ baseIds: [], mode: 'mixed' })).toEqual({ baseIds: [], mode: 'mixed' })
     expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1', 'base_1'], mode: 'strict' }).success).toBe(false)
     expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1'], mode: 'mixed', generationId: 'foreign' }).success).toBe(false)
+  })
+
+  it('keeps knowledge selection inside strict conversation preferences', () => {
+    const parsed = conversationGenerationPreferencesSchema.parse({
+      outputType: 'auto',
+      models: {},
+      generation: {
+        image: { count: 1 },
+        audio: {},
+        video: {},
+      },
+      knowledgeBaseIds: ['base_1'],
+      knowledgeMode: 'strict',
+    })
+    expect(parsed).toMatchObject({ knowledgeBaseIds: ['base_1'], knowledgeMode: 'strict' })
+    expect(conversationGenerationPreferencesSchema.safeParse({
+      ...parsed,
+      knowledgeBaseIds: ['base_1', 'base_1'],
+    }).success).toBe(false)
+    expect(conversationGenerationPreferencesSchema.safeParse({
+      ...parsed,
+      knowledgeMode: 'owner-controlled',
+    }).success).toBe(false)
   })
 
   it('reports each knowledge gate separately and fails closed with its matching reason', () => {

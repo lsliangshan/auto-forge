@@ -228,6 +228,17 @@ async function mountApp(path = '/chat', api = createApi()) {
 }
 
 describe('workbench', () => {
+  it('exposes the personal knowledge workspace from the application rail', async () => {
+    const { wrapper, router } = await mountApp('/chat')
+    const link = wrapper.findAll('[data-testid="app-nav-item"]')
+      .find(item => item.text().includes('知识库'))
+    expect(link?.attributes('href')).toBe('/knowledge')
+
+    await router.push('/knowledge')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="knowledge-workspace"]').exists()).toBe(true))
+    expect(wrapper.find('[data-testid="inspector-toggle"]').exists()).toBe(false)
+  })
+
   it('shows remote usage classifications and requires separate confirmation for unowned legacy history', async () => {
     const confirm = vi.spyOn(ElMessageBox, 'confirm')
       .mockResolvedValueOnce('confirm')
@@ -329,7 +340,7 @@ describe('workbench', () => {
   it('renders exactly the five confirmed navigation items', async () => {
     const { wrapper } = await mountApp()
     expect(wrapper.findAll('[data-testid="app-nav-item"]').map((item) => item.text()))
-      .toEqual(['聊天', '工作流', '开发', '执行记录', '设置'])
+      .toEqual(['聊天', '工作流', '知识库', '开发', '执行记录', '设置'])
   })
 
   it('keeps the responsive inspector reachable through an accessible toggle', async () => {

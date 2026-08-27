@@ -163,6 +163,36 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     await expect(profile.page.getByText('Bob 私有会话')).toHaveCount(0)
   })
 
+  test('uses the real window bridge to create, import, select, and reload a ready knowledge base', async () => {
+    const profile = await launchProfile(fixture)
+    profiles.push(profile)
+    await grantCloudSync(fixture, profile)
+    await profile.page.getByLabel('新建会话').click()
+    await expect(profile.page.getByText('新会话', { exact: true })).toBeVisible()
+    await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
+
+    await profile.page.getByRole('link', { name: '知识库' }).click()
+    await expect(profile.page.getByTestId('knowledge-workspace')).toBeVisible()
+    await profile.page.getByRole('button', { name: '新建', exact: true }).click()
+    await profile.page.getByRole('textbox', { name: '知识库名称' }).fill('个人资料')
+    await profile.page.getByRole('button', { name: '创建', exact: true }).click()
+    await expect(profile.page.getByText('个人资料', { exact: true })).toBeVisible()
+    await profile.page.getByRole('button', { name: '导入', exact: true }).click()
+    const documentPane = profile.page.getByTestId('knowledge-document-pane')
+    await expect(documentPane.getByText('e2e-guide.txt', { exact: true })).toBeVisible()
+    await expect(documentPane.getByText('可检索', { exact: true })).toBeVisible()
+
+    await profile.page.getByRole('link', { name: '聊天' }).click()
+    await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+    await profile.page.getByTestId(/knowledge-select-/).check()
+    await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
+
+    await profile.page.reload()
+    await expect(profile.page.getByLabel('主导航')).toBeVisible()
+    await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+    await expect(profile.page.getByTestId(/knowledge-select-/)).toBeChecked()
+  })
+
   test('converges Alice across two independent app profiles', async () => {
     const first = await launchProfile(fixture)
     profiles.push(first)
