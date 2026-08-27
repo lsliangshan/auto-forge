@@ -723,12 +723,17 @@ describe('AgentOrchestrator', () => {
       ],
     ])
     const checkRemainingBudgets = vi.fn(() => 'TOOL_CALL_LIMIT' as const)
-    Object.assign(dependencies, { checkRemainingBudgets })
+    Object.assign(dependencies, {
+      checkRemainingBudgets,
+      knowledge: {
+        search: vi.fn(), getProviderConsent: vi.fn(async () => 'granted' as const),
+      },
+    })
 
-    const result = await new AgentOrchestrator(dependencies).run(textRunInput({
+    const result = await new AgentOrchestrator(dependencies).run(Object.assign(textRunInput({
       conversationId: 'conversation_budget', content: '使用百度搜索今日天气', provider: 'openrouter',
       model: 'openrouter/model', requestId: 'request_budget',
-    }))
+    }), { knowledgeSelection: { baseIds: ['base_selected'], mode: 'strict' as const } }))
 
     expect(result).toMatchObject({ requestId: 'request_budget', status: 'completed' })
     expect(checkRemainingBudgets).toHaveBeenCalledWith(expect.objectContaining({
@@ -736,6 +741,8 @@ describe('AgentOrchestrator', () => {
     }))
     expect(dependencies.records.reservations).toHaveLength(0)
     expect(dependencies.records.starts).toHaveLength(0)
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).toContain('已安全停止工具执行')
+    expect(JSON.stringify(dependencies.records.terminal.at(-1))).not.toContain('依据不足')
   })
 
   it('uses one supplied credential snapshot for context compression and every normal turn', async () => {
@@ -6548,5 +6555,184 @@ describe('AgentOrchestrator', () => {
     expect(finalRequest.messages).toContainEqual(expect.objectContaining({
       role: 'tool', tool_call_id: 'injection_act', content: expect.stringContaining('INVALID_INPUT'),
     }))
+  })
+})
+
+describe('AgentOrchestrator knowledge grounding', () => {
+  const selectedKnowledge = { baseIds: ['base_selected'], mode: 'strict' as const }
+  const retrievedEvidence = {
+    id: 'evidence:contract', baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+    snippet: '合同经双方签字后生效。', score: 1,
+    citation: {
+      evidenceId: 'evidence:contract', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text' as const, line: 8, startOffset: 0, endOffset: 11 },
+    },
+  }
+
+  function knowledgeRunInput(content: string): AgentRunInput {
+    return Object.assign(textRunInput({
+      conversationId: 'knowledge_conversation', content, provider: 'openrouter', model: 'model',
+    }), { knowledgeSelection: selectedKnowledge })
+  }
+
+  function attachKnowledge(
+    dependencies: AgentOrchestratorDependencies,
+    options: { consent?: 'granted' | 'denied' | 'unknown'; sourceAvailable?: boolean } = {},
+  ) {
+    const search = vi.fn(async () => ({
+      kind: 'results' as const, strategy: 'trigram' as const, evidence: [retrievedEvidence],
+    }))
+    Object.assign(dependencies, {
+      knowledge: {
+        search,
+        getProviderConsent: vi.fn(async () => options.consent ?? 'granted'),
+        sourceAvailable: vi.fn(async () => options.sourceAvailable ?? true),
+      },
+    })
+    dependencies.workflows.list = async () => []
+    return { search }
+  }
+
+  it('captures Main scope, retrieves after routing, and persists validated citations', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies)
+
+    await expect(new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？')))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(knowledge.search).toHaveBeenCalledWith({
+      ownerId: 'user_1', conversationId: 'knowledge_conversation', baseIds: ['base_selected'],
+      query: '合同何时生效', signal: expect.any(AbortSignal),
+    })
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.map(call => call[0])
+    expect(requests[0]?.tools?.map(tool => tool.function.name)).toContain('knowledge_search')
+    expect(JSON.stringify(requests[1]?.messages)).toContain('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: Array<{ type: string; sourceAvailable?: boolean }> }
+    expect(terminal.blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'knowledge_status', status: 'found', evidenceCount: 1 }),
+      expect.objectContaining({ type: 'knowledge_citation', evidenceId: 'evidence:contract', sourceAvailable: true }),
+    ]))
+  })
+
+  it('rejects model-controlled scope and sends no snippets when Provider consent is denied', async () => {
+    const dependencies = harness([[
+      {
+        type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search',
+        arguments: { query: '合同何时生效', baseIds: ['base_forged'], owner: 'attacker', topK: 99, sql: 'select *' },
+      },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '无法确认。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    const knowledge = attachKnowledge(dependencies, { consent: 'denied' })
+
+    await new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？'))
+
+    expect(knowledge.search).not.toHaveBeenCalled()
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.map(call => call[0])
+    expect(JSON.stringify(requests)).not.toContain('合同经双方签字后生效')
+    expect(JSON.stringify(requests[1]?.messages)).toContain('INVALID_INPUT')
+    expect(JSON.stringify(requests[1]?.messages)).not.toMatch(/base_forged|attacker|select \*/u)
+  })
+
+  it('allows one citation repair then fails strict grounding closed', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '伪造结论 [[kb:evidence:forged]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '仍然伪造 [[kb:evidence:forged]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+
+    await expect(new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？')))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(3)
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: Array<{ type: string; text?: string; status?: string }> }
+    expect(terminal.blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'knowledge_status', status: 'insufficient' }),
+      expect.objectContaining({ type: 'text', text: expect.stringContaining('依据不足') }),
+    ]))
+    expect(JSON.stringify(terminal.blocks)).not.toContain('伪造结论')
+  })
+
+  it('keeps retrieved snippets local after consent denial and fails strict mode without a repair turn', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '模型猜测的答案' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies, { consent: 'denied' })
+
+    await expect(new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？')))
+      .resolves.toMatchObject({ status: 'completed' })
+
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(2)
+    const requests = vi.mocked(dependencies.providerInstances.openrouter.stream).mock.calls.map(call => call[0])
+    expect(JSON.stringify(requests)).not.toContain('合同经双方签字后生效')
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: Array<{ type: string; text?: string; status?: string }> }
+    expect(terminal.blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'knowledge_status', status: 'insufficient' }),
+      expect.objectContaining({ type: 'text', text: expect.stringContaining('依据不足') }),
+    ]))
+    expect(JSON.stringify(terminal.blocks)).not.toContain('模型猜测')
+  })
+
+  it('fails strict mode closed when the cited current source becomes unavailable', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies, { sourceAvailable: false })
+
+    await new AgentOrchestrator(dependencies).run(knowledgeRunInput('合同何时生效？'))
+
+    const terminal = dependencies.records.terminal.at(-1) as { blocks: Array<Record<string, unknown>> }
+    expect(terminal.blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'knowledge_status', status: 'source_unavailable' }),
+      expect.objectContaining({ type: 'knowledge_citation', sourceAvailable: false, preview: '来源当前不可用' }),
+      expect.objectContaining({ type: 'text', text: expect.stringContaining('依据不足') }),
+    ]))
+    expect(JSON.stringify(terminal.blocks)).not.toContain('合同生效。')
+  })
+
+  it('labels no-evidence mixed answers and keeps strict mode closed without tool support', async () => {
+    const mixedDependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '一般合同知识' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    mixedDependencies.workflows.list = async () => []
+    const mixedInput = Object.assign(knowledgeRunInput('解释合同'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+      allowTools: false,
+    })
+    await new AgentOrchestrator(mixedDependencies).run(mixedInput)
+    expect(JSON.stringify(mixedDependencies.records.terminal.at(-1))).toContain('未由所选个人知识库支持的一般信息')
+
+    const strictDependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '模型猜测' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    strictDependencies.workflows.list = async () => []
+    const strictInput = Object.assign(knowledgeRunInput('解释合同'), { allowTools: false })
+    await new AgentOrchestrator(strictDependencies).run(strictInput)
+    expect(JSON.stringify(strictDependencies.records.terminal.at(-1))).toContain('依据不足')
+    expect(JSON.stringify(strictDependencies.records.terminal.at(-1))).not.toContain('模型猜测')
   })
 })

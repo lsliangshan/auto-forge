@@ -111,6 +111,30 @@ describe('conversation context primitives', () => {
     expect(JSON.stringify(serialized)).not.toMatch(/private_|binding|request|snapshot|audit|ref|filled|dataBase64|page excerpt/i)
   })
 
+  it('serializes knowledge citations as coordinates without snippets, paths, or signed URLs', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'knowledge_message', conversationId: 'c1', role: 'assistant', ordinal: 4, createdAt: 4,
+      blocks: [
+        {
+          type: 'knowledge_status', blockId: 'knowledge_status_private', status: 'found',
+          searchIndex: 1, searchLimit: 3, evidenceCount: 1,
+        },
+        {
+          type: 'knowledge_citation', blockId: 'knowledge_citation_private', evidenceId: 'evidence:private',
+          documentId: 'document_private', versionId: 'version_private', sourceAvailable: true,
+          coordinate: { kind: 'text', line: 8, startOffset: 0, endOffset: 6 },
+          preview: '隐藏正文 /Users/private/source.txt https://signed.example/token',
+        },
+      ],
+    })
+
+    expect(serialized).toEqual({
+      role: 'assistant',
+      content: '[个人知识库: 已找到依据 1 条]\n[知识库引用: text 第 8 行]',
+    })
+    expect(JSON.stringify(serialized)).not.toMatch(/隐藏正文|private|signed|https?:|\/Users\/|preview|evidence|document|version/i)
+  })
+
   it('omits transient-only history and rejects unknown roles', () => {
     expect(serializeHistoricalMessage({
       id: 'm2', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,

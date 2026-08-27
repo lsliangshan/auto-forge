@@ -19,7 +19,7 @@ import {
   toSafeAppError,
   type AuthSession,
 } from '@autoforge/shared'
-import { createApplicationRuntime } from '../main/application.js'
+import { createApplicationRuntime, type ApplicationModelProviderPort } from '../main/application.js'
 import type { AuthService } from '../main/auth/auth-service.js'
 import { CloudBaseUserDataPort } from '../main/cloud/cloudbase-user-data-port.js'
 import { openAppDatabase } from '../main/database/client.js'
@@ -34,6 +34,7 @@ import type { NetworkProxyPort } from '../main/network/network-proxy-service.js'
 import { createSecureWindow } from '../main/window.js'
 import { KnowledgeStoreFactory } from '../main/knowledge/encrypted-database.js'
 import { createLocalKnowledgeService } from '../main/knowledge/knowledge-service.js'
+import type { ModelStreamRequest } from '../main/chat/model-provider.js'
 
 type FixtureUser = 'alice' | 'bob'
 
@@ -172,6 +173,50 @@ function createBrowserWorkspace(): ApplicationBrowserWorkspacePort {
 }
 
 let providerRequestCount = 0
+
+const deterministicProvider: ApplicationModelProviderPort = {
+  async listModels() {
+    return [{
+      id: 'e2e-knowledge-model', name: 'E2E Knowledge',
+      inputModalities: ['text'], outputModalities: ['text'], supportsTools: true,
+      generation: {},
+    }]
+  },
+  async validateCredential() { return { valid: true } },
+  async *stream(request: ModelStreamRequest) {
+    providerRequestCount += 1
+    const hasKnowledgeResult = request.messages.some(message => (
+      message.role === 'tool'
+      && typeof message.content === 'string'
+      && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+    ))
+    if (hasKnowledgeResult) {
+      const toolContent = request.messages.find(message => (
+        message.role === 'tool'
+        && typeof message.content === 'string'
+        && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+      ))?.content ?? ''
+      const evidenceId = /"evidenceId":"([^"]+)"/u.exec(toolContent)?.[1]
+      if (!evidenceId) throw new Error('E2E knowledge evidence ID is missing')
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: `AutoForge knowledge smoke [[kb:${evidenceId}]]` }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      return
+    }
+    if (request.tools?.some(tool => tool.function.name === 'knowledge_search')) {
+      yield {
+        type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'e2e_knowledge_search',
+        name: 'knowledge_search', arguments: { query: 'AutoForge knowledge smoke' },
+      }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+      return
+    }
+    yield { type: 'text_delta' as const, choiceIndex: 0, text: '知识库问答' }
+    yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+  },
+  async acquireSnapshot() {
+    return { providerId: 'openrouter', provider: deterministicProvider, apiKeyFingerprint: 'e2e' }
+  },
+}
 
 const networkProxy: NetworkProxyPort = {
   async initialize() { /* local-only */ },
@@ -316,6 +361,13 @@ async function initialize(): Promise<void> {
       if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
     },
   })
+  Object.assign(knowledgeService, {
+    getConsent: async () => ({
+      provider: 'openrouter' as const,
+      status: 'granted' as const,
+      updatedAt: '2026-08-28T00:00:00.000Z',
+    }),
+  })
   userDataStores = new UserDataStoreManager(join(userData, 'user-caches'))
   const cloudPort = new CloudBaseUserDataPort({
     async callFunction(input) {
@@ -351,6 +403,7 @@ async function initialize(): Promise<void> {
     networkProxy,
     browserWorkspace: createBrowserWorkspace(),
     knowledgeService,
+    modelProviders: { openrouter: deterministicProvider },
     chooseProjectDirectory: async () => undefined,
     chooseMediaFiles: async () => [],
     chooseAvatarFile: async () => undefined,
@@ -368,6 +421,14 @@ async function initialize(): Promise<void> {
     },
     applyTheme: (theme) => { nativeTheme.themeSource = theme },
     appInfo: { version: '0.1.0-e2e', platform: process.platform === 'win32' ? 'win32' : 'darwin' },
+  })
+  await runtime.services.settings.saveProviderApiKey('openrouter', 'e2e-openrouter-key')
+  await runtime.services.settings.update({
+    activeProvider: 'openrouter',
+    defaultModels: {
+      openrouter: { text: 'e2e-knowledge-model' },
+      deepseek: { text: 'deepseek-chat' },
+    },
   })
   await runtime.recover()
   await protocol.handle('autoforge-media', createMediaProtocolHandler(runtime.mediaAssets))

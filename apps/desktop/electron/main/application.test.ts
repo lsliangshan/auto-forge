@@ -1405,6 +1405,8 @@ describe('createApplicationRuntime', () => {
       bind: vi.fn(async (ownerId: string) => { lifecycle.push(`bind:${ownerId}`) }),
       invalidate: vi.fn(() => { lifecycle.push('invalidate') }),
       drain: vi.fn(async () => { lifecycle.push('drain') }),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
       list: vi.fn(async () => {
         listingStarted.resolve()
         await releaseListing.promise
@@ -1449,12 +1451,90 @@ describe('createApplicationRuntime', () => {
       bind: vi.fn(async () => undefined),
       invalidate: vi.fn(),
       drain: vi.fn(async () => { throw drainFailure }),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
     })
     const runtime = createApplicationRuntime(options(root, { knowledgeService }))
 
     await expect(runtime.close()).rejects.toBe(drainFailure)
     expect(knowledgeService.invalidate).toHaveBeenCalledOnce()
     expect(knowledgeService.drain).toHaveBeenCalledOnce()
+  })
+
+  it('captures conversation knowledge preferences before Main retrieval and emits a citation block', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-agent-'))
+    directories.push(root)
+    const emitted: ChatEvent[] = []
+    const searchSelected = vi.fn(async () => ({
+      kind: 'results' as const,
+      strategy: 'trigram' as const,
+      evidence: [{
+        id: 'evidence:contract', baseId: 'base_selected', documentId: 'document_1', versionId: 'version_1',
+        snippet: '合同经双方签字后生效。', score: 1,
+        citation: {
+          evidenceId: 'evidence:contract', documentId: 'document_1', versionId: 'version_1',
+          coordinate: { kind: 'text' as const, line: 8, startOffset: 0, endOffset: 11 },
+        },
+      }],
+    }))
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined), invalidate: vi.fn(), drain: vi.fn(async () => undefined),
+      searchSelected,
+      sourceAvailable: vi.fn(async () => true),
+      getConsent: vi.fn(async () => ({
+        provider: 'openrouter' as const, status: 'granted' as const, updatedAt: '2026-08-28T00:00:00.000Z',
+      })),
+    })
+    let turn = 0
+    const openrouter = snapshotProvider('openrouter', {
+      listModels: vi.fn(async () => [{ ...modelInfo('openrouter/knowledge', 'Knowledge'), supportsTools: true }]),
+      validateCredential: vi.fn(async () => ({ valid: true })),
+      stream: vi.fn(async function* (request: ModelStreamRequest) {
+        turn += 1
+        if (turn === 1) {
+          expect(request.tools?.map(tool => tool.function.name)).toContain('knowledge_search')
+          yield {
+            type: 'tool_call' as const, choiceIndex: 0, index: 0, id: 'knowledge_call',
+            name: 'knowledge_search', arguments: { query: '合同何时生效' },
+          }
+          yield { type: 'finish' as const, choiceIndex: 0, reason: 'tool_calls' }
+          return
+        }
+        expect(JSON.stringify(request.messages)).toContain('UNTRUSTED_KNOWLEDGE_EVIDENCE')
+        yield { type: 'text_delta' as const, choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' }
+        yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      modelProviders: { openrouter },
+      emitChat: event => { emitted.push(event) },
+    }))
+    await authenticate(runtime)
+    await runtime.services.settings.saveProviderApiKey('openrouter', 'sk-openrouter')
+    await runtime.services.settings.update({
+      activeProvider: 'openrouter',
+      defaultModels: { openrouter: { text: 'openrouter/knowledge' }, deepseek: { text: 'deepseek-chat' } },
+    })
+    const conversation = await runtime.services.chat.createConversation()
+    const currentPreferences = await runtime.services.chat.getGenerationPreferences(conversation.id)
+    await runtime.services.chat.updateGenerationPreferences(conversation.id, {
+      ...currentPreferences, knowledgeBaseIds: ['base_selected'], knowledgeMode: 'strict',
+    })
+
+    await runtime.services.chat.send(chatInput(conversation.id, '合同何时生效？'))
+    await vi.waitFor(() => expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'status', conversationId: conversation.id, status: 'completed',
+    })))
+
+    expect(searchSelected).toHaveBeenCalledWith(
+      { userId: 'test_user_testuser' }, '合同何时生效', ['base_selected'],
+    )
+    expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'block', conversationId: conversation.id,
+      block: expect.objectContaining({ type: 'knowledge_citation', evidenceId: 'evidence:contract' }),
+    }))
+    await runtime.close()
   })
 
   it('records a stale bind cleanup failure retained by the real knowledge lifecycle tail', async () => {

@@ -192,6 +192,15 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
     await expect(profile.page.getByLabel('主导航')).toBeVisible()
     await profile.page.getByTestId('knowledge-selector').locator('summary').click()
     await expect(profile.page.getByTestId(/knowledge-select-/)).toBeChecked()
+    await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+
+    await profile.page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
+    await profile.page.getByTestId('send-message').click()
+    await expect(profile.page.getByTestId('knowledge-status')).toContainText('已找到 1 条依据')
+    const citation = profile.page.getByTestId('knowledge-citation')
+    await expect(citation).toBeVisible()
+    await citation.getByTestId('toggle-knowledge-preview').click()
+    await expect(citation.getByTestId('knowledge-source-preview')).toContainText('AutoForge knowledge smoke')
   })
 
   test('converges Alice across two independent app profiles', async () => {

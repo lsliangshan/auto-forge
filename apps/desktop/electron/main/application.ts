@@ -1399,6 +1399,27 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       catalog: browserContinuationCatalog,
       executor: browserContinuationExecutor,
     },
+    ...(knowledge === undefined ? {} : {
+      knowledge: {
+        search: ({ ownerId, baseIds, query }: {
+          ownerId: string
+          conversationId: string
+          baseIds: readonly string[]
+          query: string
+          signal: AbortSignal
+        }) => knowledge.searchSelected({ userId: ownerId }, query, baseIds),
+        getProviderConsent: async ({ ownerId, provider }: { ownerId: string; provider: ModelProviderId }) => {
+          const consent = await knowledge.getConsent({ userId: ownerId })
+          return consent.provider === provider ? consent.status : 'unknown'
+        },
+        sourceAvailable: ({ ownerId, documentId, versionId }: {
+          ownerId: string
+          documentId: string
+          versionId: string
+          signal: AbortSignal
+        }) => knowledge.sourceAvailable({ userId: ownerId }, documentId, versionId),
+      },
+    }),
   })
   isBrowserRunActive = (runId) => agent.ownsBrowserRun(runId)
   options.inspectAgent?.(agent)
@@ -1875,6 +1896,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
                 model: route.model,
                 ...(route.contextLength === undefined ? {} : { contextLength: route.contextLength }),
                 requestId,
+                knowledgeSelection: {
+                  baseIds: [...(preferences.knowledgeBaseIds ?? [])],
+                  mode: preferences.knowledgeMode ?? 'mixed',
+                },
               })
             })
           } else if (route.outputType === 'image') {

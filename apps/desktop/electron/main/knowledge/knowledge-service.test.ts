@@ -153,6 +153,12 @@ describe('local knowledge service', () => {
     await expect(service.search({ userId: 'alice' }, '合同')).resolves.toEqual({
       kind: 'results', strategy: 'bounded-instr', evidence: [],
     })
+    await expect(service.searchSelected({ userId: 'alice' }, '合同', ['base_forged']))
+      .resolves.toEqual({ kind: 'results', strategy: 'bounded-instr', evidence: [] })
+    await expect(service.searchSelected({ userId: 'bob' }, '合同', ['base_forged']))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(service.sourceAvailable({ userId: 'alice' }, 'document_missing', 'version_missing'))
+      .resolves.toBe(false)
   })
 
   it('acknowledges a durable import without awaiting parsing and rejects a late owner callback', async () => {

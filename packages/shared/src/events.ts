@@ -203,6 +203,37 @@ export const browserStatusBlockSchema = z.object({
   errorCode: appErrorCodeSchema.optional(),
 }).strict()
 
+export const knowledgeStatusBlockSchema = z.object({
+  type: z.literal('knowledge_status'),
+  blockId: identifierSchema,
+  status: z.enum([
+    'searching', 'found', 'consent_required', 'consent_denied',
+    'insufficient', 'source_unavailable', 'failed',
+  ]),
+  searchIndex: z.number().int().positive().max(3),
+  searchLimit: z.literal(3),
+  evidenceCount: z.number().int().nonnegative().max(8),
+  errorCode: appErrorCodeSchema.optional(),
+}).strict().superRefine(({ status, evidenceCount, errorCode }, context) => {
+  if ((status === 'searching' || status === 'found') && errorCode !== undefined) {
+    context.addIssue({ code: 'custom', path: ['errorCode'], message: 'Active knowledge status cannot contain an error' })
+  }
+  if (status === 'found' && evidenceCount === 0) {
+    context.addIssue({ code: 'custom', path: ['evidenceCount'], message: 'Found knowledge status requires evidence' })
+  }
+})
+
+export const knowledgeCitationBlockSchema = z.object({
+  type: z.literal('knowledge_citation'),
+  blockId: identifierSchema,
+  evidenceId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  coordinate: knowledgeCoordinateSchema,
+  preview: nonEmptyStringSchema.max(4_000),
+  sourceAvailable: z.boolean(),
+}).strict()
+
 export const chatBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string() }).strict(),
   z.object({ type: z.literal('reasoning_status'), label: z.string().trim().min(1) }).strict(),
@@ -293,6 +324,8 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
     message: z.string().trim().min(1),
   }).strict(),
   browserStatusBlockSchema,
+  knowledgeStatusBlockSchema,
+  knowledgeCitationBlockSchema,
   mediaBlockSchema,
   mediaGenerationBlockSchema,
 ])
@@ -334,7 +367,7 @@ export const chatEventSchema = z.discriminatedUnion('type', [
     conversationId: identifierSchema,
     messageId: identifierSchema,
     blockId: identifierSchema,
-    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema]),
+    block: z.union([mediaBlockSchema, mediaGenerationBlockSchema, knowledgeStatusBlockSchema]),
   }).strict(),
   z.object({
     type: z.literal('conversation_title_updated'),

@@ -33,6 +33,14 @@
       v-else-if="block.type === 'browser_status'"
       :block="block"
     />
+    <KnowledgeStatusCard
+      v-else-if="block.type === 'knowledge_status'"
+      :block="block"
+    />
+    <KnowledgeCitation
+      v-else-if="block.type === 'knowledge_citation'"
+      :block="block"
+    />
     <WorkflowProvenance
       v-else-if="block.type === 'workflow_provenance'"
       :block="block"
@@ -77,6 +85,8 @@ import type { UiChatBlock } from '../../stores/chat'
 import { displayError } from '../../services/desktop-api'
 import ApprovalCard from './ApprovalCard.vue'
 import BrowserStatusCard from './BrowserStatusCard.vue'
+import KnowledgeCitation from './KnowledgeCitation.vue'
+import KnowledgeStatusCard from './KnowledgeStatusCard.vue'
 import ExecutionCard from './ExecutionCard.vue'
 import { renderMarkdown } from './markdown'
 import MediaBlock from './MediaBlock.vue'

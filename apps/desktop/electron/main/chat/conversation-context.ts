@@ -104,6 +104,20 @@ function serializeBlock(block: ChatBlock): string[] {
       ))
     case 'browser_status':
       return [`[浏览器页面: ${block.siteLabel}; 来源: ${block.origin}; 操作: ${block.actionSummary ?? '无'}; 状态: ${block.state}]`]
+    case 'knowledge_status':
+      return block.status === 'found'
+        ? [`[个人知识库: 已找到依据 ${block.evidenceCount} 条]`]
+        : [`[个人知识库: ${block.status}]`]
+    case 'knowledge_citation': {
+      const coordinate = block.coordinate.kind === 'pdf'
+        ? `pdf 第 ${block.coordinate.page} 页`
+        : block.coordinate.kind === 'text'
+          ? `text 第 ${block.coordinate.line} 行`
+          : block.coordinate.kind === 'docx'
+            ? `docx 第 ${block.coordinate.paragraph + 1} 段`
+            : `html ${block.coordinate.structuralPath}`
+      return [`[知识库引用: ${coordinate}]`]
+    }
     case 'workflow_execution':
       return [`[工作流执行: ${block.executionId}]`]
     case 'execution_result':

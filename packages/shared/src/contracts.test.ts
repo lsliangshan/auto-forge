@@ -1805,6 +1805,27 @@ describe('cross-process contracts', () => {
     expect(knowledgeSelectionSchema.safeParse({ baseIds: ['a'.repeat(129)], mode: 'mixed' }).success).toBe(false)
   })
 
+  it('keeps live and persisted knowledge grounding blocks path-free and bounded', () => {
+    const status = {
+      type: 'knowledge_status', blockId: 'knowledge_status_1', status: 'found',
+      searchIndex: 1, searchLimit: 3, evidenceCount: 2,
+    }
+    const citation = {
+      type: 'knowledge_citation', blockId: 'knowledge_citation_1', evidenceId: 'evidence:1',
+      documentId: 'document_1', versionId: 'version_1', sourceAvailable: true,
+      coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 },
+      preview: '合同在签字后生效。',
+    }
+    expect(chatBlockSchema.parse(status)).toEqual(status)
+    expect(chatBlockSchema.parse(citation)).toEqual(citation)
+    expect(chatBlockSchema.safeParse({ ...citation, path: '/tmp/private' }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...citation, preview: 'x'.repeat(4_001) }).success).toBe(false)
+    expect(chatEventSchema.parse({
+      type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1',
+      blockId: status.blockId, block: { ...status, status: 'insufficient', evidenceCount: 0 },
+    })).toMatchObject({ type: 'block_update', blockId: status.blockId })
+  })
+
   it('keeps knowledge selection inside strict conversation preferences', () => {
     const parsed = conversationGenerationPreferencesSchema.parse({
       outputType: 'auto',

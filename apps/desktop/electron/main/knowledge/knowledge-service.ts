@@ -8,6 +8,7 @@ import {
   type KnowledgeDocumentSummary,
   type KnowledgeEvent,
   type KnowledgeImportHandle,
+  type KnowledgeSearchResult,
   type KnowledgeVersionSummary,
 } from '@autoforge/shared'
 import { KnowledgeExportService } from './export-service.js'
@@ -74,6 +75,9 @@ export interface LocalKnowledgeService extends KnowledgeService {
   drain(): Promise<void>
   restoreDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
   restoreBase(owner: KnowledgeOwner, baseId: string): Promise<void>
+  /** Main-only Agent retrieval over the conversation selection captured before the run. */
+  searchSelected(owner: KnowledgeOwner, query: string, baseIds: readonly string[]): Promise<KnowledgeSearchResult>
+  sourceAvailable(owner: KnowledgeOwner, documentId: string, versionId: string): Promise<boolean>
 }
 
 function fail(code: AppError['code']): never {
@@ -149,6 +153,21 @@ export function createLocalKnowledgeService(
   const pendingRetirements = new Set<Binding>()
   const now = dependencies.now ?? Date.now
   const id = dependencies.id ?? randomUUID
+
+  const searchBases = async (
+    active: Binding,
+    query: string,
+    baseIds: readonly string[],
+  ): Promise<KnowledgeSearchResult> => {
+    const normalized = query.normalize('NFC').trim()
+    const length = Array.from(normalized).length
+    if (length < 2) return { kind: 'query-too-short' }
+    const unique = [...new Set(baseIds)]
+    if (unique.length === 0) {
+      return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
+    }
+    return new LocalKnowledgeRetriever(active.store.database).search(normalized, unique)
+  }
 
   const firstFailure = (
     results: readonly PromiseSettledResult<unknown>[],
@@ -643,17 +662,28 @@ export function createLocalKnowledgeService(
     updateSelection: async () => fail('SERVICE_UNAVAILABLE'),
     search: async (owner, query) => {
       const active = current(owner)
-      const normalized = query.normalize('NFC').trim()
-      const length = Array.from(normalized).length
-      if (length < 2) return { kind: 'query-too-short' }
       const bases = active.store.database.prepare(`
         SELECT id FROM knowledge_bases WHERE recycled_at IS NULL ORDER BY created_at, id
       `).all() as Array<{ id: string }>
-      if (bases.length === 0) {
-        return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
-      }
-      return new LocalKnowledgeRetriever(active.store.database)
-        .search(normalized, bases.map(base => base.id))
+      return searchBases(active, query, bases.map(base => base.id))
+    },
+    searchSelected: async (owner, query, baseIds) => searchBases(current(owner), query, baseIds),
+    sourceAvailable: async (owner, documentId, versionId) => {
+      const active = current(owner)
+      const row = active.store.database.prepare(`
+        SELECT 1 AS available
+        FROM documents AS document
+        JOIN knowledge_bases AS base ON base.id = document.knowledge_base_id
+        JOIN document_versions AS version
+          ON version.id = ? AND version.document_id = document.id
+        WHERE document.id = ?
+          AND document.recycled_at IS NULL
+          AND base.recycled_at IS NULL
+          AND document.active_version_id = version.id
+          AND version.status = 'ready'
+        LIMIT 1
+      `).get(versionId, documentId)
+      return row !== undefined
     },
     getAvailability: async (owner): Promise<KnowledgeAvailability> => {
       const disabled = unavailable
