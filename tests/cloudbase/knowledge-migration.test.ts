@@ -36,7 +36,7 @@ const tables = [
   'knowledge_snapshot_items',
 ] as const
 
-function functionBody(sql: string, name: string): string {
+function staticFunctionBodyFragment(sql: string, name: string): string {
   const marker = `CREATE OR REPLACE FUNCTION public.${name}(`
   const start = sql.indexOf(marker)
   expect(start, `${name} exists`).toBeGreaterThanOrEqual(0)
@@ -95,10 +95,28 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain('expected_byte_size bigint NOT NULL')
     expect(sql).toContain('expected_sha256 char(64) NOT NULL')
     expect(sql).toContain('expected_mime_type varchar(200) NOT NULL')
-    expect(sql).toContain('authorization.expected_mime_type <> p_actual_mime_type')
+    expect(sql).toContain(
+      'authorization.expected_mime_type IS DISTINCT FROM p_actual_mime_type',
+    )
     expect(sql).toContain('authorization.consumed_at IS NOT NULL')
     expect(sql).toContain('WHERE upload_ticket = p_upload_ticket AND owner_id = owner FOR UPDATE')
     expect(sql).toContain('FOREIGN KEY(owner_id, knowledge_base_id, object_id)')
+    const getUpload = staticFunctionBodyFragment(sql, 'autoforge_knowledge_get_upload')
+    expect(getUpload).toContain("'ownerId', owner::text")
+    expect(getUpload).toContain("'knowledgeBaseId', authorization.knowledge_base_id")
+    expect(getUpload).toContain("'uploadTicket', authorization.upload_ticket")
+    const verify = staticFunctionBodyFragment(sql, 'autoforge_knowledge_verify_upload')
+    for (const fragment of [
+      'authorization.knowledge_base_id IS DISTINCT FROM p_knowledge_base_id',
+      'authorization.object_id IS DISTINCT FROM p_object_id',
+      'object.storage_reference IS DISTINCT FROM p_storage_reference',
+      'authorization.expected_byte_size IS DISTINCT FROM p_expected_byte_size',
+      'authorization.expected_sha256 IS DISTINCT FROM p_expected_sha256',
+      'authorization.expected_mime_type IS DISTINCT FROM p_expected_mime_type',
+      'authorization.expected_byte_size IS DISTINCT FROM p_actual_byte_size',
+      'authorization.expected_sha256 IS DISTINCT FROM p_actual_sha256',
+      'authorization.expected_mime_type IS DISTINCT FROM p_actual_mime_type',
+    ]) expect(verify).toContain(fragment)
   })
 
   it('defines immutable publication, bounded pull, retention floors, and durable leases', async () => {
@@ -119,11 +137,11 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain('kill_switch_enabled boolean NOT NULL DEFAULT true')
   })
 
-  it('uses canonical request binding and durably replays conflict outcomes with both sides', async () => {
+  it('statically binds conflict receipts and independently models lost-response replay', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
     expect(sql).not.toContain('md5(concat_ws(')
     expect(canonical({ a: 'x:y', b: '' })).not.toBe(canonical({ a: 'x', b: 'y:' }))
-    const push = functionBody(sql, 'autoforge_knowledge_push_mutation')
+    const push = staticFunctionBodyFragment(sql, 'autoforge_knowledge_push_mutation')
     expect(push).toContain('existing_conflict public.knowledge_conflicts%ROWTYPE')
     expect(push).toContain('existing_conflict.input_hash <> fingerprint')
     expect(push).toContain('RETURN existing_conflict.response')
@@ -175,9 +193,9 @@ describe('CloudBase personal knowledge migration', () => {
       .toEqual({ side: 'owner-2-remote' })
   })
 
-  it('pages one stable materialized snapshot by both row and response-byte budgets', async () => {
+  it('statically constrains snapshot paging and independently models a stable byte-bounded page', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
-    const snapshot = functionBody(sql, 'autoforge_knowledge_full_resync')
+    const snapshot = staticFunctionBodyFragment(sql, 'autoforge_knowledge_full_resync')
     expect(snapshot).toContain('p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 512')
     expect(snapshot).toContain('p_max_bytes IS NULL OR p_max_bytes NOT BETWEEN 65536 AND 786432')
     expect(snapshot).toContain('INSERT INTO public.knowledge_snapshots')
@@ -187,7 +205,7 @@ describe('CloudBase personal knowledge migration', () => {
     expect(snapshot).toContain('snapshot.snapshot_sequence')
     expect(snapshot).toContain('sum(item.response_bytes) OVER')
     expect(snapshot).toContain("'hasMore', has_more")
-    const pull = functionBody(sql, 'autoforge_knowledge_pull_changes')
+    const pull = staticFunctionBodyFragment(sql, 'autoforge_knowledge_pull_changes')
     expect(pull).toContain('sum(candidate.response_bytes) OVER')
     expect(pull).toContain('p_max_bytes')
     expect(pull).toContain("'nextSequence', page_last_sequence")
@@ -221,19 +239,19 @@ describe('CloudBase personal knowledge migration', () => {
       .toEqual(['old-a', 'old-b', 'old-c'])
   })
 
-  it('binds worker leases and idempotent cancellation/orphan requests to exact arguments', async () => {
+  it('statically binds worker/request arguments and independently models lease ownership', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
-    const claim = functionBody(sql, 'autoforge_knowledge_claim_job')
+    const claim = staticFunctionBodyFragment(sql, 'autoforge_knowledge_claim_job')
     expect(claim).toContain("btrim(p_worker_id) = ''")
     expect(claim).toContain("btrim(p_lease_token) = ''")
     expect(claim).toContain('p_lease_seconds IS NULL')
     expect(claim).toContain('worker_id = p_worker_id')
-    const complete = functionBody(sql, 'autoforge_knowledge_complete_job')
+    const complete = staticFunctionBodyFragment(sql, 'autoforge_knowledge_complete_job')
     expect(complete).toContain('worker_id = p_worker_id')
-    const cancel = functionBody(sql, 'autoforge_knowledge_cancel_job')
+    const cancel = staticFunctionBodyFragment(sql, 'autoforge_knowledge_cancel_job')
     expect(cancel).toContain("'action', 'cancel_job'")
     expect(cancel).toContain("request_row.input_hash <> fingerprint")
-    const orphan = functionBody(sql, 'autoforge_knowledge_prepare_orphan_cleanup')
+    const orphan = staticFunctionBodyFragment(sql, 'autoforge_knowledge_prepare_orphan_cleanup')
     expect(orphan).toContain("'storageReferences', canonical_references")
     expect(orphan).toContain('request_row.input_hash <> fingerprint')
 
@@ -250,7 +268,7 @@ describe('CloudBase personal knowledge migration', () => {
     expect(lease.state).toBe('completed')
   })
 
-  it('admits metadata purge only after the trusted worker reports exact Storage deletion', async () => {
+  it('statically requires payload purge after exact Storage deletion and models payload removal separately', async () => {
     const sql = await readFile(canonicalUrl, 'utf8')
     expect(sql).toContain('autoforge_knowledge_prepare_base_purge')
     expect(sql).toContain('autoforge_knowledge_complete_base_purge')
@@ -262,18 +280,74 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain(
       'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_base_purge',
     )
-    const purge = functionBody(sql, 'autoforge_knowledge_complete_base_purge')
+    const purge = staticFunctionBodyFragment(sql, 'autoforge_knowledge_complete_base_purge')
+    expect(purge).toContain('DELETE FROM public.knowledge_changes')
+    expect(purge).toContain('DELETE FROM public.knowledge_conflicts')
+    expect(purge).toContain('DELETE FROM public.knowledge_requests')
+    expect(purge).toContain('DELETE FROM public.knowledge_jobs')
+    expect(purge).toContain('DELETE FROM public.knowledge_snapshots')
     const sentinel = 'secret-content-sentinel'
     const simulatedPayloadRows = [sentinel]
-    if (purge.includes('DELETE FROM public.knowledge_changes')
-      && purge.includes('DELETE FROM public.knowledge_conflicts')
-      && purge.includes('DELETE FROM public.knowledge_requests')
-      && purge.includes('DELETE FROM public.knowledge_jobs')) {
-      simulatedPayloadRows.length = 0
-    }
+    const independentlyModelPurge = (rows: string[]) => { rows.length = 0 }
+    independentlyModelPurge(simulatedPayloadRows)
     expect(simulatedPayloadRows.join('|')).not.toContain(sentinel)
     expect(purge).toContain("jsonb_build_object('deletionJobId', job.id)")
     expect(purge).toContain("'delete', job.request_id, '{}'::jsonb")
+  })
+
+  it('statically bounds global expired-snapshot cleanup and independently models cascade and purge', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    const cleanup = staticFunctionBodyFragment(sql, 'autoforge_knowledge_cleanup_retention')
+    expect(cleanup).toContain('p_snapshot_limit IS NULL OR p_snapshot_limit NOT BETWEEN 1 AND 1000')
+    expect(cleanup).toContain('FOR UPDATE SKIP LOCKED')
+    expect(cleanup).toContain('LIMIT p_snapshot_limit')
+    expect(cleanup).toContain('snapshot.owner_id = candidate.owner_id')
+    expect(cleanup).toContain('snapshot.id = candidate.id')
+    expect(cleanup).toContain('snapshot.expires_at <= clock_timestamp()')
+    expect(cleanup).toContain("'prunedSnapshots', pruned_snapshots")
+    const fullResync = staticFunctionBodyFragment(sql, 'autoforge_knowledge_full_resync')
+    expect(fullResync).not.toContain('DELETE FROM public.knowledge_snapshots WHERE owner_id = owner')
+
+    type Snapshot = { owner: string; base: string; id: string; expiresAt: number }
+    const snapshots: Snapshot[] = [
+      { owner: 'owner-a', base: 'kb-a', id: 'expired-a', expiresAt: 1 },
+      { owner: 'owner-b', base: 'kb-b', id: 'expired-b', expiresAt: 2 },
+      { owner: 'owner-a', base: 'kb-a', id: 'future-a', expiresAt: 20 },
+    ]
+    const items = new Map([
+      ['owner-a:expired-a', ['secret-a']],
+      ['owner-b:expired-b', ['secret-b']],
+      ['owner-a:future-a', ['future-secret']],
+    ])
+    const independentlyModelRetention = (now: number, limit: number) => {
+      const selected = snapshots.filter(row => row.expiresAt <= now)
+        .sort((left, right) => left.expiresAt - right.expiresAt).slice(0, limit)
+      for (const row of selected) {
+        snapshots.splice(snapshots.findIndex(candidate => candidate.owner === row.owner
+          && candidate.id === row.id && candidate.expiresAt <= now), 1)
+        items.delete(`${row.owner}:${row.id}`)
+      }
+      return selected.length
+    }
+    expect(independentlyModelRetention(10, 1)).toBe(1)
+    expect(snapshots.map(row => row.id)).toEqual(['expired-b', 'future-a'])
+    expect(items.has('owner-a:expired-a')).toBe(false)
+    expect(items.get('owner-a:future-a')).toEqual(['future-secret'])
+    expect(independentlyModelRetention(10, 1)).toBe(1)
+    expect(snapshots.map(row => row.id)).toEqual(['future-a'])
+
+    const independentlyModelBasePurge = (owner: string, base: string) => {
+      for (let index = snapshots.length - 1; index >= 0; index -= 1) {
+        const row = snapshots[index]!
+        if (row.owner === owner && row.base === base) {
+          snapshots.splice(index, 1)
+          items.delete(`${row.owner}:${row.id}`)
+        }
+      }
+    }
+    independentlyModelBasePurge('owner-a', 'kb-a')
+    expect(snapshots).toEqual([])
+    expect([...items.keys()]).toEqual([])
   })
 
   it('ships a data-preserving rollback that disables the executable surface', async () => {

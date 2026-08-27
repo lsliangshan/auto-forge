@@ -17,7 +17,9 @@
 
 4. 验证用户 JWT 由 CloudBase 运行时映射到 `context.auth.uid`；事件体中的用户字段会被严格拒绝，不能参与所有权判定。
 5. 只有完成迁移、私有存储、RLS、会员签名密钥、杀开关和集成测试后，才可在服务端打开 Cloud 功能。当前桌面端继续返回 `kill_switch_enabled`。
-6. 由受信任 worker 领取 token/expiry 租约。对于 purge job，依次调用 `autoforge_knowledge_prepare_base_purge`、幂等删除返回的全部私有 Storage 字节、再用完全相同的引用集合调用 `autoforge_knowledge_complete_base_purge`；不得把这两个 worker RPC 暴露给 Electron。worker 还需定时调用 `autoforge_knowledge_cleanup_retention(worker_id, limit)`；函数先持久提高每个知识库的 retention floor，再清理满 90 天且不再受墓碑保护的 change。验证第三次过期租约进入 `failed`，仅 `TRANSIENT_FAILURE` 可以重新排队。
+6. 由受信任 worker 领取 token/expiry 租约。对于 purge job，依次调用 `autoforge_knowledge_prepare_base_purge`、幂等删除返回的全部私有 Storage 字节、再用完全相同的引用集合调用 `autoforge_knowledge_complete_base_purge`；不得把这两个 worker RPC 暴露给 Electron。worker 还需定时调用 `autoforge_knowledge_cleanup_retention(worker_id, change_limit, snapshot_limit)`；`change_limit` 必须为 1..10000，`snapshot_limit` 必须为 1..1000。函数先按复合 owner/id 键有界删除全局过期 snapshot head（item 由复合外键级联删除），再持久提高每个知识库的 retention floor，并清理满 90 天且不再受墓碑保护的 change。验证第三次过期租约进入 `failed`，仅 `TRANSIENT_FAILURE` 可以重新排队。
+
+本地 migration 测试只检查关键 SQL 文本片段，并用彼此独立的 TypeScript 模型验证预期状态转换；它们没有执行 PostgreSQL。发布前必须在隔离预发布环境补齐实际 PostgreSQL 解析/迁移、RLS 跨 owner 拒绝、并发事务/租约竞争、snapshot retention 级联与 purge、CloudBase Function 和 PG Storage 关联漂移测试。这些预发布门禁未完成前不得把本地静态检查称为数据库行为证明。
 
 ## 生命周期边界
 

@@ -654,6 +654,8 @@ BEGIN
     WHERE id = authorization.object_id AND owner_id = owner
       AND knowledge_base_id = authorization.knowledge_base_id;
   RETURN jsonb_build_object(
+    'ownerId', owner::text, 'knowledgeBaseId', authorization.knowledge_base_id,
+    'uploadTicket', authorization.upload_ticket,
     'objectId', object.id, 'storageReference', object.storage_reference,
     'expectedByteSize', authorization.expected_byte_size,
     'expectedSha256', authorization.expected_sha256,
@@ -664,6 +666,8 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_verify_upload(
   p_caller_user_id varchar, p_upload_ticket varchar,
+  p_knowledge_base_id varchar, p_object_id varchar, p_storage_reference varchar,
+  p_expected_byte_size bigint, p_expected_sha256 varchar, p_expected_mime_type varchar,
   p_actual_byte_size bigint, p_actual_sha256 varchar, p_actual_mime_type varchar
 )
 RETURNS jsonb
@@ -679,20 +683,39 @@ BEGIN
   SELECT * INTO authorization FROM public.knowledge_upload_authorizations
     WHERE upload_ticket = p_upload_ticket AND owner_id = owner FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001'; END IF;
-  IF authorization.consumed_at IS NOT NULL OR authorization.expires_at <= clock_timestamp()
-    OR authorization.expected_byte_size <> p_actual_byte_size
-    OR authorization.expected_sha256 <> p_actual_sha256
-    OR authorization.expected_mime_type <> p_actual_mime_type THEN
+  SELECT * INTO object FROM public.knowledge_objects
+    WHERE id = authorization.object_id AND owner_id = owner
+      AND knowledge_base_id = authorization.knowledge_base_id FOR UPDATE;
+  IF NOT FOUND
+    OR authorization.consumed_at IS NOT NULL OR authorization.expires_at <= clock_timestamp()
+    OR authorization.knowledge_base_id IS DISTINCT FROM p_knowledge_base_id
+    OR authorization.object_id IS DISTINCT FROM p_object_id
+    OR object.storage_reference IS DISTINCT FROM p_storage_reference
+    OR authorization.expected_byte_size IS DISTINCT FROM p_expected_byte_size
+    OR authorization.expected_sha256 IS DISTINCT FROM p_expected_sha256
+    OR authorization.expected_mime_type IS DISTINCT FROM p_expected_mime_type
+    OR object.byte_size IS DISTINCT FROM p_expected_byte_size
+    OR object.sha256 IS DISTINCT FROM p_expected_sha256
+    OR object.mime_type IS DISTINCT FROM p_expected_mime_type
+    OR authorization.expected_byte_size IS DISTINCT FROM p_actual_byte_size
+    OR authorization.expected_sha256 IS DISTINCT FROM p_actual_sha256
+    OR authorization.expected_mime_type IS DISTINCT FROM p_actual_mime_type THEN
     RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
   END IF;
   UPDATE public.knowledge_upload_authorizations SET consumed_at = clock_timestamp()
-    WHERE upload_ticket = p_upload_ticket;
+    WHERE upload_ticket = p_upload_ticket AND owner_id = owner
+      AND knowledge_base_id = p_knowledge_base_id AND object_id = p_object_id;
   UPDATE public.knowledge_objects SET state = 'verified', verified_at = clock_timestamp()
-    WHERE id = authorization.object_id AND owner_id = owner
-      AND knowledge_base_id = authorization.knowledge_base_id
+    WHERE id = p_object_id AND owner_id = owner
+      AND knowledge_base_id = p_knowledge_base_id
+      AND storage_reference = p_storage_reference
     RETURNING * INTO object;
   RETURN jsonb_build_object(
-    'objectId', object.id, 'storageReference', object.storage_reference, 'verified', true
+    'ownerId', owner::text, 'knowledgeBaseId', p_knowledge_base_id,
+    'uploadTicket', p_upload_ticket, 'objectId', object.id,
+    'storageReference', object.storage_reference,
+    'byteSize', object.byte_size, 'sha256', object.sha256,
+    'mimeType', object.mime_type, 'verified', true
   );
 END;
 $$;
@@ -904,8 +927,6 @@ BEGIN
     WHERE id = p_knowledge_base_id AND owner_id = owner) THEN
     RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001';
   END IF;
-  DELETE FROM public.knowledge_snapshots WHERE owner_id = owner
-    AND expires_at <= clock_timestamp();
   IF p_snapshot_id IS NULL THEN
     created_snapshot_id := 'snapshot_' || md5(
       owner::text || ':' || p_knowledge_base_id || ':' || clock_timestamp()::text || ':' || random()::text
@@ -1588,7 +1609,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_cleanup_retention(
-  p_worker_id varchar, p_limit integer
+  p_worker_id varchar, p_limit integer, p_snapshot_limit integer
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1598,11 +1619,26 @@ AS $$
 DECLARE
   pruned_changes integer := 0;
   pruned_tombstones integer := 0;
+  pruned_snapshots integer := 0;
 BEGIN
   IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
-    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000 THEN
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000
+    OR p_snapshot_limit IS NULL OR p_snapshot_limit NOT BETWEEN 1 AND 1000 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
+  WITH candidates AS (
+    SELECT snapshot.owner_id, snapshot.id
+    FROM public.knowledge_snapshots snapshot
+    WHERE snapshot.expires_at <= clock_timestamp()
+    ORDER BY snapshot.expires_at, snapshot.owner_id, snapshot.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT p_snapshot_limit
+  )
+  DELETE FROM public.knowledge_snapshots snapshot USING candidates candidate
+    WHERE snapshot.owner_id = candidate.owner_id
+      AND snapshot.id = candidate.id
+      AND snapshot.expires_at <= clock_timestamp();
+  GET DIAGNOSTICS pruned_snapshots = ROW_COUNT;
   DELETE FROM public.knowledge_tombstones WHERE id IN (
     SELECT id FROM public.knowledge_tombstones
     WHERE expires_at <= clock_timestamp() ORDER BY expires_at LIMIT p_limit
@@ -1638,7 +1674,8 @@ BEGIN
       AND change.sequence = candidates.sequence;
   GET DIAGNOSTICS pruned_changes = ROW_COUNT;
   RETURN jsonb_build_object(
-    'prunedChanges', pruned_changes, 'prunedTombstones', pruned_tombstones
+    'prunedChanges', pruned_changes, 'prunedTombstones', pruned_tombstones,
+    'prunedSnapshots', pruned_snapshots
   );
 END;
 $$;
@@ -1653,7 +1690,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_require_cloud(bigint) FROM PUB
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar, varchar, integer, integer, integer) FROM PUBLIC, anon, authenticated;
@@ -1669,7 +1706,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM 
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) FROM PUBLIC, anon, authenticated;
 
 DO $grants$
 DECLARE table_name text;
@@ -1695,7 +1732,7 @@ GRANT USAGE, SELECT ON SEQUENCE public.knowledge_conflicts_id_seq TO service_rol
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar, bigint, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar, varchar, integer, integer, integer) TO service_role;
@@ -1711,6 +1748,6 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) TO service_role;
 
 COMMIT;

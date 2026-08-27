@@ -3,7 +3,7 @@ BEGIN;
 -- Disable the executable surface first. Owner-scoped tables, rows, RLS policies,
 -- composite foreign keys, and immutable lifecycle guards are deliberately retained.
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_request_hash(jsonb) FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
@@ -20,11 +20,11 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar, 
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 
-DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_retention(varchar, integer);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_retention(varchar, integer, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_claim_job(varchar, varchar, integer);
@@ -41,7 +41,7 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_full_resync(varchar, varchar,
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_authorize_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar);
-DROP FUNCTION IF EXISTS public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_verify_upload(varchar, varchar, varchar, varchar, varchar, bigint, varchar, varchar, bigint, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_upload(varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_require_cloud(bigint);

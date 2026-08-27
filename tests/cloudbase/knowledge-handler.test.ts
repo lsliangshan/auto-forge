@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import {
   createKnowledgeHandler,
@@ -8,6 +9,14 @@ import {
 
 const context = { auth: { uid: '2089908515857502208' } }
 const futureExpiry = new Date(Date.now() + 15 * 60_000).toISOString()
+
+function expectedUploadObjectId(requestId = 'upload_1', versionId = 'version_1') {
+  return `object_${createHash('md5').update(`${requestId}:${versionId}`).digest('hex')}`
+}
+
+function expectedStorageReference(objectId = expectedUploadObjectId()) {
+  return `knowledge/${context.auth.uid}/kb_1/${objectId}`
+}
 
 function streamedResponse(value: unknown, status = 200) {
   const bytes = new TextEncoder().encode(value === undefined ? '' : JSON.stringify(value))
@@ -206,18 +215,23 @@ describe('CloudBase knowledge function', () => {
 
   it('returns a consumable expiring PG Storage authorization and verifies uploaded bytes', async () => {
     const sha256 = 'a'.repeat(64)
+    const objectId = expectedUploadObjectId()
+    const storageReference = expectedStorageReference(objectId)
     const rpc = vi.fn()
       .mockResolvedValueOnce({
-        uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
-        objectId: 'object_1', jobId: 'job_1', mimeType: 'text/plain',
+        uploadTicket: 'ticket_1', storageReference,
+        objectId, jobId: 'job_1', mimeType: 'text/plain',
         expiresAt: futureExpiry,
       })
       .mockResolvedValueOnce({
-        objectId: 'object_1', storageReference: 'knowledge/1/kb_1/object_1',
+        ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
+        objectId, storageReference,
         expectedByteSize: 42, expectedSha256: sha256, expectedMimeType: 'text/plain',
       })
       .mockResolvedValueOnce({
-        objectId: 'object_1', storageReference: 'knowledge/1/kb_1/object_1', verified: true,
+        ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
+        objectId, storageReference, byteSize: 42, sha256, mimeType: 'text/plain',
+        verified: true,
       })
     const storage = {
       createUploadAuthorization: vi.fn().mockResolvedValue({
@@ -246,17 +260,96 @@ describe('CloudBase knowledge function', () => {
     } })
     await expect(handler({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
       .resolves.toMatchObject({ ok: true, data: { verified: true } })
-    expect(storage.statObject).toHaveBeenCalledWith('knowledge/1/kb_1/object_1')
+    expect(storage.statObject).toHaveBeenCalledWith(storageReference)
     expect(rpc).toHaveBeenNthCalledWith(3, 'autoforge_knowledge_verify_upload', {
       p_caller_user_id: '2089908515857502208', p_upload_ticket: 'ticket_1',
+      p_knowledge_base_id: 'kb_1', p_object_id: objectId,
+      p_storage_reference: storageReference,
+      p_expected_byte_size: 42, p_expected_sha256: sha256,
+      p_expected_mime_type: 'text/plain',
       p_actual_byte_size: 42, p_actual_sha256: sha256, p_actual_mime_type: 'text/plain',
     })
   })
 
+  it('rejects reviewer-reproduced owner, base, object, or private-path drift before Storage authorization', async () => {
+    const objectId = expectedUploadObjectId()
+    const valid = {
+      uploadTicket: 'ticket_1', storageReference: expectedStorageReference(objectId),
+      objectId, jobId: 'job_1', mimeType: 'text/plain', expiresAt: futureExpiry,
+    }
+    for (const drift of [
+      { storageReference: `knowledge/attacker/kb_1/${objectId}` },
+      { storageReference: `knowledge/${context.auth.uid}/kb_other/${objectId}` },
+      { objectId: 'object_attacker', storageReference: expectedStorageReference('object_attacker') },
+    ]) {
+      const storage = {
+        createUploadAuthorization: vi.fn(), statObject: vi.fn(), deleteObjects: vi.fn(),
+      }
+      const handler = createKnowledgeHandler({
+        rpc: vi.fn().mockResolvedValue({ ...valid, ...drift }), storage,
+        uploadUrlPrefix: 'https://pg-storage.example/upload/',
+      })
+      await expect(handler({
+        action: 'authorizeUpload', requestId: 'upload_1', knowledgeBaseId: 'kb_1',
+        documentId: 'document_1', versionId: 'version_1', byteSize: 42,
+        sha256: 'a'.repeat(64), mimeType: 'text/plain',
+      }, context)).resolves.toEqual({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+      expect(storage.createUploadAuthorization).not.toHaveBeenCalled()
+    }
+  })
+
+  it('rejects get/stat/verify correlation drift without publishing a completion', async () => {
+    const sha256 = 'a'.repeat(64)
+    const objectId = expectedUploadObjectId()
+    const storageReference = expectedStorageReference(objectId)
+    const getUpload = {
+      ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_1',
+      objectId, storageReference, expectedByteSize: 42, expectedSha256: sha256,
+      expectedMimeType: 'text/plain',
+    }
+    const storage = {
+      createUploadAuthorization: vi.fn(),
+      statObject: vi.fn().mockResolvedValue({ byteSize: 42, sha256, mimeType: 'text/plain' }),
+      deleteObjects: vi.fn(),
+    }
+    const mismatchedGet = createKnowledgeHandler({
+      rpc: vi.fn().mockResolvedValue({ ...getUpload, knowledgeBaseId: 'kb_other' }), storage,
+    })
+    await expect(mismatchedGet({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
+      .resolves.toEqual({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+    expect(storage.statObject).not.toHaveBeenCalled()
+
+    const statDriftRpc = vi.fn().mockResolvedValue(getUpload)
+    const mismatchedStat = createKnowledgeHandler({
+      rpc: statDriftRpc,
+      storage: {
+        ...storage,
+        statObject: vi.fn().mockResolvedValue({
+          byteSize: 41, sha256, mimeType: 'text/plain',
+        }),
+      },
+    })
+    await expect(mismatchedStat({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
+      .resolves.toEqual({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+    expect(statDriftRpc).toHaveBeenCalledTimes(1)
+
+    const rpc = vi.fn()
+      .mockResolvedValueOnce(getUpload)
+      .mockResolvedValueOnce({
+        ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', uploadTicket: 'ticket_other',
+        objectId, storageReference, byteSize: 42, sha256, mimeType: 'text/plain',
+        verified: true,
+      })
+    const mismatchedVerify = createKnowledgeHandler({ rpc, storage })
+    await expect(mismatchedVerify({ action: 'completeUpload', uploadTicket: 'ticket_1' }, context))
+      .resolves.toEqual({ ok: false, error: { code: 'INTERNAL_ERROR' } })
+  })
+
   it('rejects upload authorization outside the configured HTTPS path or with credential headers', async () => {
+    const objectId = expectedUploadObjectId()
     const rpc = vi.fn().mockResolvedValue({
-      uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
-      objectId: 'object_1', jobId: 'job_1', mimeType: 'text/plain',
+      uploadTicket: 'ticket_1', storageReference: expectedStorageReference(objectId),
+      objectId, jobId: 'job_1', mimeType: 'text/plain',
       expiresAt: futureExpiry,
     })
     const storage = {
@@ -347,7 +440,7 @@ describe('CloudBase knowledge function', () => {
         },
         expiresAt: futureExpiry,
       }))
-      .mockResolvedValueOnce(streamedResponse(undefined, 204))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
     const storage = createPostgresStorageClient({
       baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
       uploadUrlPrefix: 'https://pg-storage.example/upload/', fetchImpl,
@@ -362,5 +455,13 @@ describe('CloudBase knowledge function', () => {
       expect.objectContaining({ headers: expect.objectContaining({ authorization: 'Bearer server-only' }) }),
     )
     await expect(storage.deleteObjects(['knowledge/1/kb_1/object_1'])).resolves.toBeUndefined()
+
+    const nonEmptyStatusStorage = createPostgresStorageClient({
+      baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
+      uploadUrlPrefix: 'https://pg-storage.example/upload/',
+      fetchImpl: vi.fn().mockResolvedValue(new Response(null, { status: 200 })),
+    })
+    await expect(nonEmptyStatusStorage.deleteObjects(['knowledge/1/kb_1/object_1']))
+      .rejects.toEqual({ code: 'INTERNAL_ERROR' })
   })
 })

@@ -1,4 +1,6 @@
-/* global Buffer, fetch, module, TextDecoder, URL */
+/* global Buffer, fetch, module, require, TextDecoder, URL */
+
+const { createHash } = require('node:crypto')
 
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
@@ -92,7 +94,8 @@ async function readBoundedJson(response, allowEmpty = false) {
         if (bytes > maximumResponseBytes) throw { code: 'INTERNAL_ERROR' }
         text += decoder.decode(chunk.value, { stream: true })
       }
-      if (allowEmpty && text.length === 0) return undefined
+      if (allowEmpty && (response.status === 204 || response.status === 205)
+        && text.length === 0) return undefined
       return JSON.parse(text)
     } finally {
       if (!complete && typeof reader.cancel === 'function') {
@@ -103,6 +106,8 @@ async function readBoundedJson(response, allowEmpty = false) {
       }
     }
   }
+  if (allowEmpty && (response?.status === 204 || response?.status === 205)
+    && (!response?.body || typeof response.body.getReader !== 'function')) return undefined
   throw { code: 'INTERNAL_ERROR' }
 }
 
@@ -112,6 +117,16 @@ function isIsoDate(value) {
 
 function validStorageReference(value) {
   return nonEmptyString(value, 512) && value.startsWith('knowledge/') && !value.includes('..')
+}
+
+function canonicalStorageReference(ownerId, knowledgeBaseId, objectId) {
+  if (![ownerId, knowledgeBaseId, objectId].every(value => nonEmptyString(value)
+    && /^[A-Za-z0-9_-]+$/.test(value))) return undefined
+  return `knowledge/${ownerId}/${knowledgeBaseId}/${objectId}`
+}
+
+function expectedUploadObjectId(requestId, versionId) {
+  return `object_${createHash('md5').update(`${requestId}:${versionId}`).digest('hex')}`
 }
 
 function validUploadAuthorization(value, expected, uploadUrlPrefix) {
@@ -174,14 +189,25 @@ function validResponse(action, value) {
         && nonEmptyString(value.objectId) && nonEmptyString(value.jobId)
         && nonEmptyString(value.mimeType, 200) && isIsoDate(value.expiresAt)
     case 'getUpload':
-      return exactKeys(value, ['objectId', 'storageReference', 'expectedByteSize', 'expectedSha256', 'expectedMimeType'])
-        && nonEmptyString(value.objectId) && validStorageReference(value.storageReference)
+      return exactKeys(value, [
+        'ownerId', 'knowledgeBaseId', 'uploadTicket', 'objectId', 'storageReference',
+        'expectedByteSize', 'expectedSha256', 'expectedMimeType',
+      ]) && nonEmptyString(value.ownerId, 64) && nonEmptyString(value.knowledgeBaseId)
+        && nonEmptyString(value.uploadTicket) && nonEmptyString(value.objectId)
+        && validStorageReference(value.storageReference)
         && Number.isSafeInteger(value.expectedByteSize) && value.expectedByteSize > 0
         && typeof value.expectedSha256 === 'string' && /^[a-f0-9]{64}$/.test(value.expectedSha256)
         && nonEmptyString(value.expectedMimeType, 200)
     case 'completeUpload':
-      return exactKeys(value, ['objectId', 'storageReference', 'verified'])
-        && nonEmptyString(value.objectId) && validStorageReference(value.storageReference)
+      return exactKeys(value, [
+        'ownerId', 'knowledgeBaseId', 'uploadTicket', 'objectId', 'storageReference',
+        'byteSize', 'sha256', 'mimeType', 'verified',
+      ]) && nonEmptyString(value.ownerId, 64) && nonEmptyString(value.knowledgeBaseId)
+        && nonEmptyString(value.uploadTicket) && nonEmptyString(value.objectId)
+        && validStorageReference(value.storageReference)
+        && Number.isSafeInteger(value.byteSize) && value.byteSize > 0
+        && typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256)
+        && nonEmptyString(value.mimeType, 200)
         && value.verified === true
     case 'pushMutation':
       if (!nonEmptyString(value.mutationId) || !Number.isSafeInteger(value.sequence)
@@ -402,7 +428,11 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix }) {
       if (event.action === 'authorizeUpload') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
         if (!validResponse('authorizeUpload', data)) throw { code: 'INTERNAL_ERROR' }
-        if (data.mimeType !== event.mimeType || Date.parse(data.expiresAt) <= Date.now()) {
+        const expectedObjectId = expectedUploadObjectId(event.requestId, event.versionId)
+        const expectedReference = canonicalStorageReference(uid, event.knowledgeBaseId, expectedObjectId)
+        if (!expectedReference || data.objectId !== expectedObjectId
+          || data.storageReference !== expectedReference
+          || data.mimeType !== event.mimeType || Date.parse(data.expiresAt) <= Date.now()) {
           throw { code: 'INTERNAL_ERROR' }
         }
         const uploadAuthorization = await storage.createUploadAuthorization({
@@ -427,18 +457,45 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix }) {
       if (event.action === 'completeUpload') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
         if (!validResponse('getUpload', data)) throw { code: 'INTERNAL_ERROR' }
+        const expectedReference = canonicalStorageReference(
+          data.ownerId, data.knowledgeBaseId, data.objectId,
+        )
+        if (data.ownerId !== uid || data.uploadTicket !== event.uploadTicket
+          || !expectedReference || data.storageReference !== expectedReference) {
+          throw { code: 'INTERNAL_ERROR' }
+        }
         const observed = await storage.statObject(data.storageReference)
         if (!exactKeys(observed, ['byteSize', 'sha256', 'mimeType'])
           || !Number.isSafeInteger(observed.byteSize) || observed.byteSize <= 0
           || typeof observed.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(observed.sha256)
-          || !nonEmptyString(observed.mimeType, 200)) throw { code: 'INTERNAL_ERROR' }
+          || !nonEmptyString(observed.mimeType, 200)
+          || observed.byteSize !== data.expectedByteSize
+          || observed.sha256 !== data.expectedSha256
+          || observed.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
         const verified = await rpc('autoforge_knowledge_verify_upload', {
           p_caller_user_id: uid, p_upload_ticket: event.uploadTicket,
+          p_knowledge_base_id: data.knowledgeBaseId, p_object_id: data.objectId,
+          p_storage_reference: data.storageReference,
+          p_expected_byte_size: data.expectedByteSize,
+          p_expected_sha256: data.expectedSha256,
+          p_expected_mime_type: data.expectedMimeType,
           p_actual_byte_size: observed.byteSize, p_actual_sha256: observed.sha256,
           p_actual_mime_type: observed.mimeType,
         })
-        if (!validResponse('completeUpload', verified)) throw { code: 'INTERNAL_ERROR' }
-        return { ok: true, data: verified }
+        if (!validResponse('completeUpload', verified)
+          || verified.ownerId !== uid
+          || verified.knowledgeBaseId !== data.knowledgeBaseId
+          || verified.uploadTicket !== event.uploadTicket
+          || verified.objectId !== data.objectId
+          || verified.storageReference !== data.storageReference
+          || verified.byteSize !== data.expectedByteSize
+          || verified.sha256 !== data.expectedSha256
+          || verified.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
+        return { ok: true, data: {
+          objectId: verified.objectId,
+          storageReference: verified.storageReference,
+          verified: true,
+        } }
       }
       if (event.action === 'cleanupOrphans') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
