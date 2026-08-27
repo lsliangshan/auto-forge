@@ -91,10 +91,13 @@ describe('CloudBaseKnowledgeClient', () => {
     const callFunction = vi.fn()
       .mockResolvedValueOnce({ result: { ok: true, data: {
         uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1', objectId: 'object_1',
-        jobId: 'job_1', mimeType: 'text/plain', expiresAt: '2026-08-26T12:15:00.000Z',
+        jobId: 'job_1', mimeType: 'text/plain', expiresAt: '2026-09-26T12:15:00.000Z',
         uploadAuthorization: {
-          url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT', headers: {},
-          expiresAt: '2026-08-26T12:15:00.000Z',
+          url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT', headers: {
+            'content-length': '42', 'content-type': 'text/plain',
+            'x-content-sha256': 'a'.repeat(64), 'x-upload-ticket': 'ticket_1',
+          },
+          expiresAt: '2026-09-26T12:15:00.000Z',
         },
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: {
@@ -162,23 +165,56 @@ describe('CloudBaseKnowledgeClient', () => {
 
     await expect(client.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 0 }))
       .resolves.toMatchObject({ nextSequence: 1000, hasMore: true })
+    expect(callFunction).toHaveBeenNthCalledWith(1, {
+      name: 'autoforge-knowledge', data: {
+        action: 'pullChanges', knowledgeBaseId: 'kb_1', afterSequence: 0,
+        limit: 512, maxBytes: 786_432,
+      },
+    })
     await expect(client.pullChanges({ knowledgeBaseId: 'kb_1', afterSequence: 1000 }))
       .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
   })
 
-  it('accepts a full snapshot and 512-character storage references', async () => {
+  it('paginates a stable full snapshot with bounded advancing requests', async () => {
     const storageReference = `knowledge/${'s'.repeat(502)}`
     const callFunction = vi.fn()
       .mockResolvedValueOnce({ result: { ok: true, data: {
-        kind: 'snapshot', nextSequence: 42,
+        kind: 'snapshot_page', snapshotId: 'snapshot_1', snapshotSequence: 42,
+        nextOrdinal: 1, hasMore: true,
         changes: [{ sequence: 42, entityKind: 'document', entityId: 'document_1',
           operation: 'upsert', revision: 'r42', payload: {} }],
+      } } })
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        kind: 'snapshot_page', snapshotId: 'snapshot_1', snapshotSequence: 42,
+        nextOrdinal: 2, hasMore: false,
+        changes: [{ sequence: 42, entityKind: 'metadata', entityId: 'metadata_1',
+          operation: 'upsert', revision: 'r42b', payload: {} }],
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: { removed: 1 } } })
     const client = new CloudBaseKnowledgeClient({ callFunction })
 
     await expect(client.fullResync({ knowledgeBaseId: 'kb_1' }))
-      .resolves.toMatchObject({ kind: 'snapshot', nextSequence: 42 })
+      .resolves.toEqual({
+        kind: 'snapshot', nextSequence: 42,
+        changes: [
+          { sequence: 42, entityKind: 'document', entityId: 'document_1',
+            operation: 'upsert', revision: 'r42', payload: {} },
+          { sequence: 42, entityKind: 'metadata', entityId: 'metadata_1',
+            operation: 'upsert', revision: 'r42b', payload: {} },
+        ],
+      })
+    expect(callFunction).toHaveBeenNthCalledWith(1, {
+      name: 'autoforge-knowledge', data: {
+        action: 'fullResync', knowledgeBaseId: 'kb_1', snapshotId: null,
+        afterOrdinal: 0, limit: 512, maxBytes: 786_432,
+      },
+    })
+    expect(callFunction).toHaveBeenNthCalledWith(2, {
+      name: 'autoforge-knowledge', data: {
+        action: 'fullResync', knowledgeBaseId: 'kb_1', snapshotId: 'snapshot_1',
+        afterOrdinal: 1, limit: 512, maxBytes: 786_432,
+      },
+    })
     await expect(client.cleanupOrphans({
       requestId: 'cleanup_1', knowledgeBaseId: 'kb_1', storageReferences: [storageReference],
     })).resolves.toEqual({ removed: 1 })
@@ -190,7 +226,8 @@ describe('CloudBaseKnowledgeClient', () => {
         knowledgeBaseId: 'kb_other', generationId: 'generation_1', status: 'staging',
       } } })
       .mockResolvedValueOnce({ result: { ok: true, data: {
-        kind: 'snapshot', nextSequence: 4, changes: [
+        kind: 'snapshot_page', snapshotId: 'snapshot_1', snapshotSequence: 4,
+        nextOrdinal: 2, hasMore: false, changes: [
           { sequence: 4, entityKind: 'document', entityId: 'document_1',
             operation: 'upsert', revision: 'r4', payload: {} },
           { sequence: 4, entityKind: 'document', entityId: 'document_1',
@@ -202,6 +239,19 @@ describe('CloudBaseKnowledgeClient', () => {
       requestId: 'begin_1', knowledgeBaseId: 'kb_1', name: 'Personal',
       revision: 'r1', generationId: 'generation_1',
     })).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+    await expect(client.fullResync({ knowledgeBaseId: 'kb_1' }))
+      .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+  })
+
+  it('rejects a snapshot page that does not advance its ordinal', async () => {
+    const client = new CloudBaseKnowledgeClient({
+      callFunction: vi.fn().mockResolvedValue({ result: { ok: true, data: {
+        kind: 'snapshot_page', snapshotId: 'snapshot_1', snapshotSequence: 4,
+        nextOrdinal: 0, hasMore: true,
+        changes: [{ sequence: 4, entityKind: 'document', entityId: 'document_1',
+          operation: 'upsert', revision: 'r4', payload: {} }],
+      } } }),
+    })
     await expect(client.fullResync({ knowledgeBaseId: 'kb_1' }))
       .rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
   })

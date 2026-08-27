@@ -9,7 +9,16 @@ const CipherDatabase = createRequire(import.meta.url)('better-sqlite3-multiple-c
   new(filename: string): Database.Database
 }
 
-function fixture(overrides: Partial<CloudKnowledgeRemote> = {}, online = true) {
+interface LocalDependencyOverrides {
+  applyRemoteChange?: (...args: unknown[]) => Promise<void>
+  replaceRemoteSnapshot?: (...args: unknown[]) => Promise<void>
+}
+
+function fixture(
+  overrides: Partial<CloudKnowledgeRemote> = {},
+  online = true,
+  localOverrides: LocalDependencyOverrides = {},
+) {
   const database = new CipherDatabase(':memory:')
   databases.push(database)
   initializeKnowledgeSchema(database)
@@ -37,8 +46,10 @@ function fixture(overrides: Partial<CloudKnowledgeRemote> = {}, online = true) {
     cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
     ...overrides,
   }
-  const applyRemoteChange = vi.fn().mockResolvedValue(undefined)
-  const replaceRemoteSnapshot = vi.fn().mockResolvedValue(undefined)
+  const applyRemoteChange = vi.fn(localOverrides.applyRemoteChange ?? (async () => undefined))
+  const replaceRemoteSnapshot = vi.fn(
+    localOverrides.replaceRemoteSnapshot ?? (async () => undefined),
+  )
   const service = new KnowledgeSyncService(database, remote, {
     now: () => 1_000,
     id: () => 'lease_1',
@@ -47,6 +58,22 @@ function fixture(overrides: Partial<CloudKnowledgeRemote> = {}, online = true) {
     replaceRemoteSnapshot,
   })
   return { database, remote, service, applyRemoteChange, replaceRemoteSnapshot }
+}
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void
+  const promise = new Promise<void>(settle => { resolve = settle })
+  return { promise, resolve }
+}
+
+function commitFromCallback(args: unknown[], write: () => void): void {
+  const guard = args.find(value => typeof value === 'object' && value !== null
+    && 'commit' in value) as { commit?: (callback: () => void) => void } | undefined
+  if (guard?.commit) {
+    guard.commit(write)
+    return
+  }
+  write()
 }
 
 afterEach(() => {
@@ -113,12 +140,47 @@ describe('KnowledgeSyncService', () => {
     expect(fullResync).toHaveBeenCalledWith({ knowledgeBaseId: 'kb_1' })
     expect(replaceRemoteSnapshot).toHaveBeenCalledWith([
       { sequence: 42, entityKind: 'document', entityId: 'document_remote', operation: 'upsert', revision: 'r42', payload: {} },
-    ])
+    ], expect.objectContaining({ knowledgeBaseId: 'kb_1', commit: expect.any(Function) }))
     expect(applyRemoteChange).not.toHaveBeenCalled()
     expect(pullChanges).not.toHaveBeenCalled()
     expect(database.prepare(
       'SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?',
     ).get('kb_1')).toEqual({ sequence: 42 })
+  })
+
+  it('rejects a held snapshot commit after cancellation and still releases callback resources', async () => {
+    const entered = deferred()
+    const release = deferred()
+    let localWrites = 0
+    let cleanedUp = false
+    const replaceRemoteSnapshot = async (...args: unknown[]) => {
+      entered.resolve()
+      await release.promise
+      try {
+        commitFromCallback(args, () => { localWrites += 1 })
+      } finally {
+        cleanedUp = true
+      }
+    }
+    const { database, service } = fixture({
+      fullResync: vi.fn().mockResolvedValue({
+        kind: 'snapshot', nextSequence: 7,
+        changes: [{ sequence: 7, entityKind: 'document', entityId: 'document_remote',
+          operation: 'upsert', revision: 'r7', payload: { held: true } }],
+      }),
+    }, true, { replaceRemoteSnapshot })
+
+    const running = service.synchronize('kb_1')
+    await entered.promise
+    service.cancel('kb_1')
+    release.resolve()
+
+    await expect(running).resolves.toEqual({ status: 'paused', processed: 0, conflicts: 0 })
+    expect(localWrites).toBe(0)
+    expect(cleanedUp).toBe(true)
+    expect(database.prepare(
+      'SELECT count(*) AS count FROM sync_cursors WHERE knowledge_base_id = ?',
+    ).get('kb_1')).toEqual({ count: 0 })
   })
 
   it('replaces an expired incremental cursor with a complete snapshot', async () => {
@@ -139,6 +201,44 @@ describe('KnowledgeSyncService', () => {
     expect(database.prepare(
       'SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?',
     ).get('kb_1')).toEqual({ sequence: 4 })
+  })
+
+  it('rejects a held incremental apply after owner invalidation without advancing the cursor', async () => {
+    const entered = deferred()
+    const release = deferred()
+    let localWrites = 0
+    let cleanedUp = false
+    const applyRemoteChange = async (...args: unknown[]) => {
+      entered.resolve()
+      await release.promise
+      try {
+        commitFromCallback(args, () => { localWrites += 1 })
+      } finally {
+        cleanedUp = true
+      }
+    }
+    const { database, service } = fixture({
+      pullChanges: vi.fn().mockResolvedValue({
+        kind: 'incremental', nextSequence: 2, hasMore: false,
+        changes: [{ sequence: 2, entityKind: 'document', entityId: 'document_remote',
+          operation: 'upsert', revision: 'r2', payload: { held: true } }],
+      }),
+    }, true, { applyRemoteChange })
+    database.prepare(
+      'INSERT INTO sync_cursors (knowledge_base_id, sequence, updated_at) VALUES (?, ?, ?)',
+    ).run('kb_1', 1, 1)
+
+    const running = service.synchronize('kb_1')
+    await entered.promise
+    service.invalidateOwner()
+    release.resolve()
+
+    await expect(running).resolves.toEqual({ status: 'paused', processed: 0, conflicts: 0 })
+    expect(localWrites).toBe(0)
+    expect(cleanedUp).toBe(true)
+    expect(database.prepare(
+      'SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?',
+    ).get('kb_1')).toEqual({ sequence: 1 })
   })
 
   it('never regresses a durable monotonic cursor', async () => {
@@ -279,6 +379,35 @@ describe('KnowledgeSyncService', () => {
     expect(database.prepare(
       'SELECT count(*) AS count FROM sync_cursors WHERE knowledge_base_id = ?',
     ).get('kb_1')).toEqual({ count: 0 })
+  })
+
+  it('rejects a held conversion download commit after cancellation and releases resources', async () => {
+    const entered = deferred()
+    const release = deferred()
+    let localWrites = 0
+    let cleanedUp = false
+    const { database, remote, service } = fixture()
+    const conversion = service.convertToLocalOnly('kb_1', async (...args: unknown[]) => {
+      entered.resolve()
+      await release.promise
+      try {
+        commitFromCallback(args, () => { localWrites += 1 })
+        return { complete: true, expectedDigest: 'verified', actualDigest: 'verified' }
+      } finally {
+        cleanedUp = true
+      }
+    })
+    await entered.promise
+    service.cancel('kb_1')
+    release.resolve()
+
+    await expect(conversion).rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(localWrites).toBe(0)
+    expect(cleanedUp).toBe(true)
+    expect(remote.deleteKnowledgeBase).not.toHaveBeenCalled()
+    expect(database.prepare(
+      'SELECT state FROM cloud_sync_conversions WHERE knowledge_base_id = ?',
+    ).get('kb_1')).toEqual({ state: 'downloading' })
   })
 
   it('cancels queued work and drains durable orphan cleanup records idempotently', async () => {

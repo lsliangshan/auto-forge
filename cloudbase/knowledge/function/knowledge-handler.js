@@ -1,4 +1,4 @@
-/* global Buffer, fetch, module, TextDecoder */
+/* global Buffer, fetch, module, TextDecoder, URL */
 
 const stableErrorCodes = new Set([
   'AUTH_REQUIRED',
@@ -16,13 +16,18 @@ const stableErrorCodes = new Set([
 const entityKinds = new Set(['knowledge_base', 'document', 'metadata'])
 const operations = new Set(['upsert', 'delete'])
 const maximumResponseBytes = 1024 * 1024
+const maximumPageBytes = 786432
+const pageLimit = 512
+const uploadHeaderNames = [
+  'content-length', 'content-type', 'x-content-sha256', 'x-upload-ticket',
+]
 const actionKeys = {
   beginSync: ['action', 'requestId', 'knowledgeBaseId', 'name', 'revision', 'generationId'],
   authorizeUpload: ['action', 'requestId', 'knowledgeBaseId', 'documentId', 'versionId', 'byteSize', 'sha256', 'mimeType'],
   completeUpload: ['action', 'uploadTicket'],
   pushMutation: ['action', 'mutationId', 'knowledgeBaseId', 'entityKind', 'entityId', 'operation', 'baseRevision', 'payload'],
-  pullChanges: ['action', 'knowledgeBaseId', 'afterSequence', 'limit'],
-  fullResync: ['action', 'knowledgeBaseId'],
+  pullChanges: ['action', 'knowledgeBaseId', 'afterSequence', 'limit', 'maxBytes'],
+  fullResync: ['action', 'knowledgeBaseId', 'snapshotId', 'afterOrdinal', 'limit', 'maxBytes'],
   publishGeneration: ['action', 'requestId', 'knowledgeBaseId', 'generationId', 'expectedPublishedGenerationId'],
   deleteKnowledgeBase: ['action', 'requestId', 'knowledgeBaseId', 'expectedPublishedGenerationId'],
   cancelJob: ['action', 'requestId', 'jobId'],
@@ -98,10 +103,7 @@ async function readBoundedJson(response, allowEmpty = false) {
       }
     }
   }
-  const value = await response.json().catch(() => undefined)
-  if (allowEmpty && value === undefined) return undefined
-  if (safeSerializedSize(value) > maximumResponseBytes) throw { code: 'INTERNAL_ERROR' }
-  return value
+  throw { code: 'INTERNAL_ERROR' }
 }
 
 function isIsoDate(value) {
@@ -110,6 +112,32 @@ function isIsoDate(value) {
 
 function validStorageReference(value) {
   return nonEmptyString(value, 512) && value.startsWith('knowledge/') && !value.includes('..')
+}
+
+function validUploadAuthorization(value, expected, uploadUrlPrefix) {
+  if (!exactKeys(value, ['url', 'method', 'headers', 'expiresAt'])
+    || value.method !== 'PUT' || !isRecord(value.headers)
+    || !nonEmptyString(uploadUrlPrefix, 2048)) return false
+  let expectedUrl
+  try {
+    const prefix = new URL(uploadUrlPrefix)
+    if (prefix.protocol !== 'https:' || prefix.username || prefix.password
+      || !prefix.pathname.endsWith('/')) return false
+    expectedUrl = new URL(encodeURIComponent(expected.uploadTicket), prefix).href
+  } catch {
+    return false
+  }
+  const names = Object.keys(value.headers).map(name => name.toLowerCase()).sort()
+  if (value.url !== expectedUrl
+    || names.length !== uploadHeaderNames.length
+    || names.some((name, index) => name !== uploadHeaderNames[index])
+    || value.headers['content-type'] !== expected.mimeType
+    || value.headers['content-length'] !== String(expected.byteSize)
+    || value.headers['x-content-sha256'] !== expected.sha256
+    || value.headers['x-upload-ticket'] !== expected.uploadTicket
+    || value.expiresAt !== expected.expiresAt
+    || !isIsoDate(value.expiresAt) || Date.parse(value.expiresAt) <= Date.now()) return false
+  return true
 }
 
 function validChange(value) {
@@ -145,14 +173,6 @@ function validResponse(action, value) {
         && nonEmptyString(value.uploadTicket) && validStorageReference(value.storageReference)
         && nonEmptyString(value.objectId) && nonEmptyString(value.jobId)
         && nonEmptyString(value.mimeType, 200) && isIsoDate(value.expiresAt)
-    case 'uploadAuthorization':
-      return exactKeys(value, ['url', 'method', 'headers', 'expiresAt'])
-        && typeof value.url === 'string' && value.url.startsWith('https://')
-        && value.method === 'PUT' && isRecord(value.headers)
-        && Object.keys(value.headers).length <= 16
-        && Object.entries(value.headers).every(([key, item]) => nonEmptyString(key, 128)
-          && typeof item === 'string' && item.length <= 1024)
-        && isIsoDate(value.expiresAt)
     case 'getUpload':
       return exactKeys(value, ['objectId', 'storageReference', 'expectedByteSize', 'expectedSha256', 'expectedMimeType'])
         && nonEmptyString(value.objectId) && validStorageReference(value.storageReference)
@@ -182,9 +202,13 @@ function validResponse(action, value) {
         && Array.isArray(value.changes) && value.changes.length <= 1000
         && value.changes.every(validChange)
     case 'fullResync':
-      return exactKeys(value, ['kind', 'nextSequence', 'changes']) && value.kind === 'snapshot'
-        && Number.isSafeInteger(value.nextSequence) && value.nextSequence >= 0
-        && validSnapshotChanges(value.changes, value.nextSequence)
+      return exactKeys(value, [
+        'kind', 'snapshotId', 'snapshotSequence', 'nextOrdinal', 'hasMore', 'changes',
+      ]) && value.kind === 'snapshot_page' && nonEmptyString(value.snapshotId)
+        && Number.isSafeInteger(value.snapshotSequence) && value.snapshotSequence >= 0
+        && Number.isSafeInteger(value.nextOrdinal) && value.nextOrdinal >= 0
+        && typeof value.hasMore === 'boolean'
+        && validSnapshotChanges(value.changes, value.snapshotSequence)
     case 'publishGeneration':
       return exactKeys(value, ['generationId', 'previousGenerationId', 'sequence'])
         && nonEmptyString(value.generationId)
@@ -195,8 +219,12 @@ function validResponse(action, value) {
     case 'cancelJob':
       return exactKeys(value, ['cancelled']) && typeof value.cancelled === 'boolean'
     case 'prepareCleanup':
-      return exactKeys(value, ['storageReferences']) && Array.isArray(value.storageReferences)
+      return (exactKeys(value, ['storageReferences'])
+          || exactKeys(value, ['storageReferences', 'removed']))
+        && Array.isArray(value.storageReferences)
         && value.storageReferences.length <= 100 && value.storageReferences.every(validStorageReference)
+        && (!Object.hasOwn(value, 'removed')
+          || (Number.isSafeInteger(value.removed) && value.removed >= 0))
     case 'cleanupOrphans':
       return exactKeys(value, ['removed']) && Number.isSafeInteger(value.removed) && value.removed >= 0
     case 'getJob':
@@ -296,14 +324,26 @@ function parseAction(event, uid) {
     case 'pullChanges':
       if (!nonEmptyString(event.knowledgeBaseId)
         || !Number.isSafeInteger(event.afterSequence) || event.afterSequence < 0
-        || !Number.isSafeInteger(event.limit) || event.limit < 1 || event.limit > 1000) return undefined
+        || !Number.isSafeInteger(event.limit) || event.limit < 1 || event.limit > pageLimit
+        || !Number.isSafeInteger(event.maxBytes)
+        || event.maxBytes < 65536 || event.maxBytes > maximumPageBytes) return undefined
       return ['autoforge_knowledge_pull_changes', {
         ...common, p_knowledge_base_id: event.knowledgeBaseId,
         p_after_sequence: event.afterSequence, p_limit: event.limit,
+        p_max_bytes: event.maxBytes,
       }]
     case 'fullResync':
-      if (!nonEmptyString(event.knowledgeBaseId)) return undefined
-      return ['autoforge_knowledge_full_resync', { ...common, p_knowledge_base_id: event.knowledgeBaseId }]
+      if (!nonEmptyString(event.knowledgeBaseId)
+        || !(event.snapshotId === null || nonEmptyString(event.snapshotId))
+        || !Number.isSafeInteger(event.afterOrdinal) || event.afterOrdinal < 0
+        || !Number.isSafeInteger(event.limit) || event.limit < 1 || event.limit > pageLimit
+        || !Number.isSafeInteger(event.maxBytes)
+        || event.maxBytes < 65536 || event.maxBytes > maximumPageBytes) return undefined
+      return ['autoforge_knowledge_full_resync', {
+        ...common, p_knowledge_base_id: event.knowledgeBaseId,
+        p_snapshot_id: event.snapshotId, p_after_ordinal: event.afterOrdinal,
+        p_limit: event.limit, p_max_bytes: event.maxBytes,
+      }]
     case 'publishGeneration':
       if (!nonEmptyString(event.requestId)
         || !nonEmptyString(event.knowledgeBaseId)
@@ -349,7 +389,7 @@ function parseAction(event, uid) {
   }
 }
 
-function createKnowledgeHandler({ rpc, storage }) {
+function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix }) {
   return async (rawEvent, context) => {
     const uid = callerUid(context)
     if (!uid) return { ok: false, error: { code: 'AUTH_REQUIRED' } }
@@ -362,6 +402,9 @@ function createKnowledgeHandler({ rpc, storage }) {
       if (event.action === 'authorizeUpload') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
         if (!validResponse('authorizeUpload', data)) throw { code: 'INTERNAL_ERROR' }
+        if (data.mimeType !== event.mimeType || Date.parse(data.expiresAt) <= Date.now()) {
+          throw { code: 'INTERNAL_ERROR' }
+        }
         const uploadAuthorization = await storage.createUploadAuthorization({
           uploadTicket: data.uploadTicket,
           storageReference: data.storageReference,
@@ -370,7 +413,13 @@ function createKnowledgeHandler({ rpc, storage }) {
           mimeType: event.mimeType,
           expiresAt: data.expiresAt,
         })
-        if (!validResponse('uploadAuthorization', uploadAuthorization)) {
+        if (!validUploadAuthorization(uploadAuthorization, {
+          uploadTicket: data.uploadTicket,
+          byteSize: event.byteSize,
+          sha256: event.sha256,
+          mimeType: event.mimeType,
+          expiresAt: data.expiresAt,
+        }, uploadUrlPrefix)) {
           throw { code: 'INTERNAL_ERROR' }
         }
         return { ok: true, data: { ...data, uploadAuthorization } }
@@ -394,6 +443,9 @@ function createKnowledgeHandler({ rpc, storage }) {
       if (event.action === 'cleanupOrphans') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
         if (!validResponse('prepareCleanup', data)) throw { code: 'INTERNAL_ERROR' }
+        if (Object.hasOwn(data, 'removed')) {
+          return { ok: true, data: { removed: data.removed } }
+        }
         await storage.deleteObjects(data.storageReferences)
         const completed = await rpc('autoforge_knowledge_complete_orphan_cleanup', {
           p_caller_user_id: uid, p_request_id: event.requestId,
@@ -419,8 +471,12 @@ function createKnowledgeHandler({ rpc, storage }) {
   }
 }
 
-function createPostgresStorageClient({ baseUrl, serviceKey, fetchImpl = fetch }) {
-  if (!baseUrl || !serviceKey) throw new Error('CloudBase PostgreSQL Storage is not configured')
+function createPostgresStorageClient({
+  baseUrl, serviceKey, uploadUrlPrefix, fetchImpl = fetch,
+}) {
+  if (!baseUrl || !serviceKey || !uploadUrlPrefix) {
+    throw new Error('CloudBase PostgreSQL Storage is not configured')
+  }
   const normalizedBaseUrl = baseUrl.replace(/\/$/, '')
   async function request(path, body, allowEmpty = false) {
     let response
@@ -438,8 +494,12 @@ function createPostgresStorageClient({ baseUrl, serviceKey, fetchImpl = fetch })
     throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
   }
   return {
-    createUploadAuthorization(input) {
-      return request('/upload-authorizations', input)
+    async createUploadAuthorization(input) {
+      const result = await request('/upload-authorizations', input)
+      if (!validUploadAuthorization(result, input, uploadUrlPrefix)) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      return result
     },
     statObject(storageReference) {
       return request('/objects/stat', { storageReference })

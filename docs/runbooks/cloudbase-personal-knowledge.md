@@ -30,8 +30,9 @@ Stop if the two forward migrations are not byte-identical.
    owner/base/document/object joins use their composite owner keys, and the
    entitlement row defaults to `kill_switch_enabled = true`.
 2. Deploy the reviewed CommonJS `autoforge-knowledge` function with
-   `AUTOFORGE_PG_RPC_BASE_URL`, `AUTOFORGE_PG_STORAGE_BASE_URL`, and
-   `AUTOFORGE_PG_SERVICE_KEY` supplied only by the server-side secret manager.
+   `AUTOFORGE_PG_RPC_BASE_URL`, `AUTOFORGE_PG_STORAGE_BASE_URL`, the exact HTTPS
+   `AUTOFORGE_PG_STORAGE_UPLOAD_URL_PREFIX`, and `AUTOFORGE_PG_SERVICE_KEY`
+   supplied only by the server-side secret manager.
    Confirm the deployed checksum and the one-MiB response ceiling.
 3. With anonymous, Alice, and Bob staging identities, probe every action.
    Anonymous and forged-owner events must fail; cross-owner reads, upload
@@ -44,8 +45,10 @@ Stop if the two forward migrations are not byte-identical.
 5. Verify immutable staging generations: a failed parser/index job leaves the
    prior published generation active; publication requires both the expected
    prior generation and a ready candidate.
-6. Verify pull pages use the page-last sequence, `hasMore` makes progress, a
-   zero or retention-floor cursor receives a complete owner-scoped snapshot,
+6. Verify pull pages stay within both 512 rows and 768 KiB, use the page-last
+   sequence, and make progress while `hasMore` is true. Verify a zero or
+   retention-floor cursor receives one transactionally materialized,
+   owner-scoped snapshot through bounded stable pages,
    and the 90-day cleanup advances the durable floor before pruning changes.
 7. Verify job claim and completion CAS with token and expiry. Only
    `TRANSIENT_FAILURE` may retry, at most three attempts; the third expired

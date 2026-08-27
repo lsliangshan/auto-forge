@@ -32,7 +32,30 @@ const tables = [
   'knowledge_upload_authorizations',
   'knowledge_entitlements',
   'knowledge_requests',
+  'knowledge_snapshots',
+  'knowledge_snapshot_items',
 ] as const
+
+function functionBody(sql: string, name: string): string {
+  const marker = `CREATE OR REPLACE FUNCTION public.${name}(`
+  const start = sql.indexOf(marker)
+  expect(start, `${name} exists`).toBeGreaterThanOrEqual(0)
+  const bodyStart = sql.indexOf('AS $$', start)
+  const end = sql.indexOf('$$;', bodyStart + 5)
+  expect(bodyStart, `${name} has body`).toBeGreaterThan(start)
+  expect(end, `${name} body closes`).toBeGreaterThan(bodyStart)
+  return sql.slice(bodyStart + 5, end)
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
 
 describe('CloudBase personal knowledge migration', () => {
   it('keeps the deployment and feature migrations byte-identical', async () => {
@@ -84,7 +107,7 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain('expected_published_generation_id')
     expect(sql).toContain('GENERATION_NOT_READY')
     expect(sql).toContain("'kind', 'cursor_stale'")
-    expect(sql).toContain("'kind', 'snapshot'")
+    expect(sql).toContain("'kind', 'snapshot_page'")
     expect(sql).toContain("'hasMore'")
     expect(sql).toContain('page_last_sequence')
     expect(sql).toContain("interval '90 days'")
@@ -94,6 +117,137 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain("p_error_code = 'TRANSIENT_FAILURE'")
     expect(sql).toContain('attempt >= 3')
     expect(sql).toContain('kill_switch_enabled boolean NOT NULL DEFAULT true')
+  })
+
+  it('uses canonical request binding and durably replays conflict outcomes with both sides', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    expect(sql).not.toContain('md5(concat_ws(')
+    expect(canonical({ a: 'x:y', b: '' })).not.toBe(canonical({ a: 'x', b: 'y:' }))
+    const push = functionBody(sql, 'autoforge_knowledge_push_mutation')
+    expect(push).toContain('existing_conflict public.knowledge_conflicts%ROWTYPE')
+    expect(push).toContain('existing_conflict.input_hash <> fingerprint')
+    expect(push).toContain('RETURN existing_conflict.response')
+    expect(push).toContain('local_revision, remote_revision, local_payload, remote_payload')
+    expect(push).toContain('p_mutation_id, head.revision, p_payload, head.payload')
+    expect(push).toContain('input_hash, response')
+
+    const receipts = new Map<string, {
+      hash: string
+      response: Record<string, unknown>
+      localPayload: Record<string, unknown>
+      remotePayload: Record<string, unknown>
+    }>()
+    const attempt = (
+      owner: string,
+      mutationId: string,
+      input: Record<string, unknown>,
+      remotePayload: Record<string, unknown>,
+    ) => {
+      const key = `${owner.length}:${owner}${mutationId.length}:${mutationId}`
+      const hash = canonical(input)
+      const existing = receipts.get(key)
+      if (existing) {
+        if (existing.hash !== hash) throw new Error('CONFLICT')
+        return existing
+      }
+      const receipt = {
+        hash,
+        response: {
+          mutationId, status: 'conflict', conflictKind: 'content',
+          localRevision: mutationId, remoteRevision: 'remote-r2', sequence: 9,
+        },
+        localPayload: input.payload as Record<string, unknown>,
+        remotePayload,
+      }
+      receipts.set(key, receipt)
+      return receipt
+    }
+    const input = { knowledgeBaseId: 'kb', entityId: 'document', payload: { side: 'local' } }
+    const first = attempt('owner-1', 'mutation-1', input, { side: 'remote' })
+    const replay = attempt('owner-1', 'mutation-1', input, { side: 'new-remote-ignored' })
+    expect(replay.response).toEqual(first.response)
+    expect(replay.localPayload).toEqual({ side: 'local' })
+    expect(replay.remotePayload).toEqual({ side: 'remote' })
+    expect(() => attempt('owner-1', 'mutation-1', {
+      ...input, payload: { side: 'changed' },
+    }, {})).toThrow('CONFLICT')
+    expect(attempt('owner-2', 'mutation-1', input, { side: 'owner-2-remote' }).remotePayload)
+      .toEqual({ side: 'owner-2-remote' })
+  })
+
+  it('pages one stable materialized snapshot by both row and response-byte budgets', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    const snapshot = functionBody(sql, 'autoforge_knowledge_full_resync')
+    expect(snapshot).toContain('p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 512')
+    expect(snapshot).toContain('p_max_bytes IS NULL OR p_max_bytes NOT BETWEEN 65536 AND 786432')
+    expect(snapshot).toContain('INSERT INTO public.knowledge_snapshots')
+    expect(snapshot).toContain('INSERT INTO public.knowledge_snapshot_items')
+    expect(snapshot).toContain('WITH snapshot_boundary AS MATERIALIZED')
+    expect(snapshot).toContain('CROSS JOIN created_snapshot created')
+    expect(snapshot).toContain('snapshot.snapshot_sequence')
+    expect(snapshot).toContain('sum(item.response_bytes) OVER')
+    expect(snapshot).toContain("'hasMore', has_more")
+    const pull = functionBody(sql, 'autoforge_knowledge_pull_changes')
+    expect(pull).toContain('sum(candidate.response_bytes) OVER')
+    expect(pull).toContain('p_max_bytes')
+    expect(pull).toContain("'nextSequence', page_last_sequence")
+    expect(pull).toContain('INTO changes, page_last_sequence, has_more')
+
+    const liveHeads = [
+      { id: 'a', payload: 'old-a', bytes: 60_000 },
+      { id: 'b', payload: 'old-b', bytes: 60_000 },
+      { id: 'c', payload: 'old-c', bytes: 60_000 },
+    ]
+    const materialized = structuredClone(liveHeads)
+    liveHeads[1]!.payload = 'new-b'
+    const page = (after: number, rowLimit: number, byteLimit: number) => {
+      const selected: typeof materialized = []
+      let bytes = 0
+      for (const item of materialized.slice(after, after + rowLimit)) {
+        if (bytes + item.bytes > byteLimit) break
+        selected.push(item)
+        bytes += item.bytes
+      }
+      return {
+        selected,
+        next: after + selected.length,
+        hasMore: after + selected.length < materialized.length,
+      }
+    }
+    const first = page(0, 2, 100_000)
+    const second = page(first.next, 2, 130_000)
+    expect(first).toMatchObject({ next: 1, hasMore: true })
+    expect([...first.selected, ...second.selected].map(item => item.payload))
+      .toEqual(['old-a', 'old-b', 'old-c'])
+  })
+
+  it('binds worker leases and idempotent cancellation/orphan requests to exact arguments', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    const claim = functionBody(sql, 'autoforge_knowledge_claim_job')
+    expect(claim).toContain("btrim(p_worker_id) = ''")
+    expect(claim).toContain("btrim(p_lease_token) = ''")
+    expect(claim).toContain('p_lease_seconds IS NULL')
+    expect(claim).toContain('worker_id = p_worker_id')
+    const complete = functionBody(sql, 'autoforge_knowledge_complete_job')
+    expect(complete).toContain('worker_id = p_worker_id')
+    const cancel = functionBody(sql, 'autoforge_knowledge_cancel_job')
+    expect(cancel).toContain("'action', 'cancel_job'")
+    expect(cancel).toContain("request_row.input_hash <> fingerprint")
+    const orphan = functionBody(sql, 'autoforge_knowledge_prepare_orphan_cleanup')
+    expect(orphan).toContain("'storageReferences', canonical_references")
+    expect(orphan).toContain('request_row.input_hash <> fingerprint')
+
+    const lease = { workerId: 'worker-a', token: 'token-a', state: 'running' }
+    const completeLease = (workerId: string, token: string) => {
+      if (lease.state !== 'running' || lease.workerId !== workerId || lease.token !== token) {
+        throw new Error('CONFLICT')
+      }
+      lease.state = 'completed'
+    }
+    expect(() => completeLease('worker-b', 'token-a')).toThrow('CONFLICT')
+    expect(() => completeLease('worker-a', 'token-b')).toThrow('CONFLICT')
+    completeLease('worker-a', 'token-a')
+    expect(lease.state).toBe('completed')
   })
 
   it('admits metadata purge only after the trusted worker reports exact Storage deletion', async () => {
@@ -108,6 +262,18 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain(
       'GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_base_purge',
     )
+    const purge = functionBody(sql, 'autoforge_knowledge_complete_base_purge')
+    const sentinel = 'secret-content-sentinel'
+    const simulatedPayloadRows = [sentinel]
+    if (purge.includes('DELETE FROM public.knowledge_changes')
+      && purge.includes('DELETE FROM public.knowledge_conflicts')
+      && purge.includes('DELETE FROM public.knowledge_requests')
+      && purge.includes('DELETE FROM public.knowledge_jobs')) {
+      simulatedPayloadRows.length = 0
+    }
+    expect(simulatedPayloadRows.join('|')).not.toContain(sentinel)
+    expect(purge).toContain("jsonb_build_object('deletionJobId', job.id)")
+    expect(purge).toContain("'delete', job.request_id, '{}'::jsonb")
   })
 
   it('ships a data-preserving rollback that disables the executable surface', async () => {

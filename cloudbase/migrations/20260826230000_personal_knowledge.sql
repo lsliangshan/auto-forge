@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS public.knowledge_jobs (
   entity_id varchar(128) NOT NULL,
   state varchar(32) NOT NULL CHECK (state IN ('queued', 'running', 'paused', 'completed', 'failed', 'cancelled')),
   attempt integer NOT NULL DEFAULT 0 CHECK (attempt BETWEEN 0 AND 3),
+  worker_id varchar(128),
   lease_token varchar(128),
   lease_expires_at timestamptz,
   error_code varchar(64),
@@ -257,6 +258,8 @@ CREATE TABLE IF NOT EXISTS public.knowledge_conflicts (
   remote_revision varchar(128) NOT NULL,
   local_payload jsonb NOT NULL,
   remote_payload jsonb NOT NULL,
+  input_hash char(32) NOT NULL,
+  response jsonb NOT NULL,
   state varchar(16) NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'resolved')),
   created_at timestamptz NOT NULL DEFAULT now(),
   resolved_at timestamptz,
@@ -309,12 +312,52 @@ CREATE TABLE IF NOT EXISTS public.knowledge_entitlements (
 CREATE TABLE IF NOT EXISTS public.knowledge_requests (
   owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   request_id varchar(128) NOT NULL,
+  knowledge_base_id varchar(128),
   action varchar(64) NOT NULL,
   input_hash char(32) NOT NULL,
   response jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY(owner_id, request_id)
+  PRIMARY KEY(owner_id, request_id),
+  FOREIGN KEY(owner_id, knowledge_base_id)
+    REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS public.knowledge_snapshots (
+  id varchar(128) NOT NULL,
+  owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  knowledge_base_id varchar(128) NOT NULL,
+  snapshot_sequence bigint NOT NULL CHECK (snapshot_sequence >= 0),
+  expires_at timestamptz NOT NULL DEFAULT (now() + interval '15 minutes'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(owner_id, id),
+  UNIQUE(owner_id, knowledge_base_id, id),
+  FOREIGN KEY(owner_id, knowledge_base_id)
+    REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS public.knowledge_snapshot_items (
+  owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  snapshot_id varchar(128) NOT NULL,
+  ordinal integer NOT NULL CHECK (ordinal >= 0),
+  entity_kind varchar(32) NOT NULL CHECK (entity_kind IN ('knowledge_base', 'document', 'metadata')),
+  entity_id varchar(128) NOT NULL,
+  operation varchar(16) NOT NULL CHECK (operation IN ('upsert', 'delete')),
+  revision varchar(128) NOT NULL,
+  payload jsonb NOT NULL,
+  response_bytes integer NOT NULL CHECK (response_bytes > 0 AND response_bytes <= 131072),
+  PRIMARY KEY(owner_id, snapshot_id, ordinal),
+  UNIQUE(owner_id, snapshot_id, entity_kind, entity_id),
+  FOREIGN KEY(owner_id, snapshot_id)
+    REFERENCES public.knowledge_snapshots(owner_id, id) ON DELETE CASCADE
+);
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_request_hash(p_value jsonb)
+RETURNS char(32)
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path = pg_catalog, public
+AS $$ SELECT md5(p_value::text) $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_version_lifecycle()
 RETURNS trigger
@@ -412,7 +455,8 @@ BEGIN
     'knowledge_index_generations', 'knowledge_jobs', 'knowledge_entity_heads',
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
     'knowledge_sync_floors', 'knowledge_upload_authorizations',
-    'knowledge_entitlements', 'knowledge_requests'
+    'knowledge_entitlements', 'knowledge_requests', 'knowledge_snapshots',
+    'knowledge_snapshot_items'
   ] LOOP
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', table_name);
     EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', table_name);
@@ -473,7 +517,10 @@ AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   request_row public.knowledge_requests%ROWTYPE;
-  fingerprint char(32) := md5(concat_ws(':', p_knowledge_base_id, p_name, p_revision, p_generation_id));
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'begin_sync', 'knowledgeBaseId', p_knowledge_base_id,
+    'name', p_name, 'revision', p_revision, 'generationId', p_generation_id
+  ));
   response jsonb;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
@@ -501,8 +548,9 @@ BEGIN
     'generationId', p_generation_id,
     'status', 'staging'
   );
-  INSERT INTO public.knowledge_requests(owner_id, request_id, action, input_hash, response)
-    VALUES (owner, p_request_id, 'begin_sync', fingerprint, response);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, p_knowledge_base_id, 'begin_sync', fingerprint, response);
   RETURN response;
 END;
 $$;
@@ -520,9 +568,10 @@ AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   request_row public.knowledge_requests%ROWTYPE;
-  fingerprint char(32) := md5(concat_ws(
-    ':', p_knowledge_base_id, p_document_id, p_version_id, p_byte_size::text,
-    p_sha256, p_mime_type
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'authorize_upload', 'knowledgeBaseId', p_knowledge_base_id,
+    'documentId', p_document_id, 'versionId', p_version_id,
+    'byteSize', p_byte_size, 'sha256', p_sha256, 'mimeType', p_mime_type
   ));
   response jsonb;
   object_id varchar := 'object_' || md5(p_request_id || ':' || p_version_id);
@@ -534,7 +583,7 @@ DECLARE
   storage_ref varchar;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
-  IF p_byte_size NOT BETWEEN 1 AND 536870912
+  IF p_byte_size IS NULL OR p_byte_size NOT BETWEEN 1 AND 536870912
     OR p_sha256 IS NULL OR p_sha256 !~ '^[a-f0-9]{64}$'
     OR p_mime_type IS NULL OR length(p_mime_type) NOT BETWEEN 1 AND 200
     OR btrim(p_mime_type) <> p_mime_type THEN
@@ -575,8 +624,9 @@ BEGIN
     'objectId', object_id, 'jobId', job_id, 'mimeType', p_mime_type, 'expiresAt',
     to_char(authorization_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
   );
-  INSERT INTO public.knowledge_requests(owner_id, request_id, action, input_hash, response)
-    VALUES (owner, p_request_id, 'authorize_upload', fingerprint, response);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, p_knowledge_base_id, 'authorize_upload', fingerprint, response);
   RETURN response;
 END;
 $$;
@@ -661,12 +711,15 @@ DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   head public.knowledge_entity_heads%ROWTYPE;
   existing public.knowledge_changes%ROWTYPE;
+  existing_conflict public.knowledge_conflicts%ROWTYPE;
   next_sequence bigint;
   next_revision varchar := p_mutation_id;
   conflict_kind varchar;
-  fingerprint char(32) := md5(concat_ws(
-    ':', p_knowledge_base_id, p_entity_kind, p_entity_id, p_operation,
-    COALESCE(p_base_revision, ''), p_payload::text
+  response jsonb;
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'push_mutation', 'knowledgeBaseId', p_knowledge_base_id,
+    'entityKind', p_entity_kind, 'entityId', p_entity_id, 'operation', p_operation,
+    'baseRevision', p_base_revision, 'payload', p_payload
   ));
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
@@ -682,6 +735,14 @@ BEGIN
       'sequence', existing.sequence, 'revision', existing.revision
     );
   END IF;
+  SELECT * INTO existing_conflict FROM public.knowledge_conflicts
+    WHERE owner_id = owner AND mutation_id = p_mutation_id;
+  IF FOUND THEN
+    IF existing_conflict.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN existing_conflict.response;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM public.knowledge_bases
     WHERE id = p_knowledge_base_id AND owner_id = owner AND deleted_at IS NULL) THEN
     RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001';
@@ -695,20 +756,21 @@ BEGIN
   IF FOUND AND p_entity_kind <> 'metadata' AND p_base_revision IS DISTINCT FROM head.revision THEN
     conflict_kind := CASE WHEN p_operation = 'delete' AND NOT head.deleted
       THEN 'delete_vs_update' ELSE 'content' END;
+    SELECT COALESCE(max(sequence), 0) INTO next_sequence FROM public.knowledge_changes
+      WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id;
+    response := jsonb_build_object(
+      'mutationId', p_mutation_id, 'status', 'conflict', 'conflictKind', conflict_kind,
+      'localRevision', p_mutation_id, 'remoteRevision', head.revision,
+      'sequence', next_sequence
+    );
     INSERT INTO public.knowledge_conflicts(
       owner_id, knowledge_base_id, mutation_id, entity_kind, entity_id, conflict_kind,
-      local_revision, remote_revision, local_payload, remote_payload
+      local_revision, remote_revision, local_payload, remote_payload, input_hash, response
     ) VALUES (
       owner, p_knowledge_base_id, p_mutation_id, p_entity_kind, p_entity_id, conflict_kind,
-      COALESCE(p_base_revision, p_mutation_id), head.revision, p_payload, head.payload
+      p_mutation_id, head.revision, p_payload, head.payload, fingerprint, response
     );
-    RETURN jsonb_build_object(
-      'mutationId', p_mutation_id, 'status', 'conflict', 'conflictKind', conflict_kind,
-      'localRevision', COALESCE(p_base_revision, p_mutation_id),
-      'remoteRevision', head.revision,
-      'sequence', COALESCE((SELECT max(sequence) FROM public.knowledge_changes
-        WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id), 0)
-    );
+    RETURN response;
   END IF;
   INSERT INTO public.knowledge_entity_heads(
     owner_id, knowledge_base_id, entity_kind, entity_id, revision, payload, deleted, updated_at
@@ -739,7 +801,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_pull_changes(
   p_caller_user_id varchar, p_knowledge_base_id varchar,
-  p_after_sequence bigint, p_limit integer
+  p_after_sequence bigint, p_limit integer, p_max_bytes integer
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -754,6 +816,11 @@ DECLARE
   changes jsonb;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
+  IF p_after_sequence IS NULL OR p_after_sequence < 0
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 512
+    OR p_max_bytes IS NULL OR p_max_bytes NOT BETWEEN 65536 AND 786432 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM public.knowledge_bases
     WHERE id = p_knowledge_base_id AND owner_id = owner) THEN
     RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001';
@@ -770,27 +837,38 @@ BEGIN
     )) THEN
     RETURN jsonb_build_object('kind', 'cursor_stale');
   END IF;
-  SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'sequence', sequence, 'entityKind', entity_kind, 'entityId', entity_id,
-    'operation', operation, 'revision', revision, 'payload', payload
-  ) ORDER BY sequence), '[]'::jsonb) INTO changes
-  FROM (SELECT * FROM public.knowledge_changes
-    WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id
-      AND sequence > p_after_sequence ORDER BY sequence LIMIT p_limit) selected;
-  SELECT COALESCE(max(sequence), p_after_sequence) INTO page_last_sequence
-    FROM public.knowledge_changes
-    WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id
-      AND sequence > p_after_sequence
-      AND sequence IN (
-        SELECT sequence FROM public.knowledge_changes
-        WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id
-          AND sequence > p_after_sequence ORDER BY sequence LIMIT p_limit
-      );
-  SELECT EXISTS(
-    SELECT 1 FROM public.knowledge_changes
-    WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id
-      AND sequence > page_last_sequence
-  ) INTO has_more;
+  WITH candidates AS (
+    SELECT change.*,
+      pg_column_size(jsonb_build_object(
+        'sequence', change.sequence, 'entityKind', change.entity_kind,
+        'entityId', change.entity_id, 'operation', change.operation,
+        'revision', change.revision, 'payload', change.payload
+      )) + 64 AS response_bytes
+    FROM public.knowledge_changes change
+    WHERE change.owner_id = owner AND change.knowledge_base_id = p_knowledge_base_id
+      AND change.sequence > p_after_sequence
+    ORDER BY change.sequence LIMIT p_limit
+  ), measured AS (
+    SELECT candidate.*,
+      sum(candidate.response_bytes) OVER (ORDER BY candidate.sequence) AS cumulative_bytes
+    FROM candidates candidate
+  ), selected AS (
+    SELECT * FROM measured WHERE cumulative_bytes <= p_max_bytes - 4096
+  ), page AS (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'sequence', sequence, 'entityKind', entity_kind, 'entityId', entity_id,
+        'operation', operation, 'revision', revision, 'payload', payload
+      ) ORDER BY sequence), '[]'::jsonb) AS changes,
+      COALESCE(max(sequence), p_after_sequence) AS page_last_sequence
+    FROM selected
+  )
+  SELECT page.changes, page.page_last_sequence, EXISTS(
+      SELECT 1 FROM public.knowledge_changes change
+      WHERE change.owner_id = owner
+        AND change.knowledge_base_id = p_knowledge_base_id
+        AND change.sequence > page.page_last_sequence
+    ) INTO changes, page_last_sequence, has_more
+    FROM page;
   RETURN jsonb_build_object(
     'kind', 'incremental', 'nextSequence', page_last_sequence,
     'hasMore', has_more, 'changes', changes
@@ -799,7 +877,8 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_full_resync(
-  p_caller_user_id varchar, p_knowledge_base_id varchar
+  p_caller_user_id varchar, p_knowledge_base_id varchar, p_snapshot_id varchar,
+  p_after_ordinal integer, p_limit integer, p_max_bytes integer
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -808,28 +887,100 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
-  latest bigint;
+  snapshot public.knowledge_snapshots%ROWTYPE;
+  created_snapshot_id varchar;
+  next_ordinal integer;
+  has_more boolean;
   changes jsonb;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
+  IF p_after_ordinal IS NULL OR p_after_ordinal < 0
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 512
+    OR p_max_bytes IS NULL OR p_max_bytes NOT BETWEEN 65536 AND 786432
+    OR (p_snapshot_id IS NULL AND p_after_ordinal <> 0) THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM public.knowledge_bases
     WHERE id = p_knowledge_base_id AND owner_id = owner) THEN
     RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001';
   END IF;
-  SELECT greatest(
-    COALESCE((SELECT max(sequence) FROM public.knowledge_changes
-      WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id), 0),
-    COALESCE((SELECT minimum_sequence - 1 FROM public.knowledge_sync_floors
-      WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id), 0)
-  ) INTO latest;
+  DELETE FROM public.knowledge_snapshots WHERE owner_id = owner
+    AND expires_at <= clock_timestamp();
+  IF p_snapshot_id IS NULL THEN
+    created_snapshot_id := 'snapshot_' || md5(
+      owner::text || ':' || p_knowledge_base_id || ':' || clock_timestamp()::text || ':' || random()::text
+    );
+    WITH snapshot_boundary AS MATERIALIZED (
+      SELECT greatest(
+        COALESCE((SELECT max(sequence) FROM public.knowledge_changes
+          WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id), 0),
+        COALESCE((SELECT minimum_sequence - 1 FROM public.knowledge_sync_floors
+          WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id), 0)
+      ) AS latest
+    ), created_snapshot AS (
+      INSERT INTO public.knowledge_snapshots(
+        id, owner_id, knowledge_base_id, snapshot_sequence
+      ) SELECT created_snapshot_id, owner, p_knowledge_base_id, boundary.latest
+        FROM snapshot_boundary boundary
+      RETURNING id, owner_id, snapshot_sequence
+    )
+    INSERT INTO public.knowledge_snapshot_items(
+      owner_id, snapshot_id, ordinal, entity_kind, entity_id,
+      operation, revision, payload, response_bytes
+    ) SELECT owner, created.id,
+      row_number() OVER (ORDER BY head.entity_kind, head.entity_id)::integer - 1,
+      head.entity_kind, head.entity_id,
+      CASE WHEN head.deleted THEN 'delete' ELSE 'upsert' END,
+      head.revision, head.payload,
+      pg_column_size(jsonb_build_object(
+        'sequence', created.snapshot_sequence, 'entityKind', head.entity_kind,
+        'entityId', head.entity_id,
+        'operation', CASE WHEN head.deleted THEN 'delete' ELSE 'upsert' END,
+        'revision', head.revision, 'payload', head.payload
+      )) + 64
+    FROM public.knowledge_entity_heads head CROSS JOIN created_snapshot created
+    WHERE head.owner_id = owner AND head.knowledge_base_id = p_knowledge_base_id;
+    SELECT * INTO STRICT snapshot FROM public.knowledge_snapshots
+      WHERE owner_id = owner AND id = created_snapshot_id;
+  ELSE
+    SELECT * INTO snapshot FROM public.knowledge_snapshots
+      WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id
+        AND id = p_snapshot_id AND expires_at > clock_timestamp() FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING MESSAGE = 'CURSOR_STALE', ERRCODE = 'P0001';
+    END IF;
+  END IF;
+  WITH candidates AS (
+    SELECT item.* FROM public.knowledge_snapshot_items item
+    WHERE item.owner_id = owner AND item.snapshot_id = snapshot.id
+      AND item.ordinal >= p_after_ordinal
+    ORDER BY item.ordinal LIMIT p_limit
+  ), measured AS (
+    SELECT item.*,
+      sum(item.response_bytes) OVER (ORDER BY item.ordinal) AS cumulative_bytes
+    FROM candidates item
+  ), selected AS (
+    SELECT * FROM measured WHERE cumulative_bytes <= p_max_bytes - 4096
+  )
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'sequence', latest, 'entityKind', entity_kind, 'entityId', entity_id,
-    'operation', CASE WHEN deleted THEN 'delete' ELSE 'upsert' END,
-    'revision', revision, 'payload', payload
-  ) ORDER BY entity_kind, entity_id), '[]'::jsonb) INTO changes
-  FROM public.knowledge_entity_heads
-  WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id;
-  RETURN jsonb_build_object('kind', 'snapshot', 'nextSequence', latest, 'changes', changes);
+      'sequence', snapshot.snapshot_sequence, 'entityKind', entity_kind,
+      'entityId', entity_id, 'operation', operation,
+      'revision', revision, 'payload', payload
+    ) ORDER BY ordinal), '[]'::jsonb),
+    COALESCE(max(ordinal) + 1, p_after_ordinal)
+    INTO changes, next_ordinal FROM selected;
+  SELECT EXISTS(SELECT 1 FROM public.knowledge_snapshot_items item
+    WHERE item.owner_id = owner AND item.snapshot_id = snapshot.id
+      AND item.ordinal >= next_ordinal) INTO has_more;
+  IF NOT has_more THEN
+    DELETE FROM public.knowledge_snapshots
+      WHERE owner_id = owner AND id = snapshot.id;
+  END IF;
+  RETURN jsonb_build_object(
+    'kind', 'snapshot_page', 'snapshotId', snapshot.id,
+    'snapshotSequence', snapshot.snapshot_sequence,
+    'nextOrdinal', next_ordinal, 'hasMore', has_more, 'changes', changes
+  );
 END;
 $$;
 
@@ -847,8 +998,10 @@ DECLARE
   base public.knowledge_bases%ROWTYPE;
   generation public.knowledge_index_generations%ROWTYPE;
   request_row public.knowledge_requests%ROWTYPE;
-  fingerprint char(32) := md5(concat_ws(
-    ':', p_knowledge_base_id, p_generation_id, COALESCE(p_expected_published_generation_id, '')
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'publish_generation', 'knowledgeBaseId', p_knowledge_base_id,
+    'generationId', p_generation_id,
+    'expectedPublishedGenerationId', p_expected_published_generation_id
   ));
   response jsonb;
   next_sequence bigint;
@@ -902,8 +1055,9 @@ BEGIN
     'previousGenerationId', base.published_generation_id,
     'sequence', next_sequence
   );
-  INSERT INTO public.knowledge_requests(owner_id, request_id, action, input_hash, response)
-    VALUES (owner, p_request_id, 'publish_generation', fingerprint, response);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, p_knowledge_base_id, 'publish_generation', fingerprint, response);
   RETURN response;
 END;
 $$;
@@ -921,8 +1075,9 @@ DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   base public.knowledge_bases%ROWTYPE;
   request_row public.knowledge_requests%ROWTYPE;
-  fingerprint char(32) := md5(concat_ws(
-    ':', p_knowledge_base_id, COALESCE(p_expected_published_generation_id, '')
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'delete_base', 'knowledgeBaseId', p_knowledge_base_id,
+    'expectedPublishedGenerationId', p_expected_published_generation_id
   ));
   response jsonb;
   job_id varchar := 'job_' || md5(p_request_id || ':delete');
@@ -961,8 +1116,9 @@ BEGIN
     id, owner_id, knowledge_base_id, request_id, kind, entity_id, state
   ) VALUES (job_id, owner, p_knowledge_base_id, p_request_id, 'purge', p_knowledge_base_id, 'queued');
   response := jsonb_build_object('deletionJobId', job_id);
-  INSERT INTO public.knowledge_requests(owner_id, request_id, action, input_hash, response)
-    VALUES (owner, p_request_id, 'delete_base', fingerprint, response);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, p_knowledge_base_id, 'delete_base', fingerprint, response);
   RETURN response;
 END;
 $$;
@@ -978,12 +1134,33 @@ AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
   changed integer;
+  request_row public.knowledge_requests%ROWTYPE;
+  target_base_id varchar;
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'cancel_job', 'jobId', p_job_id
+  ));
+  response jsonb;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id;
+  IF FOUND THEN
+    IF request_row.action <> 'cancel_job' OR request_row.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN request_row.response;
+  END IF;
+  SELECT knowledge_base_id INTO target_base_id FROM public.knowledge_jobs
+    WHERE id = p_job_id AND owner_id = owner;
   UPDATE public.knowledge_jobs SET state = 'cancelled', lease_token = NULL,
-    lease_expires_at = NULL, updated_at = clock_timestamp()
+    lease_expires_at = NULL, worker_id = NULL, updated_at = clock_timestamp()
     WHERE id = p_job_id AND owner_id = owner AND state IN ('queued', 'running', 'paused');
   GET DIAGNOSTICS changed = ROW_COUNT;
-  RETURN jsonb_build_object('cancelled', changed = 1);
+  response := jsonb_build_object('cancelled', changed = 1);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, target_base_id, 'cancel_job', fingerprint, response);
+  RETURN response;
 END;
 $$;
 
@@ -998,18 +1175,57 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  canonical_references jsonb;
+  fingerprint char(32);
+  request_row public.knowledge_requests%ROWTYPE;
   references_to_delete jsonb;
+  response jsonb;
 BEGIN
-  SELECT COALESCE(jsonb_agg(object.storage_reference), '[]'::jsonb)
+  IF jsonb_typeof(p_storage_references) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF jsonb_array_length(p_storage_references) NOT BETWEEN 1 AND 100
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements(p_storage_references) AS supplied(item)
+      WHERE jsonb_typeof(item) IS DISTINCT FROM 'string') THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT jsonb_agg(reference ORDER BY reference) INTO canonical_references
+    FROM (SELECT DISTINCT jsonb_array_elements_text(p_storage_references) AS reference) refs;
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements_text(canonical_references) AS supplied(reference)
+    WHERE length(reference) NOT BETWEEN 1 AND 512
+      OR reference !~ '^knowledge/' OR position('..' in reference) > 0) THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  fingerprint := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'orphan_cleanup', 'knowledgeBaseId', p_knowledge_base_id,
+    'storageReferences', canonical_references
+  ));
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id;
+  IF FOUND THEN
+    IF request_row.action <> 'orphan_cleanup' OR request_row.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN request_row.response;
+  END IF;
+  SELECT COALESCE(jsonb_agg(object.storage_reference ORDER BY object.storage_reference), '[]'::jsonb)
     INTO references_to_delete
     FROM public.knowledge_objects object
     WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
       AND object.state IN ('authorized', 'orphaned')
-      AND object.storage_reference IN (SELECT jsonb_array_elements_text(p_storage_references))
+      AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
       AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
         WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
           AND version.source_object_id = object.id);
-  RETURN jsonb_build_object('storageReferences', references_to_delete);
+  IF references_to_delete IS DISTINCT FROM canonical_references THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  response := jsonb_build_object('storageReferences', references_to_delete);
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (owner, p_request_id, p_knowledge_base_id, 'orphan_cleanup', fingerprint, response);
+  RETURN response;
 END;
 $$;
 
@@ -1024,16 +1240,54 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  canonical_references jsonb;
+  fingerprint char(32);
+  request_row public.knowledge_requests%ROWTYPE;
   removed integer;
+  completed_response jsonb;
 BEGIN
+  IF jsonb_typeof(p_storage_references) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF jsonb_array_length(p_storage_references) > 100
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements(p_storage_references) AS supplied(item)
+      WHERE jsonb_typeof(item) IS DISTINCT FROM 'string') THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT COALESCE(jsonb_agg(reference ORDER BY reference), '[]'::jsonb)
+    INTO canonical_references
+    FROM (SELECT DISTINCT jsonb_array_elements_text(p_storage_references) AS reference) refs;
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id FOR UPDATE;
+  IF NOT FOUND OR request_row.action <> 'orphan_cleanup' THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  fingerprint := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'orphan_cleanup', 'knowledgeBaseId', p_knowledge_base_id,
+    'storageReferences', canonical_references
+  ));
+  IF request_row.input_hash <> fingerprint THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  IF request_row.response ? 'removed' THEN
+    RETURN jsonb_build_object('removed', (request_row.response->>'removed')::integer);
+  END IF;
+  IF request_row.response->'storageReferences' IS DISTINCT FROM canonical_references THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
   DELETE FROM public.knowledge_objects object
     WHERE object.owner_id = owner AND object.knowledge_base_id = p_knowledge_base_id
       AND object.state IN ('authorized', 'orphaned')
-      AND object.storage_reference IN (SELECT jsonb_array_elements_text(p_storage_references))
+      AND object.storage_reference IN (SELECT jsonb_array_elements_text(canonical_references))
       AND NOT EXISTS (SELECT 1 FROM public.knowledge_versions version
         WHERE version.owner_id = owner AND version.knowledge_base_id = p_knowledge_base_id
           AND version.source_object_id = object.id);
   GET DIAGNOSTICS removed = ROW_COUNT;
+  completed_response := jsonb_build_object(
+    'storageReferences', canonical_references, 'removed', removed
+  );
+  UPDATE public.knowledge_requests SET response = completed_response
+    WHERE owner_id = owner AND request_id = p_request_id;
   RETURN jsonb_build_object('removed', removed);
 END;
 $$;
@@ -1073,12 +1327,14 @@ DECLARE
   references_to_delete jsonb;
 BEGIN
   IF p_worker_id IS NULL OR length(p_worker_id) NOT BETWEEN 1 AND 128
-    OR p_job_id IS NULL OR p_lease_token IS NULL THEN
+    OR btrim(p_worker_id) = '' OR p_job_id IS NULL OR p_lease_token IS NULL
+    OR btrim(p_lease_token) = '' THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   SELECT * INTO job FROM public.knowledge_jobs
     WHERE id = p_job_id AND kind = 'purge' AND state = 'running'
-      AND lease_token = p_lease_token AND lease_expires_at > clock_timestamp()
+      AND worker_id = p_worker_id AND lease_token = p_lease_token
+      AND lease_expires_at > clock_timestamp()
     FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   SELECT COALESCE(jsonb_agg(object.storage_reference ORDER BY object.storage_reference), '[]'::jsonb)
@@ -1106,16 +1362,26 @@ DECLARE
   job public.knowledge_jobs%ROWTYPE;
   expected_count integer;
   supplied_count integer;
+  purge_sequence bigint;
 BEGIN
   IF p_worker_id IS NULL OR length(p_worker_id) NOT BETWEEN 1 AND 128
-    OR jsonb_typeof(p_deleted_storage_references) IS DISTINCT FROM 'array'
-    OR jsonb_array_length(p_deleted_storage_references) > 10000
-    OR pg_column_size(p_deleted_storage_references) > 1048576 THEN
+    OR btrim(p_worker_id) = '' OR p_job_id IS NULL OR p_lease_token IS NULL
+    OR btrim(p_lease_token) = '' THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF jsonb_typeof(p_deleted_storage_references) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF jsonb_array_length(p_deleted_storage_references) > 10000
+    OR pg_column_size(p_deleted_storage_references) > 1048576
+    OR EXISTS (SELECT 1 FROM jsonb_array_elements(p_deleted_storage_references) AS supplied(item)
+      WHERE jsonb_typeof(item) IS DISTINCT FROM 'string') THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   SELECT * INTO job FROM public.knowledge_jobs
     WHERE id = p_job_id AND kind = 'purge' AND state = 'running'
-      AND lease_token = p_lease_token AND lease_expires_at > clock_timestamp()
+      AND worker_id = p_worker_id AND lease_token = p_lease_token
+      AND lease_expires_at > clock_timestamp()
     FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   SELECT count(*) INTO expected_count FROM public.knowledge_objects object
@@ -1149,12 +1415,48 @@ BEGIN
     WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id;
   DELETE FROM public.knowledge_index_generations
     WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id;
+  DELETE FROM public.knowledge_snapshots
+    WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id;
+  DELETE FROM public.knowledge_changes
+    WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id;
+  DELETE FROM public.knowledge_requests
+    WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id
+      AND request_id <> job.request_id;
+  UPDATE public.knowledge_requests SET action = 'delete_base',
+    response = jsonb_build_object('deletionJobId', job.id)
+    WHERE owner_id = job.owner_id AND request_id = job.request_id;
+  DELETE FROM public.knowledge_jobs
+    WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id
+      AND id <> job.id;
   UPDATE public.knowledge_bases SET name = '[deleted]', status = 'deleted',
+    published_generation_id = NULL,
     updated_at = clock_timestamp()
     WHERE owner_id = job.owner_id AND id = job.knowledge_base_id;
+  INSERT INTO public.knowledge_changes(
+    owner_id, knowledge_base_id, mutation_id, input_hash,
+    entity_kind, entity_id, operation, revision, payload
+  ) VALUES (
+    job.owner_id, job.knowledge_base_id, job.request_id,
+    public.autoforge_knowledge_request_hash(jsonb_build_object(
+      'action', 'base_purge_receipt', 'jobId', job.id
+    )), 'knowledge_base', job.knowledge_base_id, 'delete', job.request_id, '{}'::jsonb
+  ) RETURNING sequence INTO purge_sequence;
+  INSERT INTO public.knowledge_tombstones(
+    owner_id, knowledge_base_id, entity_kind, entity_id, revision, sequence
+  ) VALUES (
+    job.owner_id, job.knowledge_base_id, 'knowledge_base',
+    job.knowledge_base_id, job.request_id, purge_sequence
+  );
+  INSERT INTO public.knowledge_sync_floors(
+    owner_id, knowledge_base_id, minimum_sequence, updated_at
+  ) VALUES (job.owner_id, job.knowledge_base_id, purge_sequence, clock_timestamp())
+  ON CONFLICT(owner_id, knowledge_base_id) DO UPDATE SET
+    minimum_sequence = excluded.minimum_sequence, updated_at = excluded.updated_at;
   UPDATE public.knowledge_jobs SET state = 'completed', error_code = NULL,
-    lease_token = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
-    WHERE owner_id = job.owner_id AND id = job.id AND lease_token = p_lease_token;
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    updated_at = clock_timestamp()
+    WHERE owner_id = job.owner_id AND id = job.id
+      AND worker_id = p_worker_id AND lease_token = p_lease_token;
   RETURN jsonb_build_object('jobId', job.id, 'completed', true);
 END;
 $$;
@@ -1195,11 +1497,14 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE job public.knowledge_jobs%ROWTYPE;
 BEGIN
-  IF p_worker_id IS NULL OR p_lease_token IS NULL OR p_lease_seconds NOT BETWEEN 10 AND 600 THEN
+  IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
+    OR p_lease_token IS NULL OR btrim(p_lease_token) = '' OR length(p_lease_token) > 128
+    OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 10 AND 600 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   UPDATE public.knowledge_jobs SET state = 'failed', error_code = 'LEASE_EXPIRED',
-    lease_token = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    updated_at = clock_timestamp()
     WHERE state = 'running' AND attempt >= 3 AND lease_expires_at <= clock_timestamp();
   SELECT * INTO job FROM public.knowledge_jobs
     WHERE attempt < 3 AND (
@@ -1207,7 +1512,7 @@ BEGIN
     ) ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1;
   IF NOT FOUND THEN RETURN jsonb_build_object('job', NULL); END IF;
   UPDATE public.knowledge_jobs SET state = 'running', attempt = attempt + 1,
-    lease_token = p_lease_token,
+    worker_id = p_worker_id, lease_token = p_lease_token,
     lease_expires_at = clock_timestamp() + make_interval(secs => p_lease_seconds),
     updated_at = clock_timestamp() WHERE id = job.id AND owner_id = job.owner_id;
   RETURN jsonb_build_object('job', jsonb_build_object(
@@ -1218,7 +1523,8 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_job(
-  p_job_id varchar, p_lease_token varchar, p_state varchar, p_error_code varchar
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
+  p_state varchar, p_error_code varchar
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1229,7 +1535,10 @@ DECLARE
   changed integer;
   next_state varchar;
 BEGIN
-  IF p_state NOT IN ('completed', 'failed') THEN
+  IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
+    OR p_job_id IS NULL OR btrim(p_job_id) = ''
+    OR p_lease_token IS NULL OR btrim(p_lease_token) = ''
+    OR p_state IS NULL OR p_state NOT IN ('completed', 'failed') THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   next_state := CASE
@@ -1239,12 +1548,42 @@ BEGIN
   UPDATE public.knowledge_jobs SET state = CASE
       WHEN next_state = 'queued' AND attempt >= 3 THEN 'failed' ELSE next_state END,
     error_code = p_error_code,
-    lease_token = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
-    WHERE id = p_job_id AND state = 'running' AND lease_token = p_lease_token
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    updated_at = clock_timestamp()
+    WHERE id = p_job_id AND state = 'running' AND worker_id = p_worker_id
+      AND lease_token = p_lease_token
       AND lease_expires_at > clock_timestamp();
   GET DIAGNOSTICS changed = ROW_COUNT;
   IF changed <> 1 THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   RETURN jsonb_build_object('completed', true);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_cancel_claimed_job(
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE changed integer;
+BEGIN
+  IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
+    OR p_job_id IS NULL OR btrim(p_job_id) = ''
+    OR p_lease_token IS NULL OR btrim(p_lease_token) = '' THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  UPDATE public.knowledge_jobs SET state = 'cancelled', error_code = NULL,
+    worker_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+    updated_at = clock_timestamp()
+    WHERE id = p_job_id AND state = 'running' AND worker_id = p_worker_id
+      AND lease_token = p_lease_token AND lease_expires_at > clock_timestamp();
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  IF changed <> 1 THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('cancelled', true);
 END;
 $$;
 
@@ -1260,7 +1599,8 @@ DECLARE
   pruned_changes integer := 0;
   pruned_tombstones integer := 0;
 BEGIN
-  IF p_worker_id IS NULL OR length(p_worker_id) = 0 OR p_limit NOT BETWEEN 1 AND 10000 THEN
+  IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000 THEN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   DELETE FROM public.knowledge_tombstones WHERE id IN (
@@ -1307,6 +1647,7 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_request_user_id() FROM PUBLIC,
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_version_lifecycle() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_generation_lifecycle() FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_reject_mutation() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_request_hash(jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_caller(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_require_cloud(bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
@@ -1314,8 +1655,8 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, varc
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar, varchar, integer, integer, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_publish_generation(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_delete_base(varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
@@ -1326,7 +1667,8 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_prepare_base_purge(varchar, va
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer) FROM PUBLIC, anon, authenticated;
 
 DO $grants$
@@ -1338,7 +1680,8 @@ BEGIN
     'knowledge_index_generations', 'knowledge_jobs', 'knowledge_entity_heads',
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
     'knowledge_sync_floors', 'knowledge_upload_authorizations',
-    'knowledge_entitlements', 'knowledge_requests'
+    'knowledge_entitlements', 'knowledge_requests', 'knowledge_snapshots',
+    'knowledge_snapshot_items'
   ] LOOP
     EXECUTE format('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon, authenticated', table_name);
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO service_role', table_name);
@@ -1354,8 +1697,8 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_authorize_upload(varchar, v
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar, bigint, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_push_mutation(varchar, varchar, varchar, varchar, varchar, varchar, varchar, jsonb) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_pull_changes(varchar, varchar, bigint, integer, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_full_resync(varchar, varchar, varchar, integer, integer, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_publish_generation(varchar, varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_delete_base(varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cancel_job(varchar, varchar, varchar) TO service_role;
@@ -1366,7 +1709,8 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_prepare_base_purge(varchar,
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_base_purge(varchar, varchar, varchar, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) TO service_role;
-GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer) TO service_role;
 
 COMMIT;

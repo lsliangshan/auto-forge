@@ -50,12 +50,23 @@ export interface CloudKnowledgeRemote {
 
 export type CloudSyncMode = 'local_only' | 'syncing' | 'synced' | 'paused' | 'converting' | 'failed'
 
+export interface KnowledgeSyncCommitGuard {
+  readonly knowledgeBaseId: string
+  commit(write: () => void): void
+}
+
 interface SyncServiceDependencies {
   now(): number
   id(): string
   isOnline(): boolean
-  applyRemoteChange(change: CloudKnowledgeChange): Promise<void>
-  replaceRemoteSnapshot(changes: CloudKnowledgeChange[]): Promise<void>
+  applyRemoteChange(
+    change: CloudKnowledgeChange,
+    guard: KnowledgeSyncCommitGuard,
+  ): Promise<void>
+  replaceRemoteSnapshot(
+    changes: CloudKnowledgeChange[],
+    guard: KnowledgeSyncCommitGuard,
+  ): Promise<void>
 }
 
 interface MutationRow {
@@ -324,7 +335,7 @@ export class KnowledgeSyncService {
 
   convertToLocalOnly(
     knowledgeBaseId: string,
-    downloadAndVerify: () => Promise<{
+    downloadAndVerify: (guard: KnowledgeSyncCommitGuard) => Promise<{
       complete: boolean
       expectedDigest: string
       actualDigest: string
@@ -345,7 +356,7 @@ export class KnowledgeSyncService {
 
   private async runConversion(
     knowledgeBaseId: string,
-    downloadAndVerify: () => Promise<{
+    downloadAndVerify: (guard: KnowledgeSyncCommitGuard) => Promise<{
       complete: boolean
       expectedDigest: string
       actualDigest: string
@@ -399,8 +410,9 @@ export class KnowledgeSyncService {
       const control = this.getControl(knowledgeBaseId)
       if (control.epoch !== epoch || control.mode !== 'converting') throw syncError('CONFLICT')
     }
+    const conversionGuard = this.createCommitGuard(knowledgeBaseId, epoch, 'converting')
     if (conversion.state === 'downloading') {
-      const verification = await downloadAndVerify()
+      const verification = await downloadAndVerify(conversionGuard)
       assertConverting()
       if (!verification.complete
         || !verification.expectedDigest
@@ -484,6 +496,33 @@ export class KnowledgeSyncService {
 
   private isEpochCurrent(knowledgeBaseId: string, epoch: number): boolean {
     return this.getControl(knowledgeBaseId).epoch === epoch
+  }
+
+  private createCommitGuard(
+    knowledgeBaseId: string,
+    epoch: number,
+    mode: Extract<CloudSyncMode, 'syncing' | 'converting'>,
+  ): KnowledgeSyncCommitGuard {
+    const isCurrent = () => {
+      const current = this.getControl(knowledgeBaseId)
+      return current.epoch === epoch && current.mode === mode
+    }
+    return Object.freeze({
+      knowledgeBaseId,
+      commit: (write: () => void) => {
+        if (!isCurrent()) throw syncError('CONFLICT')
+        let failed = false
+        let failure: unknown
+        try {
+          write()
+        } catch (error) {
+          failed = true
+          failure = error
+        }
+        if (!isCurrent()) throw syncError('CONFLICT')
+        if (failed) throw failure
+      },
+    })
   }
 
   private compareAndSetMode(knowledgeBaseId: string, epoch: number, mode: CloudSyncMode): boolean {
@@ -640,10 +679,16 @@ export class KnowledgeSyncService {
       SELECT sequence FROM sync_cursors WHERE knowledge_base_id = ?
     `).get(knowledgeBaseId) as { sequence: number } | undefined
     let afterSequence = cursor?.sequence ?? 0
+    const commitGuard = this.createCommitGuard(knowledgeBaseId, epoch, 'syncing')
     if (afterSequence === 0) {
       const snapshot = await this.remote.fullResync({ knowledgeBaseId })
       if (!this.isActive(knowledgeBaseId, epoch)) return
-      await this.dependencies.replaceRemoteSnapshot(snapshot.changes)
+      try {
+        await this.dependencies.replaceRemoteSnapshot(snapshot.changes, commitGuard)
+      } catch (error) {
+        if (!this.isActive(knowledgeBaseId, epoch)) return
+        throw error
+      }
       if (!this.isActive(knowledgeBaseId, epoch)) return
       this.replaceCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
       return
@@ -654,7 +699,12 @@ export class KnowledgeSyncService {
       if (result.kind === 'cursor_stale') {
         const snapshot = await this.remote.fullResync({ knowledgeBaseId })
         if (!this.isActive(knowledgeBaseId, epoch)) return
-        await this.dependencies.replaceRemoteSnapshot(snapshot.changes)
+        try {
+          await this.dependencies.replaceRemoteSnapshot(snapshot.changes, commitGuard)
+        } catch (error) {
+          if (!this.isActive(knowledgeBaseId, epoch)) return
+          throw error
+        }
         if (!this.isActive(knowledgeBaseId, epoch)) return
         this.replaceCursor(knowledgeBaseId, snapshot.nextSequence, this.dependencies.now())
         return
@@ -669,7 +719,12 @@ export class KnowledgeSyncService {
           throw syncError('INTERNAL_ERROR')
         }
         if (!this.isActive(knowledgeBaseId, epoch)) return
-        await this.dependencies.applyRemoteChange(change)
+        try {
+          await this.dependencies.applyRemoteChange(change, commitGuard)
+        } catch (error) {
+          if (!this.isActive(knowledgeBaseId, epoch)) return
+          throw error
+        }
         if (!this.isActive(knowledgeBaseId, epoch)) return
         afterSequence = change.sequence
       }

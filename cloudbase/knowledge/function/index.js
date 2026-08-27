@@ -18,7 +18,9 @@ async function main(event, context) {
         }),
         storage: createPostgresStorageClient({
           baseUrl: process.env.AUTOFORGE_PG_STORAGE_BASE_URL, serviceKey,
+          uploadUrlPrefix: process.env.AUTOFORGE_PG_STORAGE_UPLOAD_URL_PREFIX,
         }),
+        uploadUrlPrefix: process.env.AUTOFORGE_PG_STORAGE_UPLOAD_URL_PREFIX,
       })
     } catch {
       return { ok: false, error: { code: 'TRANSIENT_FAILURE' } }

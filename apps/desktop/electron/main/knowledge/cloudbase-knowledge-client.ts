@@ -32,6 +32,8 @@ export class CloudKnowledgeError extends Error {
 }
 
 const maximumKnowledgeWireBytes = 1_048_576
+const maximumKnowledgePageBytes = 786_432
+const maximumSnapshotItems = 10_000
 const canonicalString = (maximum: number) => z.string().min(1).max(maximum)
   .refine(value => value.trim() === value)
 const identifier = canonicalString(128)
@@ -76,10 +78,17 @@ const changesSchema = z.object({
 }).strict()
 const staleCursorSchema = z.object({ kind: z.literal('cursor_stale') }).strict()
 export type CloudPullChangesResult = z.infer<typeof changesSchema> | z.infer<typeof staleCursorSchema>
+const snapshotPageSchema = z.object({
+  kind: z.literal('snapshot_page'),
+  snapshotId: identifier,
+  snapshotSequence: z.number().int().nonnegative(),
+  nextOrdinal: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  changes: z.array(changeSchema).max(512),
+}).strict()
 const snapshotSchema = z.object({
-  kind: z.literal('snapshot'),
-  nextSequence: z.number().int().nonnegative(),
-  changes: z.array(changeSchema).max(10_000),
+  kind: z.literal('snapshot'), nextSequence: z.number().int().nonnegative(),
+  changes: z.array(changeSchema).max(maximumSnapshotItems),
 }).strict()
 
 const publishedSchema = z.object({
@@ -97,8 +106,12 @@ const uploadAuthorizationSchema = z.object({
   uploadAuthorization: z.object({
     url: z.string().url().refine(value => value.startsWith('https://')),
     method: z.literal('PUT'),
-    headers: z.record(canonicalString(128), z.string().max(1_024))
-      .refine(value => Object.keys(value).length <= 16),
+    headers: z.object({
+      'content-length': canonicalString(20),
+      'content-type': canonicalString(200),
+      'x-content-sha256': z.string().regex(/^[a-f0-9]{64}$/),
+      'x-upload-ticket': identifier,
+    }).strict(),
     expiresAt: z.string().datetime(),
   }).strict(),
 }).strict()
@@ -163,7 +176,7 @@ export class CloudBaseKnowledgeClient {
     private readonly functionName = 'autoforge-knowledge',
   ) {}
 
-  authorizeUpload(input: {
+  async authorizeUpload(input: {
     requestId: string
     knowledgeBaseId: string
     documentId: string
@@ -181,8 +194,17 @@ export class CloudBaseKnowledgeClient {
       sha256: z.string().regex(/^[a-f0-9]{64}$/),
       mimeType: canonicalString(200),
     }).strict().safeParse(input)
-    if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
-    return this.invoke('authorizeUpload', parsed.data, uploadAuthorizationSchema)
+    if (!parsed.success) throw new CloudKnowledgeError('INVALID_INPUT')
+    const result = await this.invoke('authorizeUpload', parsed.data, uploadAuthorizationSchema)
+    if (result.mimeType !== parsed.data.mimeType
+      || result.uploadAuthorization.expiresAt !== result.expiresAt
+      || result.uploadAuthorization.headers['content-type'] !== parsed.data.mimeType
+      || result.uploadAuthorization.headers['content-length'] !== String(parsed.data.byteSize)
+      || result.uploadAuthorization.headers['x-content-sha256'] !== parsed.data.sha256
+      || result.uploadAuthorization.headers['x-upload-ticket'] !== result.uploadTicket) {
+      throw new CloudKnowledgeError('INTERNAL_ERROR')
+    }
+    return result
   }
 
   getEntitlement(): Promise<z.infer<typeof cloudEntitlementSchema>> {
@@ -238,7 +260,8 @@ export class CloudBaseKnowledgeClient {
     }).strict().safeParse(input)
     if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
     const result = await this.invoke(
-      'pullChanges', { ...parsed.data, limit: 1_000 }, z.union([changesSchema, staleCursorSchema]),
+      'pullChanges', { ...parsed.data, limit: 512, maxBytes: maximumKnowledgePageBytes },
+      z.union([changesSchema, staleCursorSchema]),
     )
     if (result.kind === 'incremental'
       && !validPage(result, parsed.data.afterSequence)) {
@@ -250,16 +273,41 @@ export class CloudBaseKnowledgeClient {
   async fullResync(input: { knowledgeBaseId: string }): Promise<z.infer<typeof snapshotSchema>> {
     const parsed = z.object({ knowledgeBaseId: identifier }).strict().safeParse(input)
     if (!parsed.success) return Promise.reject(new CloudKnowledgeError('INVALID_INPUT'))
-    const result = await this.invoke('fullResync', parsed.data, snapshotSchema)
+    let snapshotId: string | null = null
+    let snapshotSequence: number | undefined
+    let afterOrdinal = 0
+    const changes: CloudKnowledgeChange[] = []
     const identities = new Set<string>()
-    for (const change of result.changes) {
-      const identity = `${change.entityKind}:${change.entityId}`
-      if (change.sequence !== result.nextSequence || identities.has(identity)) {
+    for (let pageNumber = 0; pageNumber < 1_000; pageNumber += 1) {
+      const page: z.infer<typeof snapshotPageSchema> = await this.invoke('fullResync', {
+        ...parsed.data, snapshotId, afterOrdinal, limit: 512,
+        maxBytes: maximumKnowledgePageBytes,
+      }, snapshotPageSchema)
+      if ((snapshotId !== null && page.snapshotId !== snapshotId)
+        || (snapshotSequence !== undefined && page.snapshotSequence !== snapshotSequence)
+        || page.nextOrdinal !== afterOrdinal + page.changes.length
+        || (page.hasMore && page.changes.length === 0)) {
         throw new CloudKnowledgeError('INTERNAL_ERROR')
       }
-      identities.add(identity)
+      snapshotId = page.snapshotId
+      snapshotSequence = page.snapshotSequence
+      for (const change of page.changes) {
+        const identity = `${change.entityKind}:${change.entityId}`
+        if (change.sequence !== snapshotSequence || identities.has(identity)
+          || changes.length >= maximumSnapshotItems) {
+          throw new CloudKnowledgeError('INTERNAL_ERROR')
+        }
+        identities.add(identity)
+        changes.push(change)
+      }
+      afterOrdinal = page.nextOrdinal
+      if (!page.hasMore) {
+        return snapshotSchema.parse({
+          kind: 'snapshot', nextSequence: snapshotSequence, changes,
+        })
+      }
     }
-    return result
+    throw new CloudKnowledgeError('INTERNAL_ERROR')
   }
 
   async publishGeneration(input: PublishGenerationInput): Promise<z.infer<typeof publishedSchema>> {

@@ -7,6 +7,26 @@ import {
 } from '../../cloudbase/knowledge/function/knowledge-handler.js'
 
 const context = { auth: { uid: '2089908515857502208' } }
+const futureExpiry = new Date(Date.now() + 15 * 60_000).toISOString()
+
+function streamedResponse(value: unknown, status = 200) {
+  const bytes = new TextEncoder().encode(value === undefined ? '' : JSON.stringify(value))
+  let read = false
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: vi.fn().mockReturnValue(String(bytes.byteLength)) },
+    body: { getReader: () => ({
+      read: vi.fn().mockImplementation(async () => {
+        if (read) return { done: true, value: undefined }
+        read = true
+        return { done: false, value: bytes }
+      }),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      releaseLock: vi.fn(),
+    }) },
+  }
+}
 
 describe('CloudBase knowledge function', () => {
   it('uses the CloudBase CommonJS index.main deployment contract', async () => {
@@ -65,6 +85,35 @@ describe('CloudBase knowledge function', () => {
     expect(rpc).not.toHaveBeenCalled()
   })
 
+  it('forwards bounded pull budgets and snapshot page identity exactly', async () => {
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({
+        kind: 'incremental', nextSequence: 5, hasMore: false, changes: [],
+      })
+      .mockResolvedValueOnce({
+        kind: 'snapshot_page', snapshotId: 'snapshot_1', snapshotSequence: 5,
+        nextOrdinal: 0, hasMore: false, changes: [],
+      })
+    const handler = createKnowledgeHandler({ rpc })
+
+    await expect(handler({
+      action: 'pullChanges', knowledgeBaseId: 'kb_1', afterSequence: 5,
+      limit: 512, maxBytes: 786_432,
+    }, context)).resolves.toMatchObject({ ok: true })
+    await expect(handler({
+      action: 'fullResync', knowledgeBaseId: 'kb_1', snapshotId: null,
+      afterOrdinal: 0, limit: 512, maxBytes: 786_432,
+    }, context)).resolves.toMatchObject({ ok: true })
+    expect(rpc).toHaveBeenNthCalledWith(1, 'autoforge_knowledge_pull_changes', {
+      p_caller_user_id: '2089908515857502208', p_knowledge_base_id: 'kb_1',
+      p_after_sequence: 5, p_limit: 512, p_max_bytes: 786_432,
+    })
+    expect(rpc).toHaveBeenNthCalledWith(2, 'autoforge_knowledge_full_resync', {
+      p_caller_user_id: '2089908515857502208', p_knowledge_base_id: 'kb_1',
+      p_snapshot_id: null, p_after_ordinal: 0, p_limit: 512, p_max_bytes: 786_432,
+    })
+  })
+
   it('rejects extra keys on every public action before RPC or Storage', async () => {
     const rpc = vi.fn()
     const storage = {
@@ -77,8 +126,8 @@ describe('CloudBase knowledge function', () => {
       { action: 'authorizeUpload', requestId: 'r', knowledgeBaseId: 'kb', documentId: 'd', versionId: 'v', byteSize: 1, sha256, mimeType: 'text/plain' },
       { action: 'completeUpload', uploadTicket: 't' },
       { action: 'pushMutation', mutationId: 'm', knowledgeBaseId: 'kb', entityKind: 'document', entityId: 'd', operation: 'upsert', baseRevision: null, payload: {} },
-      { action: 'pullChanges', knowledgeBaseId: 'kb', afterSequence: 0, limit: 1 },
-      { action: 'fullResync', knowledgeBaseId: 'kb' },
+      { action: 'pullChanges', knowledgeBaseId: 'kb', afterSequence: 0, limit: 1, maxBytes: 65536 },
+      { action: 'fullResync', knowledgeBaseId: 'kb', snapshotId: null, afterOrdinal: 0, limit: 1, maxBytes: 65536 },
       { action: 'publishGeneration', requestId: 'r', knowledgeBaseId: 'kb', generationId: 'g', expectedPublishedGenerationId: null },
       { action: 'deleteKnowledgeBase', requestId: 'r', knowledgeBaseId: 'kb', expectedPublishedGenerationId: null },
       { action: 'cancelJob', requestId: 'r', jobId: 'j' },
@@ -98,9 +147,7 @@ describe('CloudBase knowledge function', () => {
   })
 
   it('masks server details and keeps service credentials inside the function RPC client', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue({
-      ok: true, status: 200, json: vi.fn().mockResolvedValue({ tier: 'member' }),
-    })
+    const fetchImpl = vi.fn().mockResolvedValue(streamedResponse({ tier: 'member' }))
     const rpc = createPostgresRpcClient({
       baseUrl: 'https://autoforge.example/v1/rdb/rest', serviceKey: 'server-only', fetchImpl,
     })
@@ -141,13 +188,29 @@ describe('CloudBase knowledge function', () => {
     expect(releaseLock).toHaveBeenCalledOnce()
   })
 
+  it('fails closed before parsing an unbounded non-streaming upstream response', async () => {
+    const parse = vi.fn().mockResolvedValue({ tier: 'member' })
+    const rpc = createPostgresRpcClient({
+      baseUrl: 'https://autoforge.example/v1/rdb/rest',
+      serviceKey: 'server-only',
+      fetchImpl: vi.fn().mockResolvedValue({
+        ok: true, status: 200, headers: { get: vi.fn().mockReturnValue(null) }, json: parse,
+      }),
+    })
+
+    await expect(rpc('autoforge_knowledge_get_entitlement', {
+      p_caller_user_id: '1',
+    })).rejects.toEqual({ code: 'INTERNAL_ERROR' })
+    expect(parse).not.toHaveBeenCalled()
+  })
+
   it('returns a consumable expiring PG Storage authorization and verifies uploaded bytes', async () => {
     const sha256 = 'a'.repeat(64)
     const rpc = vi.fn()
       .mockResolvedValueOnce({
         uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
         objectId: 'object_1', jobId: 'job_1', mimeType: 'text/plain',
-        expiresAt: '2026-08-26T12:15:00.000Z',
+        expiresAt: futureExpiry,
       })
       .mockResolvedValueOnce({
         objectId: 'object_1', storageReference: 'knowledge/1/kb_1/object_1',
@@ -159,13 +222,18 @@ describe('CloudBase knowledge function', () => {
     const storage = {
       createUploadAuthorization: vi.fn().mockResolvedValue({
         url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT',
-        headers: { 'content-length': '42', 'x-content-sha256': sha256 },
-        expiresAt: '2026-08-26T12:15:00.000Z',
+        headers: {
+          'content-type': 'text/plain', 'content-length': '42',
+          'x-content-sha256': sha256, 'x-upload-ticket': 'ticket_1',
+        },
+        expiresAt: futureExpiry,
       }),
       statObject: vi.fn().mockResolvedValue({ byteSize: 42, sha256, mimeType: 'text/plain' }),
       deleteObjects: vi.fn(),
     }
-    const handler = createKnowledgeHandler({ rpc, storage })
+    const handler = createKnowledgeHandler({
+      rpc, storage, uploadUrlPrefix: 'https://pg-storage.example/upload/',
+    })
 
     await expect(handler({
       action: 'authorizeUpload', requestId: 'upload_1', knowledgeBaseId: 'kb_1',
@@ -183,6 +251,35 @@ describe('CloudBase knowledge function', () => {
       p_caller_user_id: '2089908515857502208', p_upload_ticket: 'ticket_1',
       p_actual_byte_size: 42, p_actual_sha256: sha256, p_actual_mime_type: 'text/plain',
     })
+  })
+
+  it('rejects upload authorization outside the configured HTTPS path or with credential headers', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
+      objectId: 'object_1', jobId: 'job_1', mimeType: 'text/plain',
+      expiresAt: futureExpiry,
+    })
+    const storage = {
+      createUploadAuthorization: vi.fn().mockResolvedValue({
+        url: 'https://attacker.example/upload/ticket_1', method: 'PUT',
+        headers: {
+          authorization: 'Bearer leaked', 'content-type': 'text/plain',
+          'content-length': '42', 'x-content-sha256': 'a'.repeat(64),
+          'x-upload-ticket': 'ticket_1',
+        },
+        expiresAt: futureExpiry,
+      }),
+      statObject: vi.fn(), deleteObjects: vi.fn(),
+    }
+    const handler = createKnowledgeHandler({
+      rpc, storage, uploadUrlPrefix: 'https://pg-storage.example/upload/',
+    })
+
+    await expect(handler({
+      action: 'authorizeUpload', requestId: 'upload_1', knowledgeBaseId: 'kb_1',
+      documentId: 'document_1', versionId: 'version_1', byteSize: 42,
+      sha256: 'a'.repeat(64), mimeType: 'text/plain',
+    }, context)).resolves.toEqual({ ok: false, error: { code: 'INTERNAL_ERROR' } })
   })
 
   it('fails closed on oversized or extra-key upstream responses', async () => {
@@ -223,23 +320,42 @@ describe('CloudBase knowledge function', () => {
     expect(order).toEqual(['prepare', 'storage', 'complete'])
   })
 
+  it('replays a completed orphan-cleanup receipt without deleting Storage twice', async () => {
+    const storage = {
+      createUploadAuthorization: vi.fn(), statObject: vi.fn(), deleteObjects: vi.fn(),
+    }
+    const handler = createKnowledgeHandler({
+      rpc: vi.fn().mockResolvedValue({
+        storageReferences: ['knowledge/1/kb_1/object_1'], removed: 1,
+      }),
+      storage,
+    })
+
+    await expect(handler({
+      action: 'cleanupOrphans', requestId: 'cleanup_1', knowledgeBaseId: 'kb_1',
+      storageReferences: ['knowledge/1/kb_1/object_1'],
+    }, context)).resolves.toEqual({ ok: true, data: { removed: 1 } })
+    expect(storage.deleteObjects).not.toHaveBeenCalled()
+  })
+
   it('keeps storage service credentials server-side in the PG Storage adapter', async () => {
     const fetchImpl = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true, status: 200, json: vi.fn().mockResolvedValue({
-        url: 'https://pg-storage.example/upload/ticket', method: 'PUT', headers: {},
-        expiresAt: '2026-08-26T12:15:00.000Z',
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true, status: 204, json: vi.fn().mockRejectedValue(new Error('empty')),
-      })
+      .mockResolvedValueOnce(streamedResponse({
+        url: 'https://pg-storage.example/upload/ticket_1', method: 'PUT', headers: {
+          'content-length': '42', 'content-type': 'text/plain',
+          'x-content-sha256': 'a'.repeat(64), 'x-upload-ticket': 'ticket_1',
+        },
+        expiresAt: futureExpiry,
+      }))
+      .mockResolvedValueOnce(streamedResponse(undefined, 204))
     const storage = createPostgresStorageClient({
-      baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only', fetchImpl,
+      baseUrl: 'https://pg-storage.example/v1/storage', serviceKey: 'server-only',
+      uploadUrlPrefix: 'https://pg-storage.example/upload/', fetchImpl,
     })
     await storage.createUploadAuthorization({
       uploadTicket: 'ticket_1', storageReference: 'knowledge/1/kb_1/object_1',
-      byteSize: 42, sha256: 'a'.repeat(64), expiresAt: '2026-08-26T12:15:00.000Z',
+      byteSize: 42, sha256: 'a'.repeat(64), mimeType: 'text/plain',
+      expiresAt: futureExpiry,
     })
     expect(fetchImpl).toHaveBeenCalledWith(
       'https://pg-storage.example/v1/storage/upload-authorizations',
