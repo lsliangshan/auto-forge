@@ -520,11 +520,11 @@ describe('sandbox parser supervisor', () => {
       limits: DEFAULT_PARSER_LIMITS,
     })).rejects.toMatchObject({ code: 'PARSER_PROTOCOL_INVALID' })
     expect(jsonParse).not.toHaveBeenCalled()
-    expect(subview[0]).toBe(0)
-    expect(giantBacking[0]).toBe(7)
+    expect(giantBacking.every(byte => byte === 0)).toBe(true)
     jsonParse.mockRestore()
 
-    const descriptorBytes = new Uint8Array([9])
+    const descriptorBacking = new Uint8Array([9, 9, 9])
+    const descriptorBytes = descriptorBacking.subarray(1, 2)
     const invalidDescriptor = harness({
       version: 1,
       type: 'response-chunk',
@@ -540,7 +540,7 @@ describe('sandbox parser supervisor', () => {
       mediaType: 'text/plain',
       limits: DEFAULT_PARSER_LIMITS,
     })).rejects.toMatchObject({ code: 'PARSER_PROTOCOL_INVALID' })
-    expect(descriptorBytes[0]).toBe(0)
+    expect(descriptorBacking.every(byte => byte === 0)).toBe(true)
 
     const settled = harness(success)
     await settled.supervisor.parse({
@@ -549,7 +549,8 @@ describe('sandbox parser supervisor', () => {
       mediaType: 'text/plain',
       limits: DEFAULT_PARSER_LIMITS,
     })
-    const lateBytes = new Uint8Array([8])
+    const lateBacking = new Uint8Array([8, 8, 8])
+    const lateBytes = lateBacking.subarray(1, 2)
     settled.port2.emit('message', { data: {
       version: 1,
       type: 'response-chunk',
@@ -558,7 +559,7 @@ describe('sandbox parser supervisor', () => {
       totalBytes: 1,
       bytes: lateBytes,
     } })
-    expect(lateBytes[0]).toBe(0)
+    expect(lateBacking.every(byte => byte === 0)).toBe(true)
   })
 
   it('ships a deny-by-default parser CSP and verifies packaged assets before supervisor creation', async () => {

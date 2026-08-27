@@ -285,7 +285,7 @@ export function clearParserResponseChunkBytes(value: unknown): void {
   if (!descriptor || descriptor.get || descriptor.set || !ArrayBuffer.isView(descriptor.value)) return
   const bytes = descriptor.value
   try {
-    new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength).fill(0)
+    if (bytes.buffer instanceof ArrayBuffer) new Uint8Array(bytes.buffer).fill(0)
   } catch {
     // Detached or otherwise invalid typed views contain no accessible bytes to clear.
   }
