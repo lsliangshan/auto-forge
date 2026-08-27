@@ -24,6 +24,7 @@
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
     "better-sqlite3": "12.11.1",
+    "better-sqlite3-multiple-ciphers": "13.0.3",
     "chokidar": "5.0.0",
     "drizzle-orm": "0.45.2",
     "echarts": "6.1.0",

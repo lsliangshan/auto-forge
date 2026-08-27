@@ -7,25 +7,33 @@ import {
 } from '../../scripts/prepare-native-electron.mjs'
 
 describe('prepare-native-electron', () => {
-  it('probes by opening and querying an in-memory database', () => {
+  it('probes both the existing user-data database and an encrypted cipher database', () => {
     expect(nativeProbeSource).toContain("new Database(':memory:')")
     expect(nativeProbeSource).toContain('SELECT 1 AS value')
+    expect(nativeProbeSource).toContain('CipherDatabase')
+    expect(nativeProbeSource).toContain('cipherDatabase.key(')
     expect(nativeProbeSource).toContain('database.close()')
   })
 
-  it('runs the probe with Electron Node mode and the resolved database directory', () => {
+  it('runs the probe with Electron Node mode and both resolved database directories', () => {
     const spawn = vi.fn(() => ({ status: 0 }))
 
     runNativeProbe({
       electronExecutable: '/runtime/Electron',
       databaseDirectory: '/workspace/node_modules/better-sqlite3',
+      cipherDatabaseDirectory: '/workspace/node_modules/better-sqlite3-multiple-ciphers',
       environment: { EXISTING: 'preserved' },
       spawn,
     })
 
     expect(spawn).toHaveBeenCalledWith(
       '/runtime/Electron',
-      ['-e', nativeProbeSource, '/workspace/node_modules/better-sqlite3'],
+      [
+        '-e',
+        nativeProbeSource,
+        '/workspace/node_modules/better-sqlite3',
+        '/workspace/node_modules/better-sqlite3-multiple-ciphers',
+      ],
       expect.objectContaining({
         encoding: 'utf8',
         env: { EXISTING: 'preserved', ELECTRON_RUN_AS_NODE: '1' },
@@ -56,7 +64,7 @@ describe('prepare-native-electron', () => {
     expect(probe).toHaveBeenCalledTimes(2)
     expect(rebuildNative).toHaveBeenCalledTimes(1)
     expect(rebuildNative).toHaveBeenCalledWith(expect.objectContaining({
-      onlyModules: ['better-sqlite3'],
+      onlyModules: ['better-sqlite3', 'better-sqlite3-multiple-ciphers'],
       force: true,
       types: ['prod'],
     }))
