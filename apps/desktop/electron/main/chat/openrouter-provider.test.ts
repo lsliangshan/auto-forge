@@ -21,6 +21,14 @@ function sseResponse(chunks: string[], status = 200, headers?: Record<string, st
   }), { status, headers })
 }
 
+function chunkedSseResponse(frame: string): Response {
+  const chunks: string[] = []
+  for (let offset = 0; offset < frame.length; offset += 65_536) {
+    chunks.push(frame.slice(offset, offset + 65_536))
+  }
+  return sseResponse(chunks)
+}
+
 function abortingSlowJsonResponse(
   abort: AbortController,
   value: unknown,
@@ -1982,6 +1990,47 @@ describe('OpenRouterProvider', () => {
       { type: 'finish', choiceIndex: 0, reason: 'stop' },
       { type: 'usage', inputTokens: 2, outputTokens: 3, totalTokens: 5 },
     ])
+  })
+
+  it('accepts audio SSE frames larger than the text stream buffer limit', async () => {
+    const frame = `data: ${JSON.stringify({
+      id: 'audio_large',
+      choices: [{
+        index: 0,
+        delta: { audio: { data: 'A'.repeat(1_500_000) } },
+        finish_reason: 'stop',
+      }],
+    })}\n\ndata: [DONE]\n\n`
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => chunkedSseResponse(frame)),
+    })
+
+    const result = await collect(provider.stream({
+      model: 'google/lyria-3-pro-preview',
+      messages: [{ role: 'user', content: '生成完整歌曲' }],
+      output: { type: 'audio', format: 'mp3' },
+    }))
+
+    expect(result.map((event) => event.type)).toEqual(['generation', 'audio_delta', 'finish'])
+    const audio = result[1]
+    if (audio?.type !== 'audio_delta') throw new Error('expected an audio event')
+    expect(audio.dataBase64).toHaveLength(1_500_000)
+  })
+
+  it('rejects non-audio SSE frames larger than the text stream buffer limit', async () => {
+    const frame = `data: ${JSON.stringify({
+      choices: [{ index: 0, delta: { content: 'A'.repeat(1_500_000) } }],
+    })}\n\ndata: [DONE]\n\n`
+    const provider = new OpenRouterProvider({
+      credential,
+      fetch: vi.fn(async () => chunkedSseResponse(frame)),
+    })
+
+    await expect(collect(provider.stream({
+      model: 'text-model',
+      messages: [{ role: 'user', content: 'write' }],
+    }))).rejects.toMatchObject({ code: 'MODEL_PROVIDER_REQUEST_FAILED' })
   })
 
   it('does not retry a paid audio-output POST after a streamed network failure', async () => {

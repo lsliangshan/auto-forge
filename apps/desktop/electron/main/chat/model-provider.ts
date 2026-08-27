@@ -14,6 +14,8 @@ const MAX_ATTEMPTS = 4
 const MAX_RETRY_AFTER_MS = 5_000
 const MAX_DIAGNOSTIC_BODY = 1_024
 const MAX_MODEL_CATALOG_BODY = 4 * 1024 * 1024
+const MAX_STREAM_BUFFER_SIZE = 1024 * 1024
+const MAX_AUDIO_STREAM_BUFFER_SIZE = 32 * 1024 * 1024
 const MAX_MODELS = 5_000
 const MAX_MODEL_PARAMETERS = 256
 const MAX_MODALITIES = 16
@@ -1001,7 +1003,12 @@ export class OpenAiCompatibleProvider implements ModelProvider {
         if (!response.ok) await this.throwHttpFailure('chat', response, request.signal)
 
         try {
-          yield* this.parseStream(response, replay, request.signal)
+          yield* this.parseStream(
+            response,
+            replay,
+            request.output?.type === 'audio' ? MAX_AUDIO_STREAM_BUFFER_SIZE : MAX_STREAM_BUFFER_SIZE,
+            request.signal,
+          )
           return
         } catch (error) {
           if (isAbort(error, request.signal)) throw failure('CANCELLED')
@@ -1178,7 +1185,12 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     try { this.dependencies.diagnostic({ operation: 'models' }) } catch { /* diagnostics are observational */ }
   }
 
-  private async *parseStream(response: Response, replay: ReplayState, signal?: AbortSignal): AsyncGenerator<ModelStreamEvent> {
+  private async *parseStream(
+    response: Response,
+    replay: ReplayState,
+    maxBufferSize: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ModelStreamEvent> {
     if (!response.body) throw failure('MODEL_PROVIDER_REQUEST_FAILED')
     const pending: ModelStreamEvent[] = []
     const attemptText = new Map<number, string>()
@@ -1188,7 +1200,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
     let done = false
     let explicitTerminal = false
     const parser = createParser({
-      maxBufferSize: 1024 * 1024,
+      maxBufferSize,
       onError(error) { parserError = error },
       onEvent: ({ data }) => {
         if (data === '[DONE]') { done = true; return }
