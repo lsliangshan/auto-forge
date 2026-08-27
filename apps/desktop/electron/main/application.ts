@@ -779,6 +779,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       }
       await userDataSync.start(session.user.id, deviceId)
       await knowledge?.bind(session.user.id)
+      await knowledge?.refreshEntitlement?.(
+        session.user.id,
+        session.authorization?.knowledgeEntitlement,
+      )
       await bindUserMedia(session)
       boundUserId = session.user.id
       const warningSince = userDataSync.status().warningSince
@@ -1648,6 +1652,10 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       refreshAuthorization: () => userDataAdmission.run(async () => {
         const session = await auth.refreshAuthorization()
         await bindUserData(session)
+        await knowledge?.refreshEntitlement?.(
+          session.user.id,
+          session.authorization?.knowledgeEntitlement,
+        )
         return session
       }),
       sendOtp: (input) => auth.sendOtp(input),

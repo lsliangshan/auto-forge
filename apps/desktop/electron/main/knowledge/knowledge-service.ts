@@ -8,11 +8,14 @@ import {
   type KnowledgeDocumentSummary,
   type KnowledgeEvent,
   type KnowledgeImportHandle,
+  type KnowledgeEntitlementState,
+  type KnowledgeRetentionSelection,
   type KnowledgeSearchResult,
   type KnowledgeSourcePreview,
   type KnowledgeSourcePreviewRequest,
   type ModelProviderId,
   type KnowledgeVersionSummary,
+  type SignedKnowledgeEntitlementSnapshot,
 } from '@autoforge/shared'
 import { KnowledgeExportService } from './export-service.js'
 import { ImportJobRunner, type KnowledgeParserPort } from './import-job-runner.js'
@@ -46,6 +49,14 @@ export interface LocalKnowledgeServiceDependencies {
   createParser(store: LocalKnowledgeStore): KnowledgeParserPort | Promise<KnowledgeParserPort>
   saveExport(name: string, contents: Buffer): Promise<void>
   isMember(ownerId: string): boolean
+  /** Main-owned verified projection. Renderer state is never consulted. */
+  entitlement?(ownerId: string): KnowledgeEntitlementState
+  refreshEntitlement?(ownerId: string): Promise<KnowledgeEntitlementState | undefined>
+  verifyEntitlement?(
+    ownerId: string,
+    snapshot: SignedKnowledgeEntitlementSnapshot,
+  ): KnowledgeEntitlementState
+  cloudKillSwitchEnabled?(): boolean
   emit?(event: KnowledgeEvent): void
   now?(): number
   id?(): string
@@ -75,6 +86,7 @@ interface UnavailableBinding {
 
 export interface LocalKnowledgeService extends KnowledgeService {
   bind(ownerId: string): Promise<void>
+  refreshEntitlement?(ownerId: string, snapshot?: SignedKnowledgeEntitlementSnapshot): Promise<void>
   invalidate(): void
   drain(): Promise<void>
   restoreDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
@@ -82,6 +94,12 @@ export interface LocalKnowledgeService extends KnowledgeService {
   /** Main-only Agent retrieval over the conversation selection captured before the run. */
   searchSelected(owner: KnowledgeOwner, query: string, baseIds: readonly string[], signal?: AbortSignal): Promise<KnowledgeSearchResult>
   sourceAvailable(owner: KnowledgeOwner, documentId: string, versionId: string, signal?: AbortSignal): Promise<boolean>
+}
+
+interface RetentionSelection {
+  baseId: string
+  documentId?: string
+  confirmed: boolean
 }
 
 function fail(code: AppError['code']): never {
@@ -92,7 +110,11 @@ function timestamp(value: number): string {
   return new Date(value).toISOString()
 }
 
-function baseSummary(database: Database.Database, baseId: string): KnowledgeBaseSummary | undefined {
+function baseSummary(
+  database: Database.Database,
+  baseId: string,
+  readOnly = false,
+): KnowledgeBaseSummary | undefined {
   const row = database.prepare(`
     SELECT base.id, base.name, base.lifecycle_status, base.updated_at,
       count(document.id) AS document_count,
@@ -113,14 +135,19 @@ function baseSummary(database: Database.Database, baseId: string): KnowledgeBase
     id: row.id,
     name: row.name,
     kind: 'local',
-    status: row.lifecycle_status,
-    searchable: row.lifecycle_status !== 'recycled' && row.searchable === 1,
+    status: readOnly && row.lifecycle_status !== 'recycled' ? 'read_only' : row.lifecycle_status,
+    searchable: !readOnly && row.lifecycle_status !== 'recycled' && row.searchable === 1,
     documentCount: row.document_count,
     updatedAt: timestamp(row.updated_at),
+    ...(readOnly ? { readOnly: true } : {}),
   }
 }
 
-function documentSummary(database: Database.Database, documentId: string): KnowledgeDocumentSummary | undefined {
+function documentSummary(
+  database: Database.Database,
+  documentId: string,
+  readOnly = false,
+): KnowledgeDocumentSummary | undefined {
   const row = database.prepare(`
     SELECT document.id, document.knowledge_base_id, document.name, document.mime_type,
            document.lifecycle_status, document.updated_at, count(version.id) AS version_count
@@ -141,6 +168,7 @@ function documentSummary(database: Database.Database, documentId: string): Knowl
     status: row.lifecycle_status,
     versionCount: row.version_count,
     updatedAt: timestamp(row.updated_at),
+    ...(readOnly ? { readOnly: true } : {}),
   }
 }
 
@@ -151,12 +179,151 @@ export function createLocalKnowledgeService(
   let binding: Binding | undefined
   let unavailable: UnavailableBinding | undefined
   let lifecycleTail = Promise.resolve()
+  let refreshedEntitlement: { ownerId: string; epoch: number; state: KnowledgeEntitlementState } | undefined
   let lifecycleFailure: unknown
   let hasLifecycleFailure = false
   const retiring = new Set<Promise<void>>()
   const pendingRetirements = new Set<Binding>()
   const now = dependencies.now ?? Date.now
   const id = dependencies.id ?? randomUUID
+
+  const entitlement = (active: Binding): KnowledgeEntitlementState => {
+    const raw = (refreshedEntitlement?.ownerId === active.ownerId
+      && refreshedEntitlement.epoch === active.epoch
+      ? refreshedEntitlement.state
+      : dependencies.entitlement?.(active.ownerId)) ?? {
+      tier: dependencies.isMember(active.ownerId) ? 'member' as const : 'free' as const,
+      status: 'active' as const,
+      localEnabled: true,
+      cloudEnabled: false,
+    }
+    const expiry = raw.expiresAt ? Date.parse(raw.expiresAt) : undefined
+    const graceEnd = raw.graceEndsAt ? Date.parse(raw.graceEndsAt) : undefined
+    const checkedAt = now()
+    const projected: KnowledgeEntitlementState = expiry !== undefined && graceEnd !== undefined
+      && Number.isFinite(expiry) && Number.isFinite(graceEnd)
+      ? checkedAt <= expiry
+        ? { ...raw, status: 'active' }
+        : checkedAt <= graceEnd
+          ? { ...raw, status: 'offline_grace' }
+          : { ...raw, tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false }
+      : raw
+    const current = active.store.database.prepare(`
+      SELECT tier, status, beta_enabled AS betaEnabled, cloud_enabled AS cloudEnabled,
+        expires_at AS expiresAt, grace_ends_at AS graceEndsAt, epoch
+      FROM knowledge_entitlement_projection WHERE singleton = 1
+    `).get() as {
+      tier: string; status: string; betaEnabled: number; cloudEnabled: number
+      expiresAt: number | null; graceEndsAt: number | null; epoch: number
+    } | undefined
+    const expiresAt = projected.expiresAt ? Date.parse(projected.expiresAt) : null
+    const graceEndsAt = projected.graceEndsAt ? Date.parse(projected.graceEndsAt) : null
+    const betaEnabled = projected.betaEnabled === true
+    const changed = !current
+      || current.tier !== projected.tier || current.status !== projected.status
+      || current.betaEnabled !== Number(betaEnabled)
+      || current.cloudEnabled !== Number(projected.cloudEnabled)
+      || current.expiresAt !== expiresAt || current.graceEndsAt !== graceEndsAt
+    if (changed) {
+      active.store.database.prepare(`
+        INSERT INTO knowledge_entitlement_projection(
+          singleton, tier, status, beta_enabled, cloud_enabled, expires_at,
+          grace_ends_at, epoch, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          tier = excluded.tier, status = excluded.status,
+          beta_enabled = excluded.beta_enabled, cloud_enabled = excluded.cloud_enabled,
+          expires_at = excluded.expires_at, grace_ends_at = excluded.grace_ends_at,
+          epoch = knowledge_entitlement_projection.epoch + 1, updated_at = excluded.updated_at
+      `).run(
+        projected.tier, projected.status, Number(betaEnabled), Number(projected.cloudEnabled),
+        expiresAt, graceEndsAt, now(),
+      )
+    }
+    return projected
+  }
+
+  const storedRetention = (active: Binding): RetentionSelection | undefined => {
+    const row = active.store.database.prepare(`
+      SELECT retention.knowledge_base_id AS baseId, retention.document_id AS documentId,
+        retention.confirmed
+      FROM knowledge_free_retention AS retention
+      JOIN knowledge_bases AS base
+        ON base.id = retention.knowledge_base_id AND base.recycled_at IS NULL
+      LEFT JOIN documents AS document
+        ON document.id = retention.document_id
+       AND document.knowledge_base_id = retention.knowledge_base_id
+       AND document.recycled_at IS NULL
+      WHERE retention.singleton = 1
+        AND (retention.document_id IS NULL OR document.id IS NOT NULL)
+    `).get() as { baseId: string; documentId: string | null; confirmed: number } | undefined
+    return row ? {
+      baseId: row.baseId,
+      ...(row.documentId ? { documentId: row.documentId } : {}),
+      confirmed: row.confirmed === 1,
+    } : undefined
+  }
+
+  const writeRetention = (active: Binding, selection: RetentionSelection): void => {
+    const epochRow = active.store.database.prepare(
+      'SELECT epoch FROM knowledge_entitlement_projection WHERE singleton = 1',
+    ).get() as { epoch: number } | undefined
+    active.store.database.prepare(`
+      INSERT INTO knowledge_free_retention(
+        singleton, knowledge_base_id, document_id, confirmed, entitlement_epoch, updated_at
+      ) VALUES (1, ?, ?, ?, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET
+        knowledge_base_id = excluded.knowledge_base_id,
+        document_id = excluded.document_id,
+        confirmed = excluded.confirmed,
+        entitlement_epoch = excluded.entitlement_epoch,
+        updated_at = excluded.updated_at
+    `).run(
+      selection.baseId, selection.documentId ?? null, Number(selection.confirmed),
+      epochRow?.epoch ?? 0, now(),
+    )
+  }
+
+  const retention = (active: Binding, state = entitlement(active)): RetentionSelection | undefined => {
+    if (state.tier === 'member' && state.status !== 'expired') return undefined
+    const stored = storedRetention(active)
+    if (stored) return stored
+    const selected = active.store.database.prepare(`
+      SELECT base.id AS baseId, document.id AS documentId
+      FROM knowledge_bases AS base
+      LEFT JOIN documents AS document
+        ON document.knowledge_base_id = base.id AND document.recycled_at IS NULL
+      WHERE base.recycled_at IS NULL
+      ORDER BY base.created_at, base.id, document.created_at, document.id
+      LIMIT 1
+    `).get() as { baseId: string; documentId: string | null } | undefined
+    const normalized = selected
+      ? {
+          baseId: selected.baseId,
+          ...(selected.documentId ? { documentId: selected.documentId } : {}),
+          confirmed: false,
+        }
+      : undefined
+    if (normalized) writeRetention(active, normalized)
+    return normalized
+  }
+
+  const isMember = (active: Binding): boolean => {
+    const state = entitlement(active)
+    return state.tier === 'member' && state.status !== 'expired'
+  }
+
+  const assertWritableBase = (active: Binding, baseId: string): void => {
+    if (isMember(active)) return
+    const kept = retention(active)
+    if (kept && kept.baseId !== baseId) fail('FORBIDDEN')
+  }
+
+  const assertWritableDocument = (active: Binding, documentId: string): void => {
+    if (isMember(active)) return
+    const kept = retention(active)
+    if (!kept?.documentId || kept.documentId !== documentId) fail('FORBIDDEN')
+  }
 
   const searchBases = async (
     active: Binding,
@@ -172,7 +339,22 @@ export function createLocalKnowledgeService(
     if (unique.length === 0) {
       return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
     }
-    const result = await new LocalKnowledgeRetriever(active.store.database).search(normalized, unique)
+    const state = entitlement(active)
+    const kept = retention(active, state)
+    const allowedBases = state.tier === 'member' && state.status !== 'expired'
+      ? unique
+      : kept && unique.includes(kept.baseId) ? [kept.baseId] : []
+    if (allowedBases.length === 0) {
+      return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
+    }
+    if (kept && !kept.documentId) {
+      return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
+    }
+    const result = await new LocalKnowledgeRetriever(active.store.database).search(
+      normalized,
+      allowedBases,
+      kept?.documentId ? [kept.documentId] : undefined,
+    )
     if (signal?.aborted) fail('CANCELLED')
     return result
   }
@@ -252,6 +434,7 @@ export function createLocalKnowledgeService(
     const current = binding
     binding = undefined
     unavailable = undefined
+    refreshedEntitlement = undefined
     if (current) {
       current.runner.invalidate()
       pendingRetirements.add(current)
@@ -403,6 +586,28 @@ export function createLocalKnowledgeService(
 
   return {
     bind,
+    refreshEntitlement: async (ownerId, snapshot) => {
+      if (!dependencies.refreshEntitlement && !dependencies.verifyEntitlement) return
+      const active = binding
+      if (!active || active.ownerId !== ownerId || active.epoch !== epoch) fail('AUTH_REQUIRED')
+      const refreshEpoch = epoch
+      let state: KnowledgeEntitlementState | undefined
+      try {
+        state = snapshot && dependencies.verifyEntitlement
+          ? dependencies.verifyEntitlement(ownerId, snapshot)
+          : await dependencies.refreshEntitlement?.(ownerId)
+      } catch {
+        state = undefined
+      }
+      if (binding !== active || epoch !== refreshEpoch || active.ownerId !== ownerId) fail('CONFLICT')
+      if (state) refreshedEntitlement = { ownerId, epoch: refreshEpoch, state }
+      else refreshedEntitlement = {
+        ownerId,
+        epoch: refreshEpoch,
+        state: { tier: 'free', status: 'unavailable', localEnabled: true, cloudEnabled: false },
+      }
+      entitlement(active)
+    },
     invalidate,
     drain: async () => {
       await lifecycleTail
@@ -415,16 +620,23 @@ export function createLocalKnowledgeService(
     },
     list: async (owner) => {
       const active = current(owner)
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      const member = state.tier === 'member' && state.status !== 'expired'
       const ids = active.store.database.prepare(
         'SELECT id FROM knowledge_bases ORDER BY created_at, id',
       ).all() as Array<{ id: string }>
-      return ids.map(row => baseSummary(active.store.database, row.id)!)
+      return ids.map(row => baseSummary(
+        active.store.database,
+        row.id,
+        !member && kept !== undefined && kept.baseId !== row.id,
+      )!)
     },
     create: async (owner, rawName) => {
       const active = current(owner)
       const name = rawName.trim()
       if (!name || name.length > 200) fail('INVALID_INPUT')
-      if (!dependencies.isMember(active.ownerId)) {
+      if (!isMember(active)) {
         const count = active.store.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get() as { count: number }
         if (count.count >= 1) fail('CONFLICT')
       }
@@ -439,10 +651,17 @@ export function createLocalKnowledgeService(
     listDocuments: async (owner, baseId) => {
       const active = current(owner)
       if (!baseSummary(active.store.database, baseId)) fail('NOT_FOUND')
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      const member = state.tier === 'member' && state.status !== 'expired'
       const rows = active.store.database.prepare(`
         SELECT id FROM documents WHERE knowledge_base_id = ? ORDER BY created_at, id
       `).all(baseId) as Array<{ id: string }>
-      return rows.map(row => documentSummary(active.store.database, row.id)!)
+      return rows.map(row => documentSummary(
+        active.store.database,
+        row.id,
+        !member && kept !== undefined && kept.documentId !== row.id,
+      )!)
     },
     listVersions: async (owner, documentId) => {
       const active = current(owner)
@@ -498,11 +717,12 @@ export function createLocalKnowledgeService(
     },
     importDocument: async (owner, baseId, handleId) => {
       const active = current(owner)
+      assertWritableBase(active, baseId)
       const base = active.store.database.prepare(
         'SELECT id FROM knowledge_bases WHERE id = ? AND recycled_at IS NULL',
       ).get(baseId)
       if (!base) fail('NOT_FOUND')
-      if (!dependencies.isMember(active.ownerId)) {
+      if (!isMember(active)) {
         const count = active.store.database.prepare(
           'SELECT count(*) AS count FROM documents WHERE recycled_at IS NULL',
         ).get() as { count: number }
@@ -520,11 +740,13 @@ export function createLocalKnowledgeService(
         `).run(documentId, baseId, handle.name, handle.mimeType, createdAt, createdAt)
         enqueue(active, documentId, handle, 1, 1)
       })()
+      if (!isMember(active)) writeRetention(active, { baseId, documentId, confirmed: false })
       void active.runner.runQueued().catch(() => undefined)
       return documentSummary(active.store.database, documentId)
     },
     replaceDocument: async (owner, documentId, handleId) => {
       const active = current(owner)
+      assertWritableDocument(active, documentId)
       const document = active.store.database.prepare(`
         SELECT publication_generation FROM documents WHERE id = ? AND recycled_at IS NULL
       `).get(documentId) as { publication_generation: number } | undefined
@@ -568,7 +790,7 @@ export function createLocalKnowledgeService(
         SELECT active_version_id FROM documents WHERE id = ? AND recycled_at IS NOT NULL
       `).get(documentId) as { active_version_id: string | null } | undefined
       if (!document) fail('NOT_FOUND')
-      if (!dependencies.isMember(active.ownerId)) {
+      if (!isMember(active)) {
         const count = active.store.database.prepare(
           'SELECT count(*) AS count FROM documents WHERE recycled_at IS NULL',
         ).get() as { count: number }
@@ -627,7 +849,7 @@ export function createLocalKnowledgeService(
         'SELECT id FROM knowledge_bases WHERE id = ? AND recycled_at IS NOT NULL',
       ).get(baseId)
       if (!exists) fail('NOT_FOUND')
-      if (!dependencies.isMember(active.ownerId)) {
+      if (!isMember(active)) {
         const count = active.store.database.prepare(
           'SELECT count(*) AS count FROM knowledge_bases WHERE recycled_at IS NULL',
         ).get() as { count: number }
@@ -679,6 +901,10 @@ export function createLocalKnowledgeService(
     sourceAvailable: async (owner, documentId, versionId, signal) => {
       if (signal?.aborted) fail('CANCELLED')
       const active = current(owner)
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      if ((state.tier !== 'member' || state.status === 'expired')
+        && kept?.documentId !== documentId) return false
       const row = active.store.database.prepare(`
         SELECT 1 AS available
         FROM documents AS document
@@ -713,15 +939,22 @@ export function createLocalKnowledgeService(
           cloud: { available: false, reason: 'cloud_disabled' },
         }
       }
-      current(owner)
+      const active = current(owner)
+      const state = entitlement(active)
+      const verified = state.status !== 'unavailable'
+        && (dependencies.entitlement !== undefined
+          || (refreshedEntitlement?.ownerId === active.ownerId
+            && refreshedEntitlement.epoch === active.epoch))
+      const beta = verified && state.betaEnabled === true
+      const cloud = beta && state.cloudEnabled && dependencies.cloudKillSwitchEnabled?.() === false
       return {
         encryption: { available: true },
         parser: { available: true },
         cloudbase: { available: false, reason: 'cloudbase_unavailable' },
         embedding: { available: false, reason: 'embedding_unavailable' },
-        entitlement: { available: false, reason: 'entitlement_unavailable' },
-        beta: { available: false, reason: 'beta_disabled' },
-        cloud: { available: false, reason: 'cloud_disabled' },
+        entitlement: verified ? { available: true } : { available: false, reason: 'entitlement_unavailable' },
+        beta: beta ? { available: true } : { available: false, reason: 'beta_disabled' },
+        cloud: cloud ? { available: true } : { available: false, reason: 'cloud_disabled' },
       }
     },
     getEntitlement: async (owner) => {
@@ -729,8 +962,46 @@ export function createLocalKnowledgeService(
         return { tier: 'free', status: 'unavailable', localEnabled: false, cloudEnabled: false }
       }
       const active = current(owner)
-      const member = dependencies.isMember(active.ownerId)
-      return { tier: member ? 'member' : 'free', status: 'active', localEnabled: true, cloudEnabled: false }
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      return {
+        ...state,
+        ...(kept ? {
+          retainedBaseId: kept.baseId,
+          ...(kept.documentId ? { retainedDocumentId: kept.documentId } : {}),
+        } : {}),
+      }
+    },
+    retainFreeAllowance: async (owner, input: KnowledgeRetentionSelection) => {
+      const active = current(owner)
+      const state = entitlement(active)
+      if (state.tier === 'member' && state.status !== 'expired') fail('CONFLICT')
+      const selected = active.store.database.prepare(`
+        SELECT document.id AS documentId, base.id AS baseId
+        FROM documents AS document
+        JOIN knowledge_bases AS base ON base.id = document.knowledge_base_id
+        WHERE base.id = ? AND document.id = ?
+          AND base.recycled_at IS NULL AND document.recycled_at IS NULL
+      `).get(input.baseId, input.documentId) as Omit<RetentionSelection, 'confirmed'> | undefined
+      if (!selected) fail('NOT_FOUND')
+      const existing = storedRetention(active)
+      if (existing?.confirmed
+        && (existing.baseId !== selected.baseId || existing.documentId !== selected.documentId)) {
+        fail('CONFLICT')
+      }
+      active.store.database.transaction(() => {
+        writeRetention(active, { ...selected, confirmed: true })
+        active.store.database.prepare(`
+          UPDATE cloud_sync_states
+          SET mode = 'paused', epoch = epoch + 1, updated_at = ?
+          WHERE knowledge_base_id <> ? AND mode NOT IN ('local_only', 'paused')
+        `).run(now(), selected.baseId)
+      })()
+      return {
+        ...state,
+        retainedBaseId: selected.baseId,
+        retainedDocumentId: selected.documentId,
+      }
     },
     getConsent: async (owner, provider: ModelProviderId = 'openrouter') => {
       if (unavailable?.ownerId === owner.userId && unavailable.epoch === epoch) {
@@ -760,6 +1031,12 @@ export function createLocalKnowledgeService(
     },
     getSourcePreview: async (owner, input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview> => {
       const active = current(owner)
+      const state = entitlement(active)
+      const kept = retention(active, state)
+      if ((state.tier !== 'member' || state.status === 'expired')
+        && (kept?.baseId !== input.baseId || kept.documentId !== input.documentId)) {
+        return { kind: 'unavailable' }
+      }
       if (input.evidenceId !== `evidence:${input.evidenceId.slice('evidence:'.length)}`
         || !input.evidenceId.startsWith('evidence:')) return { kind: 'unavailable' }
       const row = active.store.database.prepare(`

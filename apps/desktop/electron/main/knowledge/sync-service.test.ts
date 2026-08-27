@@ -81,6 +81,66 @@ afterEach(() => {
 })
 
 describe('KnowledgeSyncService', () => {
+  it('invalidates an awaited cloud callback and removes every cloud operation when access closes', async () => {
+    let resolveBegin!: (value: {
+      knowledgeBaseId: string; generationId: string; status: 'staging'
+    }) => void
+    const beginSync = vi.fn().mockReturnValue(new Promise(resolve => { resolveBegin = resolve }))
+    const { service } = fixture({ beginSync })
+    const enabling = service.enableSync({
+      requestId: 'begin_gate', knowledgeBaseId: 'kb_1', name: 'Synced',
+      revision: 'local_1', generationId: 'generation_1',
+    })
+    await vi.waitFor(() => expect(beginSync).toHaveBeenCalledOnce())
+    service.setCloudAccess(false)
+    resolveBegin({ knowledgeBaseId: 'kb_1', generationId: 'generation_1', status: 'staging' })
+
+    await expect(enabling).rejects.toMatchObject({ code: 'CONFLICT' })
+    expect(service.getState('kb_1').mode).toBe('paused')
+    await expect(service.enableSync({
+      requestId: 'closed', knowledgeBaseId: 'kb_1', name: 'Synced',
+      revision: 'local_1', generationId: 'generation_1',
+    })).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(service.synchronize('kb_1')).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    expect(() => service.enqueue({
+      mutationId: 'closed_mutation', knowledgeBaseId: 'kb_1', entityKind: 'document',
+      entityId: 'document_1', operation: 'upsert', baseRevision: null, payload: {},
+    })).toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(() => service.resume('kb_1')).toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }))
+  })
+
+  it('durably advances the 30+30 day lifecycle and permits immediate purge while cloud is off', async () => {
+    const { database, remote, service } = fixture()
+    expect(service.beginCloudRetention('kb_1')).toMatchObject({
+      stage: 'download_window', downloadUntil: 1_000 + (30 * 24 * 60 * 60 * 1_000),
+      recycleUntil: 1_000 + (60 * 24 * 60 * 60 * 1_000), epoch: 1,
+    })
+    database.prepare(`
+      UPDATE knowledge_cloud_retention SET download_until = 999, recycle_until = 2000
+      WHERE knowledge_base_id = 'kb_1'
+    `).run()
+    await expect(service.advanceCloudRetention('kb_1')).resolves.toMatchObject({
+      stage: 'recycle', epoch: 2,
+    })
+    const download = vi.fn().mockResolvedValue({
+      complete: true, expectedDigest: 'digest', actualDigest: 'digest',
+    })
+    await expect(service.convertToLocalOnly('kb_1', download))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+    expect(download).not.toHaveBeenCalled()
+    database.prepare(`
+      UPDATE knowledge_cloud_retention SET recycle_until = 1000
+      WHERE knowledge_base_id = 'kb_1'
+    `).run()
+    service.setCloudAccess(false)
+    await expect(service.advanceCloudRetention('kb_1')).resolves.toBeUndefined()
+    expect(remote.deleteKnowledgeBase).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBaseId: 'kb_1', requestId: expect.any(String),
+    }))
+    expect(service.getCloudRetention('kb_1')).toBeUndefined()
+    expect(service.getState('kb_1')).toEqual({ mode: 'local_only', publishedGenerationId: null })
+  })
+
   it('durably queues offline mutations without calling CloudBase', async () => {
     const { database, remote, service } = fixture({}, false)
     service.enqueue({

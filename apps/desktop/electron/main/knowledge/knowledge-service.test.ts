@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
+import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import { KnowledgeStoreFactory } from './encrypted-database.js'
 import { createLocalKnowledgeService } from './knowledge-service.js'
 import type { KnowledgeParserPort } from './import-job-runner.js'
@@ -14,6 +15,115 @@ function deferred<T>() {
 }
 
 describe('local knowledge service', () => {
+  it('keeps only the Main-selected free allowance writable/searchable after membership expiry', async () => {
+    const memory = memoryKnowledgeStore()
+    let entitlement: KnowledgeEntitlementState = {
+      tier: 'member' as const,
+      status: 'active' as const,
+      localEnabled: true as const,
+      betaEnabled: true,
+      cloudEnabled: true,
+      expiresAt: '2026-08-28T00:00:00.000Z',
+      graceEndsAt: '2026-08-31T00:00:00.000Z',
+    }
+    const selected = [
+      { name: '甲.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('甲库合同条款') },
+      { name: '乙.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('乙库采购条款') },
+      { name: '替换.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('不可替换') },
+    ]
+    let parsed = 0
+    const saveExport = vi.fn()
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [selected.shift()!],
+      createParser: () => ({
+        parse: async () => parsedText(++parsed === 1 ? '甲库合同条款' : '乙库采购条款'),
+        terminateAll: async () => undefined,
+      }),
+      saveExport,
+      isMember: () => false,
+      entitlement: () => entitlement,
+      cloudKillSwitchEnabled: () => true,
+    })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const firstBase = await service.create(owner, '甲库')
+    let handle = (await service.pickImportFiles(owner))[0]!
+    const firstDocument = (await service.importDocument(owner, firstBase.id, handle.id))!
+    const secondBase = await service.create(owner, '乙库')
+    handle = (await service.pickImportFiles(owner))[0]!
+    const secondDocument = (await service.importDocument(owner, secondBase.id, handle.id))!
+    await vi.waitFor(async () => {
+      expect(await service.listDocuments(owner, secondBase.id)).toEqual([
+        expect.objectContaining({ id: secondDocument.id, status: 'ready' }),
+      ])
+    })
+
+    entitlement = {
+      ...entitlement,
+      tier: 'free',
+      status: 'expired',
+      betaEnabled: false,
+      cloudEnabled: false,
+      expiresAt: '2020-08-20T00:00:00.000Z',
+      graceEndsAt: '2020-08-23T00:00:00.000Z',
+    }
+    await expect(service.getEntitlement(owner)).resolves.toMatchObject({
+      tier: 'free', status: 'expired', retainedBaseId: firstBase.id,
+      retainedDocumentId: firstDocument.id,
+    })
+    await expect(service.list(owner)).resolves.toEqual([
+      expect.objectContaining({ id: firstBase.id, status: 'ready', searchable: true }),
+      expect.objectContaining({ id: secondBase.id, status: 'read_only', searchable: false, readOnly: true }),
+    ])
+    await expect(service.searchSelected(owner, '采购条款', [secondBase.id])).resolves.toMatchObject({
+      kind: 'results', evidence: [],
+    })
+
+    await expect(service.retainFreeAllowance(owner, {
+      baseId: secondBase.id, documentId: secondDocument.id,
+    })).resolves.toMatchObject({ retainedBaseId: secondBase.id, retainedDocumentId: secondDocument.id })
+    await expect(service.searchSelected(owner, '采购条款', [secondBase.id])).resolves.toMatchObject({
+      kind: 'results', evidence: [expect.objectContaining({ documentId: secondDocument.id })],
+    })
+    await expect(service.retainFreeAllowance(owner, {
+      baseId: firstBase.id, documentId: firstDocument.id,
+    })).rejects.toMatchObject({ code: 'CONFLICT' })
+    const replacement = (await service.pickImportFiles(owner))[0]!
+    await expect(service.replaceDocument(owner, firstDocument.id, replacement.id))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(service.exportBase(owner, firstBase.id)).resolves.toBeUndefined()
+    expect(saveExport).toHaveBeenCalledOnce()
+    await expect(service.recycleBase(owner, firstBase.id)).resolves.toBeUndefined()
+  })
+
+  it('drops a late entitlement refresh after the owner epoch is invalidated', async () => {
+    const alice = memoryKnowledgeStore()
+    const bob = memoryKnowledgeStore()
+    const refreshed = deferred<KnowledgeEntitlementState>()
+    const service = createLocalKnowledgeService({
+      openStore: async ownerId => ownerId === 'alice' ? alice.store : bob.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      refreshEntitlement: async () => refreshed.promise,
+    })
+    await service.bind('alice')
+    const pending = service.refreshEntitlement!('alice')
+    service.invalidate()
+    const rebound = service.bind('bob')
+    refreshed.resolve({
+      tier: 'member', status: 'active', localEnabled: true, betaEnabled: true, cloudEnabled: true,
+    })
+
+    await expect(pending).rejects.toMatchObject({ code: 'CONFLICT' })
+    await rebound
+    await expect(service.getEntitlement({ userId: 'bob' })).resolves.toMatchObject({
+      tier: 'free', cloudEnabled: false,
+    })
+  })
+
   it.runIf(process.platform === 'darwin' && process.arch === 'arm64')(
     'recovers a durable import through the real encrypted store after restart',
     async () => {

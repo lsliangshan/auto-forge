@@ -67,11 +67,19 @@ function selectedScope(baseIds: readonly string[]): { clause: string; values: st
 export class LocalKnowledgeRetriever {
   constructor(private readonly database: Database.Database) {}
 
-  async search(query: string, baseIds: readonly string[]): Promise<KnowledgeSearchResult> {
+  async search(
+    query: string,
+    baseIds: readonly string[],
+    documentIds?: readonly string[],
+  ): Promise<KnowledgeSearchResult> {
     const normalized = query.normalize('NFC').trim()
     const length = Array.from(normalized).length
     if (length < 2) return { kind: 'query-too-short' }
     const scope = selectedScope(baseIds)
+    const documentScope = documentIds === undefined ? undefined : selectedScope(documentIds)
+    const documentPredicate = documentScope
+      ? `AND chunk.document_id IN (${documentScope.clause})`
+      : ''
     const selected = `
       SELECT chunk.id, chunk.knowledge_base_id, chunk.document_id, chunk.version_id,
              chunk.body, chunk.coordinates_json, chunk.ordinal
@@ -88,6 +96,7 @@ export class LocalKnowledgeRetriever {
         AND document.recycled_at IS NULL
         AND document.active_version_id = chunk.version_id
         AND version.status = 'ready'
+        ${documentPredicate}
     `
     if (length === 2) {
       const rows = this.database.prepare(`
@@ -101,7 +110,7 @@ export class LocalKnowledgeRetriever {
         WHERE instr(body, ?) > 0
         ORDER BY version_id, ordinal
         LIMIT ${MAX_RESULTS}
-      `).all(...scope.values, normalized) as ChunkRow[]
+      `).all(...scope.values, ...(documentScope?.values ?? []), normalized) as ChunkRow[]
       return searchResult(rows, 'bounded-instr')
     }
 
@@ -124,9 +133,10 @@ export class LocalKnowledgeRetriever {
         AND document.recycled_at IS NULL
         AND document.active_version_id = chunk.version_id
         AND version.status = 'ready'
+        ${documentPredicate}
       ORDER BY bm25(kb_chunks_fts), chunk.version_id, chunk.ordinal
       LIMIT ${MAX_RESULTS}
-    `).all(literal, ...scope.values) as ChunkRow[]
+    `).all(literal, ...scope.values, ...(documentScope?.values ?? [])) as ChunkRow[]
     return searchResult(rows, 'trigram')
   }
 }

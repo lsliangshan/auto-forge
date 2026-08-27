@@ -36,6 +36,7 @@ export const knowledgeBaseSummarySchema = z.object({
   searchable: z.boolean(),
   documentCount: z.number().int().nonnegative(),
   updatedAt: timestampSchema,
+  readOnly: z.boolean().optional(),
 }).strict()
 export type KnowledgeBaseSummary = z.infer<typeof knowledgeBaseSummarySchema>
 
@@ -47,6 +48,7 @@ export const knowledgeDocumentSummarySchema = z.object({
   status: z.enum(['queued', 'copying', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted']),
   versionCount: z.number().int().nonnegative(),
   updatedAt: timestampSchema,
+  readOnly: z.boolean().optional(),
 }).strict()
 export type KnowledgeDocumentSummary = z.infer<typeof knowledgeDocumentSummarySchema>
 
@@ -81,8 +83,39 @@ export const knowledgeEntitlementStateSchema = z.object({
   status: z.enum(['active', 'offline_grace', 'expired', 'unavailable']),
   localEnabled: z.boolean(),
   cloudEnabled: z.boolean(),
-}).strict()
+  betaEnabled: z.boolean().optional(),
+  expiresAt: timestampSchema.optional(),
+  graceEndsAt: timestampSchema.optional(),
+  retainedBaseId: identifierSchema.optional(),
+  retainedDocumentId: identifierSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.cloudEnabled && (value.tier !== 'member'
+    || !['active', 'offline_grace'].includes(value.status)
+    || value.betaEnabled !== true)) {
+    context.addIssue({ code: 'custom', path: ['cloudEnabled'], message: 'Cloud requires an admitted member beta entitlement' })
+  }
+  if (value.betaEnabled && value.tier !== 'member') {
+    context.addIssue({ code: 'custom', path: ['betaEnabled'], message: 'Beta requires membership' })
+  }
+  if ((value.status === 'expired' || value.status === 'unavailable') && value.cloudEnabled) {
+    context.addIssue({ code: 'custom', path: ['cloudEnabled'], message: 'Expired or unavailable entitlement must fail closed' })
+  }
+  if ((value.expiresAt === undefined) !== (value.graceEndsAt === undefined)
+    || (value.expiresAt && value.graceEndsAt
+      && Date.parse(value.graceEndsAt) < Date.parse(value.expiresAt))) {
+    context.addIssue({ code: 'custom', path: ['graceEndsAt'], message: 'Expiry and grace boundaries must be complete and ordered' })
+  }
+  if (value.retainedDocumentId && !value.retainedBaseId) {
+    context.addIssue({ code: 'custom', path: ['retainedDocumentId'], message: 'A retained document requires its retained base' })
+  }
+})
 export type KnowledgeEntitlementState = z.infer<typeof knowledgeEntitlementStateSchema>
+
+export const knowledgeRetentionSelectionSchema = z.object({
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+}).strict()
+export type KnowledgeRetentionSelection = z.infer<typeof knowledgeRetentionSelectionSchema>
 
 export const knowledgeConsentStateSchema = z.object({
   provider: z.enum(['openrouter', 'deepseek']),
@@ -317,12 +350,19 @@ export type RoleId = z.infer<typeof roleIdSchema>
 export const businessCapabilitySchema = z.enum(['manage_users'])
 export type BusinessCapability = z.infer<typeof businessCapabilitySchema>
 
+export const signedKnowledgeEntitlementSnapshotSchema = z.object({
+  payload: z.string().regex(/^[A-Za-z0-9_-]+$/).max(8_192),
+  signature: z.string().regex(/^[A-Za-z0-9_-]+$/).max(256),
+}).strict()
+export type SignedKnowledgeEntitlementSnapshot = z.infer<typeof signedKnowledgeEntitlementSnapshotSchema>
+
 export const authorizationSnapshotSchema = z.object({
   role: roleIdSchema,
   capabilities: z.array(businessCapabilitySchema),
   version: z.number().int().nonnegative(),
   updatedAt: timestampSchema,
   confirmed: z.boolean(),
+  knowledgeEntitlement: signedKnowledgeEntitlementSnapshotSchema.optional(),
 }).strict()
 export type AuthorizationSnapshot = z.infer<typeof authorizationSnapshotSchema>
 
@@ -1609,6 +1649,7 @@ export const ipcChannels = {
   knowledgeSearch: 'knowledge:search',
   knowledgeGetAvailability: 'knowledge:get-availability',
   knowledgeGetEntitlement: 'knowledge:get-entitlement',
+  knowledgeRetainFreeAllowance: 'knowledge:retain-free-allowance',
   knowledgeGetConsent: 'knowledge:get-consent',
   knowledgeSetConsent: 'knowledge:set-consent',
   knowledgeRevokeConsent: 'knowledge:revoke-consent',
@@ -1717,6 +1758,7 @@ export const knowledgeUpdateSelectionRequestSchema = knowledgeSelectionRequestSc
   selection: knowledgeSelectionSchema,
 }).strict()
 export const knowledgeSearchRequestSchema = z.object({ query: nonEmptyStringSchema.max(1_000) }).strict()
+export const knowledgeRetentionSelectionRequestSchema = knowledgeRetentionSelectionSchema
 export const knowledgeConsentRequestSchema = z.object({ provider: modelProviderIdSchema }).strict()
 export const knowledgeSetConsentRequestSchema = knowledgeConsentRequestSchema.extend({
   status: z.enum(['granted', 'denied']),
@@ -1827,6 +1869,7 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeSearch]: knowledgeSearchRequestSchema,
   [ipcChannels.knowledgeGetAvailability]: z.undefined(),
   [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
+  [ipcChannels.knowledgeRetainFreeAllowance]: knowledgeRetentionSelectionRequestSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentRequestSchema.optional(),
   [ipcChannels.knowledgeSetConsent]: knowledgeSetConsentRequestSchema,
   [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentRequestSchema,
@@ -1927,6 +1970,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeSearch]: knowledgeSearchResultSchema,
   [ipcChannels.knowledgeGetAvailability]: knowledgeAvailabilitySchema,
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
+  [ipcChannels.knowledgeRetainFreeAllowance]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.knowledgeSetConsent]: knowledgeConsentStateSchema,
   [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentStateSchema,
@@ -2050,6 +2094,7 @@ export interface DesktopAPI {
     search(query: string): Promise<KnowledgeSearchResult>
     getAvailability(): Promise<KnowledgeAvailability>
     getEntitlement(): Promise<KnowledgeEntitlementState>
+    retainFreeAllowance(input: KnowledgeRetentionSelection): Promise<KnowledgeEntitlementState>
     getConsent(provider?: ModelProviderId): Promise<KnowledgeConsentState>
     setConsent(provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
     revokeConsent(provider: ModelProviderId): Promise<KnowledgeConsentState>

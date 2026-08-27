@@ -189,6 +189,11 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       search: (query) => invoke(ipcRenderer, ipcChannels.knowledgeSearch, { query }),
       getAvailability: () => invoke(ipcRenderer, ipcChannels.knowledgeGetAvailability),
       getEntitlement: () => invoke(ipcRenderer, ipcChannels.knowledgeGetEntitlement),
+      retainFreeAllowance: (input) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeRetainFreeAllowance,
+        input,
+      ),
       getConsent: (provider) => invoke(
         ipcRenderer,
         ipcChannels.knowledgeGetConsent,

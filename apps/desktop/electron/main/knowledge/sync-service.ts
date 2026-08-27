@@ -9,6 +9,7 @@ import type {
 
 const LEASE_MS = 60_000
 const MAX_ATTEMPTS = 3
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1_000
 
 export interface CloudKnowledgeRemote {
   beginSync(input: {
@@ -98,6 +99,14 @@ interface ConversionRow {
   previousMode: Exclude<CloudSyncMode, 'converting'>
 }
 
+export interface CloudRetentionState {
+  knowledgeBaseId: string
+  stage: 'download_window' | 'recycle' | 'purging'
+  downloadUntil: number
+  recycleUntil: number
+  epoch: number
+}
+
 interface ErrorShape {
   code?: unknown
   retryable?: unknown
@@ -125,6 +134,8 @@ function encodePayload(value: Record<string, unknown>): string {
 export class KnowledgeSyncService {
   private readonly activeSynchronizations = new Map<string, Promise<SyncResult>>()
   private readonly activeConversions = new Map<string, Promise<void>>()
+  private entitlementEpoch = 0
+  private cloudAllowed = true
 
   constructor(
     private readonly database: Database.Database,
@@ -132,7 +143,38 @@ export class KnowledgeSyncService {
     private readonly dependencies: SyncServiceDependencies,
   ) {}
 
+  /** Main entitlement/kill-switch hook. Revocation advances all durable base epochs. */
+  setCloudAccess(allowed: boolean): void {
+    if (this.cloudAllowed === allowed) return
+    this.cloudAllowed = allowed
+    this.entitlementEpoch += 1
+    if (!allowed) {
+      const now = this.dependencies.now()
+      this.database.prepare(`
+        INSERT INTO cloud_sync_states (
+          knowledge_base_id, mode, published_generation_id, epoch, updated_at
+        ) SELECT id, 'paused', NULL, 1, ? FROM knowledge_bases WHERE 1
+        ON CONFLICT(knowledge_base_id) DO UPDATE SET
+          mode = CASE WHEN cloud_sync_states.mode = 'converting'
+            THEN cloud_sync_states.mode ELSE 'paused' END,
+          epoch = CASE WHEN cloud_sync_states.mode = 'converting'
+            THEN cloud_sync_states.epoch ELSE cloud_sync_states.epoch + 1 END,
+          updated_at = excluded.updated_at
+      `).run(now)
+    }
+  }
+
+  private captureCloudAccess(): number {
+    if (!this.cloudAllowed) throw syncError('FORBIDDEN')
+    return this.entitlementEpoch
+  }
+
+  private assertCloudAccess(epoch: number): void {
+    if (!this.cloudAllowed || epoch !== this.entitlementEpoch) throw syncError('CONFLICT')
+  }
+
   enqueue(input: PushMutationInput): void {
+    this.captureCloudAccess()
     const now = this.dependencies.now()
     const payloadJson = encodePayload(input.payload)
     try {
@@ -168,10 +210,12 @@ export class KnowledgeSyncService {
     revision: string
     generationId: string
   }): Promise<void> {
+    const entitlementEpoch = this.captureCloudAccess()
     if (!this.dependencies.isOnline()) throw syncError('OFFLINE')
     const control = this.getControl(input.knowledgeBaseId)
     if (control.mode === 'paused' || control.mode === 'converting') throw syncError('CONFLICT')
     const begun = await this.remote.beginSync(input)
+    this.assertCloudAccess(entitlementEpoch)
     const current = this.getControl(input.knowledgeBaseId)
     if (current.epoch !== control.epoch
       || current.mode === 'paused' || current.mode === 'converting') throw syncError('CONFLICT')
@@ -197,6 +241,7 @@ export class KnowledgeSyncService {
   }
 
   private async runSynchronization(knowledgeBaseId: string): Promise<SyncResult> {
+    const entitlementEpoch = this.captureCloudAccess()
     const state = this.getState(knowledgeBaseId)
     if (state.mode === 'paused' || state.mode === 'converting') {
       return { status: 'paused', processed: 0, conflicts: 0 }
@@ -221,6 +266,7 @@ export class KnowledgeSyncService {
           baseRevision: mutation.baseRevision,
           payload: JSON.parse(mutation.payloadJson) as Record<string, unknown>,
         })
+        this.assertCloudAccess(entitlementEpoch)
         if (!this.isActive(knowledgeBaseId, epoch)) {
           return { status: 'paused', processed, conflicts }
         }
@@ -239,6 +285,7 @@ export class KnowledgeSyncService {
     }
 
     await this.pull(knowledgeBaseId, epoch)
+    this.assertCloudAccess(entitlementEpoch)
     if (!this.isActive(knowledgeBaseId, epoch)) {
       return { status: 'paused', processed, conflicts }
     }
@@ -283,6 +330,7 @@ export class KnowledgeSyncService {
   }
 
   resume(knowledgeBaseId: string): void {
+    this.captureCloudAccess()
     const current = this.getState(knowledgeBaseId)
     if (current.mode === 'converting') throw syncError('CONFLICT')
     this.setMode(knowledgeBaseId, 'syncing')
@@ -302,16 +350,142 @@ export class KnowledgeSyncService {
     return row ?? { mode: 'local_only', publishedGenerationId: null }
   }
 
+  beginCloudRetention(knowledgeBaseId: string): CloudRetentionState {
+    const existing = this.getCloudRetention(knowledgeBaseId)
+    if (existing) return existing
+    const exists = this.database.prepare(
+      'SELECT 1 AS present FROM knowledge_bases WHERE id = ?',
+    ).get(knowledgeBaseId)
+    if (!exists) throw syncError('NOT_FOUND')
+    const now = this.dependencies.now()
+    const operationId = this.dependencies.id()
+    const generatedRequestId = this.dependencies.id()
+    const requestId = generatedRequestId === operationId
+      ? `retention:${operationId}`.slice(0, 128)
+      : generatedRequestId
+    this.database.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO knowledge_cloud_retention(
+          knowledge_base_id, stage, download_until, recycle_until,
+          operation_id, request_id, deletion_job_id, epoch, updated_at
+        ) VALUES (?, 'download_window', ?, ?, ?, ?, NULL, 1, ?)
+      `).run(
+        knowledgeBaseId, now + THIRTY_DAYS_MS, now + (2 * THIRTY_DAYS_MS),
+        operationId, requestId, now,
+      )
+      this.setMode(knowledgeBaseId, 'paused')
+    })()
+    return this.getCloudRetention(knowledgeBaseId)!
+  }
+
+  getCloudRetention(knowledgeBaseId: string): CloudRetentionState | undefined {
+    return this.database.prepare(`
+      SELECT knowledge_base_id AS knowledgeBaseId, stage,
+        download_until AS downloadUntil, recycle_until AS recycleUntil, epoch
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId) as CloudRetentionState | undefined
+  }
+
+  recycleCloud(knowledgeBaseId: string): CloudRetentionState {
+    const current = this.beginCloudRetention(knowledgeBaseId)
+    if (current.stage === 'purging') throw syncError('CONFLICT')
+    if (current.stage !== 'recycle') {
+      this.database.prepare(`
+        UPDATE knowledge_cloud_retention
+        SET stage = 'recycle', epoch = epoch + 1, updated_at = ?
+        WHERE knowledge_base_id = ? AND epoch = ?
+      `).run(this.dependencies.now(), knowledgeBaseId, current.epoch)
+    }
+    return this.getCloudRetention(knowledgeBaseId)!
+  }
+
+  async advanceCloudRetention(knowledgeBaseId: string): Promise<CloudRetentionState | undefined> {
+    const current = this.getCloudRetention(knowledgeBaseId)
+    if (!current) return undefined
+    const now = this.dependencies.now()
+    if (now >= current.recycleUntil) {
+      await this.purgeCloudImmediately(knowledgeBaseId)
+      return undefined
+    }
+    if (now >= current.downloadUntil && current.stage === 'download_window') {
+      return this.recycleCloud(knowledgeBaseId)
+    }
+    return current
+  }
+
+  /** GDPR-style deletion remains available even while sync/search gates are closed. */
+  async purgeCloudImmediately(knowledgeBaseId: string): Promise<void> {
+    let row = this.database.prepare(`
+      SELECT request_id AS requestId, deletion_job_id AS deletionJobId, epoch
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId) as {
+      requestId: string; deletionJobId: string | null; epoch: number
+    } | undefined
+    if (!row) row = (() => {
+      this.beginCloudRetention(knowledgeBaseId)
+      return this.database.prepare(`
+        SELECT request_id AS requestId, deletion_job_id AS deletionJobId, epoch
+        FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+      `).get(knowledgeBaseId) as { requestId: string; deletionJobId: string | null; epoch: number }
+    })()
+    if (!row.deletionJobId) {
+      const expected = this.getState(knowledgeBaseId).publishedGenerationId
+      const accepted = await this.remote.deleteKnowledgeBase({
+        requestId: row.requestId,
+        knowledgeBaseId,
+        expectedPublishedGenerationId: expected,
+      })
+      const updated = this.database.prepare(`
+        UPDATE knowledge_cloud_retention
+        SET stage = 'purging', deletion_job_id = ?, epoch = epoch + 1, updated_at = ?
+        WHERE knowledge_base_id = ? AND epoch = ?
+      `).run(accepted.deletionJobId, this.dependencies.now(), knowledgeBaseId, row.epoch)
+      if (updated.changes !== 1) throw syncError('CONFLICT')
+      row = { ...row, deletionJobId: accepted.deletionJobId, epoch: row.epoch + 1 }
+    }
+    const deletionJobId = row.deletionJobId
+    if (!deletionJobId) throw syncError('INTERNAL_ERROR')
+    let completed = false
+    for (let poll = 0; poll < 3; poll += 1) {
+      const job = await this.remote.getJob({ jobId: deletionJobId })
+      const current = this.database.prepare(`
+        SELECT epoch, deletion_job_id AS deletionJobId
+        FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+      `).get(knowledgeBaseId) as { epoch: number; deletionJobId: string | null } | undefined
+      if (!current || current.epoch !== row.epoch || current.deletionJobId !== row.deletionJobId) {
+        throw syncError('CONFLICT')
+      }
+      if (job.jobId !== deletionJobId) throw syncError('INTERNAL_ERROR')
+      if (job.state === 'completed') { completed = true; break }
+      if (job.state === 'failed' || job.state === 'cancelled') {
+        throw syncError(job.errorCode ?? 'INTERNAL_ERROR')
+      }
+    }
+    if (!completed) throw Object.assign(new Error('TRANSIENT_FAILURE'), {
+      code: 'TRANSIENT_FAILURE', retryable: true as const,
+    })
+    this.database.transaction(() => {
+      const removed = this.database.prepare(`
+        DELETE FROM knowledge_cloud_retention
+        WHERE knowledge_base_id = ? AND epoch = ? AND deletion_job_id = ?
+      `).run(knowledgeBaseId, row.epoch, row.deletionJobId)
+      if (removed.changes !== 1) throw syncError('CONFLICT')
+      this.setState(knowledgeBaseId, 'local_only', null)
+    })()
+  }
+
   async publishGeneration(input: {
     requestId: string
     knowledgeBaseId: string
     generationId: string
   }): Promise<void> {
+    const entitlementEpoch = this.captureCloudAccess()
     const current = this.getControl(input.knowledgeBaseId)
     const published = await this.remote.publishGeneration({
       ...input,
       expectedPublishedGenerationId: current.publishedGenerationId,
     })
+    this.assertCloudAccess(entitlementEpoch)
     if (!this.isEpochCurrent(input.knowledgeBaseId, current.epoch)
       || ['paused', 'converting'].includes(this.getState(input.knowledgeBaseId).mode)) {
       throw syncError('CONFLICT')
@@ -343,6 +517,15 @@ export class KnowledgeSyncService {
   ): Promise<void> {
     const active = this.activeConversions.get(knowledgeBaseId)
     if (active) return active
+    const retention = this.getCloudRetention(knowledgeBaseId)
+    const durableConversion = this.database.prepare(
+      'SELECT 1 AS present FROM cloud_sync_conversions WHERE knowledge_base_id = ?',
+    ).get(knowledgeBaseId)
+    if (retention && !durableConversion
+      && (retention.stage !== 'download_window'
+        || this.dependencies.now() >= retention.downloadUntil)) {
+      return Promise.reject(syncError('FORBIDDEN'))
+    }
     const conversion = this.runConversion(knowledgeBaseId, downloadAndVerify)
     this.activeConversions.set(knowledgeBaseId, conversion)
     const clear = () => {
@@ -578,6 +761,7 @@ export class KnowledgeSyncService {
   }
 
   async cleanupOrphans(knowledgeBaseId: string): Promise<void> {
+    const entitlementEpoch = this.captureCloudAccess()
     const rows = this.database.prepare(`
       SELECT storage_reference AS storageReference, request_id AS requestId
       FROM cloud_sync_orphans WHERE knowledge_base_id = ?
@@ -591,6 +775,7 @@ export class KnowledgeSyncService {
       knowledgeBaseId,
       storageReferences: references,
     })
+    this.assertCloudAccess(entitlementEpoch)
     if (!this.isEpochCurrent(knowledgeBaseId, epoch)) throw syncError('CONFLICT')
     const placeholders = references.map(() => '?').join(', ')
     this.database.prepare(`

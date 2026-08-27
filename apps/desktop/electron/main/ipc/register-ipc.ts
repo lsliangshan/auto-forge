@@ -255,6 +255,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   registerKnowledge(ipcChannels.knowledgeSearch, (owner, input) => options.services.knowledge.search(owner, input.query))
   registerKnowledge(ipcChannels.knowledgeGetAvailability, (owner) => options.services.knowledge.getAvailability(owner))
   registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))
+  registerKnowledge(ipcChannels.knowledgeRetainFreeAllowance, (owner, input) => (
+    options.services.knowledge.retainFreeAllowance(owner, input)
+  ))
   registerKnowledge(ipcChannels.knowledgeGetConsent, (owner, input) => options.services.knowledge.getConsent(owner, input?.provider))
   registerKnowledge(ipcChannels.knowledgeSetConsent, (owner, input) => (
     options.services.knowledge.setConsent(owner, input.provider, input.status)

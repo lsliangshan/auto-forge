@@ -48,6 +48,10 @@ function api(overrides: Partial<DesktopAPI['knowledge']> = {}): DesktopAPI {
     getEntitlement: vi.fn().mockResolvedValue({
       tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false,
     }),
+    retainFreeAllowance: vi.fn().mockResolvedValue({
+      tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+      retainedBaseId: 'base_1', retainedDocumentId: 'doc_1',
+    }),
     getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
     setConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'granted' }),
     revokeConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
@@ -94,6 +98,42 @@ describe('personal knowledge workspace', () => {
     const inspector = wrapper.get('[data-testid="knowledge-inspector-pane"]')
     expect(inspector.text()).toContain('版本 1 · 可检索')
     expect(inspector.text()).not.toContain('ready')
+  })
+
+  it('renders expired extras read-only and sends the chosen keep-one pair through preload', async () => {
+    const client = api({
+      list: vi.fn().mockResolvedValue([
+        base('base_kept', '原保留库'),
+        { ...base('base_extra', '额外库'), status: 'read_only', searchable: false, readOnly: true },
+      ]),
+      listDocuments: vi.fn().mockImplementation(async (baseId: string) => [
+        { ...document(baseId === 'base_extra' ? 'doc_extra' : 'doc_kept', baseId),
+          ...(baseId === 'base_extra' ? { readOnly: true } : {}) },
+      ]),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+        retainedBaseId: 'base_kept', retainedDocumentId: 'doc_kept',
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    await store.selectBase('base_extra')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-local-availability"]').text())
+      .toContain('会员已到期，额外内容只读')
+    expect(wrapper.get('[data-testid="knowledge-document-doc_extra"]').text()).toContain('只读')
+    expect(wrapper.get('[data-testid="knowledge-import"]').attributes()).toHaveProperty('disabled')
+    expect(wrapper.get('[data-testid="knowledge-replace"]').attributes()).toHaveProperty('disabled')
+    await wrapper.get('[data-testid="knowledge-retain-free-selection"]').trigger('click')
+    await flushPromises()
+    expect(client.knowledge.retainFreeAllowance).toHaveBeenCalledWith({
+      baseId: 'base_extra', documentId: 'doc_extra',
+    })
   })
 
   it('renders local availability, base state, and a sanitized failed-document explanation', async () => {

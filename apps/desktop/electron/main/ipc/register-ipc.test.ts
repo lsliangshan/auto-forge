@@ -148,6 +148,10 @@ function services(): DesktopIpcServices {
         beta: { available: false, reason: 'beta_disabled' }, cloud: { available: false, reason: 'cloud_disabled' },
       }),
       getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false }),
+      retainFreeAllowance: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+        retainedBaseId: 'base_1', retainedDocumentId: 'document_1',
+      }),
       getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
       setConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'granted' }),
       revokeConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),

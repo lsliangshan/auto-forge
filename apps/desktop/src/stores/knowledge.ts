@@ -329,6 +329,23 @@ export const useKnowledgeStore = defineStore('knowledge', {
         this.finishOperation(operation)
       }
     },
+    async retainSelectedForFreeTier() {
+      const baseId = this.selectedBaseId
+      const documentId = this.selectedDocumentId
+      if (!baseId || !documentId) return
+      const operation = this.beginOperation()
+      if (!operation) return
+      try {
+        const entitlement = await getDesktopApi().knowledge.retainFreeAllowance({ baseId, documentId })
+        if (!this.ownsOperation(operation)) return
+        this.entitlement = entitlement
+        await this.refresh()
+      } catch (error) {
+        if (this.ownsOperation(operation)) this.error = displayError(error, '保留项设置失败')
+      } finally {
+        this.finishOperation(operation)
+      }
+    },
   },
 })
 

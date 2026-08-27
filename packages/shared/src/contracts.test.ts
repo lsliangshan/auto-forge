@@ -693,6 +693,16 @@ describe('cross-process contracts', () => {
         role: 'user', capabilities: [], version: 0, updatedAt: '2026-08-21T00:00:00.000Z', confirmed: true,
       },
     }).authorization.role).toBe('user')
+    expect(authorizationSnapshotSchema.parse({
+      role: 'user', capabilities: [], version: 4,
+      updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+    }).knowledgeEntitlement).toEqual({ payload: 'eA', signature: 'eA' })
+    expect(authorizationSnapshotSchema.safeParse({
+      role: 'user', capabilities: [], version: 4,
+      updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA', ownerId: 'forged' },
+    }).success).toBe(false)
   })
 
   it('validates strict paged user administration requests and optimistic role updates', () => {
@@ -1864,6 +1874,19 @@ describe('cross-process contracts', () => {
       ...parsed,
       knowledgeMode: 'owner-controlled',
     }).success).toBe(false)
+  })
+
+  it('keeps downgrade retention owner-free and returns only advisory opaque IDs', () => {
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRetainFreeAllowance].parse({
+      baseId: 'base_1', documentId: 'document_1',
+    })).toEqual({ baseId: 'base_1', documentId: 'document_1' })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRetainFreeAllowance].safeParse({
+      baseId: 'base_1', documentId: 'document_1', ownerId: 'forged',
+    }).success).toBe(false)
+    expect(ipcResponseSchemas[ipcChannels.knowledgeRetainFreeAllowance].parse({
+      tier: 'free', status: 'expired', localEnabled: true, cloudEnabled: false,
+      retainedBaseId: 'base_1', retainedDocumentId: 'document_1',
+    })).toMatchObject({ retainedBaseId: 'base_1', retainedDocumentId: 'document_1' })
   })
 
   it('reports each knowledge gate separately and fails closed with its matching reason', () => {

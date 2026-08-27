@@ -7,6 +7,15 @@
       role="status"
     >
       {{ availabilityLabel }}
+      <button
+        v-if="canRetainSelection"
+        type="button"
+        data-testid="knowledge-retain-free-selection"
+        :disabled="store.busy"
+        @click="store.retainSelectedForFreeTier"
+      >
+        保留当前知识库和文件
+      </button>
     </div>
     <div
       v-if="store.error"
@@ -46,15 +55,23 @@ const availabilityLabel = computed(() => {
     && store.availability.entitlement.available
     && store.availability.beta.available
     && store.availability.cloud.available
-  return `本地知识库可用 · ${cloudReady ? '云同步可用' : '云同步不可用'}`
+  const membership = store.entitlement.status === 'offline_grace'
+    ? ' · 离线权益宽限期'
+    : store.entitlement.status === 'expired' ? ' · 会员已到期，额外内容只读' : ''
+  return `本地知识库可用 · ${cloudReady ? '云同步可用' : '云同步不可用'}${membership}`
 })
+const canRetainSelection = computed(() => store.entitlement?.status === 'expired'
+  && !!store.selectedBaseId && !!store.selectedDocumentId
+  && (store.entitlement.retainedBaseId !== store.selectedBaseId
+    || store.entitlement.retainedDocumentId !== store.selectedDocumentId))
 onMounted(() => store.bindOwner(auth.session?.user.id))
 watch(() => auth.session?.user.id, ownerId => store.bindOwner(ownerId))
 </script>
 
 <style scoped>
 .knowledge-view { display: flex; height: 100%; min-height: 0; flex-direction: column; }
-.knowledge-availability { border-bottom: 1px solid var(--af-border); padding: 7px 12px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 11px; }
+.knowledge-availability { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--af-border); padding: 7px 12px; color: var(--af-text-muted); background: var(--af-surface-muted); font-size: 11px; }
+.knowledge-availability button { border: 1px solid var(--af-border-strong); border-radius: 7px; padding: 4px 8px; color: var(--af-text); background: var(--af-surface); cursor: pointer; }
 .knowledge-workspace { display: grid; min-height: 0; flex: 1; grid-template-columns: minmax(190px, .75fr) minmax(260px, 1fr) minmax(280px, 1.15fr); }
 @media (max-width: 1050px) { .knowledge-workspace { grid-template-columns: 190px minmax(240px, 1fr) minmax(250px, 1fr); } }
 </style>

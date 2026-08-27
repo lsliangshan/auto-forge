@@ -36,14 +36,14 @@
         <button
           type="button"
           data-testid="knowledge-replace"
-          :disabled="store.busy || !store.localAvailable"
+          :disabled="store.busy || !store.localAvailable || store.selectedDocument.readOnly === true"
           @click="store.replaceDocument"
         >
           替换文件
         </button>
         <button
           type="button"
-          :disabled="store.busy || !store.localAvailable"
+          :disabled="store.busy || !store.localAvailable || (store.selectedDocument.status === 'deleted' && store.selectedDocument.readOnly === true)"
           @click="store.runDocumentAction(store.selectedDocument.status === 'deleted' ? 'restore' : 'recycle')"
         >
           {{ store.selectedDocument.status === 'deleted' ? '恢复' : '移入回收站' }}

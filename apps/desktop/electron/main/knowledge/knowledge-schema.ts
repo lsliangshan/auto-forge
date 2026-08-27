@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 5
+export const KNOWLEDGE_SCHEMA_VERSION = 6
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -216,12 +216,52 @@ const KNOWLEDGE_SCHEMA_V5 = `
   ) STRICT;
 `
 
+const KNOWLEDGE_SCHEMA_V6 = `
+  CREATE TABLE knowledge_entitlement_projection (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    tier TEXT NOT NULL CHECK (tier IN ('free', 'member')),
+    status TEXT NOT NULL CHECK (status IN ('active', 'offline_grace', 'expired', 'unavailable')),
+    beta_enabled INTEGER NOT NULL CHECK (beta_enabled IN (0, 1)),
+    cloud_enabled INTEGER NOT NULL CHECK (cloud_enabled IN (0, 1)),
+    expires_at INTEGER,
+    grace_ends_at INTEGER,
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE knowledge_free_retention (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    knowledge_base_id TEXT NOT NULL,
+    document_id TEXT,
+    confirmed INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0, 1)),
+    entitlement_epoch INTEGER NOT NULL CHECK (entitlement_epoch >= 0),
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    FOREIGN KEY (document_id, knowledge_base_id)
+      REFERENCES documents(id, knowledge_base_id) ON DELETE CASCADE
+  ) STRICT;
+
+  CREATE TABLE knowledge_cloud_retention (
+    knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (stage IN ('download_window', 'recycle', 'purging')),
+    download_until INTEGER NOT NULL,
+    recycle_until INTEGER NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    request_id TEXT NOT NULL UNIQUE,
+    deletion_job_id TEXT,
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    updated_at INTEGER NOT NULL,
+    CHECK (download_until <= recycle_until)
+  ) STRICT;
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
   [3, KNOWLEDGE_SCHEMA_V3],
   [4, KNOWLEDGE_SCHEMA_V4],
   [5, KNOWLEDGE_SCHEMA_V5],
+  [6, KNOWLEDGE_SCHEMA_V6],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

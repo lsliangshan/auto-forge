@@ -9,7 +9,7 @@
       <button
         type="button"
         data-testid="knowledge-import"
-        :disabled="!store.selectedBaseId || store.busy || !store.localAvailable"
+        :disabled="!store.selectedBaseId || store.busy || !store.localAvailable || store.selectedBase?.readOnly === true"
         @click="store.importDocuments"
       >
         导入
@@ -26,7 +26,7 @@
         @click="store.selectDocument(document.id)"
       >
         <span class="af-truncate">{{ document.name }}</span>
-        <small>{{ statusLabel(document.status) }}</small>
+        <small>{{ document.readOnly ? '只读' : statusLabel(document.status) }}</small>
       </button>
       <p
         v-if="store.selectedBaseId && !store.documents.length && !store.loading"

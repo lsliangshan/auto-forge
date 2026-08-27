@@ -42,6 +42,10 @@ import {
 } from './knowledge/knowledge-service.js'
 import { createElectronParserSupervisor } from './knowledge/parser-supervisor.js'
 import { readKnowledgeImportFile, writeKnowledgeExportFile } from './knowledge/knowledge-file-io.js'
+import {
+  AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS,
+  KnowledgeEntitlementVerifier,
+} from './knowledge/entitlement-verifier.js'
 import type { SafeStoragePort } from './security/secret-store.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -140,6 +144,9 @@ async function initialize(): Promise<ApplicationRuntime> {
     }
     return selected
   }
+  const entitlementVerifier = new KnowledgeEntitlementVerifier({
+    publicKeys: AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS,
+  })
   const knowledgeService = createLocalKnowledgeService({
     openStore: ownerId => knowledgeStoreFactory.open(ownerId),
     selectImportFiles: selectKnowledgeFiles,
@@ -154,8 +161,11 @@ async function initialize(): Promise<ApplicationRuntime> {
         : await dialog.showSaveDialog({ defaultPath: name })
       if (!result.canceled && result.filePath) await writeKnowledgeExportFile(result.filePath, contents)
     },
-    // Signed membership snapshots arrive in Task 8. Main stays on the free 1/1 policy until then.
+    // Missing or invalid signed snapshots fail closed to the free 1/1 policy in Main.
     isMember: () => false,
+    verifyEntitlement: (ownerId, snapshot) => entitlementVerifier.verify(ownerId, snapshot),
+    // Authorized staging proof is still absent, so production cloud stays closed.
+    cloudKillSwitchEnabled: () => true,
     emit: event => {
       const parsed = knowledgeEventSchema.safeParse(event)
       if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)

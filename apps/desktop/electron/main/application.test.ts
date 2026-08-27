@@ -1443,6 +1443,40 @@ describe('createApplicationRuntime', () => {
     expect(lifecycle.slice(beforeClose, beforeClose + 2)).toEqual(['invalidate', 'drain'])
   })
 
+  it('forwards only the existing authorization refresh snapshot to Main entitlement verification', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-entitlement-'))
+    directories.push(root)
+    const signed = { payload: 'eA', signature: 'eA' }
+    const refreshEntitlement = vi.fn(async () => undefined)
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      refreshEntitlement,
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => undefined),
+      searchSelected: vi.fn(async () => ({ kind: 'results' as const, strategy: 'trigram' as const, evidence: [] })),
+      sourceAvailable: vi.fn(async () => false),
+    })
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      roleService: {
+        ensureMyRole: vi.fn(async () => ({
+          role: 'user', capabilities: [], version: 1,
+          updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
+          knowledgeEntitlement: signed,
+        })),
+        listUsers: vi.fn(),
+        updateUserRole: vi.fn(),
+      },
+    }))
+    const session = await authenticate(runtime, 'EntitlementAlice')
+    refreshEntitlement.mockClear()
+
+    await runtime.services.auth.refreshAuthorization()
+
+    expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, signed)
+    await runtime.close()
+  })
+
   it('records a knowledge resource drain failure at the Application shutdown boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-drain-failure-'))
     directories.push(root)

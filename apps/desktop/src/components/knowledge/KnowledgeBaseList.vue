@@ -9,7 +9,7 @@
       <button
         type="button"
         data-testid="knowledge-create-toggle"
-        :disabled="store.busy || !store.localAvailable"
+        :disabled="store.busy || !store.localAvailable || (store.entitlement?.tier === 'free' && store.bases.length > 0)"
         @click="creating = !creating"
       >
         新建
@@ -28,7 +28,7 @@
       >
       <button
         type="submit"
-        :disabled="store.busy || !store.localAvailable || !name.trim()"
+        :disabled="store.busy || !store.localAvailable || !name.trim() || (store.entitlement?.tier === 'free' && store.bases.length > 0)"
       >
         创建
       </button>
@@ -57,7 +57,7 @@
     <footer v-if="store.selectedBase">
       <button
         type="button"
-        :disabled="store.busy || !store.localAvailable"
+        :disabled="store.busy || !store.localAvailable || (store.selectedBase.status === 'recycled' && store.selectedBase.readOnly === true)"
         @click="store.runBaseAction('export')"
       >
         导出

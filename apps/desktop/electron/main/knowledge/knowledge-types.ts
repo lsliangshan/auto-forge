@@ -4,6 +4,7 @@ import type {
   KnowledgeConsentState,
   KnowledgeDocumentSummary,
   KnowledgeEntitlementState,
+  KnowledgeRetentionSelection,
   KnowledgeSearchResult,
   KnowledgeImportHandle,
   KnowledgeSelection,
@@ -40,6 +41,7 @@ export interface KnowledgeService {
   search(owner: KnowledgeOwner, query: string): Promise<KnowledgeSearchResult>
   getAvailability(owner: KnowledgeOwner): Promise<KnowledgeAvailability>
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
+  retainFreeAllowance(owner: KnowledgeOwner, input: KnowledgeRetentionSelection): Promise<KnowledgeEntitlementState>
   getConsent(owner: KnowledgeOwner, provider?: ModelProviderId): Promise<KnowledgeConsentState>
   setConsent(owner: KnowledgeOwner, provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
   revokeConsent(owner: KnowledgeOwner, provider: ModelProviderId): Promise<KnowledgeConsentState>
@@ -80,6 +82,7 @@ export function createUnavailableKnowledgeService(): KnowledgeService {
       cloud: { available: false, reason: 'cloud_disabled' },
     }),
     getEntitlement: async () => ({ tier: 'free', status: 'unavailable', localEnabled: false, cloudEnabled: false }),
+    retainFreeAllowance: async () => unavailable(),
     getConsent: async () => ({ provider: 'openrouter', status: 'unknown' }),
     setConsent: async () => unavailable(),
     revokeConsent: async () => unavailable(),
