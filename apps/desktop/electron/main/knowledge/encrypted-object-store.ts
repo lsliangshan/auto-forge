@@ -5,7 +5,7 @@ import {
   randomBytes,
   randomUUID,
 } from 'node:crypto'
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
+import { chmod, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
 const OBJECT_ID_PATTERN = /^[0-9a-f]{32}$/
@@ -100,9 +100,18 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 })
+  if (process.platform !== 'win32') await chmod(path, 0o700)
+}
+
+async function ensurePrivateFile(path: string): Promise<void> {
+  if (process.platform !== 'win32') await chmod(path, 0o600)
+}
+
 async function publishDurably(path: string, contents: Buffer): Promise<void> {
   const directory = dirname(path)
-  await mkdir(directory, { recursive: true, mode: 0o700 })
+  await ensurePrivateDirectory(directory)
   const temporaryPath = join(directory, `.object-${randomUUID()}.recovery`)
   const handle = await open(temporaryPath, 'wx', 0o600)
   try {
@@ -116,6 +125,7 @@ async function publishDurably(path: string, contents: Buffer): Promise<void> {
   await handle.close()
   try {
     await rename(temporaryPath, path)
+    await ensurePrivateFile(path)
     await syncDirectory(directory)
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined)
@@ -173,7 +183,10 @@ export class KnowledgeObjectStore {
     validateObjectId(objectId)
     let serialized: Buffer
     try {
-      serialized = await readFile(this.#pathFor(objectId))
+      await ensurePrivateDirectory(this.#root)
+      const path = this.#pathFor(objectId)
+      await ensurePrivateFile(path)
+      serialized = await readFile(path)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         throw new Error('Knowledge object is unavailable')
@@ -209,7 +222,7 @@ export class KnowledgeObjectStore {
   async delete(objectId: string): Promise<void> {
     this.#requireOpen()
     validateObjectId(objectId)
-    await mkdir(this.#root, { recursive: true, mode: 0o700 })
+    await ensurePrivateDirectory(this.#root)
     try {
       await unlink(this.#pathFor(objectId))
     } catch (error) {

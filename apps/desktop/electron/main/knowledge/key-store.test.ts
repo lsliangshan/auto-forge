@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { chmod, copyFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -40,6 +40,29 @@ afterEach(async () => {
 })
 
 describe('KnowledgeKeyStore', () => {
+  it.runIf(process.platform !== 'win32')(
+    'tightens pre-existing root, owner, and key-record permissions before loading',
+    async () => {
+      const root = await temporaryRoot()
+      const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+      const created = await store.loadOrCreate('owner-loose-key-paths')
+      created.active.fill(0)
+      created.objectKey.fill(0)
+      await chmod(root, 0o777)
+      await chmod(created.ownerRoot, 0o777)
+      await chmod(created.recordPath, 0o666)
+
+      const loaded = await store.loadExisting('owner-loose-key-paths')
+
+      expect(loaded).toBeDefined()
+      expect((await stat(root)).mode & 0o777).toBe(0o700)
+      expect((await stat(created.ownerRoot)).mode & 0o777).toBe(0o700)
+      expect((await stat(created.recordPath)).mode & 0o777).toBe(0o600)
+      loaded?.active.fill(0)
+      loaded?.objectKey.fill(0)
+    },
+  )
+
   it('single-flights concurrent first use so every caller receives the committed key', async () => {
     const root = await temporaryRoot()
     const store = new KnowledgeKeyStore(root, fakeSafeStorage())

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -27,6 +27,24 @@ afterEach(async () => {
 })
 
 describe('KnowledgeObjectStore', () => {
+  it.runIf(process.platform !== 'win32')(
+    'tightens pre-existing object directory and file permissions before reading',
+    async () => {
+      const root = await temporaryRoot()
+      const store = new KnowledgeObjectStore(root, randomBytes(32))
+      const payload = Buffer.from('pre-existing-object-permissions')
+      const stored = await store.put(payload)
+      const objectPath = join(root, `${stored.objectId}.afobj`)
+      await chmod(root, 0o777)
+      await chmod(objectPath, 0o666)
+
+      expect(await store.read(stored.objectId)).toEqual(payload)
+      expect((await stat(root)).mode & 0o777).toBe(0o700)
+      expect((await stat(objectPath)).mode & 0o777).toBe(0o600)
+      store.close()
+    },
+  )
+
   it('round-trips AEAD objects with random IDs and random file keys without plaintext artifacts', async () => {
     const root = await temporaryRoot()
     const masterKey = randomBytes(32)

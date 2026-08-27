@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { constants, mkdtempSync, rmSync } from 'node:fs'
-import { access } from 'node:fs/promises'
+import { access, chmod } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -51,10 +51,20 @@ export interface KnowledgeStore {
   capabilities: KnowledgeNativeCapabilities
   objects: KnowledgeObjectStore
   rotateKey(): Promise<void>
-  close(): void
+  close(): Promise<void>
 }
 
-const openKnowledgeStores = new Map<string, KnowledgeStore>()
+interface SharedKnowledgeStore {
+  database: CipherDatabaseInstance
+  databasePath: string
+  ownerRoot: string
+  capabilities: KnowledgeNativeCapabilities
+  objects: KnowledgeObjectStore
+  referenceCount: number
+  closed: boolean
+}
+
+const openKnowledgeStores = new Map<string, SharedKnowledgeStore>()
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -63,6 +73,13 @@ async function pathExists(path: string): Promise<boolean> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
     throw error
+  }
+}
+
+async function tightenExistingDatabaseArtifacts(databasePath: string): Promise<void> {
+  if (process.platform === 'win32') return
+  for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    if (await pathExists(path)) await chmod(path, 0o600)
   }
 }
 
@@ -155,7 +172,10 @@ export class KnowledgeStoreFactory {
     return this.#keyStore.withOwnerLock(ownerId, async keyStore => {
       const cacheKey = keyStore.paths.ownerRoot
       const current = openKnowledgeStores.get(cacheKey)
-      if (current) return current
+      if (current) {
+        current.referenceCount += 1
+        return this.#createLease(ownerId, cacheKey, current)
+      }
 
       let material = await keyStore.loadExisting()
       const databasePath = join(keyStore.paths.ownerRoot, 'knowledge.sqlite')
@@ -163,6 +183,7 @@ export class KnowledgeStoreFactory {
         if (await pathExists(databasePath)) throw new Error('Knowledge database key is unavailable')
         material = await keyStore.loadOrCreate()
       }
+      await tightenExistingDatabaseArtifacts(databasePath)
 
       let database: CipherDatabaseInstance | undefined
       let objects: KnowledgeObjectStore | undefined
@@ -170,6 +191,7 @@ export class KnowledgeStoreFactory {
         database = await this.#openRecoveringPending(databasePath, material, keyStore)
         configureAndProbe(database)
         initializeKnowledgeSchema(database)
+        await tightenExistingDatabaseArtifacts(databasePath)
         objects = new KnowledgeObjectStore(join(keyStore.paths.ownerRoot, 'objects'), material.objectKey)
       } catch (error) {
         database?.close()
@@ -181,38 +203,51 @@ export class KnowledgeStoreFactory {
         material.pending?.fill(0)
       }
 
-      let closed = false
-      const activeDatabase = database
-      const activeObjects = objects
-      let store!: KnowledgeStore
-      store = {
-        database: activeDatabase,
+      const shared: SharedKnowledgeStore = {
+        database,
         databasePath,
         ownerRoot: keyStore.paths.ownerRoot,
         capabilities,
-        objects: activeObjects,
-        rotateKey: () => this.#keyStore.withOwnerLock(ownerId, async lockedStore => {
-          if (closed) throw new Error('Knowledge database is closed')
-          const pending = randomBytes(KEY_BYTES)
-          try {
-            await lockedStore.stagePending(pending)
-            rekeyEncryptedKnowledgeDatabase(activeDatabase, pending)
-            await lockedStore.promotePending()
-          } finally {
-            pending.fill(0)
-          }
-        }),
-        close: () => {
-          if (closed) return
-          closed = true
-          if (openKnowledgeStores.get(cacheKey) === store) openKnowledgeStores.delete(cacheKey)
-          activeObjects.close()
-          activeDatabase.close()
-        },
+        objects,
+        referenceCount: 1,
+        closed: false,
       }
-      openKnowledgeStores.set(cacheKey, store)
-      return store
+      openKnowledgeStores.set(cacheKey, shared)
+      return this.#createLease(ownerId, cacheKey, shared)
     })
+  }
+
+  #createLease(ownerId: string, cacheKey: string, shared: SharedKnowledgeStore): KnowledgeStore {
+    let closed = false
+    return {
+      database: shared.database,
+      databasePath: shared.databasePath,
+      ownerRoot: shared.ownerRoot,
+      capabilities: shared.capabilities,
+      objects: shared.objects,
+      rotateKey: () => this.#keyStore.withOwnerLock(ownerId, async lockedStore => {
+        if (closed || shared.closed) throw new Error('Knowledge database is closed')
+        const pending = randomBytes(KEY_BYTES)
+        try {
+          await lockedStore.stagePending(pending)
+          rekeyEncryptedKnowledgeDatabase(shared.database, pending)
+          await lockedStore.promotePending()
+        } finally {
+          pending.fill(0)
+        }
+      }),
+      close: () => this.#keyStore.withOwnerLock(ownerId, async () => {
+        if (closed) return
+        closed = true
+        shared.referenceCount -= 1
+        if (shared.referenceCount > 0) return
+        shared.closed = true
+        if (openKnowledgeStores.get(cacheKey) === shared) openKnowledgeStores.delete(cacheKey)
+        shared.objects.close()
+        shared.database.close()
+        await tightenExistingDatabaseArtifacts(shared.databasePath)
+      }),
+    }
   }
 
   async #openRecoveringPending(

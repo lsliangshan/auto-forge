@@ -88,9 +88,8 @@ describe('knowledge schema v1', () => {
 
     database.prepare("DELETE FROM kb_chunks WHERE id = 'chunk_1'").run()
     expect(database.prepare(`
-      SELECT kb_chunks.id
+      SELECT rowid
       FROM kb_chunks_fts
-      JOIN kb_chunks ON kb_chunks.rowid = kb_chunks_fts.rowid
       WHERE kb_chunks_fts MATCH ?
     `).all('"紫色彗星"')).toEqual([])
   })

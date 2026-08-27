@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { mkdtemp, rm, unlink } from 'node:fs/promises'
+import { chmod, mkdtemp, rm, stat, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { createRequire } from 'node:module'
@@ -65,6 +65,24 @@ afterEach(async () => {
 })
 
 describe('encrypted personal knowledge database', () => {
+  it.runIf(process.platform !== 'win32')(
+    'tightens a pre-existing owner directory and encrypted database before reopening',
+    async () => {
+      const root = await temporaryRoot()
+      const factory = new KnowledgeStoreFactory(root, fakeSafeStorage())
+      const first = await factory.open('owner-loose-database-paths')
+      await first.close()
+      await chmod(first.ownerRoot, 0o777)
+      await chmod(first.databasePath, 0o666)
+
+      const reopened = await factory.open('owner-loose-database-paths')
+
+      expect((await stat(reopened.ownerRoot)).mode & 0o777).toBe(0o700)
+      expect((await stat(reopened.databasePath)).mode & 0o777).toBe(0o600)
+      await reopened.close()
+    },
+  )
+
   it('single-flights concurrent first open for one owner', async () => {
     const root = await temporaryRoot()
     let encryptions = 0
@@ -82,9 +100,31 @@ describe('encrypted personal knowledge database', () => {
       Array.from({ length: 6 }, () => factory.open('owner-concurrent-open')),
     )
 
-    expect(opened.every(store => store === opened[0])).toBe(true)
+    expect(new Set(opened).size).toBe(6)
+    expect(opened.every(store => store.database === opened[0]!.database)).toBe(true)
     expect(encryptions).toBe(2)
-    opened[0]!.close()
+    for (const store of opened) await store.close()
+  })
+
+  it('keeps shared resources open until every completed open lease closes', async () => {
+    const root = await temporaryRoot()
+    const factory = new KnowledgeStoreFactory(root, fakeSafeStorage())
+    const first = await factory.open('owner-leases')
+    const second = await factory.open('owner-leases')
+    const payload = Buffer.from('lease-owned-object')
+    const stored = await first.objects.put(payload)
+
+    await first.close()
+    await first.close()
+
+    expect(second.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get())
+      .toEqual({ count: 0 })
+    expect(await second.objects.read(stored.objectId)).toEqual(payload)
+    await second.rotateKey()
+
+    await second.close()
+    expect(() => second.database.prepare('SELECT 1').get()).toThrow(/not open|closed/i)
+    await expect(second.objects.read(stored.objectId)).rejects.toThrow(/closed/i)
   })
 
   it('serializes concurrent rotations through pending rekey publication', async () => {
@@ -116,7 +156,7 @@ describe('encrypted personal knowledge database', () => {
     ])
     releasePromotion.resolve()
     const rotations = await Promise.allSettled([first, second])
-    opened.close()
+    await opened.close()
 
     expect(secondFinishedBeforeRelease).toBe(false)
     expect(rotations).toEqual([
@@ -126,7 +166,43 @@ describe('encrypted personal knowledge database', () => {
     const reopened = await new KnowledgeStoreFactory(root, safeStorage).open('owner-concurrent-rotation')
     expect(reopened.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get())
       .toEqual({ count: 0 })
-    reopened.close()
+    await reopened.close()
+  })
+
+  it('waits for an in-flight rotation before closing the last lease', async () => {
+    const root = await temporaryRoot()
+    const promotionBlocked = deferred()
+    const releasePromotion = deferred()
+    let encryptions = 0
+    const safeStorage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async (value) => {
+        encryptions += 1
+        if (encryptions === 4) {
+          promotionBlocked.resolve()
+          await releasePromotion.promise
+        }
+        return Buffer.from(value, 'utf8')
+      },
+      decrypt: async value => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+    }
+    const opened = await new KnowledgeStoreFactory(root, safeStorage).open('owner-rotate-close')
+
+    const rotation = opened.rotateKey()
+    await promotionBlocked.promise
+    const finalClose = Promise.resolve(opened.close())
+    const closeFinishedBeforeRelease = await Promise.race([
+      finalClose.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 200)),
+    ])
+
+    expect(closeFinishedBeforeRelease).toBe(false)
+    expect(opened.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get())
+      .toEqual({ count: 0 })
+    releasePromotion.resolve()
+    await rotation
+    await finalClose
+    expect(() => opened.database.prepare('SELECT 1').get()).toThrow(/not open|closed/i)
   })
 
   it('probes the current cipher binding and FTS5 trigram under Electron 43 on macOS arm64', () => {
@@ -154,7 +230,7 @@ describe('encrypted personal knowledge database', () => {
     expect(opened.databasePath).not.toContain('alice@example.test')
     expect(opened.database.pragma('temp_store', { simple: true })).toBe(2)
     expect(opened.capabilities).toMatchObject({ tempStore: 'memory', fts5: true, trigram: true })
-    opened.close()
+    await opened.close()
 
     const correct = openEncryptedKnowledgeDatabase(opened.databasePath, keyMaterial.active)
     expect(correct.prepare('SELECT count(*) AS count FROM knowledge_bases').get()).toEqual({ count: 0 })
@@ -180,7 +256,7 @@ describe('encrypted personal knowledge database', () => {
     const safeStorage = fakeSafeStorage()
     const factory = new KnowledgeStoreFactory(root, safeStorage)
     const opened = await factory.open('owner-missing-key')
-    opened.close()
+    await opened.close()
     const material = await new KnowledgeKeyStore(root, safeStorage).loadExisting('owner-missing-key')
     if (!material) throw new Error('test key is missing')
     await unlink(material.recordPath)
@@ -211,7 +287,7 @@ describe('encrypted personal knowledge database', () => {
     expect(sensitiveArtifacts(root).filter(path => readFileSync(path).includes(Buffer.from(sentinel))))
       .toEqual([])
     opened.database.pragma('wal_checkpoint(TRUNCATE)')
-    opened.close()
+    await opened.close()
 
     expect(sensitiveArtifacts(root).filter(path => readFileSync(path).includes(Buffer.from(sentinel))))
       .toEqual([])
@@ -226,21 +302,21 @@ describe('encrypted personal knowledge database', () => {
     const before = await factory.open('owner-before-rekey')
     const pendingBefore = randomBytes(32)
     await keyStore.stagePending('owner-before-rekey', pendingBefore)
-    before.close()
+    await before.close()
     const recoveredBefore = await factory.open('owner-before-rekey')
     expect((await keyStore.loadExisting('owner-before-rekey'))?.pending).toBeUndefined()
-    recoveredBefore.close()
+    await recoveredBefore.close()
 
     const after = await factory.open('owner-after-rekey')
     const pendingAfter = randomBytes(32)
     await keyStore.stagePending('owner-after-rekey', pendingAfter)
     rekeyEncryptedKnowledgeDatabase(after.database, pendingAfter)
-    after.close()
+    await after.close()
     const recoveredAfter = await factory.open('owner-after-rekey')
     const promoted = await keyStore.loadExisting('owner-after-rekey')
     expect(promoted?.active.equals(pendingAfter)).toBe(true)
     expect(promoted?.pending).toBeUndefined()
-    recoveredAfter.close()
+    await recoveredAfter.close()
 
     pendingBefore.fill(0)
     pendingAfter.fill(0)
@@ -256,6 +332,6 @@ describe('encrypted personal knowledge database', () => {
     await opened.rotateKey()
 
     expect(await opened.objects.read(stored.objectId)).toEqual(sentinel)
-    opened.close()
+    await opened.close()
   })
 })

@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, link, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
+import { access, chmod, link, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { SafeStoragePort } from '../security/secret-store.js'
 
@@ -132,13 +132,22 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 })
+  if (process.platform !== 'win32') await chmod(path, 0o700)
+}
+
+async function ensurePrivateFile(path: string): Promise<void> {
+  if (process.platform !== 'win32') await chmod(path, 0o600)
+}
+
 async function writeRecordDurably(
   path: string,
   record: KeyRecord,
   { createOnly = false }: { createOnly?: boolean } = {},
 ): Promise<void> {
   const directory = dirname(path)
-  await mkdir(directory, { recursive: true, mode: 0o700 })
+  await ensurePrivateDirectory(directory)
   const temporaryPath = join(directory, `.keys-${randomUUID()}.recovery`)
   const handle = await open(temporaryPath, 'wx', 0o600)
   try {
@@ -157,6 +166,7 @@ async function writeRecordDurably(
     } else {
       await rename(temporaryPath, path)
     }
+    await ensurePrivateFile(path)
     const directoryHandle = await open(directory, 'r')
     try {
       await directoryHandle.sync()
@@ -268,7 +278,10 @@ export class KnowledgeKeyStore {
 
   async #loadExistingUnlocked(ownerId: string): Promise<KnowledgeKeyMaterial | undefined> {
     const paths = ownerPaths(this.#root, ownerId)
+    await ensurePrivateDirectory(this.#root)
+    await ensurePrivateDirectory(paths.ownerRoot)
     if (!await pathExists(paths.recordPath)) return undefined
+    await ensurePrivateFile(paths.recordPath)
     await this.#requireSecureStorage()
     const record = parseRecord(await readFile(paths.recordPath, 'utf8'))
     const activeResult = await this.#unwrapKey(record.active, paths.token)
