@@ -192,6 +192,48 @@ describe('knowledge tool and answer validation', () => {
   })
 
   it.each([
+    '会议时间为 12:30。',
+    '服务费为 100.50 美元。',
+    '注册资本为 1,000 美元。',
+    '合同于 2026-08-01 生效。',
+  ])('keeps numeric punctuation inside one supported material claim: %s', (text) => {
+    expect(validateKnowledgeAnswer(`${text}[[kb:evidence:0]]`, [evidence(0, { snippet: text })], 'strict', 0)).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false, text,
+    })
+  })
+
+  it.each([
+    {
+      name: '完整公司名称替换',
+      snippet: '供应商为北京星火科技有限公司。',
+      answer: '供应商为上海星火科技有限公司。[[kb:evidence:0]]',
+    },
+    {
+      name: '其他中文组织名称一处替换',
+      snippet: '报告由华南创新研究院发布。',
+      answer: '报告由华北创新研究院发布。[[kb:evidence:0]]',
+    },
+    {
+      name: '中文地名一处替换不能被长句稀释',
+      snippet: '该重点示范项目的主要实施地点位于杭州市西湖区并持续运营。',
+      answer: '该重点示范项目的主要实施地点位于杭州市西湖县并持续运营。[[kb:evidence:0]]',
+    },
+    {
+      name: '连续高信息片段替换不能被长句稀释',
+      snippet: '该项目的核心交付成果必须采用红色标准格式并保持长期稳定。',
+      answer: '该项目的核心交付成果必须采用蓝色标准格式并保持长期稳定。[[kb:evidence:0]]',
+    },
+  ])('rejects $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it.each([
     {
       name: '中文普通逗号后的无关月球断言',
       snippet: '合同经双方签字后生效。',

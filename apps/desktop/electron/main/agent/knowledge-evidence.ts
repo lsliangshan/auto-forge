@@ -121,9 +121,29 @@ export type KnowledgeAnswerValidation =
   | { kind: 'insufficient'; reason: 'no-evidence' | 'uncited' | 'invalid-citation' | 'unsupported-claim' }
 
 const KNOWLEDGE_MARKER = /\[\[kb:([^\]\r\n]{1,512})\]\]/gu
+const NUMERIC_DOT = '\u{e100}'
+const NUMERIC_COLON = '\u{e101}'
+const NUMERIC_COMMA = '\u{e102}'
+const NUMERIC_CJK_COMMA = '\u{e103}'
+
+function protectNumericPunctuation(value: string): string {
+  return value
+    .replace(/(?<=[0-9０-９])\.(?=[0-9０-９])/gu, NUMERIC_DOT)
+    .replace(/(?<=[0-9０-９]):(?=[0-9０-９])/gu, NUMERIC_COLON)
+    .replace(/(?<=[0-9０-９]),(?=[0-9０-９]{3}(?:[^0-9０-９]|$))/gu, NUMERIC_COMMA)
+    .replace(/(?<=[0-9０-９])，(?=[0-9０-９]{3}(?:[^0-9０-９]|$))/gu, NUMERIC_CJK_COMMA)
+}
+
+function restoreNumericPunctuation(value: string): string {
+  return value
+    .replaceAll(NUMERIC_DOT, '.')
+    .replaceAll(NUMERIC_COLON, ':')
+    .replaceAll(NUMERIC_COMMA, ',')
+    .replaceAll(NUMERIC_CJK_COMMA, '，')
+}
 
 function splitKnowledgeClaims(answer: string): string[] {
-  const sentences = answer
+  const sentences = protectNumericPunctuation(answer)
     .split(/(?<=[。！？.!?])|\n+/gu)
     .map(part => part.trim())
     .filter(Boolean)
@@ -150,6 +170,7 @@ function splitKnowledgeClaims(answer: string): string[] {
       .map(part => part.trim())
       .filter(Boolean)
       .map(part => part.replace(/\u{e000}(\d+)\u{e001}/gu, (_placeholder, index: string) => protectedMarkers[Number(index)] ?? ''))
+      .map(restoreNumericPunctuation)
       .map(claim => propagatedMarker && !/\[\[kb:[^\]\r\n]{1,512}\]\]/u.test(claim)
         ? `${claim}${propagatedMarker}`
         : claim)
@@ -237,6 +258,14 @@ function namedEntities(value: string): string[] {
   return [...new Set([...latin, ...quoted])]
 }
 
+function chineseNamedEntities(value: string): string[] {
+  const organizations = [...value.matchAll(/[一-鿿·]{2,40}(?:有限责任公司|股份有限公司|有限公司|公司|集团|银行|大学|法院|委员会|研究院)/gu)]
+    .map(match => match[0]!)
+  const locations = [...value.matchAll(/[一-鿿·]{2,32}(?:特别行政区|自治区|自治州|街道|省|市|区|县|镇|乡)/gu)]
+    .map(match => match[0]!)
+  return [...new Set([...organizations, ...locations])]
+}
+
 function entitiesCompatible(claim: string, evidence: string, rawClaim: string, rawEvidence: string): boolean {
   const roles = ['甲方', '乙方', '丙方', '买方', '卖方', '出租方', '承租方']
   if (roles.some(role => claim.includes(role) && !evidence.includes(role))) return false
@@ -246,6 +275,7 @@ function entitiesCompatible(claim: string, evidence: string, rawClaim: string, r
   const claimCurrencies = matchingIds(claim, CURRENCIES)
   const evidenceCurrencies = matchingIds(evidence, CURRENCIES)
   if ([...claimCurrencies].some(id => !evidenceCurrencies.has(id))) return false
+  if (chineseNamedEntities(claim).some(entity => !evidence.includes(entity))) return false
   const normalizedRawEvidence = rawEvidence.normalize('NFKC').toLowerCase()
   return namedEntities(rawClaim).every(entity => normalizedRawEvidence.includes(entity.toLowerCase()))
 }
@@ -284,6 +314,21 @@ function hasHighCoverage(tokens: readonly string[], evidence: string): boolean {
   return matched >= Math.min(2, tokens.length) && matched / tokens.length >= 0.8
 }
 
+function hasConsecutiveUnsupportedCjkFragment(claim: string, evidence: string): boolean {
+  const characters = [...cjkMaterialText(claim)]
+  let consecutiveMisses = 0
+  for (let index = 0; index + 1 < characters.length; index += 1) {
+    const gram = `${characters[index]}${characters[index + 1]}`
+    consecutiveMisses = evidence.includes(gram) ? 0 : consecutiveMisses + 1
+    if (consecutiveMisses >= 2) return true
+  }
+  return false
+}
+
+function numericTokens(value: string): string[] {
+  return value.match(/\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:[./:-]\d+)*/gu) ?? []
+}
+
 function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
   const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
   const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
@@ -291,14 +336,19 @@ function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
   const normalizedEvidence = canonicalSupportText(rawEvidence)
   if (!polarityCompatible(normalizedClaim, normalizedEvidence)) return false
   if (!entitiesCompatible(normalizedClaim, normalizedEvidence, rawClaim, rawEvidence)) return false
-  const claimNumbers = normalizedClaim.match(/\d+(?:[./:-]\d+)*/gu) ?? []
-  const evidenceNumbers = new Set(normalizedEvidence.match(/\d+(?:[./:-]\d+)*/gu) ?? [])
+  const claimNumbers = numericTokens(normalizedClaim)
+  const evidenceNumbers = new Set(numericTokens(normalizedEvidence))
   if (claimNumbers.some(number => !evidenceNumbers.has(number))) return false
 
   const cjkTokens = cjkMaterialTokens(normalizedClaim)
   const latinTokens = latinMaterialTokens(normalizedClaim)
   if (cjkTokens.length === 0 && latinTokens.length === 0) return false
-  if (cjkTokens.length > 0 && !hasHighCoverage(cjkTokens, cjkMaterialText(normalizedEvidence))) return false
+  if (cjkTokens.length > 0) {
+    const cjkEvidence = cjkMaterialText(normalizedEvidence)
+    const matched = cjkTokens.filter(token => cjkEvidence.includes(token)).length
+    if (matched < Math.min(2, cjkTokens.length) || matched / cjkTokens.length < 0.9) return false
+    if (hasConsecutiveUnsupportedCjkFragment(normalizedClaim, cjkEvidence)) return false
+  }
   if (latinTokens.length > 0 && !hasHighCoverage(latinTokens, normalizedEvidence)) return false
   return true
 }
