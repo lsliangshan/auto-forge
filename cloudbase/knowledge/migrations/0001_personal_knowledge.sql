@@ -141,18 +141,53 @@ CREATE TABLE IF NOT EXISTS public.knowledge_index_generations (
   id varchar(128) NOT NULL,
   owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   knowledge_base_id varchar(128) NOT NULL,
-  status varchar(32) NOT NULL CHECK (status IN ('staging', 'ready', 'published', 'failed', 'retired')),
-  model varchar(128),
-  configuration jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status varchar(32) NOT NULL CHECK (status IN ('staging', 'ready', 'published', 'retained', 'failed', 'retired')),
+  model varchar(128) NOT NULL DEFAULT 'kinfra-text-embedding-0.6b'
+    CHECK (model = 'kinfra-text-embedding-0.6b'),
+  embedding_dimensions smallint NOT NULL DEFAULT 1024 CHECK (embedding_dimensions = 1024),
+  configuration_version varchar(128) NOT NULL DEFAULT 'autoforge-knowledge-embedding-v1'
+    CHECK (configuration_version = 'autoforge-knowledge-embedding-v1'),
+  configuration jsonb NOT NULL DEFAULT '{"distance":"cosine","normalization":"none","region":"guangzhou"}'::jsonb
+    CHECK (configuration = '{"distance":"cosine","normalization":"none","region":"guangzhou"}'::jsonb),
   created_at timestamptz NOT NULL DEFAULT now(),
   ready_at timestamptz,
   published_at timestamptz,
+  retained_until timestamptz,
   PRIMARY KEY(owner_id, knowledge_base_id, id),
   FOREIGN KEY(owner_id, knowledge_base_id)
     REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS knowledge_one_published_generation
   ON public.knowledge_index_generations(owner_id, knowledge_base_id) WHERE status = 'published';
+
+CREATE TABLE IF NOT EXISTS public.knowledge_embedding_consents (
+  owner_id bigint PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  state varchar(16) NOT NULL DEFAULT 'revoked' CHECK (state IN ('granted', 'revoked')),
+  consent_epoch bigint NOT NULL DEFAULT 0 CHECK (consent_epoch >= 0),
+  granted_at timestamptz,
+  revoked_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.knowledge_chunk_embeddings (
+  owner_id bigint NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  knowledge_base_id varchar(128) NOT NULL,
+  generation_id varchar(128) NOT NULL,
+  chunk_id varchar(128) NOT NULL,
+  model varchar(128) NOT NULL CHECK (model = 'kinfra-text-embedding-0.6b'),
+  dimensions smallint NOT NULL CHECK (dimensions = 1024),
+  configuration_version varchar(128) NOT NULL
+    CHECK (configuration_version = 'autoforge-knowledge-embedding-v1'),
+  embedding real[] NOT NULL CHECK (cardinality(embedding) = 1024),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(owner_id, knowledge_base_id, generation_id, chunk_id),
+  FOREIGN KEY(owner_id, knowledge_base_id, generation_id)
+    REFERENCES public.knowledge_index_generations(owner_id, knowledge_base_id, id) ON DELETE CASCADE,
+  FOREIGN KEY(owner_id, knowledge_base_id, chunk_id)
+    REFERENCES public.knowledge_chunks(owner_id, knowledge_base_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS knowledge_embeddings_small_set
+  ON public.knowledge_chunk_embeddings(owner_id, knowledge_base_id, generation_id, chunk_id);
 
 ALTER TABLE public.knowledge_documents
   DROP CONSTRAINT IF EXISTS knowledge_documents_active_version_owner_fk,
@@ -395,11 +430,14 @@ BEGIN
     OR NEW.owner_id IS DISTINCT FROM OLD.owner_id
     OR NEW.knowledge_base_id IS DISTINCT FROM OLD.knowledge_base_id
     OR NEW.model IS DISTINCT FROM OLD.model
+    OR NEW.embedding_dimensions IS DISTINCT FROM OLD.embedding_dimensions
+    OR NEW.configuration_version IS DISTINCT FROM OLD.configuration_version
     OR NEW.configuration IS DISTINCT FROM OLD.configuration
     OR NEW.created_at IS DISTINCT FROM OLD.created_at
     OR NOT ((OLD.status = 'staging' AND NEW.status IN ('ready', 'failed'))
       OR (OLD.status = 'ready' AND NEW.status = 'published')
-      OR (OLD.status = 'published' AND NEW.status = 'retired')) THEN
+      OR (OLD.status = 'published' AND NEW.status = 'retained')
+      OR (OLD.status = 'retained' AND NEW.status = 'retired')) THEN
     RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
   END IF;
   RETURN NEW;
@@ -456,7 +494,8 @@ BEGIN
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
     'knowledge_sync_floors', 'knowledge_upload_authorizations',
     'knowledge_entitlements', 'knowledge_requests', 'knowledge_snapshots',
-    'knowledge_snapshot_items'
+    'knowledge_snapshot_items', 'knowledge_embedding_consents',
+    'knowledge_chunk_embeddings'
   ] LOOP
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', table_name);
     EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', table_name);
@@ -542,7 +581,10 @@ BEGIN
   ) VALUES (p_knowledge_base_id, owner, p_name, 'staging', p_revision);
   INSERT INTO public.knowledge_index_generations(
     id, owner_id, knowledge_base_id, status, configuration
-  ) VALUES (p_generation_id, owner, p_knowledge_base_id, 'staging', '{}'::jsonb);
+  ) VALUES (
+    p_generation_id, owner, p_knowledge_base_id, 'staging',
+    '{"distance":"cosine","normalization":"none","region":"guangzhou"}'::jsonb
+  );
   response := jsonb_build_object(
     'knowledgeBaseId', p_knowledge_base_id,
     'generationId', p_generation_id,
@@ -1056,9 +1098,30 @@ BEGIN
   ) THEN
     RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
   END IF;
-  UPDATE public.knowledge_index_generations SET status = 'retired'
+  IF EXISTS (
+    SELECT 1 FROM public.knowledge_embedding_consents consent
+    WHERE consent.owner_id = owner AND consent.state = 'granted'
+  ) AND EXISTS (
+    SELECT 1 FROM public.knowledge_chunks chunk
+    WHERE chunk.owner_id = owner AND chunk.knowledge_base_id = p_knowledge_base_id
+      AND NOT EXISTS (
+        SELECT 1 FROM public.knowledge_chunk_embeddings embedding
+        WHERE embedding.owner_id = chunk.owner_id
+          AND embedding.knowledge_base_id = chunk.knowledge_base_id
+          AND embedding.generation_id = p_generation_id
+          AND embedding.chunk_id = chunk.id
+      )
+  ) THEN
+    RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
+  END IF;
+  DELETE FROM public.knowledge_index_generations
+    WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id
+      AND status = 'retained';
+  UPDATE public.knowledge_index_generations SET status = 'retained',
+    retained_until = clock_timestamp() + interval '7 days'
     WHERE owner_id = owner AND knowledge_base_id = p_knowledge_base_id AND status = 'published';
-  UPDATE public.knowledge_index_generations SET status = 'published', published_at = clock_timestamp()
+  UPDATE public.knowledge_index_generations SET status = 'published', published_at = clock_timestamp(),
+    retained_until = NULL
     WHERE id = p_generation_id AND owner_id = owner
       AND knowledge_base_id = p_knowledge_base_id;
   UPDATE public.knowledge_bases SET published_generation_id = p_generation_id,
@@ -1608,6 +1671,517 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(
+  p_caller_user_id varchar, p_request_id varchar, p_knowledge_base_id varchar,
+  p_generation_id varchar, p_expected_published_generation_id varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  base public.knowledge_bases%ROWTYPE;
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  request_row public.knowledge_requests%ROWTYPE;
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'begin_embedding_drift_probe',
+    'knowledgeBaseId', p_knowledge_base_id, 'generationId', p_generation_id,
+    'expectedPublishedGenerationId', p_expected_published_generation_id
+  ));
+  job_id varchar := 'job_' || md5(p_request_id || ':embedding');
+  response jsonb;
+BEGIN
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id;
+  IF FOUND THEN
+    IF request_row.action <> 'begin_embedding_drift_probe'
+      OR request_row.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN request_row.response;
+  END IF;
+  SELECT * INTO base FROM public.knowledge_bases
+    WHERE owner_id = owner AND id = p_knowledge_base_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'NOT_FOUND', ERRCODE = 'P0001'; END IF;
+  IF base.published_generation_id IS DISTINCT FROM p_expected_published_generation_id THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner FOR SHARE;
+  IF NOT FOUND OR consent.state <> 'granted' THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO public.knowledge_index_generations(
+    id, owner_id, knowledge_base_id, status
+  ) VALUES (p_generation_id, owner, p_knowledge_base_id, 'staging');
+  INSERT INTO public.knowledge_jobs(
+    id, owner_id, knowledge_base_id, request_id, kind, entity_id, state
+  ) VALUES (
+    job_id, owner, p_knowledge_base_id, p_request_id,
+    'embedding', p_generation_id, 'queued'
+  );
+  response := jsonb_build_object(
+    'generationId', p_generation_id,
+    'previousGenerationId', base.published_generation_id,
+    'jobId', job_id, 'status', 'staging'
+  );
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (
+    owner, p_request_id, p_knowledge_base_id,
+    'begin_embedding_drift_probe', fingerprint, response
+  );
+  RETURN response;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_complete_embedding_generation(
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar,
+  p_owner_id bigint, p_knowledge_base_id varchar, p_generation_id varchar,
+  p_consent_epoch bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  job public.knowledge_jobs%ROWTYPE;
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  generation public.knowledge_index_generations%ROWTYPE;
+BEGIN
+  SELECT * INTO job FROM public.knowledge_jobs
+    WHERE owner_id = p_owner_id AND id = p_job_id
+      AND knowledge_base_id = p_knowledge_base_id
+      AND kind = 'embedding' AND entity_id = p_generation_id
+      AND state = 'running' AND worker_id = p_worker_id
+      AND lease_token = p_lease_token AND lease_expires_at > clock_timestamp()
+    FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = job.owner_id FOR SHARE;
+  IF NOT FOUND OR consent.state <> 'granted'
+    OR consent.consent_epoch <> p_consent_epoch THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO generation FROM public.knowledge_index_generations
+    WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id
+      AND id = job.entity_id AND status = 'staging' FOR UPDATE;
+  IF NOT FOUND OR EXISTS (
+    SELECT 1 FROM public.knowledge_chunks chunk
+    WHERE chunk.owner_id = job.owner_id
+      AND chunk.knowledge_base_id = job.knowledge_base_id
+      AND NOT EXISTS (
+        SELECT 1 FROM public.knowledge_chunk_embeddings embedding
+        WHERE embedding.owner_id = chunk.owner_id
+          AND embedding.knowledge_base_id = chunk.knowledge_base_id
+          AND embedding.generation_id = generation.id
+          AND embedding.chunk_id = chunk.id
+      )
+  ) THEN
+    RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
+  END IF;
+  UPDATE public.knowledge_index_generations
+    SET status = 'ready', ready_at = clock_timestamp()
+    WHERE owner_id = generation.owner_id
+      AND knowledge_base_id = generation.knowledge_base_id AND id = generation.id;
+  UPDATE public.knowledge_jobs SET state = 'completed', worker_id = NULL,
+    lease_token = NULL, lease_expires_at = NULL, error_code = NULL,
+    updated_at = clock_timestamp()
+    WHERE owner_id = job.owner_id AND id = job.id;
+  RETURN jsonb_build_object('ready', true);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_get_embedding_consent(
+  p_caller_user_id varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  consent public.knowledge_embedding_consents%ROWTYPE;
+BEGIN
+  INSERT INTO public.knowledge_embedding_consents(owner_id)
+    VALUES (owner) ON CONFLICT(owner_id) DO NOTHING;
+  SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner;
+  RETURN jsonb_build_object(
+    'state', consent.state, 'consentEpoch', consent.consent_epoch
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_set_embedding_consent(
+  p_caller_user_id varchar, p_request_id varchar, p_enabled boolean
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  request_row public.knowledge_requests%ROWTYPE;
+  fingerprint char(32) := public.autoforge_knowledge_request_hash(jsonb_build_object(
+    'action', 'set_embedding_consent', 'enabled', p_enabled
+  ));
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  vectors_deleted integer := 0;
+  response jsonb;
+BEGIN
+  IF p_request_id IS NULL OR btrim(p_request_id) = '' OR length(p_request_id) > 128
+    OR p_enabled IS NULL THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  IF p_enabled THEN PERFORM public.autoforge_knowledge_require_cloud(owner); END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id;
+  IF FOUND THEN
+    IF request_row.action <> 'set_embedding_consent'
+      OR request_row.input_hash <> fingerprint THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN request_row.response;
+  END IF;
+  INSERT INTO public.knowledge_embedding_consents(owner_id)
+    VALUES (owner) ON CONFLICT(owner_id) DO NOTHING;
+  SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner FOR UPDATE;
+  UPDATE public.knowledge_embedding_consents SET
+    state = CASE WHEN p_enabled THEN 'granted' ELSE 'revoked' END,
+    consent_epoch = consent_epoch + 1,
+    granted_at = CASE WHEN p_enabled THEN clock_timestamp() ELSE granted_at END,
+    revoked_at = CASE WHEN p_enabled THEN revoked_at ELSE clock_timestamp() END,
+    updated_at = clock_timestamp()
+    WHERE owner_id = owner
+    RETURNING * INTO consent;
+  IF NOT p_enabled THEN
+    DELETE FROM public.knowledge_chunk_embeddings WHERE owner_id = owner;
+    GET DIAGNOSTICS vectors_deleted = ROW_COUNT;
+  END IF;
+  response := jsonb_build_object(
+    'state', consent.state, 'consentEpoch', consent.consent_epoch,
+    'vectorsDeleted', vectors_deleted
+  );
+  INSERT INTO public.knowledge_requests(
+    owner_id, request_id, knowledge_base_id, action, input_hash, response
+  ) VALUES (
+    owner, p_request_id, NULL, 'set_embedding_consent', fingerprint, response
+  );
+  RETURN response;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_assert_embedding_consent(
+  p_owner_id bigint, p_consent_epoch bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE consent public.knowledge_embedding_consents%ROWTYPE;
+BEGIN
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = p_owner_id;
+  RETURN jsonb_build_object(
+    'enabled', FOUND AND consent.state = 'granted'
+      AND consent.consent_epoch = p_consent_epoch,
+    'consentEpoch', COALESCE(consent.consent_epoch, 0)
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_claim_embedding_batch(
+  p_worker_id varchar, p_job_id varchar, p_lease_token varchar, p_limit integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  job public.knowledge_jobs%ROWTYPE;
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  generation public.knowledge_index_generations%ROWTYPE;
+  chunks jsonb;
+BEGIN
+  IF p_worker_id IS NULL OR btrim(p_worker_id) = ''
+    OR p_job_id IS NULL OR btrim(p_job_id) = ''
+    OR p_lease_token IS NULL OR btrim(p_lease_token) = ''
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 24 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO job FROM public.knowledge_jobs
+    WHERE id = p_job_id AND kind = 'embedding' AND state = 'running'
+      AND worker_id = p_worker_id AND lease_token = p_lease_token
+      AND lease_expires_at > clock_timestamp();
+  IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = job.owner_id;
+  IF NOT FOUND OR consent.state <> 'granted' THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO generation FROM public.knowledge_index_generations
+    WHERE owner_id = job.owner_id AND knowledge_base_id = job.knowledge_base_id
+      AND id = job.entity_id AND status IN ('staging', 'ready');
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
+  END IF;
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', candidate.id, 'body', candidate.body
+  ) ORDER BY candidate.ordinal, candidate.id), '[]'::jsonb)
+  INTO chunks
+  FROM (
+    SELECT chunk.id, chunk.body, chunk.ordinal
+    FROM public.knowledge_chunks chunk
+    LEFT JOIN public.knowledge_chunk_embeddings embedding
+      ON embedding.owner_id = chunk.owner_id
+      AND embedding.knowledge_base_id = chunk.knowledge_base_id
+      AND embedding.generation_id = generation.id
+      AND embedding.chunk_id = chunk.id
+    WHERE chunk.owner_id = job.owner_id
+      AND chunk.knowledge_base_id = job.knowledge_base_id
+      AND embedding.chunk_id IS NULL
+    ORDER BY chunk.ordinal, chunk.id
+    LIMIT p_limit
+  ) candidate;
+  RETURN jsonb_build_object(
+    'ownerId', job.owner_id::text, 'knowledgeBaseId', job.knowledge_base_id,
+    'generationId', generation.id, 'consentEpoch', consent.consent_epoch,
+    'chunks', chunks
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_store_embedding(
+  p_owner_id bigint, p_knowledge_base_id varchar, p_generation_id varchar,
+  p_chunk_id varchar, p_consent_epoch bigint, p_model varchar,
+  p_dimensions integer, p_configuration_version varchar, p_vector real[]
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  generation public.knowledge_index_generations%ROWTYPE;
+BEGIN
+  IF p_model <> 'kinfra-text-embedding-0.6b' OR p_dimensions <> 1024
+    OR p_configuration_version <> 'autoforge-knowledge-embedding-v1'
+    OR cardinality(p_vector) <> 1024
+    OR EXISTS (SELECT 1 FROM unnest(p_vector) AS vector_values(value)
+      WHERE value::text IN ('NaN', 'Infinity', '-Infinity')) THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = p_owner_id FOR SHARE;
+  IF NOT FOUND OR consent.state <> 'granted'
+    OR consent.consent_epoch <> p_consent_epoch THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO generation FROM public.knowledge_index_generations
+    WHERE owner_id = p_owner_id AND knowledge_base_id = p_knowledge_base_id
+      AND id = p_generation_id FOR SHARE;
+  IF NOT FOUND OR generation.status NOT IN ('staging', 'ready')
+    OR generation.model <> p_model
+    OR generation.embedding_dimensions <> p_dimensions
+    OR generation.configuration_version <> p_configuration_version THEN
+    RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO public.knowledge_chunk_embeddings(
+    owner_id, knowledge_base_id, generation_id, chunk_id,
+    model, dimensions, configuration_version, embedding
+  ) VALUES (
+    p_owner_id, p_knowledge_base_id, p_generation_id, p_chunk_id,
+    p_model, p_dimensions, p_configuration_version, p_vector
+  ) ON CONFLICT(owner_id, knowledge_base_id, generation_id, chunk_id)
+    DO NOTHING;
+  RETURN jsonb_build_object('stored', true);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_search_keywords(
+  p_caller_user_id varchar, p_knowledge_base_ids varchar[], p_query varchar,
+  p_limit integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  candidates jsonb;
+  generations jsonb;
+  generation_count integer;
+BEGIN
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  IF p_knowledge_base_ids IS NULL OR cardinality(p_knowledge_base_ids) NOT BETWEEN 1 AND 8
+    OR p_query IS NULL OR btrim(p_query) = '' OR length(p_query) > 2000
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 24 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT count(*), COALESCE(jsonb_agg(jsonb_build_object(
+    'knowledgeBaseId', current_generation.knowledge_base_id,
+    'generationId', current_generation.id,
+    'previousGenerationId', previous_generation.id
+  ) ORDER BY current_generation.knowledge_base_id), '[]'::jsonb)
+  INTO generation_count, generations
+  FROM public.knowledge_index_generations current_generation
+  LEFT JOIN LATERAL (
+    SELECT retained.id FROM public.knowledge_index_generations retained
+    WHERE retained.owner_id = owner
+      AND retained.knowledge_base_id = current_generation.knowledge_base_id
+      AND retained.status = 'retained' AND retained.retained_until > clock_timestamp()
+    ORDER BY retained.published_at DESC, retained.id LIMIT 1
+  ) previous_generation ON true
+  WHERE current_generation.owner_id = owner
+    AND current_generation.knowledge_base_id = ANY(p_knowledge_base_ids)
+    AND current_generation.status = 'published';
+  IF generation_count <> cardinality(p_knowledge_base_ids) THEN
+    RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
+  END IF;
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', ranked.id, 'knowledgeBaseId', ranked.knowledge_base_id,
+    'documentId', ranked.document_id, 'versionId', ranked.version_id,
+    'generationId', ranked.generation_id, 'rank', ranked.rank,
+    'body', ranked.body, 'coordinates', ranked.coordinates
+  ) ORDER BY ranked.rank), '[]'::jsonb)
+  INTO candidates
+  FROM (
+    SELECT candidate.*, row_number() OVER (
+      ORDER BY candidate.literal_position, candidate.ordinal, candidate.id
+    )::integer AS rank
+    FROM (
+      SELECT chunk.id, chunk.knowledge_base_id, chunk.document_id,
+        chunk.version_id, chunk.body, chunk.coordinates, chunk.ordinal,
+        generation.id AS generation_id,
+        position(lower(p_query) in lower(chunk.body)) AS literal_position
+      FROM public.knowledge_chunks chunk
+      JOIN public.knowledge_index_generations generation
+        ON generation.owner_id = chunk.owner_id
+        AND generation.knowledge_base_id = chunk.knowledge_base_id
+        AND generation.status = 'published'
+      JOIN public.knowledge_versions version
+        ON version.owner_id = chunk.owner_id
+        AND version.knowledge_base_id = chunk.knowledge_base_id
+        AND version.id = chunk.version_id AND version.status = 'ready'
+      WHERE chunk.owner_id = owner
+        AND chunk.knowledge_base_id = ANY(p_knowledge_base_ids)
+        AND position(lower(p_query) in lower(chunk.body)) > 0
+      ORDER BY literal_position, chunk.ordinal, chunk.id
+      LIMIT p_limit
+    ) candidate
+  ) ranked;
+  RETURN jsonb_build_object(
+    'generations', generations,
+    'embedding', jsonb_build_object(
+      'model', 'kinfra-text-embedding-0.6b', 'dimensions', 1024,
+      'configurationVersion', 'autoforge-knowledge-embedding-v1', 'region', 'guangzhou'
+    ),
+    'driftProbeRequired', false,
+    'keywordCandidates', candidates
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_search_vectors(
+  p_caller_user_id varchar, p_knowledge_base_ids varchar[],
+  p_vector real[], p_model varchar, p_dimensions integer,
+  p_configuration_version varchar, p_limit integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  candidates jsonb;
+  generation_count integer;
+BEGIN
+  PERFORM public.autoforge_knowledge_require_cloud(owner);
+  IF p_knowledge_base_ids IS NULL OR cardinality(p_knowledge_base_ids) NOT BETWEEN 1 AND 8
+    OR p_model <> 'kinfra-text-embedding-0.6b' OR p_dimensions <> 1024
+    OR p_configuration_version <> 'autoforge-knowledge-embedding-v1'
+    OR cardinality(p_vector) <> 1024
+    OR EXISTS (SELECT 1 FROM unnest(p_vector) AS vector_values(value)
+      WHERE value::text IN ('NaN', 'Infinity', '-Infinity'))
+    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 24 THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner;
+  IF NOT FOUND OR consent.state <> 'granted' THEN
+    RAISE EXCEPTION USING MESSAGE = 'FORBIDDEN', ERRCODE = 'P0001';
+  END IF;
+  SELECT count(*) INTO generation_count FROM public.knowledge_index_generations
+    WHERE owner_id = owner AND knowledge_base_id = ANY(p_knowledge_base_ids)
+      AND status = 'published';
+  IF generation_count <> cardinality(p_knowledge_base_ids) THEN
+    RAISE EXCEPTION USING MESSAGE = 'GENERATION_NOT_READY', ERRCODE = 'P0001';
+  END IF;
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', ranked.id, 'knowledgeBaseId', ranked.knowledge_base_id,
+    'documentId', ranked.document_id, 'versionId', ranked.version_id,
+    'generationId', ranked.generation_id, 'rank', ranked.rank,
+    'body', ranked.body, 'coordinates', ranked.coordinates
+  ) ORDER BY ranked.rank), '[]'::jsonb)
+  INTO candidates
+  FROM (
+    SELECT candidate.*, row_number() OVER (
+      ORDER BY candidate.score DESC, candidate.id
+    )::integer AS rank
+    FROM (
+      SELECT chunk.id, chunk.knowledge_base_id, chunk.document_id,
+        chunk.version_id, chunk.body, chunk.coordinates,
+        generation.id AS generation_id,
+        (
+          SELECT sum(embedding.embedding[vector_index] * p_vector[vector_index])
+          FROM generate_subscripts(p_vector, 1) AS subscripts(vector_index)
+        ) / NULLIF(
+          sqrt((SELECT sum(
+              embedding.embedding[vector_index] * embedding.embedding[vector_index]
+            ) FROM generate_subscripts(p_vector, 1) AS subscripts(vector_index)))
+          * sqrt((SELECT sum(p_vector[vector_index] * p_vector[vector_index])
+            FROM generate_subscripts(p_vector, 1) AS subscripts(vector_index))),
+          0
+        ) AS score
+      FROM public.knowledge_chunk_embeddings embedding
+      JOIN public.knowledge_index_generations generation
+        ON generation.owner_id = embedding.owner_id
+        AND generation.knowledge_base_id = embedding.knowledge_base_id
+        AND generation.id = embedding.generation_id
+        AND generation.status = 'published'
+      JOIN public.knowledge_chunks chunk
+        ON chunk.owner_id = embedding.owner_id
+        AND chunk.knowledge_base_id = embedding.knowledge_base_id
+        AND chunk.id = embedding.chunk_id
+      WHERE embedding.owner_id = owner
+        AND embedding.knowledge_base_id = ANY(p_knowledge_base_ids)
+        AND embedding.model = p_model AND embedding.dimensions = p_dimensions
+        AND embedding.configuration_version = p_configuration_version
+      ORDER BY score DESC NULLS LAST, chunk.id
+      LIMIT p_limit
+    ) candidate
+    WHERE candidate.score IS NOT NULL
+  ) ranked;
+  RETURN jsonb_build_object('vectorCandidates', candidates);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_cleanup_retention(
   p_worker_id varchar, p_limit integer, p_snapshot_limit integer
 )
@@ -1620,6 +2194,7 @@ DECLARE
   pruned_changes integer := 0;
   pruned_tombstones integer := 0;
   pruned_snapshots integer := 0;
+  pruned_generations integer := 0;
 BEGIN
   IF p_worker_id IS NULL OR btrim(p_worker_id) = '' OR length(p_worker_id) > 128
     OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000
@@ -1639,6 +2214,21 @@ BEGIN
       AND snapshot.id = candidate.id
       AND snapshot.expires_at <= clock_timestamp();
   GET DIAGNOSTICS pruned_snapshots = ROW_COUNT;
+  WITH candidates AS (
+    SELECT generation.owner_id, generation.knowledge_base_id, generation.id
+    FROM public.knowledge_index_generations generation
+    WHERE generation.status = 'retained'
+      AND generation.retained_until <= clock_timestamp()
+    ORDER BY generation.retained_until, generation.owner_id, generation.id
+    FOR UPDATE SKIP LOCKED LIMIT p_limit
+  )
+  DELETE FROM public.knowledge_index_generations generation USING candidates candidate
+    WHERE generation.owner_id = candidate.owner_id
+      AND generation.knowledge_base_id = candidate.knowledge_base_id
+      AND generation.id = candidate.id
+      AND generation.status = 'retained'
+      AND generation.retained_until <= clock_timestamp();
+  GET DIAGNOSTICS pruned_generations = ROW_COUNT;
   DELETE FROM public.knowledge_tombstones WHERE id IN (
     SELECT id FROM public.knowledge_tombstones
     WHERE expires_at <= clock_timestamp() ORDER BY expires_at LIMIT p_limit
@@ -1675,7 +2265,7 @@ BEGIN
   GET DIAGNOSTICS pruned_changes = ROW_COUNT;
   RETURN jsonb_build_object(
     'prunedChanges', pruned_changes, 'prunedTombstones', pruned_tombstones,
-    'prunedSnapshots', pruned_snapshots
+    'prunedSnapshots', pruned_snapshots, 'prunedGenerations', pruned_generations
   );
 END;
 $$;
@@ -1706,6 +2296,15 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) FROM 
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_keywords(varchar, varchar[], varchar, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_vectors(varchar, varchar[], real[], varchar, integer, varchar, integer) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) FROM PUBLIC, anon, authenticated;
 
 DO $grants$
@@ -1718,7 +2317,8 @@ BEGIN
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
     'knowledge_sync_floors', 'knowledge_upload_authorizations',
     'knowledge_entitlements', 'knowledge_requests', 'knowledge_snapshots',
-    'knowledge_snapshot_items'
+    'knowledge_snapshot_items', 'knowledge_embedding_consents',
+    'knowledge_chunk_embeddings'
   ] LOOP
     EXECUTE format('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon, authenticated', table_name);
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO service_role', table_name);
@@ -1748,6 +2348,15 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_entitlement(varchar) TO
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_job(varchar, varchar, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_search_keywords(varchar, varchar[], varchar, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_search_vectors(varchar, varchar[], real[], varchar, integer, varchar, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) TO service_role;
 
 COMMIT;

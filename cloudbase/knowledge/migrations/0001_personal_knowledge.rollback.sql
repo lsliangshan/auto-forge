@@ -3,6 +3,15 @@ BEGIN;
 -- Disable the executable surface first. Owner-scoped tables, rows, RLS policies,
 -- composite foreign keys, and immutable lifecycle guards are deliberately retained.
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_request_hash(jsonb) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_keywords(varchar, varchar[], varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_search_vectors(varchar, varchar[], real[], varchar, integer, varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cleanup_retention(varchar, integer, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
@@ -24,6 +33,15 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_verify_upload(varchar, varchar
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_upload(varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_sync(varchar, varchar, varchar, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_embedding_drift_probe(varchar, varchar, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_embedding_consent(varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_assert_embedding_consent(bigint, bigint);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_search_keywords(varchar, varchar[], varchar, integer);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_search_vectors(varchar, varchar[], real[], varchar, integer, varchar, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cleanup_retention(varchar, integer, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_cancel_claimed_job(varchar, varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_job(varchar, varchar, varchar, varchar, varchar);
@@ -58,7 +76,8 @@ BEGIN
     'knowledge_changes', 'knowledge_tombstones', 'knowledge_conflicts',
     'knowledge_sync_floors', 'knowledge_upload_authorizations',
     'knowledge_entitlements', 'knowledge_requests', 'knowledge_snapshots',
-    'knowledge_snapshot_items'
+    'knowledge_snapshot_items', 'knowledge_embedding_consents',
+    'knowledge_chunk_embeddings'
   ] LOOP
     EXECUTE format('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon, authenticated, service_role', table_name);
   END LOOP;

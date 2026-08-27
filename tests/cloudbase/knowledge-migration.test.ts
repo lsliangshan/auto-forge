@@ -34,6 +34,8 @@ const tables = [
   'knowledge_requests',
   'knowledge_snapshots',
   'knowledge_snapshot_items',
+  'knowledge_embedding_consents',
+  'knowledge_chunk_embeddings',
 ] as const
 
 function staticFunctionBodyFragment(sql: string, name: string): string {
@@ -135,6 +137,54 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain("p_error_code = 'TRANSIENT_FAILURE'")
     expect(sql).toContain('attempt >= 3')
     expect(sql).toContain('kill_switch_enabled boolean NOT NULL DEFAULT true')
+  })
+
+  it('defines fixed consented embeddings, shadow isolation, atomic publication, and seven-day retention', async () => {
+    const sql = await readFile(canonicalUrl, 'utf8')
+    expect(sql).toContain("model varchar(128) NOT NULL DEFAULT 'kinfra-text-embedding-0.6b'")
+    expect(sql).toContain('embedding_dimensions smallint NOT NULL DEFAULT 1024')
+    expect(sql).toContain("configuration_version varchar(128) NOT NULL DEFAULT 'autoforge-knowledge-embedding-v1'")
+    expect(sql).toContain('"region":"guangzhou"')
+    expect(sql).toContain('cardinality(embedding) = 1024')
+    expect(sql).not.toMatch(/\bUSING\s+hnsw\b/i)
+
+    const revoke = staticFunctionBodyFragment(sql, 'autoforge_knowledge_set_embedding_consent')
+    expect(revoke).toContain('owner bigint := public.autoforge_knowledge_caller(p_caller_user_id)')
+    expect(revoke).toContain('consent_epoch = consent_epoch + 1')
+    expect(revoke).toContain('DELETE FROM public.knowledge_chunk_embeddings')
+    expect(revoke).toContain('WHERE owner_id = owner')
+
+    const store = staticFunctionBodyFragment(sql, 'autoforge_knowledge_store_embedding')
+    expect(store).toContain("consent.state <> 'granted'")
+    expect(store).toContain('consent.consent_epoch <> p_consent_epoch')
+    expect(store).toContain('cardinality(p_vector) <> 1024')
+    expect(store).toContain("generation.status NOT IN ('staging', 'ready')")
+
+    const keyword = staticFunctionBodyFragment(sql, 'autoforge_knowledge_search_keywords')
+    expect(keyword).toContain("generation.status = 'published'")
+    const vectors = staticFunctionBodyFragment(sql, 'autoforge_knowledge_search_vectors')
+    expect(vectors).toContain("generation.status = 'published'")
+    expect(vectors).toContain('cardinality(p_vector) <> 1024')
+    expect(vectors).toContain('row_number() OVER')
+    expect(vectors).toContain('candidate.id')
+
+    const publish = staticFunctionBodyFragment(sql, 'autoforge_knowledge_publish_generation')
+    expect(publish).toContain("consent.owner_id = owner AND consent.state = 'granted'")
+    expect(publish).toContain('embedding.generation_id = p_generation_id')
+    expect(publish).toContain("AND status = 'retained';")
+    expect(publish).toContain("status = 'retained'")
+    expect(publish).toContain("retained_until = clock_timestamp() + interval '7 days'")
+    expect(publish).toContain("status = 'published', published_at = clock_timestamp()")
+
+    const probe = staticFunctionBodyFragment(sql, 'autoforge_knowledge_begin_embedding_drift_probe')
+    expect(probe).toContain("'begin_embedding_drift_probe'")
+    expect(probe).toContain("'embedding', p_generation_id, 'queued'")
+    expect(probe).toContain("p_generation_id, owner, p_knowledge_base_id, 'staging'")
+    const complete = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_complete_embedding_generation',
+    )
+    expect(complete).toContain("AND id = job.entity_id AND status = 'staging'")
+    expect(complete).toContain("SET status = 'ready', ready_at = clock_timestamp()")
   })
 
   it('statically binds conflict receipts and independently models lost-response replay', async () => {
