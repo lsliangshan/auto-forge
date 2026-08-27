@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v7', () => {
+describe('knowledge schema v8', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(7)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(8)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -60,6 +60,9 @@ describe('knowledge schema v7', () => {
       FROM documents LIMIT 0
     `).all()).toEqual([])
     expect(database.prepare('SELECT name, mime_type FROM document_versions LIMIT 0').all()).toEqual([])
+    expect(database.prepare(
+      'SELECT accepted_key_generation FROM knowledge_entitlement_projection LIMIT 0',
+    ).all()).toEqual([])
   })
 
   it('backfills immutable version metadata when upgrading a v2 database', () => {

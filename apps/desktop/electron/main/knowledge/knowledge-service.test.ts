@@ -9,11 +9,36 @@ import { createLocalKnowledgeService } from './knowledge-service.js'
 import { canonicalizeEntitlementPayload, KnowledgeEntitlementVerifier } from './entitlement-verifier.js'
 import type { KnowledgeParserPort } from './import-job-runner.js'
 import { memoryKnowledgeStore, parsedText } from './knowledge-test-support.js'
+import type { CloudKnowledgeRemote } from './sync-service.js'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise })
   return { promise, resolve }
+}
+
+function cloudRemote(): CloudKnowledgeRemote {
+  return {
+    beginSync: vi.fn().mockResolvedValue({
+      knowledgeBaseId: 'unused', generationId: 'unused', status: 'staging',
+    }),
+    pushMutation: vi.fn().mockResolvedValue({
+      mutationId: 'unused', status: 'applied', sequence: 1, revision: 'unused',
+    }),
+    pullChanges: vi.fn().mockResolvedValue({
+      kind: 'incremental', nextSequence: 0, hasMore: false, changes: [],
+    }),
+    fullResync: vi.fn().mockResolvedValue({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+    publishGeneration: vi.fn().mockResolvedValue({
+      generationId: 'unused', previousGenerationId: null, sequence: 1,
+    }),
+    deleteKnowledgeBase: vi.fn().mockResolvedValue({ deletionJobId: 'unused' }),
+    getJob: vi.fn().mockResolvedValue({
+      jobId: 'unused', state: 'completed', errorCode: null,
+    }),
+    cancelJob: vi.fn().mockResolvedValue(undefined),
+    cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
+  }
 }
 
 describe('local knowledge service', () => {
@@ -126,8 +151,12 @@ describe('local knowledge service', () => {
     const memory = memoryKnowledgeStore()
     const keys = generateKeyPairSync('ed25519')
     let observedAt = Date.parse('2026-08-28T00:00:00.000Z')
+    let killSwitchEnabled = false
     const verifier = new KnowledgeEntitlementVerifier({
-      publicKeys: { primary: keys.publicKey }, now: () => observedAt,
+      publicKeys: {
+        primary: { publicKey: keys.publicKey, generation: 1, status: 'active' },
+      },
+      now: () => observedAt,
     })
     const signed = (issuedAt: string, expiresAt: string) => {
       const canonical = canonicalizeEntitlementPayload({
@@ -151,21 +180,42 @@ describe('local knowledge service', () => {
       verifyEntitlement: (ownerId, snapshot, effectiveNow) => (
         verifier.verify(ownerId, snapshot, effectiveNow)
       ),
+      cloudKillSwitchEnabled: () => killSwitchEnabled,
     })
 
     const first = createService()
+    first.configureCloudRemote!(cloudRemote())
+    await expect(first.getAvailability({ userId: 'alice' }))
+      .rejects.toMatchObject({ code: 'AUTH_REQUIRED' })
     await first.bind('alice')
     await first.refreshEntitlement!('alice', firstSigned, true)
     await expect(first.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({ tier: 'member' })
+    await expect(first.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      cloudbase: { available: true },
+      entitlement: { available: true },
+      beta: { available: true },
+      cloud: { available: true },
+    })
     first.invalidate()
     await first.drain()
 
     const restarted = createService()
+    restarted.configureCloudRemote!(cloudRemote())
     await restarted.bind('alice')
     await restarted.refreshEntitlement!('alice', undefined, false)
     await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
       tier: 'member', status: 'active',
     })
+    await expect(restarted.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      entitlement: { available: true }, beta: { available: true }, cloud: { available: true },
+    })
+    killSwitchEnabled = true
+    await expect(restarted.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      cloudbase: { available: true },
+      entitlement: { available: true }, beta: { available: true },
+      cloud: { available: false },
+    })
+    killSwitchEnabled = false
     await restarted.refreshEntitlement!('alice', laterSigned, true)
     await expect(restarted.refreshEntitlement!('alice', firstSigned, true))
       .rejects.toMatchObject({ code: 'FORBIDDEN' })
@@ -173,6 +223,9 @@ describe('local knowledge service', () => {
     observedAt = Date.parse('2026-09-02T00:00:00.000Z') + 1
     await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
       tier: 'free', status: 'expired',
+    })
+    await expect(restarted.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      entitlement: { available: false }, beta: { available: false }, cloud: { available: false },
     })
     observedAt = Date.parse('2026-08-29T00:00:00.000Z')
     await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
@@ -183,8 +236,168 @@ describe('local knowledge service', () => {
     await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
       tier: 'free', status: 'active', cloudEnabled: false,
     })
+    await expect(restarted.getAvailability({ userId: 'alice' })).resolves.toMatchObject({
+      entitlement: { available: false }, beta: { available: false }, cloud: { available: false },
+    })
     await expect(restarted.refreshEntitlement!('alice', laterSigned, true))
       .rejects.toMatchObject({ code: 'FORBIDDEN' })
+  })
+
+  it('rejects entitlement key-generation rollback and same-generation key replacement across restart', async () => {
+    const memory = memoryKnowledgeStore()
+    const oldKey = generateKeyPairSync('ed25519')
+    const currentKey = generateKeyPairSync('ed25519')
+    const replacementKey = generateKeyPairSync('ed25519')
+    const observedAt = Date.parse('2026-08-28T12:00:00.000Z')
+    const rotationVerifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        old: {
+          publicKey: oldKey.publicKey,
+          generation: 1,
+          status: 'retired',
+          retiredAt: '2026-08-28T12:00:00.000Z',
+        },
+        current: { publicKey: currentKey.publicKey, generation: 2, status: 'active' },
+      },
+      now: () => observedAt,
+    })
+    const replacementVerifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        replacement: { publicKey: replacementKey.publicKey, generation: 2, status: 'active' },
+      },
+      now: () => observedAt,
+    })
+    let verifier = rotationVerifier
+    const signed = (
+      keyId: 'old' | 'current' | 'replacement',
+      issuedAt: string,
+      privateKey: typeof oldKey.privateKey,
+    ) => {
+      const canonical = canonicalizeEntitlementPayload({
+        userId: 'alice',
+        entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
+        issuedAt,
+        expiresAt: '2026-08-30T00:00:00.000Z',
+        keyId,
+      })
+      return {
+        payload: Buffer.from(canonical).toString('base64url'),
+        signature: sign(null, Buffer.from(canonical), privateKey).toString('base64url'),
+      }
+    }
+    const createService = () => createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      now: () => observedAt,
+      verifyEntitlement: (ownerId, snapshot, effectiveNow) => (
+        verifier.verify(ownerId, snapshot, effectiveNow)
+      ),
+    })
+
+    const first = createService()
+    await first.bind('alice')
+    await first.refreshEntitlement!('alice', signed(
+      'old', '2026-08-28T00:00:00.000Z', oldKey.privateKey,
+    ), true)
+    await first.refreshEntitlement!('alice', signed(
+      'current', '2026-08-28T06:00:00.000Z', currentKey.privateKey,
+    ), true)
+    await expect(first.refreshEntitlement!('alice', signed(
+      'old', '2026-08-28T12:00:00.000Z', oldKey.privateKey,
+    ), true)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    first.invalidate()
+    await first.drain()
+
+    const restarted = createService()
+    await restarted.bind('alice')
+    await expect(restarted.refreshEntitlement!('alice', signed(
+      'old', '2026-08-28T12:00:00.000Z', oldKey.privateKey,
+    ), true)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    verifier = replacementVerifier
+    await expect(restarted.refreshEntitlement!('alice', signed(
+      'replacement', '2026-08-28T11:00:00.000Z', replacementKey.privateKey,
+    ), true)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+  })
+
+  it('starts explicit-free cloud retention at the confirmed refresh boundary without extending it', async () => {
+    const memory = memoryKnowledgeStore()
+    const keys = generateKeyPairSync('ed25519')
+    let observedAt = Date.parse('2026-08-28T00:00:00.000Z')
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        primary: { publicKey: keys.publicKey, generation: 1, status: 'active' },
+      },
+      now: () => observedAt,
+    })
+    const canonical = canonicalizeEntitlementPayload({
+      userId: 'alice',
+      entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      expiresAt: '2026-09-10T00:00:00.000Z',
+      keyId: 'primary',
+    })
+    const member = {
+      payload: Buffer.from(canonical).toString('base64url'),
+      signature: sign(null, Buffer.from(canonical), keys.privateKey).toString('base64url'),
+    }
+    const createService = () => createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      now: () => observedAt,
+      verifyEntitlement: (ownerId, snapshot, effectiveNow) => (
+        verifier.verify(ownerId, snapshot, effectiveNow)
+      ),
+    })
+    const owner = { userId: 'alice' }
+    const first = createService()
+    await first.bind(owner.userId)
+    await first.refreshEntitlement!(owner.userId, member, true)
+    const base = await first.create(owner, '曾同步资料')
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(knowledge_base_id, mode, published_generation_id, epoch, updated_at)
+      VALUES (?, 'synced', 'generation_1', 1, ?)
+    `).run(base.id, observedAt)
+
+    const confirmedFreeAt = Date.parse('2026-09-01T08:30:00.000Z')
+    observedAt = confirmedFreeAt
+    await first.refreshEntitlement!(owner.userId, undefined, true)
+    const firstRetention = memory.database.prepare(`
+      SELECT download_until AS downloadUntil, recycle_until AS recycleUntil,
+        operation_id AS operationId, request_id AS requestId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id)
+    expect(firstRetention).toEqual({
+      downloadUntil: confirmedFreeAt + (30 * 24 * 60 * 60 * 1_000),
+      recycleUntil: confirmedFreeAt + (60 * 24 * 60 * 60 * 1_000),
+      operationId: expect.any(String), requestId: expect.any(String),
+    })
+
+    observedAt += 24 * 60 * 60 * 1_000
+    await first.refreshEntitlement!(owner.userId, undefined, true)
+    expect(memory.database.prepare(`
+      SELECT download_until AS downloadUntil, recycle_until AS recycleUntil,
+        operation_id AS operationId, request_id AS requestId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual(firstRetention)
+    first.invalidate()
+    await first.drain()
+
+    const restarted = createService()
+    await restarted.bind(owner.userId)
+    await expect(restarted.getEntitlement(owner)).resolves.toMatchObject({
+      tier: 'free', status: 'active', cloudEnabled: false,
+    })
+    expect(memory.database.prepare(`
+      SELECT download_until AS downloadUntil, recycle_until AS recycleUntil,
+        operation_id AS operationId, request_id AS requestId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual(firstRetention)
   })
 
   it('anchors durable cloud degradation to the signed grace boundary while local data remains available', async () => {

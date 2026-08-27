@@ -1492,7 +1492,9 @@ describe('createApplicationRuntime', () => {
       signature: sign(null, Buffer.from(canonical), keys.privateKey).toString('base64url'),
     }
     const verifier = new KnowledgeEntitlementVerifier({
-      publicKeys: { primary: keys.publicKey },
+      publicKeys: {
+        primary: { publicKey: keys.publicKey, generation: 1, status: 'active' },
+      },
       now: () => Date.parse('2026-08-28T00:00:00.000Z'),
     })
     const knowledgeService = createLocalKnowledgeService({

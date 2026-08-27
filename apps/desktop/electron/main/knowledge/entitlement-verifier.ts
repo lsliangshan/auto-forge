@@ -7,9 +7,13 @@ const base64url = /^[A-Za-z0-9_-]+$/
 
 /** Public verification material only; the signing key remains outside the desktop bundle. */
 export const AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS = Object.freeze({
-  'knowledge-2026-01': `-----BEGIN PUBLIC KEY-----
+  'knowledge-2026-01': Object.freeze({
+    publicKey: `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEALldb4naB63qosvMo+P8W6Jyh7fia+uzNRFjSr2OlG9E=
 -----END PUBLIC KEY-----`,
+    generation: 1,
+    status: 'active' as const,
+  }),
 })
 
 export const knowledgeEntitlementNames = [
@@ -55,7 +59,20 @@ export interface VerifiedKnowledgeEntitlement {
   readonly expiresAt: string
   readonly graceEndsAt: string
   readonly keyId: string
+  readonly keyGeneration: number
 }
+
+export type KnowledgeEntitlementVerificationKey = Readonly<{
+  publicKey: KeyLike
+  generation: number
+  status: 'active'
+  retiredAt?: never
+} | {
+  publicKey: KeyLike
+  generation: number
+  status: 'retired'
+  retiredAt: string
+}>
 
 export function canonicalizeEntitlementPayload(input: {
   readonly userId: string
@@ -79,19 +96,45 @@ function fail(code: 'INVALID_INPUT' | 'FORBIDDEN'): never {
 }
 
 export class KnowledgeEntitlementVerifier {
-  private readonly publicKeys: ReadonlyMap<string, KeyObject>
+  private readonly publicKeys: ReadonlyMap<string, {
+    publicKey: KeyObject
+    generation: number
+    retiredAt?: number
+  }>
   private readonly now: () => number
 
   constructor(input: {
-    publicKeys: Readonly<Record<string, KeyLike>>
+    publicKeys: Readonly<Record<string, KnowledgeEntitlementVerificationKey>>
     now?: () => number
   }) {
-    this.publicKeys = new Map(Object.entries(input.publicKeys).map(([keyId, key]) => {
-      const publicKey = key instanceof KeyObject ? key : createPublicKey(key)
+    const configured = Object.entries(input.publicKeys)
+    const active = configured.filter(([, key]) => key.status === 'active')
+    if (active.length !== 1) {
+      throw new TypeError('Knowledge entitlement verification requires exactly one active key')
+    }
+    const activeGeneration = active[0]![1].generation
+    this.publicKeys = new Map(configured.map(([keyId, key]) => {
+      if (!Number.isSafeInteger(key.generation) || key.generation <= 0) {
+        throw new TypeError('Knowledge entitlement verification key generations must be positive integers')
+      }
+      if (key.status === 'retired' && key.generation >= activeGeneration) {
+        throw new TypeError('Retired knowledge entitlement keys must precede the active generation')
+      }
+      let retiredAt: number | undefined
+      if (key.status === 'retired') {
+        retiredAt = Date.parse(key.retiredAt)
+        if (!Number.isSafeInteger(retiredAt)
+          || new Date(retiredAt).toISOString() !== key.retiredAt) {
+          throw new TypeError('Retired knowledge entitlement keys require a canonical transition boundary')
+        }
+      }
+      const publicKey = key.publicKey instanceof KeyObject
+        ? key.publicKey
+        : createPublicKey(key.publicKey)
       if (publicKey.type !== 'public' || publicKey.asymmetricKeyType !== 'ed25519') {
         throw new TypeError('Knowledge entitlement verification keys must be Ed25519 public keys')
       }
-      return [keyId, publicKey]
+      return [keyId, { publicKey, generation: key.generation, retiredAt }]
     }))
     this.now = input.now ?? Date.now
   }
@@ -118,12 +161,14 @@ export class KnowledgeEntitlementVerifier {
     if (!parsed.success) fail('INVALID_INPUT')
     const canonical = canonicalizeEntitlementPayload(parsed.data)
     if (!payloadBytes.equals(Buffer.from(canonical, 'utf8'))) fail('INVALID_INPUT')
-    const publicKey = this.publicKeys.get(parsed.data.keyId)
-    if (!publicKey || !verify(null, payloadBytes, publicKey, signature)) fail('FORBIDDEN')
+    const configuredKey = this.publicKeys.get(parsed.data.keyId)
+    if (!configuredKey
+      || !verify(null, payloadBytes, configuredKey.publicKey, signature)) fail('FORBIDDEN')
     if (parsed.data.userId !== ownerId) fail('FORBIDDEN')
     const now = observedAt
     const issuedAt = Date.parse(parsed.data.issuedAt)
     if (issuedAt > now) fail('FORBIDDEN')
+    if (configuredKey.retiredAt !== undefined && issuedAt > configuredKey.retiredAt) fail('FORBIDDEN')
     const expiresAt = Date.parse(parsed.data.expiresAt)
     const graceEndsAt = expiresAt + GRACE_MS
     const status = now <= expiresAt ? 'active' : now <= graceEndsAt ? 'offline_grace' : 'expired'
@@ -141,6 +186,7 @@ export class KnowledgeEntitlementVerifier {
       expiresAt: parsed.data.expiresAt,
       graceEndsAt: new Date(graceEndsAt).toISOString(),
       keyId: parsed.data.keyId,
+      keyGeneration: configuredKey.generation,
     })
   }
 }

@@ -162,6 +162,19 @@ describe('KnowledgeSyncService', () => {
     expect(service.getState('kb_1')).toEqual({ mode: 'local_only', publishedGenerationId: null })
   })
 
+  it('permits a user-requested immediate purge during the download window while cloud is off', async () => {
+    const { remote, service } = fixture()
+    service.beginCloudRetention('kb_1', 500)
+    service.setCloudAccess(false)
+
+    await expect(service.purgeCloudImmediately('kb_1')).resolves.toBeUndefined()
+    expect(remote.deleteKnowledgeBase).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBaseId: 'kb_1', requestId: expect.any(String),
+    }))
+    expect(service.getCloudRetention('kb_1')).toBeUndefined()
+    expect(service.getState('kb_1')).toEqual({ mode: 'local_only', publishedGenerationId: null })
+  })
+
   it('durably queues offline mutations without calling CloudBase', async () => {
     const { database, remote, service } = fixture({}, false)
     service.enqueue({

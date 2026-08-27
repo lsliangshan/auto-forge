@@ -26,7 +26,9 @@ function fixture() {
     }
   }
   const verifier = (now = NOW) => new KnowledgeEntitlementVerifier({
-    publicKeys: { primary: key.publicKey },
+    publicKeys: {
+      primary: { publicKey: key.publicKey, generation: 1, status: 'active' },
+    },
     now: () => now,
   })
   return { key, other, payload, envelope, verifier }
@@ -37,7 +39,52 @@ describe('KnowledgeEntitlementVerifier', () => {
     const { envelope, verifier } = fixture()
     expect(verifier().verify('alice', envelope())).toMatchObject({
       tier: 'member', status: 'active', localEnabled: true, betaEnabled: true, cloudEnabled: true,
+      keyGeneration: 1,
     })
+  })
+
+  it('enforces active-to-retired key transitions and returns the monotonic key generation', () => {
+    const oldKey = generateKeyPairSync('ed25519')
+    const newKey = generateKeyPairSync('ed25519')
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        old: {
+          publicKey: oldKey.publicKey,
+          generation: 1,
+          status: 'retired',
+          retiredAt: '2026-08-27T12:00:00.000Z',
+        },
+        current: { publicKey: newKey.publicKey, generation: 2, status: 'active' },
+      },
+      now: () => NOW,
+    })
+    const signed = (
+      keyId: 'old' | 'current',
+      issuedAt: string,
+      privateKey: typeof oldKey.privateKey,
+    ) => {
+      const canonical = canonicalizeEntitlementPayload({
+        userId: 'alice',
+        entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
+        issuedAt,
+        expiresAt: '2026-08-29T00:00:00.000Z',
+        keyId,
+      })
+      return {
+        payload: Buffer.from(canonical).toString('base64url'),
+        signature: sign(null, Buffer.from(canonical), privateKey).toString('base64url'),
+      }
+    }
+
+    expect(verifier.verify('alice', signed(
+      'old', '2026-08-27T12:00:00.000Z', oldKey.privateKey,
+    ))).toMatchObject({ keyId: 'old', keyGeneration: 1 })
+    expect(() => verifier.verify('alice', signed(
+      'old', '2026-08-27T12:00:00.001Z', oldKey.privateKey,
+    ))).toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }))
+    expect(verifier.verify('alice', signed(
+      'current', '2026-08-28T00:00:00.000Z', newKey.privateKey,
+    ))).toMatchObject({ keyId: 'current', keyGeneration: 2 })
   })
 
   it('rejects tampering, wrong owners, unknown keys, and future issuance', () => {
@@ -111,7 +158,11 @@ describe('KnowledgeEntitlementVerifier', () => {
     })).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }))
 
     const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 })
-    expect(() => new KnowledgeEntitlementVerifier({ publicKeys: { primary: rsa.publicKey } }))
+    expect(() => new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        primary: { publicKey: rsa.publicKey, generation: 1, status: 'active' },
+      },
+    }))
       .toThrowError()
   })
 })

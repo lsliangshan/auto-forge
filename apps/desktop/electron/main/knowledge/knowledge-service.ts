@@ -61,7 +61,7 @@ export interface LocalKnowledgeServiceDependencies {
     ownerId: string,
     snapshot: SignedKnowledgeEntitlementSnapshot,
     observedAt: number,
-  ): KnowledgeEntitlementState & { issuedAt?: string; keyId?: string }
+  ): KnowledgeEntitlementState & { issuedAt?: string; keyId?: string; keyGeneration?: number }
   cloudKillSwitchEnabled?(): boolean
   emit?(event: KnowledgeEvent): void
   now?(): number
@@ -131,6 +131,7 @@ interface EntitlementProjectionRow {
   epoch: number
   acceptedIssuedAt: number | null
   acceptedKeyId: string | null
+  acceptedKeyGeneration: number
   acceptedSnapshotDigest: string | null
   verified: number
   explicitFree: number
@@ -306,6 +307,38 @@ export function createLocalKnowledgeService(
     })
   }
 
+  const beginDurableCloudRetention = (active: Binding, boundaryAt: number): void => {
+    const database = active.store.database
+    const rows = database.prepare(`
+      SELECT knowledge_base_id AS knowledgeBaseId FROM cloud_sync_states
+      WHERE mode <> 'local_only'
+      UNION SELECT knowledge_base_id AS knowledgeBaseId FROM knowledge_cloud_retention
+    `).all() as Array<{ knowledgeBaseId: string }>
+    for (const row of rows) {
+      const operationId = id()
+      const generatedRequestId = id()
+      const requestId = generatedRequestId === operationId
+        ? `retention:${operationId}`.slice(0, 128)
+        : generatedRequestId
+      database.prepare(`
+        INSERT INTO knowledge_cloud_retention(
+          knowledge_base_id, stage, download_until, recycle_until, operation_id,
+          request_id, deletion_job_id, epoch, updated_at
+        ) VALUES (?, 'download_window', ?, ?, ?, ?, NULL, 1, ?)
+        ON CONFLICT(knowledge_base_id) DO NOTHING
+      `).run(
+        row.knowledgeBaseId,
+        boundaryAt + (30 * 24 * 60 * 60 * 1_000),
+        boundaryAt + (60 * 24 * 60 * 60 * 1_000),
+        operationId, requestId, boundaryAt,
+      )
+    }
+    database.prepare(`
+      UPDATE cloud_sync_states SET mode = CASE WHEN mode = 'converting' THEN mode ELSE 'paused' END,
+        epoch = epoch + 1, updated_at = ? WHERE mode <> 'local_only' AND mode <> 'paused'
+    `).run(boundaryAt)
+  }
+
   const reconcileCloud = (active: Binding, state: KnowledgeEntitlementState): void => {
     const allowed = cloudRemote !== undefined
       && state.cloudEnabled
@@ -313,16 +346,19 @@ export function createLocalKnowledgeService(
       && state.status !== 'expired'
       && dependencies.cloudKillSwitchEnabled?.() === false
     active.cloud.setCloudAccess(allowed)
-    if (state.status !== 'expired') return
-    const boundaryAt = state.graceEndsAt ? Date.parse(state.graceEndsAt) : NaN
+    const projection = active.store.database.prepare(`
+      SELECT explicit_free AS explicitFree, accepted_issued_at AS acceptedIssuedAt
+      FROM knowledge_entitlement_projection WHERE singleton = 1
+    `).get() as { explicitFree: number; acceptedIssuedAt: number | null } | undefined
+    const boundaryAt = state.status === 'expired'
+      ? state.graceEndsAt ? Date.parse(state.graceEndsAt) : NaN
+      : projection?.explicitFree === 1 ? projection.acceptedIssuedAt ?? NaN : NaN
     if (!Number.isSafeInteger(boundaryAt) || boundaryAt < 0) return
+    beginDurableCloudRetention(active, boundaryAt)
     const rows = active.store.database.prepare(`
-      SELECT knowledge_base_id AS knowledgeBaseId FROM cloud_sync_states
-      WHERE mode <> 'local_only'
-      UNION SELECT knowledge_base_id AS knowledgeBaseId FROM knowledge_cloud_retention
+      SELECT knowledge_base_id AS knowledgeBaseId FROM knowledge_cloud_retention
     `).all() as Array<{ knowledgeBaseId: string }>
     for (const row of rows) {
-      active.cloud.beginCloudRetention(row.knowledgeBaseId, boundaryAt)
       const advancing = active.cloud.advanceCloudRetention(row.knowledgeBaseId)
       active.cloudTasks.add(advancing)
       void advancing.then(
@@ -337,6 +373,7 @@ export function createLocalKnowledgeService(
       SELECT tier, status, beta_enabled AS betaEnabled, cloud_enabled AS cloudEnabled,
         expires_at AS expiresAt, grace_ends_at AS graceEndsAt, epoch,
         accepted_issued_at AS acceptedIssuedAt, accepted_key_id AS acceptedKeyId,
+        accepted_key_generation AS acceptedKeyGeneration,
         accepted_snapshot_digest AS acceptedSnapshotDigest, verified, explicit_free AS explicitFree,
         max_observed_at AS maxObservedAt
       FROM knowledge_entitlement_projection WHERE singleton = 1
@@ -351,6 +388,7 @@ export function createLocalKnowledgeService(
       explicitFree?: boolean
       acceptedIssuedAt?: number | null
       acceptedKeyId?: string | null
+      acceptedKeyGeneration?: number
       acceptedSnapshotDigest?: string | null
       observedAt: number
     },
@@ -362,8 +400,8 @@ export function createLocalKnowledgeService(
       INSERT INTO knowledge_entitlement_projection(
         singleton, tier, status, beta_enabled, cloud_enabled, expires_at,
         grace_ends_at, epoch, updated_at, accepted_issued_at, accepted_key_id,
-        accepted_snapshot_digest, verified, explicit_free, max_observed_at
-      ) VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+        accepted_key_generation, accepted_snapshot_digest, verified, explicit_free, max_observed_at
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(singleton) DO UPDATE SET
         tier = excluded.tier, status = excluded.status,
         beta_enabled = excluded.beta_enabled, cloud_enabled = excluded.cloud_enabled,
@@ -371,6 +409,7 @@ export function createLocalKnowledgeService(
         epoch = knowledge_entitlement_projection.epoch + 1, updated_at = excluded.updated_at,
         accepted_issued_at = excluded.accepted_issued_at,
         accepted_key_id = excluded.accepted_key_id,
+        accepted_key_generation = excluded.accepted_key_generation,
         accepted_snapshot_digest = excluded.accepted_snapshot_digest,
         verified = excluded.verified, explicit_free = excluded.explicit_free,
         max_observed_at = excluded.max_observed_at
@@ -379,6 +418,7 @@ export function createLocalKnowledgeService(
       expiresAt, graceEndsAt, options.observedAt,
       options.acceptedIssuedAt ?? current?.acceptedIssuedAt ?? null,
       options.acceptedKeyId ?? current?.acceptedKeyId ?? null,
+      options.acceptedKeyGeneration ?? current?.acceptedKeyGeneration ?? 0,
       options.acceptedSnapshotDigest ?? current?.acceptedSnapshotDigest ?? null,
       Number(options.verified === true), Number(options.explicitFree === true),
       Math.max(options.observedAt, current?.maxObservedAt ?? 0),
@@ -804,7 +844,9 @@ export function createLocalKnowledgeService(
         const verified = dependencies.verifyEntitlement(ownerId, snapshot, observedAt)
         const issuedAt = verified.issuedAt ? Date.parse(verified.issuedAt) : NaN
         const keyId = verified.keyId
-        if (!Number.isFinite(issuedAt) || !keyId) fail('INVALID_INPUT')
+        const keyGeneration = verified.keyGeneration
+        if (!Number.isFinite(issuedAt) || !keyId || typeof keyGeneration !== 'number'
+          || !Number.isSafeInteger(keyGeneration) || keyGeneration <= 0) fail('INVALID_INPUT')
         const digest = createHash('sha256')
           .update(snapshot.payload).update('.').update(snapshot.signature).digest('hex')
         if (currentProjection?.acceptedIssuedAt !== null
@@ -813,11 +855,16 @@ export function createLocalKnowledgeService(
             || (issuedAt === currentProjection.acceptedIssuedAt
               && digest !== currentProjection.acceptedSnapshotDigest)) fail('FORBIDDEN')
         }
+        if (currentProjection && keyGeneration < currentProjection.acceptedKeyGeneration) fail('FORBIDDEN')
+        if (currentProjection && keyGeneration === currentProjection.acceptedKeyGeneration
+          && currentProjection.acceptedKeyId !== null
+          && keyId !== currentProjection.acceptedKeyId) fail('FORBIDDEN')
         state = verified
         writeProjection(active, state, {
           verified: true,
           acceptedIssuedAt: issuedAt,
           acceptedKeyId: keyId,
+          acceptedKeyGeneration: keyGeneration,
           acceptedSnapshotDigest: digest,
           observedAt,
         })
@@ -831,11 +878,14 @@ export function createLocalKnowledgeService(
         if (state) writeProjection(active, state, { observedAt })
       } else {
         state = { tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false }
-        writeProjection(active, state, {
-          explicitFree: true,
-          acceptedIssuedAt: observedAt,
-          observedAt,
-        })
+        active.store.database.transaction(() => {
+          writeProjection(active, state!, {
+            explicitFree: true,
+            acceptedIssuedAt: observedAt,
+            observedAt,
+          })
+          beginDurableCloudRetention(active, observedAt)
+        })()
       }
       if (binding !== active || epoch !== refreshEpoch || active.ownerId !== ownerId) fail('CONFLICT')
       if (state) refreshedEntitlement = { ownerId, epoch: refreshEpoch, state }
@@ -1194,16 +1244,18 @@ export function createLocalKnowledgeService(
       }
       const active = current(owner)
       const state = entitlement(active)
-      const verified = state.status !== 'unavailable'
-        && (dependencies.entitlement !== undefined
-          || (refreshedEntitlement?.ownerId === active.ownerId
-            && refreshedEntitlement.epoch === active.epoch))
+      const projection = readProjection(active)
+      const verified = projection?.verified === 1
+        && state.tier === 'member'
+        && (state.status === 'active' || state.status === 'offline_grace')
       const beta = verified && state.betaEnabled === true
-      const cloud = beta && state.cloudEnabled && dependencies.cloudKillSwitchEnabled?.() === false
+      const cloudbase = cloudRemote !== undefined
+      const cloud = beta && state.cloudEnabled && cloudbase
+        && dependencies.cloudKillSwitchEnabled?.() === false
       return {
         encryption: { available: true },
         parser: { available: true },
-        cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+        cloudbase: cloudbase ? { available: true } : { available: false, reason: 'cloudbase_unavailable' },
         embedding: { available: false, reason: 'embedding_unavailable' },
         entitlement: verified ? { available: true } : { available: false, reason: 'entitlement_unavailable' },
         beta: beta ? { available: true } : { available: false, reason: 'beta_disabled' },
