@@ -70,9 +70,29 @@ describe('knowledge schema v1', () => {
       WHERE kb_chunks_fts MATCH ?
     `).all('"橙色星云"')).toEqual([{ id: 'chunk_1' }])
 
+    database.prepare(
+      "UPDATE kb_chunks SET body = '紫色彗星更新内容' WHERE id = 'chunk_1'",
+    ).run()
+    expect(database.prepare(`
+      SELECT kb_chunks.id
+      FROM kb_chunks_fts
+      JOIN kb_chunks ON kb_chunks.rowid = kb_chunks_fts.rowid
+      WHERE kb_chunks_fts MATCH ?
+    `).all('"橙色星云"')).toEqual([])
+    expect(database.prepare(`
+      SELECT kb_chunks.id
+      FROM kb_chunks_fts
+      JOIN kb_chunks ON kb_chunks.rowid = kb_chunks_fts.rowid
+      WHERE kb_chunks_fts MATCH ?
+    `).all('"紫色彗星"')).toEqual([{ id: 'chunk_1' }])
+
     database.prepare("DELETE FROM kb_chunks WHERE id = 'chunk_1'").run()
-    expect(database.prepare('SELECT count(*) AS count FROM kb_chunks_fts').get())
-      .toEqual({ count: 0 })
+    expect(database.prepare(`
+      SELECT kb_chunks.id
+      FROM kb_chunks_fts
+      JOIN kb_chunks ON kb_chunks.rowid = kb_chunks_fts.rowid
+      WHERE kb_chunks_fts MATCH ?
+    `).all('"紫色彗星"')).toEqual([])
   })
 
   it('rejects a chunk whose graph identifiers cross knowledge-base boundaries', () => {
@@ -94,5 +114,35 @@ describe('knowledge schema v1', () => {
         (id, knowledge_base_id, document_id, version_id, block_id, ordinal, body, coordinates_json)
       VALUES ('chunk_bad', 'kb_b', 'document_a', 'version_a', 'block_a', 0, 'bad', '{}')
     `).run()).toThrow(/foreign key/i)
+  })
+
+  it('publishes only an active version belonging to the same document', () => {
+    const database = testDatabase()
+    initializeKnowledgeSchema(database)
+    database.exec(`
+      INSERT INTO knowledge_bases (id, name, created_at, updated_at)
+      VALUES ('kb_versions', 'Versions', 1, 1);
+      INSERT INTO documents (id, knowledge_base_id, name, mime_type, created_at, updated_at) VALUES
+        ('document_a', 'kb_versions', 'a.txt', 'text/plain', 1, 1),
+        ('document_b', 'kb_versions', 'b.txt', 'text/plain', 1, 1);
+      INSERT INTO document_versions
+        (id, document_id, version_number, status, content_hash, object_id, created_at) VALUES
+        ('version_a', 'document_a', 1, 'ready', 'hash-a', 'object-a', 1),
+        ('version_b', 'document_b', 1, 'ready', 'hash-b', 'object-b', 1);
+    `)
+
+    expect(() => database.prepare(
+      "UPDATE documents SET active_version_id = 'version_missing' WHERE id = 'document_a'",
+    ).run()).toThrow(/foreign key/i)
+    expect(() => database.prepare(
+      "UPDATE documents SET active_version_id = 'version_b' WHERE id = 'document_a'",
+    ).run()).toThrow(/foreign key/i)
+
+    expect(() => database.prepare(
+      "UPDATE documents SET active_version_id = 'version_a' WHERE id = 'document_a'",
+    ).run()).not.toThrow()
+    expect(database.prepare(
+      "SELECT active_version_id AS activeVersionId FROM documents WHERE id = 'document_a'",
+    ).get()).toEqual({ activeVersionId: 'version_a' })
   })
 })

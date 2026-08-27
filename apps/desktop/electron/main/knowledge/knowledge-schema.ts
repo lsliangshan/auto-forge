@@ -19,7 +19,8 @@ const KNOWLEDGE_SCHEMA_V1 = `
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (id, knowledge_base_id),
-    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
+    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    FOREIGN KEY (active_version_id, id) REFERENCES document_versions(id, document_id)
   ) STRICT;
 
   CREATE TABLE document_versions (

@@ -22,6 +22,12 @@ const CipherDatabase = createRequire(import.meta.url)('better-sqlite3-multiple-c
 const roots: string[] = []
 const wrappingMask = Buffer.from('51a91a9db5b71dd3410dd82f39e33886', 'hex')
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(release => { resolve = release })
+  return { promise, resolve }
+}
+
 function fakeSafeStorage(available = true): SafeStoragePort {
   return {
     isAvailable: async () => available,
@@ -59,6 +65,70 @@ afterEach(async () => {
 })
 
 describe('encrypted personal knowledge database', () => {
+  it('single-flights concurrent first open for one owner', async () => {
+    const root = await temporaryRoot()
+    let encryptions = 0
+    const safeStorage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async (value) => {
+        encryptions += 1
+        return Buffer.from(value, 'utf8')
+      },
+      decrypt: async value => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+    }
+    const factory = new KnowledgeStoreFactory(root, safeStorage)
+
+    const opened = await Promise.all(
+      Array.from({ length: 6 }, () => factory.open('owner-concurrent-open')),
+    )
+
+    expect(opened.every(store => store === opened[0])).toBe(true)
+    expect(encryptions).toBe(2)
+    opened[0]!.close()
+  })
+
+  it('serializes concurrent rotations through pending rekey publication', async () => {
+    const root = await temporaryRoot()
+    const promotionBlocked = deferred()
+    const releasePromotion = deferred()
+    let encryptions = 0
+    const safeStorage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async (value) => {
+        encryptions += 1
+        if (encryptions === 4) {
+          promotionBlocked.resolve()
+          await releasePromotion.promise
+        }
+        return Buffer.from(value, 'utf8')
+      },
+      decrypt: async value => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+    }
+    const factory = new KnowledgeStoreFactory(root, safeStorage)
+    const opened = await factory.open('owner-concurrent-rotation')
+
+    const first = opened.rotateKey()
+    await promotionBlocked.promise
+    const second = opened.rotateKey()
+    const secondFinishedBeforeRelease = await Promise.race([
+      second.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 200)),
+    ])
+    releasePromotion.resolve()
+    const rotations = await Promise.allSettled([first, second])
+    opened.close()
+
+    expect(secondFinishedBeforeRelease).toBe(false)
+    expect(rotations).toEqual([
+      expect.objectContaining({ status: 'fulfilled' }),
+      expect.objectContaining({ status: 'fulfilled' }),
+    ])
+    const reopened = await new KnowledgeStoreFactory(root, safeStorage).open('owner-concurrent-rotation')
+    expect(reopened.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get())
+      .toEqual({ count: 0 })
+    reopened.close()
+  })
+
   it('probes the current cipher binding and FTS5 trigram under Electron 43 on macOS arm64', () => {
     expect(process.versions.electron).toMatch(/^43\./)
     expect(probeKnowledgeNativeAvailability()).toEqual({

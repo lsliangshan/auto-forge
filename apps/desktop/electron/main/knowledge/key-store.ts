@@ -1,12 +1,48 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { access, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
+import { access, link, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { SafeStoragePort } from '../security/secret-store.js'
 
 const KNOWLEDGE_OWNER_DOMAIN = 'autoforge-knowledge-owner-v2\0'
 const OWNER_SCOPE_PATTERN = /^[0-9a-f]{32}$/
 const KEY_BYTES = 32
+const KNOWLEDGE_LOCK_DOMAIN = 'autoforge-knowledge-owner-lock-v2\0'
+
+class OwnerMutex {
+  #locked = false
+  readonly #waiters: Array<() => void> = []
+
+  get idle(): boolean {
+    return !this.#locked && this.#waiters.length === 0
+  }
+
+  async run<T>(operation: () => Promise<T>, onIdle: () => void): Promise<T> {
+    await this.#acquire()
+    try {
+      return await operation()
+    } finally {
+      this.#release()
+      if (this.idle) onIdle()
+    }
+  }
+
+  async #acquire(): Promise<void> {
+    if (!this.#locked) {
+      this.#locked = true
+      return
+    }
+    await new Promise<void>(resolve => this.#waiters.push(resolve))
+  }
+
+  #release(): void {
+    const next = this.#waiters.shift()
+    if (next) next()
+    else this.#locked = false
+  }
+}
+
+const ownerMutexes = new Map<string, OwnerMutex>()
 
 interface KeyRecord {
   version: 1
@@ -32,6 +68,15 @@ export interface KnowledgeKeyMaterial {
 export interface KnowledgeOwnerPaths {
   ownerRoot: string
   recordPath: string
+}
+
+export interface LockedKnowledgeKeyStore {
+  paths: KnowledgeOwnerPaths
+  loadOrCreate(): Promise<KnowledgeKeyMaterial>
+  loadExisting(): Promise<KnowledgeKeyMaterial | undefined>
+  stagePending(pendingKey: Buffer): Promise<void>
+  promotePending(): Promise<void>
+  discardPending(): Promise<void>
 }
 
 function validateOwnerId(ownerId: string): void {
@@ -87,7 +132,11 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function writeRecordDurably(path: string, record: KeyRecord): Promise<void> {
+async function writeRecordDurably(
+  path: string,
+  record: KeyRecord,
+  { createOnly = false }: { createOnly?: boolean } = {},
+): Promise<void> {
   const directory = dirname(path)
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const temporaryPath = join(directory, `.keys-${randomUUID()}.recovery`)
@@ -102,7 +151,12 @@ async function writeRecordDurably(path: string, record: KeyRecord): Promise<void
   }
   await handle.close()
   try {
-    await rename(temporaryPath, path)
+    if (createOnly) {
+      await link(temporaryPath, path)
+      await unlink(temporaryPath)
+    } else {
+      await rename(temporaryPath, path)
+    }
     const directoryHandle = await open(directory, 'r')
     try {
       await directoryHandle.sync()
@@ -131,7 +185,55 @@ export class KnowledgeKeyStore {
   }
 
   async loadOrCreate(ownerId: string): Promise<KnowledgeKeyMaterial> {
-    const existing = await this.loadExisting(ownerId)
+    return this.withOwnerLock(ownerId, store => store.loadOrCreate())
+  }
+
+  async loadExisting(ownerId: string): Promise<KnowledgeKeyMaterial | undefined> {
+    return this.withOwnerLock(ownerId, store => store.loadExisting())
+  }
+
+  async stagePending(ownerId: string, pendingKey: Buffer): Promise<void> {
+    return this.withOwnerLock(ownerId, store => store.stagePending(pendingKey))
+  }
+
+  async promotePending(ownerId: string): Promise<void> {
+    return this.withOwnerLock(ownerId, store => store.promotePending())
+  }
+
+  async discardPending(ownerId: string): Promise<void> {
+    return this.withOwnerLock(ownerId, store => store.discardPending())
+  }
+
+  async withOwnerLock<T>(
+    ownerId: string,
+    operation: (store: LockedKnowledgeKeyStore) => Promise<T>,
+  ): Promise<T> {
+    const paths = ownerPaths(this.#root, ownerId)
+    const lockKey = createHash('sha256')
+      .update(KNOWLEDGE_LOCK_DOMAIN)
+      .update(this.#root)
+      .update(paths.ownerRoot)
+      .digest('hex')
+    let mutex = ownerMutexes.get(lockKey)
+    if (!mutex) {
+      mutex = new OwnerMutex()
+      ownerMutexes.set(lockKey, mutex)
+    }
+    const activeMutex = mutex
+    return activeMutex.run(() => operation({
+      paths,
+      loadOrCreate: () => this.#loadOrCreateUnlocked(ownerId),
+      loadExisting: () => this.#loadExistingUnlocked(ownerId),
+      stagePending: pendingKey => this.#stagePendingUnlocked(ownerId, pendingKey),
+      promotePending: () => this.#promotePendingUnlocked(ownerId),
+      discardPending: () => this.#discardPendingUnlocked(ownerId),
+    }), () => {
+      if (ownerMutexes.get(lockKey) === activeMutex) ownerMutexes.delete(lockKey)
+    })
+  }
+
+  async #loadOrCreateUnlocked(ownerId: string): Promise<KnowledgeKeyMaterial> {
+    const existing = await this.#loadExistingUnlocked(ownerId)
     if (existing) return existing
     await this.#requireSecureStorage()
     const paths = ownerPaths(this.#root, ownerId)
@@ -140,7 +242,18 @@ export class KnowledgeKeyStore {
     try {
       const active = await this.#wrapKey(key, paths.token)
       const object = await this.#wrapKey(objectKey, paths.token)
-      await writeRecordDurably(paths.recordPath, { version: 1, active, object })
+      try {
+        await writeRecordDurably(
+          paths.recordPath,
+          { version: 1, active, object },
+          { createOnly: true },
+        )
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        const committed = await this.#loadExistingUnlocked(ownerId)
+        if (!committed) throw new Error('Knowledge key is unavailable')
+        return committed
+      }
       return {
         active: Buffer.from(key),
         objectKey: Buffer.from(objectKey),
@@ -153,7 +266,7 @@ export class KnowledgeKeyStore {
     }
   }
 
-  async loadExisting(ownerId: string): Promise<KnowledgeKeyMaterial | undefined> {
+  async #loadExistingUnlocked(ownerId: string): Promise<KnowledgeKeyMaterial | undefined> {
     const paths = ownerPaths(this.#root, ownerId)
     if (!await pathExists(paths.recordPath)) return undefined
     await this.#requireSecureStorage()
@@ -187,11 +300,11 @@ export class KnowledgeKeyStore {
     }
   }
 
-  async stagePending(ownerId: string, pendingKey: Buffer): Promise<void> {
+  async #stagePendingUnlocked(ownerId: string, pendingKey: Buffer): Promise<void> {
     if (!Buffer.isBuffer(pendingKey) || pendingKey.length !== KEY_BYTES) {
       throw new Error('Invalid pending knowledge key')
     }
-    const material = await this.#requireExisting(ownerId)
+    const material = await this.#requireExistingUnlocked(ownerId)
     const paths = ownerPaths(this.#root, ownerId)
     try {
       const record = parseRecord(await readFile(paths.recordPath, 'utf8'))
@@ -204,8 +317,8 @@ export class KnowledgeKeyStore {
     }
   }
 
-  async promotePending(ownerId: string): Promise<void> {
-    const material = await this.#requireExisting(ownerId)
+  async #promotePendingUnlocked(ownerId: string): Promise<void> {
+    const material = await this.#requireExistingUnlocked(ownerId)
     const paths = ownerPaths(this.#root, ownerId)
     try {
       if (!material.pending) throw new Error('Pending knowledge key is unavailable')
@@ -219,8 +332,8 @@ export class KnowledgeKeyStore {
     }
   }
 
-  async discardPending(ownerId: string): Promise<void> {
-    const material = await this.#requireExisting(ownerId)
+  async #discardPendingUnlocked(ownerId: string): Promise<void> {
+    const material = await this.#requireExistingUnlocked(ownerId)
     const paths = ownerPaths(this.#root, ownerId)
     try {
       const active = await this.#wrapKey(material.active, paths.token)
@@ -233,8 +346,8 @@ export class KnowledgeKeyStore {
     }
   }
 
-  async #requireExisting(ownerId: string): Promise<KnowledgeKeyMaterial> {
-    const material = await this.loadExisting(ownerId)
+  async #requireExistingUnlocked(ownerId: string): Promise<KnowledgeKeyMaterial> {
+    const material = await this.#loadExistingUnlocked(ownerId)
     if (!material) throw new Error('Knowledge key is unavailable')
     return material
   }

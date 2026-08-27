@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { copyFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -7,6 +7,12 @@ import { KnowledgeKeyStore } from './key-store.js'
 
 const roots: string[] = []
 const wrappingMask = Buffer.from('67f64f3eb4a85dedbce6132d63159fe1', 'hex')
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>(release => { resolve = release })
+  return { promise, resolve }
+}
 
 async function temporaryRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-keys-'))
@@ -34,6 +40,58 @@ afterEach(async () => {
 })
 
 describe('KnowledgeKeyStore', () => {
+  it('single-flights concurrent first use so every caller receives the committed key', async () => {
+    const root = await temporaryRoot()
+    const store = new KnowledgeKeyStore(root, fakeSafeStorage())
+
+    const materials = await Promise.all(
+      Array.from({ length: 8 }, () => store.loadOrCreate('owner-concurrent-create')),
+    )
+
+    expect(materials.every(material => material.active.equals(materials[0]!.active))).toBe(true)
+    expect(materials.every(material => material.objectKey.equals(materials[0]!.objectKey))).toBe(true)
+    for (const material of materials) {
+      material.active.fill(0)
+      material.objectKey.fill(0)
+    }
+  })
+
+  it('does not make one owner wait for another owner key operation', async () => {
+    const root = await temporaryRoot()
+    const firstEncryptionStarted = deferred()
+    const releaseFirstEncryption = deferred()
+    let encryptionCount = 0
+    const safeStorage: SafeStoragePort = {
+      isAvailable: async () => true,
+      encrypt: async (value) => {
+        encryptionCount += 1
+        if (encryptionCount === 1) {
+          firstEncryptionStarted.resolve()
+          await releaseFirstEncryption.promise
+        }
+        return Buffer.from(value, 'utf8')
+      },
+      decrypt: async value => ({ value: value.toString('utf8'), shouldReEncrypt: false }),
+    }
+    const store = new KnowledgeKeyStore(root, safeStorage)
+    const first = store.loadOrCreate('owner-blocked-a')
+    await firstEncryptionStarted.promise
+
+    const second = store.loadOrCreate('owner-independent-b')
+    const secondFinishedEarly = await Promise.race([
+      second.then(() => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 200)),
+    ])
+    releaseFirstEncryption.resolve()
+    const [firstMaterial, secondMaterial] = await Promise.all([first, second])
+
+    expect(secondFinishedEarly).toBe(true)
+    firstMaterial.active.fill(0)
+    firstMaterial.objectKey.fill(0)
+    secondMaterial.active.fill(0)
+    secondMaterial.objectKey.fill(0)
+  })
+
   it('creates one owner-bound active key under a hashed per-user root', async () => {
     const root = await temporaryRoot()
     const store = new KnowledgeKeyStore(root, fakeSafeStorage())
@@ -46,6 +104,10 @@ describe('KnowledgeKeyStore', () => {
     expect(first.ownerRoot).not.toContain('alice@example.test')
     expect(first.recordPath).not.toContain('alice@example.test')
     expect(JSON.parse(await readFile(first.recordPath, 'utf8'))).toMatchObject({ version: 1 })
+    if (process.platform !== 'win32') {
+      expect((await stat(first.ownerRoot)).mode & 0o777).toBe(0o700)
+      expect((await stat(first.recordPath)).mode & 0o777).toBe(0o600)
+    }
     first.active.fill(0)
     first.objectKey.fill(0)
     second.active.fill(0)

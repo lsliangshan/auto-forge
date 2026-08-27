@@ -66,9 +66,21 @@ const nativeModule = join(
 if (!existsSync(nativeModule)) {
   throw new Error(`Packaged better-sqlite3 native module not found: ${nativeModule}`)
 }
+const cipherNativeModule = join(
+  resourcesDirectory,
+  'app.asar.unpacked',
+  'node_modules',
+  'better-sqlite3-multiple-ciphers',
+  'prebuilds',
+  'darwin-arm64.node',
+)
+if (!existsSync(cipherNativeModule)) {
+  throw new Error(`Packaged knowledge SQLite native module not found: ${cipherNativeModule}`)
+}
 
 const executable = resolvePackagedExecutable(packageDirectory)
 const databasePackage = join(appArchive, 'node_modules', 'better-sqlite3')
+const cipherDatabasePackage = join(appArchive, 'node_modules', 'better-sqlite3-multiple-ciphers')
 const httpsProxyAgentPackage = join(appArchive, 'node_modules', 'https-proxy-agent', 'dist', 'index.js')
 const socksProxyAgentPackage = join(appArchive, 'node_modules', 'socks-proxy-agent', 'dist', 'index.js')
 const workflowCompilerPackage = join(
@@ -91,7 +103,25 @@ const probe = [
   'const { transformSync } = require(process.argv[4])',
   'const transformed = transformSync("const answer: number = 42", { loader: "ts" })',
   'if (!transformed.code.includes("42")) throw new Error("Packaged workflow compiler output was invalid")',
-  'console.log(`Packaged proxy agents, better-sqlite3, and workflow compiler loaded under Electron ${process.versions.electron}`)',
+  'const CipherDatabase = require(process.argv[5])',
+  'const { randomBytes } = require("node:crypto")',
+  'const { mkdtempSync, rmSync } = require("node:fs")',
+  'const { tmpdir } = require("node:os")',
+  'const { join } = require("node:path")',
+  'const cipherRoot = mkdtempSync(join(tmpdir(), "autoforge-packaged-cipher-"))',
+  'const cipherKey = randomBytes(32)',
+  'const cipherDatabase = new CipherDatabase(join(cipherRoot, "probe.sqlite"))',
+  'try {',
+  'cipherDatabase.key(cipherKey)',
+  'cipherDatabase.pragma("temp_store = MEMORY")',
+  'cipherDatabase.exec("CREATE VIRTUAL TABLE temp.__probe USING fts5(body, tokenize=\'trigram\'); DROP TABLE temp.__probe;")',
+  'if (cipherDatabase.pragma("temp_store", { simple: true }) !== 2) throw new Error("Packaged cipher temp storage probe failed")',
+  '} finally {',
+  'cipherKey.fill(0)',
+  'cipherDatabase.close()',
+  'rmSync(cipherRoot, { recursive: true, force: true })',
+  '}',
+  'console.log(`Packaged proxy agents, both SQLite bindings, and workflow compiler loaded under Electron ${process.versions.electron}`)',
 ].join(';')
 
 const result = spawnSync(executable, [
@@ -101,6 +131,7 @@ const result = spawnSync(executable, [
   httpsProxyAgentPackage,
   socksProxyAgentPackage,
   workflowCompilerPackage,
+  cipherDatabasePackage,
 ], {
   env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   stdio: 'inherit',

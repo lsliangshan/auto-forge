@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -42,6 +42,10 @@ describe('KnowledgeObjectStore', () => {
     const firstBytes = await readFile(join(root, `${first.objectId}.afobj`))
     const secondBytes = await readFile(join(root, `${second.objectId}.afobj`))
     expect(firstBytes.equals(secondBytes)).toBe(false)
+    if (process.platform !== 'win32') {
+      expect((await stat(root)).mode & 0o777).toBe(0o700)
+      expect((await stat(join(root, `${first.objectId}.afobj`))).mode & 0o777).toBe(0o600)
+    }
     expect(collectFiles(root).filter(path => readFileSync(path).includes(sentinel))).toEqual([])
     expect(collectFiles(root).filter(path => /(tmp|temp|recovery)/i.test(basename(path)))).toEqual([])
 

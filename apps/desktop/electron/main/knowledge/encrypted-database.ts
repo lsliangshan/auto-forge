@@ -8,7 +8,11 @@ import process from 'node:process'
 import type Database from 'better-sqlite3'
 import type { SafeStoragePort } from '../security/secret-store.js'
 import { initializeKnowledgeSchema } from './knowledge-schema.js'
-import { KnowledgeKeyStore, type KnowledgeKeyMaterial } from './key-store.js'
+import {
+  KnowledgeKeyStore,
+  type KnowledgeKeyMaterial,
+  type LockedKnowledgeKeyStore,
+} from './key-store.js'
 import { KnowledgeObjectStore } from './encrypted-object-store.js'
 
 const KEY_BYTES = 32
@@ -49,6 +53,8 @@ export interface KnowledgeStore {
   rotateKey(): Promise<void>
   close(): void
 }
+
+const openKnowledgeStores = new Map<string, KnowledgeStore>()
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -146,70 +152,80 @@ export class KnowledgeStoreFactory {
     const capabilities = probeKnowledgeNativeAvailability()
     if (!capabilities.available) throw new Error('Encrypted knowledge storage is unavailable on this platform')
 
-    const paths = this.#keyStore.pathsFor(ownerId)
-    let material = await this.#keyStore.loadExisting(ownerId)
-    const databasePath = join(paths.ownerRoot, 'knowledge.sqlite')
-    if (!material) {
-      if (await pathExists(databasePath)) throw new Error('Knowledge database key is unavailable')
-      material = await this.#keyStore.loadOrCreate(ownerId)
-    }
+    return this.#keyStore.withOwnerLock(ownerId, async keyStore => {
+      const cacheKey = keyStore.paths.ownerRoot
+      const current = openKnowledgeStores.get(cacheKey)
+      if (current) return current
 
-    let database: CipherDatabaseInstance | undefined
-    let objects: KnowledgeObjectStore | undefined
-    try {
-      database = await this.#openRecoveringPending(ownerId, databasePath, material)
-      configureAndProbe(database)
-      initializeKnowledgeSchema(database)
-      objects = new KnowledgeObjectStore(join(paths.ownerRoot, 'objects'), material.objectKey)
-    } catch (error) {
-      database?.close()
-      objects?.close()
-      throw error
-    } finally {
-      material.active.fill(0)
-      material.objectKey.fill(0)
-      material.pending?.fill(0)
-    }
+      let material = await keyStore.loadExisting()
+      const databasePath = join(keyStore.paths.ownerRoot, 'knowledge.sqlite')
+      if (!material) {
+        if (await pathExists(databasePath)) throw new Error('Knowledge database key is unavailable')
+        material = await keyStore.loadOrCreate()
+      }
 
-    let closed = false
-    const activeDatabase = database
-    return {
-      database: activeDatabase,
-      databasePath,
-      ownerRoot: paths.ownerRoot,
-      capabilities,
-      objects,
-      rotateKey: async () => {
-        if (closed) throw new Error('Knowledge database is closed')
-        const pending = randomBytes(KEY_BYTES)
-        try {
-          await this.#keyStore.stagePending(ownerId, pending)
-          rekeyEncryptedKnowledgeDatabase(activeDatabase, pending)
-          await this.#keyStore.promotePending(ownerId)
-        } finally {
-          pending.fill(0)
-        }
-      },
-      close: () => {
-        if (closed) return
-        closed = true
-        objects.close()
-        activeDatabase.close()
-      },
-    }
+      let database: CipherDatabaseInstance | undefined
+      let objects: KnowledgeObjectStore | undefined
+      try {
+        database = await this.#openRecoveringPending(databasePath, material, keyStore)
+        configureAndProbe(database)
+        initializeKnowledgeSchema(database)
+        objects = new KnowledgeObjectStore(join(keyStore.paths.ownerRoot, 'objects'), material.objectKey)
+      } catch (error) {
+        database?.close()
+        objects?.close()
+        throw error
+      } finally {
+        material.active.fill(0)
+        material.objectKey.fill(0)
+        material.pending?.fill(0)
+      }
+
+      let closed = false
+      const activeDatabase = database
+      const activeObjects = objects
+      let store!: KnowledgeStore
+      store = {
+        database: activeDatabase,
+        databasePath,
+        ownerRoot: keyStore.paths.ownerRoot,
+        capabilities,
+        objects: activeObjects,
+        rotateKey: () => this.#keyStore.withOwnerLock(ownerId, async lockedStore => {
+          if (closed) throw new Error('Knowledge database is closed')
+          const pending = randomBytes(KEY_BYTES)
+          try {
+            await lockedStore.stagePending(pending)
+            rekeyEncryptedKnowledgeDatabase(activeDatabase, pending)
+            await lockedStore.promotePending()
+          } finally {
+            pending.fill(0)
+          }
+        }),
+        close: () => {
+          if (closed) return
+          closed = true
+          if (openKnowledgeStores.get(cacheKey) === store) openKnowledgeStores.delete(cacheKey)
+          activeObjects.close()
+          activeDatabase.close()
+        },
+      }
+      openKnowledgeStores.set(cacheKey, store)
+      return store
+    })
   }
 
   async #openRecoveringPending(
-    ownerId: string,
     databasePath: string,
     material: KnowledgeKeyMaterial,
+    keyStore: LockedKnowledgeKeyStore,
   ): Promise<CipherDatabaseInstance> {
     if (!material.pending) return openEncryptedKnowledgeDatabase(databasePath, material.active)
 
     try {
       const database = openEncryptedKnowledgeDatabase(databasePath, material.active)
       try {
-        await this.#keyStore.discardPending(ownerId)
+        await keyStore.discardPending()
         return database
       } catch (error) {
         database.close()
@@ -223,7 +239,7 @@ export class KnowledgeStoreFactory {
         throw activeError
       }
       try {
-        await this.#keyStore.promotePending(ownerId)
+        await keyStore.promotePending()
         return database
       } catch (error) {
         database.close()
