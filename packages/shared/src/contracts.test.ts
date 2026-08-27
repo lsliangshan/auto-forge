@@ -1819,6 +1819,16 @@ describe('cross-process contracts', () => {
     expect(chatBlockSchema.parse(citation)).toEqual(citation)
     expect(chatBlockSchema.safeParse({ ...citation, path: '/tmp/private' }).success).toBe(false)
     expect(chatBlockSchema.safeParse({ ...citation, preview: '合同在签字后生效。' }).success).toBe(false)
+    expect(chatBlockSchema.parse({
+      type: 'knowledge_citation', blockId: 'legacy_citation_1', evidenceId: 'evidence:legacy',
+      documentId: 'document_legacy', versionId: 'version_legacy',
+      coordinate: { kind: 'text', line: 3, startOffset: 0, endOffset: 6 },
+      preview: '/etc/private 旧摇要不得重新披露', sourceAvailable: true,
+    })).toEqual({
+      type: 'knowledge_citation', blockId: 'legacy_citation_1', evidenceId: 'evidence:legacy',
+      baseId: 'legacy_unavailable', documentId: 'document_legacy', versionId: 'version_legacy',
+      coordinate: { kind: 'text', line: 3, startOffset: 0, endOffset: 6 }, legacyUnavailable: true,
+    })
     expect(chatEventSchema.parse({
       type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1',
       blockId: status.blockId, block: { ...status, status: 'insufficient', evidenceCount: 0 },

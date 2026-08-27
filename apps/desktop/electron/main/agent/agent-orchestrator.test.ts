@@ -6680,6 +6680,28 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(JSON.stringify(terminal.blocks)).not.toContain('伪造结论')
   })
 
+  it('repairs a current but semantically unsupported citation exactly once', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '月球由奶酪构成。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+
+    await new AgentOrchestrator(dependencies).run(knowledgeRunInput('根据合同库回答生效条件'))
+
+    expect(dependencies.providerInstances.openrouter.stream).toHaveBeenCalledTimes(3)
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('合同经双方签字后生效')
+    expect(terminal).not.toContain('月球由奶酪构成')
+    expect(terminal).toContain('knowledge_citation')
+  })
+
   it('grounds workflow-to-knowledge composite answers and rejects forged markers after one repair', async () => {
     const dependencies = harness([toolTurn, [
       { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_after_workflow', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
@@ -6752,6 +6774,28 @@ describe('AgentOrchestrator knowledge grounding', () => {
     expect(JSON.stringify(terminal.blocks)).not.toContain('合同生效。')
   })
 
+  it('downgrades unavailable mixed sources and persists no stale citation', async () => {
+    const dependencies = harness([[
+      { type: 'tool_call', choiceIndex: 0, index: 0, id: 'knowledge_call', name: 'knowledge_search', arguments: { query: '合同何时生效' } },
+      { type: 'finish', choiceIndex: 0, reason: 'tool_calls' },
+    ], [
+      { type: 'text_delta', choiceIndex: 0, text: '合同经双方签字后生效。[[kb:evidence:contract]]' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies, { sourceAvailable: false })
+    const input = Object.assign(knowledgeRunInput('根据合同库回答生效条件'), {
+      knowledgeSelection: { baseIds: ['base_selected'], mode: 'mixed' as const },
+    })
+
+    await new AgentOrchestrator(dependencies).run(input)
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('【一般信息】')
+    expect(terminal).toContain('来源当前不可用')
+    expect(terminal).not.toContain('【知识库依据】')
+    expect(terminal).not.toContain('knowledge_citation')
+  })
+
   it('does not write evidence, status updates, or citations after a pending retrieval is cancelled', async () => {
     const pendingSearch = deferred<{
       kind: 'results'; strategy: 'trigram'; evidence: Array<typeof retrievedEvidence>
@@ -6801,6 +6845,37 @@ describe('AgentOrchestrator knowledge grounding', () => {
     strictDependencies.workflows.list = async () => []
     const strictInput = Object.assign(knowledgeRunInput('解释合同'), { allowTools: false })
     await new AgentOrchestrator(strictDependencies).run(strictInput)
-    expect(JSON.stringify(strictDependencies.records.terminal.at(-1))).toContain('模型猜测')
+    expect(JSON.stringify(strictDependencies.records.terminal.at(-1))).toContain('依据不足')
+    expect(JSON.stringify(strictDependencies.records.terminal.at(-1))).not.toContain('模型猜测')
+  })
+
+  it('fails a strict knowledge-only request closed when the model skips retrieval', async () => {
+    const dependencies = harness([[
+      { type: 'text_delta', choiceIndex: 0, text: '模型直接猜测' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies)
+
+    await new AgentOrchestrator(dependencies).run(knowledgeRunInput('根据合同库回答生效条件'))
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('依据不足')
+    expect(terminal).not.toContain('模型直接猜测')
+  })
+
+  it('fails a workflow-to-knowledge composite closed when the second stage skips retrieval', async () => {
+    const dependencies = harness([toolTurn, [
+      { type: 'text_delta', choiceIndex: 0, text: '工作流已完成，合同的答案是模型猜测。' },
+      { type: 'finish', choiceIndex: 0, reason: 'stop' },
+    ]])
+    attachKnowledge(dependencies, { keepWorkflows: true })
+
+    await new AgentOrchestrator(dependencies).run(
+      knowledgeRunInput('使用百度搜索，再根据合同库回答合同何时生效'),
+    )
+
+    const terminal = JSON.stringify(dependencies.records.terminal.at(-1))
+    expect(terminal).toContain('依据不足')
+    expect(terminal).not.toContain('模型猜测')
   })
 })

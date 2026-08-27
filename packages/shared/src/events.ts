@@ -236,9 +236,10 @@ export const knowledgeCitationBlockSchema = z.object({
   documentId: identifierSchema,
   versionId: identifierSchema,
   coordinate: knowledgeCoordinateSchema,
+  legacyUnavailable: z.literal(true).optional(),
 }).strict()
 
-export const chatBlockSchema = z.discriminatedUnion('type', [
+const currentChatBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string() }).strict(),
   z.object({ type: z.literal('reasoning_status'), label: z.string().trim().min(1) }).strict(),
   z.object({
@@ -333,6 +334,24 @@ export const chatBlockSchema = z.discriminatedUnion('type', [
   mediaBlockSchema,
   mediaGenerationBlockSchema,
 ])
+
+function normalizeLegacyKnowledgeCitation(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || !('type' in value)
+    || value.type !== 'knowledge_citation' || 'baseId' in value) return value
+  const legacy = value as Record<string, unknown>
+  return {
+    type: 'knowledge_citation',
+    blockId: legacy.blockId,
+    evidenceId: legacy.evidenceId,
+    baseId: 'legacy_unavailable',
+    documentId: legacy.documentId,
+    versionId: legacy.versionId,
+    coordinate: legacy.coordinate,
+    legacyUnavailable: true,
+  }
+}
+
+export const chatBlockSchema = z.preprocess(normalizeLegacyKnowledgeCitation, currentChatBlockSchema)
 
 export type ChatBlock = z.infer<typeof chatBlockSchema>
 

@@ -6,6 +6,7 @@
     <header>
       <span>知识库依据 · {{ coordinateLabel }}</span>
       <button
+        v-if="!block.legacyUnavailable"
         type="button"
         data-testid="toggle-knowledge-preview"
         :aria-expanded="expanded"
@@ -14,6 +15,12 @@
         {{ expanded ? '收起原文' : '查看原文' }}
       </button>
     </header>
+    <p
+      v-if="block.legacyUnavailable"
+      class="source-unavailable"
+    >
+      来源当前不可用
+    </p>
     <KnowledgeSourcePreview
       v-if="expanded && preview"
       :preview="preview"

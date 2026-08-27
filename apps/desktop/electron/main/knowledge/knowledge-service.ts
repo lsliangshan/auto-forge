@@ -17,6 +17,7 @@ import {
 import { KnowledgeExportService } from './export-service.js'
 import { ImportJobRunner, type KnowledgeParserPort } from './import-job-runner.js'
 import { LocalKnowledgeRetriever } from './local-retriever.js'
+import { sanitizeKnowledgeText } from './knowledge-sanitizer.js'
 import type { KnowledgeOwner, KnowledgeService } from './knowledge-types.js'
 import { PARSER_MEDIA_TYPES, type ParserMediaType } from './parser-protocol.js'
 
@@ -776,10 +777,7 @@ export function createLocalKnowledgeService(
         body: string
       } | undefined
       if (!row) return { kind: 'unavailable' }
-      const preview = row.body
-        .replace(/(?:https?|file):\/\/[^\s<>"']+/giu, '[REDACTED_LOCATION]')
-        .replace(/\/(?:Users|home|tmp|private|var|Volumes)\/[^\s<>"']+/gu, '[REDACTED_LOCATION]')
-        .replace(/[A-Za-z]:\\(?:[^\\\s<>"']+\\)*[^\s<>"']+/gu, '[REDACTED_LOCATION]')
+      const preview = sanitizeKnowledgeText(row.body)
         .slice(0, 4_000)
         .trim()
       return preview ? { kind: 'available', preview } : { kind: 'unavailable' }

@@ -19,6 +19,7 @@
       class="knowledge-consent-actions"
     >
       <button
+        v-if="consentStatus === 'unknown'"
         type="button"
         data-testid="grant-knowledge-consent"
         :disabled="busy"
@@ -27,6 +28,7 @@
         允许发送依据
       </button>
       <button
+        v-if="consentStatus === 'unknown'"
         type="button"
         data-testid="deny-knowledge-consent"
         :disabled="busy"
@@ -35,17 +37,24 @@
         拒绝
       </button>
       <button
-        v-if="grantedHere"
+        v-if="consentStatus === 'granted' || consentStatus === 'denied'"
         type="button"
         data-testid="revoke-knowledge-consent"
         :disabled="busy"
         @click="revokeConsent"
       >
-        撤销授权
+        {{ consentStatus === 'denied' ? '重置授权选择' : '撤销授权' }}
       </button>
     </div>
     <p v-if="decisionMessage">
       {{ decisionMessage }}
+    </p>
+    <p
+      v-if="consentError"
+      data-testid="knowledge-consent-error"
+      aria-live="polite"
+    >
+      {{ consentError }}
     </p>
   </section>
 </template>
@@ -53,26 +62,46 @@
 <script setup lang="ts">
 import { Reading } from '@element-plus/icons-vue'
 import type { ChatBlock } from '@autoforge/shared'
-import { computed } from 'vue'
-import { ref } from 'vue'
-import { getDesktopApi } from '../../services/desktop-api'
+import { computed, ref, watch } from 'vue'
+import { displayError, getDesktopApi } from '../../services/desktop-api'
 
 type KnowledgeStatusBlock = Extract<ChatBlock, { type: 'knowledge_status' }>
 const props = defineProps<{ block: KnowledgeStatusBlock }>()
 const busy = ref(false)
 const decisionMessage = ref('')
-const grantedHere = ref(false)
+const consentError = ref('')
+const consentStatus = ref<'unknown' | 'granted' | 'denied'>('unknown')
+let consentRead = 0
 const canDecide = computed(() => (
   (props.block.status === 'consent_required' || props.block.status === 'consent_denied')
   && props.block.provider !== undefined
 ))
+watch(() => props.block.provider, async (provider) => {
+  const read = ++consentRead
+  consentStatus.value = 'unknown'
+  decisionMessage.value = ''
+  consentError.value = ''
+  if (!provider) return
+  try {
+    const state = await getDesktopApi().knowledge.getConsent(provider)
+    if (read !== consentRead) return
+    consentStatus.value = state.status
+    if (state.status === 'granted') decisionMessage.value = '已授权当前模型供应商。'
+    if (state.status === 'denied') decisionMessage.value = '已拒绝向当前模型供应商发送依据。'
+  } catch (error) {
+    if (read === consentRead) consentError.value = displayError(error, '无法读取当前授权状态。')
+  }
+}, { immediate: true })
 async function setConsent(status: 'granted' | 'denied') {
   if (!props.block.provider || busy.value) return
   busy.value = true
+  consentError.value = ''
   try {
     await getDesktopApi().knowledge.setConsent(props.block.provider, status)
-    grantedHere.value = status === 'granted'
+    consentStatus.value = status
     decisionMessage.value = status === 'granted' ? '已授权，请重新发送问题。' : '已拒绝发送知识库依据。'
+  } catch (error) {
+    consentError.value = displayError(error, '无法更新当前授权状态。')
   } finally {
     busy.value = false
   }
@@ -80,10 +109,13 @@ async function setConsent(status: 'granted' | 'denied') {
 async function revokeConsent() {
   if (!props.block.provider || busy.value) return
   busy.value = true
+  consentError.value = ''
   try {
     await getDesktopApi().knowledge.revokeConsent(props.block.provider)
-    grantedHere.value = false
+    consentStatus.value = 'unknown'
     decisionMessage.value = '已撤销当前模型供应商的知识库依据授权。'
+  } catch (error) {
+    consentError.value = displayError(error, '无法重置当前授权状态。')
   } finally {
     busy.value = false
   }

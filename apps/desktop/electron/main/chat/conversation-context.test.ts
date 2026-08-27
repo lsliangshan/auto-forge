@@ -134,6 +134,21 @@ describe('conversation context primitives', () => {
     expect(JSON.stringify(serialized)).not.toMatch(/隐藏正文|private|signed|https?:|\/Users\/|preview|evidence|document|version/i)
   })
 
+  it('upgrades legacy citation previews to an unavailable handle without re-disclosure', () => {
+    const serialized = serializeHistoricalMessage({
+      id: 'legacy_knowledge_message', conversationId: 'c1', role: 'assistant', ordinal: 5, createdAt: 5,
+      blocks: [{
+        type: 'knowledge_citation', blockId: 'legacy_citation', evidenceId: 'evidence:legacy',
+        documentId: 'document_legacy', versionId: 'version_legacy',
+        coordinate: { kind: 'text', line: 3, startOffset: 0, endOffset: 6 },
+        preview: '隐藏正文 /etc/private', sourceAvailable: true,
+      }],
+    })
+
+    expect(serialized).toEqual({ role: 'assistant', content: '[知识库引用: text 第 3 行]' })
+    expect(JSON.stringify(serialized)).not.toMatch(/隐藏正文|\/etc\/private|preview|sourceAvailable/u)
+  })
+
   it('omits transient-only history and rejects unknown roles', () => {
     expect(serializeHistoricalMessage({
       id: 'm2', conversationId: 'c1', role: 'assistant', ordinal: 2, createdAt: 2,

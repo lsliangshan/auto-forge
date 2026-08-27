@@ -80,6 +80,7 @@ import {
 } from './workflow-tool-executor.js'
 import {
   CurrentTurnKnowledgeEvidence,
+  formatValidatedKnowledgeAnswer,
   MAX_KNOWLEDGE_SEARCHES,
   knowledgeSearchTool,
   parseKnowledgeSearchArguments,
@@ -156,7 +157,7 @@ const KNOWLEDGE_AGENT_POLICY = [
   'strict 模式下依据不足时不得补充一般知识；mixed 模式下没有依据支持的内容必须明确标为一般信息。',
 ].join('\n')
 
-const KNOWLEDGE_CITATION_REPAIR = '上一回答包含无效或缺失的个人知识库引用。只能使用本轮已提供的 evidenceId，格式为 [[kb:evidenceId]]。这是唯一一次引用修复机会。'
+const KNOWLEDGE_CITATION_REPAIR = '上一回答包含无效、缺失或不支持当前断言的个人知识库引用。每个断言只能引用内容确实支持它的本轮 evidenceId，格式为 [[kb:evidenceId]]。这是唯一一次引用修复机会。'
 const KNOWLEDGE_INSUFFICIENT_TEXT = '所选个人知识库中的当前依据不足，无法可靠回答这个问题。您可以补充相关文件、调整所选知识库，或改用混合模式。'
 
 const SINGLE_TOOL_REPAIR = '上一响应包含多个工具调用。一次只能调用一个工作流、个人知识库或浏览器工具；请重新决定，只返回一个工具调用或直接回答。'
@@ -565,6 +566,7 @@ interface ActiveAgentRun {
   knowledgeCitationRepairs: number
   knowledgeDisclosedEvidenceIds: Set<string>
   knowledgeEligible: boolean
+  knowledgeRequired: boolean
   knowledgeToolAllowed: boolean
   knowledgeStatusBlockId?: string
   knowledgeConsentBlocked?: 'consent_required' | 'consent_denied'
@@ -704,6 +706,10 @@ function workflowLaunchOnlyRequest(
 function workflowExecutionRequested(content: string, candidates: readonly WorkflowCandidate[]): boolean {
   if (!/(?:使用|运行|执行|启动|打开|查询|办理|\b(?:use|run|execute|launch|open|search)\b)/iu.test(content)) return false
   return candidates.length === 1 && content.includes(candidates[0]!.workflow.name)
+}
+
+function knowledgeAnswerRequested(content: string): boolean {
+  return /(?:知识库|资料库|文档库|合同库|根据[^\n。！？]{0,24}(?:文档|资料|依据|库)|引用[^\n。！？]{0,12}(?:文档|资料|依据)|\bknowledge\s+base\b|\bbased\s+on\s+(?:the\s+)?(?:documents?|knowledge|sources?)\b|\bcite\s+(?:the\s+)?(?:documents?|sources?)\b)/iu.test(content)
 }
 
 function trustedRequestNamesTarget(request: string, target: BrowserSemanticNode): boolean {
@@ -935,6 +941,7 @@ export class AgentOrchestrator {
         knowledgeEligible: input.allowTools
           && knowledgeSelection.baseIds.length > 0
           && this.dependencies.knowledge !== undefined,
+        knowledgeRequired: knowledgeSelection.mode === 'strict' && knowledgeSelection.baseIds.length > 0,
         knowledgeToolAllowed: false,
         busy: false,
         cancelled: false,
@@ -980,7 +987,9 @@ export class AgentOrchestrator {
           active.browserExplicitBindingId = undefined
           active.browserPolicyAdded = false
           active.knowledgeEligible = false
+          active.knowledgeRequired = false
         }
+        if (candidates.length > 0 && !knowledgeAnswerRequested(input.content)) active.knowledgeRequired = false
         active.knowledgeToolAllowed = active.knowledgeEligible && candidates.length === 0
       }
       if (!workflowToolsAllowed) active.knowledgeToolAllowed = active.knowledgeEligible
@@ -2079,7 +2088,7 @@ export class AgentOrchestrator {
   private async appendKnowledgeCitations(
     active: ActiveAgentRun,
     evidenceIds: readonly string[],
-  ): Promise<boolean> {
+  ): Promise<{ availableIds: Set<string>; allAvailable: boolean }> {
     const knowledge = this.dependencies.knowledge
     let allAvailable = true
     const availableEvidence: KnowledgeEvidence[] = []
@@ -2098,7 +2107,9 @@ export class AgentOrchestrator {
       allAvailable &&= sourceAvailable
       if (sourceAvailable) availableEvidence.push(evidence)
     }
-    if (!allAvailable && active.knowledgeSelection.mode === 'strict') return false
+    if (!allAvailable && active.knowledgeSelection.mode === 'strict') {
+      return { availableIds: new Set(), allAvailable: false }
+    }
     for (const evidence of availableEvidence) {
       this.appendBlock(active, {
         type: 'knowledge_citation',
@@ -2110,7 +2121,7 @@ export class AgentOrchestrator {
         coordinate: sanitizeKnowledgeCoordinate(evidence.citation.coordinate),
       })
     }
-    return allAvailable
+    return { availableIds: new Set(availableEvidence.map(item => item.id)), allAvailable }
   }
 
   private async groundKnowledgeAnswer(
@@ -2119,7 +2130,11 @@ export class AgentOrchestrator {
   ): Promise<{ kind: 'answer'; text: string } | { kind: 'repair' }> {
     if (active.knowledgeSelection.baseIds.length === 0) return { kind: 'answer', text: answer }
     const allEvidence = active.knowledgeEvidence.snapshot()
-    if (active.knowledgeSearches === 0 && allEvidence.length === 0) return { kind: 'answer', text: answer }
+    if (active.knowledgeSearches === 0 && allEvidence.length === 0) {
+      if (!active.knowledgeRequired || active.browserRead) return { kind: 'answer', text: answer }
+      this.setKnowledgeStatus(active, 'insufficient', 0)
+      return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }
+    }
     if (active.knowledgeConsentBlocked) {
       return {
         kind: 'answer',
@@ -2145,12 +2160,16 @@ export class AgentOrchestrator {
       return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }
     }
     if (validation.citedEvidenceIds.length > 0) {
-      const available = await this.appendKnowledgeCitations(active, validation.citedEvidenceIds)
-      if (!available && active.knowledgeSelection.mode === 'strict') {
+      const availability = await this.appendKnowledgeCitations(active, validation.citedEvidenceIds)
+      if (!availability.allAvailable && active.knowledgeSelection.mode === 'strict') {
         this.setKnowledgeStatus(active, 'source_unavailable', allEvidence.length)
         return { kind: 'answer', text: KNOWLEDGE_INSUFFICIENT_TEXT }
       }
-      if (!available) this.setKnowledgeStatus(active, 'source_unavailable', allEvidence.length)
+      if (!availability.allAvailable) this.setKnowledgeStatus(active, 'source_unavailable', allEvidence.length)
+      return {
+        kind: 'answer',
+        text: formatValidatedKnowledgeAnswer(validation, active.knowledgeSelection.mode, availability.availableIds),
+      }
     }
     return {
       kind: 'answer',

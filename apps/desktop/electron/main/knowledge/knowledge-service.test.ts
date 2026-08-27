@@ -171,7 +171,9 @@ describe('local knowledge service', () => {
         ? { name: '合同.txt', mimeType: 'text/plain', bytes: Buffer.from('合同经双方签字后生效。') }
         : { name: '合同-v2.txt', mimeType: 'text/plain', bytes: Buffer.from('合同经盖章后生效。') }],
       createParser: () => ({
-        parse: async () => parsedText(parse++ === 0 ? '合同经双方签字后生效。' : '合同经盖章后生效。'),
+        parse: async () => parsedText(parse++ === 0
+          ? '合同经双方签字后生效。 /etc/private /opt/autoforge \\\\server\\share\\secret.txt'
+          : '合同经盖章后生效。'),
         terminateAll: async () => undefined,
       }),
       saveExport: async () => undefined,
@@ -199,10 +201,12 @@ describe('local knowledge service', () => {
     const search = await service.searchSelected({ userId: 'alice' }, '合同经双', [base.id])
     if (search.kind !== 'results' || !search.evidence[0]) throw new Error('Expected evidence')
     const evidence = search.evidence[0]
-    await expect(service.getSourcePreview({ userId: 'alice' }, {
+    const preview = await service.getSourcePreview({ userId: 'alice' }, {
       evidenceId: evidence.id, baseId: evidence.baseId, documentId: evidence.documentId,
       versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
-    })).resolves.toMatchObject({ kind: 'available', preview: expect.stringContaining('合同') })
+    })
+    expect(preview).toMatchObject({ kind: 'available', preview: expect.stringContaining('合同') })
+    expect(JSON.stringify(preview)).not.toMatch(/\/etc\/private|\/opt\/autoforge|server\\share/u)
     const [replacement] = await service.pickImportFiles({ userId: 'alice' })
     await service.replaceDocument({ userId: 'alice' }, document!.id, replacement!.id)
     await vi.waitFor(async () => {

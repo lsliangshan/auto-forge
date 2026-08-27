@@ -41,11 +41,12 @@ describe('knowledge grounding blocks', () => {
   })
 
   it('records and revokes Provider-bound consent through the real desktop bridge action', async () => {
+    const getConsent = vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'unknown' })
     const setConsent = vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'granted' })
     const revokeConsent = vi.fn().mockResolvedValue({ provider: 'deepseek', status: 'unknown' })
     window.autoForge = {
       auth: {}, profile: {}, chat: {}, workflows: {}, executions: {}, settings: {},
-      knowledge: { setConsent, revokeConsent },
+      knowledge: { getConsent, setConsent, revokeConsent },
     } as unknown as DesktopAPI
     const wrapper = mount(MessageBlock, {
       props: { block: {
@@ -54,12 +55,44 @@ describe('knowledge grounding blocks', () => {
       } },
       global: { plugins: [ElementPlus] },
     })
+    await flushPromises()
+    expect(getConsent).toHaveBeenCalledWith('deepseek')
     await wrapper.get('[data-testid="grant-knowledge-consent"]').trigger('click')
     await flushPromises()
     expect(setConsent).toHaveBeenCalledWith('deepseek', 'granted')
     await wrapper.get('[data-testid="revoke-knowledge-consent"]').trigger('click')
     await flushPromises()
     expect(revokeConsent).toHaveBeenCalledWith('deepseek')
+  })
+
+  it('restores Provider consent on remount, refreshes on switch, and exposes sanitized failures', async () => {
+    const getConsent = vi.fn()
+      .mockResolvedValueOnce({ provider: 'deepseek', status: 'granted' })
+      .mockRejectedValueOnce(new Error('secret /etc/private'))
+    window.autoForge = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, executions: {}, settings: {},
+      knowledge: { getConsent, setConsent: vi.fn(), revokeConsent: vi.fn() },
+    } as unknown as DesktopAPI
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message:status', type: 'knowledge_status', blockId: 'status', status: 'consent_required',
+        searchIndex: 1, searchLimit: 3, evidenceCount: 1, provider: 'deepseek',
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('已授权当前模型供应商')
+    expect(wrapper.find('[data-testid="revoke-knowledge-consent"]').exists()).toBe(true)
+
+    await wrapper.setProps({ block: {
+      id: 'message:status', type: 'knowledge_status', blockId: 'status', status: 'consent_required',
+      searchIndex: 1, searchLimit: 3, evidenceCount: 1, provider: 'openrouter',
+    } })
+    await flushPromises()
+    expect(getConsent).toHaveBeenLastCalledWith('openrouter')
+    expect(wrapper.get('[data-testid="knowledge-consent-error"]').attributes('aria-live')).toBe('polite')
+    expect(wrapper.text()).toContain('无法读取当前授权状态')
+    expect(wrapper.text()).not.toContain('/etc/private')
   })
 
   it('fails a missing source closed without exposing stale preview text', async () => {
@@ -78,5 +111,25 @@ describe('knowledge grounding blocks', () => {
     await wrapper.get('[data-testid="toggle-knowledge-preview"]').trigger('click')
     await flushPromises()
     expect(wrapper.text()).toContain('来源当前不可用')
+  })
+
+  it('renders an upgraded legacy citation as unavailable without requesting its old preview', () => {
+    const getSourcePreview = vi.fn()
+    window.autoForge = {
+      auth: {}, profile: {}, chat: {}, workflows: {}, executions: {}, settings: {},
+      knowledge: { getSourcePreview },
+    } as unknown as DesktopAPI
+    const wrapper = mount(MessageBlock, {
+      props: { block: {
+        id: 'message:legacy', type: 'knowledge_citation', blockId: 'legacy',
+        evidenceId: 'evidence:legacy', baseId: 'legacy_unavailable',
+        documentId: 'document_legacy', versionId: 'version_legacy', legacyUnavailable: true,
+        coordinate: { kind: 'text', line: 3, startOffset: 0, endOffset: 6 },
+      } },
+      global: { plugins: [ElementPlus] },
+    })
+    expect(wrapper.text()).toContain('来源当前不可用')
+    expect(wrapper.find('[data-testid="toggle-knowledge-preview"]').exists()).toBe(false)
+    expect(getSourcePreview).not.toHaveBeenCalled()
   })
 })

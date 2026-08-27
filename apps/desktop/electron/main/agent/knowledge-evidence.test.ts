@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { KnowledgeEvidence } from '@autoforge/shared'
 import {
   CurrentTurnKnowledgeEvidence,
+  formatValidatedKnowledgeAnswer,
   parseKnowledgeSearchArguments,
   validateKnowledgeAnswer,
 } from './knowledge-evidence.js'
@@ -55,7 +56,7 @@ describe('CurrentTurnKnowledgeEvidence', () => {
   it('builds a bounded untrusted Provider envelope without owner, path, URL, or generation fields', () => {
     const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
     registry.add([evidence(0, {
-      snippet: '正文 https://signed.example/object?token=private /Users/alice/private.txt C:\\Users\\alice\\private.txt',
+      snippet: '正文 https://signed.example/object?token=private /Users/alice/private.txt /etc/passwd /opt/autoforge \\\\server\\share\\secret.txt C:\\Users\\alice\\private.txt',
       citation: {
         evidenceId: 'evidence:0', documentId: 'document_0', versionId: 'version_0',
         coordinate: { kind: 'docx', headingPath: ['https://signed.example/title'], paragraph: 1 },
@@ -69,6 +70,9 @@ describe('CurrentTurnKnowledgeEvidence', () => {
     expect(envelope).toContain('[REDACTED_LOCATION]')
     expect(envelope).not.toContain('signed.example')
     expect(envelope).not.toContain('/Users/alice')
+    expect(envelope).not.toContain('/etc/passwd')
+    expect(envelope).not.toContain('/opt/autoforge')
+    expect(envelope).not.toContain('server\\share')
     expect(envelope).not.toContain('C:\\Users')
     expect(envelope).not.toMatch(/owner|userId|https?:|generation/iu)
     expect(new TextEncoder().encode(envelope).byteLength).toBeLessThanOrEqual(40 * 1024)
@@ -88,7 +92,7 @@ describe('knowledge tool and answer validation', () => {
 
   it('validates citations only against current-turn evidence and allows exactly one repair decision', () => {
     const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
-    registry.add([evidence(0), evidence(1)])
+    registry.add([evidence(0, { snippet: '结论来自当前证据。' }), evidence(1)])
 
     expect(validateKnowledgeAnswer('结论 [[kb:evidence:0]]', registry.snapshot(), 'strict', 0)).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false, text: '结论',
@@ -109,14 +113,44 @@ describe('knowledge tool and answer validation', () => {
       kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】一般信息',
     })
     expect(validateKnowledgeAnswer(
-      '有依据的结论 [[kb:evidence:0]]\n\n未由依据支持的补充', [evidence(0)], 'strict', 0,
+      '第 0 条证据 [[kb:evidence:0]]\n\n未由依据支持的补充', [evidence(0)], 'strict', 0,
     )).toEqual({ kind: 'repair', invalidEvidenceIds: ['uncited-material'] })
     expect(validateKnowledgeAnswer(
-      '有依据的结论 [[kb:evidence:0]]\n\n一般补充', [evidence(0)], 'mixed', 0,
+      '第 0 条证据 [[kb:evidence:0]]\n\n一般补充', [evidence(0)], 'mixed', 0,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
-      text: '【知识库依据】有依据的结论\n【一般信息】一般补充',
+      text: '【知识库依据】第 0 条证据\n【一般信息】一般补充',
     })
+  })
+
+  it('rejects unrelated cited claims and grounds mixed answers clause by clause', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    expect(validateKnowledgeAnswer(
+      '月球由奶酪构成。[[kb:evidence:0]]', [contract], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['unsupported-claim'] })
+    expect(validateKnowledgeAnswer(
+      '月球由奶酪构成。[[kb:evidence:0]]', [contract], 'strict', 1,
+    )).toEqual({ kind: 'insufficient', reason: 'unsupported-claim' })
+
+    expect(validateKnowledgeAnswer(
+      '合同经双方签字后生效[[kb:evidence:0]]，但月球由奶酪构成[[kb:evidence:0]]。',
+      [contract], 'mixed', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
+      text: '【知识库依据】合同经双方签字后生效\n【一般信息】但月球由奶酪构成。',
+    })
+  })
+
+  it('downgrades mixed claims whose current cited source became unavailable', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    const validation = validateKnowledgeAnswer(
+      '合同经双方签字后生效。[[kb:evidence:0]]', [contract], 'mixed', 0,
+    )
+    expect(validation.kind).toBe('valid')
+    if (validation.kind !== 'valid') throw new Error('Expected valid answer')
+    expect(formatValidatedKnowledgeAnswer(validation, 'mixed', new Set())).toBe(
+      '【一般信息】合同经双方签字后生效。（来源当前不可用）',
+    )
   })
 
   it('requires a citation on each strict factual sentence and bounds eight emoji snippets by UTF-8 bytes', () => {
