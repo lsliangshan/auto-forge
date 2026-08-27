@@ -23,6 +23,11 @@ import { LocalKnowledgeRetriever } from './local-retriever.js'
 import { sanitizeKnowledgeText } from './knowledge-sanitizer.js'
 import type { KnowledgeOwner, KnowledgeService } from './knowledge-types.js'
 import { PARSER_MEDIA_TYPES, type ParserMediaType } from './parser-protocol.js'
+import {
+  KnowledgeSyncService,
+  type CloudKnowledgeRemote,
+  type CloudRetentionState,
+} from './sync-service.js'
 
 export const MAX_KNOWLEDGE_IMPORT_BYTES = 64 * 1024 * 1024
 const mediaTypes = new Set<string>(PARSER_MEDIA_TYPES)
@@ -55,7 +60,8 @@ export interface LocalKnowledgeServiceDependencies {
   verifyEntitlement?(
     ownerId: string,
     snapshot: SignedKnowledgeEntitlementSnapshot,
-  ): KnowledgeEntitlementState
+    observedAt: number,
+  ): KnowledgeEntitlementState & { issuedAt?: string; keyId?: string }
   cloudKillSwitchEnabled?(): boolean
   emit?(event: KnowledgeEvent): void
   now?(): number
@@ -75,6 +81,8 @@ interface Binding {
   parser: KnowledgeParserPort
   runner: ImportJobRunner
   handles: Map<string, ImportHandleRecord>
+  cloud: KnowledgeCloudLifecycle
+  cloudTasks: Set<Promise<unknown>>
 }
 
 interface UnavailableBinding {
@@ -86,9 +94,14 @@ interface UnavailableBinding {
 
 export interface LocalKnowledgeService extends KnowledgeService {
   bind(ownerId: string): Promise<void>
-  refreshEntitlement?(ownerId: string, snapshot?: SignedKnowledgeEntitlementSnapshot): Promise<void>
+  refreshEntitlement?(
+    ownerId: string,
+    snapshot?: SignedKnowledgeEntitlementSnapshot,
+    authorizationConfirmed?: boolean,
+  ): Promise<void>
   invalidate(): void
   drain(): Promise<void>
+  configureCloudRemote?(remote: CloudKnowledgeRemote | undefined): void
   restoreDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
   restoreBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   /** Main-only Agent retrieval over the conversation selection captured before the run. */
@@ -100,6 +113,36 @@ interface RetentionSelection {
   baseId: string
   documentId?: string
   confirmed: boolean
+}
+
+interface RetentionRecord {
+  baseId?: string
+  documentId?: string
+  confirmed: boolean
+}
+
+interface EntitlementProjectionRow {
+  tier: KnowledgeEntitlementState['tier']
+  status: KnowledgeEntitlementState['status']
+  betaEnabled: number
+  cloudEnabled: number
+  expiresAt: number | null
+  graceEndsAt: number | null
+  epoch: number
+  acceptedIssuedAt: number | null
+  acceptedKeyId: string | null
+  acceptedSnapshotDigest: string | null
+  verified: number
+  explicitFree: number
+  maxObservedAt: number
+}
+
+interface KnowledgeCloudLifecycle {
+  setCloudAccess(allowed: boolean): void
+  beginCloudRetention(knowledgeBaseId: string, boundaryAt: number): CloudRetentionState
+  advanceCloudRetention(knowledgeBaseId: string): Promise<CloudRetentionState | undefined>
+  invalidateOwner(): void
+  drain(): Promise<void>
 }
 
 function fail(code: AppError['code']): never {
@@ -180,6 +223,7 @@ export function createLocalKnowledgeService(
   let unavailable: UnavailableBinding | undefined
   let lifecycleTail = Promise.resolve()
   let refreshedEntitlement: { ownerId: string; epoch: number; state: KnowledgeEntitlementState } | undefined
+  let cloudRemote: CloudKnowledgeRemote | undefined
   let lifecycleFailure: unknown
   let hasLifecycleFailure = false
   const retiring = new Set<Promise<void>>()
@@ -187,8 +231,175 @@ export function createLocalKnowledgeService(
   const now = dependencies.now ?? Date.now
   const id = dependencies.id ?? randomUUID
 
+  const failClosedCloudLifecycle = (database: Database.Database): KnowledgeCloudLifecycle => {
+    let appliedCloudAccess = false
+    return {
+    setCloudAccess: () => {
+      if (appliedCloudAccess) return
+      appliedCloudAccess = true
+      database.prepare(`
+        UPDATE cloud_sync_states SET mode = CASE WHEN mode = 'converting' THEN mode ELSE 'paused' END,
+          epoch = epoch + 1, updated_at = ? WHERE mode <> 'local_only'
+      `).run(now())
+    },
+    beginCloudRetention: (knowledgeBaseId, boundaryAt) => {
+      const select = () => database.prepare(`
+        SELECT knowledge_base_id AS knowledgeBaseId, stage, download_until AS downloadUntil,
+          recycle_until AS recycleUntil, epoch FROM knowledge_cloud_retention
+        WHERE knowledge_base_id = ?
+      `).get(knowledgeBaseId) as CloudRetentionState | undefined
+      const existing = select()
+      if (existing) return existing
+      const operationId = id()
+      const generatedRequestId = id()
+      const requestId = generatedRequestId === operationId
+        ? `retention:${operationId}`.slice(0, 128)
+        : generatedRequestId
+      database.prepare(`
+        INSERT INTO knowledge_cloud_retention(
+          knowledge_base_id, stage, download_until, recycle_until, operation_id,
+          request_id, deletion_job_id, epoch, updated_at
+        ) VALUES (?, 'download_window', ?, ?, ?, ?, NULL, 1, ?)
+      `).run(
+        knowledgeBaseId,
+        boundaryAt + (30 * 24 * 60 * 60 * 1_000),
+        boundaryAt + (60 * 24 * 60 * 60 * 1_000),
+        operationId, requestId, now(),
+      )
+      return select()!
+    },
+    advanceCloudRetention: async (knowledgeBaseId) => {
+      const select = () => database.prepare(`
+        SELECT knowledge_base_id AS knowledgeBaseId, stage, download_until AS downloadUntil,
+          recycle_until AS recycleUntil, epoch FROM knowledge_cloud_retention
+        WHERE knowledge_base_id = ?
+      `).get(knowledgeBaseId) as CloudRetentionState | undefined
+      const current = select()
+      if (!current) return undefined
+      const stage = now() >= current.recycleUntil
+        ? 'purging'
+        : now() >= current.downloadUntil ? 'recycle' : current.stage
+      if (stage !== current.stage) database.prepare(`
+        UPDATE knowledge_cloud_retention SET stage = ?, epoch = epoch + 1, updated_at = ?
+        WHERE knowledge_base_id = ? AND epoch = ?
+      `).run(stage, now(), knowledgeBaseId, current.epoch)
+      return select()
+    },
+    invalidateOwner: () => {
+      database.prepare(`
+        UPDATE cloud_sync_states SET mode = 'paused', epoch = epoch + 1, updated_at = ?
+        WHERE mode <> 'local_only'
+      `).run(now())
+    },
+    drain: async () => undefined,
+    }
+  }
+
+  const createCloudLifecycle = (store: LocalKnowledgeStore): KnowledgeCloudLifecycle => {
+    if (!cloudRemote) return failClosedCloudLifecycle(store.database)
+    return new KnowledgeSyncService(store.database, cloudRemote, {
+      now,
+      id,
+      isOnline: () => true,
+      applyRemoteChange: async () => fail('CONFLICT'),
+      replaceRemoteSnapshot: async () => fail('CONFLICT'),
+    })
+  }
+
+  const reconcileCloud = (active: Binding, state: KnowledgeEntitlementState): void => {
+    const allowed = cloudRemote !== undefined
+      && state.cloudEnabled
+      && state.tier === 'member'
+      && state.status !== 'expired'
+      && dependencies.cloudKillSwitchEnabled?.() === false
+    active.cloud.setCloudAccess(allowed)
+    if (state.status !== 'expired') return
+    const boundaryAt = state.graceEndsAt ? Date.parse(state.graceEndsAt) : NaN
+    if (!Number.isSafeInteger(boundaryAt) || boundaryAt < 0) return
+    const rows = active.store.database.prepare(`
+      SELECT knowledge_base_id AS knowledgeBaseId FROM cloud_sync_states
+      WHERE mode <> 'local_only'
+      UNION SELECT knowledge_base_id AS knowledgeBaseId FROM knowledge_cloud_retention
+    `).all() as Array<{ knowledgeBaseId: string }>
+    for (const row of rows) {
+      active.cloud.beginCloudRetention(row.knowledgeBaseId, boundaryAt)
+      const advancing = active.cloud.advanceCloudRetention(row.knowledgeBaseId)
+      active.cloudTasks.add(advancing)
+      void advancing.then(
+        () => active.cloudTasks.delete(advancing),
+        () => active.cloudTasks.delete(advancing),
+      )
+    }
+  }
+
+  const readProjection = (active: Binding): EntitlementProjectionRow | undefined => (
+    active.store.database.prepare(`
+      SELECT tier, status, beta_enabled AS betaEnabled, cloud_enabled AS cloudEnabled,
+        expires_at AS expiresAt, grace_ends_at AS graceEndsAt, epoch,
+        accepted_issued_at AS acceptedIssuedAt, accepted_key_id AS acceptedKeyId,
+        accepted_snapshot_digest AS acceptedSnapshotDigest, verified, explicit_free AS explicitFree,
+        max_observed_at AS maxObservedAt
+      FROM knowledge_entitlement_projection WHERE singleton = 1
+    `).get() as EntitlementProjectionRow | undefined
+  )
+
+  const writeProjection = (
+    active: Binding,
+    state: KnowledgeEntitlementState,
+    options: {
+      verified?: boolean
+      explicitFree?: boolean
+      acceptedIssuedAt?: number | null
+      acceptedKeyId?: string | null
+      acceptedSnapshotDigest?: string | null
+      observedAt: number
+    },
+  ): void => {
+    const current = readProjection(active)
+    const expiresAt = state.expiresAt ? Date.parse(state.expiresAt) : null
+    const graceEndsAt = state.graceEndsAt ? Date.parse(state.graceEndsAt) : null
+    active.store.database.prepare(`
+      INSERT INTO knowledge_entitlement_projection(
+        singleton, tier, status, beta_enabled, cloud_enabled, expires_at,
+        grace_ends_at, epoch, updated_at, accepted_issued_at, accepted_key_id,
+        accepted_snapshot_digest, verified, explicit_free, max_observed_at
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(singleton) DO UPDATE SET
+        tier = excluded.tier, status = excluded.status,
+        beta_enabled = excluded.beta_enabled, cloud_enabled = excluded.cloud_enabled,
+        expires_at = excluded.expires_at, grace_ends_at = excluded.grace_ends_at,
+        epoch = knowledge_entitlement_projection.epoch + 1, updated_at = excluded.updated_at,
+        accepted_issued_at = excluded.accepted_issued_at,
+        accepted_key_id = excluded.accepted_key_id,
+        accepted_snapshot_digest = excluded.accepted_snapshot_digest,
+        verified = excluded.verified, explicit_free = excluded.explicit_free,
+        max_observed_at = excluded.max_observed_at
+    `).run(
+      state.tier, state.status, Number(state.betaEnabled === true), Number(state.cloudEnabled),
+      expiresAt, graceEndsAt, options.observedAt,
+      options.acceptedIssuedAt ?? current?.acceptedIssuedAt ?? null,
+      options.acceptedKeyId ?? current?.acceptedKeyId ?? null,
+      options.acceptedSnapshotDigest ?? current?.acceptedSnapshotDigest ?? null,
+      Number(options.verified === true), Number(options.explicitFree === true),
+      Math.max(options.observedAt, current?.maxObservedAt ?? 0),
+    )
+  }
+
   const entitlement = (active: Binding): KnowledgeEntitlementState => {
-    const raw = (refreshedEntitlement?.ownerId === active.ownerId
+    const current = readProjection(active)
+    const observedAt = Math.max(now(), current?.maxObservedAt ?? 0)
+    const persisted = current && (current.verified === 1 || current.explicitFree === 1)
+      ? {
+          tier: current.tier,
+          status: current.status,
+          localEnabled: true as const,
+          betaEnabled: current.betaEnabled === 1,
+          cloudEnabled: current.cloudEnabled === 1,
+          ...(current.expiresAt !== null ? { expiresAt: timestamp(current.expiresAt) } : {}),
+          ...(current.graceEndsAt !== null ? { graceEndsAt: timestamp(current.graceEndsAt) } : {}),
+        }
+      : undefined
+    const raw = persisted ?? (refreshedEntitlement?.ownerId === active.ownerId
       && refreshedEntitlement.epoch === active.epoch
       ? refreshedEntitlement.state
       : dependencies.entitlement?.(active.ownerId)) ?? {
@@ -199,7 +410,7 @@ export function createLocalKnowledgeService(
     }
     const expiry = raw.expiresAt ? Date.parse(raw.expiresAt) : undefined
     const graceEnd = raw.graceEndsAt ? Date.parse(raw.graceEndsAt) : undefined
-    const checkedAt = now()
+    const checkedAt = observedAt
     const projected: KnowledgeEntitlementState = expiry !== undefined && graceEnd !== undefined
       && Number.isFinite(expiry) && Number.isFinite(graceEnd)
       ? checkedAt <= expiry
@@ -208,14 +419,6 @@ export function createLocalKnowledgeService(
           ? { ...raw, status: 'offline_grace' }
           : { ...raw, tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false }
       : raw
-    const current = active.store.database.prepare(`
-      SELECT tier, status, beta_enabled AS betaEnabled, cloud_enabled AS cloudEnabled,
-        expires_at AS expiresAt, grace_ends_at AS graceEndsAt, epoch
-      FROM knowledge_entitlement_projection WHERE singleton = 1
-    `).get() as {
-      tier: string; status: string; betaEnabled: number; cloudEnabled: number
-      expiresAt: number | null; graceEndsAt: number | null; epoch: number
-    } | undefined
     const expiresAt = projected.expiresAt ? Date.parse(projected.expiresAt) : null
     const graceEndsAt = projected.graceEndsAt ? Date.parse(projected.graceEndsAt) : null
     const betaEnabled = projected.betaEnabled === true
@@ -224,41 +427,27 @@ export function createLocalKnowledgeService(
       || current.betaEnabled !== Number(betaEnabled)
       || current.cloudEnabled !== Number(projected.cloudEnabled)
       || current.expiresAt !== expiresAt || current.graceEndsAt !== graceEndsAt
+      || current.maxObservedAt !== observedAt
     if (changed) {
-      active.store.database.prepare(`
-        INSERT INTO knowledge_entitlement_projection(
-          singleton, tier, status, beta_enabled, cloud_enabled, expires_at,
-          grace_ends_at, epoch, updated_at
-        ) VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?)
-        ON CONFLICT(singleton) DO UPDATE SET
-          tier = excluded.tier, status = excluded.status,
-          beta_enabled = excluded.beta_enabled, cloud_enabled = excluded.cloud_enabled,
-          expires_at = excluded.expires_at, grace_ends_at = excluded.grace_ends_at,
-          epoch = knowledge_entitlement_projection.epoch + 1, updated_at = excluded.updated_at
-      `).run(
-        projected.tier, projected.status, Number(betaEnabled), Number(projected.cloudEnabled),
-        expiresAt, graceEndsAt, now(),
-      )
+      writeProjection(active, projected, {
+        verified: current?.verified === 1,
+        explicitFree: current?.explicitFree === 1,
+        observedAt,
+      })
     }
+    reconcileCloud(active, projected)
     return projected
   }
 
-  const storedRetention = (active: Binding): RetentionSelection | undefined => {
+  const storedRetention = (active: Binding): RetentionRecord | undefined => {
     const row = active.store.database.prepare(`
       SELECT retention.knowledge_base_id AS baseId, retention.document_id AS documentId,
         retention.confirmed
       FROM knowledge_free_retention AS retention
-      JOIN knowledge_bases AS base
-        ON base.id = retention.knowledge_base_id AND base.recycled_at IS NULL
-      LEFT JOIN documents AS document
-        ON document.id = retention.document_id
-       AND document.knowledge_base_id = retention.knowledge_base_id
-       AND document.recycled_at IS NULL
       WHERE retention.singleton = 1
-        AND (retention.document_id IS NULL OR document.id IS NOT NULL)
-    `).get() as { baseId: string; documentId: string | null; confirmed: number } | undefined
+    `).get() as { baseId: string | null; documentId: string | null; confirmed: number } | undefined
     return row ? {
-      baseId: row.baseId,
+      ...(row.baseId ? { baseId: row.baseId } : {}),
       ...(row.documentId ? { documentId: row.documentId } : {}),
       confirmed: row.confirmed === 1,
     } : undefined
@@ -287,7 +476,7 @@ export function createLocalKnowledgeService(
   const retention = (active: Binding, state = entitlement(active)): RetentionSelection | undefined => {
     if (state.tier === 'member' && state.status !== 'expired') return undefined
     const stored = storedRetention(active)
-    if (stored) return stored
+    if (stored) return stored.baseId ? stored as RetentionSelection : undefined
     const selected = active.store.database.prepare(`
       SELECT base.id AS baseId, document.id AS documentId
       FROM knowledge_bases AS base
@@ -382,9 +571,14 @@ export function createLocalKnowledgeService(
 
   const retire = (current: Binding): void => {
     current.runner.invalidate()
+    current.cloud.invalidateOwner()
     const closing = (async () => {
       const failures: PromiseSettledResult<unknown>[] = []
-      failures.push(...await settle([() => current.runner.drain()]))
+      failures.push(...await settle([
+        () => current.runner.drain(),
+        () => current.cloud.drain(),
+        () => Promise.allSettled([...current.cloudTasks]),
+      ]))
       for (const handle of current.handles.values()) {
         try {
           current.store.database.prepare(`
@@ -528,7 +722,10 @@ export function createLocalKnowledgeService(
         token: id,
         onDocumentChanged: documentId => emitDocument(active, documentId),
       })
-      Object.assign(active, { ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map() })
+      Object.assign(active, {
+        ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map(),
+        cloud: createCloudLifecycle(store), cloudTasks: new Set(),
+      })
       if (bindEpoch !== epoch) {
         const cleanup = await settle([() => runner.drain(), () => store.close()])
         const cleanupFailure = firstFailure(cleanup)
@@ -586,26 +783,67 @@ export function createLocalKnowledgeService(
 
   return {
     bind,
-    refreshEntitlement: async (ownerId, snapshot) => {
+    configureCloudRemote: (remote) => {
+      if (binding && remote) fail('CONFLICT')
+      if (binding) return
+      cloudRemote = remote
+    },
+    refreshEntitlement: async (ownerId, snapshot, authorizationConfirmed = true) => {
       if (!dependencies.refreshEntitlement && !dependencies.verifyEntitlement) return
       const active = binding
       if (!active || active.ownerId !== ownerId || active.epoch !== epoch) fail('AUTH_REQUIRED')
       const refreshEpoch = epoch
+      if (!authorizationConfirmed) {
+        entitlement(active)
+        return
+      }
+      const currentProjection = readProjection(active)
+      const observedAt = Math.max(now(), currentProjection?.maxObservedAt ?? 0)
       let state: KnowledgeEntitlementState | undefined
-      try {
-        state = snapshot && dependencies.verifyEntitlement
-          ? dependencies.verifyEntitlement(ownerId, snapshot)
-          : await dependencies.refreshEntitlement?.(ownerId)
-      } catch {
-        state = undefined
+      if (snapshot && dependencies.verifyEntitlement) {
+        const verified = dependencies.verifyEntitlement(ownerId, snapshot, observedAt)
+        const issuedAt = verified.issuedAt ? Date.parse(verified.issuedAt) : NaN
+        const keyId = verified.keyId
+        if (!Number.isFinite(issuedAt) || !keyId) fail('INVALID_INPUT')
+        const digest = createHash('sha256')
+          .update(snapshot.payload).update('.').update(snapshot.signature).digest('hex')
+        if (currentProjection?.acceptedIssuedAt !== null
+          && currentProjection?.acceptedIssuedAt !== undefined) {
+          if (issuedAt < currentProjection.acceptedIssuedAt
+            || (issuedAt === currentProjection.acceptedIssuedAt
+              && digest !== currentProjection.acceptedSnapshotDigest)) fail('FORBIDDEN')
+        }
+        state = verified
+        writeProjection(active, state, {
+          verified: true,
+          acceptedIssuedAt: issuedAt,
+          acceptedKeyId: keyId,
+          acceptedSnapshotDigest: digest,
+          observedAt,
+        })
+      } else if (dependencies.refreshEntitlement) {
+        try {
+          state = await dependencies.refreshEntitlement(ownerId)
+        } catch {
+          state = undefined
+        }
+        if (binding !== active || epoch !== refreshEpoch || active.ownerId !== ownerId) fail('CONFLICT')
+        if (state) writeProjection(active, state, { observedAt })
+      } else {
+        state = { tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false }
+        writeProjection(active, state, {
+          explicitFree: true,
+          acceptedIssuedAt: observedAt,
+          observedAt,
+        })
       }
       if (binding !== active || epoch !== refreshEpoch || active.ownerId !== ownerId) fail('CONFLICT')
       if (state) refreshedEntitlement = { ownerId, epoch: refreshEpoch, state }
-      else refreshedEntitlement = {
-        ownerId,
-        epoch: refreshEpoch,
-        state: { tier: 'free', status: 'unavailable', localEnabled: true, cloudEnabled: false },
-      }
+      else if (!currentProjection?.verified) refreshedEntitlement = {
+          ownerId,
+          epoch: refreshEpoch,
+          state: { tier: 'free', status: 'unavailable', localEnabled: true, cloudEnabled: false },
+        }
       entitlement(active)
     },
     invalidate,
@@ -629,14 +867,15 @@ export function createLocalKnowledgeService(
       return ids.map(row => baseSummary(
         active.store.database,
         row.id,
-        !member && kept !== undefined && kept.baseId !== row.id,
+        !member && kept?.baseId !== row.id,
       )!)
     },
     create: async (owner, rawName) => {
       const active = current(owner)
       const name = rawName.trim()
       if (!name || name.length > 200) fail('INVALID_INPUT')
-      if (!isMember(active)) {
+      const member = isMember(active)
+      if (!member) {
         const count = active.store.database.prepare('SELECT count(*) AS count FROM knowledge_bases').get() as { count: number }
         if (count.count >= 1) fail('CONFLICT')
       }
@@ -646,6 +885,9 @@ export function createLocalKnowledgeService(
         INSERT INTO knowledge_bases(id, name, created_at, updated_at, lifecycle_status, recycled_at)
         VALUES (?, ?, ?, ?, 'ready', NULL)
       `).run(baseId, name, createdAt, createdAt)
+      if (!member && !storedRetention(active)) {
+        writeRetention(active, { baseId, confirmed: false })
+      }
       return baseSummary(active.store.database, baseId)!
     },
     listDocuments: async (owner, baseId) => {
@@ -660,7 +902,7 @@ export function createLocalKnowledgeService(
       return rows.map(row => documentSummary(
         active.store.database,
         row.id,
-        !member && kept !== undefined && kept.documentId !== row.id,
+        !member && kept?.documentId !== row.id,
       )!)
     },
     listVersions: async (owner, documentId) => {
@@ -791,10 +1033,8 @@ export function createLocalKnowledgeService(
       `).get(documentId) as { active_version_id: string | null } | undefined
       if (!document) fail('NOT_FOUND')
       if (!isMember(active)) {
-        const count = active.store.database.prepare(
-          'SELECT count(*) AS count FROM documents WHERE recycled_at IS NULL',
-        ).get() as { count: number }
-        if (count.count >= 1) fail('CONFLICT')
+        const kept = storedRetention(active)
+        if (kept?.documentId !== documentId) fail('FORBIDDEN')
       }
       const status = document.active_version_id ? 'ready' : 'failed'
       active.store.database.prepare(`
@@ -812,6 +1052,13 @@ export function createLocalKnowledgeService(
         'SELECT object_id FROM document_versions WHERE document_id = ?',
       ).all(documentId) as Array<{ object_id: string }>
       active.store.database.transaction(() => {
+        if (storedRetention(active)?.documentId === documentId) {
+          const epochRow = readProjection(active)
+          active.store.database.prepare(`
+            UPDATE knowledge_free_retention SET knowledge_base_id = NULL, document_id = NULL,
+              confirmed = 0, entitlement_epoch = ?, updated_at = ? WHERE singleton = 1
+          `).run(epochRow?.epoch ?? 0, now())
+        }
         for (const object of objects) active.store.database.prepare(`
           INSERT OR IGNORE INTO knowledge_cleanup_records(object_id, created_at) VALUES (?, ?)
         `).run(object.object_id, now())
@@ -850,10 +1097,8 @@ export function createLocalKnowledgeService(
       ).get(baseId)
       if (!exists) fail('NOT_FOUND')
       if (!isMember(active)) {
-        const count = active.store.database.prepare(
-          'SELECT count(*) AS count FROM knowledge_bases WHERE recycled_at IS NULL',
-        ).get() as { count: number }
-        if (count.count >= 1) fail('CONFLICT')
+        const kept = storedRetention(active)
+        if (kept?.baseId !== baseId) fail('FORBIDDEN')
       }
       active.store.database.prepare(`
         UPDATE knowledge_bases SET lifecycle_status = 'ready', recycled_at = NULL, updated_at = ? WHERE id = ?
@@ -862,15 +1107,23 @@ export function createLocalKnowledgeService(
     purgeBase: async (owner, baseId) => {
       const active = current(owner)
       const exists = active.store.database.prepare(
-        'SELECT id FROM knowledge_bases WHERE id = ? AND recycled_at IS NOT NULL',
-      ).get(baseId)
-      if (!exists) fail('NOT_FOUND')
+        'SELECT recycled_at AS recycledAt FROM knowledge_bases WHERE id = ?',
+      ).get(baseId) as { recycledAt: number | null } | undefined
+      if (!exists) return
+      if (exists.recycledAt === null) fail('NOT_FOUND')
       const objects = active.store.database.prepare(`
         SELECT version.object_id FROM document_versions AS version
         JOIN documents AS document ON document.id = version.document_id
         WHERE document.knowledge_base_id = ?
       `).all(baseId) as Array<{ object_id: string }>
       active.store.database.transaction(() => {
+        if (storedRetention(active)?.baseId === baseId) {
+          const epochRow = readProjection(active)
+          active.store.database.prepare(`
+            UPDATE knowledge_free_retention SET knowledge_base_id = NULL, document_id = NULL,
+              confirmed = 0, entitlement_epoch = ?, updated_at = ? WHERE singleton = 1
+          `).run(epochRow?.epoch ?? 0, now())
+        }
         for (const object of objects) active.store.database.prepare(`
           INSERT OR IGNORE INTO knowledge_cleanup_records(object_id, created_at) VALUES (?, ?)
         `).run(object.object_id, now())
@@ -964,8 +1217,12 @@ export function createLocalKnowledgeService(
       const active = current(owner)
       const state = entitlement(active)
       const kept = retention(active, state)
+      const retained = storedRetention(active)
       return {
         ...state,
+        ...((state.tier !== 'member' || state.status === 'expired')
+          ? { retentionConfirmed: retained?.confirmed === true }
+          : {}),
         ...(kept ? {
           retainedBaseId: kept.baseId,
           ...(kept.documentId ? { retainedDocumentId: kept.documentId } : {}),
@@ -1001,6 +1258,7 @@ export function createLocalKnowledgeService(
         ...state,
         retainedBaseId: selected.baseId,
         retainedDocumentId: selected.documentId,
+        retentionConfirmed: true,
       }
     },
     getConsent: async (owner, provider: ModelProviderId = 'openrouter') => {

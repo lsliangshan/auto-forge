@@ -60,9 +60,10 @@ const availabilityLabel = computed(() => {
     : store.entitlement.status === 'expired' ? ' · 会员已到期，额外内容只读' : ''
   return `本地知识库可用 · ${cloudReady ? '云同步可用' : '云同步不可用'}${membership}`
 })
-const canRetainSelection = computed(() => store.entitlement?.status === 'expired'
+const canRetainSelection = computed(() => store.entitlement?.tier === 'free'
   && !!store.selectedBaseId && !!store.selectedDocumentId
-  && (store.entitlement.retainedBaseId !== store.selectedBaseId
+  && (store.entitlement.retentionConfirmed === false
+    || store.entitlement.retainedBaseId !== store.selectedBaseId
     || store.entitlement.retainedDocumentId !== store.selectedDocumentId))
 onMounted(() => store.bindOwner(auth.session?.user.id))
 watch(() => auth.session?.user.id, ownerId => store.bindOwner(ownerId))

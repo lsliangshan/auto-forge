@@ -30,6 +30,39 @@ function nonEmptyString(value, maximum = 254) {
   return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= maximum
 }
 
+function signedKnowledgeEntitlement(value) {
+  if (value === null || value === undefined) return value ?? null
+  if (!hasExactKeys(value, ['payload', 'signature'])
+    || !nonEmptyString(value.payload, 8192)
+    || !nonEmptyString(value.signature, 256)
+    || !/^[A-Za-z0-9_-]+$/.test(value.payload)
+    || !/^[A-Za-z0-9_-]+$/.test(value.signature)) return undefined
+  return { payload: value.payload, signature: value.signature }
+}
+
+function ensureRoleResult(value) {
+  if (!isRecord(value)) return undefined
+  const expected = ['userId', 'role', 'capabilities', 'version', 'updatedAt']
+  if (!(hasExactKeys(value, expected)
+    || hasExactKeys(value, [...expected, 'knowledgeEntitlement']))) return undefined
+  const entitlement = signedKnowledgeEntitlement(value.knowledgeEntitlement)
+  if (!nonEmptyString(value.userId, 64)
+    || !nonEmptyString(value.role, 63)
+    || !Array.isArray(value.capabilities) || value.capabilities.length > 16
+    || !value.capabilities.every(capability => nonEmptyString(capability, 63))
+    || !Number.isInteger(value.version) || value.version < 0
+    || !nonEmptyString(value.updatedAt, 64)
+    || entitlement === undefined) return undefined
+  return {
+    userId: value.userId,
+    role: value.role,
+    capabilities: [...value.capabilities],
+    version: value.version,
+    updatedAt: value.updatedAt,
+    knowledgeEntitlement: entitlement,
+  }
+}
+
 function callerUid(context) {
   if (!isRecord(context)) return undefined
   if (isRecord(context.auth) && nonEmptyString(context.auth.uid, 64)) return context.auth.uid
@@ -88,9 +121,13 @@ function createUserRoleHandler({ rpc }) {
     const event = isRecord(rawEvent) ? rawEvent : {}
     try {
       if (event.action === 'ensureMyRole') {
+        const result = ensureRoleResult(await rpc('autoforge_ensure_my_role', {
+          p_caller_user_id: uid,
+        }))
+        if (!result) throw { code: 'INTERNAL_ERROR' }
         return {
           ok: true,
-          data: await rpc('autoforge_ensure_my_role', { p_caller_user_id: uid }),
+          data: result,
         }
       }
       if (event.action === 'listUsers') {

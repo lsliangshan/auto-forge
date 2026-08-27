@@ -94,4 +94,24 @@ describe('KnowledgeEntitlementVerifier', () => {
       signature: sign(null, Buffer.from(invalid), key.privateKey).toString('base64url'),
     })).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }))
   })
+
+  it('rejects non-canonical base64url, non-64-byte signatures, and non-Ed25519 keys', () => {
+    const { envelope, verifier } = fixture()
+    const signed = envelope()
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    const last = signed.signature.at(-1)!
+    const nonCanonicalLast = alphabet[(alphabet.indexOf(last) ^ 1)]!
+    expect(() => verifier().verify('alice', {
+      ...signed,
+      signature: `${signed.signature.slice(0, -1)}${nonCanonicalLast}`,
+    })).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }))
+    expect(() => verifier().verify('alice', {
+      ...signed,
+      signature: Buffer.alloc(63).toString('base64url'),
+    })).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }))
+
+    const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    expect(() => new KnowledgeEntitlementVerifier({ publicKeys: { primary: rsa.publicKey } }))
+      .toThrowError()
+  })
 })

@@ -18,6 +18,7 @@ function fixture(
   overrides: Partial<CloudKnowledgeRemote> = {},
   online = true,
   localOverrides: LocalDependencyOverrides = {},
+  cloudAllowed = true,
 ) {
   const database = new CipherDatabase(':memory:')
   databases.push(database)
@@ -57,6 +58,7 @@ function fixture(
     applyRemoteChange,
     replaceRemoteSnapshot,
   })
+  if (cloudAllowed) service.setCloudAccess(true)
   return { database, remote, service, applyRemoteChange, replaceRemoteSnapshot }
 }
 
@@ -81,6 +83,25 @@ afterEach(() => {
 })
 
 describe('KnowledgeSyncService', () => {
+  it('starts fail closed and anchors retention windows to the entitlement boundary', async () => {
+    const { database, service } = fixture({}, true, {}, false)
+    expect(() => service.enqueue({
+      mutationId: 'closed', knowledgeBaseId: 'kb_1', entityKind: 'document',
+      entityId: 'doc_1', operation: 'upsert', baseRevision: null, payload: {},
+    })).toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }))
+    database.prepare(`
+      INSERT INTO cloud_sync_states(knowledge_base_id, mode, published_generation_id, epoch, updated_at)
+      VALUES ('kb_1', 'synced', 'generation_1', 1, 1)
+    `).run()
+    service.setCloudAccess(false)
+    expect(service.getState('kb_1').mode).toBe('paused')
+    expect(service.beginCloudRetention('kb_1', 500)).toMatchObject({
+      downloadUntil: 500 + (30 * 24 * 60 * 60 * 1_000),
+      recycleUntil: 500 + (60 * 24 * 60 * 60 * 1_000),
+    })
+    await expect(service.drain()).resolves.toBeUndefined()
+  })
+
   it('invalidates an awaited cloud callback and removes every cloud operation when access closes', async () => {
     let resolveBegin!: (value: {
       knowledgeBaseId: string; generationId: string; status: 'staging'

@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 6
+export const KNOWLEDGE_SCHEMA_VERSION = 7
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -255,6 +255,39 @@ const KNOWLEDGE_SCHEMA_V6 = `
   ) STRICT;
 `
 
+const KNOWLEDGE_SCHEMA_V7 = `
+  ALTER TABLE knowledge_entitlement_projection
+    ADD COLUMN accepted_issued_at INTEGER;
+  ALTER TABLE knowledge_entitlement_projection
+    ADD COLUMN accepted_key_id TEXT;
+  ALTER TABLE knowledge_entitlement_projection
+    ADD COLUMN accepted_snapshot_digest TEXT;
+  ALTER TABLE knowledge_entitlement_projection
+    ADD COLUMN verified INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0, 1));
+  ALTER TABLE knowledge_entitlement_projection
+    ADD COLUMN explicit_free INTEGER NOT NULL DEFAULT 0 CHECK (explicit_free IN (0, 1));
+  ALTER TABLE knowledge_entitlement_projection
+    ADD COLUMN max_observed_at INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE knowledge_free_retention_v7 (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    knowledge_base_id TEXT,
+    document_id TEXT,
+    confirmed INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0, 1)),
+    entitlement_epoch INTEGER NOT NULL CHECK (entitlement_epoch >= 0),
+    updated_at INTEGER NOT NULL,
+    CHECK (document_id IS NULL OR knowledge_base_id IS NOT NULL),
+    CHECK (confirmed = 0 OR (knowledge_base_id IS NOT NULL AND document_id IS NOT NULL)),
+    FOREIGN KEY (knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    FOREIGN KEY (document_id, knowledge_base_id)
+      REFERENCES documents(id, knowledge_base_id) ON DELETE CASCADE
+  ) STRICT;
+  INSERT INTO knowledge_free_retention_v7
+    SELECT * FROM knowledge_free_retention;
+  DROP TABLE knowledge_free_retention;
+  ALTER TABLE knowledge_free_retention_v7 RENAME TO knowledge_free_retention;
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
@@ -262,6 +295,7 @@ const migrations = new Map<number, string>([
   [4, KNOWLEDGE_SCHEMA_V4],
   [5, KNOWLEDGE_SCHEMA_V5],
   [6, KNOWLEDGE_SCHEMA_V6],
+  [7, KNOWLEDGE_SCHEMA_V7],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

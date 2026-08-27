@@ -1,5 +1,5 @@
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -33,7 +33,7 @@ import {
 } from './application.js'
 import { AgentOrchestrator } from './agent/agent-orchestrator.js'
 import type { AuthService } from './auth/auth-service.js'
-import type { BusinessRoleService } from './auth/cloudbase-role-service.js'
+import { CloudBaseRoleService, type BusinessRoleService } from './auth/cloudbase-role-service.js'
 import { BrowserContinuationRegistry } from './browser/browser-continuation-registry.js'
 import { BrowserManualResumeCoordinator } from './browser/browser-manual-resume-coordinator.js'
 import type {
@@ -70,6 +70,7 @@ import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
 import { createLocalKnowledgeService } from './knowledge/knowledge-service.js'
+import { canonicalizeEntitlementPayload, KnowledgeEntitlementVerifier } from './knowledge/entitlement-verifier.js'
 import type { KnowledgeParserPort } from './knowledge/import-job-runner.js'
 import { memoryKnowledgeStore, parsedText } from './knowledge/knowledge-test-support.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
@@ -1458,22 +1459,70 @@ describe('createApplicationRuntime', () => {
     })
     const runtime = createApplicationRuntime(options(root, {
       knowledgeService,
-      roleService: {
-        ensureMyRole: vi.fn(async () => ({
-          role: 'user', capabilities: [], version: 1,
-          updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
-          knowledgeEntitlement: signed,
-        })),
-        listUsers: vi.fn(),
-        updateUserRole: vi.fn(),
-      },
+      roleService: new CloudBaseRoleService({
+        callFunction: vi.fn(async () => ({ result: { ok: true, data: {
+          userId: 'test_user_entitlementalice', role: 'user', capabilities: [], version: 1,
+          updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: signed,
+        } } })),
+      }),
     }))
     const session = await authenticate(runtime, 'EntitlementAlice')
     refreshEntitlement.mockClear()
 
     await runtime.services.auth.refreshAuthorization()
 
-    expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, signed)
+    expect(refreshEntitlement).toHaveBeenCalledWith(session.user.id, signed, true)
+    await runtime.close()
+  })
+
+  it('admits a signed member through the real role transport and preserves it across a refresh outage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-real-role-entitlement-'))
+    directories.push(root)
+    const memory = memoryKnowledgeStore()
+    const keys = generateKeyPairSync('ed25519')
+    const canonical = canonicalizeEntitlementPayload({
+      userId: 'test_user_entitlementmember',
+      entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
+      issuedAt: '2026-08-27T00:00:00.000Z',
+      expiresAt: '2026-08-29T00:00:00.000Z',
+      keyId: 'primary',
+    })
+    const signed = {
+      payload: Buffer.from(canonical).toString('base64url'),
+      signature: sign(null, Buffer.from(canonical), keys.privateKey).toString('base64url'),
+    }
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: { primary: keys.publicKey },
+      now: () => Date.parse('2026-08-28T00:00:00.000Z'),
+    })
+    const knowledgeService = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      now: () => Date.parse('2026-08-28T00:00:00.000Z'),
+      verifyEntitlement: (ownerId, snapshot, observedAt) => verifier.verify(ownerId, snapshot, observedAt),
+    })
+    const callFunction = vi.fn()
+      .mockResolvedValueOnce({ result: { ok: true, data: {
+        userId: 'test_user_entitlementmember', role: 'user', capabilities: [], version: 1,
+        updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: signed,
+      } } })
+      .mockRejectedValueOnce(new Error('temporary role transport outage'))
+    const runtime = createApplicationRuntime(options(root, {
+      knowledgeService,
+      roleService: new CloudBaseRoleService({ callFunction }),
+    }))
+    const session = await authenticate(runtime, 'EntitlementMember')
+
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id }))
+      .resolves.toMatchObject({ tier: 'member', status: 'active', cloudEnabled: true })
+    await expect(runtime.services.auth.refreshAuthorization()).resolves.toMatchObject({
+      authorization: { confirmed: false, knowledgeEntitlement: signed },
+    })
+    await expect(runtime.services.knowledge.getEntitlement({ userId: session.user.id }))
+      .resolves.toMatchObject({ tier: 'member', status: 'active', cloudEnabled: true })
     await runtime.close()
   })
 

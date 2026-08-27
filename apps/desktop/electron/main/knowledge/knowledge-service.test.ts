@@ -1,10 +1,12 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { generateKeyPairSync, sign } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { KnowledgeEntitlementState } from '@autoforge/shared'
 import { KnowledgeStoreFactory } from './encrypted-database.js'
 import { createLocalKnowledgeService } from './knowledge-service.js'
+import { canonicalizeEntitlementPayload, KnowledgeEntitlementVerifier } from './entitlement-verifier.js'
 import type { KnowledgeParserPort } from './import-job-runner.js'
 import { memoryKnowledgeStore, parsedText } from './knowledge-test-support.js'
 
@@ -70,7 +72,7 @@ describe('local knowledge service', () => {
     }
     await expect(service.getEntitlement(owner)).resolves.toMatchObject({
       tier: 'free', status: 'expired', retainedBaseId: firstBase.id,
-      retainedDocumentId: firstDocument.id,
+      retainedDocumentId: firstDocument.id, retentionConfirmed: false,
     })
     await expect(service.list(owner)).resolves.toEqual([
       expect.objectContaining({ id: firstBase.id, status: 'ready', searchable: true }),
@@ -82,7 +84,10 @@ describe('local knowledge service', () => {
 
     await expect(service.retainFreeAllowance(owner, {
       baseId: secondBase.id, documentId: secondDocument.id,
-    })).resolves.toMatchObject({ retainedBaseId: secondBase.id, retainedDocumentId: secondDocument.id })
+    })).resolves.toMatchObject({
+      retainedBaseId: secondBase.id, retainedDocumentId: secondDocument.id,
+      retentionConfirmed: true,
+    })
     await expect(service.searchSelected(owner, '采购条款', [secondBase.id])).resolves.toMatchObject({
       kind: 'results', evidence: [expect.objectContaining({ documentId: secondDocument.id })],
     })
@@ -95,6 +100,132 @@ describe('local knowledge service', () => {
     await expect(service.exportBase(owner, firstBase.id)).resolves.toBeUndefined()
     expect(saveExport).toHaveBeenCalledOnce()
     await expect(service.recycleBase(owner, firstBase.id)).resolves.toBeUndefined()
+
+    await service.recycleDocument(owner, secondDocument.id)
+    await expect(service.getEntitlement(owner)).resolves.toMatchObject({
+      retainedBaseId: secondBase.id, retainedDocumentId: secondDocument.id,
+      retentionConfirmed: true,
+    })
+    await expect(service.restoreDocument(owner, secondDocument.id)).resolves.toBeUndefined()
+    await expect(service.searchSelected(owner, '采购条款', [secondBase.id])).resolves.toMatchObject({
+      kind: 'results', evidence: [expect.objectContaining({ documentId: secondDocument.id })],
+    })
+
+    await service.recycleDocument(owner, secondDocument.id)
+    await service.purgeDocument(owner, secondDocument.id)
+    const afterPurge = await service.getEntitlement(owner)
+    expect(afterPurge).toMatchObject({ retentionConfirmed: false })
+    expect(afterPurge).not.toHaveProperty('retainedBaseId')
+    await expect(service.list(owner)).resolves.toEqual([
+      expect.objectContaining({ id: firstBase.id, readOnly: true }),
+      expect.objectContaining({ id: secondBase.id, readOnly: true }),
+    ])
+  })
+
+  it('persists verified grace and replay/clock floors while transient refresh failures preserve authority', async () => {
+    const memory = memoryKnowledgeStore()
+    const keys = generateKeyPairSync('ed25519')
+    let observedAt = Date.parse('2026-08-28T00:00:00.000Z')
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: { primary: keys.publicKey }, now: () => observedAt,
+    })
+    const signed = (issuedAt: string, expiresAt: string) => {
+      const canonical = canonicalizeEntitlementPayload({
+        userId: 'alice', entitlements: ['knowledge_base_beta', 'knowledge_base_cloud'],
+        issuedAt, expiresAt, keyId: 'primary',
+      })
+      return {
+        payload: Buffer.from(canonical).toString('base64url'),
+        signature: sign(null, Buffer.from(canonical), keys.privateKey).toString('base64url'),
+      }
+    }
+    const firstSigned = signed('2026-08-27T00:00:00.000Z', '2026-08-29T00:00:00.000Z')
+    const laterSigned = signed('2026-08-28T00:00:00.000Z', '2026-08-30T00:00:00.000Z')
+    const createService = () => createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      now: () => observedAt,
+      verifyEntitlement: (ownerId, snapshot, effectiveNow) => (
+        verifier.verify(ownerId, snapshot, effectiveNow)
+      ),
+    })
+
+    const first = createService()
+    await first.bind('alice')
+    await first.refreshEntitlement!('alice', firstSigned, true)
+    await expect(first.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({ tier: 'member' })
+    first.invalidate()
+    await first.drain()
+
+    const restarted = createService()
+    await restarted.bind('alice')
+    await restarted.refreshEntitlement!('alice', undefined, false)
+    await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      tier: 'member', status: 'active',
+    })
+    await restarted.refreshEntitlement!('alice', laterSigned, true)
+    await expect(restarted.refreshEntitlement!('alice', firstSigned, true))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+
+    observedAt = Date.parse('2026-09-02T00:00:00.000Z') + 1
+    await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      tier: 'free', status: 'expired',
+    })
+    observedAt = Date.parse('2026-08-29T00:00:00.000Z')
+    await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      tier: 'free', status: 'expired',
+    })
+
+    await restarted.refreshEntitlement!('alice', undefined, true)
+    await expect(restarted.getEntitlement({ userId: 'alice' })).resolves.toMatchObject({
+      tier: 'free', status: 'active', cloudEnabled: false,
+    })
+    await expect(restarted.refreshEntitlement!('alice', laterSigned, true))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+  })
+
+  it('anchors durable cloud degradation to the signed grace boundary while local data remains available', async () => {
+    const memory = memoryKnowledgeStore()
+    const boundaryAt = Date.parse('2026-08-31T00:00:00.000Z')
+    let entitlement: KnowledgeEntitlementState = {
+      tier: 'member', status: 'active', localEnabled: true,
+      betaEnabled: true, cloudEnabled: true,
+      expiresAt: '2026-08-28T00:00:00.000Z',
+      graceEndsAt: '2026-08-31T00:00:00.000Z',
+    }
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      entitlement: () => entitlement,
+      cloudKillSwitchEnabled: () => true,
+      now: () => boundaryAt + 1,
+    })
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const base = await service.create(owner, '云端资料')
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(knowledge_base_id, mode, published_generation_id, epoch, updated_at)
+      VALUES (?, 'synced', 'generation_1', 1, ?)
+    `).run(base.id, boundaryAt)
+    entitlement = { ...entitlement, tier: 'free', status: 'expired', betaEnabled: false, cloudEnabled: false }
+
+    await expect(service.getEntitlement(owner)).resolves.toMatchObject({ status: 'expired' })
+    expect(memory.database.prepare(`
+      SELECT download_until AS downloadUntil, recycle_until AS recycleUntil
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({
+      downloadUntil: boundaryAt + (30 * 24 * 60 * 60 * 1_000),
+      recycleUntil: boundaryAt + (60 * 24 * 60 * 60 * 1_000),
+    })
+    await expect(service.list(owner)).resolves.toEqual([
+      expect.objectContaining({ id: base.id }),
+    ])
   })
 
   it('drops a late entitlement refresh after the owner epoch is invalidated', async () => {

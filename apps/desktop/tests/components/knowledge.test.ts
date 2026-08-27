@@ -136,6 +136,25 @@ describe('personal knowledge workspace', () => {
     })
   })
 
+  it('offers keep-one confirmation for every unconfirmed free downgrade state', async () => {
+    const client = api({
+      list: vi.fn().mockResolvedValue([base('base_1')]),
+      listDocuments: vi.fn().mockResolvedValue([document('doc_1', 'base_1')]),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false,
+        retainedBaseId: 'base_1', retainedDocumentId: 'doc_1', retentionConfirmed: false,
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="knowledge-retain-free-selection"]').exists()).toBe(true)
+  })
+
   it('renders local availability, base state, and a sanitized failed-document explanation', async () => {
     const failedBase = { ...base('base_failed', '失败资料'), status: 'failed' as const, searchable: false }
     const client = api({

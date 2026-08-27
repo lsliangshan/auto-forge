@@ -30,6 +30,51 @@ describe('CloudBaseRoleService', () => {
     })
   })
 
+  it('preserves only a strict opaque signed knowledge entitlement from ensureMyRole', async () => {
+    const callFunction = vi.fn().mockResolvedValue({
+      result: {
+        ok: true,
+        data: {
+          userId: 'uid_1', role: 'user', capabilities: [], version: 3,
+          updatedAt: '2026-08-28T00:00:00.000Z',
+          knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+        },
+      },
+    })
+    const service = new CloudBaseRoleService({ callFunction })
+    await expect(service.ensureMyRole()).resolves.toMatchObject({
+      confirmed: true,
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+    })
+
+    callFunction.mockResolvedValueOnce({
+      result: {
+        ok: true,
+        data: {
+          userId: 'uid_1', role: 'user', capabilities: [], version: 3,
+          updatedAt: '2026-08-28T00:00:00.000Z',
+          knowledgeEntitlement: { payload: 'eA', signature: 'eA', privateKey: 'forbidden' },
+        },
+      },
+    })
+    await expect(service.ensureMyRole()).rejects.toMatchObject({ code: 'INTERNAL_ERROR' })
+  })
+
+  it('maps a nullable cloud entitlement to an omitted free authorization field', async () => {
+    const service = new CloudBaseRoleService({
+      callFunction: vi.fn().mockResolvedValue({
+        result: { ok: true, data: {
+          userId: 'uid_1', role: 'user', capabilities: [], version: 0,
+          updatedAt: '2026-08-28T00:00:00.000Z', knowledgeEntitlement: null,
+        } },
+      }),
+    })
+    await expect(service.ensureMyRole()).resolves.toEqual({
+      role: 'user', capabilities: [], version: 0,
+      updatedAt: '2026-08-28T00:00:00.000Z', confirmed: true,
+    })
+  })
+
   it.each([
     'AUTH_REQUIRED',
     'FORBIDDEN',

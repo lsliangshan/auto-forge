@@ -1,4 +1,4 @@
-import { createPublicKey, verify, type KeyLike } from 'node:crypto'
+import { createPublicKey, KeyObject, verify, type KeyLike } from 'node:crypto'
 import { z } from 'zod'
 import { toSafeAppError } from '@autoforge/shared'
 
@@ -79,25 +79,35 @@ function fail(code: 'INVALID_INPUT' | 'FORBIDDEN'): never {
 }
 
 export class KnowledgeEntitlementVerifier {
-  private readonly publicKeys: ReadonlyMap<string, KeyLike>
+  private readonly publicKeys: ReadonlyMap<string, KeyObject>
   private readonly now: () => number
 
   constructor(input: {
     publicKeys: Readonly<Record<string, KeyLike>>
     now?: () => number
   }) {
-    this.publicKeys = new Map(Object.entries(input.publicKeys).map(([keyId, key]) => [
-      keyId,
-      typeof key === 'string' || Buffer.isBuffer(key) ? createPublicKey(key) : key,
-    ]))
+    this.publicKeys = new Map(Object.entries(input.publicKeys).map(([keyId, key]) => {
+      const publicKey = key instanceof KeyObject ? key : createPublicKey(key)
+      if (publicKey.type !== 'public' || publicKey.asymmetricKeyType !== 'ed25519') {
+        throw new TypeError('Knowledge entitlement verification keys must be Ed25519 public keys')
+      }
+      return [keyId, publicKey]
+    }))
     this.now = input.now ?? Date.now
   }
 
-  verify(ownerId: string, snapshot: SignedKnowledgeEntitlement): VerifiedKnowledgeEntitlement {
+  verify(
+    ownerId: string,
+    snapshot: SignedKnowledgeEntitlement,
+    observedAt = this.now(),
+  ): VerifiedKnowledgeEntitlement {
     if (!base64url.test(snapshot.payload) || snapshot.payload.length > 8_192
       || !base64url.test(snapshot.signature) || snapshot.signature.length > 256) fail('INVALID_INPUT')
     const payloadBytes = Buffer.from(snapshot.payload, 'base64url')
     const signature = Buffer.from(snapshot.signature, 'base64url')
+    if (payloadBytes.toString('base64url') !== snapshot.payload
+      || signature.toString('base64url') !== snapshot.signature
+      || signature.length !== 64) fail('INVALID_INPUT')
     let value: unknown
     try {
       value = JSON.parse(payloadBytes.toString('utf8'))
@@ -111,7 +121,7 @@ export class KnowledgeEntitlementVerifier {
     const publicKey = this.publicKeys.get(parsed.data.keyId)
     if (!publicKey || !verify(null, payloadBytes, publicKey, signature)) fail('FORBIDDEN')
     if (parsed.data.userId !== ownerId) fail('FORBIDDEN')
-    const now = this.now()
+    const now = observedAt
     const issuedAt = Date.parse(parsed.data.issuedAt)
     if (issuedAt > now) fail('FORBIDDEN')
     const expiresAt = Date.parse(parsed.data.expiresAt)

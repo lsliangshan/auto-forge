@@ -82,6 +82,30 @@ describe('CloudBase user role function', () => {
     })
   })
 
+  it('returns only a nullable strict opaque signed entitlement from the role RPC', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      userId: 'admin_1', role: 'user', capabilities: [], version: 0,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+    })
+    const handler = createUserRoleHandler({ rpc })
+    await expect(handler({ action: 'ensureMyRole' }, context)).resolves.toEqual({
+      ok: true,
+      data: expect.objectContaining({
+        knowledgeEntitlement: { payload: 'eA', signature: 'eA' },
+      }),
+    })
+
+    rpc.mockResolvedValueOnce({
+      userId: 'admin_1', role: 'user', capabilities: [], version: 0,
+      updatedAt: '2026-08-21T00:00:00.000Z',
+      knowledgeEntitlement: { payload: 'eA', signature: 'eA', privateKey: 'forbidden' },
+    })
+    await expect(handler({ action: 'ensureMyRole' }, context)).resolves.toEqual({
+      ok: false, error: { code: 'INTERNAL_ERROR' },
+    })
+  })
+
   it('ignores CloudBase-injected event identity metadata while trusting only the function context', async () => {
     const rpc = vi.fn().mockResolvedValue({
       userId: 'admin_1', role: 'user', capabilities: [], version: 0,
@@ -197,6 +221,9 @@ describe('CloudBase PostgreSQL user role migration', () => {
     expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.app_user_role_audit')
     expect(sql).toContain('user_id bigint PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE')
     expect(sql).toContain("'userId', role_row.user_id::text")
+    expect(sql).toContain("'knowledgeEntitlement', role_row.knowledge_entitlement")
+    expect(sql).toContain('knowledge_entitlement jsonb')
+    expect(sql).toContain('jsonb_object_length(knowledge_entitlement) = 2')
     expect(sql).toContain('users.id::text = p_caller_user_id')
     expect(sql).toContain('users.id::text = p_target_user_id')
     expect(sql).not.toMatch(/users\.id\s*=\s*p_(?:caller|target)_user_id/)

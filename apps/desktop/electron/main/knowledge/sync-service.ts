@@ -135,7 +135,8 @@ export class KnowledgeSyncService {
   private readonly activeSynchronizations = new Map<string, Promise<SyncResult>>()
   private readonly activeConversions = new Map<string, Promise<void>>()
   private entitlementEpoch = 0
-  private cloudAllowed = true
+  private cloudAllowed = false
+  private cloudAccessApplied = false
 
   constructor(
     private readonly database: Database.Database,
@@ -145,8 +146,9 @@ export class KnowledgeSyncService {
 
   /** Main entitlement/kill-switch hook. Revocation advances all durable base epochs. */
   setCloudAccess(allowed: boolean): void {
-    if (this.cloudAllowed === allowed) return
+    if (this.cloudAccessApplied && this.cloudAllowed === allowed) return
     this.cloudAllowed = allowed
+    this.cloudAccessApplied = true
     this.entitlementEpoch += 1
     if (!allowed) {
       const now = this.dependencies.now()
@@ -285,10 +287,10 @@ export class KnowledgeSyncService {
     }
 
     await this.pull(knowledgeBaseId, epoch)
-    this.assertCloudAccess(entitlementEpoch)
     if (!this.isActive(knowledgeBaseId, epoch)) {
       return { status: 'paused', processed, conflicts }
     }
+    this.assertCloudAccess(entitlementEpoch)
     const failures = this.database.prepare(`
       SELECT count(*) AS count FROM cloud_sync_mutations
       WHERE knowledge_base_id = ? AND state = 'failed'
@@ -319,6 +321,9 @@ export class KnowledgeSyncService {
   }
 
   invalidateOwner(): void {
+    this.cloudAllowed = false
+    this.cloudAccessApplied = true
+    this.entitlementEpoch += 1
     const now = this.dependencies.now()
     this.database.prepare(`
       INSERT INTO cloud_sync_states (
@@ -350,9 +355,15 @@ export class KnowledgeSyncService {
     return row ?? { mode: 'local_only', publishedGenerationId: null }
   }
 
-  beginCloudRetention(knowledgeBaseId: string): CloudRetentionState {
+  beginCloudRetention(
+    knowledgeBaseId: string,
+    entitlementBoundaryAt = this.dependencies.now(),
+  ): CloudRetentionState {
     const existing = this.getCloudRetention(knowledgeBaseId)
     if (existing) return existing
+    if (!Number.isSafeInteger(entitlementBoundaryAt) || entitlementBoundaryAt < 0) {
+      throw syncError('INVALID_INPUT')
+    }
     const exists = this.database.prepare(
       'SELECT 1 AS present FROM knowledge_bases WHERE id = ?',
     ).get(knowledgeBaseId)
@@ -370,7 +381,9 @@ export class KnowledgeSyncService {
           operation_id, request_id, deletion_job_id, epoch, updated_at
         ) VALUES (?, 'download_window', ?, ?, ?, ?, NULL, 1, ?)
       `).run(
-        knowledgeBaseId, now + THIRTY_DAYS_MS, now + (2 * THIRTY_DAYS_MS),
+        knowledgeBaseId,
+        entitlementBoundaryAt + THIRTY_DAYS_MS,
+        entitlementBoundaryAt + (2 * THIRTY_DAYS_MS),
         operationId, requestId, now,
       )
       this.setMode(knowledgeBaseId, 'paused')
@@ -782,6 +795,13 @@ export class KnowledgeSyncService {
       DELETE FROM cloud_sync_orphans
       WHERE knowledge_base_id = ? AND storage_reference IN (${placeholders})
     `).run(knowledgeBaseId, ...references)
+  }
+
+  async drain(): Promise<void> {
+    await Promise.allSettled([
+      ...this.activeSynchronizations.values(),
+      ...this.activeConversions.values(),
+    ])
   }
 
   private claimMutation(knowledgeBaseId: string): MutationRow | undefined {

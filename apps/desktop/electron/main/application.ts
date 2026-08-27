@@ -73,6 +73,7 @@ import { UserDataStoreManager, type UserDataStore } from './database/user-data-c
 import { CloudBaseUserDataPort } from './cloud/cloudbase-user-data-port.js'
 import { UserDataSyncEngine } from './sync/user-data-sync-engine.js'
 import { LegacyUserDataImporter } from './sync/legacy-user-data-import.js'
+import { CloudBaseKnowledgeClient } from './knowledge/cloudbase-knowledge-client.js'
 import {
   ProviderUsageConsistencyError,
   type AppRepositories,
@@ -395,6 +396,9 @@ export function observeAuthService(
           version: currentAuthorization?.version ?? 0,
           updatedAt: currentAuthorization?.updatedAt ?? session.authenticatedAt,
           confirmed: false,
+          ...(currentAuthorization?.knowledgeEntitlement
+            ? { knowledgeEntitlement: currentAuthorization.knowledgeEntitlement }
+            : {}),
         }
         authenticated = true
         currentUserId = session.user.id
@@ -768,6 +772,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let pauseUserMedia = (): void => undefined
   let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
   const knowledge = options.knowledgeService
+  knowledge?.configureCloudRemote?.(
+    cloudBasePorts ? new CloudBaseKnowledgeClient(cloudBasePorts.functions) : undefined,
+  )
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
@@ -782,6 +789,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       await knowledge?.refreshEntitlement?.(
         session.user.id,
         session.authorization?.knowledgeEntitlement,
+        session.authorization?.confirmed === true,
       )
       await bindUserMedia(session)
       boundUserId = session.user.id
@@ -1655,6 +1663,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         await knowledge?.refreshEntitlement?.(
           session.user.id,
           session.authorization?.knowledgeEntitlement,
+          session.authorization?.confirmed === true,
         )
         return session
       }),

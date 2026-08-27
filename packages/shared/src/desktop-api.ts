@@ -88,6 +88,7 @@ export const knowledgeEntitlementStateSchema = z.object({
   graceEndsAt: timestampSchema.optional(),
   retainedBaseId: identifierSchema.optional(),
   retainedDocumentId: identifierSchema.optional(),
+  retentionConfirmed: z.boolean().optional(),
 }).strict().superRefine((value, context) => {
   if (value.cloudEnabled && (value.tier !== 'member'
     || !['active', 'offline_grace'].includes(value.status)
