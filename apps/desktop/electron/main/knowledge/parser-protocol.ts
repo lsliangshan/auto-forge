@@ -130,7 +130,7 @@ export interface ParserResponseChunk {
   readonly index: number
   readonly totalChunks: number
   readonly totalBytes: number
-  readonly bytes: ArrayBufferView
+  readonly bytes: Uint8Array
 }
 
 export function parseParserRequest(value: unknown): ParserRequest {
@@ -184,7 +184,8 @@ function responseMatchesContext(response: ParserResponse, context: ParserRespons
       if (
         coordinate.page > context.limits.maxPages
         || coordinate.page <= previousPage
-        || coordinate.itemStart > coordinate.itemEnd
+        || coordinate.itemStart !== 0
+        || coordinate.itemEnd < 1
         || block.id !== `page-${coordinate.page}`
       ) return false
       previousPage = coordinate.page
@@ -267,12 +268,27 @@ export function parseParserResponseChunk(value: unknown, maxResponseBytes: numbe
     || (index as number) >= (totalChunks as number)
     || (totalBytes as number) < 1
     || (totalBytes as number) > maxResponseBytes
-    || !ArrayBuffer.isView(bytes)
+    || !(bytes instanceof Uint8Array)
+    || !(bytes.buffer instanceof ArrayBuffer)
+    || bytes.byteOffset !== 0
+    || bytes.buffer.byteLength !== bytes.byteLength
     || bytes.byteLength < 1
     || bytes.byteLength > PARSER_RESPONSE_CHUNK_BYTES
     || (totalChunks as number) !== Math.ceil((totalBytes as number) / PARSER_RESPONSE_CHUNK_BYTES)
   ) throw new Error('Knowledge parser protocol is invalid')
   return { version: 1, type: 'response-chunk', index, totalChunks, totalBytes, bytes } as ParserResponseChunk
+}
+
+export function clearParserResponseChunkBytes(value: unknown): void {
+  if (typeof value !== 'object' || value === null) return
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'bytes')
+  if (!descriptor || descriptor.get || descriptor.set || !ArrayBuffer.isView(descriptor.value)) return
+  const bytes = descriptor.value
+  try {
+    new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength).fill(0)
+  } catch {
+    // Detached or otherwise invalid typed views contain no accessible bytes to clear.
+  }
 }
 
 export function parseParserResponse(value: unknown, context?: ParserResponseContext): ParserResponse {

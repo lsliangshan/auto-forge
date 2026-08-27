@@ -8,7 +8,11 @@ import {
   powerSaveBlocker,
   session,
 } from 'electron'
-import { DEFAULT_PARSER_LIMITS } from '../main/knowledge/parser-protocol.js'
+import {
+  DEFAULT_PARSER_LIMITS,
+  PARSER_RESPONSE_CHUNK_BYTES,
+  parseParserResponseChunk,
+} from '../main/knowledge/parser-protocol.js'
 import {
   ParserFailure,
   ParserSupervisor,
@@ -18,10 +22,46 @@ import {
 const HANDLE = '0123456789abcdef0123456789abcdef'
 let stage = 'start'
 
+async function verifyCanonicalPortBoundary(): Promise<void> {
+  const { port1, port2 } = new MessageChannelMain()
+  try {
+    const checked = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Canonical port check timed out')), 2_000)
+      port2.once('message', ({ data }) => {
+        clearTimeout(timeout)
+        let rejected = false
+        try {
+          parseParserResponseChunk(data, DEFAULT_PARSER_LIMITS.maxResponseBytes)
+        } catch {
+          rejected = true
+        }
+        if (rejected) resolve()
+        else reject(new Error('Non-canonical port chunk was accepted'))
+      })
+    })
+    port2.start()
+    const backing = new Uint8Array(PARSER_RESPONSE_CHUNK_BYTES * 4)
+    port1.postMessage({
+      version: 1,
+      type: 'response-chunk',
+      index: 0,
+      totalChunks: 1,
+      totalBytes: 1,
+      bytes: backing.subarray(1, 2),
+    })
+    await checked
+  } finally {
+    port1.close()
+    port2.close()
+  }
+}
+
 async function run(): Promise<void> {
   stage = 'app-ready'
   await app.whenReady()
   const blocker = powerSaveBlocker.start('prevent-app-suspension')
+  stage = 'canonical-port-check'
+  await verifyCanonicalPortBoundary()
   stage = 'supervisor-create'
   const applicationRoot = process.env.AUTOFORGE_PARSER_APP_ROOT ?? app.getAppPath()
   const supervisor = new ParserSupervisor({

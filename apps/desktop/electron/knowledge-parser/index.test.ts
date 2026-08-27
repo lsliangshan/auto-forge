@@ -14,7 +14,7 @@ import {
   minimalDocx,
   minimalPdf,
 } from '../main/knowledge/test-fixtures/document-fixtures.js'
-import { parseEncryptedDocument } from './index.js'
+import { parseEncryptedDocument, postParserResponse } from './index.js'
 import { parseDocx } from './parsers/docx.js'
 import { parsePdf } from './parsers/pdf.js'
 
@@ -69,6 +69,48 @@ describe('sandbox knowledge parser', () => {
     })).resolves.toMatchObject({ type: 'error', code: 'PARSER_PROTOCOL_INVALID' })
     expect(new Uint8Array(encryptedSnapshot).every(byte => byte === 0)).toBe(true)
     expect(new Uint8Array(oneTimeKey).every(byte => byte === 0)).toBe(true)
+  })
+
+  it('clears renderer snapshot and key buffers on the lowered encrypted-byte early limit', async () => {
+    const request = encryptedRequest('text/plain', Buffer.from('bounded'))
+    request.limits = {
+      ...request.limits,
+      maxEncryptedBytes: request.encryptedSnapshot.byteLength - 1,
+    }
+    await expect(parseEncryptedDocument(request))
+      .resolves.toMatchObject({ type: 'error', code: 'PARSER_LIMIT_EXCEEDED' })
+    expect(new Uint8Array(request.encryptedSnapshot).every(byte => byte === 0)).toBe(true)
+    expect(new Uint8Array(request.oneTimeKey).every(byte => byte === 0)).toBe(true)
+  })
+
+  it('clears encoded response and current chunk and closes the port when postMessage throws', () => {
+    const originalEncode = TextEncoder.prototype.encode
+    let encoded: Uint8Array<ArrayBuffer> | undefined
+    const encodeSpy = vi.spyOn(TextEncoder.prototype, 'encode').mockImplementation(function (
+      this: TextEncoder,
+      input?: string,
+    ): Uint8Array<ArrayBuffer> {
+      encoded = originalEncode.call(this, input) as Uint8Array<ArrayBuffer>
+      return encoded
+    })
+    let currentChunk: Uint8Array | undefined
+    const port = {
+      postMessage: vi.fn((frame: { bytes: Uint8Array }) => {
+        currentChunk = frame.bytes
+        throw new Error('port closed')
+      }),
+      close: vi.fn(),
+    }
+    expect(() => postParserResponse(port, {
+      version: 1,
+      type: 'error',
+      jobId: 'post-failure',
+      code: 'PARSER_INTERNAL_ERROR',
+    })).toThrow('port closed')
+    expect(encoded?.every(byte => byte === 0)).toBe(true)
+    expect(currentChunk?.every(byte => byte === 0)).toBe(true)
+    expect(port.close).toHaveBeenCalledOnce()
+    encodeSpy.mockRestore()
   })
 
   it('decodes fatal UTF-8 TXT with stable line and character coordinates', async () => {
@@ -204,8 +246,8 @@ describe('sandbox knowledge parser', () => {
       type: 'result',
       document: {
         blocks: [
-          { text: 'PDF first', coordinate: { kind: 'pdf', page: 1, itemStart: 0 } },
-          { text: 'PDF second', coordinate: { kind: 'pdf', page: 2, itemStart: 0 } },
+          { text: 'PDF first', coordinate: { kind: 'pdf', page: 1, itemStart: 0, itemEnd: 1 } },
+          { text: 'PDF second', coordinate: { kind: 'pdf', page: 2, itemStart: 0, itemEnd: 1 } },
         ],
       },
     })

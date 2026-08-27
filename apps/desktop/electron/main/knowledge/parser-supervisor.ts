@@ -1,11 +1,12 @@
 import type { EventEmitter } from 'node:events'
 import { createCipheriv, randomBytes, randomUUID } from 'node:crypto'
 import { stat } from 'node:fs/promises'
-import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_PARSER_LIMITS,
   PARSER_MEDIA_TYPES,
+  clearParserResponseChunkBytes,
   parseParserRequest,
   parseParserResponseBytes,
   parseParserResponseChunk,
@@ -96,11 +97,13 @@ function fail(code: ParserErrorCode): never {
 function isAllowedParserAsset(url: string, workerHtmlPath: string): boolean {
   try {
     const parsed = new URL(url)
-    if (parsed.protocol !== 'file:') return false
-    const assetRoot = resolve(dirname(workerHtmlPath), '../..')
-    const candidate = fileURLToPath(parsed)
-    const pathFromRoot = relative(assetRoot, candidate)
-    return pathFromRoot === '' || (!pathFromRoot.startsWith('..') && !isAbsolute(pathFromRoot))
+    if (parsed.protocol !== 'file:' || parsed.search || parsed.hash) return false
+    const candidate = resolve(fileURLToPath(parsed))
+    if (candidate === resolve(workerHtmlPath)) return true
+    const assetRoot = resolve(dirname(workerHtmlPath), '../../assets')
+    if (dirname(candidate) !== assetRoot) return false
+    return /^(?:knowledgeParser|schemas|decode|_commonjsHelpers|text|markdown|html|docx|pdf)-[A-Za-z0-9_-]+\.js$/.test(basename(candidate))
+      || /^pdf\.worker-[A-Za-z0-9_-]+\.mjs$/.test(basename(candidate))
   } catch {
     return false
   }
@@ -331,12 +334,22 @@ export class ParserSupervisor {
             .finally(() => { checkingMemory = false })
         }, 25)
         port2?.on('message', (event: { data: unknown }) => {
-          ensureWithinDeadline()
-          if (settled || terminalCode) return
+          if (settled || terminalCode) {
+            clearParserResponseChunkBytes(event.data)
+            return
+          }
+          try {
+            ensureWithinDeadline()
+          } catch {
+            clearParserResponseChunkBytes(event.data)
+            rejectCode('PARSER_TIMEOUT')
+            return
+          }
           let chunk
           try {
             chunk = parseParserResponseChunk(event.data, limits.maxResponseBytes)
           } catch {
+            clearParserResponseChunkBytes(event.data)
             rejectCode('PARSER_PROTOCOL_INVALID')
             return
           }
@@ -350,7 +363,7 @@ export class ParserSupervisor {
             || chunk.totalBytes !== responseBuffer.byteLength
             || responseOffset + chunk.bytes.byteLength > responseBuffer.byteLength
           ) {
-            new Uint8Array(chunk.bytes.buffer, chunk.bytes.byteOffset, chunk.bytes.byteLength).fill(0)
+            clearParserResponseChunkBytes(event.data)
             rejectCode('PARSER_PROTOCOL_INVALID')
             return
           }

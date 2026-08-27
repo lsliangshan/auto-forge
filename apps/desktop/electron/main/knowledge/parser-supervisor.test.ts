@@ -97,7 +97,7 @@ function harness(
     createMessageChannel: vi.fn(() => ({ port1, port2 })),
     resolveObject,
     workerHtmlPath: '/app/out/renderer/electron/knowledge-parser/index.html',
-    preloadPath: '/app/out/preload/knowledge-parser.cjs',
+    preloadPath: '/app/out/preload/knowledgeParser.cjs',
     partitionId: () => 'autoforge-parser-test-unique',
     processMemoryBytes,
     ...overrides,
@@ -190,18 +190,32 @@ describe('sandbox parser supervisor', () => {
         webviewTag: false,
         backgroundThrottling: false,
         partition: 'autoforge-parser-test-unique',
-        preload: '/app/out/preload/knowledge-parser.cjs',
+        preload: '/app/out/preload/knowledgeParser.cjs',
       }),
     }))
     const networkDecision = vi.fn()
     h.networkHandler()?.({ url: 'https://invalid.example/steal' }, networkDecision)
     expect(networkDecision).toHaveBeenCalledWith({ cancel: true })
-    const allowedAsset = vi.fn()
-    h.networkHandler()?.({ url: 'file:///app/out/renderer/assets/pdf.worker.mjs' }, allowedAsset)
-    expect(allowedAsset).toHaveBeenCalledWith({ cancel: false })
+    for (const url of [
+      'file:///app/out/renderer/electron/knowledge-parser/index.html',
+      'file:///app/out/renderer/assets/knowledgeParser-Ab12_cd.js',
+      'file:///app/out/renderer/assets/schemas-Ab12_cd.js',
+      'file:///app/out/renderer/assets/decode-Ab12_cd.js',
+      'file:///app/out/renderer/assets/_commonjsHelpers-Ab12_cd.js',
+      'file:///app/out/renderer/assets/pdf-Xy9.js',
+      'file:///app/out/renderer/assets/pdf.worker-Ab12_cd.mjs',
+    ]) {
+      const decision = vi.fn()
+      h.networkHandler()?.({ url }, decision)
+      expect(decision).toHaveBeenCalledWith({ cancel: false })
+    }
     for (const url of [
       'file:///app/out/private.txt',
       'file:///app/out/renderer/../private.txt',
+      'file:///app/out/renderer/index.html',
+      'file:///app/out/renderer/assets/index-Ab12_cd.js',
+      'file:///app/out/renderer/assets/random-Ab12_cd.js',
+      'file:///app/out/renderer/assets/pdf.worker.mjs',
       'custom://parser/escape',
     ]) {
       const decision = vi.fn()
@@ -484,6 +498,67 @@ describe('sandbox parser supervisor', () => {
       mediaType: 'text/plain',
       limits: DEFAULT_PARSER_LIMITS,
     })).resolves.toMatchObject({ text: largeText })
+  })
+
+  it('rejects non-canonical chunk views before JSON parsing and clears every recognizable frame', async () => {
+    const giantBacking = new Uint8Array(PARSER_RESPONSE_CHUNK_BYTES * 4)
+    giantBacking.fill(7)
+    const subview = giantBacking.subarray(1, 2)
+    const jsonParse = vi.spyOn(JSON, 'parse')
+    const h = harness({
+      version: 1,
+      type: 'response-chunk',
+      index: 0,
+      totalChunks: 1,
+      totalBytes: 1,
+      bytes: subview,
+    }, {}, true)
+    await expect(h.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 3),
+      mediaType: 'text/plain',
+      limits: DEFAULT_PARSER_LIMITS,
+    })).rejects.toMatchObject({ code: 'PARSER_PROTOCOL_INVALID' })
+    expect(jsonParse).not.toHaveBeenCalled()
+    expect(subview[0]).toBe(0)
+    expect(giantBacking[0]).toBe(7)
+    jsonParse.mockRestore()
+
+    const descriptorBytes = new Uint8Array([9])
+    const invalidDescriptor = harness({
+      version: 1,
+      type: 'response-chunk',
+      index: 0,
+      totalChunks: 1,
+      totalBytes: 1,
+      bytes: descriptorBytes,
+      forbidden: true,
+    }, {}, true)
+    await expect(invalidDescriptor.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 4),
+      mediaType: 'text/plain',
+      limits: DEFAULT_PARSER_LIMITS,
+    })).rejects.toMatchObject({ code: 'PARSER_PROTOCOL_INVALID' })
+    expect(descriptorBytes[0]).toBe(0)
+
+    const settled = harness(success)
+    await settled.supervisor.parse({
+      objectHandle: HANDLE,
+      oneTimeKey: Buffer.alloc(32, 5),
+      mediaType: 'text/plain',
+      limits: DEFAULT_PARSER_LIMITS,
+    })
+    const lateBytes = new Uint8Array([8])
+    settled.port2.emit('message', { data: {
+      version: 1,
+      type: 'response-chunk',
+      index: 0,
+      totalChunks: 1,
+      totalBytes: 1,
+      bytes: lateBytes,
+    } })
+    expect(lateBytes[0]).toBe(0)
   })
 
   it('ships a deny-by-default parser CSP and verifies packaged assets before supervisor creation', async () => {

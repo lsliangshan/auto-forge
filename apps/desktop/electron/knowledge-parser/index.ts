@@ -70,12 +70,11 @@ export async function parseEncryptedDocument(input: unknown): Promise<ParserResp
     clearUnparsedRequestBuffers(input)
     return { version: 1, type: 'error', jobId, code: 'PARSER_PROTOCOL_INVALID' }
   }
-  if (request.encryptedSnapshot.byteLength > request.limits.maxEncryptedBytes) {
-    return { version: 1, type: 'error', jobId, code: 'PARSER_LIMIT_EXCEEDED' }
-  }
-
   let cleartext: Uint8Array | undefined
   try {
+    if (request.encryptedSnapshot.byteLength > request.limits.maxEncryptedBytes) {
+      throw new DocumentParserError('PARSER_LIMIT_EXCEEDED')
+    }
     cleartext = await decryptSnapshot(request.encryptedSnapshot, request.oneTimeKey)
     const document = await parseDocument(request.mediaType, cleartext, request.limits)
     const response = { version: 1, type: 'result', jobId, document } as const
@@ -97,28 +96,48 @@ export async function parseEncryptedDocument(input: unknown): Promise<ParserResp
   }
 }
 
+interface ParserResponsePort {
+  postMessage(message: unknown): void
+  close(): void
+}
+
+export function postParserResponse(port: ParserResponsePort, response: ParserResponse): void {
+  let encoded: Uint8Array | undefined
+  let currentChunk: Uint8Array | undefined
+  try {
+    encoded = new TextEncoder().encode(JSON.stringify(response))
+    const totalChunks = Math.ceil(encoded.byteLength / PARSER_RESPONSE_CHUNK_BYTES)
+    for (let index = 0; index < totalChunks; index += 1) {
+      const start = index * PARSER_RESPONSE_CHUNK_BYTES
+      currentChunk = encoded.slice(start, start + PARSER_RESPONSE_CHUNK_BYTES)
+      port.postMessage({
+        version: 1,
+        type: 'response-chunk',
+        index,
+        totalChunks,
+        totalBytes: encoded.byteLength,
+        bytes: currentChunk,
+      })
+      currentChunk.fill(0)
+      currentChunk = undefined
+    }
+  } finally {
+    currentChunk?.fill(0)
+    encoded?.fill(0)
+    port.close()
+  }
+}
+
 if (typeof window !== 'undefined') {
   window.addEventListener('message', (event: MessageEvent<unknown>) => {
     const port = event.ports[0]
     if (!port) return
     void parseEncryptedDocument(event.data).then((response) => {
-      const encoded = new TextEncoder().encode(JSON.stringify(response))
-      const totalChunks = Math.ceil(encoded.byteLength / PARSER_RESPONSE_CHUNK_BYTES)
-      for (let index = 0; index < totalChunks; index += 1) {
-        const start = index * PARSER_RESPONSE_CHUNK_BYTES
-        const bytes = encoded.slice(start, start + PARSER_RESPONSE_CHUNK_BYTES)
-        port.postMessage({
-          version: 1,
-          type: 'response-chunk',
-          index,
-          totalChunks,
-          totalBytes: encoded.byteLength,
-          bytes,
-        })
-        bytes.fill(0)
+      try {
+        postParserResponse(port, response)
+      } catch {
+        // The supervisor owns job failure once the response port is unavailable.
       }
-      encoded.fill(0)
-      port.close()
     })
   }, { once: true })
 }

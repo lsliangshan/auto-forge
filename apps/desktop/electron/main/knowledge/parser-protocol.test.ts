@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_PARSER_LIMITS,
+  PARSER_RESPONSE_CHUNK_BYTES,
   parseParserRequest,
   parseParserResponse,
+  parseParserResponseChunk,
 } from './parser-protocol.js'
 
 function request(): unknown {
@@ -241,5 +243,53 @@ describe('knowledge parser protocol', () => {
         }],
       },
     }, docxContext)).toThrow(/protocol/i)
+  })
+
+  it('accepts only canonical bounded Uint8Array response chunks', () => {
+    const frame = (bytes: ArrayBufferView) => ({
+      version: 1,
+      type: 'response-chunk',
+      index: 0,
+      totalChunks: 1,
+      totalBytes: bytes.byteLength,
+      bytes,
+    })
+    expect(parseParserResponseChunk(frame(new Uint8Array([1])), 128).bytes)
+      .toEqual(new Uint8Array([1]))
+
+    const giantBacking = new Uint8Array(PARSER_RESPONSE_CHUNK_BYTES * 4)
+    for (const bytes of [
+      giantBacking.subarray(1, 2),
+      new DataView(new ArrayBuffer(1)),
+      new Uint16Array(1),
+      new Uint8Array(PARSER_RESPONSE_CHUNK_BYTES + 1),
+    ]) {
+      expect(() => parseParserResponseChunk(frame(bytes), PARSER_RESPONSE_CHUNK_BYTES * 2))
+        .toThrow(/protocol/i)
+    }
+  })
+
+  it('rejects non-canonical PDF item coordinates', () => {
+    const context = {
+      jobId: 'job-1',
+      mediaType: 'application/pdf' as const,
+      limits: DEFAULT_PARSER_LIMITS,
+    }
+    const response = (itemStart: number, itemEnd: number) => ({
+      version: 1,
+      type: 'result',
+      jobId: 'job-1',
+      document: {
+        mediaType: 'application/pdf',
+        text: 'page text',
+        blocks: [{
+          id: 'page-1',
+          text: 'page text',
+          coordinate: { kind: 'pdf', page: 1, itemStart, itemEnd },
+        }],
+      },
+    })
+    expect(() => parseParserResponse(response(1, 2), context)).toThrow(/protocol/i)
+    expect(() => parseParserResponse(response(0, 0), context)).toThrow(/protocol/i)
   })
 })
