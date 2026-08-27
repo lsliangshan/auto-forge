@@ -149,6 +149,10 @@ describe('CloudBase personal knowledge migration', () => {
     expect(sql).toContain('"region":"guangzhou"')
     expect(sql).toContain('cardinality(embedding) = 1024')
     expect(sql).not.toMatch(/\bUSING\s+hnsw\b/i)
+    expect(sql).toContain('provider_request_key varchar(128) NOT NULL')
+    expect(sql).toContain('settlement_outcome varchar(16)')
+    expect(sql).toContain('provider_response_hash char(64)')
+    expect(sql).toContain('settlement_intent_at timestamptz')
 
     const revoke = staticFunctionBodyFragment(sql, 'autoforge_knowledge_set_embedding_consent')
     expect(revoke).toContain('owner bigint := public.autoforge_knowledge_caller(p_caller_user_id)')
@@ -158,6 +162,9 @@ describe('CloudBase personal knowledge migration', () => {
     expect(revoke).toContain("state = 'expired'")
     expect(revoke).toContain("rebuild_required = p_enabled")
     expect(revoke).toContain("state = 'revoking'")
+    expect(revoke).toContain("owner::text || ':embedding-consent'")
+    expect(revoke).toContain('SELECT prior.response INTO response')
+    expect(revoke).toContain("prior.response->>'state' = 'revoked'")
 
     const issuePermit = staticFunctionBodyFragment(
       sql, 'autoforge_knowledge_issue_embedding_dispatch_permit',
@@ -170,6 +177,9 @@ describe('CloudBase personal knowledge migration', () => {
     expect(issuePermit).toContain("completed.state = 'completed'")
     expect(issuePermit).toContain("prior.state = 'failed'")
     expect(issuePermit).toContain('p_attempt_id - 1')
+    expect(issuePermit).toContain("'embed_' || md5(jsonb_build_array(")
+    expect(issuePermit).toContain("'providerRequestKey', permit.provider_request_key")
+    expect(issuePermit).toContain("'recovery', jsonb_build_object")
     const reserveAttempt = staticFunctionBodyFragment(
       sql, 'autoforge_knowledge_reserve_embedding_dispatch_attempt',
     )
@@ -181,11 +191,25 @@ describe('CloudBase personal knowledge migration', () => {
     )
     expect(startAttempt).toContain("consent.state <> 'granted'")
     expect(startAttempt).toContain("SET state = 'started'")
+    const recordIntent = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_record_embedding_dispatch_settlement_intent',
+    )
+    expect(recordIntent).toContain('provider_response_hash')
+    expect(recordIntent).toContain('settlement_outcome')
+    expect(recordIntent).toContain('settlement_intent_at')
+    expect(recordIntent).toContain('IS DISTINCT FROM p_provider_response_hash')
     const settleAttempt = staticFunctionBodyFragment(
       sql, 'autoforge_knowledge_settle_embedding_dispatch_attempt',
     )
     expect(settleAttempt).toContain("p_outcome NOT IN ('completed', 'failed')")
+    expect(settleAttempt).toContain('permit.settlement_outcome IS DISTINCT FROM p_outcome')
     expect(settleAttempt).toContain('state = p_outcome')
+    const revocationRecovery = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_get_embedding_revocation_attempt',
+    )
+    expect(revocationRecovery).toContain("consent.state <> 'revoking'")
+    expect(revocationRecovery).toContain("state = 'started'")
+    expect(revocationRecovery).toContain("'providerRequestKey', permit.provider_request_key")
     const finalizeRevocation = staticFunctionBodyFragment(
       sql, 'autoforge_knowledge_finalize_embedding_revocation',
     )
@@ -195,6 +219,9 @@ describe('CloudBase personal knowledge migration', () => {
     expect(finalizeRevocation).not.toContain("state IN ('dispatching', 'started')\n      AND expires_at")
     expect(finalizeRevocation).toContain('DELETE FROM public.knowledge_chunk_embeddings')
     expect(finalizeRevocation).toContain("SET state = 'revoked'")
+    expect(finalizeRevocation).toContain("response->>'consentEpoch'")
+    expect(finalizeRevocation).toContain("response->>'state' = 'revoking'")
+    expect(finalizeRevocation).toContain("owner::text || ':embedding-consent'")
 
     const store = staticFunctionBodyFragment(sql, 'autoforge_knowledge_store_embedding')
     expect(store).toContain("consent.state <> 'granted'")

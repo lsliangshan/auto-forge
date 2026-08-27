@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS public.knowledge_embedding_dispatch_permits (
   request_id varchar(128) NOT NULL,
   attempt_id smallint NOT NULL CHECK (attempt_id BETWEEN 1 AND 3),
   consent_epoch bigint NOT NULL CHECK (consent_epoch >= 0),
+  provider_request_key varchar(128) NOT NULL,
   knowledge_base_id varchar(128),
   generation_id varchar(128),
   chunk_id varchar(128),
@@ -213,10 +214,15 @@ CREATE TABLE IF NOT EXISTS public.knowledge_embedding_dispatch_permits (
   expires_at timestamptz NOT NULL,
   dispatching_at timestamptz,
   started_at timestamptz,
+  settlement_outcome varchar(16) CHECK (settlement_outcome IN ('completed', 'failed')),
+  provider_response_hash char(64) CHECK (provider_response_hash ~ '^[a-f0-9]{64}$'),
+  provider_retryable boolean,
+  settlement_intent_at timestamptz,
   settled_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY(owner_id, permit_id),
   UNIQUE(owner_id, purpose, request_id, attempt_id),
+  UNIQUE(owner_id, provider_request_key),
   FOREIGN KEY(owner_id, knowledge_base_id)
     REFERENCES public.knowledge_bases(owner_id, id) ON DELETE CASCADE,
   FOREIGN KEY(owner_id, knowledge_base_id, generation_id)
@@ -226,7 +232,11 @@ CREATE TABLE IF NOT EXISTS public.knowledge_embedding_dispatch_permits (
   CHECK ((purpose = 'query' AND knowledge_base_id IS NULL
       AND generation_id IS NULL AND chunk_id IS NULL)
     OR (purpose = 'chunk' AND knowledge_base_id IS NOT NULL
-      AND generation_id IS NOT NULL AND chunk_id IS NOT NULL))
+      AND generation_id IS NOT NULL AND chunk_id IS NOT NULL)),
+  CHECK ((settlement_outcome IS NULL AND provider_response_hash IS NULL
+      AND provider_retryable IS NULL AND settlement_intent_at IS NULL)
+    OR (settlement_outcome IS NOT NULL AND provider_response_hash IS NOT NULL
+      AND provider_retryable IS NOT NULL AND settlement_intent_at IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS knowledge_embedding_dispatch_permit_expiry
   ON public.knowledge_embedding_dispatch_permits(state, expires_at);
@@ -1992,7 +2002,7 @@ BEGIN
     RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
   END IF;
   IF p_enabled THEN PERFORM public.autoforge_knowledge_require_cloud(owner); END IF;
-  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':' || p_request_id, 0));
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':embedding-consent', 0));
   SELECT * INTO request_row FROM public.knowledge_requests
     WHERE owner_id = owner AND request_id = p_request_id;
   IF FOUND THEN
@@ -2032,13 +2042,22 @@ BEGIN
       GET DIAGNOSTICS vectors_deleted = ROW_COUNT;
       UPDATE public.knowledge_embedding_consents SET state = 'revoked',
         revoked_at = clock_timestamp(), updated_at = clock_timestamp()
-        WHERE owner_id = owner RETURNING * INTO consent;
+      WHERE owner_id = owner RETURNING * INTO consent;
     END IF;
   END IF;
-  response := jsonb_build_object(
-    'state', consent.state, 'consentEpoch', consent.consent_epoch,
-    'vectorsDeleted', vectors_deleted, 'rebuildRequired', consent.rebuild_required
-  );
+  IF NOT p_enabled AND consent.state = 'revoked' AND vectors_deleted = 0 THEN
+    SELECT prior.response INTO response FROM public.knowledge_requests prior
+      WHERE prior.owner_id = owner AND prior.action = 'set_embedding_consent'
+        AND prior.response->>'state' = 'revoked'
+        AND (prior.response->>'consentEpoch')::bigint = consent.consent_epoch
+      ORDER BY prior.created_at, prior.request_id LIMIT 1;
+  END IF;
+  IF response IS NULL THEN
+    response := jsonb_build_object(
+      'state', consent.state, 'consentEpoch', consent.consent_epoch,
+      'vectorsDeleted', vectors_deleted, 'rebuildRequired', consent.rebuild_required
+    );
+  END IF;
   INSERT INTO public.knowledge_requests(
     owner_id, request_id, knowledge_base_id, action, input_hash, response
   ) VALUES (
@@ -2064,6 +2083,7 @@ DECLARE
   consent public.knowledge_embedding_consents%ROWTYPE;
   permit public.knowledge_embedding_dispatch_permits%ROWTYPE;
   new_permit_id varchar(128);
+  new_provider_request_key varchar(128);
   new_expiry timestamptz;
 BEGIN
   PERFORM public.autoforge_knowledge_require_cloud(owner);
@@ -2112,29 +2132,6 @@ BEGIN
   ) THEN
     RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
   END IF;
-  IF EXISTS (
-    SELECT 1 FROM public.knowledge_embedding_dispatch_permits completed
-    WHERE completed.owner_id = owner AND completed.purpose = p_purpose
-      AND completed.request_id = p_request_id AND completed.state = 'completed'
-  ) OR (
-    p_attempt_id > 1 AND (
-      SELECT count(*) FROM public.knowledge_embedding_dispatch_permits prior
-      WHERE prior.owner_id = owner AND prior.purpose = p_purpose
-        AND prior.request_id = p_request_id AND prior.attempt_id < p_attempt_id
-        AND prior.state = 'failed'
-    ) <> p_attempt_id - 1
-  ) THEN
-    RETURN jsonb_build_object('issued', false);
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM public.knowledge_embedding_dispatch_permits active
-    WHERE active.owner_id = owner AND active.purpose = p_purpose
-      AND active.request_id = p_request_id
-      AND active.attempt_id <> p_attempt_id
-      AND active.state IN ('issued', 'dispatching', 'started')
-  ) THEN
-    RETURN jsonb_build_object('issued', false);
-  END IF;
   SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
     WHERE owner_id = owner AND purpose = p_purpose AND request_id = p_request_id
       AND attempt_id = p_attempt_id
@@ -2149,6 +2146,27 @@ BEGIN
       OR permit.configuration_version IS DISTINCT FROM p_configuration_version THEN
       RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
     END IF;
+    IF permit.state IN ('started', 'completed', 'failed') THEN
+      RETURN jsonb_build_object(
+        'issued', false, 'recovery', jsonb_build_object(
+          'state', CASE WHEN permit.state = 'started'
+              AND permit.settlement_outcome IS NOT NULL
+            THEN 'settlement_pending' ELSE permit.state END,
+          'permitId', permit.permit_id, 'purpose', permit.purpose,
+          'requestId', permit.request_id, 'attemptId', permit.attempt_id,
+          'consentEpoch', permit.consent_epoch,
+          'providerRequestKey', permit.provider_request_key,
+          'outcome', permit.settlement_outcome,
+          'responseHash', permit.provider_response_hash,
+          'retryable', COALESCE(permit.provider_retryable, false),
+          'embedding', jsonb_build_object(
+            'model', permit.model, 'dimensions', permit.dimensions,
+            'configurationVersion', permit.configuration_version,
+            'region', 'guangzhou'
+          )
+        )
+      );
+    END IF;
     IF permit.state <> 'issued' OR permit.expires_at <= clock_timestamp() THEN
       IF permit.state = 'issued' THEN
         UPDATE public.knowledge_embedding_dispatch_permits SET state = 'expired'
@@ -2157,17 +2175,42 @@ BEGIN
       RETURN jsonb_build_object('issued', false);
     END IF;
   ELSE
+    IF EXISTS (
+      SELECT 1 FROM public.knowledge_embedding_dispatch_permits completed
+      WHERE completed.owner_id = owner AND completed.purpose = p_purpose
+        AND completed.request_id = p_request_id AND completed.state = 'completed'
+    ) OR (
+      p_attempt_id > 1 AND (
+        SELECT count(*) FROM public.knowledge_embedding_dispatch_permits prior
+        WHERE prior.owner_id = owner AND prior.purpose = p_purpose
+          AND prior.request_id = p_request_id AND prior.attempt_id < p_attempt_id
+          AND prior.state = 'failed'
+      ) <> p_attempt_id - 1
+    ) OR EXISTS (
+      SELECT 1 FROM public.knowledge_embedding_dispatch_permits active
+      WHERE active.owner_id = owner AND active.purpose = p_purpose
+        AND active.request_id = p_request_id
+        AND active.state IN ('issued', 'dispatching', 'started')
+    ) THEN
+      RETURN jsonb_build_object('issued', false);
+    END IF;
     new_permit_id := 'permit_' || md5(
       owner::text || ':' || p_purpose || ':' || p_request_id || ':'
       || clock_timestamp()::text || ':' || random()::text
     );
+    new_provider_request_key := 'embed_' || md5(jsonb_build_array(
+      owner, p_purpose, p_request_id, p_attempt_id, p_consent_epoch,
+      p_knowledge_base_id, p_generation_id, p_chunk_id, p_configuration_version
+    )::text);
     new_expiry := clock_timestamp() + interval '15 seconds';
     INSERT INTO public.knowledge_embedding_dispatch_permits(
       permit_id, owner_id, purpose, request_id, attempt_id, consent_epoch,
+      provider_request_key,
       knowledge_base_id, generation_id, chunk_id,
       model, dimensions, configuration_version, expires_at
     ) VALUES (
       new_permit_id, owner, p_purpose, p_request_id, p_attempt_id, p_consent_epoch,
+      new_provider_request_key,
       p_knowledge_base_id, p_generation_id, p_chunk_id,
       p_model, p_dimensions, p_configuration_version, new_expiry
     ) RETURNING * INTO permit;
@@ -2177,6 +2220,7 @@ BEGIN
     'purpose', permit.purpose, 'requestId', permit.request_id,
     'attemptId', permit.attempt_id,
     'consentEpoch', permit.consent_epoch, 'expiresAt', permit.expires_at,
+    'providerRequestKey', permit.provider_request_key,
     'embedding', jsonb_build_object(
       'model', permit.model, 'dimensions', permit.dimensions,
       'configurationVersion', permit.configuration_version, 'region', 'guangzhou'
@@ -2301,6 +2345,63 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(
+  p_owner_id varchar, p_purpose varchar, p_request_id varchar,
+  p_attempt_id integer, p_consent_epoch bigint, p_knowledge_base_id varchar,
+  p_generation_id varchar, p_chunk_id varchar,
+  p_model varchar, p_dimensions integer, p_configuration_version varchar,
+  p_permit_id varchar, p_outcome varchar, p_provider_response_hash varchar,
+  p_retryable boolean
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_owner_id);
+  permit public.knowledge_embedding_dispatch_permits%ROWTYPE;
+BEGIN
+  IF p_outcome NOT IN ('completed', 'failed')
+    OR p_provider_response_hash IS NULL
+    OR p_provider_response_hash !~ '^[a-f0-9]{64}$'
+    OR p_retryable IS NULL OR (p_outcome = 'completed' AND p_retryable) THEN
+    RAISE EXCEPTION USING MESSAGE = 'INVALID_INPUT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
+    WHERE owner_id = owner AND permit_id = p_permit_id FOR UPDATE;
+  IF NOT FOUND
+    OR permit.purpose IS DISTINCT FROM p_purpose
+    OR permit.request_id IS DISTINCT FROM p_request_id
+    OR permit.attempt_id IS DISTINCT FROM p_attempt_id
+    OR permit.consent_epoch IS DISTINCT FROM p_consent_epoch
+    OR permit.knowledge_base_id IS DISTINCT FROM p_knowledge_base_id
+    OR permit.generation_id IS DISTINCT FROM p_generation_id
+    OR permit.chunk_id IS DISTINCT FROM p_chunk_id
+    OR permit.model IS DISTINCT FROM p_model
+    OR permit.dimensions IS DISTINCT FROM p_dimensions
+    OR permit.configuration_version IS DISTINCT FROM p_configuration_version THEN
+    RETURN jsonb_build_object('recorded', false);
+  END IF;
+  IF permit.settlement_outcome IS NOT NULL THEN
+    IF permit.settlement_outcome IS DISTINCT FROM p_outcome
+      OR permit.provider_response_hash IS DISTINCT FROM p_provider_response_hash
+      OR permit.provider_retryable IS DISTINCT FROM p_retryable THEN
+      RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+    END IF;
+    RETURN jsonb_build_object('recorded', true);
+  END IF;
+  IF permit.state <> 'started' THEN RETURN jsonb_build_object('recorded', false); END IF;
+  UPDATE public.knowledge_embedding_dispatch_permits SET
+    settlement_outcome = p_outcome,
+    provider_response_hash = p_provider_response_hash,
+    provider_retryable = p_retryable,
+    settlement_intent_at = clock_timestamp()
+    WHERE owner_id = owner AND permit_id = permit.permit_id;
+  RETURN jsonb_build_object('recorded', true);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(
   p_owner_id varchar, p_purpose varchar, p_request_id varchar,
   p_attempt_id integer, p_consent_epoch bigint, p_knowledge_base_id varchar,
@@ -2338,13 +2439,66 @@ BEGIN
   IF permit.state = p_outcome THEN
     RETURN jsonb_build_object('settled', true);
   END IF;
-  IF permit.state <> 'started' THEN
+  IF permit.state <> 'started'
+    OR permit.settlement_outcome IS DISTINCT FROM p_outcome
+    OR permit.provider_response_hash IS NULL
+    OR permit.settlement_intent_at IS NULL THEN
     RETURN jsonb_build_object('settled', false);
   END IF;
   UPDATE public.knowledge_embedding_dispatch_permits SET state = p_outcome,
     settled_at = clock_timestamp()
     WHERE owner_id = owner AND permit_id = permit.permit_id;
   RETURN jsonb_build_object('settled', true);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.autoforge_knowledge_get_embedding_revocation_attempt(
+  p_caller_user_id varchar, p_request_id varchar
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  owner bigint := public.autoforge_knowledge_caller(p_caller_user_id);
+  consent public.knowledge_embedding_consents%ROWTYPE;
+  request_row public.knowledge_requests%ROWTYPE;
+  permit public.knowledge_embedding_dispatch_permits%ROWTYPE;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':embedding-consent', 0));
+  SELECT * INTO request_row FROM public.knowledge_requests
+    WHERE owner_id = owner AND request_id = p_request_id;
+  IF NOT FOUND OR request_row.action <> 'set_embedding_consent'
+    OR request_row.response->>'state' NOT IN ('revoking', 'revoked') THEN
+    RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
+    WHERE owner_id = owner;
+  IF consent.state <> 'revoking' THEN RETURN jsonb_build_object('attempt', NULL); END IF;
+  SELECT * INTO permit FROM public.knowledge_embedding_dispatch_permits
+    WHERE owner_id = owner AND state = 'started'
+      AND consent_epoch < consent.consent_epoch
+    ORDER BY started_at, purpose, request_id, attempt_id
+    LIMIT 1;
+  IF NOT FOUND THEN RETURN jsonb_build_object('attempt', NULL); END IF;
+  RETURN jsonb_build_object('attempt', jsonb_build_object(
+    'state', CASE WHEN permit.settlement_outcome IS NULL
+      THEN 'started' ELSE 'settlement_pending' END,
+    'permitId', permit.permit_id, 'purpose', permit.purpose,
+    'requestId', permit.request_id, 'attemptId', permit.attempt_id,
+    'consentEpoch', permit.consent_epoch,
+    'providerRequestKey', permit.provider_request_key,
+    'outcome', permit.settlement_outcome,
+    'responseHash', permit.provider_response_hash,
+    'retryable', COALESCE(permit.provider_retryable, false),
+    'knowledgeBaseId', permit.knowledge_base_id,
+    'generationId', permit.generation_id, 'chunkId', permit.chunk_id,
+    'embedding', jsonb_build_object(
+      'model', permit.model, 'dimensions', permit.dimensions,
+      'configurationVersion', permit.configuration_version, 'region', 'guangzhou'
+    )
+  ));
 END;
 $$;
 
@@ -2363,13 +2517,33 @@ DECLARE
   vectors_deleted integer := 0;
   final_response jsonb;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended(owner::text || ':embedding-consent', 0));
   SELECT * INTO request_row FROM public.knowledge_requests
     WHERE owner_id = owner AND request_id = p_request_id
       AND action = 'set_embedding_consent' FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001'; END IF;
   SELECT * INTO STRICT consent FROM public.knowledge_embedding_consents
     WHERE owner_id = owner FOR UPDATE;
-  IF consent.state = 'revoked' THEN RETURN request_row.response; END IF;
+  IF consent.state = 'revoked' THEN
+    SELECT response INTO final_response FROM public.knowledge_requests
+      WHERE owner_id = owner AND action = 'set_embedding_consent'
+        AND response->>'state' = 'revoked'
+        AND (response->>'consentEpoch')::bigint = consent.consent_epoch
+      ORDER BY created_at, request_id LIMIT 1;
+    IF NOT FOUND THEN
+      final_response := jsonb_build_object(
+        'state', 'revoked', 'consentEpoch', consent.consent_epoch,
+        'vectorsDeleted', 0, 'rebuildRequired', false
+      );
+    END IF;
+    UPDATE public.knowledge_requests SET response = final_response
+      WHERE owner_id = owner AND action = 'set_embedding_consent'
+        AND (request_id = p_request_id OR (
+          response->>'state' = 'revoking'
+          AND (response->>'consentEpoch')::bigint = consent.consent_epoch
+        ));
+    RETURN final_response;
+  END IF;
   IF consent.state <> 'revoking' THEN
     RAISE EXCEPTION USING MESSAGE = 'CONFLICT', ERRCODE = 'P0001';
   END IF;
@@ -2396,8 +2570,11 @@ BEGIN
     'vectorsDeleted', vectors_deleted, 'rebuildRequired', false
   );
   UPDATE public.knowledge_requests SET response = final_response
-    WHERE owner_id = owner AND request_id = p_request_id
-      AND action = 'set_embedding_consent';
+    WHERE owner_id = owner AND action = 'set_embedding_consent'
+      AND (request_id = p_request_id OR (
+        response->>'state' = 'revoking'
+        AND (response->>'consentEpoch')::bigint = consent.consent_epoch
+      ));
   RETURN final_response;
 END;
 $$;
@@ -2843,7 +3020,7 @@ BEGIN
       WHERE (candidate.state IN ('issued', 'expired')
           AND candidate.expires_at <= clock_timestamp())
         OR (candidate.state IN ('completed', 'failed')
-          AND candidate.settled_at <= clock_timestamp() - interval '1 hour')
+          AND candidate.settled_at <= clock_timestamp() - interval '7 days')
       ORDER BY candidate.expires_at, candidate.owner_id, candidate.permit_id
       LIMIT p_limit
     );
@@ -2924,7 +3101,9 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar,
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, boolean) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_revocation_attempt(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_finalize_embedding_revocation(varchar, varchar) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) FROM PUBLIC, anon, authenticated;
@@ -2983,7 +3162,9 @@ GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varch
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_record_embedding_dispatch_settlement_intent(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar, varchar, boolean) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar) TO service_role;
+GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_get_embedding_revocation_attempt(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_finalize_embedding_revocation(varchar, varchar) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) TO service_role;

@@ -329,13 +329,124 @@ function validCloudCandidate(value, generationByBase) {
 function validDispatchPermit(value, purpose, requestId, attemptId, consentEpoch) {
   return exactKeys(value, [
     'issued', 'permitId', 'purpose', 'requestId', 'attemptId',
-    'consentEpoch', 'expiresAt', 'embedding',
+    'consentEpoch', 'expiresAt', 'providerRequestKey', 'embedding',
   ]) && value.issued === true && nonEmptyString(value.permitId)
     && value.purpose === purpose && value.requestId === requestId
     && value.attemptId === attemptId
     && value.consentEpoch === consentEpoch
+    && nonEmptyString(value.providerRequestKey)
     && isIsoDate(value.expiresAt) && Date.parse(value.expiresAt) > Date.now()
     && validEmbeddingConfiguration(value.embedding)
+}
+
+function validDispatchRecovery(value, purpose, requestId, attemptId, consentEpoch) {
+  return exactKeys(value, [
+    'state', 'permitId', 'purpose', 'requestId', 'attemptId', 'consentEpoch',
+    'providerRequestKey', 'outcome', 'responseHash', 'retryable', 'embedding',
+  ]) && ['started', 'settlement_pending', 'completed', 'failed'].includes(value.state)
+    && nonEmptyString(value.permitId) && value.purpose === purpose
+    && value.requestId === requestId && value.attemptId === attemptId
+    && value.consentEpoch === consentEpoch && nonEmptyString(value.providerRequestKey)
+    && (value.outcome === null || ['completed', 'failed'].includes(value.outcome))
+    && (value.responseHash === null
+      || (typeof value.responseHash === 'string' && /^[a-f0-9]{64}$/.test(value.responseHash)))
+    && typeof value.retryable === 'boolean'
+    && validEmbeddingConfiguration(value.embedding)
+}
+
+function dispatchResultHash(result) {
+  return createHash('sha256').update(JSON.stringify(result)).digest('hex')
+}
+
+async function persistDispatchSettlement({ rpc, parameters, permit, result }) {
+  const outcome = result.state
+  const responseHash = dispatchResultHash(result)
+  const retryable = outcome === 'failed' && result.retryable
+  const recorded = await rpc('autoforge_knowledge_record_embedding_dispatch_settlement_intent', {
+    ...parameters, p_permit_id: permit.permitId, p_outcome: outcome,
+    p_provider_response_hash: responseHash, p_retryable: retryable,
+  })
+  if (!exactKeys(recorded, ['recorded']) || recorded.recorded !== true) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  const settled = await rpc('autoforge_knowledge_settle_embedding_dispatch_attempt', {
+    ...parameters, p_permit_id: permit.permitId, p_outcome: outcome,
+  })
+  if (!exactKeys(settled, ['settled']) || settled.settled !== true) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  return { outcome, responseHash, retryable }
+}
+
+async function reconcileRevocationAttempt({ rpc, tokenHub, attempt }) {
+  if (!exactKeys(attempt, [
+    'ownerId', 'state', 'permitId', 'purpose', 'requestId', 'attemptId', 'consentEpoch',
+    'providerRequestKey', 'outcome', 'responseHash', 'retryable',
+    'knowledgeBaseId', 'generationId', 'chunkId', 'embedding',
+  ]) || !nonEmptyString(attempt.ownerId, 64)
+    || !['started', 'settlement_pending'].includes(attempt.state)
+    || !nonEmptyString(attempt.permitId) || !['query', 'chunk'].includes(attempt.purpose)
+    || !nonEmptyString(attempt.requestId)
+    || !Number.isSafeInteger(attempt.attemptId) || attempt.attemptId < 1 || attempt.attemptId > 3
+    || !Number.isSafeInteger(attempt.consentEpoch) || attempt.consentEpoch < 0
+    || !nonEmptyString(attempt.providerRequestKey)
+    || (attempt.outcome !== null && !['completed', 'failed'].includes(attempt.outcome))
+    || (attempt.responseHash !== null
+      && (typeof attempt.responseHash !== 'string' || !/^[a-f0-9]{64}$/.test(attempt.responseHash)))
+    || typeof attempt.retryable !== 'boolean'
+    || !validEmbeddingConfiguration(attempt.embedding)
+    || (attempt.purpose === 'query' && (attempt.knowledgeBaseId !== null
+      || attempt.generationId !== null || attempt.chunkId !== null))
+    || (attempt.purpose === 'chunk' && (![attempt.knowledgeBaseId,
+      attempt.generationId, attempt.chunkId].every(value => nonEmptyString(value))))) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  if (!tokenHub || typeof tokenHub.recoverAttempt !== 'function') {
+    throw { code: 'TRANSIENT_FAILURE' }
+  }
+  const recovered = await tokenHub.recoverAttempt({
+    model: fixedEmbeddingConfiguration.model,
+    dimensions: fixedEmbeddingConfiguration.dimensions,
+    configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
+    region: fixedEmbeddingConfiguration.region,
+    idempotencyKey: attempt.providerRequestKey,
+  })
+  if (!isRecord(recovered) || !['pending', 'completed', 'failed'].includes(recovered.state)
+    || (recovered.state === 'completed' && (!Array.isArray(recovered.vector)
+      || recovered.vector.length !== fixedEmbeddingConfiguration.dimensions
+      || recovered.vector.some(value => !Number.isFinite(value))))
+    || (recovered.state === 'failed' && typeof recovered.retryable !== 'boolean')) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  if (recovered.state === 'pending') return false
+  const result = recovered.state === 'completed'
+    ? { state: 'completed', vector: recovered.vector }
+    : { state: 'failed', retryable: recovered.retryable }
+  const responseHash = dispatchResultHash(result)
+  if ((attempt.outcome !== null && attempt.outcome !== result.state)
+    || (attempt.responseHash !== null && attempt.responseHash !== responseHash)
+    || (attempt.outcome === 'failed' && attempt.retryable !== result.retryable)) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  await persistDispatchSettlement({
+    rpc,
+    parameters: {
+      p_owner_id: attempt.ownerId,
+      p_purpose: attempt.purpose,
+      p_request_id: attempt.requestId,
+      p_attempt_id: attempt.attemptId,
+      p_consent_epoch: attempt.consentEpoch,
+      p_knowledge_base_id: attempt.knowledgeBaseId,
+      p_generation_id: attempt.generationId,
+      p_chunk_id: attempt.chunkId,
+      p_model: fixedEmbeddingConfiguration.model,
+      p_dimensions: fixedEmbeddingConfiguration.dimensions,
+      p_configuration_version: fixedEmbeddingConfiguration.configurationVersion,
+    },
+    permit: attempt,
+    result,
+  })
+  return true
 }
 
 async function dispatchEmbedding({
@@ -358,6 +469,45 @@ async function dispatchEmbedding({
     }
     const permit = await rpc('autoforge_knowledge_issue_embedding_dispatch_permit', parameters)
     if (exactKeys(permit, ['issued']) && permit.issued === false) continue
+    if (exactKeys(permit, ['issued', 'recovery']) && permit.issued === false) {
+      const recovery = permit.recovery
+      if (!validDispatchRecovery(recovery, purpose, requestId, attemptId, consentEpoch)
+        || !tokenHub || typeof tokenHub.recoverAttempt !== 'function') {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      const recovered = await tokenHub.recoverAttempt({
+        model: fixedEmbeddingConfiguration.model,
+        dimensions: fixedEmbeddingConfiguration.dimensions,
+        configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
+        region: fixedEmbeddingConfiguration.region,
+        idempotencyKey: recovery.providerRequestKey,
+      })
+      if (!isRecord(recovered) || !['pending', 'completed', 'failed'].includes(recovered.state)
+        || (recovered.state === 'completed' && (!Array.isArray(recovered.vector)
+          || recovered.vector.length !== fixedEmbeddingConfiguration.dimensions
+          || recovered.vector.some(value => !Number.isFinite(value))))
+        || (recovered.state === 'failed' && typeof recovered.retryable !== 'boolean')) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      if (recovered.state === 'pending') return { kind: 'provider_failure' }
+      const recoveredResult = recovered.state === 'completed'
+        ? { state: 'completed', vector: recovered.vector }
+        : { state: 'failed', retryable: recovered.retryable }
+      const recoveredHash = dispatchResultHash(recoveredResult)
+      if ((recovery.outcome !== null && recovery.outcome !== recoveredResult.state)
+        || (recovery.responseHash !== null && recovery.responseHash !== recoveredHash)
+        || (recovery.outcome === 'failed' && recovery.retryable !== recoveredResult.retryable)) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      await persistDispatchSettlement({
+        rpc, parameters, permit: recovery, result: recoveredResult,
+      })
+      if (recoveredResult.state === 'completed') {
+        return { kind: 'sent', vector: recoveredResult.vector }
+      }
+      if (!recoveredResult.retryable) return { kind: 'provider_failure' }
+      continue
+    }
     if (!validDispatchPermit(permit, purpose, requestId, attemptId, consentEpoch)) {
       throw { code: 'INTERNAL_ERROR' }
     }
@@ -385,19 +535,20 @@ async function dispatchEmbedding({
         configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
         region: fixedEmbeddingConfiguration.region,
         dispatchPermit: permit.permitId,
+        idempotencyKey: permit.providerRequestKey,
       })
     } catch (error) {
       providerError = error
     }
-    const settled = await rpc('autoforge_knowledge_settle_embedding_dispatch_attempt', {
-      ...parameters, p_permit_id: permit.permitId,
-      p_outcome: providerError ? 'failed' : 'completed',
+    const result = providerError
+      ? { state: 'failed', retryable: isRecord(providerError)
+        && providerError.code === 'TRANSIENT_FAILURE' }
+      : { state: 'completed', vector }
+    await persistDispatchSettlement({
+      rpc, parameters, permit, result,
     })
-    if (!exactKeys(settled, ['settled']) || settled.settled !== true) {
-      throw { code: 'INTERNAL_ERROR' }
-    }
     if (!providerError) return { kind: 'sent', vector }
-    if (!isRecord(providerError) || providerError.code !== 'TRANSIENT_FAILURE') {
+    if (!result.retryable) {
       return { kind: 'provider_failure' }
     }
   }
@@ -614,6 +765,18 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         && isRecord(data) && data.state === 'revoking') {
         if (!validResponse('setEmbeddingConsent', data)) throw { code: 'INTERNAL_ERROR' }
         for (let poll = 0; poll < 3; poll += 1) {
+          const recovery = await rpc('autoforge_knowledge_get_embedding_revocation_attempt', {
+            p_caller_user_id: uid, p_request_id: event.requestId,
+          })
+          if (!exactKeys(recovery, ['attempt'])
+            || !(recovery.attempt === null || isRecord(recovery.attempt))) {
+            throw { code: 'INTERNAL_ERROR' }
+          }
+          if (recovery.attempt !== null) {
+            await reconcileRevocationAttempt({
+              rpc, tokenHub, attempt: { ...recovery.attempt, ownerId: uid },
+            })
+          }
           const finalized = await rpc('autoforge_knowledge_finalize_embedding_revocation', {
             p_caller_user_id: uid, p_request_id: event.requestId,
           })
@@ -987,24 +1150,34 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch }) {
     || parsed.search || parsed.hash || !apiKey) {
     throw new Error('TokenHub is not configured')
   }
+  const statusUrl = new URL(parsed.href)
+  statusUrl.pathname = `${statusUrl.pathname.replace(/\/$/, '')}/status`
+  function validAttemptIdentity(input) {
+    return isRecord(input) && nonEmptyString(input.idempotencyKey)
+      && input.model === fixedEmbeddingConfiguration.model
+      && input.dimensions === fixedEmbeddingConfiguration.dimensions
+      && input.configurationVersion === fixedEmbeddingConfiguration.configurationVersion
+      && input.region === fixedEmbeddingConfiguration.region
+  }
   return {
     async embed(input) {
       if (!exactKeys(input, [
         'input', 'model', 'dimensions', 'configurationVersion', 'region', 'dispatchPermit',
+        'idempotencyKey',
       ])
         || !nonEmptyString(input.input, 64 * 1024)
         || !nonEmptyString(input.dispatchPermit)
-        || input.model !== fixedEmbeddingConfiguration.model
-        || input.dimensions !== fixedEmbeddingConfiguration.dimensions
-        || input.configurationVersion !== fixedEmbeddingConfiguration.configurationVersion
-        || input.region !== fixedEmbeddingConfiguration.region) {
+        || !validAttemptIdentity(input)) {
         throw { code: 'INVALID_INPUT' }
       }
       let response
       try {
         response = await fetchImpl(parsed.href, {
           method: 'POST',
-          headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+          headers: {
+            authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
+            'idempotency-key': input.idempotencyKey,
+          },
           body: JSON.stringify(input),
         })
       } catch {
@@ -1020,6 +1193,45 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch }) {
         throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
       }
       return body.embedding
+    },
+    async recoverAttempt(input) {
+      if (!exactKeys(input, [
+        'model', 'dimensions', 'configurationVersion', 'region', 'idempotencyKey',
+      ]) || !validAttemptIdentity(input)) throw { code: 'INVALID_INPUT' }
+      let response
+      try {
+        response = await fetchImpl(statusUrl.href, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${apiKey}`, 'content-type': 'application/json',
+            'idempotency-key': input.idempotencyKey,
+          },
+          body: JSON.stringify(input),
+        })
+      } catch {
+        throw { code: 'TRANSIENT_FAILURE' }
+      }
+      const body = await readBoundedJson(response)
+      if (!response.ok || !isRecord(body)) {
+        throw { code: response.status >= 500 ? 'TRANSIENT_FAILURE' : 'INTERNAL_ERROR' }
+      }
+      if (exactKeys(body, ['status']) && body.status === 'pending') {
+        return { state: 'pending' }
+      }
+      if (exactKeys(body, ['status', 'retryable']) && body.status === 'failed'
+        && typeof body.retryable === 'boolean') {
+        return { state: 'failed', retryable: body.retryable }
+      }
+      if (!exactKeys(body, ['status', 'model', 'dimensions', 'embedding'])
+        || body.status !== 'completed'
+        || body.model !== fixedEmbeddingConfiguration.model
+        || body.dimensions !== fixedEmbeddingConfiguration.dimensions
+        || !Array.isArray(body.embedding)
+        || body.embedding.length !== fixedEmbeddingConfiguration.dimensions
+        || body.embedding.some(value => !Number.isFinite(value))) {
+        throw { code: 'INTERNAL_ERROR' }
+      }
+      return { state: 'completed', vector: body.embedding }
     },
   }
 }
