@@ -14,9 +14,9 @@ const timers = new WeakMap<object, ReturnType<typeof setTimeout>>()
 const disposeWrapped = new WeakSet<object>()
 const MAX_POLL_DELAY_MS = 15_000
 
-interface OperationOwner {
-  ownerId: string
-  epoch: number
+interface OwnerToken {
+  readonly ownerId: string
+  readonly epoch: number
 }
 
 function clearTimer(store: object): void {
@@ -208,17 +208,25 @@ export const useKnowledgeStore = defineStore('knowledge', {
         if (epoch === this._epoch) void this.refresh()
       }, this._pollDelayMs))
     },
-    beginOperation(): OperationOwner | undefined {
-      if (!this.ownerId || this.busy) return undefined
-      const operation = { ownerId: this.ownerId, epoch: this._epoch }
+    captureOwnerToken(): OwnerToken | undefined {
+      if (!this.ownerId) return undefined
+      return Object.freeze({ ownerId: this.ownerId, epoch: this._epoch })
+    },
+    isOwnerTokenCurrent(token: OwnerToken): boolean {
+      return token.epoch === this._epoch && token.ownerId === this.ownerId
+    },
+    beginOperation(): OwnerToken | undefined {
+      if (this.busy) return undefined
+      const operation = this.captureOwnerToken()
+      if (!operation) return undefined
       this._pendingOperations += 1
       this.error = ''
       return operation
     },
-    ownsOperation(operation: OperationOwner): boolean {
-      return operation.epoch === this._epoch && operation.ownerId === this.ownerId
+    ownsOperation(operation: OwnerToken): boolean {
+      return this.isOwnerTokenCurrent(operation)
     },
-    finishOperation(operation: OperationOwner): void {
+    finishOperation(operation: OwnerToken): void {
       if (!this.ownsOperation(operation)) return
       this._pendingOperations = Math.max(0, this._pendingOperations - 1)
     },

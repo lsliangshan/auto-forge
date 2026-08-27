@@ -90,7 +90,8 @@ const formatTime = (value: string) => new Intl.DateTimeFormat('zh-CN', { dateSty
 async function purgeDocument() {
   const selected = store.selectedDocument
   if (!selected || selected.status !== 'deleted' || purgePending.value) return
-  const ownerId = store.ownerId
+  const ownerToken = store.captureOwnerToken()
+  if (!ownerToken) return
   const documentId = selected.id
   purgePending.value = true
   try {
@@ -99,7 +100,7 @@ async function purgeDocument() {
       '永久删除文档',
       { type: 'warning', confirmButtonText: '永久删除', cancelButtonText: '取消' },
     )
-    if (store.ownerId !== ownerId || store.selectedDocumentId !== documentId) return
+    if (!store.isOwnerTokenCurrent(ownerToken) || store.selectedDocumentId !== documentId) return
     await store.runDocumentAction('purge')
   } catch {
     // Cancellation is an expected terminal result.

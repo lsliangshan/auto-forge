@@ -188,6 +188,8 @@ describe('personal knowledge workspace', () => {
     await wrapper.get('[data-testid="knowledge-purge-document"]').trigger('click')
     await flushPromises()
     expect(client.knowledge.purgeDocument).toHaveBeenCalledWith('doc_deleted')
+    expect(client.knowledge.purgeBase).toHaveBeenCalledOnce()
+    expect(client.knowledge.purgeDocument).toHaveBeenCalledOnce()
     expect(confirm).toHaveBeenCalledTimes(3)
   })
 
@@ -240,6 +242,69 @@ describe('personal knowledge workspace', () => {
     expect(store.ownerId).toBe('bob')
     expect(store.selectedBaseId).toBe('base_bob')
     expect(client.knowledge.purgeBase).not.toHaveBeenCalled()
+  })
+
+  it('rejects an old base confirmation after the same UID resets and rebinds the same base', async () => {
+    const confirmation = deferred<'confirm'>()
+    const purge = deferred<void>()
+    const recycledBase = {
+      ...base('base_same', '同一知识库'), status: 'recycled' as const, searchable: false,
+    }
+    const client = api({
+      list: vi.fn().mockResolvedValue([recycledBase]),
+      listDocuments: vi.fn().mockResolvedValue([]),
+      purgeBase: vi.fn(() => purge.promise),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+
+    await wrapper.get('[data-testid="knowledge-purge-base"]').trigger('click')
+    store.resetLocalData()
+    await store.bindOwner('alice')
+    expect(store.selectedBaseId).toBe('base_same')
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(client.knowledge.purgeBase).not.toHaveBeenCalled()
+    expect(store.busy).toBe(false)
+    purge.resolve()
+  })
+
+  it('rejects an old document confirmation after the same UID resets and rebinds the same document', async () => {
+    const confirmation = deferred<'confirm'>()
+    const purge = deferred<void>()
+    const recycledBase = {
+      ...base('base_same', '同一知识库'), status: 'recycled' as const, searchable: false,
+    }
+    const deletedDocument = document('doc_same', 'base_same', 'deleted')
+    const client = api({
+      list: vi.fn().mockResolvedValue([recycledBase]),
+      listDocuments: vi.fn().mockResolvedValue([deletedDocument]),
+      purgeDocument: vi.fn(() => purge.promise),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+
+    await wrapper.get('[data-testid="knowledge-purge-document"]').trigger('click')
+    store.resetLocalData()
+    await store.bindOwner('alice')
+    expect(store.selectedDocumentId).toBe('doc_same')
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(client.knowledge.purgeDocument).not.toHaveBeenCalled()
+    expect(store.busy).toBe(false)
+    purge.resolve()
   })
 
   it('uses the preload API for import and refreshes the selected base', async () => {

@@ -118,7 +118,8 @@ async function create() {
 async function purgeBase() {
   const selected = store.selectedBase
   if (!selected || selected.status !== 'recycled' || purgePending.value) return
-  const ownerId = store.ownerId
+  const ownerToken = store.captureOwnerToken()
+  if (!ownerToken) return
   const baseId = selected.id
   purgePending.value = true
   try {
@@ -127,7 +128,7 @@ async function purgeBase() {
       '永久删除知识库',
       { type: 'warning', confirmButtonText: '永久删除', cancelButtonText: '取消' },
     )
-    if (store.ownerId !== ownerId || store.selectedBaseId !== baseId) return
+    if (!store.isOwnerTokenCurrent(ownerToken) || store.selectedBaseId !== baseId) return
     await store.runBaseAction('purge')
   } catch {
     // Cancellation is an expected terminal result.
