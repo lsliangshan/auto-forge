@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v8', () => {
+describe('knowledge schema v9', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(8)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(9)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -48,6 +48,7 @@ describe('knowledge schema v8', () => {
       'knowledge_entitlement_projection',
       'knowledge_free_retention',
       'knowledge_cloud_retention',
+      'knowledge_cloud_deletion_receipts',
       'knowledge_schema_migrations',
       'cloud_sync_conversions',
       'cloud_sync_mutations',
@@ -63,6 +64,11 @@ describe('knowledge schema v8', () => {
     expect(database.prepare(
       'SELECT accepted_key_generation FROM knowledge_entitlement_projection LIMIT 0',
     ).all()).toEqual([])
+    expect((database.prepare(
+      'PRAGMA table_info(knowledge_cloud_deletion_receipts)',
+    ).all() as Array<{ name: string }>).map(column => column.name)).toEqual([
+      'knowledge_base_id', 'operation_id', 'request_id', 'deletion_job_id', 'completed_at',
+    ])
   })
 
   it('backfills immutable version metadata when upgrading a v2 database', () => {
@@ -71,6 +77,7 @@ describe('knowledge schema v8', () => {
     database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 3').run()
     database.exec(`
       DROP TABLE knowledge_provider_consents;
+      DROP TABLE knowledge_cloud_deletion_receipts;
       DROP TABLE knowledge_cloud_retention;
       DROP TABLE knowledge_free_retention;
       DROP TABLE knowledge_entitlement_projection;

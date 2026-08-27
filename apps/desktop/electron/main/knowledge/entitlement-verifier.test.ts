@@ -2,6 +2,7 @@ import { generateKeyPairSync, sign } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import {
   canonicalizeEntitlementPayload,
+  createKnowledgeEntitlementVerificationCallback,
   KnowledgeEntitlementVerifier,
   type SignedKnowledgeEntitlement,
 } from './entitlement-verifier.js'
@@ -41,6 +42,31 @@ describe('KnowledgeEntitlementVerifier', () => {
       tier: 'member', status: 'active', localEnabled: true, betaEnabled: true, cloudEnabled: true,
       keyGeneration: 1,
     })
+  })
+
+  it('uses the service clock floor in the production verification callback', () => {
+    const { envelope, payload } = fixture()
+    const key = generateKeyPairSync('ed25519')
+    const verifier = new KnowledgeEntitlementVerifier({
+      publicKeys: {
+        primary: { publicKey: key.publicKey, generation: 1, status: 'active' },
+      },
+      now: () => Date.parse('2026-08-27T00:00:00.000Z'),
+    })
+    const canonical = canonicalizeEntitlementPayload({
+      ...payload,
+      issuedAt: '2026-08-28T00:00:00.000Z',
+    })
+    const snapshot = {
+      ...envelope(),
+      payload: Buffer.from(canonical).toString('base64url'),
+      signature: sign(null, Buffer.from(canonical), key.privateKey).toString('base64url'),
+    }
+    const verifyEntitlement = createKnowledgeEntitlementVerificationCallback(verifier)
+
+    expect(verifyEntitlement(
+      'alice', snapshot, Date.parse('2026-08-29T00:00:00.000Z'),
+    )).toMatchObject({ tier: 'member', keyGeneration: 1 })
   })
 
   it('enforces active-to-retired key transitions and returns the monotonic key generation', () => {

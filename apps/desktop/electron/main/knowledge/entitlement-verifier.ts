@@ -190,3 +190,13 @@ export class KnowledgeEntitlementVerifier {
     })
   }
 }
+
+export function createKnowledgeEntitlementVerificationCallback(
+  verifier: KnowledgeEntitlementVerifier,
+): (
+  ownerId: string,
+  snapshot: SignedKnowledgeEntitlement,
+  observedAt: number,
+) => VerifiedKnowledgeEntitlement {
+  return (ownerId, snapshot, observedAt) => verifier.verify(ownerId, snapshot, observedAt)
+}

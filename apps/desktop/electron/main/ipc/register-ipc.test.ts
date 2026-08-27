@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ipcChannels, toSafeAppError, type AppSettings } from '@autoforge/shared'
 import { pathToFileURL } from 'node:url'
+import { createLocalKnowledgeService } from '../knowledge/knowledge-service.js'
+import { memoryKnowledgeStore, parsedText } from '../knowledge/knowledge-test-support.js'
+import type { CloudKnowledgeRemote } from '../knowledge/sync-service.js'
 import {
   registerDesktopIpc,
   type DesktopIpcServices,
@@ -194,6 +197,61 @@ function harness(
 }
 
 describe('registerDesktopIpc', () => {
+  it('waits for real cloud deletion before acknowledging a synced base purge', async () => {
+    const memory = memoryKnowledgeStore()
+    const deleteKnowledgeBase = vi.fn().mockResolvedValue({ deletionJobId: 'delete_ipc_1' })
+    const remote: CloudKnowledgeRemote = {
+      beginSync: vi.fn().mockResolvedValue({
+        knowledgeBaseId: 'unused', generationId: 'unused', status: 'staging',
+      }),
+      pushMutation: vi.fn().mockResolvedValue({
+        mutationId: 'unused', status: 'applied', sequence: 1, revision: 'unused',
+      }),
+      pullChanges: vi.fn().mockResolvedValue({
+        kind: 'incremental', nextSequence: 0, hasMore: false, changes: [],
+      }),
+      fullResync: vi.fn().mockResolvedValue({ kind: 'snapshot', nextSequence: 0, changes: [] }),
+      publishGeneration: vi.fn().mockResolvedValue({
+        generationId: 'unused', previousGenerationId: null, sequence: 1,
+      }),
+      deleteKnowledgeBase,
+      getJob: vi.fn().mockResolvedValue({
+        jobId: 'delete_ipc_1', state: 'completed', errorCode: null,
+      }),
+      cancelJob: vi.fn().mockResolvedValue(undefined),
+      cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
+    }
+    const knowledge = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      verifyEntitlement: () => { throw new Error('signed path unused') },
+    })
+    knowledge.configureCloudRemote!(remote)
+    await knowledge.bind(authSession.user.id)
+    const base = await knowledge.create({ userId: authSession.user.id }, '同步库')
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(knowledge_base_id, mode, published_generation_id, epoch, updated_at)
+      VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base.id)
+    await knowledge.refreshEntitlement!(authSession.user.id, undefined, true)
+    await knowledge.recycleBase({ userId: authSession.user.id }, base.id)
+    const app = harness()
+    app.dependencies.knowledge = knowledge
+
+    await expect(app.invoke(ipcChannels.knowledgePurgeBase, { baseId: base.id }))
+      .resolves.toBeUndefined()
+
+    expect(deleteKnowledgeBase).toHaveBeenCalledOnce()
+    await expect(knowledge.list({ userId: authSession.user.id })).resolves.toEqual([])
+    expect(memory.database.prepare(`
+      SELECT deletion_job_id AS deletionJobId
+      FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({ deletionJobId: 'delete_ipc_1' })
+  })
+
   it('validates owner-free cloud account methods before invoking Main services', async () => {
     const app = harness()
     const consent = {

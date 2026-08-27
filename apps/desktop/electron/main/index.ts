@@ -44,6 +44,7 @@ import { createElectronParserSupervisor } from './knowledge/parser-supervisor.js
 import { readKnowledgeImportFile, writeKnowledgeExportFile } from './knowledge/knowledge-file-io.js'
 import {
   AUTOFORGE_KNOWLEDGE_ENTITLEMENT_PUBLIC_KEYS,
+  createKnowledgeEntitlementVerificationCallback,
   KnowledgeEntitlementVerifier,
 } from './knowledge/entitlement-verifier.js'
 import type { SafeStoragePort } from './security/secret-store.js'
@@ -163,7 +164,7 @@ async function initialize(): Promise<ApplicationRuntime> {
     },
     // Missing or invalid signed snapshots fail closed to the free 1/1 policy in Main.
     isMember: () => false,
-    verifyEntitlement: (ownerId, snapshot) => entitlementVerifier.verify(ownerId, snapshot),
+    verifyEntitlement: createKnowledgeEntitlementVerificationCallback(entitlementVerifier),
     // Authorized staging proof is still absent, so production cloud stays closed.
     cloudKillSwitchEnabled: () => true,
     emit: event => {

@@ -160,6 +160,10 @@ describe('KnowledgeSyncService', () => {
     }))
     expect(service.getCloudRetention('kb_1')).toBeUndefined()
     expect(service.getState('kb_1')).toEqual({ mode: 'local_only', publishedGenerationId: null })
+    expect(database.prepare(`
+      SELECT deletion_job_id AS deletionJobId
+      FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = 'kb_1'
+    `).get()).toEqual({ deletionJobId: 'delete_1' })
   })
 
   it('permits a user-requested immediate purge during the download window while cloud is off', async () => {
@@ -173,6 +177,69 @@ describe('KnowledgeSyncService', () => {
     }))
     expect(service.getCloudRetention('kb_1')).toBeUndefined()
     expect(service.getState('kb_1')).toEqual({ mode: 'local_only', publishedGenerationId: null })
+  })
+
+  it('reuses the deletion request after a lost response and preserves a payload-free terminal receipt', async () => {
+    const deleteKnowledgeBase = vi.fn()
+      .mockRejectedValueOnce(new Error('lost response'))
+      .mockResolvedValueOnce({ deletionJobId: 'delete_retry_1' })
+    const { database, remote, service } = fixture({
+      deleteKnowledgeBase,
+      getJob: vi.fn().mockResolvedValue({
+        jobId: 'delete_retry_1', state: 'completed', errorCode: null,
+      }),
+    })
+    service.beginCloudRetention('kb_1', 500)
+    service.setCloudAccess(false)
+
+    await expect(service.purgeCloudImmediately('kb_1')).rejects.toThrow('lost response')
+    const journal = database.prepare(`
+      SELECT operation_id AS operationId, request_id AS requestId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = 'kb_1'
+    `).get() as { operationId: string; requestId: string }
+    await expect(service.purgeCloudImmediately('kb_1')).resolves.toBeUndefined()
+    await expect(service.purgeCloudImmediately('kb_1')).resolves.toBeUndefined()
+
+    expect(deleteKnowledgeBase).toHaveBeenCalledTimes(2)
+    expect(deleteKnowledgeBase.mock.calls.map(([input]) => input.requestId))
+      .toEqual([journal.requestId, journal.requestId])
+    expect(remote.getJob).toHaveBeenCalledWith({ jobId: 'delete_retry_1' })
+    expect(database.prepare(`
+      SELECT knowledge_base_id AS knowledgeBaseId, operation_id AS operationId,
+        request_id AS requestId, deletion_job_id AS deletionJobId, completed_at AS completedAt
+      FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = 'kb_1'
+    `).get()).toEqual({
+      knowledgeBaseId: 'kb_1', operationId: journal.operationId,
+      requestId: journal.requestId, deletionJobId: 'delete_retry_1', completedAt: 1_000,
+    })
+    expect(service.getCloudRetention('kb_1')).toBeUndefined()
+  })
+
+  it('keeps the deletion job journal recoverable when remote confirmation times out', async () => {
+    const getJob = vi.fn().mockResolvedValue({
+      jobId: 'delete_timeout_1', state: 'running', errorCode: null,
+    })
+    const { database, service } = fixture({
+      deleteKnowledgeBase: vi.fn().mockResolvedValue({ deletionJobId: 'delete_timeout_1' }),
+      getJob,
+    })
+    service.beginCloudRetention('kb_1', 500)
+    service.setCloudAccess(false)
+
+    await expect(service.purgeCloudImmediately('kb_1')).rejects.toMatchObject({
+      code: 'TRANSIENT_FAILURE', retryable: true,
+    })
+    expect(getJob).toHaveBeenCalledTimes(3)
+    expect(database.prepare(`
+      SELECT stage, deletion_job_id AS deletionJobId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = 'kb_1'
+    `).get()).toEqual({ stage: 'purging', deletionJobId: 'delete_timeout_1' })
+    expect(database.prepare(`
+      SELECT 1 FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = 'kb_1'
+    `).get()).toBeUndefined()
+    expect(database.prepare(
+      "SELECT 1 AS present FROM knowledge_bases WHERE id = 'kb_1'",
+    ).get()).toEqual({ present: 1 })
   })
 
   it('durably queues offline mutations without calling CloudBase', async () => {

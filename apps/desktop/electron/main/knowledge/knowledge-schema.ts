@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 8
+export const KNOWLEDGE_SCHEMA_VERSION = 9
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -294,6 +294,16 @@ const KNOWLEDGE_SCHEMA_V8 = `
       CHECK (accepted_key_generation >= 0);
 `
 
+const KNOWLEDGE_SCHEMA_V9 = `
+  CREATE TABLE knowledge_cloud_deletion_receipts (
+    knowledge_base_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    request_id TEXT NOT NULL UNIQUE,
+    deletion_job_id TEXT NOT NULL,
+    completed_at INTEGER NOT NULL
+  ) STRICT;
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
@@ -303,6 +313,7 @@ const migrations = new Map<number, string>([
   [6, KNOWLEDGE_SCHEMA_V6],
   [7, KNOWLEDGE_SCHEMA_V7],
   [8, KNOWLEDGE_SCHEMA_V8],
+  [9, KNOWLEDGE_SCHEMA_V9],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

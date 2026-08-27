@@ -142,6 +142,7 @@ interface KnowledgeCloudLifecycle {
   setCloudAccess(allowed: boolean): void
   beginCloudRetention(knowledgeBaseId: string, boundaryAt: number): CloudRetentionState
   advanceCloudRetention(knowledgeBaseId: string): Promise<CloudRetentionState | undefined>
+  purgeCloudImmediately(knowledgeBaseId: string): Promise<void>
   invalidateOwner(): void
   drain(): Promise<void>
 }
@@ -285,6 +286,14 @@ export function createLocalKnowledgeService(
         WHERE knowledge_base_id = ? AND epoch = ?
       `).run(stage, now(), knowledgeBaseId, current.epoch)
       return select()
+    },
+    purgeCloudImmediately: async (knowledgeBaseId) => {
+      const completed = database.prepare(`
+        SELECT 1 AS completed FROM knowledge_cloud_deletion_receipts
+        WHERE knowledge_base_id = ?
+      `).get(knowledgeBaseId)
+      if (completed) return
+      fail('SERVICE_UNAVAILABLE')
     },
     invalidateOwner: () => {
       database.prepare(`
@@ -1161,6 +1170,17 @@ export function createLocalKnowledgeService(
       ).get(baseId) as { recycledAt: number | null } | undefined
       if (!exists) return
       if (exists.recycledAt === null) fail('NOT_FOUND')
+      const cloud = active.store.database.prepare(`
+        SELECT 1 AS required FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+        UNION SELECT 1 AS required FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = ?
+        UNION SELECT 1 AS required FROM cloud_sync_states
+          WHERE knowledge_base_id = ? AND mode <> 'local_only'
+        LIMIT 1
+      `).get(baseId, baseId, baseId)
+      if (cloud) {
+        await active.cloud.purgeCloudImmediately(baseId)
+        if (binding !== active || active.epoch !== epoch) fail('CONFLICT')
+      }
       const objects = active.store.database.prepare(`
         SELECT version.object_id FROM document_versions AS version
         JOIN documents AS document ON document.id = version.document_id

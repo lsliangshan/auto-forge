@@ -428,18 +428,27 @@ export class KnowledgeSyncService {
 
   /** GDPR-style deletion remains available even while sync/search gates are closed. */
   async purgeCloudImmediately(knowledgeBaseId: string): Promise<void> {
+    const terminalReceipt = this.database.prepare(`
+      SELECT 1 AS completed FROM knowledge_cloud_deletion_receipts
+      WHERE knowledge_base_id = ?
+    `).get(knowledgeBaseId)
+    if (terminalReceipt) return
     let row = this.database.prepare(`
-      SELECT request_id AS requestId, deletion_job_id AS deletionJobId, epoch
+      SELECT operation_id AS operationId, request_id AS requestId,
+        deletion_job_id AS deletionJobId, epoch
       FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
     `).get(knowledgeBaseId) as {
-      requestId: string; deletionJobId: string | null; epoch: number
+      operationId: string; requestId: string; deletionJobId: string | null; epoch: number
     } | undefined
     if (!row) row = (() => {
       this.beginCloudRetention(knowledgeBaseId)
       return this.database.prepare(`
-        SELECT request_id AS requestId, deletion_job_id AS deletionJobId, epoch
+        SELECT operation_id AS operationId, request_id AS requestId,
+          deletion_job_id AS deletionJobId, epoch
         FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
-      `).get(knowledgeBaseId) as { requestId: string; deletionJobId: string | null; epoch: number }
+      `).get(knowledgeBaseId) as {
+        operationId: string; requestId: string; deletionJobId: string | null; epoch: number
+      }
     })()
     if (!row.deletionJobId) {
       const expected = this.getState(knowledgeBaseId).publishedGenerationId
@@ -478,6 +487,16 @@ export class KnowledgeSyncService {
       code: 'TRANSIENT_FAILURE', retryable: true as const,
     })
     this.database.transaction(() => {
+      const receipt = this.database.prepare(`
+        INSERT INTO knowledge_cloud_deletion_receipts(
+          knowledge_base_id, operation_id, request_id, deletion_job_id, completed_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(knowledge_base_id) DO NOTHING
+      `).run(
+        knowledgeBaseId, row.operationId, row.requestId, deletionJobId,
+        this.dependencies.now(),
+      )
+      if (receipt.changes !== 1) throw syncError('CONFLICT')
       const removed = this.database.prepare(`
         DELETE FROM knowledge_cloud_retention
         WHERE knowledge_base_id = ? AND epoch = ? AND deletion_job_id = ?

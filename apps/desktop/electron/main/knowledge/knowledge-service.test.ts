@@ -17,7 +17,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-function cloudRemote(): CloudKnowledgeRemote {
+function cloudRemote(overrides: Partial<CloudKnowledgeRemote> = {}): CloudKnowledgeRemote {
   return {
     beginSync: vi.fn().mockResolvedValue({
       knowledgeBaseId: 'unused', generationId: 'unused', status: 'staging',
@@ -38,6 +38,7 @@ function cloudRemote(): CloudKnowledgeRemote {
     }),
     cancelJob: vi.fn().mockResolvedValue(undefined),
     cleanupOrphans: vi.fn().mockResolvedValue({ removed: 0 }),
+    ...overrides,
   }
 }
 
@@ -398,6 +399,94 @@ describe('local knowledge service', () => {
         operation_id AS operationId, request_id AS requestId
       FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
     `).get(base.id)).toEqual(firstRetention)
+  })
+
+  it('keeps a synced recycled base and journal until remote deletion is durably confirmed', async () => {
+    const memory = memoryKnowledgeStore()
+    const selected = [{
+      name: 'cloud.txt', mimeType: 'text/plain' as const, bytes: Buffer.from('cloud body'),
+    }]
+    const deleteKnowledgeBase = vi.fn()
+      .mockRejectedValueOnce(new Error('lost response'))
+      .mockResolvedValueOnce({ deletionJobId: 'delete_service_1' })
+    const remote = cloudRemote({
+      deleteKnowledgeBase,
+      getJob: vi.fn().mockResolvedValue({
+        jobId: 'delete_service_1', state: 'completed', errorCode: null,
+      }),
+    })
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => selected.splice(0),
+      createParser: () => ({ parse: async () => parsedText('cloud body'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      verifyEntitlement: () => { throw new Error('signed path unused') },
+    })
+    service.configureCloudRemote!(remote)
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const base = await service.create(owner, '曾同步资料')
+    const handle = (await service.pickImportFiles(owner))[0]!
+    await service.importDocument(owner, base.id, handle.id)
+    await vi.waitFor(() => expect(memory.objects.values.size).toBe(1))
+    memory.database.prepare(`
+      INSERT INTO cloud_sync_states(knowledge_base_id, mode, published_generation_id, epoch, updated_at)
+      VALUES (?, 'synced', 'generation_1', 1, 1)
+    `).run(base.id)
+    await service.refreshEntitlement!(owner.userId, undefined, true)
+    await service.recycleBase(owner, base.id)
+
+    await expect(service.purgeBase(owner, base.id)).rejects.toThrow('lost response')
+    await expect(service.list(owner)).resolves.toEqual([
+      expect.objectContaining({ id: base.id, status: 'recycled' }),
+    ])
+    const journal = memory.database.prepare(`
+      SELECT operation_id AS operationId, request_id AS requestId
+      FROM knowledge_cloud_retention WHERE knowledge_base_id = ?
+    `).get(base.id) as { operationId: string; requestId: string }
+    expect(memory.objects.values.size).toBe(1)
+
+    await expect(service.purgeBase(owner, base.id)).resolves.toBeUndefined()
+    await expect(service.list(owner)).resolves.toEqual([])
+    expect(memory.objects.values.size).toBe(0)
+    expect(deleteKnowledgeBase.mock.calls.map(([input]) => input.requestId))
+      .toEqual([journal.requestId, journal.requestId])
+    expect(memory.database.prepare(
+      'SELECT 1 FROM knowledge_cloud_retention WHERE knowledge_base_id = ?',
+    ).get(base.id)).toBeUndefined()
+    expect(memory.database.prepare(
+      'SELECT 1 FROM cloud_sync_states WHERE knowledge_base_id = ?',
+    ).get(base.id)).toBeUndefined()
+    expect(memory.database.prepare(`
+      SELECT operation_id AS operationId, request_id AS requestId,
+        deletion_job_id AS deletionJobId
+      FROM knowledge_cloud_deletion_receipts WHERE knowledge_base_id = ?
+    `).get(base.id)).toEqual({
+      operationId: journal.operationId,
+      requestId: journal.requestId,
+      deletionJobId: 'delete_service_1',
+    })
+  })
+
+  it('purges a local-only recycled base without a remote deletion operation', async () => {
+    const memory = memoryKnowledgeStore()
+    const remote = cloudRemote()
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [],
+      createParser: () => ({ parse: async () => parsedText('unused'), terminateAll: async () => undefined }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+    service.configureCloudRemote!(remote)
+    const owner = { userId: 'alice' }
+    await service.bind(owner.userId)
+    const base = await service.create(owner, '仅本地')
+    await service.recycleBase(owner, base.id)
+
+    await expect(service.purgeBase(owner, base.id)).resolves.toBeUndefined()
+    expect(remote.deleteKnowledgeBase).not.toHaveBeenCalled()
   })
 
   it('anchors durable cloud degradation to the signed grace boundary while local data remains available', async () => {
