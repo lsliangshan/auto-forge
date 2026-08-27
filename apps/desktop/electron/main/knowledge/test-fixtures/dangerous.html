@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <head>
+    <script src="https://invalid.example/steal.js">steal()</script>
+    <style>@import "https://invalid.example/style.css";</style>
+  </head>
+  <body onload="steal()">
+    <h1>Safe title</h1>
+    <iframe src="https://invalid.example/frame"></iframe>
+    <img src="https://invalid.example/tracker.png" onerror="steal()">
+    <p>Safe paragraph</p>
+  </body>
+</html>
