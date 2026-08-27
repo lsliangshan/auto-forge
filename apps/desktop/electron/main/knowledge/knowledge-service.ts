@@ -9,6 +9,9 @@ import {
   type KnowledgeEvent,
   type KnowledgeImportHandle,
   type KnowledgeSearchResult,
+  type KnowledgeSourcePreview,
+  type KnowledgeSourcePreviewRequest,
+  type ModelProviderId,
   type KnowledgeVersionSummary,
 } from '@autoforge/shared'
 import { KnowledgeExportService } from './export-service.js'
@@ -76,8 +79,8 @@ export interface LocalKnowledgeService extends KnowledgeService {
   restoreDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
   restoreBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   /** Main-only Agent retrieval over the conversation selection captured before the run. */
-  searchSelected(owner: KnowledgeOwner, query: string, baseIds: readonly string[]): Promise<KnowledgeSearchResult>
-  sourceAvailable(owner: KnowledgeOwner, documentId: string, versionId: string): Promise<boolean>
+  searchSelected(owner: KnowledgeOwner, query: string, baseIds: readonly string[], signal?: AbortSignal): Promise<KnowledgeSearchResult>
+  sourceAvailable(owner: KnowledgeOwner, documentId: string, versionId: string, signal?: AbortSignal): Promise<boolean>
 }
 
 function fail(code: AppError['code']): never {
@@ -158,7 +161,9 @@ export function createLocalKnowledgeService(
     active: Binding,
     query: string,
     baseIds: readonly string[],
+    signal?: AbortSignal,
   ): Promise<KnowledgeSearchResult> => {
+    if (signal?.aborted) fail('CANCELLED')
     const normalized = query.normalize('NFC').trim()
     const length = Array.from(normalized).length
     if (length < 2) return { kind: 'query-too-short' }
@@ -166,7 +171,9 @@ export function createLocalKnowledgeService(
     if (unique.length === 0) {
       return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
     }
-    return new LocalKnowledgeRetriever(active.store.database).search(normalized, unique)
+    const result = await new LocalKnowledgeRetriever(active.store.database).search(normalized, unique)
+    if (signal?.aborted) fail('CANCELLED')
+    return result
   }
 
   const firstFailure = (
@@ -667,8 +674,9 @@ export function createLocalKnowledgeService(
       `).all() as Array<{ id: string }>
       return searchBases(active, query, bases.map(base => base.id))
     },
-    searchSelected: async (owner, query, baseIds) => searchBases(current(owner), query, baseIds),
-    sourceAvailable: async (owner, documentId, versionId) => {
+    searchSelected: async (owner, query, baseIds, signal) => searchBases(current(owner), query, baseIds, signal),
+    sourceAvailable: async (owner, documentId, versionId, signal) => {
+      if (signal?.aborted) fail('CANCELLED')
       const active = current(owner)
       const row = active.store.database.prepare(`
         SELECT 1 AS available
@@ -683,6 +691,7 @@ export function createLocalKnowledgeService(
           AND version.status = 'ready'
         LIMIT 1
       `).get(versionId, documentId)
+      if (signal?.aborted) fail('CANCELLED')
       return row !== undefined
     },
     getAvailability: async (owner): Promise<KnowledgeAvailability> => {
@@ -722,12 +731,58 @@ export function createLocalKnowledgeService(
       const member = dependencies.isMember(active.ownerId)
       return { tier: member ? 'member' : 'free', status: 'active', localEnabled: true, cloudEnabled: false }
     },
-    getConsent: async (owner) => {
+    getConsent: async (owner, provider: ModelProviderId = 'openrouter') => {
       if (unavailable?.ownerId === owner.userId && unavailable.epoch === epoch) {
-        return { provider: 'openrouter', status: 'unknown' }
+        return { provider, status: 'unknown' }
       }
-      current(owner)
-      return { provider: 'openrouter', status: 'unknown' }
+      const active = current(owner)
+      const row = active.store.database.prepare(
+        'SELECT status, updated_at FROM knowledge_provider_consents WHERE provider = ?',
+      ).get(provider) as { status: 'granted' | 'denied'; updated_at: number } | undefined
+      return row
+        ? { provider, status: row.status, updatedAt: timestamp(row.updated_at) }
+        : { provider, status: 'unknown' }
+    },
+    setConsent: async (owner, provider, status) => {
+      const active = current(owner)
+      const updatedAt = now()
+      active.store.database.prepare(`
+        INSERT INTO knowledge_provider_consents(provider, status, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(provider) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
+      `).run(provider, status, updatedAt)
+      return { provider, status, updatedAt: timestamp(updatedAt) }
+    },
+    revokeConsent: async (owner, provider) => {
+      const active = current(owner)
+      active.store.database.prepare('DELETE FROM knowledge_provider_consents WHERE provider = ?').run(provider)
+      return { provider, status: 'unknown' }
+    },
+    getSourcePreview: async (owner, input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview> => {
+      const active = current(owner)
+      if (input.evidenceId !== `evidence:${input.evidenceId.slice('evidence:'.length)}`
+        || !input.evidenceId.startsWith('evidence:')) return { kind: 'unavailable' }
+      const row = active.store.database.prepare(`
+        SELECT chunk.body
+        FROM kb_chunks AS chunk
+        JOIN documents AS document ON document.id = chunk.document_id
+        JOIN knowledge_bases AS base ON base.id = chunk.knowledge_base_id
+        JOIN document_versions AS version
+          ON version.id = chunk.version_id AND version.document_id = chunk.document_id
+        WHERE chunk.id = ? AND chunk.knowledge_base_id = ? AND chunk.document_id = ? AND chunk.version_id = ?
+          AND base.recycled_at IS NULL AND document.recycled_at IS NULL
+          AND document.active_version_id = version.id AND version.status = 'ready'
+        LIMIT 1
+      `).get(input.evidenceId.slice('evidence:'.length), input.baseId, input.documentId, input.versionId) as {
+        body: string
+      } | undefined
+      if (!row) return { kind: 'unavailable' }
+      const preview = row.body
+        .replace(/(?:https?|file):\/\/[^\s<>"']+/giu, '[REDACTED_LOCATION]')
+        .replace(/\/(?:Users|home|tmp|private|var|Volumes)\/[^\s<>"']+/gu, '[REDACTED_LOCATION]')
+        .replace(/[A-Za-z]:\\(?:[^\\\s<>"']+\\)*[^\s<>"']+/gu, '[REDACTED_LOCATION]')
+        .slice(0, 4_000)
+        .trim()
+      return preview ? { kind: 'available', preview } : { kind: 'unavailable' }
     },
   }
 }

@@ -5,6 +5,7 @@ import { proxySettingsSchema } from './proxy-settings.js'
 import { appErrorCodeSchema } from './errors.js'
 import {
   chatBlockSchema,
+  knowledgeCoordinateSchema,
   knowledgeEvidenceSchema,
   mediaKindSchema,
   type ChatBlock,
@@ -89,6 +90,20 @@ export const knowledgeConsentStateSchema = z.object({
   updatedAt: timestampSchema.optional(),
 }).strict()
 export type KnowledgeConsentState = z.infer<typeof knowledgeConsentStateSchema>
+
+export const knowledgeSourcePreviewRequestSchema = z.object({
+  evidenceId: identifierSchema,
+  baseId: identifierSchema,
+  documentId: identifierSchema,
+  versionId: identifierSchema,
+  coordinate: knowledgeCoordinateSchema,
+}).strict()
+export type KnowledgeSourcePreviewRequest = z.infer<typeof knowledgeSourcePreviewRequestSchema>
+export const knowledgeSourcePreviewSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('available'), preview: nonEmptyStringSchema.max(4_000) }).strict(),
+  z.object({ kind: z.literal('unavailable') }).strict(),
+])
+export type KnowledgeSourcePreview = z.infer<typeof knowledgeSourcePreviewSchema>
 
 function knowledgeGateSchema(reason: string) {
   return z.object({
@@ -1595,6 +1610,9 @@ export const ipcChannels = {
   knowledgeGetAvailability: 'knowledge:get-availability',
   knowledgeGetEntitlement: 'knowledge:get-entitlement',
   knowledgeGetConsent: 'knowledge:get-consent',
+  knowledgeSetConsent: 'knowledge:set-consent',
+  knowledgeRevokeConsent: 'knowledge:revoke-consent',
+  knowledgeGetSourcePreview: 'knowledge:get-source-preview',
   knowledgeEvent: 'knowledge:event',
   systemOpenExternal: 'system:open-external',
   systemGetAppInfo: 'system:get-app-info',
@@ -1699,6 +1717,10 @@ export const knowledgeUpdateSelectionRequestSchema = knowledgeSelectionRequestSc
   selection: knowledgeSelectionSchema,
 }).strict()
 export const knowledgeSearchRequestSchema = z.object({ query: nonEmptyStringSchema.max(1_000) }).strict()
+export const knowledgeConsentRequestSchema = z.object({ provider: modelProviderIdSchema }).strict()
+export const knowledgeSetConsentRequestSchema = knowledgeConsentRequestSchema.extend({
+  status: z.enum(['granted', 'denied']),
+}).strict()
 export const openExternalRequestSchema = z.object({
   url: z.string().superRefine((value, context) => {
     try {
@@ -1805,7 +1827,10 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeSearch]: knowledgeSearchRequestSchema,
   [ipcChannels.knowledgeGetAvailability]: z.undefined(),
   [ipcChannels.knowledgeGetEntitlement]: z.undefined(),
-  [ipcChannels.knowledgeGetConsent]: z.undefined(),
+  [ipcChannels.knowledgeGetConsent]: knowledgeConsentRequestSchema.optional(),
+  [ipcChannels.knowledgeSetConsent]: knowledgeSetConsentRequestSchema,
+  [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentRequestSchema,
+  [ipcChannels.knowledgeGetSourcePreview]: knowledgeSourcePreviewRequestSchema,
   [ipcChannels.systemOpenExternal]: openExternalRequestSchema,
   [ipcChannels.systemGetAppInfo]: z.undefined(),
 } as const
@@ -1903,6 +1928,9 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeGetAvailability]: knowledgeAvailabilitySchema,
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeSetConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeRevokeConsent]: knowledgeConsentStateSchema,
+  [ipcChannels.knowledgeGetSourcePreview]: knowledgeSourcePreviewSchema,
   [ipcChannels.systemOpenExternal]: voidResponseSchema,
   [ipcChannels.systemGetAppInfo]: appInfoSchema,
 } as const
@@ -2022,7 +2050,10 @@ export interface DesktopAPI {
     search(query: string): Promise<KnowledgeSearchResult>
     getAvailability(): Promise<KnowledgeAvailability>
     getEntitlement(): Promise<KnowledgeEntitlementState>
-    getConsent(): Promise<KnowledgeConsentState>
+    getConsent(provider?: ModelProviderId): Promise<KnowledgeConsentState>
+    setConsent(provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
+    revokeConsent(provider: ModelProviderId): Promise<KnowledgeConsentState>
+    getSourcePreview(input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview>
     onEvent(listener: (event: KnowledgeEvent) => void): () => void
   }
   system: {

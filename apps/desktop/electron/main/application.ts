@@ -1401,23 +1401,23 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     },
     ...(knowledge === undefined ? {} : {
       knowledge: {
-        search: ({ ownerId, baseIds, query }: {
+        search: ({ ownerId, baseIds, query, signal }: {
           ownerId: string
           conversationId: string
           baseIds: readonly string[]
           query: string
           signal: AbortSignal
-        }) => knowledge.searchSelected({ userId: ownerId }, query, baseIds),
+        }) => knowledge.searchSelected({ userId: ownerId }, query, baseIds, signal),
         getProviderConsent: async ({ ownerId, provider }: { ownerId: string; provider: ModelProviderId }) => {
-          const consent = await knowledge.getConsent({ userId: ownerId })
-          return consent.provider === provider ? consent.status : 'unknown'
+          const consent = await knowledge.getConsent({ userId: ownerId }, provider)
+          return consent.status
         },
-        sourceAvailable: ({ ownerId, documentId, versionId }: {
+        sourceAvailable: ({ ownerId, documentId, versionId, signal }: {
           ownerId: string
           documentId: string
           versionId: string
           signal: AbortSignal
-        }) => knowledge.sourceAvailable({ userId: ownerId }, documentId, versionId),
+        }) => knowledge.sourceAvailable({ userId: ownerId }, documentId, versionId, signal),
       },
     }),
   })

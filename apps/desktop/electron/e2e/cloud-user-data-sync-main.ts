@@ -191,14 +191,23 @@ const deterministicProvider: ApplicationModelProviderPort = {
       && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
     ))
     if (hasKnowledgeResult) {
-      const toolContent = request.messages.find(message => (
+      const rawToolContent = request.messages.find(message => (
         message.role === 'tool'
         && typeof message.content === 'string'
         && message.content.includes('UNTRUSTED_KNOWLEDGE_EVIDENCE')
       ))?.content ?? ''
+      const toolContent = typeof rawToolContent === 'string' ? rawToolContent : ''
       const evidenceId = /"evidenceId":"([^"]+)"/u.exec(toolContent)?.[1]
       if (!evidenceId) throw new Error('E2E knowledge evidence ID is missing')
       yield { type: 'text_delta' as const, choiceIndex: 0, text: `AutoForge knowledge smoke [[kb:${evidenceId}]]` }
+      yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
+      return
+    }
+    const consentRequired = request.messages.some(message => (
+      message.role === 'tool' && typeof message.content === 'string' && message.content.includes('consent_required')
+    ))
+    if (consentRequired) {
+      yield { type: 'text_delta' as const, choiceIndex: 0, text: '等待知识库授权。' }
       yield { type: 'finish' as const, choiceIndex: 0, reason: 'stop' }
       return
     }
@@ -360,13 +369,6 @@ async function initialize(): Promise<void> {
       const parsed = knowledgeEventSchema.safeParse(event)
       if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
     },
-  })
-  Object.assign(knowledgeService, {
-    getConsent: async () => ({
-      provider: 'openrouter' as const,
-      status: 'granted' as const,
-      updatedAt: '2026-08-28T00:00:00.000Z',
-    }),
   })
   userDataStores = new UserDataStoreManager(join(userData, 'user-caches'))
   const cloudPort = new CloudBaseUserDataPort({

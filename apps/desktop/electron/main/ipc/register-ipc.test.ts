@@ -149,6 +149,9 @@ function services(): DesktopIpcServices {
       }),
       getEntitlement: vi.fn().mockResolvedValue({ tier: 'free', status: 'active', localEnabled: true, cloudEnabled: false }),
       getConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+      setConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'granted' }),
+      revokeConsent: vi.fn().mockResolvedValue({ provider: 'openrouter', status: 'unknown' }),
+      getSourcePreview: vi.fn().mockResolvedValue({ kind: 'unavailable' }),
     },
     system: { openExternal: vi.fn(), getAppInfo: vi.fn() },
   }

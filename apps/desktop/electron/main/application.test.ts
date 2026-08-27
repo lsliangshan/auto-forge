@@ -1528,7 +1528,7 @@ describe('createApplicationRuntime', () => {
     })))
 
     expect(searchSelected).toHaveBeenCalledWith(
-      { userId: 'test_user_testuser' }, '合同何时生效', ['base_selected'],
+      { userId: 'test_user_testuser' }, '合同何时生效', ['base_selected'], expect.any(AbortSignal),
     )
     expect(emitted).toContainEqual(expect.objectContaining({
       type: 'block', conversationId: conversation.id,

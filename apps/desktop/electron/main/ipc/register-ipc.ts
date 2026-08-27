@@ -255,7 +255,16 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   registerKnowledge(ipcChannels.knowledgeSearch, (owner, input) => options.services.knowledge.search(owner, input.query))
   registerKnowledge(ipcChannels.knowledgeGetAvailability, (owner) => options.services.knowledge.getAvailability(owner))
   registerKnowledge(ipcChannels.knowledgeGetEntitlement, (owner) => options.services.knowledge.getEntitlement(owner))
-  registerKnowledge(ipcChannels.knowledgeGetConsent, (owner) => options.services.knowledge.getConsent(owner))
+  registerKnowledge(ipcChannels.knowledgeGetConsent, (owner, input) => options.services.knowledge.getConsent(owner, input?.provider))
+  registerKnowledge(ipcChannels.knowledgeSetConsent, (owner, input) => (
+    options.services.knowledge.setConsent(owner, input.provider, input.status)
+  ))
+  registerKnowledge(ipcChannels.knowledgeRevokeConsent, (owner, input) => (
+    options.services.knowledge.revokeConsent(owner, input.provider)
+  ))
+  registerKnowledge(ipcChannels.knowledgeGetSourcePreview, (owner, input) => (
+    options.services.knowledge.getSourcePreview(owner, input)
+  ))
   register(ipcChannels.systemOpenExternal, (input) => options.services.system.openExternal(input.url))
   register(ipcChannels.systemGetAppInfo, () => options.services.system.getAppInfo())
 

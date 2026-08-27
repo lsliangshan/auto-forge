@@ -161,6 +161,79 @@ describe('local knowledge service', () => {
       .resolves.toBe(false)
   })
 
+  it('persists consent per owner and Provider and revalidates lazy source previews', async () => {
+    const memory = memoryKnowledgeStore()
+    let pick = 0
+    let parse = 0
+    const service = createLocalKnowledgeService({
+      openStore: async () => memory.store,
+      selectImportFiles: async () => [pick++ === 0
+        ? { name: '合同.txt', mimeType: 'text/plain', bytes: Buffer.from('合同经双方签字后生效。') }
+        : { name: '合同-v2.txt', mimeType: 'text/plain', bytes: Buffer.from('合同经盖章后生效。') }],
+      createParser: () => ({
+        parse: async () => parsedText(parse++ === 0 ? '合同经双方签字后生效。' : '合同经盖章后生效。'),
+        terminateAll: async () => undefined,
+      }),
+      saveExport: async () => undefined,
+      isMember: () => false,
+      now: () => Date.parse('2026-08-28T00:00:00.000Z'),
+    })
+    await service.bind('alice')
+    await expect(service.getConsent({ userId: 'alice' }, 'openrouter')).resolves.toEqual({
+      provider: 'openrouter', status: 'unknown',
+    })
+    await service.setConsent({ userId: 'alice' }, 'openrouter', 'granted')
+    await expect(service.getConsent({ userId: 'alice' }, 'openrouter')).resolves.toMatchObject({ status: 'granted' })
+    await expect(service.getConsent({ userId: 'alice' }, 'deepseek')).resolves.toEqual({
+      provider: 'deepseek', status: 'unknown',
+    })
+    await service.revokeConsent({ userId: 'alice' }, 'openrouter')
+    await expect(service.getConsent({ userId: 'alice' }, 'openrouter')).resolves.toMatchObject({ status: 'unknown' })
+
+    const base = await service.create({ userId: 'alice' }, '合同库')
+    const [handle] = await service.pickImportFiles({ userId: 'alice' })
+    const document = await service.importDocument({ userId: 'alice' }, base.id, handle!.id)
+    await vi.waitFor(async () => {
+      expect((await service.listDocuments({ userId: 'alice' }, base.id))[0]?.status).toBe('ready')
+    })
+    const search = await service.searchSelected({ userId: 'alice' }, '合同经双', [base.id])
+    if (search.kind !== 'results' || !search.evidence[0]) throw new Error('Expected evidence')
+    const evidence = search.evidence[0]
+    await expect(service.getSourcePreview({ userId: 'alice' }, {
+      evidenceId: evidence.id, baseId: evidence.baseId, documentId: evidence.documentId,
+      versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
+    })).resolves.toMatchObject({ kind: 'available', preview: expect.stringContaining('合同') })
+    const [replacement] = await service.pickImportFiles({ userId: 'alice' })
+    await service.replaceDocument({ userId: 'alice' }, document!.id, replacement!.id)
+    await vi.waitFor(async () => {
+      const replacementSearch = await service.searchSelected({ userId: 'alice' }, '盖章后生', [base.id])
+      const replacementVersion = replacementSearch.kind === 'results' ? replacementSearch.evidence[0]?.versionId : undefined
+      expect(replacementVersion).toBeTruthy()
+      expect(replacementVersion).not.toBe(evidence.versionId)
+    })
+    await expect(service.getSourcePreview({ userId: 'alice' }, {
+      evidenceId: evidence.id, baseId: evidence.baseId, documentId: evidence.documentId,
+      versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
+    })).resolves.toEqual({ kind: 'unavailable' })
+    await service.recycleDocument({ userId: 'alice' }, document!.id)
+    await expect(service.getSourcePreview({ userId: 'alice' }, {
+      evidenceId: evidence.id, baseId: evidence.baseId, documentId: evidence.documentId,
+      versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
+    })).resolves.toEqual({ kind: 'unavailable' })
+    await service.purgeDocument({ userId: 'alice' }, document!.id)
+    await expect(service.getSourcePreview({ userId: 'alice' }, {
+      evidenceId: evidence.id, baseId: evidence.baseId, documentId: evidence.documentId,
+      versionId: evidence.versionId, coordinate: evidence.citation.coordinate,
+    })).resolves.toEqual({ kind: 'unavailable' })
+    await service.setConsent({ userId: 'alice' }, 'deepseek', 'denied')
+    service.invalidate()
+    await service.drain()
+    await service.bind('alice')
+    await expect(service.getConsent({ userId: 'alice' }, 'deepseek')).resolves.toMatchObject({
+      provider: 'deepseek', status: 'denied',
+    })
+  })
+
   it('acknowledges a durable import without awaiting parsing and rejects a late owner callback', async () => {
     // Catches imports that block on parsing or publish after owner invalidation.
     const memory = memoryKnowledgeStore()

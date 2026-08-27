@@ -189,7 +189,14 @@ export function createDesktopApi(ipcRenderer: IpcRendererPort, ports: DesktopBri
       search: (query) => invoke(ipcRenderer, ipcChannels.knowledgeSearch, { query }),
       getAvailability: () => invoke(ipcRenderer, ipcChannels.knowledgeGetAvailability),
       getEntitlement: () => invoke(ipcRenderer, ipcChannels.knowledgeGetEntitlement),
-      getConsent: () => invoke(ipcRenderer, ipcChannels.knowledgeGetConsent),
+      getConsent: (provider) => invoke(
+        ipcRenderer,
+        ipcChannels.knowledgeGetConsent,
+        provider === undefined ? undefined : { provider },
+      ),
+      setConsent: (provider, status) => invoke(ipcRenderer, ipcChannels.knowledgeSetConsent, { provider, status }),
+      revokeConsent: (provider) => invoke(ipcRenderer, ipcChannels.knowledgeRevokeConsent, { provider }),
+      getSourcePreview: (input) => invoke(ipcRenderer, ipcChannels.knowledgeGetSourcePreview, input),
       onEvent: (listener) => subscribe(ipcRenderer, ipcChannels.knowledgeEvent, (payload) => knowledgeEventSchema.safeParse(payload), listener),
     },
     system: {

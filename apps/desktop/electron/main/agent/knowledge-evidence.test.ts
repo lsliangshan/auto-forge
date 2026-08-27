@@ -62,7 +62,7 @@ describe('CurrentTurnKnowledgeEvidence', () => {
       },
     })])
 
-    const envelope = registry.providerEnvelope()
+    const envelope = registry.providerEnvelope(registry.snapshot())
     expect(envelope).toContain('UNTRUSTED_KNOWLEDGE_EVIDENCE')
     expect(envelope).toContain('evidence:0')
     expect(envelope).toContain('正文')
@@ -91,7 +91,7 @@ describe('knowledge tool and answer validation', () => {
     registry.add([evidence(0), evidence(1)])
 
     expect(validateKnowledgeAnswer('结论 [[kb:evidence:0]]', registry.snapshot(), 'strict', 0)).toEqual({
-      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false, text: '结论',
     })
     expect(validateKnowledgeAnswer('伪造 [[kb:evidence:999]]', registry.snapshot(), 'strict', 0)).toEqual({
       kind: 'repair', invalidEvidenceIds: ['evidence:999'],
@@ -106,13 +106,34 @@ describe('knowledge tool and answer validation', () => {
       kind: 'insufficient', reason: 'no-evidence',
     })
     expect(validateKnowledgeAnswer('一般信息', [], 'mixed', 0)).toEqual({
-      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true,
+      kind: 'valid', citedEvidenceIds: [], generalKnowledge: true, text: '【一般信息】一般信息',
     })
     expect(validateKnowledgeAnswer(
       '有依据的结论 [[kb:evidence:0]]\n\n未由依据支持的补充', [evidence(0)], 'strict', 0,
     )).toEqual({ kind: 'repair', invalidEvidenceIds: ['uncited-material'] })
     expect(validateKnowledgeAnswer(
       '有依据的结论 [[kb:evidence:0]]\n\n一般补充', [evidence(0)], 'mixed', 0,
-    )).toEqual({ kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true })
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
+      text: '【知识库依据】有依据的结论\n【一般信息】一般补充',
+    })
+  })
+
+  it('requires a citation on each strict factual sentence and bounds eight emoji snippets by UTF-8 bytes', () => {
+    expect(validateKnowledgeAnswer(
+      '第一句没有依据。第二句有依据。[[kb:evidence:0]]', [evidence(0)], 'strict', 0,
+    )).toEqual({ kind: 'repair', invalidEvidenceIds: ['uncited-material'] })
+
+    const registry = new CurrentTurnKnowledgeEvidence(['base_selected'])
+    registry.add(Array.from({ length: 8 }, (_, index) => evidence(index, {
+      snippet: '😀'.repeat(2_000),
+      citation: {
+        evidenceId: `evidence:${index}`, documentId: `document_${index}`, versionId: `version_${index}`,
+        coordinate: { kind: 'docx', headingPath: ['😀'.repeat(500)], paragraph: index },
+      },
+    })))
+    const envelope = registry.providerEnvelope(registry.snapshot())
+    expect(new TextEncoder().encode(envelope).byteLength).toBeLessThanOrEqual(40 * 1024)
+    expect(envelope).toMatch(/END_UNTRUSTED_KNOWLEDGE_EVIDENCE$/u)
   })
 })

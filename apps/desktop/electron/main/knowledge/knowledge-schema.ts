@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 4
+export const KNOWLEDGE_SCHEMA_VERSION = 5
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -208,11 +208,20 @@ const KNOWLEDGE_SCHEMA_V4 = `
   CREATE INDEX conflicts_scope ON conflicts(knowledge_base_id, status);
 `
 
+const KNOWLEDGE_SCHEMA_V5 = `
+  CREATE TABLE knowledge_provider_consents (
+    provider TEXT PRIMARY KEY CHECK (provider IN ('openrouter', 'deepseek')),
+    status TEXT NOT NULL CHECK (status IN ('granted', 'denied')),
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
   [3, KNOWLEDGE_SCHEMA_V3],
   [4, KNOWLEDGE_SCHEMA_V4],
+  [5, KNOWLEDGE_SCHEMA_V5],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

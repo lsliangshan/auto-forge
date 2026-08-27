@@ -8,6 +8,7 @@ import {
   type ApprovalDecision,
   type ChatBlock,
   type ChatEvent,
+  type KnowledgeEvidence,
   type ModelProviderId,
   type KnowledgeSearchResult,
   type KnowledgeSelection,
@@ -83,7 +84,6 @@ import {
   knowledgeSearchTool,
   parseKnowledgeSearchArguments,
   sanitizeKnowledgeCoordinate,
-  sanitizeKnowledgeSnippet,
   validateKnowledgeAnswer,
 } from './knowledge-evidence.js'
 
@@ -512,7 +512,6 @@ interface ActiveAgentRun {
   workflowCatalogTools: ModelTool[]
   initialWorkflowToolChoice?: ModelStreamRequest['toolChoice']
   workflows: Map<string, WorkflowCandidate>
-  workflowAttempted: boolean
   browserCatalog: BrowserContinuationCatalogSnapshot
   browserToolsAllowed: boolean
   browserPolicyAdded: boolean
@@ -565,8 +564,10 @@ interface ActiveAgentRun {
   knowledgeSearches: number
   knowledgeCitationRepairs: number
   knowledgeDisclosedEvidenceIds: Set<string>
+  knowledgeEligible: boolean
   knowledgeToolAllowed: boolean
   knowledgeStatusBlockId?: string
+  knowledgeConsentBlocked?: 'consent_required' | 'consent_denied'
 }
 
 function appFailure(code: AppError['code']): AppError {
@@ -698,6 +699,11 @@ function workflowLaunchOnlyRequest(
     request === normalizedTrustedText(`${prefix}${workflow.name}`)
   )))
   return matches.length === 1
+}
+
+function workflowExecutionRequested(content: string, candidates: readonly WorkflowCandidate[]): boolean {
+  if (!/(?:使用|运行|执行|启动|打开|查询|办理|\b(?:use|run|execute|launch|open|search)\b)/iu.test(content)) return false
+  return candidates.length === 1 && content.includes(candidates[0]!.workflow.name)
 }
 
 function trustedRequestNamesTarget(request: string, target: BrowserSemanticNode): boolean {
@@ -902,7 +908,6 @@ export class AgentOrchestrator {
         tools: [],
         workflowCatalogTools: [],
         workflows: new Map(),
-        workflowAttempted: false,
         browserCatalog: EMPTY_BROWSER_CATALOG,
         browserToolsAllowed: false,
         browserPolicyAdded: false,
@@ -927,9 +932,10 @@ export class AgentOrchestrator {
         knowledgeSearches: 0,
         knowledgeCitationRepairs: 0,
         knowledgeDisclosedEvidenceIds: new Set(),
-        knowledgeToolAllowed: input.allowTools
+        knowledgeEligible: input.allowTools
           && knowledgeSelection.baseIds.length > 0
           && this.dependencies.knowledge !== undefined,
+        knowledgeToolAllowed: false,
         busy: false,
         cancelled: false,
       }
@@ -962,21 +968,25 @@ export class AgentOrchestrator {
             })
           : [exactCandidate]
         active.workflowCatalogTools = candidates.map(({ tool }) => tool)
-        active.initialWorkflowToolChoice = exactCandidate === undefined
+        const forcedWorkflow = exactCandidate
+          ?? (workflowExecutionRequested(input.content, candidates) ? candidates[0] : undefined)
+        active.initialWorkflowToolChoice = forcedWorkflow === undefined
           ? undefined
-          : { type: 'function', function: { name: exactCandidate.toolName } }
+          : { type: 'function', function: { name: forcedWorkflow.toolName } }
         active.workflows = new Map(candidates.map((candidate) => [candidate.toolName, candidate]))
         if (workflowLaunchOnlyRequest(input.content, candidates)) {
           active.browserToolsAllowed = false
           active.browserCatalog = EMPTY_BROWSER_CATALOG
           active.browserExplicitBindingId = undefined
           active.browserPolicyAdded = false
-          active.knowledgeToolAllowed = false
+          active.knowledgeEligible = false
         }
+        active.knowledgeToolAllowed = active.knowledgeEligible && candidates.length === 0
       }
+      if (!workflowToolsAllowed) active.knowledgeToolAllowed = active.knowledgeEligible
       active.tools = [
         ...active.workflowCatalogTools,
-        ...(active.knowledgeToolAllowed ? [knowledgeSearchTool] : []),
+        ...(active.knowledgeEligible ? [knowledgeSearchTool] : []),
         ...active.browserCatalog.tools,
       ]
       const policyMessage: ModelMessage = {
@@ -1057,6 +1067,7 @@ export class AgentOrchestrator {
       this.updateWorkflowStatus(active, pending, result.code === 'PERMISSION_DENIED' ? 'cancelled' : 'failed', result)
       this.appendToolExchange(active, pending, result)
       this.clearPending(active)
+      this.enableKnowledgeAfterWorkflow(active)
     } else {
       this.clearApprovalTimer(active)
       active.loop.resumeApproval()
@@ -1324,12 +1335,12 @@ export class AgentOrchestrator {
             }, '')
           }
         }
-        if (active.browserRead) this.appendText(active, await this.browserAnswer(active))
-        else {
-          const grounding = await this.groundKnowledgeAnswer(active, bufferedText.join(''))
-          if (grounding.kind === 'repair') continue
-          this.appendText(active, grounding.text)
-        }
+        const grounding = await this.groundKnowledgeAnswer(
+          active,
+          active.browserRead ? await this.browserAnswer(active) : bufferedText.join(''),
+        )
+        if (grounding.kind === 'repair') continue
+        this.appendText(active, grounding.text)
         this.appendWorkflowProvenance(active)
         return this.terminalize(active, 'completed')
       }
@@ -1418,7 +1429,6 @@ export class AgentOrchestrator {
       }, { kind: 'tool_error', code: 'INVALID_INPUT' })
       return this.drive(active)
     }
-    active.workflowAttempted = true
     if (!active.loop.canOfferTools()) return this.terminalize(active, 'failed', appFailure('TOOL_CALL_LIMIT'))
     const prepared = await this.workflowTools.prepare({
       candidate,
@@ -1433,6 +1443,7 @@ export class AgentOrchestrator {
         toolName: candidate.toolName,
         arguments: call.arguments,
       }, prepared)
+      this.enableKnowledgeAfterWorkflow(active)
       return this.drive(active)
     }
     const eligibility = active.loop.executionEligibility(
@@ -1451,6 +1462,7 @@ export class AgentOrchestrator {
         toolName: candidate.toolName,
         arguments: call.arguments,
       }, { kind: 'tool_error', code: eligibility.code })
+      this.enableKnowledgeAfterWorkflow(active)
       return this.drive(active)
     }
     const executionId = prepared.pending.executionId
@@ -1502,13 +1514,15 @@ export class AgentOrchestrator {
     this.setKnowledgeStatus(active, 'searching', 0)
     let result: KnowledgeSearchResult
     try {
-      result = knowledgeSearchResultSchema.parse(await this.dependencies.knowledge.search({
+      const rawResult = await this.dependencies.knowledge.search({
         ownerId: active.userId,
         conversationId: active.conversationId,
         baseIds: active.knowledgeSelection.baseIds,
         query: argumentsValue.rewrite ?? argumentsValue.query,
         signal: active.controller.signal,
-      }))
+      })
+      if (active.cancelled || active.controller.signal.aborted || active.terminal) throw appFailure('CANCELLED')
+      result = knowledgeSearchResultSchema.parse(rawResult)
     } catch (error) {
       if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
       this.setKnowledgeStatus(active, 'failed', 0, asAppError(error).code)
@@ -1516,7 +1530,7 @@ export class AgentOrchestrator {
       return this.drive(active)
     }
     const evidence = result.kind === 'results' ? result.evidence : []
-    active.knowledgeEvidence.add(evidence)
+    const addedEvidence = active.knowledgeEvidence.add(evidence)
     const snapshot = active.knowledgeEvidence.snapshot()
     if (evidence.length === 0) {
       this.setKnowledgeStatus(active, 'insufficient', snapshot.length)
@@ -1529,14 +1543,15 @@ export class AgentOrchestrator {
     })
     if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
     if (consent !== 'granted') {
-      this.setKnowledgeStatus(active, consent === 'denied' ? 'consent_denied' : 'consent_required', snapshot.length)
-      await this.appendKnowledgeCitations(active, evidence.map(item => item.id), false)
+      active.knowledgeConsentBlocked = consent === 'denied' ? 'consent_denied' : 'consent_required'
+      this.setKnowledgeStatus(active, active.knowledgeConsentBlocked, snapshot.length)
       this.appendKnowledgeToolExchange(active, call, assistantContent, JSON.stringify({ kind: consent === 'denied' ? 'consent_denied' : 'consent_required' }))
       return this.drive(active)
     }
     this.setKnowledgeStatus(active, 'found', snapshot.length)
-    for (const item of snapshot) active.knowledgeDisclosedEvidenceIds.add(item.id)
-    this.appendKnowledgeToolExchange(active, call, assistantContent, active.knowledgeEvidence.providerEnvelope())
+    active.knowledgeConsentBlocked = undefined
+    for (const item of addedEvidence) active.knowledgeDisclosedEvidenceIds.add(item.id)
+    this.appendKnowledgeToolExchange(active, call, assistantContent, active.knowledgeEvidence.providerEnvelope(addedEvidence))
     return this.drive(active)
   }
 
@@ -1808,7 +1823,9 @@ export class AgentOrchestrator {
       }, '')
     }
     if (earlyBrowserAnswer !== undefined) {
-      this.appendText(active, earlyBrowserAnswer)
+      const grounding = await this.groundKnowledgeAnswer(active, earlyBrowserAnswer)
+      if (grounding.kind === 'repair') return this.drive(active)
+      this.appendText(active, grounding.text)
       this.appendWorkflowProvenance(active)
       return this.terminalize(active, 'completed')
     }
@@ -1914,6 +1931,7 @@ export class AgentOrchestrator {
       this.updateWorkflowStatus(active, pending, 'failed', started)
       this.appendToolExchange(active, pending, started)
       this.clearPending(active)
+      this.enableKnowledgeAfterWorkflow(active)
       return this.drive(active)
     }
     if (!loopStart) {
@@ -1921,6 +1939,7 @@ export class AgentOrchestrator {
       this.updateWorkflowStatus(active, pending, 'failed', error)
       this.appendToolExchange(active, pending, error)
       this.clearPending(active)
+      this.enableKnowledgeAfterWorkflow(active)
       return this.drive(active)
     }
     pending.executionAvailable = true
@@ -1957,8 +1976,19 @@ export class AgentOrchestrator {
     this.updateWorkflowStatus(active, pending, terminalStatus, statusError)
     this.appendToolExchange(active, pending, modelResult)
     this.clearPending(active)
+    this.enableKnowledgeAfterWorkflow(active)
     if (terminalStatus === 'completed') await this.refreshBrowserCatalog(active)
     return this.drive(active)
+  }
+
+  private enableKnowledgeAfterWorkflow(active: ActiveAgentRun): void {
+    if (!active.knowledgeEligible || active.knowledgeToolAllowed || active.terminal || active.cancelled) return
+    active.knowledgeToolAllowed = true
+    active.tools = [
+      ...active.workflowCatalogTools,
+      knowledgeSearchTool,
+      ...active.browserCatalog.tools,
+    ]
   }
 
   private async refreshBrowserCatalog(active: ActiveAgentRun): Promise<void> {
@@ -1989,6 +2019,7 @@ export class AgentOrchestrator {
     evidenceCount: number,
     errorCode?: AppError['code'],
   ): void {
+    if (active.cancelled || active.controller.signal.aborted || active.terminal) return
     const block: KnowledgeStatusBlock = {
       type: 'knowledge_status',
       blockId: active.knowledgeStatusBlockId ?? this.id(),
@@ -1996,6 +2027,9 @@ export class AgentOrchestrator {
       searchIndex: Math.max(1, active.knowledgeSearches),
       searchLimit: MAX_KNOWLEDGE_SEARCHES,
       evidenceCount,
+      ...(['consent_required', 'consent_denied'].includes(status)
+        ? { provider: active.providerSnapshot.providerId }
+        : {}),
       ...(errorCode === undefined ? {} : { errorCode }),
     }
     if (active.knowledgeStatusBlockId === undefined) {
@@ -2045,32 +2079,35 @@ export class AgentOrchestrator {
   private async appendKnowledgeCitations(
     active: ActiveAgentRun,
     evidenceIds: readonly string[],
-    checkSources = true,
   ): Promise<boolean> {
     const knowledge = this.dependencies.knowledge
     let allAvailable = true
+    const availableEvidence: KnowledgeEvidence[] = []
     for (const evidenceId of evidenceIds) {
       const evidence = active.knowledgeEvidence.snapshot().find(item => item.id === evidenceId)
       if (!evidence) continue
-      const sourceAvailable = checkSources && knowledge?.sourceAvailable
+      const sourceAvailable = knowledge?.sourceAvailable
         ? await knowledge.sourceAvailable({
             ownerId: active.userId,
             documentId: evidence.documentId,
             versionId: evidence.versionId,
             signal: active.controller.signal,
           })
-        : true
+        : false
       if (active.cancelled || active.controller.signal.aborted) throw appFailure('CANCELLED')
       allAvailable &&= sourceAvailable
+      if (sourceAvailable) availableEvidence.push(evidence)
+    }
+    if (!allAvailable && active.knowledgeSelection.mode === 'strict') return false
+    for (const evidence of availableEvidence) {
       this.appendBlock(active, {
         type: 'knowledge_citation',
         blockId: this.id(),
         evidenceId: evidence.id,
+        baseId: evidence.baseId,
         documentId: evidence.documentId,
         versionId: evidence.versionId,
         coordinate: sanitizeKnowledgeCoordinate(evidence.citation.coordinate),
-        preview: sourceAvailable ? sanitizeKnowledgeSnippet(evidence.snippet) : '来源当前不可用',
-        sourceAvailable,
       })
     }
     return allAvailable
@@ -2080,11 +2117,17 @@ export class AgentOrchestrator {
     active: ActiveAgentRun,
     answer: string,
   ): Promise<{ kind: 'answer'; text: string } | { kind: 'repair' }> {
-    if (active.knowledgeSelection.baseIds.length === 0
-      || active.workflowAttempted
-      || active.actualExecutions.length > 0
-      || active.browserRead) return { kind: 'answer', text: answer }
+    if (active.knowledgeSelection.baseIds.length === 0) return { kind: 'answer', text: answer }
     const allEvidence = active.knowledgeEvidence.snapshot()
+    if (active.knowledgeSearches === 0 && allEvidence.length === 0) return { kind: 'answer', text: answer }
+    if (active.knowledgeConsentBlocked) {
+      return {
+        kind: 'answer',
+        text: active.knowledgeConsentBlocked === 'consent_denied'
+          ? '你已拒绝向当前模型供应商发送知识库依据，因此本次不生成知识库答案。'
+          : '需要你先授权向当前模型供应商发送最小知识库依据，然后重新发送问题。',
+      }
+    }
     const evidence = allEvidence.filter(item => active.knowledgeDisclosedEvidenceIds.has(item.id))
     const validation = validateKnowledgeAnswer(
       answer,
@@ -2109,12 +2152,9 @@ export class AgentOrchestrator {
       }
       if (!available) this.setKnowledgeStatus(active, 'source_unavailable', allEvidence.length)
     }
-    const clean = answer.replace(/\s*\[\[kb:[^\]\r\n]{1,512}\]\]/gu, '').trim()
     return {
       kind: 'answer',
-      text: validation.generalKnowledge && active.knowledgeSelection.mode === 'mixed'
-        ? `以下内容是未由所选个人知识库支持的一般信息：\n\n${clean}`
-        : clean,
+      text: validation.text,
     }
   }
 

@@ -7,6 +7,9 @@ import type {
   KnowledgeSearchResult,
   KnowledgeImportHandle,
   KnowledgeSelection,
+  KnowledgeSourcePreview,
+  KnowledgeSourcePreviewRequest,
+  ModelProviderId,
   KnowledgeVersionSummary,
 } from '@autoforge/shared'
 import { toSafeAppError } from '@autoforge/shared'
@@ -37,7 +40,10 @@ export interface KnowledgeService {
   search(owner: KnowledgeOwner, query: string): Promise<KnowledgeSearchResult>
   getAvailability(owner: KnowledgeOwner): Promise<KnowledgeAvailability>
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
-  getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>
+  getConsent(owner: KnowledgeOwner, provider?: ModelProviderId): Promise<KnowledgeConsentState>
+  setConsent(owner: KnowledgeOwner, provider: ModelProviderId, status: 'granted' | 'denied'): Promise<KnowledgeConsentState>
+  revokeConsent(owner: KnowledgeOwner, provider: ModelProviderId): Promise<KnowledgeConsentState>
+  getSourcePreview(owner: KnowledgeOwner, input: KnowledgeSourcePreviewRequest): Promise<KnowledgeSourcePreview>
 }
 
 function unavailable(): never {
@@ -75,5 +81,8 @@ export function createUnavailableKnowledgeService(): KnowledgeService {
     }),
     getEntitlement: async () => ({ tier: 'free', status: 'unavailable', localEnabled: false, cloudEnabled: false }),
     getConsent: async () => ({ provider: 'openrouter', status: 'unknown' }),
+    setConsent: async () => unavailable(),
+    revokeConsent: async () => unavailable(),
+    getSourcePreview: async () => ({ kind: 'unavailable' }),
   }
 }

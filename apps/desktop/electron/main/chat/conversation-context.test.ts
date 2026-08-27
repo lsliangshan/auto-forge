@@ -121,9 +121,8 @@ describe('conversation context primitives', () => {
         },
         {
           type: 'knowledge_citation', blockId: 'knowledge_citation_private', evidenceId: 'evidence:private',
-          documentId: 'document_private', versionId: 'version_private', sourceAvailable: true,
+          baseId: 'base_private', documentId: 'document_private', versionId: 'version_private',
           coordinate: { kind: 'text', line: 8, startOffset: 0, endOffset: 6 },
-          preview: '隐藏正文 /Users/private/source.txt https://signed.example/token',
         },
       ],
     })

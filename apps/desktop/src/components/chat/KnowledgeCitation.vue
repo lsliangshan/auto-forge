@@ -6,23 +6,27 @@
     <header>
       <span>知识库依据 · {{ coordinateLabel }}</span>
       <button
-        v-if="block.sourceAvailable"
         type="button"
         data-testid="toggle-knowledge-preview"
         :aria-expanded="expanded"
-        @click="expanded = !expanded"
+        @click="togglePreview"
       >
         {{ expanded ? '收起原文' : '查看原文' }}
       </button>
-      <span
-        v-else
-        class="source-unavailable"
-      >来源当前不可用</span>
     </header>
     <KnowledgeSourcePreview
-      v-if="expanded && block.sourceAvailable"
-      :preview="block.preview"
+      v-if="expanded && preview"
+      :preview="preview"
     />
+    <p v-else-if="expanded && loading">
+      正在读取原文…
+    </p>
+    <p
+      v-else-if="expanded && unavailable"
+      class="source-unavailable"
+    >
+      来源当前不可用
+    </p>
   </section>
 </template>
 
@@ -30,10 +34,42 @@
 import type { ChatBlock } from '@autoforge/shared'
 import { computed, ref } from 'vue'
 import KnowledgeSourcePreview from './KnowledgeSourcePreview.vue'
+import { getDesktopApi } from '../../services/desktop-api'
 
 type KnowledgeCitationBlock = Extract<ChatBlock, { type: 'knowledge_citation' }>
 const props = defineProps<{ block: KnowledgeCitationBlock }>()
 const expanded = ref(false)
+const preview = ref('')
+const loading = ref(false)
+const unavailable = ref(false)
+async function togglePreview() {
+  if (expanded.value) {
+    expanded.value = false
+    return
+  }
+  expanded.value = true
+  loading.value = true
+  preview.value = ''
+  unavailable.value = false
+  try {
+    const coordinate = props.block.coordinate.kind === 'docx'
+      ? { ...props.block.coordinate, headingPath: [...props.block.coordinate.headingPath] }
+      : { ...props.block.coordinate }
+    const result = await getDesktopApi().knowledge.getSourcePreview({
+      evidenceId: props.block.evidenceId,
+      baseId: props.block.baseId,
+      documentId: props.block.documentId,
+      versionId: props.block.versionId,
+      coordinate,
+    })
+    if (result.kind === 'available') preview.value = result.preview
+    else unavailable.value = true
+  } catch {
+    unavailable.value = true
+  } finally {
+    loading.value = false
+  }
+}
 const coordinateLabel = computed(() => {
   const coordinate = props.block.coordinate
   if (coordinate.kind === 'pdf') return `第 ${coordinate.page} 页`

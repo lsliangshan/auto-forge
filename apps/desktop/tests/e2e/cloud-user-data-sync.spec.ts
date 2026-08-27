@@ -196,7 +196,12 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
 
     await profile.page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
     await profile.page.getByTestId('send-message').click()
-    await expect(profile.page.getByTestId('knowledge-status')).toContainText('已找到 1 条依据')
+    await expect(profile.page.getByTestId('knowledge-status')).toContainText('需要授权后才能发送依据')
+    await profile.page.getByTestId('grant-knowledge-consent').click()
+    await expect(profile.page.getByText('已授权，请重新发送问题。')).toBeVisible()
+    await profile.page.getByPlaceholder('描述你想完成的任务…').fill('Ask the selected knowledge base')
+    await profile.page.getByTestId('send-message').click()
+    await expect(profile.page.getByTestId('knowledge-status').last()).toContainText('已找到 1 条依据')
     const citation = profile.page.getByTestId('knowledge-citation')
     await expect(citation).toBeVisible()
     await citation.getByTestId('toggle-knowledge-preview').click()

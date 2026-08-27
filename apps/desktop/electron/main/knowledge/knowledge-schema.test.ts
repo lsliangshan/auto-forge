@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v4', () => {
+describe('knowledge schema v5', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(4)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(5)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -44,6 +44,7 @@ describe('knowledge schema v4', () => {
       'knowledge_blocks',
       'knowledge_cleanup_records',
       'knowledge_import_jobs',
+      'knowledge_provider_consents',
       'knowledge_schema_migrations',
       'cloud_sync_conversions',
       'cloud_sync_mutations',
@@ -63,6 +64,7 @@ describe('knowledge schema v4', () => {
     initializeKnowledgeSchema(database)
     database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 3').run()
     database.exec(`
+      DROP TABLE knowledge_provider_consents;
       DROP TABLE conflicts;
       DROP TABLE cloud_sync_conversions;
       DROP TABLE cloud_sync_orphans;

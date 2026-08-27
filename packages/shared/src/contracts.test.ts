@@ -1812,18 +1812,25 @@ describe('cross-process contracts', () => {
     }
     const citation = {
       type: 'knowledge_citation', blockId: 'knowledge_citation_1', evidenceId: 'evidence:1',
-      documentId: 'document_1', versionId: 'version_1', sourceAvailable: true,
+      baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
       coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 },
-      preview: '合同在签字后生效。',
     }
     expect(chatBlockSchema.parse(status)).toEqual(status)
     expect(chatBlockSchema.parse(citation)).toEqual(citation)
     expect(chatBlockSchema.safeParse({ ...citation, path: '/tmp/private' }).success).toBe(false)
-    expect(chatBlockSchema.safeParse({ ...citation, preview: 'x'.repeat(4_001) }).success).toBe(false)
+    expect(chatBlockSchema.safeParse({ ...citation, preview: '合同在签字后生效。' }).success).toBe(false)
     expect(chatEventSchema.parse({
       type: 'block_update', conversationId: 'conversation_1', messageId: 'message_1',
       blockId: status.blockId, block: { ...status, status: 'insufficient', evidenceCount: 0 },
     })).toMatchObject({ type: 'block_update', blockId: status.blockId })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeGetSourcePreview].safeParse({
+      evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 },
+    }).success).toBe(true)
+    expect(ipcRequestSchemas[ipcChannels.knowledgeGetSourcePreview].safeParse({
+      evidenceId: 'evidence:1', baseId: 'base_1', documentId: 'document_1', versionId: 'version_1',
+      coordinate: { kind: 'text', line: 2, startOffset: 0, endOffset: 6 }, ownerId: 'forged',
+    }).success).toBe(false)
   })
 
   it('keeps knowledge selection inside strict conversation preferences', () => {

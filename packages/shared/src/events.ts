@@ -13,7 +13,7 @@ const nonEmptyStringSchema = z.string().trim().min(1)
 const workflowSourceSchema = z.enum(['installed', 'development'])
 const buildHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 
-const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
+export const knowledgeCoordinateSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('pdf'), page: z.number().int().positive(),
     startOffset: z.number().int().nonnegative(), endOffset: z.number().int().nonnegative(),
@@ -213,13 +213,18 @@ export const knowledgeStatusBlockSchema = z.object({
   searchIndex: z.number().int().positive().max(3),
   searchLimit: z.literal(3),
   evidenceCount: z.number().int().nonnegative().max(8),
+  provider: z.enum(['openrouter', 'deepseek']).optional(),
   errorCode: appErrorCodeSchema.optional(),
-}).strict().superRefine(({ status, evidenceCount, errorCode }, context) => {
+}).strict().superRefine(({ status, evidenceCount, errorCode, provider }, context) => {
   if ((status === 'searching' || status === 'found') && errorCode !== undefined) {
     context.addIssue({ code: 'custom', path: ['errorCode'], message: 'Active knowledge status cannot contain an error' })
   }
   if (status === 'found' && evidenceCount === 0) {
     context.addIssue({ code: 'custom', path: ['evidenceCount'], message: 'Found knowledge status requires evidence' })
+  }
+  const consentStatus = status === 'consent_required' || status === 'consent_denied'
+  if (consentStatus !== (provider !== undefined)) {
+    context.addIssue({ code: 'custom', path: ['provider'], message: 'Provider is required only for consent status' })
   }
 })
 
@@ -227,11 +232,10 @@ export const knowledgeCitationBlockSchema = z.object({
   type: z.literal('knowledge_citation'),
   blockId: identifierSchema,
   evidenceId: identifierSchema,
+  baseId: identifierSchema,
   documentId: identifierSchema,
   versionId: identifierSchema,
   coordinate: knowledgeCoordinateSchema,
-  preview: nonEmptyStringSchema.max(4_000),
-  sourceAvailable: z.boolean(),
 }).strict()
 
 export const chatBlockSchema = z.discriminatedUnion('type', [
