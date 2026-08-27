@@ -34,18 +34,24 @@ interface JobRow {
   publication_token: string
   object_id: string
   mime_type: ParserMediaType
+  name: string
 }
+
+class PublicationConflict extends Error {}
 
 export class ImportJobRunner {
   #tail = Promise.resolve()
   #controller = new AbortController()
   #invalidated = false
   #recovered = false
+  #termination: Promise<void> | undefined
+  #failure: unknown
+  #hasFailure = false
 
   constructor(private readonly dependencies: ImportJobRunnerDependencies) {}
 
   recoverAndRun(): Promise<void> {
-    if (!this.#recovered) {
+    if (!this.#recovered && this.#isCurrent()) {
       this.#recovered = true
       this.dependencies.database.prepare(`
         UPDATE knowledge_import_jobs SET status = 'queued', updated_at = ?
@@ -60,7 +66,7 @@ export class ImportJobRunner {
       if (!this.#isCurrent()) return
       const jobs = this.dependencies.database.prepare(`
         SELECT job.id, job.document_id, job.version_id, job.generation,
-               job.publication_token, version.object_id, document.mime_type
+               job.publication_token, version.object_id, version.mime_type, version.name
         FROM knowledge_import_jobs AS job
         JOIN document_versions AS version
           ON version.id = job.version_id AND version.document_id = job.document_id
@@ -73,7 +79,7 @@ export class ImportJobRunner {
         await this.#run(job)
       }
     })
-    this.#tail = operation.catch(() => undefined)
+    this.#tail = operation.catch((error: unknown) => { this.#rememberFailure(error) })
     return operation
   }
 
@@ -81,11 +87,25 @@ export class ImportJobRunner {
     if (this.#invalidated) return
     this.#invalidated = true
     this.#controller.abort()
-    void this.dependencies.parser.terminateAll().catch(() => undefined)
+    void this.#terminate().catch(() => undefined)
   }
 
   async drain(): Promise<void> {
-    await Promise.allSettled([this.#tail, this.dependencies.parser.terminateAll()])
+    const results = await Promise.allSettled([this.#tail, this.#terminate()])
+    const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (this.#hasFailure) throw this.#failure
+    if (rejected) throw rejected.reason
+  }
+
+  #terminate(): Promise<void> {
+    this.#termination ??= Promise.resolve().then(() => this.dependencies.parser.terminateAll())
+    return this.#termination
+  }
+
+  #rememberFailure(error: unknown): void {
+    if (this.#hasFailure) return
+    this.#hasFailure = true
+    this.#failure = error
   }
 
   #isCurrent(): boolean {
@@ -124,7 +144,7 @@ export class ImportJobRunner {
 
   #publish(job: JobRow, parsed: ParsedDocument): void {
     this.dependencies.database.transaction(() => {
-      if (!this.#isCurrent()) return
+      if (!this.#isCurrent()) throw new PublicationConflict('Owner epoch changed')
       const document = this.dependencies.database.prepare(`
         SELECT active_version_id FROM documents
         WHERE id = ? AND publication_generation = ? AND recycled_at IS NULL
@@ -134,8 +154,7 @@ export class ImportJobRunner {
         WHERE id = ? AND publication_token = ? AND status = 'running'
       `).get(job.id, job.publication_token)
       if (!document || !liveJob) {
-        this.#failInsideTransaction(job)
-        return
+        throw new PublicationConflict('Publication lease changed')
       }
 
       this.dependencies.database.prepare('DELETE FROM knowledge_blocks WHERE version_id = ?').run(job.version_id)
@@ -145,7 +164,7 @@ export class ImportJobRunner {
           INSERT INTO knowledge_blocks(id, version_id, ordinal, kind, text, coordinates_json)
           VALUES (?, ?, ?, ?, ?, ?)
         `).run(blockId, job.version_id, ordinal, block.coordinate.kind, block.text, JSON.stringify(block.coordinate))
-        this.dependencies.database.prepare(`
+        const inserted = this.dependencies.database.prepare(`
           INSERT INTO kb_chunks(
             id, knowledge_base_id, document_id, version_id, block_id, ordinal, body, coordinates_json
           )
@@ -155,26 +174,31 @@ export class ImportJobRunner {
           this.dependencies.token(), job.version_id, blockId, ordinal, block.text,
           JSON.stringify(block.coordinate), job.document_id,
         )
+        if (inserted.changes !== 1) throw new PublicationConflict('Document disappeared during publication')
       }
       if (document.active_version_id) {
-        this.dependencies.database.prepare(`
+        const retired = this.dependencies.database.prepare(`
           UPDATE document_versions SET status = 'superseded'
           WHERE id = ? AND status = 'ready'
         `).run(document.active_version_id)
+        if (retired.changes !== 1) throw new PublicationConflict('Active version changed during publication')
       }
-      this.dependencies.database.prepare(`
+      const published = this.dependencies.database.prepare(`
         UPDATE document_versions SET status = 'ready', error_code = NULL
         WHERE id = ? AND document_id = ? AND publication_generation = ? AND status = 'staging'
       `).run(job.version_id, job.document_id, job.generation)
-      this.dependencies.database.prepare(`
+      if (published.changes !== 1) throw new PublicationConflict('Staged version changed during publication')
+      const activated = this.dependencies.database.prepare(`
         UPDATE documents
-        SET active_version_id = ?, lifecycle_status = 'ready', updated_at = ?
+        SET active_version_id = ?, name = ?, mime_type = ?, lifecycle_status = 'ready', updated_at = ?
         WHERE id = ? AND publication_generation = ? AND recycled_at IS NULL
-      `).run(job.version_id, Date.now(), job.document_id, job.generation)
-      this.dependencies.database.prepare(`
+      `).run(job.version_id, job.name, job.mime_type, Date.now(), job.document_id, job.generation)
+      if (activated.changes !== 1) throw new PublicationConflict('Document generation changed during publication')
+      const completed = this.dependencies.database.prepare(`
         UPDATE knowledge_import_jobs SET status = 'completed', updated_at = ?
         WHERE id = ? AND publication_token = ? AND status = 'running'
       `).run(Date.now(), job.id, job.publication_token)
+      if (completed.changes !== 1) throw new PublicationConflict('Import token changed during publication')
     })()
   }
 

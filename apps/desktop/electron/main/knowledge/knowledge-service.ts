@@ -148,16 +148,46 @@ export function createLocalKnowledgeService(
   const now = dependencies.now ?? Date.now
   const id = dependencies.id ?? randomUUID
 
+  const firstFailure = (
+    results: readonly PromiseSettledResult<unknown>[],
+  ): PromiseRejectedResult | undefined => (
+    results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  )
+  const settle = (operations: readonly (() => unknown | Promise<unknown>)[]) => Promise.allSettled(
+    operations.map(operation => Promise.resolve().then(operation)),
+  )
+
   const retire = (current: Binding): void => {
     current.runner.invalidate()
     const closing = (async () => {
-      await current.runner.drain()
+      const failures: PromiseSettledResult<unknown>[] = []
+      failures.push(...await settle([() => current.runner.drain()]))
       for (const handle of current.handles.values()) {
-        await current.store.objects.delete(handle.objectId).catch(() => undefined)
+        try {
+          current.store.database.prepare(`
+            INSERT OR IGNORE INTO knowledge_cleanup_records(object_id, created_at) VALUES (?, ?)
+          `).run(handle.objectId, now())
+        } catch (error) {
+          failures.push({ status: 'rejected', reason: error })
+        }
+        const deleted = await settle([() => current.store.objects.delete(handle.objectId)])
+        failures.push(...deleted)
+        if (deleted[0]?.status === 'fulfilled') {
+          try {
+            current.store.database.prepare(
+              'DELETE FROM knowledge_cleanup_records WHERE object_id = ?',
+            ).run(handle.objectId)
+          } catch (error) {
+            failures.push({ status: 'rejected', reason: error })
+          }
+        }
       }
       current.handles.clear()
-      await current.store.close()
-    })().finally(() => { retiring.delete(closing) })
+      failures.push(...await settle([() => current.store.close()]))
+      const failure = firstFailure(failures)
+      if (failure) throw failure.reason
+    })()
+    void closing.catch(() => undefined)
     retiring.add(closing)
   }
 
@@ -166,6 +196,14 @@ export function createLocalKnowledgeService(
       pendingRetirements.delete(pending)
       retire(pending)
     }
+  }
+
+  const waitForRetirements = async (): Promise<void> => {
+    const active = [...retiring]
+    const results = await Promise.allSettled(active)
+    for (const settled of active) retiring.delete(settled)
+    const failure = firstFailure(results)
+    if (failure) throw failure.reason
   }
 
   const invalidate = (): void => {
@@ -197,12 +235,17 @@ export function createLocalKnowledgeService(
     if (document) dependencies.emit?.({ type: 'document_updated', document })
   }
 
-  const recoverCleanup = async (store: LocalKnowledgeStore): Promise<void> => {
+  const recoverCleanup = async (
+    store: LocalKnowledgeStore,
+    isCurrentEpoch: () => boolean,
+  ): Promise<void> => {
     const records = store.database.prepare(
       'SELECT object_id FROM knowledge_cleanup_records ORDER BY created_at, object_id',
     ).all() as Array<{ object_id: string }>
     for (const record of records) {
+      if (!isCurrentEpoch()) fail('CONFLICT')
       await store.objects.delete(record.object_id)
+      if (!isCurrentEpoch()) fail('CONFLICT')
       store.database.prepare('DELETE FROM knowledge_cleanup_records WHERE object_id = ?').run(record.object_id)
     }
   }
@@ -214,11 +257,13 @@ export function createLocalKnowledgeService(
     const bindEpoch = epoch
     const operation = lifecycleTail.then(async () => {
       beginRetirements()
-      await Promise.allSettled([...retiring])
+      await waitForRetirements()
+      if (bindEpoch !== epoch) fail('CONFLICT')
       let store: LocalKnowledgeStore
       try {
         store = await dependencies.openStore(ownerId)
       } catch {
+        if (bindEpoch !== epoch) fail('CONFLICT')
         if (bindEpoch === epoch) unavailable = {
           ownerId, epoch: bindEpoch, encryptionAvailable: false, parserAvailable: false,
         }
@@ -228,17 +273,27 @@ export function createLocalKnowledgeService(
         await store.close()
         fail('CONFLICT')
       }
-      let parser: KnowledgeParserPort
+      let parser: KnowledgeParserPort | undefined
       try {
-        await recoverCleanup(store)
+        await recoverCleanup(store, () => bindEpoch === epoch)
+        if (bindEpoch !== epoch) fail('CONFLICT')
         parser = await dependencies.createParser(store)
+        if (bindEpoch !== epoch) fail('CONFLICT')
       } catch {
-        await store.close()
+        if (parser) {
+          const cleanup = await settle([() => parser!.terminateAll(), () => store.close()])
+          const cleanupFailure = firstFailure(cleanup)
+          if (cleanupFailure) throw cleanupFailure.reason
+        } else {
+          await store.close()
+        }
+        if (bindEpoch !== epoch) fail('CONFLICT')
         if (bindEpoch === epoch) unavailable = {
           ownerId, epoch: bindEpoch, encryptionAvailable: true, parserAvailable: false,
         }
         return
       }
+      if (!parser) fail('SERVICE_UNAVAILABLE')
       const active = {} as Binding
       const runner = new ImportJobRunner({
         database: store.database,
@@ -250,6 +305,12 @@ export function createLocalKnowledgeService(
         onDocumentChanged: documentId => emitDocument(active, documentId),
       })
       Object.assign(active, { ownerId, epoch: bindEpoch, store, parser, runner, handles: new Map() })
+      if (bindEpoch !== epoch) {
+        const cleanup = await settle([() => runner.drain(), () => store.close()])
+        const cleanupFailure = firstFailure(cleanup)
+        if (cleanupFailure) throw cleanupFailure.reason
+        fail('CONFLICT')
+      }
       binding = active
       void runner.recoverAndRun().catch(() => undefined)
     })
@@ -275,9 +336,13 @@ export function createLocalKnowledgeService(
     const versionId = id()
     active.store.database.prepare(`
       INSERT INTO document_versions(
-        id, document_id, version_number, status, content_hash, object_id, created_at, publication_generation
-      ) VALUES (?, ?, ?, 'staging', ?, ?, ?, ?)
-    `).run(versionId, documentId, versionNumber, handle.contentHash, handle.objectId, createdAt, generation)
+        id, document_id, version_number, status, content_hash, object_id, created_at,
+        publication_generation, name, mime_type
+      ) VALUES (?, ?, ?, 'staging', ?, ?, ?, ?, ?, ?)
+    `).run(
+      versionId, documentId, versionNumber, handle.contentHash, handle.objectId,
+      createdAt, generation, handle.name, handle.mimeType,
+    )
     active.store.database.prepare(`
       INSERT INTO knowledge_import_jobs(
         id, document_id, version_id, generation, publication_token, status,
@@ -301,7 +366,7 @@ export function createLocalKnowledgeService(
     drain: async () => {
       await lifecycleTail.catch(() => undefined)
       beginRetirements()
-      await Promise.allSettled([...retiring])
+      await waitForRetirements()
     },
     list: async (owner) => {
       const active = current(owner)
@@ -426,10 +491,11 @@ export function createLocalKnowledgeService(
           FROM document_versions WHERE document_id = ?
         `).get(documentId) as { version_number: number }
         const generation = document.publication_generation + 1
-        active.store.database.prepare(`
-          UPDATE documents SET name = ?, mime_type = ?, lifecycle_status = 'queued',
+        const changed = active.store.database.prepare(`
+          UPDATE documents SET lifecycle_status = CASE WHEN active_version_id IS NULL THEN 'queued' ELSE lifecycle_status END,
             publication_generation = ?, updated_at = ? WHERE id = ? AND publication_generation = ?
-        `).run(handle.name, handle.mimeType, generation, now(), documentId, document.publication_generation)
+        `).run(generation, now(), documentId, document.publication_generation)
+        if (changed.changes !== 1) fail('CONFLICT')
         enqueue(active, documentId, handle, latest.version_number + 1, generation)
       })()
       void active.runner.runQueued().catch(() => undefined)
@@ -559,13 +625,17 @@ export function createLocalKnowledgeService(
     updateSelection: async () => fail('SERVICE_UNAVAILABLE'),
     search: async (owner, query) => {
       const active = current(owner)
+      const normalized = query.normalize('NFC').trim()
+      const length = Array.from(normalized).length
+      if (length < 2) return { kind: 'query-too-short' }
       const bases = active.store.database.prepare(`
         SELECT id FROM knowledge_bases WHERE recycled_at IS NULL ORDER BY created_at, id
       `).all() as Array<{ id: string }>
-      if (bases.length === 0) return []
-      const result = await new LocalKnowledgeRetriever(active.store.database)
-        .search(query, bases.map(base => base.id))
-      return Array.isArray(result) ? Array.from(result) : []
+      if (bases.length === 0) {
+        return { kind: 'results', strategy: length === 2 ? 'bounded-instr' : 'trigram', evidence: [] }
+      }
+      return new LocalKnowledgeRetriever(active.store.database)
+        .search(normalized, bases.map(base => base.id))
     },
     getAvailability: async (owner): Promise<KnowledgeAvailability> => {
       const disabled = unavailable

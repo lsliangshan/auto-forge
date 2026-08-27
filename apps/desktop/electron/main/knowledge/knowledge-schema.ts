@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 2
+export const KNOWLEDGE_SCHEMA_VERSION = 3
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -128,9 +128,19 @@ const KNOWLEDGE_SCHEMA_V2 = `
   ) STRICT;
 `
 
+const KNOWLEDGE_SCHEMA_V3 = `
+  ALTER TABLE document_versions ADD COLUMN name TEXT NOT NULL DEFAULT '';
+  ALTER TABLE document_versions ADD COLUMN mime_type TEXT NOT NULL DEFAULT '';
+
+  UPDATE document_versions
+  SET name = (SELECT documents.name FROM documents WHERE documents.id = document_versions.document_id),
+      mime_type = (SELECT documents.mime_type FROM documents WHERE documents.id = document_versions.document_id);
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
+  [3, KNOWLEDGE_SCHEMA_V3],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {

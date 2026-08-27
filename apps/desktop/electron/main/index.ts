@@ -1,4 +1,3 @@
-import { readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -42,6 +41,7 @@ import {
   type SelectedKnowledgeFile,
 } from './knowledge/knowledge-service.js'
 import { createElectronParserSupervisor } from './knowledge/parser-supervisor.js'
+import { readKnowledgeImportFile, writeKnowledgeExportFile } from './knowledge/knowledge-file-io.js'
 import type { SafeStoragePort } from './security/secret-store.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
@@ -132,9 +132,11 @@ async function initialize(): Promise<ApplicationRuntime> {
     for (const path of result.filePaths.slice(0, 1)) {
       const mimeType = mediaType(path)
       if (!mimeType) continue
-      const metadata = await stat(path)
-      if (!metadata.isFile() || metadata.size < 1 || metadata.size > MAX_KNOWLEDGE_IMPORT_BYTES) continue
-      selected.push({ name: basename(path), mimeType, bytes: await readFile(path) })
+      selected.push({
+        name: basename(path),
+        mimeType,
+        bytes: await readKnowledgeImportFile(path, MAX_KNOWLEDGE_IMPORT_BYTES),
+      })
     }
     return selected
   }
@@ -150,7 +152,7 @@ async function initialize(): Promise<ApplicationRuntime> {
       const result = mainWindow
         ? await dialog.showSaveDialog(mainWindow, { defaultPath: name })
         : await dialog.showSaveDialog({ defaultPath: name })
-      if (!result.canceled && result.filePath) await writeFile(result.filePath, contents, { mode: 0o600 })
+      if (!result.canceled && result.filePath) await writeKnowledgeExportFile(result.filePath, contents)
     },
     // Signed membership snapshots arrive in Task 8. Main stays on the free 1/1 policy until then.
     isMember: () => false,

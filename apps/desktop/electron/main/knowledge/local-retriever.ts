@@ -1,17 +1,8 @@
 import type Database from 'better-sqlite3'
-import type { KnowledgeEvidence } from '@autoforge/shared'
+import type { KnowledgeEvidence, KnowledgeSearchResult } from '@autoforge/shared'
 
 const MAX_RESULTS = 8
 const MAX_TWO_CHARACTER_CANDIDATES = 200
-
-export type LocalSearchResults = KnowledgeEvidence[] & {
-  readonly kind: 'results'
-  readonly strategy: 'trigram' | 'bounded-instr'
-}
-
-export interface QueryTooShort {
-  readonly kind: 'query-too-short'
-}
 
 interface ChunkRow {
   id: string
@@ -22,7 +13,10 @@ interface ChunkRow {
   coordinates_json: string
 }
 
-function resultArray(rows: ChunkRow[], strategy: LocalSearchResults['strategy']): LocalSearchResults {
+function searchResult(
+  rows: ChunkRow[],
+  strategy: Extract<KnowledgeSearchResult, { kind: 'results' }>['strategy'],
+): KnowledgeSearchResult {
   const evidence = rows.map((row, index): KnowledgeEvidence => {
     const parsed = JSON.parse(row.coordinates_json) as Record<string, unknown>
     const coordinate: KnowledgeEvidence['citation']['coordinate'] = parsed.kind === 'pdf'
@@ -58,12 +52,8 @@ function resultArray(rows: ChunkRow[], strategy: LocalSearchResults['strategy'])
         coordinate,
       },
     }
-  }) as LocalSearchResults
-  Object.defineProperties(evidence, {
-    kind: { value: 'results', enumerable: true },
-    strategy: { value: strategy, enumerable: true },
   })
-  return evidence
+  return { kind: 'results', strategy, evidence }
 }
 
 function selectedScope(baseIds: readonly string[]): { clause: string; values: string[] } {
@@ -77,12 +67,14 @@ function selectedScope(baseIds: readonly string[]): { clause: string; values: st
 export class LocalKnowledgeRetriever {
   constructor(private readonly database: Database.Database) {}
 
-  async search(query: string, baseIds: readonly string[]): Promise<LocalSearchResults | QueryTooShort> {
+  async search(query: string, baseIds: readonly string[]): Promise<KnowledgeSearchResult> {
     const normalized = query.normalize('NFC').trim()
     const length = Array.from(normalized).length
     if (length < 2) return { kind: 'query-too-short' }
     const scope = selectedScope(baseIds)
-    const common = `
+    const selected = `
+      SELECT chunk.id, chunk.knowledge_base_id, chunk.document_id, chunk.version_id,
+             chunk.body, chunk.coordinates_json, chunk.ordinal
       FROM kb_chunks AS chunk
       JOIN documents AS document
         ON document.id = chunk.document_id
@@ -99,14 +91,18 @@ export class LocalKnowledgeRetriever {
     `
     if (length === 2) {
       const rows = this.database.prepare(`
-        SELECT chunk.id, chunk.knowledge_base_id, chunk.document_id, chunk.version_id,
-               chunk.body, chunk.coordinates_json
-        ${common}
-          AND instr(chunk.body, ?) > 0
-        ORDER BY chunk.version_id, chunk.ordinal
-        LIMIT ${MAX_TWO_CHARACTER_CANDIDATES}
+        WITH candidate AS MATERIALIZED (
+          ${selected}
+          ORDER BY chunk.version_id, chunk.ordinal
+          LIMIT ${MAX_TWO_CHARACTER_CANDIDATES}
+        )
+        SELECT id, knowledge_base_id, document_id, version_id, body, coordinates_json
+        FROM candidate
+        WHERE instr(body, ?) > 0
+        ORDER BY version_id, ordinal
+        LIMIT ${MAX_RESULTS}
       `).all(...scope.values, normalized) as ChunkRow[]
-      return resultArray(rows.slice(0, MAX_RESULTS), 'bounded-instr')
+      return searchResult(rows, 'bounded-instr')
     }
 
     const literal = `"${normalized.replaceAll('"', '""')}"`
@@ -131,6 +127,6 @@ export class LocalKnowledgeRetriever {
       ORDER BY bm25(kb_chunks_fts), chunk.version_id, chunk.ordinal
       LIMIT ${MAX_RESULTS}
     `).all(literal, ...scope.values) as ChunkRow[]
-    return resultArray(rows, 'trigram')
+    return searchResult(rows, 'trigram')
   }
 }

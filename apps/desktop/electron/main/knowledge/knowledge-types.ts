@@ -4,7 +4,7 @@ import type {
   KnowledgeConsentState,
   KnowledgeDocumentSummary,
   KnowledgeEntitlementState,
-  KnowledgeEvidence,
+  KnowledgeSearchResult,
   KnowledgeImportHandle,
   KnowledgeSelection,
   KnowledgeVersionSummary,
@@ -34,7 +34,7 @@ export interface KnowledgeService {
   exportBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   getSelection(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSelection>
   updateSelection(owner: KnowledgeOwner, conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
-  search(owner: KnowledgeOwner, query: string): Promise<KnowledgeEvidence[]>
+  search(owner: KnowledgeOwner, query: string): Promise<KnowledgeSearchResult>
   getAvailability(owner: KnowledgeOwner): Promise<KnowledgeAvailability>
   getEntitlement(owner: KnowledgeOwner): Promise<KnowledgeEntitlementState>
   getConsent(owner: KnowledgeOwner): Promise<KnowledgeConsentState>

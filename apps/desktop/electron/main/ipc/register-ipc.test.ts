@@ -139,7 +139,7 @@ function services(): DesktopIpcServices {
       restoreDocument: vi.fn(), recycleBase: vi.fn(), restoreBase: vi.fn(), purgeBase: vi.fn(), exportBase: vi.fn(),
       getSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
       updateSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
-      search: vi.fn().mockResolvedValue([]),
+      search: vi.fn().mockResolvedValue({ kind: 'results', strategy: 'bounded-instr', evidence: [] }),
       getAvailability: vi.fn().mockResolvedValue({
         encryption: { available: true }, parser: { available: false, reason: 'parser_unavailable' },
         cloudbase: { available: false, reason: 'cloudbase_unavailable' },
@@ -437,14 +437,23 @@ describe('registerDesktopIpc', () => {
     await expect(app.invoke(ipcChannels.knowledgeImportDocument, {
       baseId: 'base_1', importHandleId: 'import_1',
     })).resolves.toMatchObject({ id: 'document_1', baseId: 'base_1' })
-    await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合同' })).resolves.toEqual([])
+    vi.mocked(app.dependencies.knowledge.search)
+      .mockResolvedValueOnce({ kind: 'query-too-short' })
+      .mockResolvedValueOnce({ kind: 'results', strategy: 'bounded-instr', evidence: [] })
+    await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合' })).resolves.toEqual({
+      kind: 'query-too-short',
+    })
+    await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合同' })).resolves.toEqual({
+      kind: 'results', strategy: 'bounded-instr', evidence: [],
+    })
     await expect(app.invoke(ipcChannels.knowledgeRestoreDocument, { documentId: 'document_1' })).resolves.toBeUndefined()
     await expect(app.invoke(ipcChannels.knowledgeRestoreBase, { baseId: 'base_1' })).resolves.toBeUndefined()
 
     const owner = { userId: 'user_1' }
     expect(app.dependencies.knowledge.pickImportFiles).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'base_1', 'import_1')
-    expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, '合同')
+    expect(app.dependencies.knowledge.search).toHaveBeenNthCalledWith(1, owner, '合')
+    expect(app.dependencies.knowledge.search).toHaveBeenNthCalledWith(2, owner, '合同')
     expect(app.dependencies.knowledge.restoreDocument).toHaveBeenCalledWith(owner, 'document_1')
     expect(app.dependencies.knowledge.restoreBase).toHaveBeenCalledWith(owner, 'base_1')
 
@@ -457,7 +466,7 @@ describe('registerDesktopIpc', () => {
     }
     expect(app.dependencies.knowledge.list).not.toHaveBeenCalled()
     expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledOnce()
-    expect(app.dependencies.knowledge.search).toHaveBeenCalledOnce()
+    expect(app.dependencies.knowledge.search).toHaveBeenCalledTimes(2)
   })
 
   it('strictly validates authenticated browser takeover, audit, and data-clear requests', async () => {

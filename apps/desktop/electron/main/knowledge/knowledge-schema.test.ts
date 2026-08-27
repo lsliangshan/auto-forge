@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v2', () => {
+describe('knowledge schema v3', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(2)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(3)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -50,6 +50,28 @@ describe('knowledge schema v2', () => {
       SELECT lifecycle_status, publication_generation, recycled_at
       FROM documents LIMIT 0
     `).all()).toEqual([])
+    expect(database.prepare('SELECT name, mime_type FROM document_versions LIMIT 0').all()).toEqual([])
+  })
+
+  it('backfills immutable version metadata when upgrading a v2 database', () => {
+    const database = testDatabase()
+    initializeKnowledgeSchema(database)
+    database.prepare('DELETE FROM knowledge_schema_migrations WHERE version = 3').run()
+    database.exec(`
+      ALTER TABLE document_versions DROP COLUMN mime_type;
+      ALTER TABLE document_versions DROP COLUMN name;
+      INSERT INTO knowledge_bases(id, name, created_at, updated_at) VALUES ('base', 'Base', 1, 1);
+      INSERT INTO documents(id, knowledge_base_id, name, mime_type, created_at, updated_at)
+      VALUES ('doc', 'base', '旧合同.txt', 'text/plain', 1, 1);
+      INSERT INTO document_versions(id, document_id, version_number, status, content_hash, object_id, created_at)
+      VALUES ('version', 'doc', 1, 'ready', 'hash', 'object', 1);
+    `)
+
+    initializeKnowledgeSchema(database)
+
+    expect(database.prepare('SELECT name, mime_type FROM document_versions').get()).toEqual({
+      name: '旧合同.txt', mime_type: 'text/plain',
+    })
   })
 
   it('keeps trigram FTS rows synchronized with external chunk content', () => {

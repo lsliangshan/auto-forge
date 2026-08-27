@@ -101,16 +101,17 @@ export class KnowledgeExportService {
       const manifestDocuments = []
       for (const document of documents) {
         const versions = this.dependencies.database.prepare(`
-          SELECT id, version_number, status, object_id, created_at
+          SELECT id, version_number, status, object_id, created_at, name, mime_type
           FROM document_versions WHERE document_id = ? ORDER BY version_number
         `).all(document.id) as Array<{
           id: string; version_number: number; status: string; object_id: string; created_at: number
+          name: string; mime_type: string
         }>
         for (const version of versions) {
           const contents = await this.dependencies.objects.read(version.object_id)
           retainedBytes += contents.length
           entries.push({
-            name: `originals/${version.id}.${extensionFor(document.mime_type)}`,
+            name: `originals/${version.id}.${extensionFor(version.mime_type)}`,
             contents,
           })
           if (retainedBytes > maxBytes) throw new Error('Knowledge export exceeds its limit')
@@ -125,6 +126,8 @@ export class KnowledgeExportService {
           versions: versions.map(version => ({
             id: version.id,
             number: version.version_number,
+            name: version.name,
+            mimeType: version.mime_type,
             status: version.status === 'superseded' ? 'retired' : version.status,
             createdAt: new Date(version.created_at).toISOString(),
           })),

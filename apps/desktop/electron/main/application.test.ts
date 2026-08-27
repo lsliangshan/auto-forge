@@ -1417,6 +1417,7 @@ describe('createApplicationRuntime', () => {
     await listingStarted.promise
 
     const invalidationsBeforeSwitch = knowledgeService.invalidate.mock.calls.length
+    const switchRoundStart = lifecycle.length
     const switching = runtime.services.auth.loginWithPassword({
       account: 'KnowledgeBobby', password: 'password',
     })
@@ -1426,12 +1427,31 @@ describe('createApplicationRuntime', () => {
     releaseListing.resolve()
     await listing
     await switching
-    expect(lifecycle).toContain('bind:test_user_knowledgebobby')
-    expect(lifecycle.indexOf('invalidate')).toBeLessThan(lifecycle.indexOf('bind:test_user_knowledgebobby'))
+    const switchRound = lifecycle.slice(switchRoundStart)
+    expect(switchRound[0]).toBe('invalidate')
+    expect(switchRound).toContain('drain')
+    expect(switchRound).toContain('bind:test_user_knowledgebobby')
+    expect(switchRound.indexOf('drain')).toBeLessThan(switchRound.indexOf('bind:test_user_knowledgebobby'))
 
     const beforeClose = lifecycle.length
     await runtime.close()
     expect(lifecycle.slice(beforeClose, beforeClose + 2)).toEqual(['invalidate', 'drain'])
+  })
+
+  it('records a knowledge resource drain failure at the Application shutdown boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-drain-failure-'))
+    directories.push(root)
+    const drainFailure = new Error('knowledge parser termination failed')
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async () => undefined),
+      invalidate: vi.fn(),
+      drain: vi.fn(async () => { throw drainFailure }),
+    })
+    const runtime = createApplicationRuntime(options(root, { knowledgeService }))
+
+    await expect(runtime.close()).rejects.toBe(drainFailure)
+    expect(knowledgeService.invalidate).toHaveBeenCalledOnce()
+    expect(knowledgeService.drain).toHaveBeenCalledOnce()
   })
 
   it('drains an A legacy import before an authenticated A-to-B switch', async () => {

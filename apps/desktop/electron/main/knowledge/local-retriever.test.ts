@@ -39,13 +39,35 @@ describe('local knowledge retriever', () => {
     seedSearchable(memory)
     const retriever = new LocalKnowledgeRetriever(memory.database)
 
-    await expect(retriever.search('合同条款', ['base'])).resolves.toHaveLength(8)
+    await expect(retriever.search('合同条款', ['base'])).resolves.toMatchObject({
+      kind: 'results', strategy: 'trigram', evidence: expect.any(Array),
+    })
     await expect(retriever.search('合同', ['base'])).resolves.toMatchObject({ strategy: 'bounded-instr' })
     await expect(retriever.search('合', ['base'])).resolves.toEqual({ kind: 'query-too-short' })
     const results = await retriever.search('合同条款', ['base'])
-    if (!Array.isArray(results)) throw new Error('Expected search results')
-    expect(Array.from(results)).toHaveLength(8)
-    expect(Array.from(results).every(item => item.versionId === 'ready')).toBe(true)
+    if (results.kind !== 'results') throw new Error('Expected search results')
+    expect(results.evidence).toHaveLength(8)
+    expect(results.evidence.every(item => item.versionId === 'ready')).toBe(true)
     await expect(retriever.search('" OR *', ['base'])).resolves.toEqual(expect.anything())
+  })
+
+  it('limits the selected ready scope before applying the two-character instr predicate', async () => {
+    const memory = memoryKnowledgeStore()
+    seedSearchable(memory)
+    const db = memory.database
+    for (let index = 9; index < 250; index += 1) {
+      const text = index === 220 ? '命中合同' : `普通内容${index}`
+      const block = `large-block-${index}`
+      db.prepare(`INSERT INTO knowledge_blocks(id, version_id, ordinal, kind, text, coordinates_json)
+        VALUES (?, 'ready', ?, 'txt', ?, '{"kind":"txt","lineStart":1,"lineEnd":1,"charStart":0,"charEnd":4}')`)
+        .run(block, index, text)
+      db.prepare(`INSERT INTO kb_chunks(id, knowledge_base_id, document_id, version_id, block_id, ordinal, body, coordinates_json)
+        VALUES (?, 'base', 'doc', 'ready', ?, ?, ?, '{"kind":"txt","lineStart":1,"lineEnd":1,"charStart":0,"charEnd":4}')`)
+        .run(`large-chunk-${index}`, block, index, text)
+    }
+
+    await expect(new LocalKnowledgeRetriever(db).search('命中', ['base'])).resolves.toEqual({
+      kind: 'results', strategy: 'bounded-instr', evidence: [],
+    })
   })
 })

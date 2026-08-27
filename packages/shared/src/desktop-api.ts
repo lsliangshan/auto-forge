@@ -113,6 +113,16 @@ export const knowledgeAvailabilitySchema = z.object({
 export type KnowledgeAvailability = z.infer<typeof knowledgeAvailabilitySchema>
 export type { KnowledgeEvidence, KnowledgeEvent }
 
+export const knowledgeSearchResultSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('query-too-short') }).strict(),
+  z.object({
+    kind: z.literal('results'),
+    strategy: z.enum(['trigram', 'bounded-instr']),
+    evidence: z.array(knowledgeEvidenceSchema).max(8),
+  }).strict(),
+])
+export type KnowledgeSearchResult = z.infer<typeof knowledgeSearchResultSchema>
+
 const browserAuditOriginSchema = z.string().superRefine((value, context) => {
   try {
     const origin = new URL(value)
@@ -1879,7 +1889,7 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeExportBase]: voidResponseSchema,
   [ipcChannels.knowledgeGetSelection]: knowledgeSelectionSchema,
   [ipcChannels.knowledgeUpdateSelection]: knowledgeSelectionSchema,
-  [ipcChannels.knowledgeSearch]: z.array(knowledgeEvidenceSchema).max(8),
+  [ipcChannels.knowledgeSearch]: knowledgeSearchResultSchema,
   [ipcChannels.knowledgeGetAvailability]: knowledgeAvailabilitySchema,
   [ipcChannels.knowledgeGetEntitlement]: knowledgeEntitlementStateSchema,
   [ipcChannels.knowledgeGetConsent]: knowledgeConsentStateSchema,
@@ -1999,7 +2009,7 @@ export interface DesktopAPI {
     exportBase(baseId: string): Promise<void>
     getSelection(conversationId: string): Promise<KnowledgeSelection>
     updateSelection(conversationId: string, selection: KnowledgeSelection): Promise<KnowledgeSelection>
-    search(query: string): Promise<KnowledgeEvidence[]>
+    search(query: string): Promise<KnowledgeSearchResult>
     getAvailability(): Promise<KnowledgeAvailability>
     getEntitlement(): Promise<KnowledgeEntitlementState>
     getConsent(): Promise<KnowledgeConsentState>

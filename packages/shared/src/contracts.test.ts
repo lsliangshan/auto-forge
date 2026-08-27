@@ -34,6 +34,7 @@ import {
   knowledgeListRequestSchema,
   knowledgeSelectionSchema,
   knowledgeSearchRequestSchema,
+  knowledgeSearchResultSchema,
   logoutRequestSchema,
   logoutResultSchema,
   retryConversationSyncRequestSchema,
@@ -1774,6 +1775,13 @@ describe('cross-process contracts', () => {
     // Catches a production change that lets Renderer widen a knowledge search or select a local file path.
     expect(knowledgeSearchRequestSchema.parse({ query: '合同' })).toEqual({ query: '合同' })
     expect(knowledgeSearchRequestSchema.safeParse({ query: '合同', topK: 99 }).success).toBe(false)
+    expect(knowledgeSearchResultSchema.parse({ kind: 'query-too-short' })).toEqual({ kind: 'query-too-short' })
+    expect(knowledgeSearchResultSchema.parse({
+      kind: 'results', strategy: 'bounded-instr', evidence: [],
+    })).toEqual({ kind: 'results', strategy: 'bounded-instr', evidence: [] })
+    expect(knowledgeSearchResultSchema.safeParse({
+      kind: 'results', strategy: 'bounded-instr', evidence: [], topK: 8,
+    }).success).toBe(false)
     expect(knowledgeListRequestSchema.safeParse({ userId: 'forged' }).success).toBe(false)
     expect(knowledgeImportRequestSchema.parse({ baseId: 'base_1', importHandleId: 'import_1' }))
       .toEqual({ baseId: 'base_1', importHandleId: 'import_1' })
