@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v3', () => {
+describe('knowledge schema v4', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(3)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(4)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }])
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -45,6 +45,11 @@ describe('knowledge schema v3', () => {
       'knowledge_cleanup_records',
       'knowledge_import_jobs',
       'knowledge_schema_migrations',
+      'cloud_sync_conversions',
+      'cloud_sync_mutations',
+      'cloud_sync_states',
+      'conflicts',
+      'sync_cursors',
     ]))
     expect(database.prepare(`
       SELECT lifecycle_status, publication_generation, recycled_at
@@ -56,7 +61,15 @@ describe('knowledge schema v3', () => {
   it('backfills immutable version metadata when upgrading a v2 database', () => {
     const database = testDatabase()
     initializeKnowledgeSchema(database)
-    database.prepare('DELETE FROM knowledge_schema_migrations WHERE version = 3').run()
+    database.prepare('DELETE FROM knowledge_schema_migrations WHERE version >= 3').run()
+    database.exec(`
+      DROP TABLE conflicts;
+      DROP TABLE cloud_sync_conversions;
+      DROP TABLE cloud_sync_orphans;
+      DROP TABLE cloud_sync_mutations;
+      DROP TABLE cloud_sync_states;
+      DROP TABLE sync_cursors;
+    `)
     database.exec(`
       ALTER TABLE document_versions DROP COLUMN mime_type;
       ALTER TABLE document_versions DROP COLUMN name;

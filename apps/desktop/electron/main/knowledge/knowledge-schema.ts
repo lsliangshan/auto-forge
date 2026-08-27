@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 3
+export const KNOWLEDGE_SCHEMA_VERSION = 4
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -137,10 +137,82 @@ const KNOWLEDGE_SCHEMA_V3 = `
       mime_type = (SELECT documents.mime_type FROM documents WHERE documents.id = document_versions.document_id);
 `
 
+const KNOWLEDGE_SCHEMA_V4 = `
+  CREATE TABLE sync_cursors (
+    knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE cloud_sync_states (
+    knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL CHECK (mode IN ('local_only', 'syncing', 'synced', 'paused', 'converting', 'failed')),
+    published_generation_id TEXT,
+    epoch INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE cloud_sync_mutations (
+    id TEXT PRIMARY KEY,
+    knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('knowledge_base', 'document', 'metadata')),
+    entity_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+    base_revision TEXT,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'retry', 'completed', 'conflict', 'failed', 'cancelled')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt BETWEEN 0 AND 3),
+    lease_token TEXT,
+    lease_expires_at INTEGER,
+    error_code TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+  CREATE INDEX cloud_sync_mutations_ready
+    ON cloud_sync_mutations(knowledge_base_id, state, created_at, id);
+
+  CREATE TABLE cloud_sync_orphans (
+    storage_reference TEXT PRIMARY KEY,
+    knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE cloud_sync_conversions (
+    knowledge_base_id TEXT PRIMARY KEY REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    operation_id TEXT NOT NULL UNIQUE,
+    request_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('downloading', 'verified', 'purge_accepted', 'completed')),
+    expected_published_generation_id TEXT,
+    previous_mode TEXT NOT NULL CHECK (previous_mode IN ('local_only', 'syncing', 'synced', 'paused', 'failed')),
+    expected_digest TEXT,
+    actual_digest TEXT,
+    deletion_job_id TEXT,
+    error_code TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE conflicts (
+    id TEXT PRIMARY KEY,
+    knowledge_base_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    entity_kind TEXT NOT NULL,
+    conflict_kind TEXT NOT NULL CHECK (conflict_kind IN ('content', 'delete_vs_update')),
+    entity_id TEXT NOT NULL,
+    local_version TEXT,
+    remote_version TEXT,
+    status TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+  ) STRICT;
+  CREATE INDEX conflicts_scope ON conflicts(knowledge_base_id, status);
+`
+
 const migrations = new Map<number, string>([
   [1, KNOWLEDGE_SCHEMA_V1],
   [2, KNOWLEDGE_SCHEMA_V2],
   [3, KNOWLEDGE_SCHEMA_V3],
+  [4, KNOWLEDGE_SCHEMA_V4],
 ])
 
 export function initializeKnowledgeSchema(database: Database.Database): void {
