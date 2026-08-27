@@ -54,6 +54,27 @@ function extractFunction(sql: string, functionName: string): string {
   return match![0]
 }
 
+function extractKnowledgePreferenceGuard(sql: string): string {
+  const replacement = sql.match(
+    /\$new\$(OR NOT \(payload->'preferences'[\s\S]*?)\$new\$/,
+  )
+  expect(replacement, 'missing executable knowledge preference guard replacement').not.toBeNull()
+  return replacement![1]
+}
+
+function evaluateModeGuard(guard: string, mode: unknown): boolean {
+  const typeGuard = guard.match(
+    /jsonb_typeof\(payload->'preferences'->'knowledgeMode'\)\s+IS DISTINCT FROM\s+'string'/,
+  )
+  const allowedMatch = guard.match(
+    /payload->'preferences'->>'knowledgeMode'\s+NOT IN\s+\(([^)]+)\)/,
+  )
+  if (!typeGuard || !allowedMatch) return false
+  if (typeof mode !== 'string') return true
+  const allowed = [...allowedMatch[1].matchAll(/'([^']+)'/g)].map(match => match[1])
+  return !allowed.includes(mode)
+}
+
 describe('CloudBase user data migration', () => {
   it('keeps the canonical and deployable migrations byte-identical', async () => {
     const [canonical, featureCopy] = await Promise.all([
@@ -413,11 +434,17 @@ describe('CloudBase user data migration', () => {
     ), 'utf8')
 
     expect(numbered).toBe(canonicalKnowledge)
-    expect(numbered).toMatch(/^-- Personal knowledge selection/)
-    expect(numbered).not.toMatch(/^\+/m)
-    expect(numbered).toContain('knowledgeBaseIds')
-    expect(numbered).toContain('knowledgeMode')
-    expect(numbered).toContain('CREATE OR REPLACE FUNCTION autoforge_sync_push')
+    const guard = extractKnowledgePreferenceGuard(numbered)
+    expect(guard).toMatch(
+      /jsonb_typeof\(payload->'preferences'->'knowledgeBaseIds'\)\s+IS DISTINCT FROM\s+'array'/,
+    )
+    expect(guard).toMatch(/jsonb_typeof\(base_id\)\s+IS DISTINCT FROM\s+'string'/)
+    for (const [mode, rejected] of [
+      [null, true], [7, true], [{}, true], [[], true],
+      ['mixed', false], ['strict', false], ['enterprise', true],
+    ] as const) {
+      expect(evaluateModeGuard(guard, mode), `mode ${JSON.stringify(mode)}`).toBe(rejected)
+    }
     expect(rollback).not.toMatch(/DROP TABLE|TRUNCATE|DELETE FROM/i)
     expect(rollback).not.toMatch(/^\+/m)
   })

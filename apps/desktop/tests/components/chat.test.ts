@@ -669,6 +669,47 @@ describe('conversation knowledge selection', () => {
     ))
   })
 
+  it('offers only published ready searchable bases and blocks disabled keyboard activation', async () => {
+    const { api } = createEventApi()
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: api })
+    const chat = useChatStore()
+    chat.selectedConversationId = 'conversation_knowledge'
+    chat.preferencesByConversation.conversation_knowledge = generationPreferences({
+      knowledgeBaseIds: [], knowledgeMode: 'mixed',
+    })
+    const knowledge = useKnowledgeStore()
+    const candidates = [
+      { id: 'ready', status: 'ready', searchable: true },
+      { id: 'not_searchable', status: 'ready', searchable: false },
+      { id: 'processing', status: 'processing', searchable: true },
+      { id: 'paused', status: 'paused', searchable: true },
+      { id: 'failed', status: 'failed', searchable: true },
+      { id: 'recycled', status: 'recycled', searchable: true },
+    ] as const
+    knowledge.bases = candidates.map(candidate => ({
+      ...candidate, name: candidate.id, kind: 'local' as const, documentCount: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z',
+    }))
+    const wrapper = mount(KnowledgeSelector, { props: { disabled: true } })
+    await wrapper.vm.$nextTick()
+    knowledge.bases = candidates.map(candidate => ({
+      ...candidate, name: candidate.id, kind: 'local' as const, documentCount: 1,
+      updatedAt: '2026-08-27T00:00:00.000Z',
+    }))
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.findAll('[data-testid^="knowledge-select-"]').map(item => item.attributes('data-testid')))
+      .toEqual(['knowledge-select-ready'])
+    expect(wrapper.attributes('aria-disabled')).toBe('true')
+    const summary = wrapper.get('summary')
+    expect(summary.attributes('aria-disabled')).toBe('true')
+    for (const key of ['Enter', ' ']) {
+      const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+      summary.element.dispatchEvent(event)
+      expect(event.defaultPrevented, key).toBe(true)
+    }
+  })
+
   it('normalizes a new conversation without a knowledge selection', async () => {
     const { api } = createEventApi()
     vi.mocked(api.chat.createConversation).mockResolvedValue(

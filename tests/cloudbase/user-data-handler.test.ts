@@ -414,6 +414,10 @@ describe('CloudBase user data function', () => {
     for (const preferences of [
       { ...valid.payload.preferences, knowledgeBaseIds: ['base_personal', 'base_personal'] },
       { ...valid.payload.preferences, knowledgeMode: 'enterprise' },
+      { ...valid.payload.preferences, knowledgeMode: null },
+      { ...valid.payload.preferences, knowledgeMode: 7 },
+      { ...valid.payload.preferences, knowledgeBaseIds: null, knowledgeMode: 'mixed' },
+      { ...valid.payload.preferences, knowledgeBaseIds: ['a'.repeat(129)] },
       { ...valid.payload.preferences, knowledgeBaseIds: ['base_personal'], ownerUserId: 'forged' },
     ]) {
       await expect(handler({

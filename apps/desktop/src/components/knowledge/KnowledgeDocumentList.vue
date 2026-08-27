@@ -8,7 +8,8 @@
       <strong>文档</strong>
       <button
         type="button"
-        :disabled="!store.selectedBaseId || store.busy"
+        data-testid="knowledge-import"
+        :disabled="!store.selectedBaseId || store.busy || !store.localAvailable"
         @click="store.importDocuments"
       >
         导入

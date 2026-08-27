@@ -8,7 +8,8 @@
       <strong>知识库</strong>
       <button
         type="button"
-        :disabled="store.busy"
+        data-testid="knowledge-create-toggle"
+        :disabled="store.busy || !store.localAvailable"
         @click="creating = !creating"
       >
         新建
@@ -27,7 +28,7 @@
       >
       <button
         type="submit"
-        :disabled="store.busy || !name.trim()"
+        :disabled="store.busy || !store.localAvailable || !name.trim()"
       >
         创建
       </button>
@@ -43,6 +44,7 @@
         @click="store.selectBase(base.id)"
       >
         <span class="af-truncate">{{ base.name }}</span>
+        <small>{{ kindLabel(base.kind) }} · {{ statusLabel(base.status) }}</small>
         <small>{{ base.documentCount }} 个文档</small>
       </button>
       <p
@@ -55,14 +57,14 @@
     <footer v-if="store.selectedBase">
       <button
         type="button"
-        :disabled="store.busy"
+        :disabled="store.busy || !store.localAvailable"
         @click="store.runBaseAction('export')"
       >
         导出
       </button>
       <button
         type="button"
-        :disabled="store.busy"
+        :disabled="store.busy || !store.localAvailable"
         @click="store.runBaseAction(store.selectedBase.status === 'recycled' ? 'restore' : 'recycle')"
       >
         {{ store.selectedBase.status === 'recycled' ? '恢复' : '回收' }}
@@ -71,8 +73,10 @@
         v-if="store.selectedBase.status === 'recycled'"
         type="button"
         class="danger"
-        :disabled="store.busy"
-        @click="store.runBaseAction('purge')"
+        data-testid="knowledge-purge-base"
+        :aria-label="`永久删除知识库 ${store.selectedBase.name}`"
+        :disabled="store.busy || purgePending || !store.localAvailable"
+        @click="purgeBase"
       >
         永久删除
       </button>
@@ -87,12 +91,21 @@
 </template>
 
 <script setup lang="ts">
+import type { KnowledgeBaseSummary } from '@autoforge/shared'
+import { ElMessageBox } from 'element-plus'
 import { ref } from 'vue'
 import { useKnowledgeStore } from '../../stores/knowledge'
 
 const store = useKnowledgeStore()
 const creating = ref(false)
 const name = ref('')
+const purgePending = ref(false)
+const baseLabels: Record<KnowledgeBaseSummary['status'], string> = {
+  ready: '可检索', processing: '处理中', paused: '已暂停', failed: '处理失败',
+  read_only: '只读', recycled: '回收站',
+}
+const statusLabel = (status: KnowledgeBaseSummary['status']) => baseLabels[status]
+const kindLabel = (kind: KnowledgeBaseSummary['kind']) => kind === 'local' ? '本地' : '云端'
 async function create() {
   const value = name.value.trim()
   if (!value) return
@@ -100,6 +113,26 @@ async function create() {
   if (!store.error) {
     name.value = ''
     creating.value = false
+  }
+}
+async function purgeBase() {
+  const selected = store.selectedBase
+  if (!selected || selected.status !== 'recycled' || purgePending.value) return
+  const ownerId = store.ownerId
+  const baseId = selected.id
+  purgePending.value = true
+  try {
+    await ElMessageBox.confirm(
+      `永久删除“${selected.name}”及其全部文件和版本？此操作无法撤销。`,
+      '永久删除知识库',
+      { type: 'warning', confirmButtonText: '永久删除', cancelButtonText: '取消' },
+    )
+    if (store.ownerId !== ownerId || store.selectedBaseId !== baseId) return
+    await store.runBaseAction('purge')
+  } catch {
+    // Cancellation is an expected terminal result.
+  } finally {
+    purgePending.value = false
   }
 }
 </script>

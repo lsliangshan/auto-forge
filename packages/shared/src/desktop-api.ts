@@ -23,7 +23,7 @@ import {
   type CapabilityScope,
 } from './worker-protocol.js'
 
-const identifierSchema = z.string().trim().min(1)
+const identifierSchema = z.string().trim().min(1).max(128)
 const timestampSchema = z.string().datetime()
 const nonEmptyStringSchema = z.string().trim().min(1)
 

@@ -340,7 +340,7 @@ describe('workbench', () => {
   it('renders exactly the five confirmed navigation items', async () => {
     const { wrapper } = await mountApp()
     expect(wrapper.findAll('[data-testid="app-nav-item"]').map((item) => item.text()))
-      .toEqual(['聊天', '工作流', '知识库', '开发', '执行记录', '设置'])
+      .toEqual(['聊天', '知识库', '工作流', '开发', '执行记录', '设置'])
   })
 
   it('keeps the responsive inspector reachable through an accessible toggle', async () => {

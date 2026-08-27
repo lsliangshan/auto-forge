@@ -4200,7 +4200,7 @@ describe('createApplicationRuntime', () => {
     await authenticate(runtime)
     const conversation = await runtime.services.chat.createConversation()
     expect(await runtime.services.chat.getGenerationPreferences(conversation.id)).toMatchObject({
-      outputType: 'auto', models: {},
+      outputType: 'auto', models: {}, knowledgeBaseIds: [], knowledgeMode: 'mixed',
     })
     const preferences = {
       outputType: 'image' as const, models: { image: 'image-model' },

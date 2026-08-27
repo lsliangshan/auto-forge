@@ -30,12 +30,12 @@ BEGIN
             <> (payload->'preferences' ? 'knowledgeMode'))
           OR CASE WHEN payload->'preferences' ? 'knowledgeBaseIds' THEN
             CASE
-              WHEN jsonb_typeof(payload->'preferences'->'knowledgeBaseIds') <> 'array' THEN true
+              WHEN jsonb_typeof(payload->'preferences'->'knowledgeBaseIds') IS DISTINCT FROM 'array' THEN true
               ELSE jsonb_array_length(payload->'preferences'->'knowledgeBaseIds') > 32
                 OR EXISTS (
                   SELECT 1
                   FROM jsonb_array_elements(payload->'preferences'->'knowledgeBaseIds') AS base_id
-                  WHERE jsonb_typeof(base_id) <> 'string'
+                  WHERE jsonb_typeof(base_id) IS DISTINCT FROM 'string'
                     OR length(base_id #>> '{}') < 1
                     OR length(base_id #>> '{}') > 128
                     OR base_id #>> '{}' <> btrim(base_id #>> '{}')
@@ -44,6 +44,7 @@ BEGIN
                   SELECT count(*) <> count(DISTINCT base_id #>> '{}')
                   FROM jsonb_array_elements(payload->'preferences'->'knowledgeBaseIds') AS base_id
                 )
+                OR jsonb_typeof(payload->'preferences'->'knowledgeMode') IS DISTINCT FROM 'string'
                 OR payload->'preferences'->>'knowledgeMode' NOT IN ('mixed', 'strict')
             END
           ELSE false END

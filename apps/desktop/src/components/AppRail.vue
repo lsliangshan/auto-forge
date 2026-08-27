@@ -93,8 +93,8 @@ const accountInitial = computed(() =>
 
 const items = computed(() => [
   { to: "/chat", label: "聊天", icon: ChatDotRound },
-  { to: "/workflows", label: "工作流", icon: Operation },
   { to: "/knowledge", label: "知识库", icon: Collection },
+  { to: "/workflows", label: "工作流", icon: Operation },
   { to: "/developer", label: "开发", icon: Tools },
   { to: "/executions", label: "执行记录", icon: Clock },
   ...(auth.canManageUsers

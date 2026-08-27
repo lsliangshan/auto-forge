@@ -184,6 +184,7 @@ test.describe.serial('CloudBase conversation sync milestone', () => {
 
     await profile.page.getByRole('link', { name: '聊天' }).click()
     await profile.page.getByTestId('knowledge-selector').locator('summary').click()
+    await expect(profile.page.getByTestId(/knowledge-select-/)).not.toBeChecked()
     await profile.page.getByTestId(/knowledge-select-/).check()
     await expect.poll(() => command<number>(profile.app, 'pendingOutbox')).toBe(0)
 

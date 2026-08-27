@@ -1801,6 +1801,8 @@ describe('cross-process contracts', () => {
     expect(knowledgeSelectionSchema.parse({ baseIds: [], mode: 'mixed' })).toEqual({ baseIds: [], mode: 'mixed' })
     expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1', 'base_1'], mode: 'strict' }).success).toBe(false)
     expect(knowledgeSelectionSchema.safeParse({ baseIds: ['base_1'], mode: 'mixed', generationId: 'foreign' }).success).toBe(false)
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['a'.repeat(128)], mode: 'mixed' }).success).toBe(true)
+    expect(knowledgeSelectionSchema.safeParse({ baseIds: ['a'.repeat(129)], mode: 'mixed' }).success).toBe(false)
   })
 
   it('keeps knowledge selection inside strict conversation preferences', () => {

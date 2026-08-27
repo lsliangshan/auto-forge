@@ -2,13 +2,15 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DesktopAPI, KnowledgeBaseSummary, KnowledgeDocumentSummary } from '@autoforge/shared'
+import ElementPlus, { ElMessageBox } from 'element-plus'
 import KnowledgeView from '../../src/views/KnowledgeView.vue'
 import { useKnowledgeStore } from '../../src/stores/knowledge'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((done) => { resolve = done })
-  return { promise, resolve }
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
 }
 
 function base(id: string, name = id): KnowledgeBaseSummary {
@@ -59,6 +61,7 @@ describe('personal knowledge workspace', () => {
   beforeEach(() => setActivePinia(createPinia()))
   afterEach(() => {
     Reflect.deleteProperty(window, 'autoForge')
+    vi.restoreAllMocks()
     vi.useRealTimers()
   })
 
@@ -85,7 +88,158 @@ describe('personal knowledge workspace', () => {
     expect(wrapper.get('[data-testid="knowledge-document-pane"]').text()).toContain('doc_1.txt')
     await wrapper.get('[data-testid="knowledge-document-doc_1"]').trigger('click')
     await flushPromises()
-    expect(wrapper.get('[data-testid="knowledge-inspector-pane"]').text()).toContain('版本 1')
+    const inspector = wrapper.get('[data-testid="knowledge-inspector-pane"]')
+    expect(inspector.text()).toContain('版本 1 · 可检索')
+    expect(inspector.text()).not.toContain('ready')
+  })
+
+  it('renders local availability, base state, and a sanitized failed-document explanation', async () => {
+    const failedBase = { ...base('base_failed', '失败资料'), status: 'failed' as const, searchable: false }
+    const client = api({
+      list: vi.fn().mockResolvedValue([failedBase]),
+      listDocuments: vi.fn().mockResolvedValue([document('doc_failed', 'base_failed', 'failed')]),
+      getAvailability: vi.fn().mockResolvedValue({
+        encryption: { available: false, reason: 'encryption_unavailable' },
+        parser: { available: true },
+        cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+        embedding: { available: false, reason: 'embedding_unavailable' },
+        entitlement: { available: true }, beta: { available: true },
+        cloud: { available: false, reason: 'cloud_disabled' },
+      }),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', localEnabled: false, cloudEnabled: false,
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-local-availability"]').text())
+      .toContain('本地知识库不可用')
+    expect(wrapper.get('[data-testid="knowledge-base-base_failed"]').text())
+      .toContain('处理失败')
+    await wrapper.get('[data-testid="knowledge-document-doc_failed"]').trigger('click')
+    await flushPromises()
+    const inspector = wrapper.get('[data-testid="knowledge-inspector-pane"]')
+    expect(inspector.text()).toContain('处理失败，可重新导入或替换文件')
+    expect(wrapper.get('[data-testid="knowledge-create-toggle"]').attributes()).toHaveProperty('disabled')
+    expect(wrapper.get('[data-testid="knowledge-import"]').attributes()).toHaveProperty('disabled')
+    expect(inspector.get('[data-testid="knowledge-replace"]').attributes()).toHaveProperty('disabled')
+  })
+
+  it('does not present cloud sync as available while its CloudBase gate is closed', async () => {
+    const client = api({
+      getAvailability: vi.fn().mockResolvedValue({
+        encryption: { available: true }, parser: { available: true },
+        cloudbase: { available: false, reason: 'cloudbase_unavailable' },
+        embedding: { available: false, reason: 'embedding_unavailable' },
+        entitlement: { available: true }, beta: { available: true }, cloud: { available: true },
+      }),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'member', status: 'active', localEnabled: true, cloudEnabled: true,
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-local-availability"]').text())
+      .toBe('本地知识库可用 · 云同步不可用')
+  })
+
+  it('requires confirmation before permanently purging a base or document', async () => {
+    const recycledBase = { ...base('base_recycled', '回收站资料'), status: 'recycled' as const, searchable: false }
+    const basePurge = deferred<void>()
+    const client = api({
+      list: vi.fn().mockResolvedValue([recycledBase]),
+      listDocuments: vi.fn().mockResolvedValue([document('doc_deleted', 'base_recycled', 'deleted')]),
+      purgeBase: vi.fn(() => basePurge.promise),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    await flushPromises()
+    await wrapper.get('[data-testid="knowledge-document-doc_deleted"]').trigger('click')
+    await flushPromises()
+    const confirm = vi.spyOn(ElMessageBox, 'confirm')
+      .mockRejectedValueOnce('cancel')
+      .mockResolvedValue('confirm')
+
+    await wrapper.get('[data-testid="knowledge-purge-base"]').trigger('click')
+    await flushPromises()
+    expect(client.knowledge.purgeBase).not.toHaveBeenCalled()
+    await wrapper.get('[data-testid="knowledge-purge-base"]').trigger('click')
+    await vi.waitFor(() => expect(client.knowledge.purgeBase).toHaveBeenCalledWith('base_recycled'))
+    expect(wrapper.get('[data-testid="knowledge-purge-base"]').attributes()).toHaveProperty('disabled')
+    basePurge.resolve()
+    await flushPromises()
+    expect(client.knowledge.purgeBase).toHaveBeenCalledWith('base_recycled')
+
+    await wrapper.get('[data-testid="knowledge-purge-document"]').trigger('click')
+    await flushPromises()
+    expect(client.knowledge.purgeDocument).toHaveBeenCalledWith('doc_deleted')
+    expect(confirm).toHaveBeenCalledTimes(3)
+  })
+
+  it('disables permanent deletion when local knowledge is unavailable', async () => {
+    const recycledBase = { ...base('base_recycled'), status: 'recycled' as const, searchable: false }
+    const client = api({
+      list: vi.fn().mockResolvedValue([recycledBase]),
+      listDocuments: vi.fn().mockResolvedValue([document('doc_deleted', 'base_recycled', 'deleted')]),
+      getEntitlement: vi.fn().mockResolvedValue({
+        tier: 'free', status: 'expired', localEnabled: false, cloudEnabled: false,
+      }),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    await useKnowledgeStore().bindOwner('alice')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="knowledge-purge-base"]').attributes()).toHaveProperty('disabled')
+    expect(wrapper.get('[data-testid="knowledge-purge-document"]').attributes()).toHaveProperty('disabled')
+  })
+
+  it('does not carry an Alice purge confirmation into Bob after an owner switch', async () => {
+    const confirmation = deferred<'confirm'>()
+    const client = api({
+      list: vi.fn()
+        .mockResolvedValueOnce([{
+          ...base('base_alice', 'Alice'), status: 'recycled' as const, searchable: false,
+        }])
+        .mockResolvedValueOnce([{
+          ...base('base_bob', 'Bob'), status: 'recycled' as const, searchable: false,
+        }]),
+      listDocuments: vi.fn().mockResolvedValue([]),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const wrapper = mount(KnowledgeView, { global: { plugins: [pinia, ElementPlus] } })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    vi.spyOn(ElMessageBox, 'confirm').mockReturnValue(confirmation.promise)
+
+    await wrapper.get('[data-testid="knowledge-purge-base"]').trigger('click')
+    expect(wrapper.get('[data-testid="knowledge-purge-base"]').attributes()).toHaveProperty('disabled')
+    await store.bindOwner('bob')
+    confirmation.resolve('confirm')
+    await flushPromises()
+
+    expect(store.ownerId).toBe('bob')
+    expect(store.selectedBaseId).toBe('base_bob')
+    expect(client.knowledge.purgeBase).not.toHaveBeenCalled()
   })
 
   it('uses the preload API for import and refreshes the selected base', async () => {
@@ -163,6 +317,131 @@ describe('personal knowledge workspace', () => {
     expect(store.bases.map(({ id }) => id)).toEqual(['base_bob'])
     store.resetLocalData()
     expect(store.bases).toEqual([])
+  })
+
+  it('does not let an Alice mutation release Bob busy state or publish Alice errors', async () => {
+    const aliceCreate = deferred<KnowledgeBaseSummary>()
+    const bobExport = deferred<void>()
+    const client = api({
+      list: vi.fn()
+        .mockResolvedValueOnce([base('base_alice', 'Alice')])
+        .mockResolvedValueOnce([base('base_bob', 'Bob')]),
+      create: vi.fn(() => aliceCreate.promise),
+      exportBase: vi.fn(() => bobExport.promise),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    const staleMutation = store.createBase('Alice 私有库')
+
+    await store.bindOwner('bob')
+    const bobMutation = store.runBaseAction('export')
+    expect(store.busy).toBe(true)
+
+    aliceCreate.reject(new Error('alice-only failure'))
+    await staleMutation
+    expect(store.ownerId).toBe('bob')
+    expect(store.selectedBaseId).toBe('base_bob')
+    expect(store.error).toBe('')
+    expect(store.busy).toBe(true)
+
+    bobExport.resolve()
+    await bobMutation
+    expect(store.busy).toBe(false)
+  })
+
+  it('stops an import after the owner changes while the file picker is pending', async () => {
+    const alicePicker = deferred<Awaited<ReturnType<DesktopAPI['knowledge']['pickImportFiles']>>>()
+    const client = api({
+      list: vi.fn()
+        .mockResolvedValueOnce([base('base_alice', 'Alice')])
+        .mockResolvedValueOnce([base('base_bob', 'Bob')]),
+      pickImportFiles: vi.fn(() => alicePicker.promise),
+    })
+    Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    const staleImport = store.importDocuments()
+
+    await store.bindOwner('bob')
+    alicePicker.resolve([{
+      id: 'alice_handle', name: 'alice.txt', mimeType: 'text/plain', byteSize: 5,
+    }])
+    await staleImport
+
+    expect(client.knowledge.importDocument).not.toHaveBeenCalled()
+    expect(store.ownerId).toBe('bob')
+    expect(store.selectedBaseId).toBe('base_bob')
+  })
+
+  it.each(['replace', 'document purge', 'base purge'] as const)(
+    'does not refresh Bob after a late Alice %s mutation',
+    async (kind) => {
+      const mutation = deferred<void>()
+      const list = vi.fn()
+        .mockResolvedValueOnce([base('base_alice', 'Alice')])
+        .mockResolvedValueOnce([base('base_bob', 'Bob')])
+      const listDocuments = vi.fn()
+        .mockResolvedValueOnce([document('doc_alice', 'base_alice')])
+        .mockResolvedValueOnce([document('doc_bob', 'base_bob')])
+      const client = api({
+        list,
+        listDocuments,
+        pickImportFiles: vi.fn().mockResolvedValue([{
+          id: 'alice_handle', name: 'alice.txt', mimeType: 'text/plain', byteSize: 5,
+        }]),
+        replaceDocument: vi.fn(() => mutation.promise),
+        purgeDocument: vi.fn(() => mutation.promise),
+        purgeBase: vi.fn(() => mutation.promise),
+      })
+      Object.defineProperty(window, 'autoForge', { configurable: true, value: client })
+      const store = useKnowledgeStore()
+      await store.bindOwner('alice')
+      const staleMutation = kind === 'replace'
+        ? store.replaceDocument()
+        : kind === 'document purge'
+          ? store.runDocumentAction('purge')
+          : store.runBaseAction('purge')
+      const remote = kind === 'replace'
+        ? client.knowledge.replaceDocument
+        : kind === 'document purge'
+          ? client.knowledge.purgeDocument
+          : client.knowledge.purgeBase
+      await vi.waitFor(() => expect(remote).toHaveBeenCalledOnce())
+
+      await store.bindOwner('bob')
+      const listCalls = list.mock.calls.length
+      const documentCalls = listDocuments.mock.calls.length
+      mutation.resolve()
+      await staleMutation
+
+      expect(store.ownerId).toBe('bob')
+      expect(store.selectedBaseId).toBe('base_bob')
+      expect(list).toHaveBeenCalledTimes(listCalls)
+      expect(listDocuments).toHaveBeenCalledTimes(documentCalls)
+    },
+  )
+
+  it('releases its IPC subscription when the Pinia store is disposed', async () => {
+    vi.useFakeTimers()
+    const release = vi.fn()
+    const listDocuments = vi.fn().mockResolvedValue([document('doc_queued', 'base_1', 'queued')])
+    Object.defineProperty(window, 'autoForge', {
+      configurable: true,
+      value: api({
+        list: vi.fn().mockResolvedValue([base('base_1')]), listDocuments,
+        onEvent: vi.fn(() => release),
+      }),
+    })
+    const store = useKnowledgeStore()
+    await store.bindOwner('alice')
+    const callsBeforeDispose = listDocuments.mock.calls.length
+
+    store.$dispose()
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    expect(release).toHaveBeenCalledOnce()
+    expect(listDocuments).toHaveBeenCalledTimes(callsBeforeDispose)
   })
 
   it('cancels job polling on reset and caps retry backoff', async () => {

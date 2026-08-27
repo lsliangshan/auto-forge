@@ -11,7 +11,13 @@ import { displayError, getDesktopApi } from '../services/desktop-api'
 const refreshes = new WeakMap<object, Promise<void>>()
 const releases = new WeakMap<object, () => void>()
 const timers = new WeakMap<object, ReturnType<typeof setTimeout>>()
+const disposeWrapped = new WeakSet<object>()
 const MAX_POLL_DELAY_MS = 15_000
+
+interface OperationOwner {
+  ownerId: string
+  epoch: number
+}
 
 function clearTimer(store: object): void {
   const timer = timers.get(store)
@@ -30,7 +36,7 @@ export const useKnowledgeStore = defineStore('knowledge', {
     availability: undefined as KnowledgeAvailability | undefined,
     entitlement: undefined as KnowledgeEntitlementState | undefined,
     loading: false,
-    busy: false,
+    _pendingOperations: 0,
     error: '',
     _epoch: 0,
     _pollDelayMs: 1_000,
@@ -44,6 +50,14 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     hasActiveJobs(state): boolean {
       return state.documents.some(({ status }) => ['queued', 'copying', 'parsing', 'indexing'].includes(status))
+    },
+    busy(state): boolean {
+      return state._pendingOperations > 0
+    },
+    localAvailable(state): boolean {
+      return state.entitlement?.localEnabled === true
+        && state.availability?.encryption.available === true
+        && state.availability?.parser.available === true
     },
   },
   actions: {
@@ -62,11 +76,19 @@ export const useKnowledgeStore = defineStore('knowledge', {
       this.availability = undefined
       this.entitlement = undefined
       this.loading = false
-      this.busy = false
+      this._pendingOperations = 0
       this.error = ''
       this._pollDelayMs = 1_000
     },
     async bindOwner(ownerId: string | undefined) {
+      if (!disposeWrapped.has(this)) {
+        const dispose = this.$dispose.bind(this)
+        this.$dispose = () => {
+          this.resetLocalData()
+          dispose()
+        }
+        disposeWrapped.add(this)
+      }
       if (!ownerId) {
         this.resetLocalData()
         return
@@ -141,14 +163,18 @@ export const useKnowledgeStore = defineStore('knowledge', {
     },
     async selectBase(baseId: string) {
       if (baseId === this.selectedBaseId) return
+      const epoch = this._epoch
+      const ownerId = this.ownerId
       this.selectedBaseId = baseId
       this.documents = []
       this.selectedDocumentId = ''
       this.versions = []
       try {
-        await this.loadDocuments(baseId)
+        await this.loadDocuments(baseId, epoch)
       } catch (error) {
-        if (baseId === this.selectedBaseId) this.error = displayError(error, '文档加载失败')
+        if (epoch === this._epoch && ownerId === this.ownerId && baseId === this.selectedBaseId) {
+          this.error = displayError(error, '文档加载失败')
+        }
       }
     },
     async loadVersions(documentId: string, epoch?: number) {
@@ -161,12 +187,16 @@ export const useKnowledgeStore = defineStore('knowledge', {
       if (expectedEpoch === this._epoch && documentId === this.selectedDocumentId) this.versions = versions
     },
     async selectDocument(documentId: string) {
+      const epoch = this._epoch
+      const ownerId = this.ownerId
       this.selectedDocumentId = documentId
       this.versions = []
       try {
-        await this.loadVersions(documentId)
+        await this.loadVersions(documentId, epoch)
       } catch (error) {
-        if (documentId === this.selectedDocumentId) this.error = displayError(error, '版本加载失败')
+        if (epoch === this._epoch && ownerId === this.ownerId && documentId === this.selectedDocumentId) {
+          this.error = displayError(error, '版本加载失败')
+        }
       }
     },
     schedulePolling() {
@@ -178,85 +208,117 @@ export const useKnowledgeStore = defineStore('knowledge', {
         if (epoch === this._epoch) void this.refresh()
       }, this._pollDelayMs))
     },
+    beginOperation(): OperationOwner | undefined {
+      if (!this.ownerId || this.busy) return undefined
+      const operation = { ownerId: this.ownerId, epoch: this._epoch }
+      this._pendingOperations += 1
+      this.error = ''
+      return operation
+    },
+    ownsOperation(operation: OperationOwner): boolean {
+      return operation.epoch === this._epoch && operation.ownerId === this.ownerId
+    },
+    finishOperation(operation: OperationOwner): void {
+      if (!this.ownsOperation(operation)) return
+      this._pendingOperations = Math.max(0, this._pendingOperations - 1)
+    },
     async createBase(name: string) {
       const clean = name.trim()
-      if (!clean || this.busy) return
-      this.busy = true
-      this.error = ''
+      if (!clean) return
+      const operation = this.beginOperation()
+      if (!operation) return
       try {
         const created = await getDesktopApi().knowledge.create(clean)
+        if (!this.ownsOperation(operation)) return
         await this.refresh()
+        if (!this.ownsOperation(operation)) return
         await this.selectBase(created.id)
       } catch (error) {
-        this.error = displayError(error, '知识库创建失败')
+        if (this.ownsOperation(operation)) this.error = displayError(error, '知识库创建失败')
       } finally {
-        this.busy = false
+        this.finishOperation(operation)
       }
     },
     async importDocuments() {
       const baseId = this.selectedBaseId
-      if (!baseId || this.busy) return
-      this.busy = true
-      this.error = ''
+      if (!baseId) return
+      const operation = this.beginOperation()
+      if (!operation) return
       try {
         const handles = await getDesktopApi().knowledge.pickImportFiles()
+        if (!this.ownsOperation(operation)) return
         for (const handle of handles) {
           await getDesktopApi().knowledge.importDocument(baseId, handle.id)
+          if (!this.ownsOperation(operation)) return
         }
-        await this.loadDocuments(baseId)
+        await this.loadDocuments(baseId, operation.epoch)
+        if (!this.ownsOperation(operation)) return
         this.schedulePolling()
       } catch (error) {
-        this.error = displayError(error, '文档导入失败')
+        if (this.ownsOperation(operation)) this.error = displayError(error, '文档导入失败')
       } finally {
-        this.busy = false
+        this.finishOperation(operation)
       }
     },
     async replaceDocument() {
       const documentId = this.selectedDocumentId
-      if (!documentId || this.busy) return
-      this.busy = true
+      if (!documentId) return
+      const operation = this.beginOperation()
+      if (!operation) return
       try {
         const handle = (await getDesktopApi().knowledge.pickImportFiles())[0]
-        if (handle) await getDesktopApi().knowledge.replaceDocument(documentId, handle.id)
-        await this.loadDocuments(this.selectedBaseId)
+        if (!this.ownsOperation(operation)) return
+        if (handle) {
+          await getDesktopApi().knowledge.replaceDocument(documentId, handle.id)
+          if (!this.ownsOperation(operation)) return
+        }
+        await this.loadDocuments(this.selectedBaseId, operation.epoch)
+        if (!this.ownsOperation(operation)) return
         this.schedulePolling()
       } catch (error) {
-        this.error = displayError(error, '文档替换失败')
+        if (this.ownsOperation(operation)) this.error = displayError(error, '文档替换失败')
       } finally {
-        this.busy = false
+        this.finishOperation(operation)
       }
     },
     async runDocumentAction(action: 'recycle' | 'restore' | 'purge') {
       const documentId = this.selectedDocumentId
-      if (!documentId || this.busy) return
-      this.busy = true
+      if (!documentId) return
+      const operation = this.beginOperation()
+      if (!operation) return
       try {
         const api = getDesktopApi().knowledge
         if (action === 'recycle') await api.recycleDocument(documentId)
         else if (action === 'restore') await api.restoreDocument(documentId)
         else await api.purgeDocument(documentId)
-        await this.loadDocuments(this.selectedBaseId)
+        if (!this.ownsOperation(operation)) return
+        await this.loadDocuments(this.selectedBaseId, operation.epoch)
       } catch (error) {
-        this.error = displayError(error, '文档操作失败')
+        if (this.ownsOperation(operation)) this.error = displayError(error, '文档操作失败')
       } finally {
-        this.busy = false
+        this.finishOperation(operation)
       }
     },
     async runBaseAction(action: 'recycle' | 'restore' | 'purge' | 'export') {
       const baseId = this.selectedBaseId
-      if (!baseId || this.busy) return
-      this.busy = true
+      if (!baseId) return
+      const operation = this.beginOperation()
+      if (!operation) return
       try {
         const api = getDesktopApi().knowledge
         if (action === 'recycle') await api.recycleBase(baseId)
         else if (action === 'restore') await api.restoreBase(baseId)
         else if (action === 'purge') await api.purgeBase(baseId)
         else await api.exportBase(baseId)
-        if (action !== 'export') await this.refresh()
+        if (!this.ownsOperation(operation)) return
+        if (action !== 'export') {
+          await this.refresh()
+          if (!this.ownsOperation(operation)) return
+        }
       } catch (error) {
-        this.error = displayError(error, '知识库操作失败')
+        if (this.ownsOperation(operation)) this.error = displayError(error, '知识库操作失败')
       } finally {
-        this.busy = false
+        this.finishOperation(operation)
       }
     },
   },

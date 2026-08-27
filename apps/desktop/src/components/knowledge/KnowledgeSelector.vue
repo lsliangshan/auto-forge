@@ -2,13 +2,20 @@
   <details
     class="knowledge-selector"
     data-testid="knowledge-selector"
+    :aria-disabled="disabled"
   >
-    <summary :class="{ disabled }">
+    <summary
+      :class="{ disabled }"
+      :aria-disabled="disabled"
+      @click="guardDisabled"
+      @keydown.enter="guardDisabled"
+      @keydown.space="guardDisabled"
+    >
       知识库<span v-if="selectedIds.length"> · {{ selectedIds.length }}</span>
     </summary>
     <div class="knowledge-selector-popover">
       <p
-        v-if="!store.bases.length"
+        v-if="!selectableBases.length"
         class="empty"
       >
         暂无可用知识库
@@ -48,13 +55,13 @@ import { useAuthStore } from '../../stores/auth'
 import { useChatStore } from '../../stores/chat'
 import { useKnowledgeStore } from '../../stores/knowledge'
 
-defineProps<{ disabled: boolean }>()
+const props = defineProps<{ disabled: boolean }>()
 const auth = useAuthStore()
 const chat = useChatStore()
 const store = useKnowledgeStore()
 const selectedIds = computed(() => chat.preferences.knowledgeBaseIds ?? [])
 const mode = computed(() => chat.preferences.knowledgeMode ?? 'mixed')
-const selectableBases = computed(() => store.bases.filter(base => base.status !== 'recycled'))
+const selectableBases = computed(() => store.bases.filter(base => base.status === 'ready' && base.searchable))
 
 onMounted(() => store.bindOwner(auth.session?.user.id))
 watch(() => auth.session?.user.id, ownerId => store.bindOwner(ownerId))
@@ -78,6 +85,12 @@ function toggle(baseId: string) {
 function setMode(event: unknown) {
   const value = String((event as { target?: { value?: unknown } }).target?.value ?? '')
   if (value === 'mixed' || value === 'strict') save(selectedIds.value, value)
+}
+
+function guardDisabled(event: { preventDefault(): void; stopPropagation(): void }) {
+  if (!props.disabled) return
+  event.preventDefault()
+  event.stopPropagation()
 }
 </script>
 
