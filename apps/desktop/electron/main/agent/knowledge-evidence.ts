@@ -139,11 +139,17 @@ function splitKnowledgeClaims(answer: string): string[] {
     const withoutTrailing = trailing?.index === undefined
       ? sentence
       : `${sentence.slice(0, trailing.index)}${trailing[2] ?? ''}`
-    return withoutTrailing
-      .split(/[，,；;](?=(?:但是|但|然而|不过|而且|并且|同时|以及|且))/gu)
-      .flatMap(part => part.split(/(?=(?:但是|但|然而|不过|而且|并且|同时|以及|且)|\b(?=(?:but|however|while|and)\b))/giu))
+    const protectedMarkers: string[] = []
+    const protectedSentence = withoutTrailing.replace(KNOWLEDGE_MARKER, (marker) => {
+      protectedMarkers.push(marker)
+      return `\u{e000}${protectedMarkers.length - 1}\u{e001}`
+    })
+    return protectedSentence
+      .split(/[，,；;：:]/gu)
+      .flatMap(part => part.split(/(?=(?:但是|但|然而|不过|而且|并且|同时|以及|且|所以|因此)|\b(?=(?:and|or|but|however|while|whereas|although|though|yet|also|moreover)\b))/giu))
       .map(part => part.trim())
       .filter(Boolean)
+      .map(part => part.replace(/\u{e000}(\d+)\u{e001}/gu, (_placeholder, index: string) => protectedMarkers[Number(index)] ?? ''))
       .map(claim => propagatedMarker && !/\[\[kb:[^\]\r\n]{1,512}\]\]/u.test(claim)
         ? `${claim}${propagatedMarker}`
         : claim)
@@ -160,17 +166,15 @@ function normalizedSupportText(value: string): string {
 
 function canonicalSupportText(value: string): string {
   return normalizedSupportText(value)
+    .replace(/^(?:(?:但是|但|然而|不过|而且|并且|同时|以及|且|所以|因此)|\b(?:and|or|but|however|while|whereas|although|though|yet|also|moreover)\b)\s*/iu, '')
     .replace(/(?:签订|签字)/gu, '签署')
     .replace(/(?:开始起效|开始生效|起效)/gu, '生效')
     .replace(/(?:协定|契约)/gu, '协议')
-}
-
-function supportConcepts(value: string): Set<string> {
-  const concepts = [
-    '协议', '合同', '双方', '甲方', '乙方', '签署', '生效', '盖章', '提前', '解除', '终止',
-    '允许', '需要', '无需', '不需要', '不得', '不能', '禁止',
-  ]
-  return new Set(concepts.filter(concept => value.includes(concept)))
+    .replace(/\b(?:agreement|accord)\b/giu, 'contract')
+    .replace(/\b(?:takes? effect|comes? into force|becomes? effective)\b/giu, 'effective')
+    .replace(/\b(?:allows?|authori[sz]es?)\b/giu, 'permits')
+    .replace(/\b(?:forbids?|does not permit)\b/giu, 'prohibits')
+    .replace(/\bcancellation\b/giu, 'termination')
 }
 
 interface ClaimPolarity {
@@ -183,11 +187,11 @@ interface ClaimPolarity {
 
 function claimPolarity(value: string): ClaimPolarity {
   return {
-    negated: /(?:尚未|未|没有|并非|否|无(?!需|须)|不(?!需要|必|用|得|能|可|允许|过|经))/u.test(value),
-    required: /(?:必须|需要|应当|务必|须要)/u.test(value),
-    notRequired: /(?:无需|无须|不需要|不必|不用)/u.test(value),
-    prohibited: /(?:不得|不能|不可|禁止|不允许)/u.test(value),
-    permitted: /(?:允许|可以)/u.test(value),
+    negated: /(?:尚未|未|没有|并非|否|无(?!需|须)|不(?!需要|必|用|得|能|可|允许|过|经)|\b(?:not|never|without)\b)/iu.test(value),
+    required: /(?:必须|需要|应当|务必|须要|\b(?:must|required|requires?|shall)\b)/iu.test(value),
+    notRequired: /(?:无需|无须|不需要|不必|不用|\b(?:need not|not required|optional)\b)/iu.test(value),
+    prohibited: /(?:不得|不能|不可|禁止|不允许|\b(?:prohibits?|forbids?|must not|may not|cannot|can't)\b)/iu.test(value),
+    permitted: /(?:允许|可以|\b(?:permits?|allows?|may(?!\s+not))\b)/iu.test(value),
   }
 }
 
@@ -200,51 +204,103 @@ function polarityCompatible(claim: string, evidence: string): boolean {
   return true
 }
 
-function entitiesCompatible(claim: string, evidence: string): boolean {
-  const roles = ['甲方', '乙方', '丙方', '买方', '卖方', '出租方', '承租方']
-  if (roles.some(role => claim.includes(role) && !evidence.includes(role))) return false
-  const quotedEntities = [...claim.matchAll(/[“"]([^”"\r\n]{2,64})[”"]/gu)].map(match => match[1]!)
-  return quotedEntities.every(entity => evidence.includes(entity))
+const JURISDICTIONS = [
+  { id: 'cn', pattern: /(?:中华人民共和国|中国(?:法律|法)?|chinese law|law of china)/iu },
+  { id: 'uk', pattern: /(?:英国(?:法律|法)?|英格兰(?:和威尔士)?(?:法律|法)?|british law|english law|law of england(?: and wales)?)/iu },
+  { id: 'us', pattern: /(?:美国(?:法律|法)?|美利坚合众国|american law|u\.s\. law|law of the united states)/iu },
+  { id: 'eu', pattern: /(?:欧盟(?:法律|法)?|european union law|eu law)/iu },
+  { id: 'hk', pattern: /(?:香港(?:法律|法)?|hong kong law)/iu },
+  { id: 'jp', pattern: /(?:日本(?:法律|法)?|japanese law|law of japan)/iu },
+] as const
+
+const CURRENCIES = [
+  { id: 'usd', pattern: /(?:美元|\busd\b|\$)/iu },
+  { id: 'cny', pattern: /(?:人民币|\bcny\b|\brmb\b|¥)/iu },
+  { id: 'eur', pattern: /(?:欧元|\beur\b|€)/iu },
+  { id: 'gbp', pattern: /(?:英镑|\bgbp\b|£)/iu },
+  { id: 'jpy', pattern: /(?:日元|\bjpy\b)/iu },
+] as const
+
+function matchingIds(
+  value: string,
+  definitions: ReadonlyArray<{ id: string; pattern: RegExp }>,
+): Set<string> {
+  return new Set(definitions.filter(definition => definition.pattern.test(value)).map(definition => definition.id))
 }
 
-function cjkBigrams(value: string): Set<string> {
-  const characters = [...value.replace(/[^\p{Script=Han}]/gu, '')]
-  const grams = new Set<string>()
-  if (characters.length === 1) grams.add(characters[0]!)
-  for (let index = 0; index + 1 < characters.length; index += 1) {
-    grams.add(`${characters[index]}${characters[index + 1]}`)
+function namedEntities(value: string): string[] {
+  const common = new Set(['the', 'this', 'that', 'a', 'an', 'contract', 'agreement', 'article', 'section'])
+  const latin = [...value.normalize('NFKC').matchAll(/\b[A-Z][A-Za-z0-9&.-]{1,}(?:\s+[A-Z][A-Za-z0-9&.-]{1,})*\b/gu)]
+    .map(match => match[0]!.replace(/^(?:The|This|That|A|An)\s+/u, '').trim())
+    .filter(entity => entity.length > 0 && !entity.split(/\s+/u).every(word => common.has(word.toLowerCase())))
+  const quoted = [...value.normalize('NFKC').matchAll(/[“"]([^”"\r\n]{2,64})[”"]/gu)].map(match => match[1]!)
+  return [...new Set([...latin, ...quoted])]
+}
+
+function entitiesCompatible(claim: string, evidence: string, rawClaim: string, rawEvidence: string): boolean {
+  const roles = ['甲方', '乙方', '丙方', '买方', '卖方', '出租方', '承租方']
+  if (roles.some(role => claim.includes(role) && !evidence.includes(role))) return false
+  const claimJurisdictions = matchingIds(claim, JURISDICTIONS)
+  const evidenceJurisdictions = matchingIds(evidence, JURISDICTIONS)
+  if ([...claimJurisdictions].some(id => !evidenceJurisdictions.has(id))) return false
+  const claimCurrencies = matchingIds(claim, CURRENCIES)
+  const evidenceCurrencies = matchingIds(evidence, CURRENCIES)
+  if ([...claimCurrencies].some(id => !evidenceCurrencies.has(id))) return false
+  const normalizedRawEvidence = rawEvidence.normalize('NFKC').toLowerCase()
+  return namedEntities(rawClaim).every(entity => normalizedRawEvidence.includes(entity.toLowerCase()))
+}
+
+function cjkMaterialText(value: string): string {
+  return value
+    .replace(/(?:之日起|即可)/gu, '')
+    .replace(/[^一-鿿]/gu, '')
+    .replace(/[由于在的了着后即经则将为和与及]/gu, '')
+}
+
+function cjkMaterialTokens(value: string): string[] {
+  const characters = [...cjkMaterialText(value)]
+  if (characters.length <= 2) return characters.length === 0 ? [] : [characters.join('')]
+  const tokens: string[] = []
+  for (let index = 0; index + 1 < characters.length; index += 2) {
+    tokens.push(`${characters[index]}${characters[index + 1]}`)
   }
-  return grams
+  if (characters.length % 2 === 1) tokens.push(`${characters.at(-2)}${characters.at(-1)}`)
+  return [...new Set(tokens)]
+}
+
+function latinMaterialTokens(value: string): string[] {
+  const ignored = new Set([
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'of', 'on', 'in', 'to', 'by',
+    'after', 'before', 'from', 'that', 'this', 'these', 'those', 'its', 'it', 'when', 'once', 'upon', 'as', 'at',
+  ])
+  return [...new Set((value.match(/[a-z][a-z0-9_-]{1,}/gu) ?? [])
+    .slice(0, 128)
+    .filter(term => !ignored.has(term) && !/^\d+$/u.test(term)))]
+}
+
+function hasHighCoverage(tokens: readonly string[], evidence: string): boolean {
+  if (tokens.length === 0) return false
+  const matched = tokens.filter(token => evidence.includes(token)).length
+  return matched >= Math.min(2, tokens.length) && matched / tokens.length >= 0.8
 }
 
 function supportsClaim(claim: string, evidence: KnowledgeEvidence): boolean {
+  const rawClaim = claim.replace(KNOWLEDGE_MARKER, '').slice(0, 4_000)
+  const rawEvidence = sanitizeKnowledgeSnippet(evidence.snippet).slice(0, 4_000)
   const normalizedClaim = canonicalSupportText(claim)
-  const normalizedEvidence = canonicalSupportText(sanitizeKnowledgeSnippet(evidence.snippet))
+  const normalizedEvidence = canonicalSupportText(rawEvidence)
   if (!polarityCompatible(normalizedClaim, normalizedEvidence)) return false
-  if (!entitiesCompatible(normalizedClaim, normalizedEvidence)) return false
+  if (!entitiesCompatible(normalizedClaim, normalizedEvidence, rawClaim, rawEvidence)) return false
   const claimNumbers = normalizedClaim.match(/\d+(?:[./:-]\d+)*/gu) ?? []
-  if (claimNumbers.some(number => !normalizedEvidence.includes(number))) return false
+  const evidenceNumbers = new Set(normalizedEvidence.match(/\d+(?:[./:-]\d+)*/gu) ?? [])
+  if (claimNumbers.some(number => !evidenceNumbers.has(number))) return false
 
-  const claimGrams = cjkBigrams(normalizedClaim)
-  const evidenceGrams = cjkBigrams(normalizedEvidence)
-  const matchedGrams = [...claimGrams].filter(gram => evidenceGrams.has(gram)).length
-  const cjkSupported = claimGrams.size > 0
-    && matchedGrams >= Math.min(2, claimGrams.size)
-    && matchedGrams / claimGrams.size >= 0.34
-
-  const ignored = new Set(['the', 'and', 'but', 'for', 'with', 'from', 'that', 'this'])
-  const claimTerms = (normalizedClaim.match(/[a-z][a-z0-9_-]{2,}/gu) ?? [])
-    .slice(0, 128)
-    .filter(term => !ignored.has(term) && !/^\d+$/u.test(term))
-  const matchedTerms = claimTerms.filter(term => normalizedEvidence.includes(term)).length
-  const termSupported = claimTerms.length > 0 && matchedTerms / claimTerms.length >= 0.5
-  const claimConcepts = supportConcepts(normalizedClaim)
-  const evidenceConcepts = supportConcepts(normalizedEvidence)
-  const matchedConcepts = [...claimConcepts].filter(concept => evidenceConcepts.has(concept)).length
-  const conceptSupported = claimConcepts.size >= 2
-    && matchedConcepts >= 2
-    && matchedConcepts / claimConcepts.size >= 0.5
-  return cjkSupported || termSupported || conceptSupported
+  const cjkTokens = cjkMaterialTokens(normalizedClaim)
+  const latinTokens = latinMaterialTokens(normalizedClaim)
+  if (cjkTokens.length === 0 && latinTokens.length === 0) return false
+  if (cjkTokens.length > 0 && !hasHighCoverage(cjkTokens, cjkMaterialText(normalizedEvidence))) return false
+  if (latinTokens.length > 0 && !hasHighCoverage(latinTokens, normalizedEvidence)) return false
+  return true
 }
 
 export function formatValidatedKnowledgeAnswer(

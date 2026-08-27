@@ -176,7 +176,80 @@ describe('knowledge tool and answer validation', () => {
       '双方签订协议后，协议即开始起效。[[kb:evidence:0]]', [contract], 'strict', 0,
     )).toEqual({
       kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
-      text: '双方签订协议后，协议即开始起效。',
+      text: '双方签订协议后\n协议即开始起效。',
+    })
+  })
+
+  it('accepts bounded English paraphrases only after canonical terms still meet high coverage', () => {
+    const contract = evidence(0, { snippet: 'The agreement takes effect when both parties sign it.' })
+    expect(validateKnowledgeAnswer(
+      'The contract becomes effective when both parties sign it. [[kb:evidence:0]]',
+      [contract], 'strict', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: false,
+      text: 'The contract becomes effective when both parties sign it.',
+    })
+  })
+
+  it.each([
+    {
+      name: '中文普通逗号后的无关月球断言',
+      snippet: '合同经双方签字后生效。',
+      answer: '合同经双方签字后生效，月球由奶酪构成。[[kb:evidence:0]]',
+    },
+    {
+      name: '英国法律与中国法律实体冲突',
+      snippet: '本合同适用中国法律。',
+      answer: '本合同适用英国法律。[[kb:evidence:0]]',
+    },
+    {
+      name: 'English effective and not effective polarity conflict',
+      snippet: 'The contract is effective on signature.',
+      answer: 'The contract is not effective on signature. [[kb:evidence:0]]',
+    },
+    {
+      name: 'English permits and prohibits early termination conflict',
+      snippet: 'The contract permits early termination.',
+      answer: 'The contract prohibits early termination. [[kb:evidence:0]]',
+    },
+    {
+      name: '数字只能精确匹配而不能命中较长数字',
+      snippet: '合同期限为 17 日。',
+      answer: '合同期限为 7 日。[[kb:evidence:0]]',
+    },
+    {
+      name: '货币实体不能跨币种复用',
+      snippet: '服务费为 100 美元。',
+      answer: '服务费为 100 人民币。[[kb:evidence:0]]',
+    },
+    {
+      name: '日期必须完整精确匹配',
+      snippet: '合同于 2026-08-01 生效。',
+      answer: '合同于 2026-08-02 生效。[[kb:evidence:0]]',
+    },
+    {
+      name: '英文专名实体必须出现在证据中',
+      snippet: 'Acme permits early termination.',
+      answer: 'Globex permits early termination. [[kb:evidence:0]]',
+    },
+  ])('repairs then fails closed for $name', ({ snippet, answer }) => {
+    const current = evidence(0, { snippet })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 0)).toEqual({
+      kind: 'repair', invalidEvidenceIds: ['unsupported-claim'],
+    })
+    expect(validateKnowledgeAnswer(answer, [current], 'strict', 1)).toEqual({
+      kind: 'insufficient', reason: 'unsupported-claim',
+    })
+  })
+
+  it('downgrades only the unsupported comma clause in mixed mode', () => {
+    const contract = evidence(0, { snippet: '合同经双方签字后生效。' })
+    expect(validateKnowledgeAnswer(
+      '合同经双方签字后生效，月球由奶酪构成。[[kb:evidence:0]]',
+      [contract], 'mixed', 0,
+    )).toEqual({
+      kind: 'valid', citedEvidenceIds: ['evidence:0'], generalKnowledge: true,
+      text: '【知识库依据】合同经双方签字后生效\n【一般信息】月球由奶酪构成。',
     })
   })
 
