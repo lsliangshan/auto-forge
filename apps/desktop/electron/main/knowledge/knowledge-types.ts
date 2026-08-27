@@ -26,8 +26,10 @@ export interface KnowledgeService {
   importDocument(owner: KnowledgeOwner, baseId: string, importHandleId: string): Promise<KnowledgeDocumentSummary | undefined>
   replaceDocument(owner: KnowledgeOwner, documentId: string, importHandleId: string): Promise<KnowledgeDocumentSummary | undefined>
   recycleDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
+  restoreDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
   purgeDocument(owner: KnowledgeOwner, documentId: string): Promise<void>
   recycleBase(owner: KnowledgeOwner, baseId: string): Promise<void>
+  restoreBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   purgeBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   exportBase(owner: KnowledgeOwner, baseId: string): Promise<void>
   getSelection(owner: KnowledgeOwner, conversationId: string): Promise<KnowledgeSelection>
@@ -53,8 +55,10 @@ export function createUnavailableKnowledgeService(): KnowledgeService {
     importDocument: async () => unavailable(),
     replaceDocument: async () => unavailable(),
     recycleDocument: async () => unavailable(),
+    restoreDocument: async () => unavailable(),
     purgeDocument: async () => unavailable(),
     recycleBase: async () => unavailable(),
+    restoreBase: async () => unavailable(),
     purgeBase: async () => unavailable(),
     exportBase: async () => unavailable(),
     getSelection: async () => unavailable(),

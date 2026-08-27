@@ -20,16 +20,16 @@ afterEach(() => {
   for (const database of databases.splice(0)) database.close()
 })
 
-describe('knowledge schema v1', () => {
+describe('knowledge schema v2', () => {
   it('initializes the versioned personal knowledge graph exactly once', () => {
     const database = testDatabase()
 
     initializeKnowledgeSchema(database)
     initializeKnowledgeSchema(database)
 
-    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(1)
+    expect(KNOWLEDGE_SCHEMA_VERSION).toBe(2)
     expect(database.prepare('SELECT version FROM knowledge_schema_migrations').all())
-      .toEqual([{ version: 1 }])
+      .toEqual([{ version: 1 }, { version: 2 }])
     const tables = database.prepare(`
       SELECT name FROM sqlite_master
       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
@@ -42,8 +42,14 @@ describe('knowledge schema v1', () => {
       'kb_chunks_fts',
       'knowledge_bases',
       'knowledge_blocks',
+      'knowledge_cleanup_records',
+      'knowledge_import_jobs',
       'knowledge_schema_migrations',
     ]))
+    expect(database.prepare(`
+      SELECT lifecycle_status, publication_generation, recycled_at
+      FROM documents LIMIT 0
+    `).all()).toEqual([])
   })
 
   it('keeps trigram FTS rows synchronized with external chunk content', () => {

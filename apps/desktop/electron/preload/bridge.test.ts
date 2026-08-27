@@ -287,10 +287,18 @@ describe('preload desktop bridge', () => {
       id: 'import_1', name: 'policy.txt', mimeType: 'text/plain', byteSize: 12,
     }])
     await app.api.knowledge.importDocument('base_1', 'import_1')
+    await app.api.knowledge.restoreDocument('document_1')
+    await app.api.knowledge.restoreBase('base_1')
 
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(1, ipcChannels.knowledgePickImportFiles, undefined)
     expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(2, ipcChannels.knowledgeImportDocument, {
       baseId: 'base_1', importHandleId: 'import_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(3, ipcChannels.knowledgeRestoreDocument, {
+      documentId: 'document_1',
+    })
+    expect(app.ipcRenderer.invoke).toHaveBeenNthCalledWith(4, ipcChannels.knowledgeRestoreBase, {
+      baseId: 'base_1',
     })
     expect(app.api).not.toHaveProperty('getPathForFile')
     expect(JSON.stringify(app.api)).not.toContain('/private')

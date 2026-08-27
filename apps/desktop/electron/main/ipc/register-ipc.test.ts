@@ -136,7 +136,7 @@ function services(): DesktopIpcServices {
         status: 'ready', versionCount: 1, updatedAt: '2026-08-26T00:00:00.000Z',
       }),
       replaceDocument: vi.fn(), recycleDocument: vi.fn(), purgeDocument: vi.fn(),
-      recycleBase: vi.fn(), purgeBase: vi.fn(), exportBase: vi.fn(),
+      restoreDocument: vi.fn(), recycleBase: vi.fn(), restoreBase: vi.fn(), purgeBase: vi.fn(), exportBase: vi.fn(),
       getSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
       updateSelection: vi.fn().mockResolvedValue({ baseIds: [], mode: 'mixed' }),
       search: vi.fn().mockResolvedValue([]),
@@ -438,11 +438,15 @@ describe('registerDesktopIpc', () => {
       baseId: 'base_1', importHandleId: 'import_1',
     })).resolves.toMatchObject({ id: 'document_1', baseId: 'base_1' })
     await expect(app.invoke(ipcChannels.knowledgeSearch, { query: '合同' })).resolves.toEqual([])
+    await expect(app.invoke(ipcChannels.knowledgeRestoreDocument, { documentId: 'document_1' })).resolves.toBeUndefined()
+    await expect(app.invoke(ipcChannels.knowledgeRestoreBase, { baseId: 'base_1' })).resolves.toBeUndefined()
 
     const owner = { userId: 'user_1' }
     expect(app.dependencies.knowledge.pickImportFiles).toHaveBeenCalledWith(owner)
     expect(app.dependencies.knowledge.importDocument).toHaveBeenCalledWith(owner, 'base_1', 'import_1')
     expect(app.dependencies.knowledge.search).toHaveBeenCalledWith(owner, '合同')
+    expect(app.dependencies.knowledge.restoreDocument).toHaveBeenCalledWith(owner, 'document_1')
+    expect(app.dependencies.knowledge.restoreBase).toHaveBeenCalledWith(owner, 'base_1')
 
     for (const [channel, input] of [
       [ipcChannels.knowledgeList, { userId: 'forged' }],

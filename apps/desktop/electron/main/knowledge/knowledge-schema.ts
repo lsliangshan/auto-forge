@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 
-export const KNOWLEDGE_SCHEMA_VERSION = 1
+export const KNOWLEDGE_SCHEMA_VERSION = 2
 
 const KNOWLEDGE_SCHEMA_V1 = `
   CREATE TABLE knowledge_bases (
@@ -90,6 +90,49 @@ const KNOWLEDGE_SCHEMA_V1 = `
   END;
 `
 
+const KNOWLEDGE_SCHEMA_V2 = `
+  ALTER TABLE knowledge_bases ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'ready'
+    CHECK (lifecycle_status IN ('ready', 'processing', 'paused', 'failed', 'read_only', 'recycled'));
+  ALTER TABLE knowledge_bases ADD COLUMN recycled_at INTEGER;
+
+  ALTER TABLE documents ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (lifecycle_status IN ('queued', 'copying', 'parsing', 'indexing', 'ready', 'failed', 'paused', 'deleted'));
+  ALTER TABLE documents ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0
+    CHECK (publication_generation >= 0);
+  ALTER TABLE documents ADD COLUMN recycled_at INTEGER;
+
+  ALTER TABLE document_versions ADD COLUMN publication_generation INTEGER NOT NULL DEFAULT 0
+    CHECK (publication_generation >= 0);
+  ALTER TABLE document_versions ADD COLUMN error_code TEXT;
+
+  CREATE TABLE knowledge_import_jobs (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    version_id TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    publication_token TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (version_id, document_id) REFERENCES document_versions(id, document_id) ON DELETE CASCADE
+  ) STRICT;
+
+  CREATE INDEX knowledge_import_jobs_status_idx
+    ON knowledge_import_jobs(status, created_at, id);
+
+  CREATE TABLE knowledge_cleanup_records (
+    object_id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+  ) STRICT;
+`
+
+const migrations = new Map<number, string>([
+  [1, KNOWLEDGE_SCHEMA_V1],
+  [2, KNOWLEDGE_SCHEMA_V2],
+])
+
 export function initializeKnowledgeSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS knowledge_schema_migrations (
@@ -106,9 +149,13 @@ export function initializeKnowledgeSchema(database: Database.Database): void {
   if (current.version === KNOWLEDGE_SCHEMA_VERSION) return
 
   database.transaction(() => {
-    database.exec(KNOWLEDGE_SCHEMA_V1)
-    database.prepare(
-      'INSERT INTO knowledge_schema_migrations (version, applied_at) VALUES (?, ?)',
-    ).run(KNOWLEDGE_SCHEMA_VERSION, Date.now())
+    for (let version = (current.version ?? 0) + 1; version <= KNOWLEDGE_SCHEMA_VERSION; version += 1) {
+      const migration = migrations.get(version)
+      if (!migration) throw new Error(`Knowledge database migration ${version} is unavailable`)
+      database.exec(migration)
+      database.prepare(
+        'INSERT INTO knowledge_schema_migrations (version, applied_at) VALUES (?, ?)',
+      ).run(version, Date.now())
+    }
   })()
 }

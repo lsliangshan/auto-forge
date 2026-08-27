@@ -1,4 +1,5 @@
-import { join } from 'node:path'
+import { readFile, stat, writeFile } from 'node:fs/promises'
+import { basename, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   app,
@@ -17,7 +18,7 @@ import {
   type Event,
   type OpenDialogOptions,
 } from 'electron'
-import { chatEventSchema, executionEventSchema, ipcChannels } from '@autoforge/shared'
+import { chatEventSchema, executionEventSchema, ipcChannels, knowledgeEventSchema } from '@autoforge/shared'
 import { createApplicationRuntime } from './application.js'
 import {
   closeDesktopApplicationResources,
@@ -34,6 +35,14 @@ import { NetworkProxyService } from './network/network-proxy-service.js'
 import { ElectronBrowserWorkspace } from './browser/electron-browser-workspace.js'
 import { UserDataStoreManager } from './database/user-data-client.js'
 import { createSecureWindow } from './window.js'
+import { KnowledgeStoreFactory } from './knowledge/encrypted-database.js'
+import {
+  createLocalKnowledgeService,
+  MAX_KNOWLEDGE_IMPORT_BYTES,
+  type SelectedKnowledgeFile,
+} from './knowledge/knowledge-service.js'
+import { createElectronParserSupervisor } from './knowledge/parser-supervisor.js'
+import type { SafeStoragePort } from './security/secret-store.js'
 
 type ApplicationRuntime = ReturnType<typeof createApplicationRuntime>
 
@@ -80,6 +89,11 @@ async function initialize(): Promise<ApplicationRuntime> {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
   const userData = app.getPath('userData')
+  const safeStoragePort: SafeStoragePort = {
+    isAvailable: async () => safeStorage.isEncryptionAvailable(),
+    encrypt: async (value) => safeStorage.encryptString(value),
+    decrypt: async (value) => ({ value: safeStorage.decryptString(value), shouldReEncrypt: false }),
+  }
   userDataStores ??= new UserDataStoreManager(join(userData, 'user-caches'))
   const networkProxy = new NetworkProxyService({
     setProxy: (config) => session.defaultSession.setProxy(config),
@@ -94,6 +108,57 @@ async function initialize(): Promise<ApplicationRuntime> {
     backgroundColor: () => nativeTheme.shouldUseDarkColors ? '#11151c' : '#f3f5f8',
   })
   nativeTheme.on('updated', () => browserWorkspace.updateTheme())
+  const knowledgeStoreFactory = new KnowledgeStoreFactory(join(userData, 'knowledge'), safeStoragePort)
+  const selectKnowledgeFiles = async (): Promise<SelectedKnowledgeFile[]> => {
+    const dialogOptions: OpenDialogOptions = {
+      title: '选择知识库文件',
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'Documents', extensions: ['pdf', 'docx', 'txt', 'md', 'markdown', 'html', 'htm'] }],
+    }
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+      : await dialog.showOpenDialog(dialogOptions)
+    if (result.canceled) return []
+    const mediaType = (path: string): SelectedKnowledgeFile['mimeType'] | undefined => {
+      const extension = extname(path).toLowerCase()
+      if (extension === '.pdf') return 'application/pdf'
+      if (extension === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      if (extension === '.txt') return 'text/plain'
+      if (extension === '.md' || extension === '.markdown') return 'text/markdown'
+      if (extension === '.html' || extension === '.htm') return 'text/html'
+      return undefined
+    }
+    const selected: SelectedKnowledgeFile[] = []
+    for (const path of result.filePaths.slice(0, 1)) {
+      const mimeType = mediaType(path)
+      if (!mimeType) continue
+      const metadata = await stat(path)
+      if (!metadata.isFile() || metadata.size < 1 || metadata.size > MAX_KNOWLEDGE_IMPORT_BYTES) continue
+      selected.push({ name: basename(path), mimeType, bytes: await readFile(path) })
+    }
+    return selected
+  }
+  const knowledgeService = createLocalKnowledgeService({
+    openStore: ownerId => knowledgeStoreFactory.open(ownerId),
+    selectImportFiles: selectKnowledgeFiles,
+    createParser: store => createElectronParserSupervisor({
+      workerHtmlPath: fileURLToPath(new URL('../renderer/electron/knowledge-parser/index.html', import.meta.url)),
+      preloadPath: fileURLToPath(new URL('../preload/knowledgeParser.cjs', import.meta.url)),
+      resolveObject: objectId => store.objects.read(objectId),
+    }),
+    saveExport: async (name, contents) => {
+      const result = mainWindow
+        ? await dialog.showSaveDialog(mainWindow, { defaultPath: name })
+        : await dialog.showSaveDialog({ defaultPath: name })
+      if (!result.canceled && result.filePath) await writeFile(result.filePath, contents, { mode: 0o600 })
+    },
+    // Signed membership snapshots arrive in Task 8. Main stays on the free 1/1 policy until then.
+    isMember: () => false,
+    emit: event => {
+      const parsed = knowledgeEventSchema.safeParse(event)
+      if (parsed.success) emit(ipcChannels.knowledgeEvent, parsed.data)
+    },
+  })
   return createApplicationRuntime({
     paths: {
       database: join(userData, 'autoforge.sqlite'),
@@ -104,13 +169,10 @@ async function initialize(): Promise<ApplicationRuntime> {
       workflowRunner: fileURLToPath(new URL('../workers/workflow-runner.cjs', import.meta.url)),
       temporary: app.getPath('temp'),
     },
-    safeStorage: {
-      isAvailable: async () => safeStorage.isEncryptionAvailable(),
-      encrypt: async (value) => safeStorage.encryptString(value),
-      decrypt: async (value) => ({ value: safeStorage.decryptString(value), shouldReEncrypt: false }),
-    },
+    safeStorage: safeStoragePort,
     networkProxy,
     browserWorkspace,
+    knowledgeService,
     applyTheme: (theme) => {
       nativeTheme.themeSource = theme
       browserWorkspace.updateTheme()

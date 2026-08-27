@@ -93,6 +93,7 @@ import { SafeMediaDownloader } from './media/safe-download.js'
 import type { NetworkProxyPort } from './network/network-proxy-service.js'
 import { removeInterruptedRuntimeDirectories } from './startup.js'
 import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
+import type { LocalKnowledgeService } from './knowledge/knowledge-service.js'
 import { createTokenUsageSnapshot } from './token-usage.js'
 import { QiniuAvatarUploader } from './profile/avatar-uploader.js'
 import { ProfileService } from './profile/profile-service.js'
@@ -139,6 +140,7 @@ type ApplicationFailureSource =
   | 'reconciliation-stop'
   | 'video-stop'
   | 'admission-drain'
+  | 'knowledge-drain'
   | 'agent-cancel'
   | 'media-cancel'
   | 'chat-drain'
@@ -191,6 +193,7 @@ const applicationFailureRank: Record<ApplicationFailureSource, number> = {
   'reconciliation-stop': 10,
   'video-stop': 20,
   'admission-drain': 30,
+  'knowledge-drain': 35,
   'agent-cancel': 40,
   'media-cancel': 50,
   'chat-drain': 60,
@@ -256,6 +259,8 @@ export interface ApplicationRuntimeOptions {
   removeExecutionTemporaryDirectory?(path: string): Promise<void>
   /** @internal Allows deterministic bounded-logout tests. */
   logoutSyncTimeoutMs?: number
+  /** @internal Allows deterministic knowledge lifecycle tests; production supplies the local service. */
+  knowledgeService?: LocalKnowledgeService
 }
 
 interface ObservedAuthService extends AuthService {
@@ -760,15 +765,18 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
   let bindUserMedia: (session: AuthSession) => Promise<void> = async () => undefined
   let pauseUserMedia = (): void => undefined
   let deleteUserMedia: (userId: string) => Promise<void> = async () => undefined
+  const knowledge = options.knowledgeService
   const bindUserData = (session: AuthSession): Promise<void> => {
     const operation = userDataLifecycleTail.then(async () => {
       if (boundUserId === session.user.id && userDataStores.current()) {
+        await knowledge?.bind(session.user.id)
         await bindUserMedia(session)
         activateUserReconciliation(runtimeRecovered)
         await activateVideoJobs(runtimeRecovered)
         return
       }
       await userDataSync.start(session.user.id, deviceId)
+      await knowledge?.bind(session.user.id)
       await bindUserMedia(session)
       boundUserId = session.user.id
       const warningSince = userDataSync.status().warningSince
@@ -783,7 +791,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return operation
   }
   const pauseUserData = (): Promise<void> => {
+    knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
+      await knowledge?.drain()
       await pauseVideoJobs()
       await pauseUserReconciliation()
       await userDataSync.pause()
@@ -795,7 +805,9 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     return operation
   }
   const prepareUserDataDiscard = (): Promise<void> => {
+    knowledge?.invalidate()
     const operation = userDataLifecycleTail.then(async () => {
+      await knowledge?.drain()
       await pauseVideoJobs()
       await pauseUserReconciliation()
       userDataSync.discard()
@@ -1547,6 +1559,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
     waitForActive: () => Promise<void>,
     pause = true,
   ): Promise<void> => {
+    knowledge?.invalidate()
     const current = await auth.getSession()
     if (current) {
       await resetBrowserIdentity(current.user.id)
@@ -2485,7 +2498,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
         )
       },
     },
-    knowledge: createUnavailableKnowledgeService(),
+    knowledge: knowledge ?? createUnavailableKnowledgeService(),
     system: {
       openExternal: async (url) => {
         const parsed = openExternalRequestSchema.safeParse({ url })
@@ -2574,6 +2587,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
       if (closePromise) return closePromise
       closePromise = (async () => {
         acceptingWork = false
+        knowledge?.invalidate()
         const capture = async (
           source: ApplicationFailureSource,
           operation: () => void | Promise<void>,
@@ -2581,6 +2595,7 @@ export function createApplicationRuntime(options: ApplicationRuntimeOptions) {
           try { await Promise.resolve().then(operation) } catch (error) { recordFailure(error, source) }
         }
         await capture('admission-drain', () => userDataAdmission.stopAndDrain())
+        await capture('knowledge-drain', () => knowledge?.drain())
         await capture('admission-drain', () => maintenance.stopAndDrain())
         const reconciliationStopped = Promise.resolve()
           .then(() => pauseUserReconciliation())

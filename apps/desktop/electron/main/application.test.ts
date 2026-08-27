@@ -68,6 +68,7 @@ import {
 } from './network/network-proxy-service.js'
 import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
+import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
 import {
@@ -1388,6 +1389,49 @@ describe('createApplicationRuntime', () => {
     await expect(listing).resolves.toEqual([])
     await expect(switching).resolves.toMatchObject({ user: { id: 'test_user_knowledgebobby' } })
     await runtime.close()
+  })
+
+  it('invalidates the knowledge owner before identity awaits and drains before rebinding or shutdown', async () => {
+    // Catches late parser/job callbacks that survive an account switch or shutdown under the old owner.
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-owner-epoch-'))
+    directories.push(root)
+    const listingStarted = deferred<void>()
+    const releaseListing = deferred<void>()
+    const lifecycle: string[] = []
+    const knowledgeService = Object.assign(createUnavailableKnowledgeService(), {
+      bind: vi.fn(async (ownerId: string) => { lifecycle.push(`bind:${ownerId}`) }),
+      invalidate: vi.fn(() => { lifecycle.push('invalidate') }),
+      drain: vi.fn(async () => { lifecycle.push('drain') }),
+      list: vi.fn(async () => {
+        listingStarted.resolve()
+        await releaseListing.promise
+        return []
+      }),
+    })
+    const runtime = createApplicationRuntime(options(root, { knowledgeService }))
+    await authenticate(runtime, 'KnowledgeAlice')
+    await authenticate(runtime, 'KnowledgeBobby')
+    await runtime.services.auth.loginWithPassword({ account: 'KnowledgeAlice', password: 'password' })
+    const owner = { userId: 'test_user_knowledgealice' }
+    const listing = runtime.services.knowledge.list(owner)
+    await listingStarted.promise
+
+    const invalidationsBeforeSwitch = knowledgeService.invalidate.mock.calls.length
+    const switching = runtime.services.auth.loginWithPassword({
+      account: 'KnowledgeBobby', password: 'password',
+    })
+    expect(knowledgeService.invalidate).toHaveBeenCalledTimes(invalidationsBeforeSwitch + 1)
+    expect(lifecycle.at(-1)).toBe('invalidate')
+
+    releaseListing.resolve()
+    await listing
+    await switching
+    expect(lifecycle).toContain('bind:test_user_knowledgebobby')
+    expect(lifecycle.indexOf('invalidate')).toBeLessThan(lifecycle.indexOf('bind:test_user_knowledgebobby'))
+
+    const beforeClose = lifecycle.length
+    await runtime.close()
+    expect(lifecycle.slice(beforeClose, beforeClose + 2)).toEqual(['invalidate', 'drain'])
   })
 
   it('drains an A legacy import before an authenticated A-to-B switch', async () => {

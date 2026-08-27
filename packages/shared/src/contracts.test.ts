@@ -1779,6 +1779,12 @@ describe('cross-process contracts', () => {
       .toEqual({ baseId: 'base_1', importHandleId: 'import_1' })
     expect(knowledgeImportRequestSchema.safeParse({ baseId: 'base_1', importHandleId: 'import_1', path: '/tmp/secret' }).success)
       .toBe(false)
+    expect(ipcChannels.knowledgeRestoreDocument).toBe('knowledge:restore-document')
+    expect(ipcChannels.knowledgeRestoreBase).toBe('knowledge:restore-base')
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRestoreDocument].parse({ documentId: 'document_1' }))
+      .toEqual({ documentId: 'document_1' })
+    expect(ipcRequestSchemas[ipcChannels.knowledgeRestoreBase].parse({ baseId: 'base_1' }))
+      .toEqual({ baseId: 'base_1' })
   })
 
   it('keeps knowledge selections strict and owner-free', () => {

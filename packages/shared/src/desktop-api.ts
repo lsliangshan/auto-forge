@@ -1563,8 +1563,10 @@ export const ipcChannels = {
   knowledgeImportDocument: 'knowledge:import-document',
   knowledgeReplaceDocument: 'knowledge:replace-document',
   knowledgeRecycleDocument: 'knowledge:recycle-document',
+  knowledgeRestoreDocument: 'knowledge:restore-document',
   knowledgePurgeDocument: 'knowledge:purge-document',
   knowledgeRecycleBase: 'knowledge:recycle-base',
+  knowledgeRestoreBase: 'knowledge:restore-base',
   knowledgePurgeBase: 'knowledge:purge-base',
   knowledgeExportBase: 'knowledge:export-base',
   knowledgeGetSelection: 'knowledge:get-selection',
@@ -1772,8 +1774,10 @@ export const ipcRequestSchemas = {
   [ipcChannels.knowledgeImportDocument]: knowledgeImportRequestSchema,
   [ipcChannels.knowledgeReplaceDocument]: knowledgeReplaceRequestSchema,
   [ipcChannels.knowledgeRecycleDocument]: knowledgeDocumentRequestSchema,
+  [ipcChannels.knowledgeRestoreDocument]: knowledgeDocumentRequestSchema,
   [ipcChannels.knowledgePurgeDocument]: knowledgeDocumentRequestSchema,
   [ipcChannels.knowledgeRecycleBase]: knowledgeBaseRequestSchema,
+  [ipcChannels.knowledgeRestoreBase]: knowledgeBaseRequestSchema,
   [ipcChannels.knowledgePurgeBase]: knowledgeBaseRequestSchema,
   [ipcChannels.knowledgeExportBase]: knowledgeBaseRequestSchema,
   [ipcChannels.knowledgeGetSelection]: knowledgeSelectionRequestSchema,
@@ -1867,8 +1871,10 @@ export const ipcResponseSchemas = {
   [ipcChannels.knowledgeImportDocument]: knowledgeDocumentSummarySchema.optional(),
   [ipcChannels.knowledgeReplaceDocument]: knowledgeDocumentSummarySchema.optional(),
   [ipcChannels.knowledgeRecycleDocument]: voidResponseSchema,
+  [ipcChannels.knowledgeRestoreDocument]: voidResponseSchema,
   [ipcChannels.knowledgePurgeDocument]: voidResponseSchema,
   [ipcChannels.knowledgeRecycleBase]: voidResponseSchema,
+  [ipcChannels.knowledgeRestoreBase]: voidResponseSchema,
   [ipcChannels.knowledgePurgeBase]: voidResponseSchema,
   [ipcChannels.knowledgeExportBase]: voidResponseSchema,
   [ipcChannels.knowledgeGetSelection]: knowledgeSelectionSchema,
@@ -1985,8 +1991,10 @@ export interface DesktopAPI {
     importDocument(baseId: string, importHandleId: string): Promise<KnowledgeDocumentSummary | undefined>
     replaceDocument(documentId: string, importHandleId: string): Promise<KnowledgeDocumentSummary | undefined>
     recycleDocument(documentId: string): Promise<void>
+    restoreDocument(documentId: string): Promise<void>
     purgeDocument(documentId: string): Promise<void>
     recycleBase(baseId: string): Promise<void>
+    restoreBase(baseId: string): Promise<void>
     purgeBase(baseId: string): Promise<void>
     exportBase(baseId: string): Promise<void>
     getSelection(conversationId: string): Promise<KnowledgeSelection>
