@@ -264,6 +264,72 @@ describe('local knowledge service', () => {
     expect(alice.database.prepare('SELECT status FROM knowledge_import_jobs WHERE id = ?').get('job'))
       .toEqual({ status: 'running' })
     await expect(service.list({ userId: 'bob' })).resolves.toEqual([])
+    service.invalidate()
+    await expect(service.drain()).resolves.toBeUndefined()
+  })
+
+  it('rethrows the first stale-bind cleanup failure from drain after the lifecycle tail settles', async () => {
+    // Catches the serialization tail handling a rejection but permanently hiding it from Application shutdown.
+    const alice = memoryKnowledgeStore()
+    const bob = memoryKnowledgeStore()
+    const parserStarted = deferred<void>()
+    const parserGate = deferred<KnowledgeParserPort>()
+    const terminateFailure = new Error('stale parser termination failed')
+    const closeFailure = new Error('stale store close failed')
+    const terminateAll = vi.fn(async () => { throw terminateFailure })
+    const closeAlice = vi.fn(async () => { throw closeFailure })
+    const service = createLocalKnowledgeService({
+      openStore: async ownerId => ownerId === 'alice' ? { ...alice.store, close: closeAlice } : bob.store,
+      selectImportFiles: async () => [],
+      createParser: store => {
+        if (store.database !== alice.database) {
+          return { parse: async () => parsedText('bob'), terminateAll: async () => undefined }
+        }
+        parserStarted.resolve()
+        return parserGate.promise
+      },
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+
+    const bindingAlice = service.bind('alice')
+    await parserStarted.promise
+    service.invalidate()
+    const bindingBob = service.bind('bob')
+    parserGate.resolve({ parse: async () => parsedText('alice'), terminateAll })
+
+    await expect(bindingAlice).rejects.toBe(terminateFailure)
+    await bindingBob
+    expect(terminateAll).toHaveBeenCalledOnce()
+    expect(closeAlice).toHaveBeenCalledOnce()
+    service.invalidate()
+    await expect(service.drain()).rejects.toBe(terminateFailure)
+    await expect(service.drain()).resolves.toBeUndefined()
+  })
+
+  it('retains a stale-bind store-close failure when parser termination succeeds', async () => {
+    const memory = memoryKnowledgeStore()
+    const parserStarted = deferred<void>()
+    const parserGate = deferred<KnowledgeParserPort>()
+    const closeFailure = new Error('stale store close failed')
+    const close = vi.fn(async () => { throw closeFailure })
+    const service = createLocalKnowledgeService({
+      openStore: async () => ({ ...memory.store, close }),
+      selectImportFiles: async () => [],
+      createParser: async () => { parserStarted.resolve(); return parserGate.promise },
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+
+    const binding = service.bind('alice')
+    await parserStarted.promise
+    service.invalidate()
+    parserGate.resolve({ parse: async () => parsedText('alice'), terminateAll: async () => undefined })
+
+    await expect(binding).rejects.toBe(closeFailure)
+    expect(close).toHaveBeenCalledOnce()
+    await expect(service.drain()).rejects.toBe(closeFailure)
+    await expect(service.drain()).resolves.toBeUndefined()
   })
 
   it('keeps a cleanup receipt when its object deletion returns after owner invalidation', async () => {

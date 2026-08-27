@@ -69,6 +69,9 @@ import {
 import { SecretStore } from './security/secret-store.js'
 import { SettingsService } from './settings/settings-service.js'
 import { createUnavailableKnowledgeService } from './knowledge/knowledge-types.js'
+import { createLocalKnowledgeService } from './knowledge/knowledge-service.js'
+import type { KnowledgeParserPort } from './knowledge/import-job-runner.js'
+import { memoryKnowledgeStore, parsedText } from './knowledge/knowledge-test-support.js'
 import { fingerprintApiKey, ProviderUsageReconciler } from './billing/provider-usage-reconciler.js'
 import { ExecutionService } from './workflows/execution-service.js'
 import {
@@ -1452,6 +1455,44 @@ describe('createApplicationRuntime', () => {
     await expect(runtime.close()).rejects.toBe(drainFailure)
     expect(knowledgeService.invalidate).toHaveBeenCalledOnce()
     expect(knowledgeService.drain).toHaveBeenCalledOnce()
+  })
+
+  it('records a stale bind cleanup failure retained by the real knowledge lifecycle tail', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-application-knowledge-bind-failure-'))
+    directories.push(root)
+    const alice = memoryKnowledgeStore()
+    const bob = memoryKnowledgeStore()
+    const parserStarted = deferred<void>()
+    const parserGate = deferred<KnowledgeParserPort>()
+    const terminateFailure = new Error('stale parser termination failed')
+    const closeAlice = vi.fn(async () => { throw new Error('stale store close failed') })
+    const knowledgeService = createLocalKnowledgeService({
+      openStore: async ownerId => ownerId === 'alice' ? { ...alice.store, close: closeAlice } : bob.store,
+      selectImportFiles: async () => [],
+      createParser: store => {
+        if (store.database !== alice.database) {
+          return { parse: async () => parsedText('bob'), terminateAll: async () => undefined }
+        }
+        parserStarted.resolve()
+        return parserGate.promise
+      },
+      saveExport: async () => undefined,
+      isMember: () => false,
+    })
+    const bindingAlice = knowledgeService.bind('alice')
+    await parserStarted.promise
+    knowledgeService.invalidate()
+    const bindingBob = knowledgeService.bind('bob')
+    parserGate.resolve({
+      parse: async () => parsedText('alice'),
+      terminateAll: async () => { throw terminateFailure },
+    })
+    await expect(bindingAlice).rejects.toBe(terminateFailure)
+    await bindingBob
+    const runtime = createApplicationRuntime(options(root, { knowledgeService }))
+
+    await expect(runtime.close()).rejects.toBe(terminateFailure)
+    expect(closeAlice).toHaveBeenCalledOnce()
   })
 
   it('drains an A legacy import before an authenticated A-to-B switch', async () => {

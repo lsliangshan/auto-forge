@@ -1,7 +1,9 @@
+import { execFileSync } from 'node:child_process'
+import { closeSync, constants, openSync } from 'node:fs'
 import { lstat, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   readKnowledgeImportFile,
   readOpenedKnowledgeImport,
@@ -16,6 +18,52 @@ afterEach(async () => {
 })
 
 describe('knowledge file IO', () => {
+  it.skipIf(process.platform === 'win32')('promptly rejects a FIFO without waiting for a writer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-fifo-'))
+    directories.push(root)
+    const fifo = join(root, 'source.txt')
+    execFileSync('mkfifo', [fifo])
+    const reading = readKnowledgeImportFile(fifo, 1024)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const outcome = await Promise.race([
+      reading.then(
+        () => ({ type: 'resolved' as const }),
+        error => ({ type: 'rejected' as const, error }),
+      ),
+      new Promise<{ type: 'timed-out' }>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise({ type: 'timed-out' }), 100)
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+
+    if (outcome.type === 'timed-out') {
+      const writer = openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK)
+      closeSync(writer)
+      await reading.catch(() => undefined)
+    }
+    expect(outcome.type).toBe('rejected')
+  })
+
+  it.skipIf(process.platform === 'win32')('uses nonblocking no-follow flags and closes a rejected special file', async () => {
+    const close = vi.fn(async () => undefined)
+    const read = vi.fn(async () => ({ bytesRead: 0 }))
+    const openFile = vi.fn(async () => ({
+      stat: async () => ({
+        size: 0, dev: 1, ino: 2, mtimeMs: 1, ctimeMs: 1, isFile: () => false,
+      }),
+      read,
+      close,
+    }))
+
+    await expect(readKnowledgeImportFile('/tmp/special', 1024, openFile)).rejects.toThrow(/invalid/i)
+    expect(openFile).toHaveBeenCalledWith(
+      '/tmp/special',
+      constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    )
+    expect(read).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
   it('reads through one no-follow descriptor and rejects symlinks and the incremental hard limit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'autoforge-knowledge-file-'))
     directories.push(root)

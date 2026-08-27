@@ -21,6 +21,11 @@ export interface KnowledgeImportFileHandle {
   close(): Promise<void>
 }
 
+type KnowledgeImportFileOpener = (
+  path: string,
+  flags: number,
+) => Promise<KnowledgeImportFileHandle>
+
 function changed(before: StableFileStat, after: StableFileStat): boolean {
   return before.size !== after.size
     || before.dev !== after.dev
@@ -36,13 +41,14 @@ export async function readOpenedKnowledgeImport(
 ): Promise<Buffer> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Knowledge import limit is invalid')
   const chunks: Buffer[] = []
-  const scratch = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, maxBytes + 1))
+  let scratch: Buffer | undefined
   let result: Buffer | undefined
   try {
     const before = await handle.stat()
     if (!before.isFile() || before.size < 1 || before.size > maxBytes) {
       throw new Error('Knowledge import file is invalid')
     }
+    scratch = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, maxBytes + 1))
     let total = 0
     while (true) {
       const { bytesRead } = await handle.read(scratch, 0, scratch.length, null)
@@ -61,14 +67,23 @@ export async function readOpenedKnowledgeImport(
     result?.fill(0)
     throw error
   } finally {
-    scratch.fill(0)
+    scratch?.fill(0)
     for (const chunk of chunks) chunk.fill(0)
   }
 }
 
-export async function readKnowledgeImportFile(path: string, maxBytes: number): Promise<Buffer> {
+const openKnowledgeImportFile: KnowledgeImportFileOpener = async (path, flags) => (
+  await open(path, flags) as unknown as KnowledgeImportFileHandle
+)
+
+export async function readKnowledgeImportFile(
+  path: string,
+  maxBytes: number,
+  openFile: KnowledgeImportFileOpener = openKnowledgeImportFile,
+): Promise<Buffer> {
   const noFollow = process.platform === 'win32' ? 0 : constants.O_NOFOLLOW
-  const handle = await open(path, constants.O_RDONLY | noFollow) as unknown as KnowledgeImportFileHandle
+  const nonBlocking = process.platform === 'win32' ? 0 : constants.O_NONBLOCK
+  const handle = await openFile(path, constants.O_RDONLY | nonBlocking | noFollow)
   let contents: Buffer | undefined
   let failure: unknown
   let failed = false

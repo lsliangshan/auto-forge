@@ -143,6 +143,8 @@ export function createLocalKnowledgeService(
   let binding: Binding | undefined
   let unavailable: UnavailableBinding | undefined
   let lifecycleTail = Promise.resolve()
+  let lifecycleFailure: unknown
+  let hasLifecycleFailure = false
   const retiring = new Set<Promise<void>>()
   const pendingRetirements = new Set<Binding>()
   const now = dependencies.now ?? Date.now
@@ -156,6 +158,18 @@ export function createLocalKnowledgeService(
   const settle = (operations: readonly (() => unknown | Promise<unknown>)[]) => Promise.allSettled(
     operations.map(operation => Promise.resolve().then(operation)),
   )
+  const rememberLifecycleFailure = (error: unknown): void => {
+    if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'CONFLICT') return
+    if (hasLifecycleFailure) return
+    lifecycleFailure = error
+    hasLifecycleFailure = true
+  }
+  const takeLifecycleFailure = (): { failed: boolean; error: unknown } => {
+    const recorded = { failed: hasLifecycleFailure, error: lifecycleFailure }
+    hasLifecycleFailure = false
+    lifecycleFailure = undefined
+    return recorded
+  }
 
   const retire = (current: Binding): void => {
     current.runner.invalidate()
@@ -314,7 +328,7 @@ export function createLocalKnowledgeService(
       binding = active
       void runner.recoverAndRun().catch(() => undefined)
     })
-    lifecycleTail = operation.catch(() => undefined)
+    lifecycleTail = operation.catch((error: unknown) => { rememberLifecycleFailure(error) })
     return operation
   }
 
@@ -364,9 +378,13 @@ export function createLocalKnowledgeService(
     bind,
     invalidate,
     drain: async () => {
-      await lifecycleTail.catch(() => undefined)
+      await lifecycleTail
       beginRetirements()
-      await waitForRetirements()
+      const retirement = await settle([waitForRetirements])
+      const lifecycle = takeLifecycleFailure()
+      if (lifecycle.failed) throw lifecycle.error
+      const retirementFailure = firstFailure(retirement)
+      if (retirementFailure) throw retirementFailure.reason
     },
     list: async (owner) => {
       const active = current(owner)
