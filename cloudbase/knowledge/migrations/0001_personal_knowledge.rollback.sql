@@ -7,8 +7,11 @@ REVOKE ALL ON FUNCTION public.autoforge_knowledge_begin_embedding_drift_probe(va
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_get_embedding_consent(varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean) FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar, integer, varchar) FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION public.autoforge_knowledge_consume_embedding_dispatch_permit(varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.autoforge_knowledge_finalize_embedding_revocation(varchar, varchar) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_assert_embedding_consent(bigint, bigint) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]) FROM PUBLIC, anon, authenticated, service_role;
@@ -40,8 +43,11 @@ DROP FUNCTION IF EXISTS public.autoforge_knowledge_begin_embedding_drift_probe(v
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_complete_embedding_generation(varchar, varchar, varchar, bigint, varchar, varchar, bigint);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_get_embedding_consent(varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_set_embedding_consent(varchar, varchar, boolean);
-DROP FUNCTION IF EXISTS public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar, integer, varchar);
-DROP FUNCTION IF EXISTS public.autoforge_knowledge_consume_embedding_dispatch_permit(varchar, varchar, varchar, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_issue_embedding_dispatch_permit(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_reserve_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_mark_embedding_dispatch_started(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_settle_embedding_dispatch_attempt(varchar, varchar, varchar, integer, bigint, varchar, varchar, varchar, varchar, integer, varchar, varchar, varchar);
+DROP FUNCTION IF EXISTS public.autoforge_knowledge_finalize_embedding_revocation(varchar, varchar);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_assert_embedding_consent(bigint, bigint);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_claim_embedding_batch(varchar, varchar, varchar, integer);
 DROP FUNCTION IF EXISTS public.autoforge_knowledge_store_embedding(bigint, varchar, varchar, varchar, varchar, bigint, varchar, integer, varchar, real[]);

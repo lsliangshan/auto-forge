@@ -484,9 +484,9 @@ describe('CloudBase embedding consent and retrieval', () => {
     generationId: 'generation_1', rank, body: `body-${id}`,
     coordinates: { kind: 'txt', lineStart: rank, lineEnd: rank },
   })
-  const permit = (purpose: 'query' | 'chunk', requestId: string) => ({
+  const permit = (purpose: 'query' | 'chunk', requestId: string, attemptId = 1) => ({
     issued: true, permitId: `permit_${requestId}`, purpose, requestId,
-    consentEpoch: 2, expiresAt: futureExpiry, embedding,
+    attemptId, consentEpoch: 2, expiresAt: futureExpiry, embedding,
   })
 
   it('uses a strict bounded TokenHub adapter without diagnostic content output', async () => {
@@ -599,7 +599,9 @@ describe('CloudBase embedding consent and retrieval', () => {
         keywordCandidates: [cloudCandidate('chunk_keyword', 1)],
       })
       .mockResolvedValueOnce(permit('query', 'search_outage'))
-      .mockResolvedValueOnce({ admitted: true })
+      .mockResolvedValueOnce({ reserved: true })
+      .mockResolvedValueOnce({ started: true })
+      .mockResolvedValueOnce({ settled: true })
     const tokenHub = { embed: vi.fn().mockRejectedValue(new Error('provider body')) }
     const handler = createKnowledgeHandler({ rpc, tokenHub })
 
@@ -616,6 +618,78 @@ describe('CloudBase embedding consent and retrieval', () => {
     })
   })
 
+  it('uses a new bounded attempt identity for one transient provider retry', async () => {
+    const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0)
+    const tokenHub = { embed: vi.fn()
+      .mockRejectedValueOnce({ code: 'TRANSIENT_FAILURE' })
+      .mockResolvedValueOnce(vector) }
+    const rpc = vi.fn().mockImplementation(async (name: string, parameters: {
+      p_attempt_id?: number
+    }) => {
+      if (name === 'autoforge_knowledge_get_embedding_consent') return {
+        state: 'granted', consentEpoch: 2, rebuildRequired: false,
+      }
+      if (name === 'autoforge_knowledge_search_keywords') return {
+        generations: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_1',
+          previousGenerationId: null }], embedding, driftProbeRequired: false,
+        keywordCandidates: [cloudCandidate('chunk_keyword', 1)],
+      }
+      if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
+        const attemptId = parameters.p_attempt_id ?? 0
+        return {
+          ...permit('query', 'search_retry', attemptId),
+          permitId: `permit_search_retry_${attemptId}`,
+        }
+      }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        return { started: true }
+      }
+      if (name === 'autoforge_knowledge_settle_embedding_dispatch_attempt') {
+        return { settled: true }
+      }
+      if (name === 'autoforge_knowledge_search_vectors') {
+        return { vectorCandidates: [cloudCandidate('chunk_vector', 1)] }
+      }
+      throw new Error(`unexpected rpc ${name}`)
+    })
+    const handler = createKnowledgeHandler({ rpc, tokenHub })
+
+    await expect(handler({
+      action: 'searchKnowledge', requestId: 'search_retry', query: '合同条款',
+      knowledgeBaseIds: ['kb_1'], limit: 8,
+    }, context)).resolves.toMatchObject({ ok: true, data: { strategy: 'hybrid' } })
+    expect(tokenHub.embed).toHaveBeenCalledTimes(2)
+    expect(tokenHub.embed.mock.calls.map(([input]) => input.dispatchPermit)).toEqual([
+      'permit_search_retry_1', 'permit_search_retry_2',
+    ])
+    expect(rpc.mock.calls.filter(([name]) => (
+      name === 'autoforge_knowledge_issue_embedding_dispatch_permit'
+    )).map(([, parameters]) => parameters.p_attempt_id)).toEqual([1, 2])
+  })
+
+  it('maps fixed metadata drift to the rebuild strategy accepted by Main', async () => {
+    const tokenHub = { embed: vi.fn() }
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({ state: 'granted', consentEpoch: 2, rebuildRequired: false })
+      .mockResolvedValueOnce({
+        generations: [{ knowledgeBaseId: 'kb_1', generationId: 'generation_1',
+          previousGenerationId: null }],
+        embedding: { ...embedding, dimensions: 768 }, driftProbeRequired: false,
+        keywordCandidates: [cloudCandidate('chunk_keyword', 1)],
+      })
+    const handler = createKnowledgeHandler({ rpc, tokenHub })
+    await expect(handler({
+      action: 'searchKnowledge', requestId: 'search_drift', query: '合同 条款',
+      knowledgeBaseIds: ['kb_1'], limit: 8,
+    }, context)).resolves.toMatchObject({ ok: true, data: {
+      strategy: 'keyword_only_rebuild', driftProbeRequired: true, vectorCandidates: [],
+    } })
+    expect(tokenHub.embed).not.toHaveBeenCalled()
+  })
+
   it('rechecks consent and returns strictly correlated hybrid candidates', async () => {
     const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0)
     const vectorCandidate = cloudCandidate('chunk_vector', 1)
@@ -628,7 +702,9 @@ describe('CloudBase embedding consent and retrieval', () => {
         keywordCandidates: [cloudCandidate('chunk_keyword', 1)],
       })
       .mockResolvedValueOnce(permit('query', 'search_hybrid'))
-      .mockResolvedValueOnce({ admitted: true })
+      .mockResolvedValueOnce({ reserved: true })
+      .mockResolvedValueOnce({ started: true })
+      .mockResolvedValueOnce({ settled: true })
       .mockResolvedValueOnce({ state: 'granted', consentEpoch: 2, rebuildRequired: false })
       .mockResolvedValueOnce({ vectorCandidates: [vectorCandidate] })
     const tokenHub = { embed: vi.fn().mockResolvedValue(vector) }
@@ -641,21 +717,24 @@ describe('CloudBase embedding consent and retrieval', () => {
       generationState: 'published', strategy: 'hybrid',
       vectorCandidates: [vectorCandidate],
     } })
-    expect(rpc).toHaveBeenNthCalledWith(6, 'autoforge_knowledge_search_vectors', {
+    expect(rpc).toHaveBeenNthCalledWith(8, 'autoforge_knowledge_search_vectors', {
       p_caller_user_id: context.auth.uid, p_knowledge_base_ids: ['kb_1'],
       p_vector: vector, p_model: embedding.model, p_dimensions: 1024,
       p_configuration_version: embedding.configurationVersion, p_limit: 8,
     })
   })
 
-  it('does not dispatch after a permit is issued but revocation commits before consumption', async () => {
-    let revoked = false
-    let releaseConsumption!: () => void
-    const consumptionGate = new Promise<void>(resolve => { releaseConsumption = resolve })
+  it('never starts a reserved search send after revocation has begun', async () => {
+    let consentState: 'granted' | 'revoking' | 'revoked' = 'granted'
+    let attemptActive = true
+    let releaseStart!: () => void
+    let settleAttempt!: () => void
+    const startGate = new Promise<void>(resolve => { releaseStart = resolve })
+    const attemptSettled = new Promise<void>(resolve => { settleAttempt = resolve })
     const tokenHub = { embed: vi.fn() }
     const rpc = vi.fn().mockImplementation(async (name: string) => {
       if (name === 'autoforge_knowledge_get_embedding_consent') {
-        return { state: revoked ? 'revoked' : 'granted', consentEpoch: revoked ? 3 : 2,
+        return { state: consentState, consentEpoch: consentState === 'granted' ? 2 : 3,
           rebuildRequired: false }
       }
       if (name === 'autoforge_knowledge_search_keywords') return {
@@ -666,12 +745,23 @@ describe('CloudBase embedding consent and retrieval', () => {
       if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
         return permit('query', 'search_race')
       }
-      if (name === 'autoforge_knowledge_consume_embedding_dispatch_permit') {
-        await consumptionGate
-        return { admitted: !revoked }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        await startGate
+        attemptActive = false
+        settleAttempt()
+        return { started: consentState === 'granted' }
       }
       if (name === 'autoforge_knowledge_set_embedding_consent') {
-        revoked = true
+        consentState = 'revoking'
+        return { state: 'revoking', consentEpoch: 3, vectorsDeleted: 0,
+          rebuildRequired: false }
+      }
+      if (name === 'autoforge_knowledge_finalize_embedding_revocation') {
+        if (attemptActive) await attemptSettled
+        consentState = 'revoked'
         return { state: 'revoked', consentEpoch: 3, vectorsDeleted: 8,
           rebuildRequired: false }
       }
@@ -683,16 +773,41 @@ describe('CloudBase embedding consent and retrieval', () => {
       knowledgeBaseIds: ['kb_1'], limit: 8,
     }, context)
     await vi.waitFor(() => expect(rpc.mock.calls.some(
-      ([name]) => name === 'autoforge_knowledge_consume_embedding_dispatch_permit',
+      ([name]) => name === 'autoforge_knowledge_mark_embedding_dispatch_started',
     )).toBe(true))
 
-    await handler({ action: 'setEmbeddingConsent', requestId: 'revoke_race', enabled: false }, context)
-    releaseConsumption()
+    let revokeReturned = false
+    const revoke = handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_race', enabled: false,
+    }, context).finally(() => { revokeReturned = true })
+    await vi.waitFor(() => expect(consentState).toBe('revoking'))
+    expect(revokeReturned).toBe(false)
+    releaseStart()
 
     await expect(search).resolves.toMatchObject({ ok: true, data: {
       strategy: 'keyword_only_consent', vectorCandidates: [],
     } })
+    await expect(revoke).resolves.toMatchObject({ ok: true, data: { state: 'revoked' } })
     expect(tokenHub.embed).not.toHaveBeenCalled()
+  })
+
+  it('returns a stable retry while a started dispatch is still active', async () => {
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({
+        state: 'revoking', consentEpoch: 3, vectorsDeleted: 0, rebuildRequired: false,
+      })
+      .mockResolvedValue({
+        state: 'revoking', consentEpoch: 3, vectorsDeleted: 0, rebuildRequired: false,
+      })
+    const handler = createKnowledgeHandler({ rpc, tokenHub: { embed: vi.fn() } })
+
+    await expect(handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_pending', enabled: false,
+    }, context)).resolves.toEqual({ ok: false, error: { code: 'TRANSIENT_FAILURE' } })
+    expect(rpc).toHaveBeenCalledTimes(4)
+    expect(rpc.mock.calls.slice(1).every(
+      ([name]) => name === 'autoforge_knowledge_finalize_embedding_revocation',
+    )).toBe(true)
   })
 
   it('stays keyword-only after grant until a rebuilt generation is atomically published', async () => {
@@ -729,7 +844,9 @@ describe('CloudBase embedding consent and retrieval', () => {
         keywordCandidates: largeCandidates('keyword'),
       })
       .mockResolvedValueOnce(permit('query', 'search_oversized'))
-      .mockResolvedValueOnce({ admitted: true })
+      .mockResolvedValueOnce({ reserved: true })
+      .mockResolvedValueOnce({ started: true })
+      .mockResolvedValueOnce({ settled: true })
       .mockResolvedValueOnce({ state: 'granted', consentEpoch: 2, rebuildRequired: false })
       .mockResolvedValueOnce({ vectorCandidates: largeCandidates('vector') })
     const handler = createKnowledgeHandler({
@@ -743,6 +860,9 @@ describe('CloudBase embedding consent and retrieval', () => {
 
   it('stops a held generation after revocation without storing or sending another chunk', async () => {
     let consentEnabled = true
+    let dispatchActive = true
+    let settleDispatch!: () => void
+    const dispatchSettled = new Promise<void>(resolve => { settleDispatch = resolve })
     let releaseEmbedding!: (value: number[]) => void
     const heldEmbedding = new Promise<number[]>(resolve => { releaseEmbedding = resolve })
     const tokenHub = { embed: vi.fn().mockReturnValue(heldEmbedding) }
@@ -758,14 +878,28 @@ describe('CloudBase embedding consent and retrieval', () => {
       if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
         return { ...permit('chunk', 'job_1:chunk_1'), consentEpoch: 6 }
       }
-      if (name === 'autoforge_knowledge_consume_embedding_dispatch_permit') {
-        return { admitted: true }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        return { started: true }
+      }
+      if (name === 'autoforge_knowledge_settle_embedding_dispatch_attempt') {
+        dispatchActive = false
+        settleDispatch()
+        return { settled: true }
       }
       if (name === 'autoforge_knowledge_assert_embedding_consent') return {
         enabled: consentEnabled, consentEpoch: consentEnabled ? 6 : 7,
       }
       if (name === 'autoforge_knowledge_set_embedding_consent') {
         consentEnabled = false
+        return {
+          state: 'revoking', consentEpoch: 7, vectorsDeleted: 0, rebuildRequired: false,
+        }
+      }
+      if (name === 'autoforge_knowledge_finalize_embedding_revocation') {
+        if (dispatchActive) await dispatchSettled
         return {
           state: 'revoked', consentEpoch: 7, vectorsDeleted: 12, rebuildRequired: false,
         }
@@ -778,11 +912,79 @@ describe('CloudBase embedding consent and retrieval', () => {
     await vi.waitFor(() => expect(tokenHub.embed).toHaveBeenCalledOnce())
 
     const handler = createKnowledgeHandler({ rpc, tokenHub })
-    await handler({ action: 'setEmbeddingConsent', requestId: 'revoke_1', enabled: false }, context)
+    let revokeReturned = false
+    const revoke = handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_1', enabled: false,
+    }, context).finally(() => { revokeReturned = true })
+    await vi.waitFor(() => expect(consentEnabled).toBe(false))
+    expect(revokeReturned).toBe(false)
     releaseEmbedding(Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0))
 
     await expect(run).resolves.toEqual({ state: 'revoked', embedded: 0 })
+    await expect(revoke).resolves.toMatchObject({ ok: true, data: { state: 'revoked' } })
     expect(tokenHub.embed).toHaveBeenCalledOnce()
+    expect(rpc.mock.calls.some(([name]) => name === 'autoforge_knowledge_store_embedding')).toBe(false)
+  })
+
+  it('never starts a reserved worker send after revocation has begun', async () => {
+    let consentState: 'granted' | 'revoking' | 'revoked' = 'granted'
+    let attemptActive = true
+    let releaseStart!: () => void
+    let settleAttempt!: () => void
+    const startGate = new Promise<void>(resolve => { releaseStart = resolve })
+    const attemptSettled = new Promise<void>(resolve => { settleAttempt = resolve })
+    const tokenHub = { embed: vi.fn() }
+    const rpc = vi.fn().mockImplementation(async (name: string) => {
+      if (name === 'autoforge_knowledge_claim_embedding_batch') return {
+        ownerId: context.auth.uid, knowledgeBaseId: 'kb_1', generationId: 'generation_shadow',
+        consentEpoch: 6,
+        chunks: [{ id: 'chunk_1', versionId: 'version_1', body: 'first' }],
+      }
+      if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
+        return { ...permit('chunk', 'job_1:chunk_1'), consentEpoch: 6 }
+      }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        await startGate
+        attemptActive = false
+        settleAttempt()
+        return { started: consentState === 'granted' }
+      }
+      if (name === 'autoforge_knowledge_set_embedding_consent') {
+        consentState = 'revoking'
+        return {
+          state: 'revoking', consentEpoch: 7, vectorsDeleted: 0, rebuildRequired: false,
+        }
+      }
+      if (name === 'autoforge_knowledge_finalize_embedding_revocation') {
+        if (attemptActive) await attemptSettled
+        consentState = 'revoked'
+        return {
+          state: 'revoked', consentEpoch: 7, vectorsDeleted: 0, rebuildRequired: false,
+        }
+      }
+      throw new Error(`unexpected rpc ${name}`)
+    })
+    const worker = createEmbeddingGenerationWorker({ rpc, tokenHub })
+    const run = worker.run({ workerId: 'worker_1', jobId: 'job_1', leaseToken: 'lease_1' })
+    await vi.waitFor(() => expect(rpc.mock.calls.some(
+      ([name]) => name === 'autoforge_knowledge_mark_embedding_dispatch_started',
+    )).toBe(true))
+
+    let revokeReturned = false
+    const handler = createKnowledgeHandler({ rpc, tokenHub })
+    const revoke = handler({
+      action: 'setEmbeddingConsent', requestId: 'revoke_worker_race', enabled: false,
+    }, context).finally(() => { revokeReturned = true })
+    await vi.waitFor(() => expect(consentState).toBe('revoking'))
+    expect(revokeReturned).toBe(false)
+    releaseStart()
+
+    await expect(run).resolves.toEqual({ state: 'revoked', embedded: 0 })
+    await expect(revoke).resolves.toMatchObject({ ok: true, data: { state: 'revoked' } })
+    expect(tokenHub.embed).not.toHaveBeenCalled()
     expect(rpc.mock.calls.some(([name]) => name === 'autoforge_knowledge_store_embedding')).toBe(false)
   })
 
@@ -795,8 +997,14 @@ describe('CloudBase embedding consent and retrieval', () => {
       if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
         return { ...permit('chunk', 'job_1:chunk_1'), consentEpoch: 1 }
       }
-      if (name === 'autoforge_knowledge_consume_embedding_dispatch_permit') {
-        return { admitted: true }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        return { started: true }
+      }
+      if (name === 'autoforge_knowledge_settle_embedding_dispatch_attempt') {
+        return { settled: true }
       }
       if (name === 'autoforge_knowledge_assert_embedding_consent') {
         return { enabled: true, consentEpoch: 1 }
@@ -827,8 +1035,14 @@ describe('CloudBase embedding consent and retrieval', () => {
       if (name === 'autoforge_knowledge_issue_embedding_dispatch_permit') {
         return { ...permit('chunk', 'job_1:chunk_1'), consentEpoch: 4 }
       }
-      if (name === 'autoforge_knowledge_consume_embedding_dispatch_permit') {
-        return { admitted: true }
+      if (name === 'autoforge_knowledge_reserve_embedding_dispatch_attempt') {
+        return { reserved: true }
+      }
+      if (name === 'autoforge_knowledge_mark_embedding_dispatch_started') {
+        return { started: true }
+      }
+      if (name === 'autoforge_knowledge_settle_embedding_dispatch_attempt') {
+        return { settled: true }
       }
       if (name === 'autoforge_knowledge_assert_embedding_consent') {
         return { enabled: true, consentEpoch: 4 }

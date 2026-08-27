@@ -157,6 +157,7 @@ describe('CloudBase personal knowledge migration', () => {
     expect(revoke).toContain('WHERE owner_id = owner')
     expect(revoke).toContain("state = 'expired'")
     expect(revoke).toContain("rebuild_required = p_enabled")
+    expect(revoke).toContain("state = 'revoking'")
 
     const issuePermit = staticFunctionBodyFragment(
       sql, 'autoforge_knowledge_issue_embedding_dispatch_permit',
@@ -165,12 +166,35 @@ describe('CloudBase personal knowledge migration', () => {
     expect(issuePermit).toContain("consent.state <> 'granted'")
     expect(issuePermit).toContain("interval '15 seconds'")
     expect(issuePermit).toContain('configuration_version')
-    const consumePermit = staticFunctionBodyFragment(
-      sql, 'autoforge_knowledge_consume_embedding_dispatch_permit',
+    expect(issuePermit).toContain('p_attempt_id NOT BETWEEN 1 AND 3')
+    expect(issuePermit).toContain("completed.state = 'completed'")
+    expect(issuePermit).toContain("prior.state = 'failed'")
+    expect(issuePermit).toContain('p_attempt_id - 1')
+    const reserveAttempt = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_reserve_embedding_dispatch_attempt',
     )
-    expect(consumePermit).toContain("permit.state <> 'issued'")
-    expect(consumePermit).toContain('consent.consent_epoch <> permit.consent_epoch')
-    expect(consumePermit).toContain("SET state = 'consumed'")
+    expect(reserveAttempt).toContain("permit.state <> 'issued'")
+    expect(reserveAttempt).toContain('consent.consent_epoch <> permit.consent_epoch')
+    expect(reserveAttempt).toContain("SET state = 'dispatching'")
+    const startAttempt = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_mark_embedding_dispatch_started',
+    )
+    expect(startAttempt).toContain("consent.state <> 'granted'")
+    expect(startAttempt).toContain("SET state = 'started'")
+    const settleAttempt = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_settle_embedding_dispatch_attempt',
+    )
+    expect(settleAttempt).toContain("p_outcome NOT IN ('completed', 'failed')")
+    expect(settleAttempt).toContain('state = p_outcome')
+    const finalizeRevocation = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_finalize_embedding_revocation',
+    )
+    expect(finalizeRevocation).toContain("consent.state <> 'revoking'")
+    expect(finalizeRevocation).toContain("WHERE owner_id = owner AND state = 'dispatching'")
+    expect(finalizeRevocation).toContain("permit.state = 'started'")
+    expect(finalizeRevocation).not.toContain("state IN ('dispatching', 'started')\n      AND expires_at")
+    expect(finalizeRevocation).toContain('DELETE FROM public.knowledge_chunk_embeddings')
+    expect(finalizeRevocation).toContain("SET state = 'revoked'")
 
     const store = staticFunctionBodyFragment(sql, 'autoforge_knowledge_store_embedding')
     expect(store).toContain("consent.state <> 'granted'")

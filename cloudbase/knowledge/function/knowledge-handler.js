@@ -1,4 +1,4 @@
-/* global Buffer, fetch, module, require, TextDecoder, URL */
+/* global Buffer, fetch, module, require, setTimeout, TextDecoder, URL */
 
 const { createHash } = require('node:crypto')
 
@@ -286,12 +286,12 @@ function validResponse(action, value) {
         && (value.validUntil === null || isIsoDate(value.validUntil))
     case 'getEmbeddingConsent':
       return exactKeys(value, ['state', 'consentEpoch', 'rebuildRequired'])
-        && ['granted', 'revoked'].includes(value.state)
+        && ['granted', 'revoking', 'revoked'].includes(value.state)
         && Number.isSafeInteger(value.consentEpoch) && value.consentEpoch >= 0
         && typeof value.rebuildRequired === 'boolean'
     case 'setEmbeddingConsent':
       return exactKeys(value, ['state', 'consentEpoch', 'vectorsDeleted', 'rebuildRequired'])
-        && ['granted', 'revoked'].includes(value.state)
+        && ['granted', 'revoking', 'revoked'].includes(value.state)
         && Number.isSafeInteger(value.consentEpoch) && value.consentEpoch >= 0
         && Number.isSafeInteger(value.vectorsDeleted) && value.vectorsDeleted >= 0
         && typeof value.rebuildRequired === 'boolean'
@@ -326,44 +326,82 @@ function validCloudCandidate(value, generationByBase) {
     && isRecord(value.coordinates) && safeSerializedSize(value.coordinates) <= 8 * 1024
 }
 
-function validDispatchPermit(value, purpose, requestId, consentEpoch) {
+function validDispatchPermit(value, purpose, requestId, attemptId, consentEpoch) {
   return exactKeys(value, [
-    'issued', 'permitId', 'purpose', 'requestId', 'consentEpoch', 'expiresAt', 'embedding',
+    'issued', 'permitId', 'purpose', 'requestId', 'attemptId',
+    'consentEpoch', 'expiresAt', 'embedding',
   ]) && value.issued === true && nonEmptyString(value.permitId)
     && value.purpose === purpose && value.requestId === requestId
+    && value.attemptId === attemptId
     && value.consentEpoch === consentEpoch
     && isIsoDate(value.expiresAt) && Date.parse(value.expiresAt) > Date.now()
     && validEmbeddingConfiguration(value.embedding)
 }
 
-async function obtainDispatchPermit({
-  rpc, ownerId, purpose, requestId, consentEpoch,
+async function dispatchEmbedding({
+  rpc, tokenHub, input, ownerId, purpose, requestId, consentEpoch,
   knowledgeBaseId = null, generationId = null, chunkId = null,
 }) {
-  const parameters = {
-    p_owner_id: ownerId,
-    p_purpose: purpose,
-    p_request_id: requestId,
-    p_consent_epoch: consentEpoch,
-    p_knowledge_base_id: knowledgeBaseId,
-    p_generation_id: generationId,
-    p_chunk_id: chunkId,
-    p_model: fixedEmbeddingConfiguration.model,
-    p_dimensions: fixedEmbeddingConfiguration.dimensions,
-    p_configuration_version: fixedEmbeddingConfiguration.configurationVersion,
+  for (let attemptId = 1; attemptId <= 3; attemptId += 1) {
+    const parameters = {
+      p_owner_id: ownerId,
+      p_purpose: purpose,
+      p_request_id: requestId,
+      p_attempt_id: attemptId,
+      p_consent_epoch: consentEpoch,
+      p_knowledge_base_id: knowledgeBaseId,
+      p_generation_id: generationId,
+      p_chunk_id: chunkId,
+      p_model: fixedEmbeddingConfiguration.model,
+      p_dimensions: fixedEmbeddingConfiguration.dimensions,
+      p_configuration_version: fixedEmbeddingConfiguration.configurationVersion,
+    }
+    const permit = await rpc('autoforge_knowledge_issue_embedding_dispatch_permit', parameters)
+    if (exactKeys(permit, ['issued']) && permit.issued === false) continue
+    if (!validDispatchPermit(permit, purpose, requestId, attemptId, consentEpoch)) {
+      throw { code: 'INTERNAL_ERROR' }
+    }
+    const reservation = await rpc('autoforge_knowledge_reserve_embedding_dispatch_attempt', {
+      ...parameters, p_permit_id: permit.permitId,
+    })
+    if (!exactKeys(reservation, ['reserved']) || typeof reservation.reserved !== 'boolean') {
+      throw { code: 'INTERNAL_ERROR' }
+    }
+    if (!reservation.reserved) continue
+    const start = await rpc('autoforge_knowledge_mark_embedding_dispatch_started', {
+      ...parameters, p_permit_id: permit.permitId,
+    })
+    if (!exactKeys(start, ['started']) || typeof start.started !== 'boolean') {
+      throw { code: 'INTERNAL_ERROR' }
+    }
+    if (!start.started) return { kind: 'denied' }
+    let vector
+    let providerError
+    try {
+      vector = await tokenHub.embed({
+        input,
+        model: fixedEmbeddingConfiguration.model,
+        dimensions: fixedEmbeddingConfiguration.dimensions,
+        configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
+        region: fixedEmbeddingConfiguration.region,
+        dispatchPermit: permit.permitId,
+      })
+    } catch (error) {
+      providerError = error
+    }
+    const settled = await rpc('autoforge_knowledge_settle_embedding_dispatch_attempt', {
+      ...parameters, p_permit_id: permit.permitId,
+      p_outcome: providerError ? 'failed' : 'completed',
+    })
+    if (!exactKeys(settled, ['settled']) || settled.settled !== true) {
+      throw { code: 'INTERNAL_ERROR' }
+    }
+    if (!providerError) return { kind: 'sent', vector }
+    if (!isRecord(providerError) || providerError.code !== 'TRANSIENT_FAILURE') {
+      return { kind: 'provider_failure' }
+    }
   }
-  const permit = await rpc('autoforge_knowledge_issue_embedding_dispatch_permit', parameters)
-  if (exactKeys(permit, ['issued']) && permit.issued === false) return undefined
-  if (!validDispatchPermit(permit, purpose, requestId, consentEpoch)) {
-    throw { code: 'INTERNAL_ERROR' }
-  }
-  const admission = await rpc('autoforge_knowledge_consume_embedding_dispatch_permit', {
-    ...parameters, p_permit_id: permit.permitId,
-  })
-  if (!exactKeys(admission, ['admitted']) || typeof admission.admitted !== 'boolean') {
-    throw { code: 'INTERNAL_ERROR' }
-  }
-  return admission.admitted ? permit.permitId : undefined
+  return { kind: 'provider_failure' }
 }
 
 function validKeywordSearch(value) {
@@ -572,6 +610,21 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
     if (!parsed) return { ok: false, error: { code: 'INVALID_INPUT' } }
     try {
       const data = await rpc(parsed[0], parsed[1])
+      if (event.action === 'setEmbeddingConsent' && event.enabled === false
+        && isRecord(data) && data.state === 'revoking') {
+        if (!validResponse('setEmbeddingConsent', data)) throw { code: 'INTERNAL_ERROR' }
+        for (let poll = 0; poll < 3; poll += 1) {
+          const finalized = await rpc('autoforge_knowledge_finalize_embedding_revocation', {
+            p_caller_user_id: uid, p_request_id: event.requestId,
+          })
+          if (!validResponse('setEmbeddingConsent', finalized)) {
+            throw { code: 'INTERNAL_ERROR' }
+          }
+          if (finalized.state === 'revoked') return boundedSuccess(finalized)
+          if (poll < 2) await new Promise(resolve => setTimeout(resolve, 10))
+        }
+        throw { code: 'TRANSIENT_FAILURE' }
+      }
       if (event.action === 'searchKnowledge') {
         if (!validResponse('getEmbeddingConsent', data)) throw { code: 'INTERNAL_ERROR' }
         const keyword = await rpc('autoforge_knowledge_search_keywords', {
@@ -604,32 +657,24 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         }
         if (!validEmbeddingConfiguration(keyword.embedding)) {
           return boundedSuccess({
-            ...base, strategy: 'keyword_only_provider', driftProbeRequired: true,
+            ...base, strategy: 'keyword_only_rebuild', driftProbeRequired: true,
           })
         }
         if (!tokenHub || typeof tokenHub.embed !== 'function') {
           return boundedSuccess({ ...base, strategy: 'keyword_only_provider' })
         }
-        const dispatchPermit = await obtainDispatchPermit({
-          rpc, ownerId: uid, purpose: 'query', requestId: event.requestId,
+        const dispatch = await dispatchEmbedding({
+          rpc, tokenHub, input: event.query,
+          ownerId: uid, purpose: 'query', requestId: event.requestId,
           consentEpoch: data.consentEpoch,
         })
-        if (!dispatchPermit) {
+        if (dispatch.kind === 'denied') {
           return boundedSuccess({ ...base, strategy: 'keyword_only_consent' })
         }
-        let vector
-        try {
-          vector = await tokenHub.embed({
-            input: event.query,
-            model: fixedEmbeddingConfiguration.model,
-            dimensions: fixedEmbeddingConfiguration.dimensions,
-            configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
-            region: fixedEmbeddingConfiguration.region,
-            dispatchPermit,
-          })
-        } catch {
+        if (dispatch.kind !== 'sent') {
           return boundedSuccess({ ...base, strategy: 'keyword_only_provider' })
         }
+        const vector = dispatch.vector
         if (!Array.isArray(vector) || vector.length !== fixedEmbeddingConfiguration.dimensions
           || vector.some(value => !Number.isFinite(value))) {
           return boundedSuccess({ ...base, strategy: 'keyword_only_provider' })
@@ -813,21 +858,16 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
           const chunkIdentity = `${chunk.versionId.length}:${chunk.versionId}${chunk.id}`
           if (seenChunkIds.has(chunkIdentity)) throw { code: 'INTERNAL_ERROR' }
           seenChunkIds.add(chunkIdentity)
-          const dispatchPermit = await obtainDispatchPermit({
-            rpc, ownerId: batch.ownerId, purpose: 'chunk',
+          const dispatch = await dispatchEmbedding({
+            rpc, tokenHub, input: chunk.body,
+            ownerId: batch.ownerId, purpose: 'chunk',
             requestId: `${jobId}:${chunk.id}`, consentEpoch: batch.consentEpoch,
             knowledgeBaseId: batch.knowledgeBaseId,
             generationId: batch.generationId, chunkId: chunk.id,
           })
-          if (!dispatchPermit) return { state: 'revoked', embedded }
-          const vector = await tokenHub.embed({
-            input: chunk.body,
-            model: fixedEmbeddingConfiguration.model,
-            dimensions: fixedEmbeddingConfiguration.dimensions,
-            configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
-            region: fixedEmbeddingConfiguration.region,
-            dispatchPermit,
-          })
+          if (dispatch.kind === 'denied') return { state: 'revoked', embedded }
+          if (dispatch.kind !== 'sent') throw { code: 'TRANSIENT_FAILURE' }
+          const vector = dispatch.vector
           if (!Array.isArray(vector)
             || vector.length !== fixedEmbeddingConfiguration.dimensions
             || vector.some(value => !Number.isFinite(value))) {
