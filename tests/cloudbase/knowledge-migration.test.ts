@@ -36,6 +36,8 @@ const tables = [
   'knowledge_snapshot_items',
   'knowledge_embedding_consents',
   'knowledge_chunk_embeddings',
+  'knowledge_generation_memberships',
+  'knowledge_embedding_dispatch_permits',
 ] as const
 
 function staticFunctionBodyFragment(sql: string, name: string): string {
@@ -153,20 +155,42 @@ describe('CloudBase personal knowledge migration', () => {
     expect(revoke).toContain('consent_epoch = consent_epoch + 1')
     expect(revoke).toContain('DELETE FROM public.knowledge_chunk_embeddings')
     expect(revoke).toContain('WHERE owner_id = owner')
+    expect(revoke).toContain("state = 'expired'")
+    expect(revoke).toContain("rebuild_required = p_enabled")
+
+    const issuePermit = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_issue_embedding_dispatch_permit',
+    )
+    expect(issuePermit).toContain('FOR UPDATE')
+    expect(issuePermit).toContain("consent.state <> 'granted'")
+    expect(issuePermit).toContain("interval '15 seconds'")
+    expect(issuePermit).toContain('configuration_version')
+    const consumePermit = staticFunctionBodyFragment(
+      sql, 'autoforge_knowledge_consume_embedding_dispatch_permit',
+    )
+    expect(consumePermit).toContain("permit.state <> 'issued'")
+    expect(consumePermit).toContain('consent.consent_epoch <> permit.consent_epoch')
+    expect(consumePermit).toContain("SET state = 'consumed'")
 
     const store = staticFunctionBodyFragment(sql, 'autoforge_knowledge_store_embedding')
     expect(store).toContain("consent.state <> 'granted'")
     expect(store).toContain('consent.consent_epoch <> p_consent_epoch')
     expect(store).toContain('cardinality(p_vector) <> 1024')
     expect(store).toContain("generation.status NOT IN ('staging', 'ready')")
+    expect(store).toContain('knowledge_generation_memberships')
 
     const keyword = staticFunctionBodyFragment(sql, 'autoforge_knowledge_search_keywords')
     expect(keyword).toContain("generation.status = 'published'")
+    expect(keyword).toContain('knowledge_generation_memberships')
+    expect(keyword).toContain('autoforge_knowledge_query_terms(p_query)')
+    expect(keyword).toContain('NOT EXISTS')
+    expect(keyword).toContain('LIMIT least(p_limit * 4, 96)')
     const vectors = staticFunctionBodyFragment(sql, 'autoforge_knowledge_search_vectors')
     expect(vectors).toContain("generation.status = 'published'")
     expect(vectors).toContain('cardinality(p_vector) <> 1024')
     expect(vectors).toContain('row_number() OVER')
     expect(vectors).toContain('candidate.id')
+    expect(vectors).toContain('candidate.knowledge_base_id, candidate.id')
 
     const publish = staticFunctionBodyFragment(sql, 'autoforge_knowledge_publish_generation')
     expect(publish).toContain("consent.owner_id = owner AND consent.state = 'granted'")
@@ -180,11 +204,30 @@ describe('CloudBase personal knowledge migration', () => {
     expect(probe).toContain("'begin_embedding_drift_probe'")
     expect(probe).toContain("'embedding', p_generation_id, 'queued'")
     expect(probe).toContain("p_generation_id, owner, p_knowledge_base_id, 'staging'")
+    expect(probe).toContain('INSERT INTO public.knowledge_generation_memberships')
+    expect(probe).toContain('document.active_version_id = chunk.version_id')
     const complete = staticFunctionBodyFragment(
       sql, 'autoforge_knowledge_complete_embedding_generation',
     )
     expect(complete).toContain("AND id = job.entity_id AND status = 'staging'")
     expect(complete).toContain("SET status = 'ready', ready_at = clock_timestamp()")
+    expect(complete).toContain('knowledge_generation_memberships membership')
+  })
+
+  it('models bounded Chinese term AND matching and immutable generation membership', () => {
+    const terms = (query: string) => query.toLocaleLowerCase('zh-CN').trim()
+      .split(/[\s.,!?;:，。！？；：、（）【】《》“”‘’]+/u)
+      .filter(Boolean).slice(0, 16)
+    const matches = (query: string, body: string) => terms(query)
+      .every(term => body.toLocaleLowerCase('zh-CN').includes(term))
+    expect(terms(' 合同， 条款！违约 ')).toEqual(['合同', '条款', '违约'])
+    expect(matches('合同 条款', '这里包含合同中的付款条款')).toBe(true)
+    expect(matches('合同 条款', '这里只有合同')).toBe(false)
+
+    const manifest = new Set(['kb_1:generation_1:version_1:chunk_1'])
+    const laterChunk = 'kb_1:generation_1:version_2:chunk_2'
+    expect(manifest.has(laterChunk)).toBe(false)
+    expect([...manifest].slice(0, 96)).toEqual(['kb_1:generation_1:version_1:chunk_1'])
   })
 
   it('statically binds conflict receipts and independently models lost-response replay', async () => {

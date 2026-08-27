@@ -44,7 +44,7 @@ const actionKeys = {
   getEntitlement: ['action'],
   getEmbeddingConsent: ['action'],
   setEmbeddingConsent: ['action', 'requestId', 'enabled'],
-  searchKnowledge: ['action', 'query', 'knowledgeBaseIds', 'limit'],
+  searchKnowledge: ['action', 'requestId', 'query', 'knowledgeBaseIds', 'limit'],
   beginEmbeddingDriftProbe: [
     'action', 'requestId', 'knowledgeBaseId', 'generationId',
     'expectedPublishedGenerationId',
@@ -76,6 +76,12 @@ function safeSerializedSize(value) {
   } catch {
     return Infinity
   }
+}
+
+function boundedSuccess(data) {
+  const envelope = { ok: true, data }
+  if (safeSerializedSize(envelope) > maximumResponseBytes) throw { code: 'INTERNAL_ERROR' }
+  return envelope
 }
 
 async function readBoundedJson(response, allowEmpty = false) {
@@ -279,14 +285,16 @@ function validResponse(action, value) {
         && Number.isSafeInteger(value.version) && value.version >= 0
         && (value.validUntil === null || isIsoDate(value.validUntil))
     case 'getEmbeddingConsent':
-      return exactKeys(value, ['state', 'consentEpoch'])
+      return exactKeys(value, ['state', 'consentEpoch', 'rebuildRequired'])
         && ['granted', 'revoked'].includes(value.state)
         && Number.isSafeInteger(value.consentEpoch) && value.consentEpoch >= 0
+        && typeof value.rebuildRequired === 'boolean'
     case 'setEmbeddingConsent':
-      return exactKeys(value, ['state', 'consentEpoch', 'vectorsDeleted'])
+      return exactKeys(value, ['state', 'consentEpoch', 'vectorsDeleted', 'rebuildRequired'])
         && ['granted', 'revoked'].includes(value.state)
         && Number.isSafeInteger(value.consentEpoch) && value.consentEpoch >= 0
         && Number.isSafeInteger(value.vectorsDeleted) && value.vectorsDeleted >= 0
+        && typeof value.rebuildRequired === 'boolean'
     case 'beginEmbeddingDriftProbe':
       return exactKeys(value, [
         'generationId', 'previousGenerationId', 'jobId', 'status',
@@ -315,7 +323,47 @@ function validCloudCandidate(value, generationByBase) {
     && value.generationId === generationByBase.get(value.knowledgeBaseId)
     && Number.isSafeInteger(value.rank) && value.rank > 0
     && typeof value.body === 'string' && Buffer.byteLength(value.body, 'utf8') <= 64 * 1024
-    && isRecord(value.coordinates)
+    && isRecord(value.coordinates) && safeSerializedSize(value.coordinates) <= 8 * 1024
+}
+
+function validDispatchPermit(value, purpose, requestId, consentEpoch) {
+  return exactKeys(value, [
+    'issued', 'permitId', 'purpose', 'requestId', 'consentEpoch', 'expiresAt', 'embedding',
+  ]) && value.issued === true && nonEmptyString(value.permitId)
+    && value.purpose === purpose && value.requestId === requestId
+    && value.consentEpoch === consentEpoch
+    && isIsoDate(value.expiresAt) && Date.parse(value.expiresAt) > Date.now()
+    && validEmbeddingConfiguration(value.embedding)
+}
+
+async function obtainDispatchPermit({
+  rpc, ownerId, purpose, requestId, consentEpoch,
+  knowledgeBaseId = null, generationId = null, chunkId = null,
+}) {
+  const parameters = {
+    p_owner_id: ownerId,
+    p_purpose: purpose,
+    p_request_id: requestId,
+    p_consent_epoch: consentEpoch,
+    p_knowledge_base_id: knowledgeBaseId,
+    p_generation_id: generationId,
+    p_chunk_id: chunkId,
+    p_model: fixedEmbeddingConfiguration.model,
+    p_dimensions: fixedEmbeddingConfiguration.dimensions,
+    p_configuration_version: fixedEmbeddingConfiguration.configurationVersion,
+  }
+  const permit = await rpc('autoforge_knowledge_issue_embedding_dispatch_permit', parameters)
+  if (exactKeys(permit, ['issued']) && permit.issued === false) return undefined
+  if (!validDispatchPermit(permit, purpose, requestId, consentEpoch)) {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  const admission = await rpc('autoforge_knowledge_consume_embedding_dispatch_permit', {
+    ...parameters, p_permit_id: permit.permitId,
+  })
+  if (!exactKeys(admission, ['admitted']) || typeof admission.admitted !== 'boolean') {
+    throw { code: 'INTERNAL_ERROR' }
+  }
+  return admission.admitted ? permit.permitId : undefined
 }
 
 function validKeywordSearch(value) {
@@ -492,7 +540,7 @@ function parseAction(event, uid) {
         ...common, p_request_id: event.requestId, p_enabled: event.enabled,
       }]
     case 'searchKnowledge':
-      if (!nonEmptyString(event.query, 2000)
+      if (!nonEmptyString(event.requestId) || !nonEmptyString(event.query, 2000)
         || !Array.isArray(event.knowledgeBaseIds)
         || event.knowledgeBaseIds.length < 1 || event.knowledgeBaseIds.length > 8
         || event.knowledgeBaseIds.some(id => !nonEmptyString(id))
@@ -547,15 +595,27 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           driftProbeRequired: keyword.driftProbeRequired,
         }
         if (data.state !== 'granted') {
-          return { ok: true, data: { ...base, strategy: 'keyword_only_consent' } }
+          return boundedSuccess({ ...base, strategy: 'keyword_only_consent' })
         }
-        if (!validEmbeddingConfiguration(keyword.embedding) || keyword.driftProbeRequired) {
-          return { ok: true, data: {
+        if (data.rebuildRequired || keyword.driftProbeRequired) {
+          return boundedSuccess({
+            ...base, strategy: 'keyword_only_rebuild', driftProbeRequired: true,
+          })
+        }
+        if (!validEmbeddingConfiguration(keyword.embedding)) {
+          return boundedSuccess({
             ...base, strategy: 'keyword_only_provider', driftProbeRequired: true,
-          } }
+          })
         }
         if (!tokenHub || typeof tokenHub.embed !== 'function') {
-          return { ok: true, data: { ...base, strategy: 'keyword_only_provider' } }
+          return boundedSuccess({ ...base, strategy: 'keyword_only_provider' })
+        }
+        const dispatchPermit = await obtainDispatchPermit({
+          rpc, ownerId: uid, purpose: 'query', requestId: event.requestId,
+          consentEpoch: data.consentEpoch,
+        })
+        if (!dispatchPermit) {
+          return boundedSuccess({ ...base, strategy: 'keyword_only_consent' })
         }
         let vector
         try {
@@ -565,13 +625,14 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
             dimensions: fixedEmbeddingConfiguration.dimensions,
             configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
             region: fixedEmbeddingConfiguration.region,
+            dispatchPermit,
           })
         } catch {
-          return { ok: true, data: { ...base, strategy: 'keyword_only_provider' } }
+          return boundedSuccess({ ...base, strategy: 'keyword_only_provider' })
         }
         if (!Array.isArray(vector) || vector.length !== fixedEmbeddingConfiguration.dimensions
           || vector.some(value => !Number.isFinite(value))) {
-          return { ok: true, data: { ...base, strategy: 'keyword_only_provider' } }
+          return boundedSuccess({ ...base, strategy: 'keyword_only_provider' })
         }
         const currentConsent = await rpc('autoforge_knowledge_get_embedding_consent', {
           p_caller_user_id: uid,
@@ -579,7 +640,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         if (!validResponse('getEmbeddingConsent', currentConsent)
           || currentConsent.state !== 'granted'
           || currentConsent.consentEpoch !== data.consentEpoch) {
-          return { ok: true, data: { ...base, strategy: 'keyword_only_consent' } }
+          return boundedSuccess({ ...base, strategy: 'keyword_only_consent' })
         }
         const vectorResult = await rpc('autoforge_knowledge_search_vectors', {
           p_caller_user_id: uid, p_knowledge_base_ids: event.knowledgeBaseIds,
@@ -596,9 +657,9 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || vectorResult.vectorCandidates.some(candidate => (
             !validCloudCandidate(candidate, generationByBase)
           ))) throw { code: 'INTERNAL_ERROR' }
-        return { ok: true, data: {
+        return boundedSuccess({
           ...base, strategy: 'hybrid', vectorCandidates: vectorResult.vectorCandidates,
-        } }
+        })
       }
       if (event.action === 'authorizeUpload') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
@@ -627,7 +688,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         }, uploadUrlPrefix)) {
           throw { code: 'INTERNAL_ERROR' }
         }
-        return { ok: true, data: { ...data, uploadAuthorization } }
+        return boundedSuccess({ ...data, uploadAuthorization })
       }
       if (event.action === 'completeUpload') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
@@ -666,17 +727,17 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           || verified.byteSize !== data.expectedByteSize
           || verified.sha256 !== data.expectedSha256
           || verified.mimeType !== data.expectedMimeType) throw { code: 'INTERNAL_ERROR' }
-        return { ok: true, data: {
+        return boundedSuccess({
           objectId: verified.objectId,
           storageReference: verified.storageReference,
           verified: true,
-        } }
+        })
       }
       if (event.action === 'cleanupOrphans') {
         if (!storage) throw { code: 'INTERNAL_ERROR' }
         if (!validResponse('prepareCleanup', data)) throw { code: 'INTERNAL_ERROR' }
         if (Object.hasOwn(data, 'removed')) {
-          return { ok: true, data: { removed: data.removed } }
+          return boundedSuccess({ removed: data.removed })
         }
         await storage.deleteObjects(data.storageReferences)
         const completed = await rpc('autoforge_knowledge_complete_orphan_cleanup', {
@@ -685,7 +746,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
           p_storage_references: data.storageReferences,
         })
         if (!validResponse('cleanupOrphans', completed)) throw { code: 'INTERNAL_ERROR' }
-        return { ok: true, data: completed }
+        return boundedSuccess(completed)
       }
       if (!validResponse(event.action, data)) throw { code: 'INTERNAL_ERROR' }
       if ((event.action === 'pushMutation' && data.mutationId !== event.mutationId)
@@ -699,7 +760,7 @@ function createKnowledgeHandler({ rpc, storage, uploadUrlPrefix, tokenHub }) {
         || (event.action === 'getJob' && data.jobId !== event.jobId)) {
         throw { code: 'INTERNAL_ERROR' }
       }
-      return { ok: true, data }
+      return boundedSuccess(data)
     } catch (error) {
       return { ok: false, error: { code: safeErrorCode(error) } }
     }
@@ -725,8 +786,9 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
         || !nonEmptyString(batch.generationId)
         || !Number.isSafeInteger(batch.consentEpoch) || batch.consentEpoch < 0
         || !Array.isArray(batch.chunks) || batch.chunks.length > 24
-        || batch.chunks.some(chunk => !exactKeys(chunk, ['id', 'body'])
-          || !nonEmptyString(chunk.id) || typeof chunk.body !== 'string'
+        || batch.chunks.some(chunk => !exactKeys(chunk, ['id', 'versionId', 'body'])
+          || !nonEmptyString(chunk.id) || !nonEmptyString(chunk.versionId)
+          || typeof chunk.body !== 'string'
           || Buffer.byteLength(chunk.body, 'utf8') > 64 * 1024)) {
         throw { code: 'INTERNAL_ERROR' }
       }
@@ -748,23 +810,23 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
           return { state: 'completed', embedded }
         }
         for (const chunk of currentBatch.chunks) {
-          if (seenChunkIds.has(chunk.id)) throw { code: 'INTERNAL_ERROR' }
-          seenChunkIds.add(chunk.id)
-          const before = await rpc('autoforge_knowledge_assert_embedding_consent', {
-            p_owner_id: batch.ownerId, p_consent_epoch: batch.consentEpoch,
+          const chunkIdentity = `${chunk.versionId.length}:${chunk.versionId}${chunk.id}`
+          if (seenChunkIds.has(chunkIdentity)) throw { code: 'INTERNAL_ERROR' }
+          seenChunkIds.add(chunkIdentity)
+          const dispatchPermit = await obtainDispatchPermit({
+            rpc, ownerId: batch.ownerId, purpose: 'chunk',
+            requestId: `${jobId}:${chunk.id}`, consentEpoch: batch.consentEpoch,
+            knowledgeBaseId: batch.knowledgeBaseId,
+            generationId: batch.generationId, chunkId: chunk.id,
           })
-          if (!exactKeys(before, ['enabled', 'consentEpoch'])
-            || typeof before.enabled !== 'boolean'
-            || !Number.isSafeInteger(before.consentEpoch)
-            || !before.enabled || before.consentEpoch !== batch.consentEpoch) {
-            return { state: 'revoked', embedded }
-          }
+          if (!dispatchPermit) return { state: 'revoked', embedded }
           const vector = await tokenHub.embed({
             input: chunk.body,
             model: fixedEmbeddingConfiguration.model,
             dimensions: fixedEmbeddingConfiguration.dimensions,
             configurationVersion: fixedEmbeddingConfiguration.configurationVersion,
             region: fixedEmbeddingConfiguration.region,
+            dispatchPermit,
           })
           if (!Array.isArray(vector)
             || vector.length !== fixedEmbeddingConfiguration.dimensions
@@ -783,6 +845,7 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
           const stored = await rpc('autoforge_knowledge_store_embedding', {
             p_owner_id: batch.ownerId, p_knowledge_base_id: batch.knowledgeBaseId,
             p_generation_id: batch.generationId, p_chunk_id: chunk.id,
+            p_version_id: chunk.versionId,
             p_consent_epoch: batch.consentEpoch,
             p_model: fixedEmbeddingConfiguration.model,
             p_dimensions: fixedEmbeddingConfiguration.dimensions,
@@ -805,8 +868,9 @@ function createEmbeddingGenerationWorker({ rpc, tokenHub }) {
           || currentBatch.generationId !== batch.generationId
           || currentBatch.consentEpoch !== batch.consentEpoch
           || !Array.isArray(currentBatch.chunks) || currentBatch.chunks.length > 24
-          || currentBatch.chunks.some(chunk => !exactKeys(chunk, ['id', 'body'])
-            || !nonEmptyString(chunk.id) || typeof chunk.body !== 'string'
+          || currentBatch.chunks.some(chunk => !exactKeys(chunk, ['id', 'versionId', 'body'])
+            || !nonEmptyString(chunk.id) || !nonEmptyString(chunk.versionId)
+            || typeof chunk.body !== 'string'
             || Buffer.byteLength(chunk.body, 'utf8') > 64 * 1024)) {
           throw { code: 'INTERNAL_ERROR' }
         }
@@ -886,9 +950,10 @@ function createTokenHubClient({ endpoint, apiKey, fetchImpl = fetch }) {
   return {
     async embed(input) {
       if (!exactKeys(input, [
-        'input', 'model', 'dimensions', 'configurationVersion', 'region',
+        'input', 'model', 'dimensions', 'configurationVersion', 'region', 'dispatchPermit',
       ])
         || !nonEmptyString(input.input, 64 * 1024)
+        || !nonEmptyString(input.dispatchPermit)
         || input.model !== fixedEmbeddingConfiguration.model
         || input.dimensions !== fixedEmbeddingConfiguration.dimensions
         || input.configurationVersion !== fixedEmbeddingConfiguration.configurationVersion

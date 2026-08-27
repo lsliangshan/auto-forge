@@ -4,12 +4,12 @@ import { cosineSimilarity, rankByCosine, reciprocalRankFusion } from './reciproc
 describe('reciprocal rank fusion', () => {
   it('uses deterministic identifier tie-breaking regardless of input order', () => {
     const first = reciprocalRankFusion([
-      [{ id: 'chunk_b' }, { id: 'chunk_a' }],
-      [{ id: 'chunk_a' }, { id: 'chunk_b' }],
+      [{ knowledgeBaseId: 'kb_1', id: 'chunk_b' }, { knowledgeBaseId: 'kb_1', id: 'chunk_a' }],
+      [{ knowledgeBaseId: 'kb_1', id: 'chunk_a' }, { knowledgeBaseId: 'kb_1', id: 'chunk_b' }],
     ], { limit: 8 })
     const second = reciprocalRankFusion([
-      [{ id: 'chunk_a' }, { id: 'chunk_b' }],
-      [{ id: 'chunk_b' }, { id: 'chunk_a' }],
+      [{ knowledgeBaseId: 'kb_1', id: 'chunk_a' }, { knowledgeBaseId: 'kb_1', id: 'chunk_b' }],
+      [{ knowledgeBaseId: 'kb_1', id: 'chunk_b' }, { knowledgeBaseId: 'kb_1', id: 'chunk_a' }],
     ], { limit: 8 })
 
     expect(first.map(result => result.id)).toEqual(['chunk_a', 'chunk_b'])
@@ -19,12 +19,28 @@ describe('reciprocal rank fusion', () => {
 
   it('deduplicates an identifier within a ranking before assigning reciprocal rank', () => {
     const results = reciprocalRankFusion([
-      [{ id: 'chunk_a' }, { id: 'chunk_a' }, { id: 'chunk_b' }],
+      [
+        { knowledgeBaseId: 'kb_1', id: 'chunk_a' },
+        { knowledgeBaseId: 'kb_1', id: 'chunk_a' },
+        { knowledgeBaseId: 'kb_1', id: 'chunk_b' },
+      ],
     ], { rankConstant: 60, limit: 8 })
 
     expect(results).toEqual([
-      { id: 'chunk_a', score: 1 / 61, bestRank: 1 },
-      { id: 'chunk_b', score: 1 / 62, bestRank: 2 },
+      { knowledgeBaseId: 'kb_1', id: 'chunk_a', score: 1 / 61, bestRank: 1 },
+      { knowledgeBaseId: 'kb_1', id: 'chunk_b', score: 1 / 62, bestRank: 2 },
+    ])
+  })
+
+  it('keeps the same chunk identifier from two bases as distinct candidates', () => {
+    const results = reciprocalRankFusion([[
+      { knowledgeBaseId: 'kb_b', id: 'chunk_same' },
+      { knowledgeBaseId: 'kb_a', id: 'chunk_same' },
+    ]], { limit: 8 })
+
+    expect(results.map(({ knowledgeBaseId, id }) => [knowledgeBaseId, id])).toEqual([
+      ['kb_b', 'chunk_same'],
+      ['kb_a', 'chunk_same'],
     ])
   })
 })
@@ -39,9 +55,9 @@ describe('small-set exact cosine ranking', () => {
 
   it('sorts equal cosine scores by stable identifier and omits invalid vectors', () => {
     expect(rankByCosine([1, 0], [
-      { id: 'chunk_b', vector: [1, 0] },
-      { id: 'chunk_invalid', vector: [1] },
-      { id: 'chunk_a', vector: [2, 0] },
+      { knowledgeBaseId: 'kb_1', id: 'chunk_b', vector: [1, 0] },
+      { knowledgeBaseId: 'kb_1', id: 'chunk_invalid', vector: [1] },
+      { knowledgeBaseId: 'kb_1', id: 'chunk_a', vector: [2, 0] },
     ], 2).map(candidate => candidate.id)).toEqual(['chunk_a', 'chunk_b'])
   })
 })
